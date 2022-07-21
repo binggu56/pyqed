@@ -17,8 +17,36 @@ from pyscf import gto, dft, tdscf, scf, lib, ao2mo
 from pyscf.lib import logger
 import scipy
 
-from mqed.units import au2ev
+from pyqed.units import au2ev
+from pyqed.phys import dag
 
+def _build_tdm(x, mo_coeff):
+    """
+    Compute the transition density matrix in AO basis
+    ..math::
+        \Gamma_{\mu \nu} = \langle \Phi_n | \mu^\dag \nu | \Phi_0 \rangle
+    from TDA X
+    ..math::
+        T_{ia} = \rangle \Phi_n | i a^\dag |\Phi_0\rangle
+
+    Parameters
+    ----------
+    td : tdobj
+        e.g. CIS, TDHF, TDDFT
+    n : int/list
+        state id. E.g., n = 1 is the first-excited state.
+        If n is None, it will print out all excited states.
+
+    Returns
+    -------
+    None.
+
+    """
+
+    nocc, nvir = x.shape
+
+    return np.einsum('ui, ia, vj -> uv', mo_coeff[:, :nocc], \
+                     x, mo_coeff[:, nocc:].conj())
 
 def banded(a):
     """
@@ -294,7 +322,26 @@ def core_excitation(td, energy_range=None, analyze=True, occidx=None, \
 
 #     return dip
 
-class RES:
+class TDA:
+    def __init__(self, td):
+        """
+        TDA core-excitation computations with the FULL ov excitation space
+
+        Parameters
+        ----------
+        td : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+
+    def core(self, energy_range):
+        pass
+
+class RXS:
     def __init__(self, td, occidx=None, viridx=None):
         """
         Reduced (Single) Excitation Space computations for TDDFT/TDA/TDHF
@@ -304,9 +351,9 @@ class RES:
         td : tdscf object
             DESCRIPTION.
         occidx : list of integers, optional
-            occupied orbs taken into consideration. The default is None.
+            reduced occupied orbitals taken. The default is None.
         viridx : TYPE, optional
-            virtual orbitals to consider. The default is None.
+            reduced virtual orbitals to consider. The default is None.
 
         Returns
         -------
@@ -317,6 +364,9 @@ class RES:
         self.occidx = occidx
         self.viridx = viridx
         self.x = None # TDA X coeffs
+        self.mo_coeff = td._scf.mo_coeff
+        self.mo_occ = td._scf.mo_occ
+        self.r_ao = None # position matrix element in AO
 
     @property
     def occidx(self):
@@ -340,9 +390,9 @@ class RES:
 
         # check if occidx and virdix are provided
         if self.occidx is None:
-            self.occidx = (np.where(self.td._scf.mo_occ==2)[0])
+            self.occidx = (np.where(self.mo_occ==2)[0])
         if self.viridx is None:
-            self.viridx = (np.where(self.td._scf.mo_occ==0)[0])
+            self.viridx = (np.where(self.mo_occ==0)[0])
 
         nocc = len(self.occidx)
         nvir = len(self.viridx)
@@ -361,6 +411,77 @@ class RES:
 
     def get_ab(self):
         return get_ab_ras(self.td._scf, self.occidx, self.viridx)
+
+    def tdm(self, n):
+        """
+        Compute the transition density matrix in AO basis
+        ..math::
+            \Gamma_{\mu \nu} = \langle \Phi_n | \mu \nu^\dag | \Phi_0 \rangle
+        from TDA X
+        ..math::
+            T_{ia} = \rangle \Phi_n | i a^\dag |\Phi_0\rangle
+
+
+        Parameters
+        ----------
+        n : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        x = self.x[:,:, n]
+        C = self.mo_coeff
+
+        return C[:, occidx] @ x @ dag(C[:, viridx])
+
+    # def transition_dipole_from_tdm(self, tdm):
+    #     """
+    #     Compute the transition dipole moment from the ground state to excited
+    #     states. Using a slightly different method than transition_dipole().
+
+    #     The TDM is build first from x coeff, and then calculate transition
+    #     dipole.
+
+    #     Parameters
+    #     ----------
+    #     tdm : ndarray [nao, nao]
+    #         TDM in AO representation.
+
+    #     Returns
+    #     -------
+    #     dip : ndarray [3]
+    #         DESCRIPTION.
+
+    #     """
+
+    #     td = self.td
+    #     mo_coeff = self.mo_coeff # <ao|mo>
+
+    #     occidx = self.occidx
+    #     viridx = self.viridx
+
+    #     nocc = len(occidx)
+    #     # nvir = len(viridx)
+
+    #     # 1e operator in ao basis
+    #     ints = td.mol.intor_symmetric('int1e_r', comp=3)
+
+    #     # transform to mo basis
+    #     # mo_coeff = mo_coeff[:, [*occidx, *viridx]]
+
+    #     # ints = np.einsum('xpq,pi,qj->xij', ints, \
+    #     #                  mo_coeff.conj(), mo_coeff)
+
+    #     # ints = ints[:, :nocc, nocc:]
+
+
+    #     dip = -np.einsum('xij,ij -> x', ints, tdm)*2 # the factor of 2 comes from spin
+
+    #     return dip
 
     def transition_dipole(self):
         """
@@ -526,11 +647,13 @@ def tdm_ee(X1, X2, mo_coeff, occidx, viridx):
     return tdm
 
 
-def tdm_ee_diff_exc_space(X1, X2, mo_coeff, mo_occ=None, occidx=None, viridx=None,\
+def tdm_ee_diff_xspace(X1, X2, mo_coeff, mo_occ, occidx=None, viridx=None,\
             occidx_bra=None, viridx_bra=None):
     """
     Compute the transition density matrix between two TDA/CIS/TDHF excited
     states with inequivalent excitation spaces.
+    ..math::
+        T_{qp} = \langle \Phi_2 | qp^\dag | \Phi_1 \rangle
 
     This only calculates the transition density matrix. For density matrices,
     call dm_ee().
@@ -558,34 +681,50 @@ def tdm_ee_diff_exc_space(X1, X2, mo_coeff, mo_occ=None, occidx=None, viridx=Non
         DESCRIPTION. The default is True.
         """
     # occ and vir orbs in total
-    nocc = len(np.where(mo_occ==2)[0])
-    nvir = len(np.where(mo_occ==0)[0])
+    occall = np.where(mo_occ==2)[0]
+    virall = np.where(mo_occ==0)[0]
+
+    nocc = len(occall)
+    nvir = len(virall)
 
     # expand both reduced TDA amplitudes to the full ov space and then perform
     # calculations
     x1 = np.zeros((nocc, nvir))
     x2 = np.zeros((nocc, nvir))
 
-    if occidx_bra is None:
-        occidx_bra = numpy.where(mo_occ==2)[0]
-    if viridx_bra is None:
-        viridx_bra = numpy.where(mo_occ==0)[0]
+    if occidx is None:
+        occidx = occall
+    if viridx is None:
+        viridx = virall
 
-    x1[occidx, viridx-nocc] = X1
-    x2[occidx_bra, viridx_bra - nocc] = X2
+    if occidx_bra is None:
+        occidx_bra = occall
+    if viridx_bra is None:
+        viridx_bra = virall
+
+    if X1.shape != (len(occidx), len(viridx)):
+        raise ValueError('The X1 shape {} do not match the occ {} and vir\
+                         {}.'.format(X1.shape, len(occidx), len(viridx)))
+
+    if X2.shape != (len(occidx_bra), len(viridx_bra)):
+        raise ValueError('The X2 shape {} do not match the occ {} and vir\
+                         {}.'.format(X2.shape, len(occidx_bra), len(viridx_bra)))
+
+    x1[np.ix_(occidx, viridx-nocc)] = X1
+    x2[np.ix_(occidx_bra, viridx_bra - nocc)] = X2
 
     tdm = np.zeros(mo_coeff.shape) # full MO space
 
-    tdm_oo =-np.einsum('ia,ka->ik', x2.conj(), x1)
-    tdm_vv = np.einsum('ia,ic->ac', x1, x2.conj())
+    tdm_oo = np.einsum('ia,ka->ik', x2.conj(), x1)
+    tdm_vv = -np.einsum('ia,ic->ac', x1, x2.conj())
 
     tdm[:nocc,:nocc] += tdm_oo * 2
     tdm[nocc:,nocc:] += tdm_vv * 2
 
     # Transform density matrix to AO basis
-    tdm = np.einsum('pi,ij,qj->pq', mo_coeff, tdm, mo_coeff.conj())
+    # return np.einsum('pi,ij,qj->pq', mo_coeff, tdm, mo_coeff.conj())
 
-    return tdm
+    return mo_coeff @ tdm @ dag(mo_coeff)
 
 
 
@@ -613,18 +752,20 @@ if __name__=='__main__':
     # mytd.kernel()
     # mytd.analyze()
     # w = core_excitation(mytd, ew=[20, 30])[0]
-    ras = RES(mytd)
-    ras.occidx = [0]
-    w, v = ras.core_excitation()
+    ras = RXS(mytd)
+    ras.occidx = [0, 1]
+    w, v = ras.core_excitation(nstates=4)
+
 
     # print(ras.transition_dipole())
 
     tdm1 = (tdm_ee(ras.x[:,:,2], ras.x[:,:,3], mf.mo_coeff,\
                  ras.occidx, ras.viridx))
 
-    # tdm2 = (tdm_ee_diff_exc_space(ras.x[:,:,2], ras.x[:,:,3], mf.mo_coeff, mf.mo_occ,\
-    #              ras.occidx, ras.viridx, ras.occidx, ras.viridx))
+    tdm2 = (tdm_ee_diff_exc_space(ras.x[:,:,2], ras.x[:,:,3], mf.mo_coeff, mf.mo_occ,\
+                  ras.occidx, ras.viridx, ras.occidx, ras.viridx))
 
+    # print(tdm2)
     # print(tdm1 == tdm2)
 
     # wr = core_excitation(mytd, ew=[20, 30], occidx=[0])[0]

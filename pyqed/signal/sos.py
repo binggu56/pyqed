@@ -15,10 +15,10 @@ from matplotlib import cm
 
 from numpy import conj
 
-from mqed.phys import lorentzian, dag
-from mqed.units import au2ev, au2mev
+from pyqed.phys import lorentzian, dag
+from pyqed.units import au2ev, au2mev
 
-from mqed.style import subplots
+from pyqed.style import subplots
 
 # def electronic_polarizability(w, gidx, eidx, vidx, E, d, use_rwa=True):
 #     """
