@@ -3,7 +3,7 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to lime's documentation!
+Welcome to PyQED's documentation!
 ================================
 
 The goal is to provide a simple-to-use package to study ``how light interacts with matter``.  
@@ -30,7 +30,11 @@ Main modules
 
 # Semiclassical quantum trajectory method 
 
-# Quantum chemistry 
+Quantum chemistry
+-----------------
+* TDDFT core-level excitation 
+** reduced excitation space
+** restricted energy window with full/reduced excitation space
 
 Open quantum systems 
 --------------------
@@ -56,7 +60,7 @@ Periodically driven matter
    :caption: Contents:
 
    guide/guide.rst
-   lime
+   pyqed
    developers.rst
    heom
    Floquet

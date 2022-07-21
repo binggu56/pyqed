@@ -1,6 +1,6 @@
-# Welcome to LIght-Matter Everything!
+# Welcome to PyQED!
 
-The ultimate goal is to provide a simple-to-use package to study how light interacts with matter.  
+The goal is to provide a simple-to-use package to study how light interacts with matter.  
 
 Check manual.pdf for documentations! 
 

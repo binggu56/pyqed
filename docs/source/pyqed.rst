@@ -1,4 +1,4 @@
-lime package
+pyqed package
 ============
 
 Subpackages
@@ -7,216 +7,216 @@ Subpackages
 .. toctree::
    :maxdepth: 4
 
-   lime.models
-   lime.polariton
+   pyqed.models
+   pyqed.polariton
 
 Submodules
 ----------
 
-lime.Floquet module
+pyqed.Floquet module
 -------------------
 
-.. automodule:: lime.Floquet
+.. automodule:: pyqed.Floquet
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.FranckCondon module
+pyqed.FranckCondon module
 ------------------------
 
-.. automodule:: lime.FranckCondon
+.. automodule:: pyqed.FranckCondon
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.backup module
+pyqed.backup module
 ------------------
 
-.. automodule:: lime.backup
+.. automodule:: pyqed.backup
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.beam module
+pyqed.beam module
 ----------------
 
-.. automodule:: lime.beam
+.. automodule:: pyqed.beam
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.cavity module
+pyqed.cavity module
 ------------------
 
-.. automodule:: lime.cavity
+.. automodule:: pyqed.cavity
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.common module
+pyqed.common module
 ------------------
 
-.. automodule:: lime.common
+.. automodule:: pyqed.common
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.coordinates module
+pyqed.coordinates module
 -----------------------
 
-.. automodule:: lime.coordinates
+.. automodule:: pyqed.coordinates
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.correlation module
+pyqed.correlation module
 -----------------------
 
-.. automodule:: lime.correlation
+.. automodule:: pyqed.correlation
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.fft module
+pyqed.fft module
 ---------------
 
-.. automodule:: lime.fft
+.. automodule:: pyqed.fft
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.group module
+pyqed.group module
 -----------------
 
-.. automodule:: lime.group
+.. automodule:: pyqed.group
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.gwp module
+pyqed.gwp module
 ---------------
 
-.. automodule:: lime.gwp
+.. automodule:: pyqed.gwp
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.liouville module
+pyqed.liouville module
 ---------------------
 
-.. automodule:: lime.liouville
+.. automodule:: pyqed.liouville
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.mol module
+pyqed.mol module
 ---------------
 
-.. automodule:: lime.mol
+.. automodule:: pyqed.mol
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.noise module
+pyqed.noise module
 -----------------
 
-.. automodule:: lime.noise
+.. automodule:: pyqed.noise
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.optics module
+pyqed.optics module
 ------------------
 
-.. automodule:: lime.optics
+.. automodule:: pyqed.optics
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.oqs module
+pyqed.oqs module
 ---------------
 
-.. automodule:: lime.oqs
+.. automodule:: pyqed.oqs
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.phys module
+pyqed.phys module
 ----------------
 
-.. automodule:: lime.phys
+.. automodule:: pyqed.phys
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.qnm module
+pyqed.qnm module
 ---------------
 
-.. automodule:: lime.qnm
+.. automodule:: pyqed.qnm
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.quadrature module
+pyqed.quadrature module
 ----------------------
 
-.. automodule:: lime.quadrature
+.. automodule:: pyqed.quadrature
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.spin\_boson module
+pyqed.spin\_boson module
 -----------------------
 
-.. automodule:: lime.spin_boson
+.. automodule:: pyqed.spin_boson
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.style module
+pyqed.style module
 -----------------
 
-.. automodule:: lime.style
+.. automodule:: pyqed.style
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.superoperator module
+pyqed.superoperator module
 -------------------------
 
-.. automodule:: lime.superoperator
+.. automodule:: pyqed.superoperator
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.susceptibility module
+pyqed.susceptibility module
 --------------------------
 
-.. automodule:: lime.susceptibility
+.. automodule:: pyqed.susceptibility
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.units module
+pyqed.units module
 -----------------
 
-.. automodule:: lime.units
+.. automodule:: pyqed.units
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.wigner module
+pyqed.wigner module
 ------------------
 
-.. automodule:: lime.wigner
+.. automodule:: pyqed.wigner
    :members:
    :undoc-members:
    :show-inheritance:
 
-lime.wpd module
+pyqed.wpd module
 ---------------
 
-.. automodule:: lime.wpd
+.. automodule:: pyqed.wpd
    :members:
    :undoc-members:
    :show-inheritance:
@@ -224,7 +224,7 @@ lime.wpd module
 Module contents
 ---------------
 
-.. automodule:: lime
+.. automodule:: pyqed
    :members:
    :undoc-members:
    :show-inheritance:
