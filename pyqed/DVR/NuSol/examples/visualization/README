@@ -1,0 +1,10 @@
+Each folder contains a config file together with the generated output files, eval.dat and evec.dat. 
+The data plotting scripts are the .py python files in each folder. Do not forget to deactivate the 
+python virtual environment:
+> deactivate;
+in case you installed it
+
+EXAMPLE run: 1D dvr result plotting
+> cd dvr1D;
+> python plot.py;
+The procedure is the same for all subfolders.

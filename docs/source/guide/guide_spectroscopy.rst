@@ -23,9 +23,9 @@ Direct computing the many-point correlation functions with the quantum regressio
 	Visulize with double-sided Feynman diagrams instead of the time-loop diagrams. 
 
 * Many-body systems
-	Solve Dyson equaiton for one-particle Green's function 
-	.. math:: 
-		G = G_0 + G_0 \Sigma G 
+	Solve Dyson equaiton for one-particle Green's function
+
+	.. math:: G = G_0 + G_0 \Sigma G 
 
 Non-perturbative approah 
 -------------------------
