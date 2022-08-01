@@ -24,12 +24,12 @@ import warnings
 
 import proplot as plt
 
-from lime.units import au2fs, au2ev
-from lime.signal import sos
-from lime.phys import dag, quantum_dynamics, \
+from pyqed.units import au2fs, au2ev
+from pyqed.signal import sos
+from pyqed.phys import dag, quantum_dynamics, \
     obs, basis, isdiag, jump, multimode, transform, rk4, tdse
 
-from lime.units import au2wavenumber, au2fs
+from pyqed.units import au2wavenumber, au2fs
 
 # def rk4(rho, fun, dt, *args):
 #     """
@@ -1028,12 +1028,12 @@ class LVC(Mol):
         # elif method == 'SPO':
 
         #     if self.nmodes == 1:
-        #         from lime.wpd import SPO
+        #         from pyqed.wpd import SPO
 
         #         sol = SPO()
 
         #     elif self.nmodes == 2:
-        #         from lime.wpd import SPO2
+        #         from pyqed.wpd import SPO2
 
         #         sol = SPO2()
 
@@ -1105,7 +1105,7 @@ class LVC(Mol):
             DESCRIPTION.
 
         """
-        from lime.style import plot_surfaces
+        from pyqed.style import plot_surfaces
 
         if self.nmodes != 2:
             raise ValueError('This function only works for nmodes=2.')
@@ -1286,10 +1286,10 @@ class SESolver:
             else: # single pulse
 
                 if edip.ndim == 2: # dipole projected on the laser polarization
-                    
+
                     H = [self.H]
                     H.append([edip, pulse.efield])
-                    
+
                     return driven_dynamics(H=H, psi0=psi0, dt=dt, Nt=Nt, \
                                    e_ops=e_ops, nout=nout, t0=t0, \
                                        use_sparse=use_sparse)
@@ -1733,8 +1733,8 @@ def driven_dynamics(H, psi0, dt=0.01, Nt=1, e_ops=None, nout=1, \
 
     def calcH(t):
 
-        Ht = H[0].copy()
-        
+        Ht = H[0].copy().astype(complex)
+
         for i in range(1, len(H)):
             Ht += - H[i][1](t) * H[i][0]
 
@@ -1877,8 +1877,8 @@ def test_sesolver():
 
 def high_frequency_drive():
 
-    from lime.phys import coh_op
-    from lime.optics import Pulse
+    from pyqed.phys import coh_op
+    from pyqed.optics import Pulse
 
     mol = mls()
     N = mol.dim
@@ -1915,7 +1915,7 @@ def high_frequency_drive():
     plt.show()
 
 if __name__ == '__main__':
-    from lime.phys import pauli
+    from pyqed.phys import pauli
     import time
     import proplot as plt
 

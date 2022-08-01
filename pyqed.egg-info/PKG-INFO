@@ -2,7 +2,7 @@ Metadata-Version: 1.1
 Name: pyqed
 Version: 0.1.1
 Summary: Molecular quantum electrodynamics
-Home-page: https://github.com/binggu56/lime
+Home-page: https://github.com/binggu56/pyqed
 Author: Bing Gu
 Author-email: binggu56@gmail.com
 License: MIT license
@@ -59,7 +59,7 @@ Description: ==============
         
         * First release on PyPI.
         
-Keywords: lime
+Keywords: pyqed
 Platform: UNKNOWN
 Classifier: Development Status :: 2 - Pre-Alpha
 Classifier: Intended Audience :: Developers

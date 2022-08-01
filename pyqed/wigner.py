@@ -22,7 +22,7 @@ from scipy.fft import fft, fftfreq, fftshift, ifft
 from math import log, ceil, floor
 import sys
 
-import lime
+import pyqed
 
 import matplotlib.pyplot as plt
 
@@ -206,7 +206,7 @@ def spectrogram(x, d=1):
         #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
         #         np.conj(signal[icol - tausec, 0]) + \
         #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-        w[:, j], freqs = lime.fft.ifft(w[:, j], taus)
+        w[:, j], freqs = pyqed.fft.ifft(w[:, j], taus)
 
     return w, freqs/2
 
@@ -267,7 +267,7 @@ def wigner(x, d=1):
         #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
         #         np.conj(signal[icol - tausec, 0]) + \
         #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-        freqs, w[:, j] = lime.fft.fft(w[:, j], taus)
+        freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
 
     # fig, ax = plt.subplots()
     # ax.matshow(w.real)
@@ -280,9 +280,9 @@ def wigner(x, d=1):
 
 if __name__=='__main__':
 
-    from lime.optics import Pulse, interval
-    from lime.units import au2fs, au2ev
-    #from lime.phys import
+    from pyqed.optics import Pulse, interval
+    from pyqed.units import au2fs, au2ev
+    #from pyqed.phys import
 
     pulse = Pulse(tau=4/au2fs, omegac=2/au2ev, beta=0.1)
     sigma=4/au2fs
@@ -302,10 +302,10 @@ if __name__=='__main__':
     # fig, ax = plt.subplots()
     # ax.imshow(wvd)
 
-    from lime.style import imshow
+    from pyqed.style import imshow
 
     imshow(freqs, t, wvd.T.real, xlabel=r'$\omega$', ylabel='$t$')
 
-    # from lime.style import surf
+    # from pyqed.style import surf
     # ax = surf(wvd, t, freqs)
     # ax.set_ylim(-0.1, 0)

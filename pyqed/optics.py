@@ -11,11 +11,11 @@ from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 from numpy import sqrt, exp, pi
 import proplot as plt
 
-from mqed.units import au2k, au2ev, alpha, \
+from pyqed.units import au2k, au2ev, alpha, \
     au2watt_per_centimeter_squared, au2fs
-from mqed.fft import fft, fft2
-from mqed.phys import rect, sinc, dag, interval
-from mqed.wigner import spectrogram
+from pyqed.fft import fft, fft2
+from pyqed.phys import rect, sinc, dag, interval
+from pyqed.wigner import spectrogram
 
 from numba import jit
 
@@ -213,7 +213,7 @@ class Pulse:
     def plt_efield(self):
 
         import proplot as plt
-        from lime.units import au2volt_per_angstrom
+        from pyqed.units import au2volt_per_angstrom
 
         fig, ax = plt.subplots()
 

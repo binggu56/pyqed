@@ -416,9 +416,9 @@ def plot_surface(x, y, surface):
 
     #data = [go.Surface(z=apes)]
     #fig = go.Figure(data = data)
-    import matplotlib.pyplot as plt 
-    from lime.units import au2ev 
-    
+    import matplotlib.pyplot as plt
+    from lime.units import au2ev
+
     fig = plt.figure(figsize=(5,4))
 
     ax = fig.add_subplot(111, projection='3d')
@@ -451,15 +451,15 @@ def plot_surface(x, y, surface):
     plt.savefig('apes_3d.pdf')
 
     plt.show()
-    return 
+    return
 
 def plot_surfaces(x, y, surfaces):
 
     #data = [go.Surface(z=apes)]
     #fig = go.Figure(data = data)
-    import matplotlib.pyplot as plt 
-    from lime.units import au2ev 
-    
+    import matplotlib.pyplot as plt
+    from lime.units import au2ev
+
     fig = plt.figure(figsize=(5,4))
 
     ax = fig.add_subplot(111, projection='3d')
@@ -493,11 +493,11 @@ def plot_surfaces(x, y, surfaces):
     plt.savefig('apes_3d.pdf')
 
     plt.show()
-    return 
+    return
 
 def tocolor(x, vmin=0, vmax=1):
     """
-    map values to colors 
+    map values to colors
 
     Parameters
     ----------
@@ -523,6 +523,26 @@ def test_level_scheme():
     level_scheme(x)
 
     return
+
+def vector_field(f):
+    """
+    3D plot of a vector field.
+
+    Parameters
+    ----------
+    f : list of x,y,z components
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    from mayavi.mlab import quiver3d
+    u, v, w = f
+    quiver3d(u, v, w)
+    return
+
 
 if __name__ == '__main__':
     # fig, ax = subplots(ncols=1, nrows=2)
