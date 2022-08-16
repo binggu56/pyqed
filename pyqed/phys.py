@@ -11,6 +11,14 @@ import numba
 from numba import jit
 import sys
 
+def is_positive_def(A):
+    try:
+        np.linalg.cholesky(A)
+        return True
+    except np.linalg.LinAlgError:
+        return False
+
+
 def polarization_vector(pol='x'):
     """
     unit length polarization vector

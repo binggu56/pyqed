@@ -72,6 +72,7 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
     Coloumb interaction.
 
     Q^\dagger = \sum_{ia} X_{ia} a^+ i - Y_{ia} i^+ a
+
     Leads to the RPA eigenvalue equations:
       [ A  B ][X] = omega [ 1  0 ][X]
       [ B  A ][Y]         [ 0 -1 ][Y]
@@ -241,6 +242,9 @@ def is_positive_def(A):
         return True
     except np.linalg.LinAlgError:
         return False
+
+
+
 
 
 class GW(object):

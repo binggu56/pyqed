@@ -109,7 +109,7 @@ class Analyser:
 
 class Pulse:
     def __init__(self, omegac=3./au2ev, tau=5./au2fs, tc=0, delay=0., \
-                 amplitude=0.001, cep=0., beta=0, polarization=None):
+                 amplitude=0.001, intensity=None, cep=0., beta=0, polarization=None):
         """
         (linearly chirped) Gaussian pulse
 
@@ -123,6 +123,7 @@ class Pulse:
         A: electric field amplitude
         T: time delay
         sigma: duration
+        intensity: if intensity is given, it will overwrite the amplitude
 
         DEPRECATED, Use GaussianPulse instead.
         """
@@ -134,7 +135,12 @@ class Pulse:
         self.sigma = tau # for compatibility only
         self.omegac = omegac # central frequency
         self.unit = 'au'
-        self.amplitude = amplitude
+        
+        if intensity is None:
+            self.amplitude = amplitude
+        else:
+            self.amplitude = intensity_to_field(intensity)
+            
         self.cep = cep
         self.bandwidth = 1./tau
         self.duration = 2. * tau

@@ -689,19 +689,48 @@ class RXS:
         return tdm_ee(X1, X2, self.td._scf.mo_coeff, self.occidx, self.viridx)
 
 
-def tdm_ee(X1, X2, mo_coeff, occidx, viridx):
+def _denisty_matrix(x, mo_coeff, mo_occ, state_id):
+    '''
+    Taking the TDA amplitudes as the CIS coefficients, calculate the density
+    matrix (in AO basis) of the excited states
+
+    adapted from PySCF/tddft/example 22
+
+    '''
+    cis_t1 = x
+    dm_oo =-np.einsum('ia,ka->ik', cis_t1.conj(), cis_t1)
+    dm_vv = np.einsum('ia,ic->ac', cis_t1, cis_t1.conj())
+
+    # The ground state density matrix in mo_basis
+    # mf = td._scf
+    dm = np.diag(mo_occ)
+
+    # Add CIS contribution
+    nocc = cis_t1.shape[0]
+    # Note that dm_oo and dm_vv correspond to spin-up contribution. "*2" to
+    # include the spin-down contribution
+    dm[:nocc,:nocc] += dm_oo * 2
+    dm[nocc:,nocc:] += dm_vv * 2
+
+    # Transform density matrix to AO basis
+    mo = mo_coeff
+    dm = np.einsum('pi,ij,qj->pq', mo, dm, mo.conj())
+    return dm
+
+
+def tdm_ee(X1, X2, mo_coeff, reduced_transition_space=False, occidx=None, viridx=None):
     """
-    Compute the transition density matrix in MO basis between TDA/CIS/TDHF excited
+    Compute the transition density matrix in AO basis between TDA/CIS/TDHF excited
     states with the same excitation space.
 
     D_{ia} = \braket{\Phi_J| a^\dag i | \Phi_I}
 
-    This only calculates the transition density matrix. For density matrices,
-    call dm_ee().
+    This only calculates the transition density matrix. For reduced density matrices,
+    call density_matrix(state_id).
 
     The excited states are chosen as
     .. math::
-        \Phi_I = X^I_{ia} a^\dag i \ket{\Phi}
+        \Phi_I = X^I_{ia} a^\dag i \ket{\Phi_0}
 
     Parameters
     ----------
@@ -713,6 +742,8 @@ def tdm_ee(X1, X2, mo_coeff, occidx, viridx):
         DESCRIPTION.
     mo_occ : TYPE
         DESCRIPTION.
+    reduced_transition_space: bool
+        whether the transition space is reduced. If True, the occidx and viridx have to be provided.
     occidx : list, optional
         occupied orbitals index for the ket state. The default is None.
     viridx : list of integers, optional
@@ -729,7 +760,7 @@ def tdm_ee(X1, X2, mo_coeff, occidx, viridx):
     # if viridx is None:
     #     viridx = list(numpy.where(mo_occ==0)[0])
 
-    # the two excited states use the same active space
+    # the two excited states use the same transition space
     assert(X1.shape == X2.shape)
 
     # occ and vir orbs in the reduced excitation ov space
@@ -744,7 +775,10 @@ def tdm_ee(X1, X2, mo_coeff, occidx, viridx):
 
     # Transform density matrix to AO basis, this is only valid
     # for non-restricted calculations
-    mo = mo_coeff[:, [*occidx, *viridx]]
+    if reduced_transition_space:
+        mo = mo_coeff[:, [*occidx, *viridx]]
+    else:
+        mo = mo_coeff
 
     # tdm = np.einsum('up, pq, vq->uv', mo, tdm, mo.conj())
     tdm = mo @ tdm @ mo.conj().T

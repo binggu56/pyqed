@@ -524,7 +524,7 @@ def test_level_scheme():
 
     return
 
-def vector_field(f):
+def vector_field(f, **kwargs):
     """
     3D plot of a vector field.
 
@@ -540,7 +540,7 @@ def vector_field(f):
     """
     from mayavi.mlab import quiver3d
     u, v, w = f
-    quiver3d(u, v, w)
+    quiver3d(u.real, v.real, w.real, **kwargs)
     return
 
 

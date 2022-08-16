@@ -413,8 +413,27 @@ def density(cube, rdm, ao, mo_coeff=None, representation='ao',\
     return d
 
 
-def transition_charge_density():
-    pass
+def transition_charge_density(cube, tdm, ao):
+    """
+    
+
+    Parameters
+    ----------
+    tdm : TYPE
+        DESCRIPTION.
+    ao : AOs in real space 
+
+    Returns
+    -------
+    None.
+
+    """
+    nx, ny, nz = cube.nx, cube.ny, cube.nz
+
+    # \sigma(r) = \braket{\Phi_n | \hat{\sigma}(\bf r)|\Phi_0}
+    rho = np.einsum('gu, uv, gv -> g', ao, tdm, ao.conj()).reshape(nx, ny, nz)
+
+    return rho
 
 def transition_current_density(cube, tdm, ao, nabla_ao, mo_coeff=None, basis='ao',\
             output='tcd'):
