@@ -16,7 +16,7 @@ from scipy.sparse import identity
 from functools import reduce
 import warnings
 
-from lime.phys import meshgrid
+from pyqed import meshgrid
 from scipy.io import savemat
 
 
@@ -29,8 +29,9 @@ def export_to_matlab(fname, psi, fmt='matlab'):
 
 class DVR2(object):
     def __cartesian_product(self, arrays):
-        """A fast cartesion product function that I blatantly stole from
-        user senderle on stackoverflow.com"""
+        """
+        A fast cartesion product function
+        """
         broadcastable = np.ix_(*arrays)
         broadcasted = np.broadcast_arrays(*broadcastable)
         rows, cols = reduce(np.multiply, broadcasted[0].shape), len(broadcasted)
@@ -42,24 +43,39 @@ class DVR2(object):
         return out.reshape(cols, rows).T
 
 
-    def __init__(self, xlim, nx, ylim, ny, mx=1, my=1):
+    def __init__(self, x, y, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
         # self.dvr1d = dvr1d
 
-        self.nx = nx
-        self.xmin, self.xmax = xlim 
-        self.ymin, self.ymax = ylim 
-        self.Lx = self.xmax - self.xmin 
-        self.ny = ny
-        self.Ly = self.ymax - self.ymin 
-        self.dx = self.Lx/nx
-        self.dy = self.Ly/ny
-        self.x0 = (self.xmin + self.xmax)/2
-        self.y0 = (self.ymin + self.ymax)/2
-        
-        self.x = self.x0 + np.arange(nx) * self.dx - self.Lx/2. + self.dx/2.
-        self.y = self.y0 + np.arange(ny) * self.dy - self.Ly/2. + self.dy/2.
-        self.mx = mx
-        self.my = my
+        # self.nx = nx
+        # self.xmin, self.xmax = xlim
+        # self.ymin, self.ymax = ylim
+        # self.Lx = self.xmax - self.xmin
+        # self.ny = ny
+        # self.Ly = self.ymax - self.ymin
+        # self.dx = self.Lx/nx
+        # self.dy = self.Ly/ny
+        # self.x0 = (self.xmin + self.xmax)/2
+        # self.y0 = (self.ymin + self.ymax)/2
+
+        # self.x = self.x0 + np.arange(nx) * self.dx - self.Lx/2. + self.dx/2.
+        # self.y = self.y0 + np.arange(ny) * self.dy - self.Ly/2. + self.dy/2.
+
+        self.x = x
+        self.y = y
+        self.nx = len(x)
+        self.ny = len(y)
+        self.xmax = max(x)
+        self.xmin = min(x)
+        self.ymax = max(y)
+        self.ymin = min(y)
+        self.Lx = self.xmax - self.xmin
+        self.Ly = self.ymax - self.ymin
+        self.dx = x[1] - x[0]
+        self.dy = y[1] - y[0]
+
+        if mass is None:
+            mass = [1, 1]
+        self.mx, self.my = mass
 
         self.X, self.Y = meshgrid(self.x, self.y)
         self.xy = np.fliplr(self.__cartesian_product([self.x, self.y]))
@@ -67,7 +83,7 @@ class DVR2(object):
         self.H = None
         self._K = None
         self._V = None
-        self.size = nx * ny
+        self.size = self.nx * self.ny
 
     def v(self, V):
         """Return the potential matrix with the given potential.
@@ -77,7 +93,10 @@ class DVR2(object):
         @param[in] V potential function
         @returns v_matrix potential matrix
         """
+
+
         self._V = V(self.X, self.Y)
+
         return sp.diags(self._V.flatten())
 
     def t(self, boundary_conditions=['vanishing', 'vanishing'], coords='linear',\
@@ -128,9 +147,15 @@ class DVR2(object):
         kwargs: list
             kwargs for computing kinetic energy matrix
         """
-        
-        self.H = self.t(coords=coords, **kwargs)  + self.v(V)
-        
+
+        if hasattr(V, '__call__'):
+            u = self.v(V)
+        else:
+            u = sp.diags(V.flatten())
+
+
+        self.H = self.t(coords=coords, **kwargs)  + u
+
         return self.H
 
     # def plot(self, V, E, U, **kwargs):
@@ -210,25 +235,25 @@ class DVR2(object):
         return E, U
 
     def plot(self, U, **kwargs):
-        
+
         nx, ny = self.nx, self.ny
-        
+
         for k in range(U.shape[-1]):
-            
+
             chi = U[:, k].reshape(nx, ny)
             fig, ax = plt.subplots()
             ax.contourf(self.X, self.Y, chi, **kwargs)
-            
+
         return
 
     def plot_surface(self, **kwargs):
-        
-        
+
+
         fig, ax = plt.subplots()
         ax.contour(self.X, self.Y, self._V, **kwargs)
-            
+
         return
-    
+
     def test_potential(self, V, num_eigs = 5, **kwargs):
 
         h = self.buildH(V)
@@ -538,7 +563,7 @@ class VFactory(object):
 
 
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
 
-    dvr = DVR2(nx=64, Lx=8, ny=64, Ly=8)
-    dvr.sho_test()
+    # dvr = DVR2(nx=64, Lx=8, ny=64, Ly=8)
+    # dvr.sho_test()
