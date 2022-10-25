@@ -1,0 +1,60 @@
+=== NuSol Installation ===
+NuSol requires a python 2.7 interpreter and the modules Numpy v1.9.1 as well as SciPy v0.14.0.
+To install the dependencies type:
+
+(UBUNTU >=12.4)
+> sudo apt-get install python-numpy python-scipy python-matplotlib ipython;
+
+If your Numpy/Scipy versions are older than this, you can install the required modules into a 
+python virtual environment which will provide the required modules for NuSol. In order to build 
+the virtual environment please install the following packages:
+
+(UBUNTU >=12.4)
+> sudo apt-get install libblas-dev liblapack-dev gfortran python-virtualenv python-pip;
+
+In order to setup the virtual environment execute the install script provided by NuSol
+> chmod +x install.sh;
+> ./install.sh;
+
+Before running NuSol, activate the virtual environment (only needed if your system does not provide Numpy v1.9.x as well as SciPy v0.14.x): 
+> source PATH_TO_NUSOL/nusol/bin/activate;
+You can deactivate the virtual environment with
+> deactivate;
+
+More information about python virtual environments can be found here: [http://docs.python-guide.org/en/latest/dev/virtualenvs/]
+
+=== Running NuSol ===
+Look at the config_example.cfg file for run parameter description, all units are in Hartree atomic units. [https://en.wikipedia.org/wiki/Atomic_units] 
+
+Execute NuSol via
+> python NuSol.py config_example.cfg;
+
+The output file eval.dat will contain the calculated enegies for the 3D harmonic oscillator
+E_n = (3/2 + n_x+n_y+n_z) with n = 0,1,2..
+
+=== Running NuSol Examples ===
+The ./examples folder contains further example config files.
+
+Run all examples via:
+> cd ./examples;
+> chmod +x run_all_examples.sh;
+> ./run_all_examples.sh;
+
+Run only the 1D and 2D examples (much faster):
+> cd ./examples;
+> chmod +x run_examples_quick.sh;
+> ./run_examples_quick.sh;
+
+Eigenvector (evec.dat) visualization scripts can be found in the ./examples/visualization folder.
+
+=== Using the FEAST interface (OPTIONAL) ===
+Solving the Numerov matrix can take a long time depending on the system size. In addition to 
+the ARPACK-NG solver, NuSol can also solve the Numerov matrix using the FEAST library. However,
+this does not provide additional functionality to NuSol, it only speeds up Numerov calculations.
+To use the optional FEAST solver specify the INTEL MKL and FEAST paths
+> source /usr/local/intel/MKLVARS intel64;
+> source /usr/local/intel/ICCVARS intel64;
+> export FEASTROOT=/PATH/TO/FEAST/ROOT/FEAST/2.1;
+build the NuSol_FEAST binary using
+> cd ./lib/;
+> make NuSol_FEAST;

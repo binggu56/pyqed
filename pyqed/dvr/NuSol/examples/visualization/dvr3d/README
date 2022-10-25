@@ -1,0 +1,2 @@
+run in ipython
+> ipython --pylab=tk plot3Devec.py;
