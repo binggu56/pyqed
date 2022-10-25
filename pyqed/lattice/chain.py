@@ -13,16 +13,123 @@ import numpy as np
 from numpy.linalg import inv
 from lime.phys import dagger, dag
 import scipy
+from scipy.sparse import csr_matrix
 
+from pyqed.Floquet import Floquet
+from pyqed import Mol
 
-class Chain:
-    def __init__(self, nsite, dim=1):
+class Chain(Mol):
+    """
+    open 1D tight-binding chain
+    """
+    def __init__(self, nsite, onsite, hopping, norb=1, \
+                 boundary_condition='open', disorder=False):
+        """
+
+        Parameters
+        ----------
+        nsite : TYPE
+            DESCRIPTION.
+        onsite : TYPE
+            DESCRIPTION.
+        hopping : TYPE
+            DESCRIPTION.
+        norb : int, optional
+            number of orbitals/wannier functions per unit cell.
+            The default is 1.
+        boundary_condition: str
+            'periodic' or 'open'
+
+        Returns
+        -------
+        None.
+
+        """
         self.nsite = nsite
-        self.dim = dim
+        self.norb = norb
+        self.size = nsite * norb
+        self.onsite = onsite
+        self.hopping = hopping
+
         self.H = None
+        self.boundary_condtion = boundary_condition
+
+    def position(self):
+        """
+        position matrix elements in localized basis/Wannier basis
+
+        .. math::
+            x = \sum_{n=1}^N \sum_A n (\ket{m A}\bra{m A})
+
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        norb = self.norb
+
+        if self.norb == 1:
+            return np.diag(range(1, self.nsite))
+        else:
+            r = np.zeros((self.size, self.size))
+            for n in range(self.nsite):
+                for i in range(self.norb):
+                    r[n * norb + i, n * norb + i] = n+1
 
     def buildH(self):
+        """
+
+        Returns
+        -------
+        H : TYPE
+            DESCRIPTION.
+
+        """
+        nsite = self.nsite
+        norb = self.norb
+
+        H = csr_matrix(nsite * norb)
+
+        onsite = self.onsite
+        hopping = self.hopping
+
+        if self.norb == 1:
+
+            H.setdiag(self.onsite)
+            H.setdiag(self.hopping, 1)
+            H.setdiag(self.hopping, -1)
+
+        else:
+            assert(hopping.shape == (norb, norb))
+            assert(len(onsite) == norb)
+
+            for i in range(nsite):
+                for j in range(norb):
+                    H[norb*i + j, norb*i + j] = self.onsite[j]
+
+            # nearest hopping
+            # TODO: add long-range hopping
+            for n in range(nsite-1):
+                for j in range(norb):
+                    for k in range(norb):
+                        H[norb*n, j, norb*(n+1) + k] = hopping[j, k]
+
+        self.H = H
+        return H
+
+    def floquet(self):
+        # drive_with_efield
+
+        return Floquet(self.H, -self.position())
+
+    def zeeman(self):
+        # drive with magnetic field
         pass
+
+
+
 
 def draw_points(points, colors):
     x = [p[0] for p in points]
@@ -31,7 +138,7 @@ def draw_points(points, colors):
     ax.scatter(x, y, color=colors)
     # ax.format(xlim=(-1, 2))
     return
-    
+
 class Lattice:
     def __init__(self, size=[2, 2], norb=1, lattice_vectors=None, \
                  orb_coords=None, nspin=1):
@@ -57,29 +164,29 @@ class Lattice:
 
         """
         self.nx, self.ny = size
-        self.norb = norb # number of orbitals in a unit cell 
+        self.norb = norb # number of orbitals in a unit cell
         self._dim = self.norb * np.prod(size)
         self.nspin = nspin
         if orb_coords is None:
             orb_coords = [[0.5, 0.5], ] * norb
         self.orb_coords = orb_coords
-        
+
         if lattice_vectors is None:
             lattice_vectors = [np.array([1., 0]), np.array([0., 1])]
-        self.lattice_vectors = lattice_vectors 
+        self.lattice_vectors = lattice_vectors
         self.a1 = lattice_vectors[0]
-        self.a2 = lattice_vectors[1] 
-        
-        
+        self.a2 = lattice_vectors[1]
+
+
         self.H = np.zeros((self._dim, self._dim))
-    
+
     def index(self, i, j, n):
         """
         return the index of the n-th orbital at cell (i, j) in the basis set.
-    
-        The basis set is ordered as :math:`\ket{\phi_{ijn}}` where i, j are the 
+
+        The basis set is ordered as :math:`\ket{\phi_{ijn}}` where i, j are the
         cell indexes and :math:`n` is the orbital index.
-        
+
         (0, 0, :) (0, 1, :) (0, 2, :) ... (i, j, :)
 
         Parameters
@@ -97,13 +204,13 @@ class Lattice:
             DESCRIPTION.
 
         """
-        return (i * self.ny + j) * self.norb + n 
-    
+        return (i * self.ny + j) * self.norb + n
+
     def set_hop(self, J, i, j, R, boundary_condition='open'):
         """
-        set hopping parameter J between i-orbital  and j-orbital separated by 
-        :math:`R = (R_0, R_1)` unit cells 
-            
+        set hopping parameter J between i-orbital  and j-orbital separated by
+        :math:`R = (R_0, R_1)` unit cells
+
 
         Parameters
         ----------
@@ -114,7 +221,7 @@ class Lattice:
         j : TYPE
             DESCRIPTION.
         R : list of two integers
-            distance between hopping 
+            distance between hopping
 
         Returns
         -------
@@ -125,27 +232,27 @@ class Lattice:
         if boundary_condition == 'periodic':
             raise NotImplementedError('Periodic boundary condition is not implemented.\
                                       Use open instead.')
-                                      
+
         for n in range(self.nx-R[0]):
             for m in range(self.ny-R[1]):
-                ind_i = self.index(n, m, i) 
-                ind_j = self.index(n + R[0], m+R[1], j) 
+                ind_i = self.index(n, m, i)
+                ind_j = self.index(n + R[0], m+R[1], j)
                 self.H[ind_i, ind_j] = J
                 self.H[ind_j, ind_i] = np.conj(J)
 
-        return self.H          
+        return self.H
 
     def set_onsite(self):
-        pass 
+        pass
 
     def solve(self):
         self.evals, self.evecs = scipy.linalg.eigh(self.H)
         return self.evals, self.evecs
-    
+
     def draw(self, psi):
         from lime.style import tocolor
-        
-        points = [] 
+
+        points = []
         colors = []
         for i in range(self.nx):
             for j in range(self.ny):
@@ -157,12 +264,12 @@ class Lattice:
                                     vmax=max(prob))
                     print(color)
                     colors.append(color)
-        
+
 
 
         draw_points(points, colors)
         return
-    
+
 class RiceMele:
     def __init__(self, v, w, nsite=None):
         self.intra = v
@@ -215,7 +322,7 @@ class RiceMele:
     def gf(self, omega, eta=1e-4, method='sos'):
         """
         Calculate the retarded Green's function in the frequency domain
-        ..math:: 
+        ..math::
             (\omega - i \eta - \mathbf{H}) \mathbf{G} = \mathbf{I}
 
         Parameters
@@ -225,16 +332,16 @@ class RiceMele:
         eta : float, optional
             infinitesimal number to ensure causality. The default is 1e-4.
         method : str, optional
-            'sos': Sum-over-states expansion 
+            'sos': Sum-over-states expansion
             ..math::
                 G = \sum_j \frac{\ket{\psi_j}\bra{\psi_j}}{\omega - i\eta - \omega_j}
             where j runs over all eigenstates.
-            
+
             'diag':
-                direction diagonalization of the Hamiltonian 
+                direction diagonalization of the Hamiltonian
                 ..math::
                     G = \del{\omega - i \eta - \mathbf{H}}^{-1}
-            
+
             The default is 'sos'.
 
         Raises
@@ -252,7 +359,7 @@ class RiceMele:
         if self.H is None:
             # raise ValueError('H is none. Call chain() to build the H first.')
             self.buildH()
-            
+
         if method == 'diag':
             g = scipy.linalg.inv((omega - 1j*eta) * np.identity(self.nsite) - self.H)
 
@@ -262,9 +369,9 @@ class RiceMele:
             if isinstance(omega, (float, complex)):
                 U = self.evecs
                 g = U @ np.diag(1./(omega - 1j*eta - self.evals)) @ dag(U)
-                
-                
-            
+
+
+
         return g[0, 0].imag
 
 def green_renormalization(intra,inter,energy=0.0,nite=None,
@@ -317,7 +424,7 @@ if __name__ == '__main__':
 
     # model.plot_state([1,2,3,4,5,6])
     # print(model.evals)
-    
+
     lattice = Lattice(size=(20,1), norb=2, orb_coords=[[0.4, 0.4], [0.6,0.6]])
     # for i in range(3):
     #     for j in range(2):
@@ -328,7 +435,7 @@ if __name__ == '__main__':
     evals, evecs = lattice.solve()
     from lime.style import level_scheme
     level_scheme(evals)
-    
+
     from lime.phys import get_index
     I = get_index(evals, 0)
     # for j in range(0, 10):

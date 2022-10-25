@@ -71,7 +71,8 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
     The RPA computation is required to construct the dielectric function, i.e. screened
     Coloumb interaction.
 
-    Q^\dagger = \sum_{ia} X_{ia} a^+ i - Y_{ia} i^+ a
+    .. math::
+        Q^\dagger = \sum_{ia} X_{ia} a^+ i + Y_{ia} i^+ a
 
     Leads to the RPA eigenvalue equations:
       [ A  B ][X] = omega [ 1  0 ][X]
