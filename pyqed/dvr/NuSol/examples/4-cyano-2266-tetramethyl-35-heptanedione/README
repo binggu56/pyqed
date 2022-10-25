@@ -1,0 +1,8 @@
+The scanned molecular potential of hydrogen H(1) as described in the manuscript 
+is provided as a numpy array togther with the molecular coordinates 'molecule.xyz' 
+and the grid position 'grid.xyz' for the Numerov, DVR and Chebyshev solvers.
+
+example call: 
+> chmod +x run.sh 
+> ./run.sh
+
