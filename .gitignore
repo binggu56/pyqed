@@ -1,4 +1,3 @@
-
 *.pyc
 pyqed/__pycache__/
 build/
