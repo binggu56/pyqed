@@ -24,6 +24,24 @@ from pyqed import rk4, dagger, gwp, interval, meshgrid
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
+def plot_wavepacket(x, y, psilist, **kwargs):
+
+    if not isinstance(psilist, list): psilist = [psilist]
+    
+    X, Y = np.meshgrid(x, y)
+
+    for i, psi in enumerate(psilist):
+        fig, ax0 = plt.subplots(nrows=1, sharey=True)
+        # levels = np.linspace(0, 0.005, 20)
+        ax0.contourf(X, Y, np.abs(psi)**2, colorbar='r')
+
+        # levels = np.linspace(0, 0.0005, 20)
+        ax0.format(ylim=(-0.5, 0.5), **kwargs)
+        fig.savefig('vibrational_eigenstates_D0_'+str(i)+'.png')
+
+    return ax0
+
+
 
 class ResultSPO2(Result):
     def __init__(self, **args):
