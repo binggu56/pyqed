@@ -351,9 +351,8 @@ def HamiltonFT(H0, H1, n):
     Norbs = H0.shape[-1]
 
     if n == 0:
-
         return H0
-
+    
     elif n == 1:
         return H1
 
@@ -373,7 +372,7 @@ if __name__ == '__main__':
     qe, fmodes = mol.spectrum(0.4, omegad = 1, nt=10, gauge='length')
     print(qe)
     # qe, fmodes = dmol.spectrum(E0=0.4, Nt=10, gauge='velocity')
-    # print(qe)
+    # print(qe)、、
 
 
 
