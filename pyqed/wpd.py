@@ -16,11 +16,14 @@ import numpy as np
 import proplot as plt
 from numpy import cos, pi
 from numba import jit
+import scipy
 from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 from numpy.linalg import inv, det
 
-from lime.phys import rk4, dagger, gwp, interval, meshgrid
-from lime.units import au2fs
+from pyqed import rk4, dagger, gwp, interval, meshgrid
+from pyqed.units import au2fs
+from pyqed.mol import Result
+
 
 
 
@@ -32,6 +35,7 @@ class Solver():
     def set_obs_ops(self, obs_ops):
         self.obs_ops = obs_ops
         return
+
 
 class SPO:
     def __init__(self, x, mass=1, ns=2):
@@ -228,13 +232,15 @@ class SPO2:
     For time-dependent H,
         TBI
     """
-    def __init__(self, x, y, masses, ns=2, coords='linear', G=None):
+    def __init__(self, x, y, masses, nstates=2, coords='linear', G=None, abc=False):
         self.x = x
         self.y = y
         self.X, self.Y = meshgrid(x, y)
 
         self.nx = len(x)
         self.ny = len(y)
+        self.dx = interval(x)
+        self.dy = interval(y) # for uniform grids
         self.masses = masses
         self.kx = None
         self.ky = None
@@ -244,8 +250,9 @@ class SPO2:
         self.exp_K = None
         self.V = None
         self.G = G
-        self.ns = self.nstates = ns
+        self.nstates = nstates
         self.coords =  coords
+        self.abc = abc
 
     def set_grid(self, x, y):
         self.x = x
@@ -260,9 +267,9 @@ class SPO2:
     def setG(self, G):
         self.G = G
 
-    def set_DPES(self, surfaces, diabatic_couplings, abc=False):
+    def set_DPES(self, surfaces, diabatic_couplings, eta=None):
         """
-        set the diabatic PES and diabatic couplings
+        set the diabatic PES and vibronic couplings
 
         Parameters
         ----------
@@ -297,11 +304,12 @@ class SPO2:
             a, b = dc[0][:]
             v[:, :, a, b] = v[:, :, b, a] = dc[1]
 
+
+        if self.abc:
+            for n in range(self.ns):
+                v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
+
         self.V = v
-
-        if abc:
-            raise NotImplementedError
-
         return v
 
 
@@ -333,10 +341,8 @@ class SPO2:
         None.
 
         """
-        import scipy
 
         # setup kinetic energy operator
-        mx, my = self.masses
         nx = self.nx
         ny = self.ny
 
@@ -348,6 +354,8 @@ class SPO2:
 
 
         if self.coords == 'linear':
+            
+            mx, my = self.masses
 
             Kx, Ky = meshgrid(self.kx, self.ky)
 
@@ -356,9 +364,10 @@ class SPO2:
         elif self.coords == 'jacobi':
 
             # self.exp_K = np.zeros((nx, ny, nx, ny))
+            mx = self.masses[0]
+
             self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
 
-            mx = self.masses[0]
             Iinv = 1./self.masses[1](self.x) # y is the angle
             ky = self.ky
 
@@ -375,15 +384,24 @@ class SPO2:
 
         dt2 = 0.5 * dt
 
+        if self.V is None:
+            raise ValueError('The diabatic PES is not specified.')
+
         v = self.V
 
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
-
+        # self.apes = np.zeros((nx, ny))
+        if self.abc:
+            eig = scipy.linalg.eig 
+        else:
+            eig = scipy.linalg.eigh 
+            
         for i in range(nx):
             for j in range(ny):
 
-                w, u = scipy.linalg.eigh(v[i, j, :, :])
+                i
+                w, u = eig(v[i, j, :, :])
 
                 #print(np.dot(U.conj().T, Vmat.dot(U)))
 
@@ -392,6 +410,7 @@ class SPO2:
 
                 self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
                 self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+
 
         return
 
@@ -409,21 +428,30 @@ class SPO2:
         None.
 
         """
-        P = np.zeros(self.ns)
-        for j in range(self.ns):
-            P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+        if isinstance(psi, np.ndarray):
+            P = np.zeros(self.ns)
+            for j in range(self.ns):
+                P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
 
-        assert(np.close(np.sum(P), 1))
+            assert(np.close(np.sum(P), 1))
+
+        elif isinstance(psi, list):
+
+            N = len(psi)
+            P = np.zeros((N, self.nstates))
+            for k in range(N):
+                P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                           for j in range(self.nstates)]
+
+
         return P
 
 
     def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
 
         print('Building the propagators ...')
+
         self.build(dt=dt)
-
-
-        from lime.mol import Result
 
         psi = psi0.copy()
 
@@ -553,18 +581,19 @@ class SPO2:
             return
 
     def plt_wp(self, psilist, **kwargs):
-        
-        
-        if not isinstance(psilist, list): psilist = [psilist]        
-        
-        for psi in psilist:
+
+
+        if not isinstance(psilist, list): psilist = [psilist]
+
+
+        for i, psi in enumerate(psilist):
             fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
 
             ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
             ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
             ax0.format(**kwargs)
             ax1.format(**kwargs)
-            
+            fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 
 
@@ -578,21 +607,391 @@ def diabatic_coupling(x, y):
     pass
 
 class SPO3():
-    def __init__(self):
+    def __init__(self, x, y, z):
         self.x = None
         self.y = None
 
-    def set_grid(self, x, y):
+    """
+    second-order split-operator method for nonadiabatic wavepacket dynamics
+    in the diabatic representation with three-dimensional nuclear space
+
+    For time-independent Hamiltonian
+    
+    .. math::
+        
+        e^{-i H \Delta t} = e^{- i V \Delta t/2} e^{-i K \Delta t} e^{-iV\Delta t/2}
+
+    For time-dependent H,
+        # TODO
+    """
+    def __init__(self, x, y, z, masses, nstates=2, coords='linear', G=None, abc=False):
         self.x = x
         self.y = y
+        self.z = z
+        self.X, self.Y, self.Z = meshgrid(x, y, z)
 
-    def set_potential(self, v):
+        self.nx = len(x)
+        self.ny = len(y)
+        self.nz = len(z)
+        
+        self.dx = interval(x)
+        self.dy = interval(y) # for uniform grids
+        self.dz = interval(z)
+        
+        self.masses = masses
+        self.kx = None
+        self.ky = None
+        self.kz = None
+        self.dim = 3
+        self.exp_V = None
+        self.exp_V_half = None
+        self.exp_K = None
+        self.V = None
+        self.G = G
+        self.nstates = nstates
+        self.coords =  coords
+        self.abc = abc
+
+    def set_grid(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def set_masses(self, masses):
+        self.masses = masses
+
+
+    def setG(self, G):
+        self.G = G
+
+    def set_DPES(self, surfaces, diabatic_couplings, eta=None):
+        """
+        set the diabatic PES and vibronic couplings
+
+        Parameters
+        ----------
+        surfaces : TYPE
+            DESCRIPTION.
+        diabatic_couplings : TYPE
+            DESCRIPTION.
+        abc : boolean, optional
+            indicator of whether using absorbing boundary condition. This is
+            often used for dissociation.
+            The default is False.
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+
+        nx = len(x)
+        ny = len(y)
+        ns = self.ns
+
+        # DPES and diabatic couplings
+        v = np.zeros([nx, ny, ns, ns])
+
+        # assume we have analytical forms for the DPESs
+        for a in range(self.ns):
+            v[:, :, a, a] = surfaces[a]
+
+        for dc in diabatic_couplings:
+            a, b = dc[0][:]
+            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+
+
+        if self.abc:
+            for n in range(self.ns):
+                v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
+
+        self.V = v
         return v
 
-    def evolve(self, psi0, dt, Nt=1):
-        psi = psi0
+
+    def build(self, dt, inertia=None):
+        """
+        Setup the propagators appearing in the split-operator method.
+
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        intertia: func
+            moment of inertia, only used for Jocabi coordinates.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # setup kinetic energy operator
+        nx = self.nx
+        ny = self.ny
+
+        dx = interval(self.x)
+        dy = interval(self.y)
+
+        self.kx = 2. * np.pi * fftfreq(nx, dx)
+        self.ky = 2. * np.pi * fftfreq(ny, dy)
+
+
+        if self.coords == 'linear':
+            
+            mx, my = self.masses
+
+            Kx, Ky = meshgrid(self.kx, self.ky)
+
+            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+        elif self.coords == 'jacobi':
+
+            # self.exp_K = np.zeros((nx, ny, nx, ny))
+            mx = self.masses[0]
+
+            self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
+
+            Iinv = 1./self.masses[1](self.x) # y is the angle
+            ky = self.ky
+
+            self.exp_Ky = np.exp(-1j * np.outer(Iinv, ky**2/2.) * dt)
+
+            # psik = fft(typsi, axis=0)
+            # kpsi = np.einsum('i, ija -> ija', np.exp(-1j * kx**2/2./mx * dt), psik)
+
+            # # for i in range(nx):
+            # #     for j in range(ny):
+            # #         my = self.masses[1](y[j])
+            # #         self.exp_K[i, j, :, :] = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+
+        dt2 = 0.5 * dt
+
+        if self.V is None:
+            raise ValueError('The diabatic PES is not specified.')
+
+        v = self.V
+
+        self.exp_V = np.zeros(v.shape, dtype=complex)
+        self.exp_V_half = np.zeros(v.shape, dtype=complex)
+        # self.apes = np.zeros((nx, ny))
+        if self.abc:
+            eig = scipy.linalg.eig 
+        else:
+            eig = scipy.linalg.eigh 
+            
+        for i in range(nx):
+            for j in range(ny):
+
+                i
+                w, u = eig(v[i, j, :, :])
+
+                #print(np.dot(U.conj().T, Vmat.dot(U)))
+
+                V = np.diagflat(np.exp(- 1j * w * dt))
+                V2 = np.diagflat(np.exp(- 1j * w * dt2))
+
+                self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+
+
+        return
+
+    def population(self, psi):
+        """
+        return the electronic populations
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        if isinstance(psi, np.ndarray):
+            P = np.zeros(self.ns)
+            for j in range(self.ns):
+                P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+
+            assert(np.close(np.sum(P), 1))
+
+        elif isinstance(psi, list):
+
+            N = len(psi)
+            P = np.zeros((N, self.nstates))
+            for k in range(N):
+                P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                           for j in range(self.nstates)]
+
+
+        return P
+
+
+    def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
+
+        print('Building the propagators ...')
+
+        self.build(dt=dt)
+
+        psi = psi0.copy()
+
+        def _V_half(psi):
+
+            return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r = Result(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
+
+        t = t0
+        if self.coords == 'linear':
+
+            KEO = self._KEO_linear
+
+        elif self.coords == 'jacobi':
+
+            KEO = self._KEO_jacobi
+
+        # observables
+        if return_states:
+
+            for i in range(Nt//nout):
+                for n in range(nout):
+
+                    t += dt
+
+                    psi = _V_half(psi)
+                    psi = KEO(psi)
+                    psi = _V_half(psi)
+
+                r.psilist.append(psi.copy())
+
+        else:
+
+            psi = _V_half(psi)
+
+            for i in range(Nt//nout):
+                for n in range(nout):
+                    t += dt
+
+                    psi = KEO(psi)
+                    psi = self._PEO(psi)
+
+
+                r.psilist.append(psi.copy())
+                # tlist.append(t)
+
+                # rho = density_matrix(psi_x, dx)
+
+                # # store the density matrix
+                # f.write('{} {} {} {} {} \n'.format(t, *rho))
+
+            psi = KEO(psi)
+            psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r.psi = psi
+        return r
+
+    def _PEO(self, psi):
+
+        vpsi = np.einsum('ijab, ijb -> ija', self.exp_V, psi)
+        return vpsi
+
+    def _KEO_linear(self, psi):
+        # psik = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     psik[:,:,j] = fft2(psi[:,:,j])
+        psik = fft2(psi, axes=(0,1))
+        kpsi = np.einsum('ij, ija -> ija', self.exp_K, psik)
+
+        # out = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     out[:, :, j] = ifft2(kpsi[:, :, j])
+        psi = ifft2(kpsi, axes=(0,1))
         return psi
 
+    def _KEO_jacobi(self, psi):
+        """
+        The current implementation is of order $\mc{O}(\Delta t^2)$. For improvements,
+        we can use the splitting
+
+        K_1(\Delta t/2)K_2(\Delta t/2) V(\Delta t) K_2(\Delta t/2) K_1(\Delta t/2)
+
+        For time-independent H, this is of order $\mc{O}(\Delta t^3)$.
+
+        see Hermann, M. R. & Fleck, J. A.  Phys. Rev. A 38, 6000–6012 (1988).
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        psi : TYPE
+            DESCRIPTION.
+
+
+        """
+
+        psi_ky = fft(psi, axis=1)
+        typsi = np.einsum('ij, ija -> ija', self.exp_Ky, psi_ky)
+        # psik = ifft(typsi, axis=1)
+        # psik = fft(psik, axis=0)
+        # kpsi = np.einsum('i, ija -> ija', self.exp_Kx, psik)
+        # psi = ifft(kpsi, axis=0)
+
+        psik = fft(typsi, axis=0)
+        kpsi = np.einsum('i, ija -> ija', self.exp_Kx, psik)
+
+        psi = ifft2(kpsi, axes=(0,1))
+
+
+        return psi
+
+    def plot_surface(self, style='2D'):
+        if style == '2D':
+            fig, (ax0, ax1) = plt.subplots(nrows=2)
+            ax0.contourf(self.X, self.Y, self.V[:, :, 1, 1], lw=0.7)
+            ax1.contourf(self.X, self.Y, self.V[:, :, 0, 0], lw=0.7)
+            return
+
+        else:
+            from lime.style import plot_surface
+            plot_surface(self.x, self.y, self.V[:,:,0,0])
+
+            return
+
+    def plt_wp(self, psilist, **kwargs):
+
+
+        if not isinstance(psilist, list): psilist = [psilist]
+
+
+        for i, psi in enumerate(psilist):
+            fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
+
+            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
+            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
+            ax0.format(**kwargs)
+            ax1.format(**kwargs)
+            fig.savefig('psi'+str(i)+'.pdf')
+        return ax0, ax1
 # @jit
 # def gwp(x, sigma=1., x0=0., p0=0.):
 #     """

@@ -4,12 +4,35 @@ import numpy as np
 from numpy import exp, pi, sqrt
 from scipy.sparse import csr_matrix, lil_matrix, identity, kron, linalg,\
                         spdiags, issparse
-from scipy.special import hermite
+from scipy.special import hermite, jv
 from math import factorial
 import scipy as sp
-import numba
-from numba import jit
+# import numba
+# from numba import jit
 import sys
+
+def jacobi_anger(n, z=1):
+    """
+    Jacobi-Anger expansion
+    .. math::
+        e^{iz \cos(\theta)} = \sum_{n=-\infty}^\infty i^n J_n(z) e^{in\theta}
+
+    Parameters
+    ----------
+    n : TYPE
+        DESCRIPTION.
+    z : TYPE, optional
+        DESCRIPTION. The default is 1.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    return 1j**n * jv(n, z)
+
 
 def is_positive_def(A):
     try:
