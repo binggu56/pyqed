@@ -418,49 +418,51 @@ def intertia_moment(mass, coords):
     return im
 
 
+# class Molecule:
+#     def __init__(self, geometry):
+#         self.geometry = geometry
+
+#         self.ge = None
+#         self.ee = None
+#         self.edip = None
+#         self.mdip = None
+
+#     # def atom_symbol(self):
+#     #     return [mol.atom_symbol(i) for i in range(self.natoms)]
+#     def rhf(self):
+#         pass
+
+#     def rks(self):
+#         pass
+
+#     def tddft(self, nstates=1):
+#         pass
+
+#     def normal_modes(self):
+#         pass
+
+#     def absorption(self, ttype='electron'):
+#         # range, uv, ir, xray
+
+#         pass
+
+#     def photoelectron(self):
+#         pass
+
+#     def emission(self):
+#         pass
+
+
+# class Molecule(pyscf.gto.Mole):
 class Molecule:
-    def __init__(self, geometry):
-        self.geometry = geometry
+    def __init__(self, **kwargs):
 
-        self.ge = None
-        self.ee = None
-        self.edip = None
-        self.mdip = None
-
-    # def atom_symbol(self):
-    #     return [mol.atom_symbol(i) for i in range(self.natoms)]
-    def rhf(self):
-        pass
-
-    def rks(self):
-        pass
-
-    def tddft(self, nstates=1):
-        pass
-
-    def normal_modes(self):
-        pass
-
-    def absorption(self, ttype='electron'):
-        # range, uv, ir, xray
-
-        pass
-
-    def photoelectron(self):
-        pass
-
-    def emission(self):
-        pass
-
-
-#class Geometry(pyscf.gto.Mole):
-class Geometry:
-    def __init__(self, mol, *args):
-
-        super().__init__(*args)
-
+        mol = gto.M(**kwargs)
+    
+        self.mol = mol
         # self.atom_coord = mol.atom_coord
-        self.atom_coords = mol.atom_coords() # shape 3, natoms
+        self.atom_coords = (mol.atom_coords()) # shape 3, natoms
+        # print(self.atom_coords.shape)
         self.natom = mol.natm
         self.mass = mol.atom_mass_list()
         self.atom_symbol = [mol.atom_symbol(i) for i in range(self.natom)]
@@ -468,6 +470,7 @@ class Geometry:
 
         self.distmat = None
 
+        # return gto.M(atom=geometry, *args)
 
 
     def com(self):
@@ -476,7 +479,7 @@ class Geometry:
 
         Returns
         -------
-        TYPE
+        TYPE  
             DESCRIPTION.
 
         '''
@@ -485,9 +488,31 @@ class Geometry:
 
     def inertia_moment(self):
         mass = self.mass
-        coords = self.atom_coords()
+        coords = self.atom_coords
         return intertia_moment(mass, coords)
+    
+    def molecular_frame(self):
+        # transfrom to molecular frame
+        self.atom_coords -= self.com()
+        return self.atom_coords
+    
+    def eckart_frame(self, ref):
+        """
+        transform to the Eckart frame relative to a reference geometry
 
+        Parameters
+        ----------
+        ref : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """    
+        self.atom_coords = eckart(ref.T, self.atom_coords.T, self.mass)
+        return self.atom_coords
+    
     def principle_axes(self):
         pass
 
@@ -694,7 +719,7 @@ def quasi_angular_momentum(mass, reference, changed):
         l += mass[k] * np.cross(reference[:,k], changed[:,k])
     return l
 
-def eckart(reference, changed, mass, option):
+def eckart(reference, changed, mass, option=None):
     '''
 % Rotates 'changed' to satisfy both Eckart Conditions exactly with respect to 'reference'
 % Separate translational and rotational degrees of freedom from internal degrees of freedom
@@ -740,16 +765,21 @@ def eckart(reference, changed, mass, option):
     # if (isreal(reference) == 0) && (isreal(changed) == 0):
     #     raise ValueError('Imaginary coordinates in the XYZ-Structures!')
 
-
+    natoms = len(mass)
 # % shift origin to the center of mass
 # % Eckart condition of translation (Eckart 1)
-    reference = reference - com(mass, reference)
+    com_ref = com(mass, reference)
+    com_changed = com(mass, changed)
+
+    for i in range(natoms):
+        reference[:, i] -= com_ref
+        changed[:, i] -= com_changed
+
 
 # % if (abs(max(max(comref))) > 1e-4)
 # %     disp('Warning! Translational Eckart Condition for reference not satisfied!');
 # % end
-
-    changed = changed - com(mass, changed)
+    
 
 
     # Quasi Angular Momentum
@@ -807,11 +837,11 @@ def eckart(reference, changed, mass, option):
         q = V[:,0]
 
 
-    U = np.zeros(3,3)
+    U = np.zeros((3,3))
 
-    U[0,0] = q[0]^2 + q[1]^2 - q[2]^2 - q[3]^2
-    U[1,1] = q[0]^2 + q[2]^2 - q[1]^2 - q[3]^2
-    U[2,2] = q[0]^2 + q[3]^2 - q[1]^2 - q[2]^2
+    U[0,0] = q[0]**2 + q[1]**2 - q[2]**2 - q[3]**2
+    U[1,1] = q[0]**2 + q[2]**2 - q[1]**2 - q[3]**2
+    U[2,2] = q[0]**2 + q[3]**2 - q[1]**2 - q[2]**2
 
     U[1,0] = 2 * ( q[1] * q[2] + q[0] * q[3])
     U[2,0] = 2 * ( q[1] * q[3] - q[0] * q[2])
@@ -864,9 +894,19 @@ if __name__ == '__main__':
                 # ['F' , (0.91, 0., 0.)]]
 
 
+
+    
     mol.basis = 'STO-3G'
     mol.build()
-    print(mol.atom_coords().shape)
+    
+    geometry2 = [['H' , (0.1,      0., 0.)],
+                ['H', (1.3, 0., 0.)]]
+    mol2 = Molecule(atom=geometry2)
+    
+    print(mol2.atom_coords)
+    print(mol2.com())
+    mol2.molecular_frame()
+    print(mol2.eckart_frame(mol.atom_coords()))
 
     # print(mol.natm)
 

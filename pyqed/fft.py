@@ -3,7 +3,7 @@
 
 import numpy as np
 #import numba
-import proplot as plt
+# import proplot as plt
 
 from numpy.core.multiarray import normalize_axis_index
 from numpy.core import swapaxes

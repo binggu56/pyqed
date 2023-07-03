@@ -12,7 +12,7 @@ Credits:
 
 import numpy as np
 from numpy import tensordot
-from numba import jit, njit
+# from numba import jit, njit
 import sys
 import scipy
 from scipy.linalg import eigh, eig
@@ -22,18 +22,18 @@ from scipy.integrate import solve_ivp
 # from scipy.sparse.linalg import eigs
 import opt_einsum as oe
 
-from lime.phys import anticommutator, comm, commutator, anticomm, dag, ket2dm, \
+from pyqed import anticommutator, comm, commutator, anticomm, dag, ket2dm, \
     obs_dm, destroy, rk4, basis, transform, isherm, expm
 
 # from lime.superoperator import lindblad_dissipator
-from lime.superoperator import op2sop, dm2vec, obs, left, right, operator_to_superoperator
-from lime.liouville import sort
-from lime.units import au2fs, au2k, au2wavenumber
-from lime.mol import Mol, Result
+from pyqed.superoperator import op2sop, dm2vec, obs, left, right, operator_to_superoperator
+from pyqed.liouville import sort
+from pyqed.units import au2fs, au2k, au2wavenumber
+from pyqed import Mol, Result
 
 
 
-import lime.superoperator as superop
+import pyqed.superoperator as superop
 
 
 
@@ -836,7 +836,7 @@ class Env:
 
 
 
-@jit
+# @jit
 def func(rho, h0, c_ops, l_ops):
     """
     right-hand side of the master equation
@@ -1107,7 +1107,7 @@ def _redfield_old(nstates, rho0, c_ops, h0, Nt, dt,e_ops, env):
 
     return rho
 
-@jit
+# @jit
 def observe(A, rho):
     """
     compute expectation value of the operator A
@@ -1482,7 +1482,7 @@ class HEOMSolverDL():
 
 #     return rho
 
-@njit
+# @njit
 def _fast_lindblad(H, rho0, c_ops, e_ops=None, Nt=1, dt=0.005):
 
     """

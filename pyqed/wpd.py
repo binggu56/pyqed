@@ -13,14 +13,16 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-import proplot as plt
+# import proplot as plt
+import matplotlib.pyplot as plt
+
 from numpy import cos, pi
-from numba import jit
+# from numba import jit
 import scipy
 from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 from numpy.linalg import inv, det
 
-from pyqed import rk4, dagger, gwp, interval, meshgrid
+from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
@@ -33,7 +35,7 @@ def plot_wavepacket(x, y, psilist, **kwargs):
     for i, psi in enumerate(psilist):
         fig, ax0 = plt.subplots(nrows=1, sharey=True)
         # levels = np.linspace(0, 0.005, 20)
-        ax0.contourf(X, Y, np.abs(psi)**2, colorbar='r')
+        ax0.contourf(X, Y, np.abs(psi)**2, colorbar='r', cmap='viridis')
 
         # levels = np.linspace(0, 0.0005, 20)
         ax0.format(ylim=(-0.5, 0.5), **kwargs)
@@ -49,6 +51,8 @@ class ResultSPO2(Result):
 
         self.x = None
         self.y = None
+        self.population = None
+        self.xAve = None
 
     def plot_wavepacket(self, psilist, state_id=None, **kwargs):
 
@@ -81,9 +85,39 @@ class ResultSPO2(Result):
                 fig.savefig('psi'+str(i)+'.pdf')
 
             return ax0, ax1
+        
+    def get_population(self):
+        dx = interval(self.x)
+        dy = interval(self.y)
+        p0 = [norm2(psi[:, :, 0]) * dx * dy for psi in self.psilist]
+        p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
+        
+        # fig, ax = plt.subplots()
+        # ax.plot(self.times, p0)
+        # ax.plot(self.times, p1)
+        self.population = [p0, p1]
+        return 
+    
+    def position(self):        
+        # X, Y = np.meshgrid(self.x, self.y)
+        x = self.x 
+        y = self.y
+        dx = interval(x)
+        dy = interval(y)
+        
+        xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
+        yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
 
+        # fig, ax = plt.subplots()
+        # ax.plot(self.times, xAve)
+        # ax.plot(self.times, yAve)
+        self.xAve = [xAve, yAve]
+        return xAve, yAve
+        
+        
 
-
+            
+            
 class Solver():
     def __init__(self):
         self.obs_ops = None
@@ -121,7 +155,7 @@ class SPO:
         self._exp_V_half = np.exp(-1j * self.V * dt/2.)
         m = self.mass
         k = self.k
-        self._exp_K = np.exp(-0.5 * 1j / m * (k * k) * dt)
+        self._exp_K = np.exp(-0.5j / m * (k * k) * dt)
         return
 
     def run(self, psi0, dt, Nt=1, t0=0, nout=1):
@@ -307,7 +341,7 @@ class SPO2:
         self.exp_K = None
         self.V = None
         self.G = G
-        self.nstates = nstates
+        self.nstates = self.ns = nstates
         self.coords =  coords
         self.abc = abc
 
@@ -317,8 +351,8 @@ class SPO2:
 
         return
 
-    def set_masses(self, masses):
-        self.masses = masses
+    def set_masses(self, mass):
+        self.mass = mass
 
 
     def setG(self, G):
@@ -359,7 +393,8 @@ class SPO2:
 
         for dc in diabatic_couplings:
             a, b = dc[0][:]
-            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+            v[:, :, a, b] = dc[1] 
+            v[:, :, b, a] = v[:, :, a, b].conj()
 
 
         if self.abc:
@@ -368,6 +403,10 @@ class SPO2:
 
         self.V = v
         return v
+    
+    def set_dpes(self, v):
+        self.V = v
+        return 
 
 
     def build(self, dt, inertia=None):
@@ -629,8 +668,8 @@ class SPO2:
     def plot_surface(self, style='2D'):
         if style == '2D':
             fig, (ax0, ax1) = plt.subplots(nrows=2)
-            ax0.contourf(self.X, self.Y, self.V[:, :, 1, 1], lw=0.7)
-            ax1.contourf(self.X, self.Y, self.V[:, :, 0, 0], lw=0.7)
+            ax0.contourf(self.X, self.Y, self.V[:, :, 1, 1], lw=0.7, cmap='viridis')
+            ax1.contourf(self.X, self.Y, self.V[:, :, 0, 0], lw=0.7, cmap='viridis')
             return
 
         else:
@@ -648,8 +687,8 @@ class SPO2:
         for i, psi in enumerate(psilist):
             fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
 
-            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
-            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
+            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2, cmap='viridis')
+            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2, cmap='viridis')
             ax0.format(**kwargs)
             ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
@@ -1061,7 +1100,7 @@ class SPO3():
 #     return (a/np.sqrt(np.pi))**(-0.25)*\
 #     np.exp(-0.5 * a * (x - x0)**2 + 1j * (x-x0) * p0)
 
-@jit
+# @jit
 def gauss_x_2d(sigma, x0, y0, kx0, ky0):
     """
     generate the gaussian distribution in 2D grid
@@ -1087,7 +1126,7 @@ def gauss_x_2d(sigma, x0, y0, kx0, ky0):
     return gauss_2d
 
 
-@jit
+# @jit
 def potential_2d(x_range_half, y_range_half, couple_strength, couple_type):
     """
     generate two symmetric harmonic potentials wrt the origin point in 2D
@@ -1138,7 +1177,7 @@ def potential_2d(x_range_half, y_range_half, couple_strength, couple_type):
     return v_2d
 
 
-@jit
+# @jit
 def diabatic(x, y):
     """
     PESs in diabatic representation
@@ -1196,7 +1235,7 @@ def diabatic(x, y):
 #             #               (self.k * self.k) * dt)
 
 
-@jit
+# @jit
 def x_evolve_2d(dt, psi, v):
     """
     propagate the state in grid basis half time step forward with H = V
@@ -1500,7 +1539,7 @@ def gauss_k(k,a,x0,k0):
     return ((a / np.sqrt(np.pi))**0.5
             * np.exp(-0.5 * (a * (k - k0)) ** 2 - 1j * (k - k0) * x0))
 
-@jit
+# @jit
 def theta(x):
     """
     theta function :
@@ -1515,7 +1554,7 @@ def theta(x):
 def square_barrier(x, width, height):
     return height * (theta(x) - theta(x - width))
 
-@jit
+# @jit
 def density_matrix(psi_grid):
     """
     compute electronic purity from the wavefunction
@@ -1559,8 +1598,9 @@ if __name__ == '__main__':
     X, Y = np.meshgrid(x, y)
 
     fig, ax = plt.subplots()
-    v = 0.5 * (X**2 + Y**2)
-
+    v0 = 0.5 * ((X)**2 + Y**2)
+    v1 = 0.5 * ((X-1)**2 + Y**2) + 1
+    
     # for i in range(nx):
     #     for j in range(ny):
     #         v[i,j] = diabatic(x[i], y[j])[0,0]
@@ -1570,7 +1610,7 @@ if __name__ == '__main__':
     # specify constants
     mass = [1.0, 1.0]  # particle mass
 
-    x0, y0, kx0, ky0 = -1., -1, 0.0, 0
+    x0, y0, kx0, ky0 = 0, 0, 0.0, 0
 
     #coeff1, phase = np.sqrt(0.5), 0
 
@@ -1584,10 +1624,10 @@ if __name__ == '__main__':
     sigma = np.identity(2) * 1.
     ns = 2
     psi0 = np.zeros((nx, ny, ns), dtype=complex)
-    psi0[:, :, 0] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
+    psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
 
     fig, ax = plt.subplots()
-    ax.contour(x, y, np.abs(psi0[:, :, 0]).T)
+    ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
 
     #psi = psi0
 
@@ -1600,23 +1640,32 @@ if __name__ == '__main__':
     #f.close()
 
 
-    G = np.zeros((nx, ny, ndim, ndim))
-    G[:,:,0, 0] = G[:,:,1, 1] = 1.
+    # G = np.zeros((nx, ny, ndim, ndim))
+    # G[:,:,0, 0] = G[:,:,1, 1] = 1.
 
     fig, ax = plt.subplots()
     extent=[xmin, xmax, ymin, ymax]
 
     # psi1 = adiabatic_2d(x, y, psi0, v, dt=dt, Nt=num_steps, coords='curvilinear',G=G)
-    sol = SPO2(ns=2, masses=[1, 1], x=x, y=y)
+    sol = SPO2(nstates=2, mass=[1, 1], x=x, y=y)
 
-    sol.set_DPES(surfaces = [v, v], diabatic_couplings = [[[0, 1], np.zeros((nx, ny))]])
+    sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
 
-    r = sol.run(psi0=psi0, dt=0.5, Nt=40)
+    r = sol.run(psi0=psi0, dt=0.5, Nt=200)
 
+    r.population()
+    r.position()
+    
     for j in range(4):
-        ax.contour(x, y, np.abs(r.psilist[j][:, :, 0]).T)
+        ax.contourf(x, y, np.abs(r.psilist[j][:, :, 1]).T, cmap='viridis')
+        
+    # for psi in r.psilist:
+    
+    
+    
+        
+    
 
-    # fig, ax = plt.subplots()
 
     # psi2 = adiabatic_2d(x, y, psi0, v, mass=mass, dt=dt, Nt=num_steps)
     # ax.contour(x,y, np.abs(psi2).T)

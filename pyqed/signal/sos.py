@@ -7,8 +7,9 @@ the Liouville space.
 '''
 
 import numpy as np
-import proplot as plt
-from numba import jit
+# import proplot as plt
+import matplotlib.pyplot as plt
+# from numba import jit
 import sys
 from numpy import heaviside
 from matplotlib import cm
@@ -376,7 +377,7 @@ def GF(E, a, b, t):
     # else:
     #     return 0.
 
-@jit
+# @jit
 def G(omega, E, a, b):
     '''
     Green's function in the frequency domain, i.e., FT of the retarded propagator
@@ -1411,7 +1412,7 @@ def test_model():
 
 if __name__ == '__main__':
 
-    from lime.units import au2fs
+    from pyqed.units import au2fs
     from lime.style import subplots
 
     fig, ax = plt.subplots(figsize=(4.2, 3.2))

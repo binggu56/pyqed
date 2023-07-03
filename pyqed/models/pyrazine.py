@@ -10,17 +10,22 @@ Three-state two-mode linear vibronic model of pyrazine (S0/S1/S2)
 
 
 import numpy as np
-import numba
+# import numba
 from scipy.sparse import identity, coo_matrix, lil_matrix, csr_matrix, kron
 from numpy import meshgrid
+from scipy.linalg import eigh
+from cmath import log
 
 import sys
 import proplot as plt
 
 
-from pyqed import boson, interval, sigmax
+from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
+    polar2cartesian
 from pyqed.style import set_style
 from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
+
+
 
 
 class Vibronic2:
@@ -46,6 +51,9 @@ class Vibronic2:
 
         self.v = None # diabatic PES
         self.va = None
+
+        # self.h = h
+        # self.l = l
 
     def set_grid(self, x, y):
         self.x = x
@@ -132,32 +140,212 @@ class Vibronic2:
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 
+class DHO2:
+    def __init__(self, x=None, y=None, h=1, l=1, delta=0, mass=[1, 1], nstates=2):
+        # super().__init__(x, y, mass, nstates=nstates)
 
-class DHO2(Vibronic2):
-    def __init__(self, x, y, mass, nstates=2):
-        super().__init__(x, y, mass, nstates=nstates)
-
-        self.dpes()
+        # self.dpes()
         self.edip = sigmax()
         assert(self.edip.ndim == nstates)
+        self.mass = mass
+        self.nstates = nstates
+
+        self.x = x
+        self.y = y
+
+        self.h = h
+        self.l = l
+        self.delta = delta
+
+        self.va = None
+        self.v = None
 
 
-    def dpes(self):
+    def dpes_global(self):
+        """
+        compute the glocal DPES
 
+        Returns
+        -------
+        None.
+
+        """
         x, y = self.x, self.y
         nx = self.nx
         ny = self.ny
         N = self.nstates
+        h, l = self.h, self.l
+        delta = self.delta
 
         X, Y = meshgrid(x, y)
 
         v = np.zeros((nx, ny, N, N))
 
-        v[:, :, 0, 0] = X**2/2. + Y**2/2.
-        v[:, :, 1, 1] = (X-1)**2/2. + (Y-1)**2/2. + 1.
+        v[:, :, 0, 0] = X**2/2. + (Y)**2/2. + h * X + delta
+        v[:, :, 1, 1] = X**2/2. + (Y)**2/2. - h * X - delta
+
+
 
         self.v = v
         return
+
+    def dpes(self, x):
+
+        X, Y = x
+        h, l = self.h, self.l
+        delta = self.delta
+
+        v = np.zeros((self.nstates, self.nstates))
+
+        # v[0, 0] = (X)**2/2. + (Y)**2/2. + h * X + delta
+        # v[1, 1] = (X)**2/2. + (Y)**2/2. - h * X - delta
+        v[0, 0] =  + h * X + delta
+        v[1, 1] =  - h * X - delta
+
+        v[0, 1] =   l * Y
+        v[1, 0] = v[0, 1]
+
+        self.v = v
+        return v
+
+    def apes(self, x):
+
+
+        v = self.dpes(x)
+
+        # self.v = v
+        w, u = eigh(v)
+        return w, u
+
+    def wilson_loop(self, n=0, r=1):
+
+
+        l = identity(self.nstates)
+
+
+        for theta in np.linspace(0, 2 * np.pi, 800):
+
+            x, y = polar2cartesian(r, theta)
+
+
+            w, u = self.apes([x, y])
+
+            # print(u[:,0])
+            # ground state projection operator
+            p = ket2dm(u[:,n])
+
+            l = l @ p
+
+        return np.trace(l)
+
+    def berry_phase(self, n=0, r=1):
+
+
+        phase = 0
+        z  = 1
+
+        w, u = self.apes([r, 0])
+        u0 = u[:, n]
+
+        uold = u0
+        loop = np.linspace(0, 2 * np.pi)
+        for i in range(1, len(loop)):
+
+            theta = loop[i]
+            x, y = polar2cartesian(r, theta)
+
+            w, u = self.apes([x, y])
+            unew = u[:,n]
+            z *= overlap(uold, unew)
+
+            uold = unew
+
+        z *= overlap(unew, u0)
+
+        return z
+        # return -np.angle(z)
+
+    def apes_global(self):
+
+        x = self.x
+        y = self.y
+        assert(x is not None)
+
+        nstates = self.nstates
+
+        nx = len(x)
+        ny = len(y)
+
+        v = np.zeros((nx, ny, nstates))
+
+        for i in range(nx):
+            for j in range(ny):
+                w, u = self.apes([x[i], y[j]])
+                v[i, j, :] = w
+
+        return v
+
+    def plot_apes(self):
+
+        v = self.apes_global()
+        mayavi([v[:,:,k] for k in range(self.nstates)])
+
+
+
+
+class DHO:
+    def __init__(self, d, mass=1, nstates=2, coupling=0):
+
+        # self.dpes()
+        self.edip = sigmax()
+        self.nstates = nstates
+        self.mass = mass
+        self.d = d # displacement
+        self.coupling = coupling # vibronic coupling strength
+        assert(self.edip.ndim == nstates)
+
+
+    # def dpes(self):
+
+    #     x, y = self.x, self.y
+    #     nx = self.nx
+    #     ny = self.ny
+    #     N = self.nstates
+
+    #     X, Y = meshgrid(x, y)
+
+    #     v = np.zeros((nx, ny, N, N))
+
+    #     v[:, :, 0, 0] = X**2/2. + Y**2/2.
+    #     v[:, :, 1, 1] = (X-1)**2/2. + (Y-1)**2/2. + 1.
+
+    #     self.v = v
+    #     return
+
+    def apes(self, x):
+        d = self.d
+        c = self.coupling
+
+        x = np.atleast_1d(x)
+        nx = len(x)
+
+        ns = self.nstates
+
+        wlist = []
+        ulist = []
+
+        for i in range(nx):
+            v = np.zeros((ns, ns))
+
+            v[0, 0] = x[i]**2/2.
+            v[1, 1] = (x[i]-d)**2/2.
+            v[0, 1] = v[1, 0] = c
+
+            w, u = np.linalg.eigh(v)
+            wlist.append(w.copy())
+            ulist.append(u.copy())
+
+        return wlist, ulist
 
 def pos(n_vib):
     """
@@ -371,6 +559,39 @@ def DPES(x, y, nstates=3):
 
     return hmol
 
+
+class Pyrazine:
+    """
+    vibronic coupling model for pyrazine
+    """
+    def __init__(self):
+        self.nstates = 2
+        self.mass = [1/(952. * wavenum2au), 1./(597. * wavenum2au)]
+
+    def apes(self, x):
+
+        x = np.atleast_1d(x)
+        nx = len(x)
+
+        ns = self.nstates
+
+        wlist = []
+        ulist = []
+
+        for i in range(nx):
+            # v = np.zeros((ns, ns))
+
+            w, u = get_apes(*x[i])
+            w, u = sort(w, u)
+
+            wlist.append(w.copy())
+            ulist.append(u.copy())
+
+
+        return wlist, ulist
+
+
+
 def get_apes(x, y):
     """
     diabatic PES
@@ -399,9 +620,9 @@ def get_apes(x, y):
     #for i in range(len(x)):
     V = np.array([[V0, coup], [coup, V1]])
 
-    eigs = np.linalg.eigvalsh(V)
+    w, u = np.linalg.eigh(V)
 
-    return Vg, eigs
+    return w, u
 
 
 def cut():
@@ -411,7 +632,7 @@ def cut():
     dpes = DPES(x, y)
 
     fig, ax = plt.subplots(figsize=(4,4))
-    set_style(13)
+    # set_style(13)
 
     for surface in dpes:
         ax.plot(y, surface * au2ev, lw=2)
@@ -534,12 +755,12 @@ def mayavi(surfaces):
 
     from mayavi import mlab
 
-    apes, apes1 = surfaces
+    # apes, apes1 = surfaces
 
     fig = mlab.figure()
-
-    surf2 = mlab.surf(apes * au2ev, warp_scale=20)
-    surf3 = mlab.surf(apes1 * au2ev, warp_scale=20)
+    for surface in surfaces:
+        mlab.surf(surface * au2ev)
+    # surf3 = mlab.surf(apes1 * au2ev, warp_scale=20)
     #mlab.surf(ground * au2ev, warp_scale=20)
 
 
@@ -558,7 +779,30 @@ if __name__ == '__main__':
     rcParams['xtick.major.pad']='2'
     rcParams['ytick.major.pad']='2'
 
+    x = np.linspace(-2, 2, 20)
+    y = np.linspace(-2, 2, 20)
+    deltas = [-0.5, 0, 0.5, 1, 2]
+
+    # loop_integral = np.zeros(len(deltas))
+    # for i, delta in enumerate(deltas):
+    #     mol = DHO2(x, y, delta=delta)
+    #     # mol.plot_apes()
+
+    #     loop_integral[i] = mol.berry_phase(n=1, r=3)
+
+    # fig, ax = plt.subplots()
+    # ax.plot(deltas, loop_integral)
+
+
+    # mol.plot_apes()
+
+    # from pyqed.style import plot_surface
+    # plot_surface(x, y, F)
+
     # mayavi()
     # contour()
-    #cut()
-    plot3d()
+    # cut()
+    # plot3d()
+
+
+

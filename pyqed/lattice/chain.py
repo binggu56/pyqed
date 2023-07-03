@@ -11,7 +11,7 @@ From pyqula.
 """
 import numpy as np
 from numpy.linalg import inv
-from lime.phys import dagger, dag
+from pyqed import dagger, dag
 import scipy
 from scipy.sparse import csr_matrix
 
@@ -126,6 +126,10 @@ class Chain(Mol):
 
     def zeeman(self):
         # drive with magnetic field
+        pass
+
+    def gf(self):
+        # surface and bulk Green function
         pass
 
 
@@ -270,8 +274,26 @@ class Lattice:
         draw_points(points, colors)
         return
 
+
 class RiceMele:
     def __init__(self, v, w, nsite=None):
+        """
+        Rice-Mele model with open boundary condition
+
+        Parameters
+        ----------
+        v : TYPE
+            intracell hopping.
+        w : TYPE
+            intercell hopping
+        nsite : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        None.
+
+        """
         self.intra = v
         self.inter = w
         self.H = None
@@ -366,13 +388,11 @@ class RiceMele:
         elif method == 'sos':
             if self.evals is None:
                 self.solve()
-            if isinstance(omega, (float, complex)):
+            if isinstance(omega, (int, float, complex)):
                 U = self.evecs
                 g = U @ np.diag(1./(omega - 1j*eta - self.evals)) @ dag(U)
 
-
-
-        return g[0, 0].imag
+            return g
 
 def green_renormalization(intra,inter,energy=0.0,nite=None,
                             info=False,delta=0.001,**kwargs):
@@ -388,6 +408,8 @@ def green_renormalization(intra,inter,energy=0.0,nite=None,
     beta = dagger(inter).copy()
     epsilon = intra.copy()
     epsilon_s = intra.copy()
+
+    print(' ite, alpha, beta')
     while True: # implementation of Eq 11
       einv = inv(e - epsilon) # inverse
       epsilon_s = epsilon_s + alpha @ einv @ beta
@@ -395,11 +417,13 @@ def green_renormalization(intra,inter,energy=0.0,nite=None,
       alpha = alpha @ einv @ alpha  # new alpha
       beta = beta @ einv @ beta  # new beta
       ite += 1
+      print(ite, 'alpha = \n', alpha, '\n beta', beta)
       # stop conditions
       if not nite is None:
         if ite > nite:  break
       else:
         if np.max(np.abs(alpha))<error and np.max(np.abs(beta))<error: break
+
     if info:
       print("Converged in ",ite,"iterations")
     g_surf = inv(e - epsilon_s) # surface green function
@@ -410,19 +434,21 @@ def green_renormalization(intra,inter,energy=0.0,nite=None,
 if __name__ == '__main__':
     import proplot as plt
 
-    model = RiceMele(0.1, 0.4, 12)
+    model = RiceMele(0.1, 0.2, 20)
     model.buildH()
 
-    omegas = np.linspace(-1,1, 100)
+    # omegas = np.linspace(-1,1, 200)
 
-    ldos = np.zeros(len(omegas))
-    for i in range(len(omegas)):
-        ldos[i] = model.gf(omegas[i], method='sos')
+    # ldos = np.zeros(len(omegas))
+    # for i in range(len(omegas)):
+    #     ldos[i] = model.gf(omegas[i], method='sos')[0, 0].imag
 
-    fig, ax = plt.subplots()
-    ax.plot(omegas, ldos)
+    # fig, ax = plt.subplots()
+    # ax.plot(omegas, ldos)
 
-    # model.plot_state([1,2,3,4,5,6])
+    g = model.gf(0)
+    print(g[:2, :2])
+    model.plot_state([1,2,3,4,5,6])
     # print(model.evals)
 
     lattice = Lattice(size=(20,1), norb=2, orb_coords=[[0.4, 0.4], [0.6,0.6]])
@@ -432,14 +458,19 @@ if __name__ == '__main__':
     lattice.set_hop(0.05, 0, 1, [0, 0])
     lattice.set_hop(0.08, 1, 0, [1, 0])
 
-    evals, evecs = lattice.solve()
-    from lime.style import level_scheme
-    level_scheme(evals)
+    # evals, evecs = lattice.solve()
+    from pyqed.style import level_scheme
+    level_scheme(model.evals)
 
-    from lime.phys import get_index
-    I = get_index(evals, 0)
-    # for j in range(0, 10):
-    lattice.draw(evecs[:,I])
+    # from lime.phys import get_index
+    # I = get_index(evals, 0)
+    # # for j in range(0, 10):
+    # lattice.draw(evecs[:,I])
+
+
+
+    # green_renormalization(intra=0,inter=0,energy=0.0,nite=None,
+    #                         info=True)
 
 # def green_renormalization_jit(intra,inter,energy=0.0,delta=1e-4,**kwargs):
 #     intra = algebra.todense(intra)*(1.0+0j)

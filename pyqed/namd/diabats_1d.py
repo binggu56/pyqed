@@ -16,19 +16,17 @@ Several possible improvements:
 """
 
 import numpy as np
+import proplot as plt
 from matplotlib import pyplot as plt
-from matplotlib import animation
+# from matplotlib import animation
 from scipy.fftpack import fft,ifft,fftshift
 
 from scipy.linalg import expm, sinm, cosm
 import scipy
 
-import sys
-sys.path.append(r'C:\Users\Bing\Google Drive\lime')
-sys.path.append(r'/Users/bing/Google Drive/lime')
 
-#from lime.fft import fft, ifft  
-from lime.phys import dagger
+#from lime.fft import fft, ifft
+from pyqed import dagger
 
 
 class NAMD:
@@ -50,13 +48,13 @@ class NAMD:
 
             V_x: real array [N, ns**2]
                 potential energy surfaces and vibronic couplings
-                            
+
         """
         self.x = x
         self.psi0 = psi0
         self.mass = mass
         self.V_x = V_x
-        self.nstates = nstates 
+        self.nstates = nstates
 
     def x_evolve(self, psi, vpsi):
         """
@@ -70,7 +68,7 @@ class NAMD:
         #     psi_x[i,:] = np.dot(U,V.dot(dagger(U))).dot(tmp)
 
         psi = np.einsum('imn, in -> im', vpsi, psi)
-        
+
         return psi
 
 
@@ -79,7 +77,7 @@ class NAMD:
         one time step for exp(-i * K * dt)
         """
         mass = self.mass
-        #x = self.x 
+        #x = self.x
 
         for n in range(2):
 
@@ -91,7 +89,7 @@ class NAMD:
 
         return psi_x
 
-    def propagate(self, dt, psi_x, Nsteps = 1):
+    def propagate(self, dt, psi_x, nt = 1):
 
         """
         Perform a series of time-steps via the time-dependent
@@ -114,21 +112,21 @@ class NAMD:
 
         x = self.x
         V_x = self.V_x
-        
-        nx = len(x) 
-        nstates = self.nstates 
-        
+
+        nx = len(x)
+        nstates = self.nstates
+
         dt2 = 0.5 * dt
 
-        
+
         vpsi = np.zeros((nx, nstates, nstates), dtype=complex)
         vpsi2 = np.zeros((nx, nstates, nstates), dtype=complex)
-      
+
         for i in range(nx):
-            
+
             Vmat = np.reshape(V_x[i,:], (nstates, nstates))
             w, u = scipy.linalg.eigh(Vmat)
-            
+
             #print(np.dot(U.conj().T, Vmat.dot(U)))
 
             v = np.diagflat(np.exp(- 1j * w * dt))
@@ -140,14 +138,14 @@ class NAMD:
 
         dx = x[1] - x[0]
 
-        k = 2.0 * np.pi * scipy.fftpack.fftfreq(nx, dx)         
-        
+        k = 2.0 * np.pi * scipy.fftpack.fftfreq(nx, dx)
+
         print('Propagating the wavefunction ...')
 
-        t = 0.0 
-        self.x_evolve(psi_x, vpsi2) # evolve V half step 
+        t = 0.0
+        self.x_evolve(psi_x, vpsi2) # evolve V half step
 
-        for i in range(Nsteps - 1):
+        for i in range(nt - 1):
 
             t += dt
 
@@ -155,8 +153,8 @@ class NAMD:
             psi_x = self.x_evolve(psi_x, vpsi)
 
             rho = density_matrix(psi_x, dx)
-            
-            # store the density matrix 
+
+            # store the density matrix
             f.write('{} {} {} {} {} \n'.format(t, *rho))
 
         # psi_x = self.k_evolve(dt, psi_x)
@@ -209,6 +207,71 @@ def square_barrier(x, width, height):
     return height * (theta(x) - theta(x - width))
 
 
+if __name__ == '__main__':
+    # specify time steps and duration
+    dt = 0.05
+    # t_max = 100
+    # frames = int(t_max / float(N_steps * dt))
+
+    # specify constants
+    hbar = 1.0   # planck's constant
+    m = 1.0      # particle mass
+
+    # specify range in x coordinate
+    N = 2 ** 9
+    xmin = -6
+    xmax = -xmin
+    #dx = 0.01
+    #x = dx * (np.arange(N) - 0.5 * N)
+    x = np.linspace(xmin,xmax,N)
+    print('x range = ',x[0], x[-1])
+    dx = x[1] - x[0]
+    print('dx = {}'.format(dx))
+    print('number of grid points = {}'.format(N))
+
+    # specify potential
+    #V0 = 1.5
+    #L = hbar / np.sqrt(2 * m * V0)
+    #a = 3 * L
+
+    # diabatic surfaces with vibronic couplings
+    V_x = np.zeros((N,4))
+    V_x[:,0] = (x)**2/2.0
+    V_x[:,3] = (x-1.)**2/2.0
+    c = 0.1
+    V_x[:,1] = c
+    V_x[:,2] = c
+
+
+    print('constant vibronic coupling  = ', c)
+
+    # specify initial momentum and quantities derived from it
+    #p0 = np.sqrt(2 * m * 0.2 * V0)
+    p0 = 0.0
+    x0 = 0.0
+    #dp2 = p0 * p0 * 1./80
+    #d = hbar / np.sqrt(2 * dp2)
+    a = 1.
+
+    k0 = p0 / hbar
+    v0 = p0 / m
+    angle = 0.0  # np.pi/4.0
+    print('initial phase difference between c_g and c_e = {} Pi'.format(angle/np.pi))
+    psi0 = np.zeros((N,2), dtype=complex)
+    psi0[:,0] =  gwp(x, a, x0, k0) * np.exp(1j*angle)
+    # psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
+
+    sol = NAMD(x, 2, psi0, mass=1, V_x =V_x)
+    sol.propagate(dt, psi0, nt=1000)
+
+    rho = np.genfromtxt('density_matrix.dat')
+
+    import proplot as plt
+    fig, ax = plt.subplots()
+    # ax.plot(rho[:, 0], rho[:, 4])
+    print(rho[:,2])
+    ax.plot(rho[:, 0], rho[:, 1].real)
+    # ax.format(ylim=(-1,1), xlim=(0,100))
 
 
 ######################################################################

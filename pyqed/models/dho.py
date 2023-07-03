@@ -10,7 +10,7 @@ Numerically evaluating Franck-Condon factors for displaced harmonic oscilators
 
 from scipy.special import hermite
 from scipy.special import eval_hermite as Hermite
-from lime.units import au2wavenumber
+from pyqed.units import au2wavenumber
 
 # configuration
 deltaX = 0.2e-10 # Distance between the two potentials in SI units
@@ -28,7 +28,7 @@ from math import factorial, pi, sqrt, exp
 
 
 
-        
+
 
 def FranckCondon(n1, omega1, n2, omega2, d):
     '''
@@ -98,7 +98,7 @@ def FranckCondon(n1, omega1, n2, omega2, d):
 
 
 if __name__ == '__main__':
-    
+
     # hbar = 1.05e-34
     # Hermite polynomial of n-th grade at x
     # def Hermite(n, x):
@@ -106,11 +106,11 @@ if __name__ == '__main__':
     #     # coeff.append(1)
     #     # return hermval(x, coeff)
     #     return
-    
+
     omega1 = 499/au2wavenumber
     omega2 = 501/au2wavenumber
     d = 1. # a.u.
-    
+
     # fc = fc[0]*fc[0]
     # print('{0:^3}{1:^3}{2}'.format(n1, n2, fc[0]))
     print(FranckCondon(2, omega1, 3, omega2, d))

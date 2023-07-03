@@ -343,6 +343,7 @@ def surf(f, x, y, fname='output.png', xlabel='X', \
          ylabel='Y', zlabel='Z', title=None, method='matplotlib'):
 
     if method == 'matplotlib':
+        
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
 

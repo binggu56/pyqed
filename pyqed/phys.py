@@ -10,9 +10,68 @@ import scipy as sp
 # import numba
 # from numba import jit
 import sys
-import heapq 
+import heapq
 
-def nlargest(a, n):
+def polar2cartesian(r, theta):
+    """
+    transform polar coordinates to Cartesian
+
+    .. math::
+
+        x = r  \cos(\theta)
+        y = r \sin(\theta)
+
+    Parameters
+    ----------
+    r : TYPE
+        DESCRIPTION.
+    theta : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    x : TYPE
+        DESCRIPTION.
+    y : TYPE
+        DESCRIPTION.
+
+    """
+    x, y = r * np.cos(theta), r * np.sin(theta)
+    return x, y
+
+def cartesian2polar(x, y):
+    """
+    transform Cartesian coordinates to polar
+
+    .. math::
+
+        x = r  \cos(\theta)
+        y = r \sin(\theta)
+
+    Parameters
+    ----------
+    r : TYPE
+        DESCRIPTION.
+    theta : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    x : TYPE
+        DESCRIPTION.
+    y : TYPE
+        DESCRIPTION.
+
+    """
+    r = sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+
+    return r, theta
+
+def overlap(bra, ket):
+    return np.vdot(bra, ket)
+
+def nlargest(a, n, with_index=False):
     """
     finds the largest n elements from a Python iterable
 
@@ -22,6 +81,8 @@ def nlargest(a, n):
         DESCRIPTION.
     n : int
         DESCRIPTION.
+    with_index: bool
+        if index is needed.
 
     Returns
     -------
@@ -29,8 +90,11 @@ def nlargest(a, n):
         DESCRIPTION.
 
     """
-    
-    return heapq.nlargest(n, a)
+    if with_index:
+
+        return heapq.nlargest(n, zip(a, range(len(a))))
+    else:
+        return heapq.nlargest(n, a)
 
 def jacobi_anger(n, z=1):
     """
@@ -358,6 +422,10 @@ def rect(x):
     return np.heaviside(x+0.5, 0.5) - np.heaviside(x - 0.5, 0.5)
 
 def interval(x):
+    # Deprecated use step().
+    return x[1] - x[0]
+
+def stepsize(x):
     return x[1] - x[0]
 
 def fftfreq(times):
@@ -1192,9 +1260,17 @@ def multi_spin(onsite, nsites):
     params:
         onsite: array, transition energy for each spin
         nsites: number of spins
+    Returns
+    =======
+    ham: ndarray
+        Hamiltonian
+    lower: ndnarry
+        lowering operator
     """
 
     s0, sx, sy, sz = pauli()
+    sz = (s0 - sz)/2
+
     sm = lowering()
 
     head = onsite[0] * kron(sz, tensor_power(s0, nsites-1))
@@ -1212,8 +1288,17 @@ def multi_spin(onsite, nsites):
         lower += kron(tensor_power(s0, i), kron(sm, tensor_power(s0, nsites-i-1)))
 
 
+    # edip
+    edip_head = kron(sx, tensor_power(s0, nsites-1))
+    edip_tail = kron(tensor_power(s0, nsites-1), sx)
+    edip = edip_head + edip_tail
+
+    for i in range(1, nsites-1):
+        edip += kron(tensor_power(s0, i), kron(sx, tensor_power(s0, nsites-i-1)))
+
 
     return ham, lower
+
 
 def multiboson(omega, nmodes, J=0, truncate=2):
     """
@@ -1515,6 +1600,96 @@ def expm(A, t, method='EOM'):
         raise NotImplementedError('Method of {} has not been implemented.\
                                   Choose from EOM'.format(method))
 
+def propagator(H, dt, nt):
+    """
+    compute the propagator for time-dependent and time-independent H
+    U(t) = e^{-i H t}
+
+    Parameters
+    -----------
+    H: ndarray or list of ndarray or callable
+        Hamiltonian.
+        if H is ndarray, H is time-independent. Otherwise H is time-dependent.
+    t: float or list
+        times
+    """
+
+
+
+    # propagator
+
+
+    # set the ground state energy to 0
+    print('Computing the propagator. '
+          'Please make sure that the ground-state energy is 0.')
+
+
+    if callable(H):
+        H = [H(k*dt) for k in range(nt)]
+
+    if isinstance(H, list): # time-dependent H
+
+        U = np.eye(H[0].shape[-1], dtype=complex)
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H[k])
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    elif isinstance(H, np.ndarray): # time-independent
+
+        assert(isherm(H))
+
+        # if method == 'eom':
+        U = np.eye(H.shape[-1], dtype=complex)
+
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H)
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    #     elif method == 'diag':
+    #         w, v = np.linalg.eigh(H) # H = v @ diag(w) @ v.H
+    #         return [v @ np.diag(np.exp(-1j * w * k * dt)) @ dag(v) for k in range(nt+1)]
+
+
+def propagator_H_const(H, dt, nt, method='diag'):
+    """
+    compute the propagator for time-dependent and time-independent H
+    U(t) = e^{-i H t}
+
+    Parameters
+    -----------
+    H: ndarray or list of ndarray or callable
+        Hamiltonian.
+        if H is ndarray, H is time-independent. Otherwise H is time-dependent.
+    t: float or list
+        times
+    """
+
+    assert(isherm(H))
+
+    if method == 'eom':
+        # propagator
+        U = np.eye(H.shape[-1], dtype=complex)
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H)
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    elif method == 'diag':
+
+        w, v = np.linalg.eigh(H) # H = v @ diag(w) @ v.H
+        return [v @ np.diag(np.exp(-1j * w * k * dt)) @ dag(v) for k in range(nt+1)]
+
 
 def ldo(b, A):
     '''
@@ -1539,6 +1714,10 @@ def ldo(b, A):
 def isherm(a):
     return np.allclose(a, dag(a))
 
+def isunitary(m):
+    return np.allclose(np.eye(len(m)), m.dot(m.T.conj()))
+    # return np.allclose(np.eye(len(m)), m.T.conj() @ m)
+
 def isdiag(M):
     """
     Check if a matrix is diagonal.
@@ -1554,7 +1733,7 @@ def isdiag(M):
         DESCRIPTION.
 
     """
-    return np.all(M == np.diag(np.diagonal(M)))
+    return np.allclose(M, np.diag(np.diagonal(M)))
 
 
 def pdf_normal(x, mu=0, sigma=1.):
@@ -1562,10 +1741,21 @@ def pdf_normal(x, mu=0, sigma=1.):
             np.exp(- (x - mu) ** 2 / (2 * sigma ** 2))
 
 if __name__ == '__main__':
-    a = sigmaz() - 1j * sigmax()
-    print(isherm(a))
+    H = sigmaz() -  sigmax()
+    # print(isherm(H))
 
-    import matplotlib.pyplot as plt
-    x = np.linspace(-1, 1)
-    plt.plot(x, pdf_normal(x))
-    plt.show()
+    # import matplotlib.pyplot as plt
+    # x = np.linspace(-1, 1)
+    # plt.plot(x, pdf_normal(x))
+    # plt.show()
+
+    dt = 0.005
+    nt = 50
+    U1 = propagator(H, dt, nt, method='diag')
+    U2 = propagator(H, dt, nt, method='eom')
+    print(U1[-1])
+    print(U2[-1])
+
+
+
+

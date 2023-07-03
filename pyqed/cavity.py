@@ -14,7 +14,7 @@ import sys
 
 
 from pyqed import au2fs, au2k, au2ev, dag, coth, ket2dm, comm, anticomm, pauli, destroy,\
-    basis, isherm, basis_transform
+    basis, isherm, basis_transform, driven_dynamics
 from pyqed.mol import Mol
 from pyqed.oqs import Lindblad_solver
 
@@ -390,7 +390,8 @@ class Cavity():
         self.nonhermH = None
 
         self.quality_factor = Q
-        self.decay = freq/2./Q
+        if Q is not None:
+            self.decay = freq/2./Q
         self.polarization = polarization
 
 #    @property
@@ -509,14 +510,14 @@ class Cavity():
         a = lil_matrix((N, N))
         a.setdiag(range(N), 0)
         return a.tocsr()
-    
+
     # def x(self):
     #     a = self.annihilate()
     #     return 1./np.sqrt(2.) * (a + dag(a))
 
 
-    
-    
+
+
 class Polariton(Composite):
     def __init__(self, mol, cav):
 
@@ -566,7 +567,7 @@ class Polariton(Composite):
 
         else:
 
-            hint = g * kron(mol.dip, cav.create() + cav.annihilate())
+            hint = g * kron(mol.edip, cav.create() + cav.annihilate())
 
         self.H = kron(hmol, Icav) + kron(Imol, hcav) + hint
 
@@ -603,7 +604,7 @@ class Polariton(Composite):
         self.H = h
         return
 
-    def get_dip(self, basis='product'):
+    def get_edip(self, basis='product'):
         '''
         transition dipole moment in the direct product basis
 
@@ -613,7 +614,7 @@ class Polariton(Composite):
             DESCRIPTION.
 
         '''
-        return kron(self.mol.dip, self.cav.idm)
+        return kron(self.mol.edip, self.cav.idm)
 
     def get_dm(self):
         return kron(self.mol.dm, self.cav.vacuum_dm())
@@ -714,6 +715,25 @@ class Polariton(Composite):
 
         return basis_transform(a, self.eigvecs)
 
+    def driven_dynamics(self, psi0, pulse, dt=0.001, nt=1, obs_ops=None, nout=1, t0=0.0):
+        H = self.H
+
+        if self.dip is None:
+            edip = self.get_dip()
+        else:
+            edip = self.dip
+
+        # psi0 = self.initial_state
+
+        if psi0 is None:
+            sys.exit("Error: Initial wavefunction not specified!")
+
+        H = [self.H, [edip, pulse]]
+
+        return driven_dynamics(H, psi0, dt=dt, Nt=nt, \
+                        e_ops=obs_ops, nout=nout, t0=t0)
+
+
 def QRM(omega0, omegac, ncav=2):
     '''
     Quantum Rabi model / Jaynes-Cummings model
@@ -741,46 +761,7 @@ def QRM(omega0, omegac, ncav=2):
 
     return Polariton(mol, cav)
 
-class Dicke(Cavity):
 
-    def __init__(self, onsite, nsites, omegac):
-        self.nsites = nsites
-        self.onsite = onsite
-
-        self.omegac = omegac
-
-        return
-
-    def Hsubspace(self, g, nexc=1):
-        '''
-        single-polariton Hamiltonian for N two-level molecules coupled to
-        a single cavity mode including the ground state
-
-        input:
-            g_cav: single cavity-molecule coupling strength
-        '''
-        nsites = self.nsites
-        onsite = self.onsite
-        omegac = self.omegac
-
-        if nexc == 1:
-            nstates = nsites + 1 + 1 # number of states in the system
-
-            dip = np.zeros((nstates, nstates))
-            # the states are respectively, |000>, |100>, |010>, |001>,
-            # the position are ordered as
-
-            H = np.diagflat([0.] + onsite + [omegac])
-            H[1:nsites+1, -1] = H[-1, 1:nsites+1] = g
-
-            dip[0,1:nsites+1] = dip[1:nsites+1, 0] =  1
-
-            return csr_matrix(H), csr_matrix(dip)
-        else:
-            raise NotImplementedError()
-
-    def Hfull(self):
-        pass
 
 if __name__ == '__main__':
 

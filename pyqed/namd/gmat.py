@@ -168,7 +168,7 @@ coord.ndims = 2
 coord.dim1 = v1
 coord.dim2 = v2
 
-gmatu = BuildGmatND(s0min,mass(1,:),coord);
+gmatu = BuildGmatND(s0min,mass(1,:),coord)
 
 
 # Points necessary in each dimension

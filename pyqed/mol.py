@@ -18,11 +18,11 @@ from scipy.sparse import csr_matrix, lil_matrix, identity, kron, \
     linalg, issparse
 from dataclasses import dataclass
 
-import numba
+# import numba
 import sys
 import warnings
 
-import proplot as plt
+# import proplot as plt
 
 from pyqed.units import au2fs, au2ev
 from pyqed.signal import sos
@@ -31,6 +31,8 @@ from pyqed.phys import dag, quantum_dynamics, \
         isdiag
 
 from pyqed.units import au2wavenumber, au2fs
+import pickle
+
 
 # def rk4(rho, fun, dt, *args):
 #     """
@@ -93,7 +95,7 @@ def read_input(fname_e, fname_edip,  g_included=True):
 
 class Result:
     def __init__(self, description=None, psi0=None, rho0=None, dt=None, \
-                 Nt=None, times=None, t0=None, nout=None):
+                 Nt=None, times=None, t0=0, nout=1):
         self.description = description
         self.dt = dt
         self.timesteps = Nt
@@ -166,9 +168,17 @@ class Result:
     #     else:
     #         sys.exit("ERROR: Either dt or Nt is None.")
 
+def load_result(fname):
+    '''
+    read result obj saved with pickle
+    '''
+    with open(fname, 'rb') as f:
+        result = pickle.load(f)
+    return result
+
 
 class Mol:
-    def __init__(self, H, edip=None, edip_rms=None, gamma=None):
+    def __init__(self, H, edip=None, lowering=None, edip_rms=None, gamma=None):
         """
         Class for multi-level systems.
 
@@ -199,6 +209,11 @@ class Mol:
         #        self.initial_state = psi0
         self._edip = edip
         self.dip = self.edip
+
+        if lowering is not None:
+            self.lowering = lowering
+            self.raising = dag(self.lowering)
+
         # if edip is not None:
         #     self.edip_x = edip[:,:, 0]
         #     self.edip_y = edip[:, :, 1]
@@ -227,10 +242,10 @@ class Mol:
         self.mdip = None
         self.dephasing = 0.
 
-        if isdiag(H):
-            self.E = np.diag(H)
-        else:
-            self.E = self.eigenenergies()
+        # if isdiag(H):
+        #     self.E = np.diag(H)
+        # else:
+        self.E = self.eigenenergies()
 
     # def raising(self):
     #     return self.raising
@@ -359,13 +374,8 @@ class Mol:
         self.gamma = gamma
         return
 
-
-    # def get_ham(self):
-    #     return self.H
-
-
-    # def getH(self):
-    #     return self.H
+    def getH(self):
+        return self.H
 
     def get_nonhermitianH(self):
         H = self.H
@@ -404,7 +414,10 @@ class Mol:
         self.lifetime = tau
 
     def eigenenergies(self):
-        return np.linalg.eigvals(self.H)
+        H = self.H
+        if issparse(H):
+            H = H.toarray()
+        return np.linalg.eigvals(H)
 
     def eigvals(self):
         if isdiag(self.H):
@@ -439,7 +452,7 @@ class Mol:
         if k == self.dim:
             return np.linalg.eigh(self.H.toarray())
 
-    def driven_dynamics(self, pulse, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
+    def driven_dynamics(self, psi0, pulse, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''
         wavepacket dynamics in the presence of laser pulses
 
@@ -464,13 +477,15 @@ class Mol:
 
         '''
         H = self.H
-        dip = self.dip
-        psi0 = self.initial_state
+        edip = self.dip
+        # psi0 = self.initial_state
 
         if psi0 is None:
             sys.exit("Error: Initial wavefunction not specified!")
 
-        driven_dynamics(H, dip, psi0, pulse, dt=dt, Nt=Nt, \
+        H = [self.H, [edip, pulse]]
+
+        driven_dynamics(H, psi0, dt=dt, Nt=Nt, \
                         e_ops=obs_ops, nout=nout, t0=t0)
 
         return
