@@ -3,14 +3,14 @@ Molecular QED
 ==============
 
 
-.. image:: https://img.shields.io/pypi/v/scitools.svg
+.. image:: https://img.shields.io/pypi/v/pyqed.svg
         :target: https://pypi.python.org/pypi/mqed
 
-.. image:: https://img.shields.io/travis/audreyr/scitools.svg
-        :target: https://travis-ci.org/audreyr/scitools
+.. image:: https://img.shields.io/travis/audreyr/pyqed.svg
+        :target: https://travis-ci.org/audreyr/pyqed
 
-.. image:: https://readthedocs.org/projects/scitools/badge/?version=latest
-        :target: https://scitools.readthedocs.io/en/latest/?badge=latest
+.. image:: https://readthedocs.org/projects/pyqed/badge/?version=latest
+        :target: https://pyqed.readthedocs.io/en/latest/?badge=latest
         :alt: Documentation Status
 
 
@@ -18,7 +18,7 @@ Molecular QED
 
 
 * Free software: MIT license
-* Documentation: https://mqed.readthedocs.io/en/latest/
+* Documentation: https://pyqed.readthedocs.io/en/latest/
 
 
 Features
