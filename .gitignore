@@ -3,3 +3,4 @@ pyqed/__pycache__/
 build/
 *.pdf
 *.pyc
+*.npz
