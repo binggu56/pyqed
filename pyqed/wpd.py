@@ -380,8 +380,10 @@ class SPO2:
 
         """
 
-        nx = len(x)
-        ny = len(y)
+        # nx = len(x)
+        # ny = len(y)
+        nx = self.nx 
+        ny = self.ny
         ns = self.ns
 
         # DPES and diabatic couplings

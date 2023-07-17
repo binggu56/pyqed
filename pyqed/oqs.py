@@ -22,7 +22,7 @@ from scipy.integrate import solve_ivp
 # from scipy.sparse.linalg import eigs
 import opt_einsum as oe
 
-from pyqed import anticommutator, comm, commutator, anticomm, dag, ket2dm, \
+from pyqed import commutator, anticommutator, comm, anticomm, dag, ket2dm, \
     obs_dm, destroy, rk4, basis, transform, isherm, expm
 
 # from lime.superoperator import lindblad_dissipator
@@ -1332,7 +1332,7 @@ class Lindblad_solver():
 
 
 
-class HEOMSolverDL():
+class HEOMSolver():
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
         self.e_ops = e_ops
@@ -1361,9 +1361,18 @@ class HEOMSolverDL():
         self.e_ops = e_ops
         return
 
-    def solve(self, rho0, dt, Nt, return_result):
-        return _lindblad(self.H, rho0, self.c_ops, e_ops=self.e_ops, \
-                  Nt=Nt, dt=dt, return_result=return_result)
+    def run(self, rho0, dt, nt, temperature, cutoff, reorganization, nado):
+        
+        return _heom(self.H, rho0, self.c_ops, e_ops=self.e_ops, \
+                  nt=nt, dt=dt, temperature=temperature, cutoff=cutoff, \
+                  reorganization=reorganization, nado=nado)
+    
+    def propagator(self, dt, nt, temperature, cutoff, \
+                            reorganization, nado):
+        
+        return _heom_propagator(self.H, self.c_ops, self.e_ops, temperature, cutoff, \
+                                reorganization, nado, dt, nt)
+        
 
     def correlation_2op_1t(self, rho0, a_op, b_op, dt, Nt, output='cor.dat'):
         '''
@@ -1799,7 +1808,7 @@ def _lindblad_driven(H, rho0, c_ops=None, e_ops=None, Nt=1, dt=0.005, t0=0.,
 
         return result
 
-def _heom_dl(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
+def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
              nado, dt, nt, fname=None, return_result=True):
     '''
 
@@ -1835,11 +1844,11 @@ def _heom_dl(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     print('Amplitude of the fluctuations = {}'.format(a))
 
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
-    sz = c_ops # collapse opeartor
+    sz = c_ops[0] # collapse opeartor
 
 
-    f = open(fname,'w')
-    fmt = '{} '* 5 + '\n'
+    # f = open(fname,'w')
+    # fmt = '{} '* 5 + '\n'
 
     # propagation time loop - HEOM
     t = 0.0
@@ -1856,13 +1865,79 @@ def _heom_dl(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
                         (a * commutator(sz, ado[:,:,n-1]) + \
                          1j * b * anticommutator(sz, ado[:,:,n-1]))) * dt
 
+    #     # store the reduced density matrix
+    #     f.write(fmt.format(t, ado[0,0,0], ado[0,1,0], ado[1,0,0], ado[1,1,0]))
+
+    #     #sz += -1j * commutator(sz, H) * dt
+
+    # f.close()
+    return ado[:,:,0]
+
+def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
+             nado, dt, nt, fname=None):
+    '''
+
+    terminator : ado[:,:,nado] = 0
+
+    INPUT:
+        T: in units of energy, kB * T, temperature of the bath
+        reorg: reorganization energy
+        nado : auxiliary density operators, truncation of the hierachy
+        fname: file name for output
+
+    '''
+    nst = H.shape[0]
+    u = np.zeros((nado, nst**2, nst**2), dtype=np.complex128)     # auxiliary density operators
+    u[0] = np.eye(nst**2) # propagator
+
+
+    gamma = cutoff # cutoff frequency of the environment, larger gamma --> more Makovian
+    T = temperature/au2k
+    reorg = reorganization
+    print('Temperature of the environment = {}'.format(T))
+    print('High-Temperature check gamma/(kT) = {}'.format(gamma/T))
+
+    if gamma/T > 0.8:
+        print('WARNING: High-Temperature Approximation may fail.')
+
+    print('Reorganization energy = {}'.format(reorg))
+
+    # D(t) = (a + ib) * exp(- gamma * t)
+    a = np.pi * reorg * T  # initial value of the correlation function D(0) = pi * lambda * kB * T
+    b = 0.0
+    print('Amplitude of the fluctuations = {}'.format(a))
+
+    #sz = np.zeros((nstate, nstate), dtype=np.complex128)
+    sz = c_ops[0] # collapse opeartor
+
+    
+    # f = open(fname,'w')
+    # fmt = '{} '* 5 + '\n'
+
+    # propagation time loop - HEOM
+    L0 = operator_to_superoperator(H)
+    Sm = operator_to_superoperator(sz)
+    Sp = operator_to_superoperator(sz, kind='anticommutator')
+    
+    t = 0.0
+    for k in range(nt):
+
+        t += dt # time increments
+
+        u[0] += -1j * L0 @ u[0] * dt - Sm @ u[1] * dt
+
+        for n in range(nado-1):
+            u[n] += -1j * L0 @ u[n] * dt + \
+                        ((- Sm @ u[n+1]) - n * gamma * u[n] + n * \
+                        (a *  Sm  + 1j * b * Sp) @ u[n-1] )*dt
+
         # store the reduced density matrix
-        f.write(fmt.format(t, ado[0,0,0], ado[0,1,0], ado[1,0,0], ado[1,1,0]))
+        # f.write(fmt.format(t, u[0,0,0], u[0,1,0], u[1,0,0], u[1,1,0]))
 
         #sz += -1j * commutator(sz, H) * dt
 
-    f.close()
-    return ado[:,:,0]
+    # f.close()
+    return u[0]
 
 def test_lindblad():
     mesolver = Lindblad_solver(H, c_ops=[sz.astype(complex)])

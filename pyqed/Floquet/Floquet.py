@@ -24,7 +24,7 @@ class Floquet(Mol):
     #     self.omegad = omegad # driving freqency
     #     self.FBZ = [-omegad/2., omegad/2] # first Floquet-BZ
 
-    def momentum(self):
+    def momentum_matrix_elements(self):
         """
         get momentum matrix elements by commutation relation
         .. math::

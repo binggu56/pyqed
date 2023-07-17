@@ -301,11 +301,11 @@ def gwp2(x, y, sigma=np.identity(2), xc=[0, 0], kc=[0, 0]):
     x0, y0 = xc
     kx, ky = kc
 
-    A = inv(sigma)
+    A = np.linalg.inv(sigma)
 
     delta = A[0, 0] * (x-x0)**2 + A[1, 1] * (y-y0)**2 + 2. * A[0, 1]*(x-x0)*(y-y0)
 
-    gauss_2d = (sqrt(det(sigma)) * sqrt(pi) ** 2) ** (-0.5) \
+    gauss_2d = (sqrt(np.linalg.det(sigma)) * sqrt(pi) ** 2) ** (-0.5) \
                               * exp(-0.5 * delta + 1j * kx * (x-x0) + 1j * ky * (y-y0))
 
     return gauss_2d
@@ -1254,6 +1254,78 @@ def driven_dissipative_dynamics(ham, dip, rho0, pulse, dt=0.001, Nt=1, \
 ####################
 # spin chains
 ####################
+def multispin(onsite, hopping, nsites):
+
+    if not isinstance(hopping, float):
+        raise ValueError('Hopping must be float.')
+
+    if isinstance(onsite, (float, int)):
+        onsite = [onsite, ] * nsites
+
+    return multimode(omegas=onsite, nmodes=nsites, J=hopping, truncate=2)
+
+    # s0, sx, sy, sz = pauli()
+
+    # N = 2
+    # sz = 0.5 * (s0 - sz)
+    # h0 = 0.5 * onsite[0] * sz
+    # x = sx
+    # idm = s0
+
+    # assert len(onsite) == nsites
+
+    # if nsites == 1:
+
+    #     return h0, x
+
+    # elif nsites == 2:
+
+    #     J = hopping
+
+    #     hf = 0.5 * onsite[-1] * sz
+    #     ham = kron(idm, hf) + kron(h0, idm) + J * kron(x, x)
+
+    #     xs = [kron(x, idm), kron(idm, x)]
+    #     return ham, xs
+
+    # elif nsites > 2:
+
+    #     hf = 0.5 * onsite[-1] * sz
+
+    #     head = kron(h0, tensor_power(idm, nsites-1))
+    #     tail = kron(tensor_power(idm, nsites-1), hf)
+    #     ham = head + tail
+
+    #     for i in range(1, nsites-1):
+    #         h = 0.5 * onsite[i] * sz
+    #         ham += kron(tensor_power(idm, i), \
+    #                                  kron(h, tensor_power(idm, nmodes-i-1)))
+
+    #     hop_head = J * kron(kron(x, x), tensor_power(idm, nmodes-2))
+    #     hop_tail = J * kron(tensor_power(idm, nmodes-2), kron(x, x))
+
+    #     ham += hop_head + hop_tail
+
+    #     for i in range(1, nmodes-2):
+    #         ham += J * kron(tensor_power(idm, i), \
+    #                             kron(kron(x, x), tensor_power(idm, nmodes-i-2)))
+
+    #     # connect the last mode to the first mode
+
+    #     lower_head = kron(x, tensor_power(idm, nmodes-1))
+    #     xs = []
+    #     xs.append(lower_head)
+
+    #     for i in range(1, nmodes-1):
+    #         # x = quadrature(dims[i])
+    #         lower = kron(tensor_power(idm, i), kron(x, tensor_power(idm, nmodes-i-1)))
+    #         xs.append(lower.copy())
+
+    #     lower_tail = kron(tensor_power(idm, nmodes-1), x)
+    #     xs.append(lower_tail)
+
+    #     return ham, xs
+
 def multi_spin(onsite, nsites):
     """
     construct the hamiltonian for a multi-spin system

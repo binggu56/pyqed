@@ -21,19 +21,19 @@ import proplot as plt
 
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
-    polar2cartesian
+    polar2cartesian, SPO2
 from pyqed.style import set_style
 from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
 
 
 
-class Vibronic2:
+class Vibronic:
     """
     vibronic model in the diabatic representation with 2 nuclear coordinates
 
     """
-    def __init__(self, x, y, mass, nstates=2, coords='linear'):
+    def __init__(self, x, y, mass=[1,1], nstates=2, nmodes=2, coords='linear'):
         self.x = x
         self.y = y
         self.X, self.Y = meshgrid(x, y)
@@ -47,10 +47,11 @@ class Vibronic2:
         self.kx = None
         self.ky = None
         self.dim = 2
+        self.mass = mass
 
 
         self.v = None # diabatic PES
-        self.va = None
+        self.apes = None
 
         # self.h = h
         # self.l = l
@@ -64,8 +65,16 @@ class Vibronic2:
     def set_mass(self, mass):
         self.mass = mass
 
+    # def diabatic(self, x, y):
+        
+    #     nstates = self.nstates
+    #     kappa = self.kappa 
+    #     v = np.zeros((nstates, nstates))
+    #     v[0, 0] = 
+    #     return v
+        
 
-    def set_DPES(self, surfaces, diabatic_couplings, eta=None):
+    def set_DPES(self, surfaces, diabatic_couplings, abc=False, eta=None):
         """
         set the diabatic PES and vibronic couplings
 
@@ -103,15 +112,70 @@ class Vibronic2:
             v[:, :, a, b] = v[:, :, b, a] = dc[1]
 
 
-        if self.abc:
+        if abc:
             for n in range(self.ns):
                 v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
 
         self.v = v
         return v
 
+    def adiabats(self, x, y):
+        """
+        Compute the adiabatic potential energy surfaces from diabats
 
-    def plot_surface(self, style='2D'):
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+
+        w, u = np.linalg.eigh(v)
+
+        return w, u
+    
+    def get_apes(self):
+        """
+        Compute the adiabatic potential energy surfaces from diabats
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+        x = self.x
+        y = self.y
+        assert(x is not None)
+        
+        nstates = self.nstates
+        
+        nx = len(x)
+        ny = len(y)
+        
+        v = np.zeros((nx, ny, nstates))
+        
+        for i in range(nx):
+            for j in range(ny):
+                w, u = self.apes([x[i], y[j]])
+                v[i, j, :] = w
+        
+        self.apes = v 
+        return v
+
+    def plot_apes(self):
+        """
+        plot the APES
+        """
+        if self.apes is None:
+            self.get_apes()
+        
+        fig, (ax0, ax1) = plt.subplots(nrows=2)
+        ax0.contourf(self.X, self.Y, self.apes[:, :, 1], lw=0.7)
+        ax1.contourf(self.X, self.Y, self.apes[:, :, 0], lw=0.7)
+        return
+
+    def plot_dpes(self, style='2D'):
         if style == '2D':
             fig, (ax0, ax1) = plt.subplots(nrows=2)
             ax0.contourf(self.X, self.Y, self.v[:, :, 1, 1], lw=0.7)
@@ -139,6 +203,9 @@ class Vibronic2:
             ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
+
+    def spo(self):
+        return SPO2(nstates=self.nstates, mass=self.mass, x=x, y=y)
 
 class DHO2:
     def __init__(self, x=None, y=None, h=1, l=1, delta=0, mass=[1, 1], nstates=2):
@@ -795,6 +862,8 @@ if __name__ == '__main__':
 
 
     # mol.plot_apes()
+
+    
 
     # from pyqed.style import plot_surface
     # plot_surface(x, y, F)

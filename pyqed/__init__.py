@@ -4,4 +4,5 @@ from .fft import *
 from .mol import *
 from .style import *
 from .cavity import *
+from .wpd import *
 

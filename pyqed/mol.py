@@ -425,7 +425,7 @@ class Mol:
         else:
             return np.linalg.eigvals(self.H)
 
-    def eigenstates(self, k=6):
+    def eigenstates(self, k=None):
         """
 
         Parameters
@@ -441,6 +441,9 @@ class Mol:
         if self.H is None:
             raise ValueError('Call getH/calcH to compute H first.')
 
+        if k is None or k >= self.dim :
+            return np.linalg.eigh(self.H.toarray())
+
         if k < self.dim:
             eigvals, eigvecs = linalg.eigs(self.H, k=k, which='SR')
 
@@ -449,8 +452,8 @@ class Mol:
             eigvecs = eigvecs[:, idx]
             return eigvals, eigvecs
 
-        if k == self.dim:
-            return np.linalg.eigh(self.H.toarray())
+        # if k == self.dim:
+        #     return np.linalg.eigh(self.H.toarray())
 
     def driven_dynamics(self, psi0, pulse, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''
