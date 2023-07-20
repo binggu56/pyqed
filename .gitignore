@@ -5,3 +5,8 @@ build/
 *.pdf
 *.pyc
 *.npz
+.eggs/pytest_runner-6.0.0-py3.8.egg/EGG-INFO/RECORD
+.eggs/pytest_runner-6.0.0-py3.8.egg/EGG-INFO/PKG-INFO
+*.log
+*.out
+*.gz
