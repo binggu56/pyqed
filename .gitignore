@@ -1,5 +1,6 @@
 *.pyc
 pyqed/__pycache__/
+pyqed/pyqed/__pycache__/
 build/
 *.pdf
 *.pyc
