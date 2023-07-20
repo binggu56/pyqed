@@ -1256,75 +1256,80 @@ def driven_dissipative_dynamics(ham, dip, rho0, pulse, dt=0.001, Nt=1, \
 ####################
 def multispin(onsite, hopping, nsites):
 
-    if not isinstance(hopping, float):
-        raise ValueError('Hopping must be float.')
+    # if not isinstance(hopping, float):
+    #     raise ValueError('Hopping must be float.')
 
-    if isinstance(onsite, (float, int)):
+    # if isinstance(onsite, (float, int)):
+    #     onsite = [onsite, ] * nsites
+
+    # return multimode(omegas=onsite, nmodes=nsites, J=hopping, truncate=2)
+
+    s0, sx, sy, sz = pauli()
+    sm, sp = lowering(), raising()
+
+    sz = 0.5 * (s0 - sz)
+    
+    if isinstance(onsite, float):
         onsite = [onsite, ] * nsites
+        
+    h0 = 0.5 * onsite[0] * sz
+    x = sx
+    idm = s0
 
-    return multimode(omegas=onsite, nmodes=nsites, J=hopping, truncate=2)
+    assert len(onsite) == nsites
 
-    # s0, sx, sy, sz = pauli()
+    if nsites == 1:
 
-    # N = 2
-    # sz = 0.5 * (s0 - sz)
-    # h0 = 0.5 * onsite[0] * sz
-    # x = sx
-    # idm = s0
+        return h0, sm
 
-    # assert len(onsite) == nsites
+    elif nsites == 2:
 
-    # if nsites == 1:
+        J = hopping
+        h0 = 0.5 * onsite[0] * sz
 
-    #     return h0, x
+        hf = 0.5 * onsite[-1] * sz
+        ham = kron(idm, hf) + kron(h0, idm) + J * (kron(sm, sp) + kron(sp, sm))
 
-    # elif nsites == 2:
+        xs = [kron(sm, idm), kron(idm, sm)]
+        return ham, xs
 
-    #     J = hopping
+    elif nsites > 2:
+        h0 = 0.5 * onsite[0] * sz
+        hf = 0.5 * onsite[-1] * sz
 
-    #     hf = 0.5 * onsite[-1] * sz
-    #     ham = kron(idm, hf) + kron(h0, idm) + J * kron(x, x)
+        head = kron(h0, tensor_power(idm, nsites-1))
+        tail = kron(tensor_power(idm, nsites-1), hf)
+        ham = head + tail
 
-    #     xs = [kron(x, idm), kron(idm, x)]
-    #     return ham, xs
+        for i in range(1, nsites-1):
+            h = 0.5 * onsite[i] * sz
+            ham += kron(tensor_power(idm, i), \
+                                      kron(h, tensor_power(idm, nsites-i-1)))
 
-    # elif nsites > 2:
+        hop_head = J * kron(kron(sm, sp) + kron(sp, sm), tensor_power(idm, nsites-2))
+        hop_tail = J * kron(tensor_power(idm, nsites-2), kron(sm, sp) + kron(sp, sm))
 
-    #     hf = 0.5 * onsite[-1] * sz
+        ham += hop_head + hop_tail
 
-    #     head = kron(h0, tensor_power(idm, nsites-1))
-    #     tail = kron(tensor_power(idm, nsites-1), hf)
-    #     ham = head + tail
+        for i in range(1, nsites-2):
+            ham += J * kron(tensor_power(idm, i), \
+                                kron(kron(x, x), tensor_power(idm, nsites-i-2)))
 
-    #     for i in range(1, nsites-1):
-    #         h = 0.5 * onsite[i] * sz
-    #         ham += kron(tensor_power(idm, i), \
-    #                                  kron(h, tensor_power(idm, nmodes-i-1)))
+        # connect the last mode to the first mode
 
-    #     hop_head = J * kron(kron(x, x), tensor_power(idm, nmodes-2))
-    #     hop_tail = J * kron(tensor_power(idm, nmodes-2), kron(x, x))
+        lower_head = kron(sm, tensor_power(idm, nsites-1))
+        xs = []
+        xs.append(lower_head)
 
-    #     ham += hop_head + hop_tail
+        for i in range(1, nsites-1):
+            # x = quadrature(dims[i])
+            lower = kron(tensor_power(idm, i), kron(sm, tensor_power(idm, nsites-i-1)))
+            xs.append(lower.copy())
 
-    #     for i in range(1, nmodes-2):
-    #         ham += J * kron(tensor_power(idm, i), \
-    #                             kron(kron(x, x), tensor_power(idm, nmodes-i-2)))
+        lower_tail = kron(tensor_power(idm, nsites-1), sm)
+        xs.append(lower_tail)
 
-    #     # connect the last mode to the first mode
-
-    #     lower_head = kron(x, tensor_power(idm, nmodes-1))
-    #     xs = []
-    #     xs.append(lower_head)
-
-    #     for i in range(1, nmodes-1):
-    #         # x = quadrature(dims[i])
-    #         lower = kron(tensor_power(idm, i), kron(x, tensor_power(idm, nmodes-i-1)))
-    #         xs.append(lower.copy())
-
-    #     lower_tail = kron(tensor_power(idm, nmodes-1), x)
-    #     xs.append(lower_tail)
-
-    #     return ham, xs
+        return ham, xs
 
 def multi_spin(onsite, nsites):
     """
