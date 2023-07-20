@@ -30,6 +30,8 @@ from pyqed.phys import dag, quantum_dynamics, \
     obs, basis, isdiag, jump, multimode, transform, rk4, tdse, \
         isdiag
 
+from pyqed.deom import DEOMSolver
+
 from pyqed.units import au2wavenumber, au2fs
 import pickle
 
@@ -699,6 +701,16 @@ class Mol:
         second-order time-convolutionless quantum master equation
         """
         pass
+
+
+    def deom(self, bath, coupling, coupling_dipole=None, pulse_system_func=None, pulse_coupling_func=None, mode=None):
+        """
+        hierarchical equations of motion
+        """
+        solver = DEOMSolver(self.H, self.edip, bath,
+                            coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)
+        return solver
+
 
     def absorption(self, omegas, method='sos', **kwargs):
         '''
