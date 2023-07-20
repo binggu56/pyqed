@@ -11,3 +11,4 @@ build/
 *.out
 *.gz
 .eggs/pytest_runner-6.0.0-py3.8.egg/EGG-INFO/PKG-INFO
+*.woff2
