@@ -1266,6 +1266,7 @@ def multispin(onsite, hopping, nsites):
 
     s0, sx, sy, sz = pauli()
     sm, sp = lowering(), raising()
+    J = hopping
 
     sz = 0.5 * (s0 - sz)
     

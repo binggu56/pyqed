@@ -39,14 +39,14 @@ if __name__ == '__main__':
     J = -260/au2wavenumber
 
 
-    model = Frenkel(onsite, hopping=J, nsites=2)
+    model = Frenkel(onsite, hopping=J, nsites=6)
     B = model.lowering
     B0 = B[0]
     print(dag(B0) @ B0)
     # print(model.eigenstates())
     # print(len(model.lowering))
-    # E, u = model.eigenstates()
-    # level_scheme(E)
-    # BO spectral density
+    E, u = model.eigenstates()
+    level_scheme(E)
+    #BO spectral density
 
 
