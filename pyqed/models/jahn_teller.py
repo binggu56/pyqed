@@ -19,91 +19,169 @@ from collections import namedtuple
 from dataclasses import dataclass
 
 
-# import sys
-# sys.path.append(r'C:\Users\Bing\Google Drive\lime')
-#sys.path.append(r'/Users/bing/Google Drive/lime')
-
-from lime.phys import boson, dag, sort, jump, multimode
-from lime.style import set_style
-from lime.units import au2ev, wavenumber2hartree, wavenum2au
-from lime.mol import Mol, SESolver, LVC, Mode
+from pyqed import boson, dag, sort, jump, multimode, transform, Mol, SESolver,\
+    Mode, polar, LVC
+from pyqed.style import set_style, matplot
+from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
 
-class LVC:
-    def __init__(self, e_fc, omegas, off_diagonal_coupling, diagonal_coupling):
+# class LVC:
+#     def __init__(self, e_fc, omegas, off_diagonal_coupling, diagonal_coupling):
+#         """
+#         linear vibronic coupling model
+
+#         Parameters
+#         ----------
+#         e_fc : 1d array
+#             electronic energy at ground-state minimum
+#         omegas : TYPE
+#             DESCRIPTION.
+#         off_diagonal_coupling : TYPE
+#             DESCRIPTION.
+#         diagonal_coupling : TYPE
+#             DESCRIPTION.
+
+#         Raises
+#         ------
+#         NotImplementedError
+#             DESCRIPTION.
+
+#         Returns
+#         -------
+#         None.
+
+#         """
+
+#         if len(omegas) != 2 or len(e_fc) != 3:
+#             raise NotImplementedError
+
+#         self.nstates = len(e_fc)
+#         self.nmodes = len(omegas)
+#         self.e_fc = e_fc
+#         self.omegas = omegas
+#         self.off_diagonal_coupling = off_diagonal_coupling
+#         self.diagonal_coupling = diagonal_coupling
+
+#         self.H = None
+#         self.dim = None
+
+#     def calcH(self, nums):
+#         """
+#         Calculate the vibronic Hamiltonian.
+
+#         Parameters
+#         ----------
+#         nums : list of integers
+#             size for the Fock space of each mode
+
+#         Returns
+#         -------
+#         2d array
+#             Hamiltonian
+
+#         """
+#         self.H = vibronic(self.e_fc, self.omegas, self.nstates, nums, \
+#                         self.diagonal_coupling, self.off_diagonal_coupling)
+
+#         self.dim = self.H.shape[0]
+
+#         return self.H
+
+#     def calc_edip(self):
+#         pass
+
+#     def dpes(self, q):
+#         pass
+
+#     def apes(self, q):
+#         pass
+
+#     def wavepacket_dynamics(self):
+        # return SESolver(self.H)
+
+
+class JahnTeller(LVC):
+    """
+    E \otimes e Jahn-Teller model with two degenerate modes and two degenerate electronic states
+    (+ the ground state)
+    """
+    def __init__(self, E, omega, kappa, truncate=24):
         """
-        linear vibronic coupling model
-
+    
+    
         Parameters
         ----------
-        e_fc : 1d array
-            electronic energy at ground-state minimum
-        omegas : TYPE
+        E : TYPE
             DESCRIPTION.
-        off_diagonal_coupling : TYPE
+        omega : TYPE
             DESCRIPTION.
-        diagonal_coupling : TYPE
+        kappa : TYPE
             DESCRIPTION.
-
-        Raises
-        ------
-        NotImplementedError
-            DESCRIPTION.
-
+        truncate : TYPE, optional
+            DESCRIPTION. The default is 24.
+    
         Returns
         -------
         None.
-
+    
         """
-
-        if len(omegas) != 2 or len(e_fc) != 3:
-            raise NotImplementedError
-
-        self.nstates = len(e_fc)
-        self.nmodes = len(omegas)
-        self.e_fc = e_fc
-        self.omegas = omegas
-        self.off_diagonal_coupling = off_diagonal_coupling
-        self.diagonal_coupling = diagonal_coupling
-
-        self.H = None
-        self.dim = None
-
-    def calcH(self, nums):
-        """
-        Calculate the vibronic Hamiltonian.
-
-        Parameters
-        ----------
-        nums : list of integers
-            size for the Fock space of each mode
-
-        Returns
-        -------
-        2d array
-            Hamiltonian
-
-        """
-        self.H = vibronic(self.e_fc, self.omegas, self.nstates, nums, \
-                        self.diagonal_coupling, self.off_diagonal_coupling)
-
-        self.dim = self.H.shape[0]
-
-        return self.H
-
-    def calc_edip(self):
-        pass
-
-    def dpes(self, q):
-        pass
-
-    def apes(self, q):
-        pass
-
-    def wavepacket_dynamics(self):
-        return SESolver(self.H)
-
-
+        self.omega = omega
+        self.kappa = kappa
+    
+        tuning_mode = Mode(omega, couplings=[[[1, 1], kappa], \
+                                             [[2, 2], -kappa]], truncate=24)
+        coupling_mode = Mode(omega, [[[1, 2], kappa]], truncate=24)
+    
+        modes = [tuning_mode, coupling_mode]
+        super().__init__(E, modes)
+    
+    
+    def APES(self, x, y, B=None):
+    
+        V = np.diag(self.e_fc).astype(complex)
+    
+        rho, theta = polar(x, y)
+        V += 0.5 * self.omega * rho**2 * self.idm_el
+    
+        # coupling
+        C = self.kappa * rho * np.exp(-1j * theta) * jump(1, 2, dim=3, isherm=False)
+        V += C + dag(C)
+    
+        # for j, mode in enumerate(self.modes):
+        #     for c in mode.couplings:
+        #         a, b = c[0]
+        #         strength = c[1]
+        #         V += strength * jump(a, b, self.nstates) * xvec[j]
+    
+        # # reverse transformation from |+/-> to |x/y>
+        # R = np.zeros((self.nstates, self.nstates))
+        # R[0, 0] = 1.
+        # R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1], [-1j, 1j]])
+    
+        if B is not None:
+            V += B * np.diag([0, -0.5, 0.5])
+    
+        E = np.linalg.eigvals(V)
+        return np.sort(E)
+    
+    def buildH(self, B=None):
+        H = super().buildH()
+    
+        # rotate the electronic states into ring-current carrying eigenstates of Lz ???
+        # |+/-> = (|x> +/- |y>)/sqrt(2)
+        R = np.zeros((self.nstates, self.nstates), dtype=complex)
+        R[0, 0] = 1.
+        R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1j], [1, -1j]])
+    
+        R = kron(R, self.idm_vib)
+    
+        self.H = transform(H, R)
+    
+        if B is not None:
+            H += B * kron(np.diag([0, -0.5, 0.5]), self.idm_vib)
+    
+        self.H = H
+        return H
 
 
 def pos(n_vib):
@@ -456,7 +534,7 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
     from matplotlib import rcParams
-    from lime.units import au2fs
+    from pyqed.units import au2fs
 
     # rcParams['axes.labelpad'] = 6
     # rcParams['xtick.major.pad']='2'
@@ -493,7 +571,7 @@ if __name__ == '__main__':
 
     model = LVC(Eshift, modes)
 
-    model.calcH()
+    model.buildH()
     print(model.H.shape)
 
     # e, evecs = model.eigenstates(k=2)

@@ -12,3 +12,7 @@ build/
 *.gz
 .eggs/pytest_runner-6.0.0-py3.8.egg/EGG-INFO/PKG-INFO
 *.woff2
+*.xyz
+pyqed/qchem/.DS_Store
+.DS_Store
+.DS_Store

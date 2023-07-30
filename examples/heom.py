@@ -43,4 +43,4 @@ rho0 = dm2vec(rho0)
 
 u = sol.propagator(dt=0.001, nt=nt, temperature=300, cutoff=5, reorganization=0.2, nado=5)
 
-print(u @ rho0)
+print(u[0] @ rho0)

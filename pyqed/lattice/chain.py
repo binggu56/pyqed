@@ -119,7 +119,7 @@ class Chain(Mol):
         self.H = H
         return H
 
-    def floquet(self):
+    def Floquet(self):
         # drive_with_efield
 
         return Floquet(self.H, -self.position())
@@ -131,6 +131,14 @@ class Chain(Mol):
     def gf(self):
         # surface and bulk Green function
         pass
+
+    def gf_surface(self):
+        pass
+
+
+    def LvN(self, *args, **kwargs):
+        # Liouville von Newnman equation solver
+        return LvN(*args, **kwargs)
 
 
 
