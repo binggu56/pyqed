@@ -1,33 +1,10 @@
 '''
 This example shows how to use the DEOM class to simulate the dynamics of a two-level system coupled to a drude bath.
 '''
-from pyqed.mol import Mol, LVC, Mode
-from pyqed.deom import Bath, decompose_spectrum_prony, spectrum_exp, decompose_spectrum_pade, prony_fitting
+from pyqed.deom import decompose_spectrum_prony, spectrum_exp, decompose_spectrum_pade, prony_fitting
 import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.sparse import identity, kron, dok_array, coo_matrix
-from pyqed import wavenumber2hartree
-
-
-def truncate(H, n):
-    '''
-    throw away all matrix elements with indices small than n
-    '''
-    return coo_matrix((H.toarray())[n:, n:])
-
-
-def pos(n_vib):
-    """
-    position matrix elements <n|Q|n'>
-    """
-    X = np.zeros((n_vib, n_vib))
-
-    for i in range(1, n_vib):
-        X[i, i-1] = np.sqrt(i/2.)
-    for i in range(n_vib-1):
-        X[i, i+1] = np.sqrt((i+1)/2.)
-    return X
 
 
 def gen_jw(w, lams1, gams1):
