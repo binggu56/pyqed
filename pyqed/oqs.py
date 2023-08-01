@@ -188,7 +188,7 @@ class Redfield_solver:
         """
 
 
-        # construct total liouvillian
+        # construct total liouvillia n
         if self.R is None:
             raise TypeError('Redfield tensor is not computed. Please call redfield_tensor()')
 
