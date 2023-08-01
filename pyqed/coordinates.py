@@ -458,19 +458,17 @@ class Molecule:
     def __init__(self, **kwargs):
 
         mol = gto.M(**kwargs)
-    
+
         self.mol = mol
         # self.atom_coord = mol.atom_coord
         self.atom_coords = (mol.atom_coords()) # shape 3, natoms
         # print(self.atom_coords.shape)
         self.natom = mol.natm
         self.mass = mol.atom_mass_list()
-        self.atom_symbol = [mol.atom_symbol(i) for i in range(self.natom)]
+        self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
 
 
         self.distmat = None
-
-        # return gto.M(atom=geometry, *args)
 
 
     def com(self):
@@ -479,7 +477,7 @@ class Molecule:
 
         Returns
         -------
-        TYPE  
+        TYPE
             DESCRIPTION.
 
         '''
@@ -490,12 +488,12 @@ class Molecule:
         mass = self.mass
         coords = self.atom_coords
         return intertia_moment(mass, coords)
-    
+
     def molecular_frame(self):
         # transfrom to molecular frame
         self.atom_coords -= self.com()
         return self.atom_coords
-    
+
     def eckart_frame(self, ref):
         """
         transform to the Eckart frame relative to a reference geometry
@@ -509,10 +507,10 @@ class Molecule:
         -------
         None.
 
-        """    
+        """
         self.atom_coords = eckart(ref.T, self.atom_coords.T, self.mass)
         return self.atom_coords
-    
+
     def principle_axes(self):
         pass
 
@@ -779,7 +777,7 @@ def eckart(reference, changed, mass, option=None):
 # % if (abs(max(max(comref))) > 1e-4)
 # %     disp('Warning! Translational Eckart Condition for reference not satisfied!');
 # % end
-    
+
 
 
     # Quasi Angular Momentum
@@ -895,14 +893,14 @@ if __name__ == '__main__':
 
 
 
-    
+
     mol.basis = 'STO-3G'
     mol.build()
-    
+
     geometry2 = [['H' , (0.1,      0., 0.)],
                 ['H', (1.3, 0., 0.)]]
     mol2 = Molecule(atom=geometry2)
-    
+
     print(mol2.atom_coords)
     print(mol2.com())
     mol2.molecular_frame()

@@ -1937,7 +1937,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
         #sz += -1j * commutator(sz, H) * dt
 
     # f.close()
-    return u[0]
+    return u
 
 def test_lindblad():
     mesolver = Lindblad_solver(H, c_ops=[sz.astype(complex)])

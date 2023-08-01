@@ -28,7 +28,7 @@ from pyqed.units import au2fs, au2ev
 from pyqed.signal import sos
 from pyqed.phys import dag, quantum_dynamics, \
     obs, basis, isdiag, jump, multimode, transform, rk4, tdse, \
-        isdiag
+        isdiag, ket2dm, tensor
 
 from pyqed.deom import DEOMSolver
 
@@ -835,6 +835,68 @@ class Mol:
             fig.savefig(fname+'.pdf')
 
             return S, fig, ax
+        
+    def multi(self, nmol=2):
+        H = csr_matrix(self.H)
+        I = csr_matrix(self.idm)
+        edip = csr_matrix(self.edip) 
+    
+        
+        #+ kron(I, H))
+        l = [H] + [I, ] * (nmol-1)
+        h_tot = tensor(l)
+        for n in range(1, nmol):
+            l = [I, ] * nmol
+            l[n] = H
+            # print(l[0], l[1])
+            # print(n, tensor(l))
+            h_tot += tensor(l)
+        
+
+        edip_tot = 0
+        for n in range(nmol):
+            l = [I, ] * nmol
+            l[n] = edip
+            edip_tot += tensor(l)
+            
+            
+            
+
+        return h_tot, edip_tot
+
+
+def direct_product(a, n):
+    """
+    Single-molecule operator in the direct product space of N molecules
+    
+    .. math::
+        A = a \otimes I \cdots I + I \otimes A \otimes I \cdots I + \cdots
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    n : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atot : TYPE
+        DESCRIPTION.
+
+    """
+    I = identity(a)
+    atot = 0
+    
+    for j in range(n):
+        l = [I, ] * n
+        l[j] = a
+        atot += tensor(l)
+
+    return atot
+
+    
+            
 
 @dataclass
 class Mode:
@@ -1165,88 +1227,7 @@ def polar(x, y):
     phi = np.arctan2(y, x)
     return(rho, phi)
 
-class JahnTeller(LVC):
-    """
-    E \otimes e Jahn-Teller model with two degenerate modes and two degenerate electronic states
-    (+ the ground state)
-    """
-    def __init__(self, E, omega, kappa, truncate=24):
-        """
 
-
-        Parameters
-        ----------
-        E : TYPE
-            DESCRIPTION.
-        omega : TYPE
-            DESCRIPTION.
-        kappa : TYPE
-            DESCRIPTION.
-        truncate : TYPE, optional
-            DESCRIPTION. The default is 24.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.omega = omega
-        self.kappa = kappa
-
-        tuning_mode = Mode(omega, couplings=[[[1, 1], kappa], \
-                                             [[2, 2], -kappa]], truncate=24)
-        coupling_mode = Mode(omega, [[[1, 2], kappa]], truncate=24)
-
-        modes = [tuning_mode, coupling_mode]
-        super().__init__(E, modes)
-
-
-    def APES(self, x, y, B=None):
-
-        V = np.diag(self.e_fc).astype(complex)
-
-        rho, theta = polar(x, y)
-        V += 0.5 * self.omega * rho**2 * self.idm_el
-
-        # coupling
-        C = self.kappa * rho * np.exp(-1j * theta) * jump(1, 2, dim=3, isherm=False)
-        V += C + dag(C)
-
-        # for j, mode in enumerate(self.modes):
-        #     for c in mode.couplings:
-        #         a, b = c[0]
-        #         strength = c[1]
-        #         V += strength * jump(a, b, self.nstates) * xvec[j]
-
-        # # reverse transformation from |+/-> to |x/y>
-        # R = np.zeros((self.nstates, self.nstates))
-        # R[0, 0] = 1.
-        # R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1], [-1j, 1j]])
-
-        if B is not None:
-            V += B * np.diag([0, -0.5, 0.5])
-
-        E = np.linalg.eigvals(V)
-        return np.sort(E)
-
-    def buildH(self, B=None):
-        H = super().buildH()
-
-        # rotate the electronic states into ring-current carrying eigenstates of Lz ???
-        # |+/-> = (|x> +/- |y>)/sqrt(2)
-        R = np.zeros((self.nstates, self.nstates), dtype=complex)
-        R[0, 0] = 1.
-        R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1j], [1, -1j]])
-
-        R = kron(R, self.idm_vib)
-
-        self.H = transform(H, R)
-
-        if B is not None:
-            H += B * kron(np.diag([0, -0.5, 0.5]), self.idm_vib)
-
-        self.H = H
-        return H
 
 # class Vibronic:
 #     '''
@@ -1257,6 +1238,59 @@ class JahnTeller(LVC):
 #         self.ylim = ylim
 
 
+
+# class LvNSolver:
+#     """
+#     do we need a separate class for LvN equation?
+#     """
+#     def __init__(self, H=None):
+#         self.H = H
+#         self.groundstate = None
+
+#     def run(self, rho0=None, dt=0.01, Nt=1,\
+#             e_ops=None, nout=1, t0=0.0, edip=None, pulse=None, sparse=True):
+
+#         if rho0 is None:
+#             print("Initial state not specified. Using the ground state.")
+#             rho0 = ket2dm(self.groundstate)
+
+#         # H0 = self.H
+
+#         if pulse is None:
+#             pass
+#             # return _quantum_dynamics(H0, psi0, dt=dt, Nt=Nt,
+#             #                          e_ops=e_ops, nout=nout, t0=t0)
+#         else:
+#             if edip is None:
+#                 raise ValueError('Electric dipole must be provided for \
+#                                  laser-driven dynamics.')
+
+#             if isinstance(pulse, list): # multi pulses
+
+#                 H = [self.H]
+
+#                 for i in range(len(pulse)):
+#                     H.append([edip[i], pulse[i].efield])
+
+#                 # return driven_dynamics(H=H, psi0=psi0, dt=dt, Nt=Nt, \
+#                 #                    e_ops=e_ops, nout=nout, t0=t0)
+
+#             else: # single pulse
+
+#                 if edip.ndim == 2: # dipole projected on the laser polarization
+
+#                     H = [self.H]
+#                     H.append([edip, pulse.efield])
+
+#                     # return driven_dynamics(H=H, psi0=psi0, dt=dt, Nt=Nt, \
+#                     #                e_ops=e_ops, nout=nout, t0=t0, \
+#                     #                    use_sparse=use_sparse)
+
+#                 elif edip.ndim == 3: # full dipole
+#                     pass
+#                     # return _driven_dynamics(H=H0, psi0=psi0, edip=edip,\
+#                     #                         E=pulse.E, dt=dt, Nt=Nt, \
+#                     #                e_ops=e_ops, nout=nout, t0=t0)
 
 
 
@@ -1279,6 +1313,7 @@ class SESolver:
         self.H = H
         self.groundstate = None
         # self._isherm = isherm
+
 
 
 
@@ -1460,7 +1495,7 @@ class SESolver:
         return self.correlation_3op_2t(psi0, [a_op, b_op @ c_op, d_op], dt, Nt, Ntau)
 
 
-def _propagator(H, dt, Nt):
+def _propagator(H, dt, Nt, integrator='rk4'):
     """
     compute the resolvent for the multi-point correlation function signals
     U(t) = e^{-i H t}
@@ -1472,15 +1507,24 @@ def _propagator(H, dt, Nt):
     """
 
     # propagator
-    U = identity(H.shape[-1], dtype=complex)
-
+    I = identity(H.shape[-1], dtype=complex)
+    U = I
     # set the ground state energy to 0
     print('Computing the propagator. '
           'Please make sure that the ground-state energy is 0.')
-    Ulist = []
-    for k in range(Nt):
-        Ulist.append(U.copy())
-        U = rk4(U, tdse, dt, H)
+    Ulist = [U]
+
+    if integrator == 'rk4':
+
+        for k in range(Nt):
+            Ulist.append(U.copy())
+            U = rk4(U, tdse, dt, H)
+
+    elif integrator == 'crank_nicolson':
+
+        for k in range(Nt):
+            U = np.linalg.solve(I + 1j * H * dt/2.0, np.dot(I - 1j * H * dt/2.0, U))
+            Ulist.append(U.copy())
 
     return Ulist
 
@@ -1978,7 +2022,14 @@ if __name__ == '__main__':
     shift = np.linspace(0, 1)/au2ev
 
 
-    high_frequency_drive()
+    # high_frequency_drive()
+    s0, sx, sy, sz = pauli()
+    
+    mol = Mol((-sz+s0)/2, edip=sx)
+    H, dip = mol.multi()
+    print(H)
+    print(dip)
+    
     # mol.absorption(omegas)
     # mol.photon_echo(pump=omegas, probe=omegas, plt_signal=True)
     # S = mol.cars(shift=shift, omega1=omegas, plt_signal=True)

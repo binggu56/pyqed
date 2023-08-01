@@ -445,7 +445,7 @@ def fftfreq(times):
     """
     return np.fft.fftshift(np.fft.fftfreq(len(times), interval(times)))
 
-def tensor(*args):
+def tensor(*args, **kwargs):
     """Calculates the tensor product of input operators.
 
     Build from QuTip.
@@ -460,6 +460,11 @@ def tensor(*args):
 
 
     """
+    
+    # if kwargs['sparse']:
+    #     kron = sp.kron
+    # else:
+    #     kron = np.kron
 
     if not args:
         raise TypeError("Requires at least one input argument")
@@ -474,11 +479,10 @@ def tensor(*args):
         # tensor(q1, q2, q3, ...)
         qlist = args
 
-    for n, q in enumerate(qlist):
-        if n == 0:
-            out = q
-        else:
-            out = sp.kron(out, q, format='csr')
+    out = qlist[0]
+    for n in range(1, len(qlist)):
+
+        out = kron(out, qlist[n], format='csr')
 
     return out
 
@@ -1820,6 +1824,9 @@ def pdf_normal(x, mu=0, sigma=1.):
 
 if __name__ == '__main__':
     H = sigmaz() -  sigmax()
+    s0, sx, sy, sz = pauli()
+    
+    print(kron(sz, s0) != tensor(csr_matrix(sz), csr_matrix(s0)))
     # print(isherm(H))
 
     # import matplotlib.pyplot as plt
@@ -1827,12 +1834,12 @@ if __name__ == '__main__':
     # plt.plot(x, pdf_normal(x))
     # plt.show()
 
-    dt = 0.005
-    nt = 50
-    U1 = propagator(H, dt, nt, method='diag')
-    U2 = propagator(H, dt, nt, method='eom')
-    print(U1[-1])
-    print(U2[-1])
+    # dt = 0.005
+    # nt = 50
+    # U1 = propagator(H, dt, nt, method='diag')
+    # U2 = propagator(H, dt, nt, method='eom')
+    # print(U1[-1])
+    # print(U2[-1])
 
 
 
