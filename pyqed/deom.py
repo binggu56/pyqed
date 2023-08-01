@@ -442,6 +442,15 @@ def prony_find_gamma(h, n_sample, nind):
 
 
 def prony_fitting(h, t, nind, scale, n, gamma_real=None, gamma_imag=None):
+    '''
+    h: sample
+    t: list of time
+    nind: number of poles. Can be a list of [nind_real, nind_imag], or a single number. If nind_real or nind_imag is 'a', then it will be using the analytical method.
+    scale: range of the sample, for example, if the time is from 0 to 10, then the scale should be 10.
+    n: number of sample
+    gamma_real: the gamma for real part. If not given, it will be calculated.
+    gamma_imag: the gamma for imag part. If not given, it will be calculated.
+    '''
     if type(nind) is list:
         if (gamma_real is None):
             gamma_real = prony_find_gamma(np.real(h), n, nind[0])
