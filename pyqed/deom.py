@@ -13,6 +13,53 @@ import sympy as sp
 import math
 from tqdm import tqdm
 from scipy.sparse import coo_matrix
+from numpy import linalg as la
+from cvxopt import solvers, matrix
+
+
+def spectrum_exp(w, res, expn, etal, sigma=-1):
+    for i in range(len(etal)):
+        res += etal[i] / (expn[i] + sigma * 1.j * w)
+
+
+def numpy_to_cvxopt_matrix(A):
+    if A is None:
+        return A
+    if isinstance(A, np.ndarray):
+        if A.ndim == 1:
+            return matrix(A, (A.shape[0], 1), 'd')
+        return matrix(A, A.shape, 'd')
+    return A
+
+
+def sort_symmetry(etal, expn, if_sqrt=True):
+    expn_imag_sort = np.argsort(np.abs(np.imag(expn)))[::-1]
+    expn_imag = np.sort(np.abs(np.imag(expn)))[::-1]
+    expn = expn[expn_imag_sort]
+    etal = etal[expn_imag_sort]
+    etar = etal[expn_imag_sort]
+    expn_val_cc = np.where(expn[expn_imag > 1e-10])[0]
+    etaa = np.zeros(len(etal), dtype=float)
+    for ii in range(0, len(expn_val_cc), 2):
+        even_i = ii
+        odd_i = ii + 1
+        etar[even_i] = np.conj(etal[odd_i])
+        etar[odd_i] = np.conj(etal[even_i])
+        etaa[even_i] = np.abs(etal[even_i])
+        etaa[odd_i] = np.abs(etal[odd_i])
+    for ii in range(len(expn_val_cc), len(expn)):
+        even_i = ii
+        etar[even_i] = np.conj(etal[even_i])
+        etaa[even_i] = np.abs(etal[even_i])
+    if (if_sqrt):
+        etaa = np.sqrt(etaa)
+    return etal, etar, etaa, expn
+
+
+def fit_t(t, res, expn, etal):
+    for i in range(len(etal)):
+        res += etal[i] * np.exp(-expn[i] * t)
+    return res
 
 
 def function_bose(x, pole, resi):
@@ -173,7 +220,7 @@ def return_qmds(qmd1a, qmd1c, mode, nsys, etaa, etal, etar):
     return np.array([qmdtc_l, qmdtc_r, qmdta_l, qmdta_r])
 
 
-def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1):
+def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1, bose_fermi=1):
     '''
     decompose the spectrum into the pade approximation
     '''
@@ -203,7 +250,7 @@ def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1):
     expn_val_n_cc = expn[expn_imag_sort[expn_imag == 0]]
 
     expn = list(expn[expn_imag_sort])
-    pole, resi = pade_approximation_distribution(npsd, 1, pade)
+    pole, resi = pade_approximation_distribution(npsd, bose_fermi, pade)
     temp = 1 / beta
 
     for ii in range(0, len(expn_val_cc), 2):
@@ -255,6 +302,233 @@ def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1):
     etaa = np.array(etaa)
     expn = np.array(expn)
     return etal, etar, etaa, expn
+
+
+def decompose_specturm_pade_real(spe, w_sp):
+    if (sp.cancel(spe).as_real_imag()[1] == 0):
+        imag_part = sp.cancel(spe).as_real_imag()[0]
+    else:
+        imag_part = sp.cancel(spe).as_real_imag()[1]
+    numer, denom = sp.cancel(sp.factor(imag_part)).as_numer_denom()
+    poles = sp.nroots(denom)
+    float(sp.re(poles[0]))
+
+    expn, etal, etar, etaa = [], [], [], []
+    poles_allplane = np.array([])
+    for i in poles:
+        i = complex(i)
+        if i.imag < 0:
+            expn.append(i * 1.J)
+        poles_allplane = np.append(poles_allplane, i)
+
+    expn = np.array(expn)
+    expn_imag_sort = np.argsort(np.abs(np.imag(expn)))[::-1]
+    expn_imag = np.sort(np.abs(np.imag(expn)))[::-1]
+    expn_val_cc = expn[expn_imag_sort[expn_imag != 0]]
+    expn_val_n_cc = expn[expn_imag_sort[expn_imag == 0]]
+
+    for ii in range(0, len(expn_val_cc), 2):
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane + 1.J * expn_val_cc[ii]) > 1e-14])
+                      ).subs({w_sp: -1.j * expn_val_cc[ii]}))))
+
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane + 1.J * expn_val_cc[ii + 1]) > 1e-14])
+                      ).subs({w_sp: -1.j * expn_val_cc[ii + 1]}))))
+
+        etar.append(np.conj(etal[-1]))
+        etar.append(np.conj(etal[-2]))
+        etaa.append(np.sqrt(np.abs(etal[-2]) * np.abs(etar[-2])))
+        etaa.append(np.sqrt(np.abs(etal[-1]) * np.abs(etar[-1])))
+
+    for ii in range(len(expn_val_n_cc)):
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane -
+                          -1.J * expn_val_n_cc[ii]) > 1e-14])).subs(
+                              {w_sp: -1.j * expn_val_n_cc[ii]}))))
+        etar.append(np.conj(etal[-1]))
+        etaa.append(np.sqrt(np.abs(etal[-1]) * np.abs(etar[-1])))
+
+    return np.array(etal), np.array(
+        etar), np.array(etaa), np.array(expn)
+
+
+def decompose_specturm_pade_imag(spe, w_sp):
+    if (sp.cancel(spe).as_real_imag()[1] == 0):
+        imag_part = sp.cancel(spe).as_real_imag()[0]
+    else:
+        imag_part = sp.cancel(spe).as_real_imag()[1]
+    numer, denom = sp.cancel(sp.factor(imag_part)).as_numer_denom()
+
+    poles = sp.nroots(denom)
+    float(sp.re(poles[0]))
+
+    expn, etal, etar, etaa = [], [], [], []
+    poles_allplane = np.array([])
+    for i in poles:
+        i = complex(i)
+        if i.imag < 0:
+            expn.append(i * 1.J)
+        poles_allplane = np.append(poles_allplane, i)
+
+    expn = np.array(expn)
+
+    expn_imag_sort = np.argsort(np.abs(np.imag(expn)))[::-1]
+    expn_imag = np.sort(np.abs(np.imag(expn)))[::-1]
+    expn_val_cc = expn[expn_imag_sort[expn_imag != 0]]
+    expn_val_n_cc = expn[expn_imag_sort[expn_imag == 0]]
+
+    for ii in range(0, len(expn_val_cc), 2):
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane + 1.J * expn_val_cc[ii]) > 1e-14])
+                      ).subs({w_sp: -1.j * expn_val_cc[ii]}))))
+
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane + 1.J * expn_val_cc[ii + 1]) > 1e-14])
+                      ).subs({w_sp: -1.j * expn_val_cc[ii + 1]}))))
+
+        etar.append(np.conj(etal[-1]))
+        etar.append(np.conj(etal[-2]))
+        etaa.append(np.sqrt(np.abs(etal[-2]) * np.abs(etar[-2])))
+        etaa.append(np.sqrt(np.abs(etal[-1]) * np.abs(etar[-1])))
+
+    for ii in range(len(expn_val_n_cc)):
+        etal.append(
+            complex(
+                sp.N((-1.j * numer /
+                      np.multiply.reduce(w_sp - poles_allplane[np.abs(
+                          poles_allplane + 1.J * expn_val_n_cc[ii]) > 1e-14])
+                      ).subs({w_sp: -1.j * expn_val_n_cc[ii]}))))
+        etar.append(np.conj(etal[-1]))
+        etaa.append(np.sqrt(np.abs(etal[-1]) * np.abs(etar[-1])))
+
+    return np.array(etal), np.array(
+        etar), np.array(etaa), np.array(expn)
+
+
+def prony_find_gamma(h, n_sample, nind):
+    mat_h = np.zeros((n_sample, n_sample))
+    for i in range(n_sample):
+        mat_h[i, :] = h[i:n_sample + i]
+    sing_vs, Q = la.eig(mat_h)
+    phase_mat = np.diag([np.exp(-1j * np.angle(sing_v) / 2.0)
+                        for sing_v in sing_vs])
+    vs = np.array([np.abs(sing_v) for sing_v in sing_vs])
+    Qp = np.dot(Q, phase_mat)
+    sort_array = np.argsort(vs)[::-1]
+    vs = vs[sort_array]
+    Qp = (Qp[:, sort_array])
+
+    for i in [nind]:
+        print(i)
+        gamma = np.roots(Qp[:, i][::-1])
+    gamma_new = gamma[np.argsort(np.abs(gamma))[:nind]]
+    return gamma_new
+
+
+def prony_fitting(res_t, t, nind, scale, n, gamma_real=None, gamma_imag=None):
+    n_sample = (len(t) + 1) // 2
+    h = res_t
+    if type(nind) is list:
+        if (gamma_real is None):
+            gamma_real = prony_find_gamma(np.real(h), n_sample, nind[0])
+        else:
+            gamma_real = np.array(gamma_real)
+        if (gamma_imag is None):
+            gamma_imag = prony_find_gamma(np.imag(h), n_sample, nind[1])
+        else:
+            gamma_imag = np.array(gamma_imag)
+        gamma = np.append(gamma_real, gamma_imag)
+        n_row = nind[0] + nind[1]
+    else:
+        gamma = prony_find_gamma(np.real(h), n_sample, nind)
+        n_row = nind
+
+    t_new = 2*n*np.log(gamma)
+    n_col = n_sample*2-1
+    gamma_m = np.zeros((2 * n_col, 2 * n_row), dtype=float)
+    for i in range(n_row):
+        for j in range(n_col):
+            gamma_m[j, i] = np.real(gamma[i]**j)
+            gamma_m[n_col + j, n_row + i] = np.real(gamma[i]**j)
+            gamma_m[j, n_row + i] = -np.imag(gamma[i]**j)
+            gamma_m[n_col + j, i] = np.imag(gamma[i]**j)
+    h_m = np.append(np.real(h), np.imag(h))
+
+    freq_m = np.zeros((2 * n_col, 2 * n_row), dtype=float)
+
+    C = numpy_to_cvxopt_matrix(gamma_m)
+    d = numpy_to_cvxopt_matrix(h_m)
+    A = numpy_to_cvxopt_matrix(-freq_m)
+    b = numpy_to_cvxopt_matrix(np.zeros(2 * n_col))
+    Q = C.T * C
+    q = - d.T * C
+
+    opts = {'show_progress': False, 'abstol': 1e-50,
+            'reltol': 1e-50, 'feastol': 1e-50}
+    for k, v in opts.items():
+        solvers.options[k] = v
+
+    sol = solvers.qp(Q, q.T, A, b, None, None, None, None)
+    omega_new_temp = np.array(sol['x']).reshape(2, n_row)
+    omega_new = omega_new_temp[0, :] + 1.j*omega_new_temp[1, :]
+
+    etal_p = omega_new
+    expn_p = -t_new / scale
+    return sort_symmetry(etal_p, expn_p)
+
+
+def decompose_specturm_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, beta, nind: int or list, scale=50, n=1000, npsd=100, bose_fermi=1):
+    '''
+    decompose the spectrum with prony method
+    input
+    spe: the spectrum, a sp.core.mul.Mul object (sympy expression)
+    w_sp: the frequency symbol
+    nind: int or list. If int, find gamma using the real part. If list then the number of real poles and imaginary poles
+    '''
+    etal_pade, _, _, expn_pade = decompose_specturm_pade(
+        spe, w_sp, beta, npsd, bose_fermi=bose_fermi)
+
+    t = np.linspace(0, 1, 2 * n + 1)
+    res_t = np.zeros(len(t), dtype=complex)
+    fit_t(scale * t, res_t, expn_pade, etal_pade)
+
+    print("check the sample points")
+    print(res_t[:10])
+    print(res_t[-10:])
+    if type(nind) is list:
+        if nind[0] == 'a':
+            _, _, _, expn_real = decompose_specturm_pade_real(spe, w_sp)
+            gamma_real = np.exp(- expn_real * scale / (2*n))
+            nind[0] = len(gamma_real)
+            if bose_fermi == 1:
+                print("For the bose case, C(t) have the analytical imag part")
+                exit()
+            return prony_fitting(res_t, t, nind, scale, n, gamma_real=gamma_real)
+        elif nind[1] == 'a':
+            _, _, _, expn_imag = decompose_specturm_pade_imag(spe, w_sp)
+            gamma_imag = np.exp(- expn_imag * scale / (2*n))
+            nind[1] = len(gamma_imag)
+            if bose_fermi == 2:
+                print("For the fermi case, C(t) have the analytical real part")
+                exit()
+            return prony_fitting(res_t, t, nind, scale, n, gamma_imag=gamma_imag)
+    return prony_fitting(res_t, t, nind, scale, n)
 
 
 def gen_hash_value(key, nind, comb_list):
@@ -601,7 +875,7 @@ class DEOMSolver():
         '''
         return rk4(self.ddos, self.ddos1, self.ddos2, self.ddos3, self.keys, self.lmax, [self.bath.expn, self.bath.etal, self.bath.etar, self.bath.etaa],  self.bath.mode, self.system, self.system_dipole, self.pulse_system_func, self.coupling, self.coupling_dipole, self.pulse_coupling_func, self.comb_list, self.nmax, dt, t)
 
-    def run(self, rho0, dt, nt):
+    def run(self, rho0, dt, nt, p1=None):
         '''
         solve the DEOM, return the time and density matrix of the system.
         Input:
@@ -615,15 +889,25 @@ class DEOMSolver():
         self.ddos[0] = rho0
 
         t_save = np.zeros(nt + 1, dtype=np.float64)
-        ddos_save = [coo_matrix((self.nsys, self.nsys,),
-                                dtype=np.complex128)] * (nt + 1)
+        if p1 is None:
+            ddos_save = [coo_matrix((self.nsys, self.nsys,),
+                                    dtype=np.complex128)] * (nt + 1)
+        else:
+            ddos_save = np.zeros(nt + 1, dtype=np.complex128)
+
         t_save[0] = 0
-        ddos_save[0] = self.ddos[0]
+        if p1 is None:
+            ddos_save[0] = self.ddos[0]
+        else:
+            ddos_save[0] = (p1 @ self.ddos[0]).trace()
 
         for i in tqdm(range(nt)):
             self.rk4(dt, i * dt)
-            t_save[i + 1] = i * dt
-            ddos_save[i + 1] = self.ddos[0]
+            t_save[i + 1] = (i + 1) * dt
+            if p1 is None:
+                ddos_save[i + 1] = self.ddos[0]
+            else:
+                ddos_save[i + 1] = (p1 @ self.ddos[0]).trace()
         return t_save, ddos_save
 
     # def correlation_4op_3t(self, operator_a, operator_b, operator_c, operator_d, rho0, dt, nt):
