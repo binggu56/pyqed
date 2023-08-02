@@ -220,7 +220,7 @@ def return_qmds(qmd1a, qmd1c, mode, nsys, etaa, etal, etar):
     return np.array([qmdtc_l, qmdtc_r, qmdta_l, qmdta_r])
 
 
-def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1, bose_fermi=1):
+def decompose_spectrum_pade(spe, w_sp, beta, npsd, pade=1, bose_fermi=1):
     '''
     decompose the spectrum into the pade approximation
     '''
@@ -304,7 +304,7 @@ def decompose_specturm_pade(spe, w_sp, beta, npsd, pade=1, bose_fermi=1):
     return etal, etar, etaa, expn
 
 
-def decompose_specturm_pade_real(spe, w_sp):
+def decompose_spectrum_pade_real(spe, w_sp):
     if (sp.cancel(spe).as_real_imag()[1] == 0):
         imag_part = sp.cancel(spe).as_real_imag()[0]
     else:
@@ -362,7 +362,7 @@ def decompose_specturm_pade_real(spe, w_sp):
         etar), np.array(etaa), np.array(expn)
 
 
-def decompose_specturm_pade_imag(spe, w_sp):
+def decompose_spectrum_pade_imag(spe, w_sp):
     if (sp.cancel(spe).as_real_imag()[1] == 0):
         imag_part = sp.cancel(spe).as_real_imag()[0]
     else:
@@ -441,26 +441,33 @@ def prony_find_gamma(h, n_sample, nind):
     return gamma_new
 
 
-def prony_fitting(res_t, t, nind, scale, n, gamma_real=None, gamma_imag=None):
-    n_sample = (len(t) + 1) // 2
-    h = res_t
+def prony_fitting(h, t, nind, scale, n, gamma_real=None, gamma_imag=None):
+    '''
+    h: sample
+    t: list of time
+    nind: number of poles. Can be a list of [nind_real, nind_imag], or a single number. If nind_real or nind_imag is 'a', then it will be using the analytical method.
+    scale: range of the sample, for example, if the time is from 0 to 10, then the scale should be 10.
+    n: number of sample
+    gamma_real: the gamma for real part. If not given, it will be calculated.
+    gamma_imag: the gamma for imag part. If not given, it will be calculated.
+    '''
     if type(nind) is list:
         if (gamma_real is None):
-            gamma_real = prony_find_gamma(np.real(h), n_sample, nind[0])
+            gamma_real = prony_find_gamma(np.real(h), n, nind[0])
         else:
             gamma_real = np.array(gamma_real)
         if (gamma_imag is None):
-            gamma_imag = prony_find_gamma(np.imag(h), n_sample, nind[1])
+            gamma_imag = prony_find_gamma(np.imag(h), n, nind[1])
         else:
             gamma_imag = np.array(gamma_imag)
         gamma = np.append(gamma_real, gamma_imag)
         n_row = nind[0] + nind[1]
     else:
-        gamma = prony_find_gamma(np.real(h), n_sample, nind)
+        gamma = prony_find_gamma(np.real(h), n, nind)
         n_row = nind
 
     t_new = 2*n*np.log(gamma)
-    n_col = n_sample*2-1
+    n_col = len(t)
     gamma_m = np.zeros((2 * n_col, 2 * n_row), dtype=float)
     for i in range(n_row):
         for j in range(n_col):
@@ -493,7 +500,7 @@ def prony_fitting(res_t, t, nind, scale, n, gamma_real=None, gamma_imag=None):
     return sort_symmetry(etal_p, expn_p)
 
 
-def decompose_specturm_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, beta, nind: int or list, scale=50, n=1000, npsd=100, bose_fermi=1):
+def decompose_spectrum_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, beta, nind: int or list, scale=50, n=1000, npsd=100, bose_fermi=1):
     '''
     decompose the spectrum with prony method
     input
@@ -501,7 +508,7 @@ def decompose_specturm_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, 
     w_sp: the frequency symbol
     nind: int or list. If int, find gamma using the real part. If list then the number of real poles and imaginary poles
     '''
-    etal_pade, _, _, expn_pade = decompose_specturm_pade(
+    etal_pade, _, _, expn_pade = decompose_spectrum_pade(
         spe, w_sp, beta, npsd, bose_fermi=bose_fermi)
 
     t = np.linspace(0, 1, 2 * n + 1)
@@ -513,7 +520,7 @@ def decompose_specturm_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, 
     print(res_t[-10:])
     if type(nind) is list:
         if nind[0] == 'a':
-            _, _, _, expn_real = decompose_specturm_pade_real(spe, w_sp)
+            _, _, _, expn_real = decompose_spectrum_pade_real(spe, w_sp)
             gamma_real = np.exp(- expn_real * scale / (2*n))
             nind[0] = len(gamma_real)
             if bose_fermi == 1:
@@ -521,7 +528,7 @@ def decompose_specturm_prony(spe: sp.core.mul.Mul, w_sp: sp.core.symbol.Symbol, 
                 exit()
             return prony_fitting(res_t, t, nind, scale, n, gamma_real=gamma_real)
         elif nind[1] == 'a':
-            _, _, _, expn_imag = decompose_specturm_pade_imag(spe, w_sp)
+            _, _, _, expn_imag = decompose_spectrum_pade_imag(spe, w_sp)
             gamma_imag = np.exp(- expn_imag * scale / (2*n))
             nind[1] = len(gamma_imag)
             if bose_fermi == 2:
@@ -699,16 +706,16 @@ class Bath():
     bath class for DEOM
     '''
 
-    def __init__(self, specturm_sp=None, w_sp=None, beta=None, npsd=None, mode=None):
+    def __init__(self, spectrum_sp=None, w_sp=None, beta=None, npsd=None, mode=None):
         '''
         initialize the bath
         Input:
-            specturm_sp: the spectral density of the bath, a function of frequency. Must be a sympy expression.
+            spectrum_sp: the spectral density of the bath, a function of frequency. Must be a sympy expression.
             w_sp: the frequency of the bath, a sympy symbol.
             beta: the inverse temperature of the bath.
             npsd: the number of the poles of the spectral density.
         '''
-        self.bath = specturm_sp
+        self.bath = spectrum_sp
         self.w_sp = w_sp
         self.beta = beta
         self.npsd = npsd
@@ -718,7 +725,7 @@ class Bath():
             if (len(self.bath) != len(self.beta)) or (len(self.bath) != len(self.npsd)):
                 print("the length of bath, w_sp, beta, npsd is not equal!")
             for i in range(len(self.bath)):
-                etal_p, etar_p, etaa_p, expn_p = decompose_specturm_pade(
+                etal_p, etar_p, etaa_p, expn_p = decompose_spectrum_pade(
                     self.bath[i], self.w_sp, self.beta[i], self.npsd[i])
                 self.etal = np.append(self.etal, etal_p)
                 self.etar = np.append(self.etar, etar_p)
@@ -735,7 +742,7 @@ class Bath():
                 print("the length of mode is not equal to the number of dissipatons!")
                 raise ValueError
         else:
-            self.etal, self.etar, self.etaa, self.expn = decompose_specturm_pade(
+            self.etal, self.etar, self.etaa, self.expn = decompose_spectrum_pade(
                 self.bath, self.w_sp, self.beta, self.npsd)
             self.mode = np.zeros_like(self.expn, dtype=np.int64)
 
