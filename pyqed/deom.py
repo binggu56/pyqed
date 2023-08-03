@@ -14,7 +14,7 @@ import math
 from tqdm import tqdm
 from scipy.sparse import coo_matrix
 from numpy import linalg as la
-from cvxopt import solvers, matrix
+# from cvxopt import solvers, matrix
 
 
 def spectrum_exp(w, res, expn, etal, sigma=-1):
@@ -22,14 +22,14 @@ def spectrum_exp(w, res, expn, etal, sigma=-1):
         res += etal[i] / (expn[i] + sigma * 1.j * w)
 
 
-def numpy_to_cvxopt_matrix(A):
-    if A is None:
-        return A
-    if isinstance(A, np.ndarray):
-        if A.ndim == 1:
-            return matrix(A, (A.shape[0], 1), 'd')
-        return matrix(A, A.shape, 'd')
-    return A
+# def numpy_to_cvxopt_matrix(A):
+#     if A is None:
+#         return A
+#     if isinstance(A, np.ndarray):
+#         if A.ndim == 1:
+#             return matrix(A, (A.shape[0], 1), 'd')
+#         return matrix(A, A.shape, 'd')
+#     return A
 
 
 def sort_symmetry(etal, expn, if_sqrt=True):
@@ -477,22 +477,22 @@ def prony_fitting(h, t, nind, scale, n, gamma_real=None, gamma_imag=None):
             gamma_m[n_col + j, i] = np.imag(gamma[i]**j)
     h_m = np.append(np.real(h), np.imag(h))
 
-    freq_m = np.zeros((2 * n_col, 2 * n_row), dtype=float)
+    # freq_m = np.zeros((2 * n_col, 2 * n_row), dtype=float)
+    # C = numpy_to_cvxopt_matrix(gamma_m)
+    # d = numpy_to_cvxopt_matrix(h_m)
+    # A = numpy_to_cvxopt_matrix(-freq_m)
+    # b = numpy_to_cvxopt_matrix(np.zeros(2 * n_col))
+    # Q = C.T * C
+    # q = - d.T * C
+    # opts = {'show_progress': False, 'abstol': 1e-50,
+    #         'reltol': 1e-50, 'feastol': 1e-50}
+    # for k, v in opts.items():
+    #     solvers.options[k] = v
+    # sol = solvers.qp(Q, q.T, A, b, None, None, None, None)
+    # omega_new_temp = np.array(sol['x']).reshape(2, n_row)
 
-    C = numpy_to_cvxopt_matrix(gamma_m)
-    d = numpy_to_cvxopt_matrix(h_m)
-    A = numpy_to_cvxopt_matrix(-freq_m)
-    b = numpy_to_cvxopt_matrix(np.zeros(2 * n_col))
-    Q = C.T * C
-    q = - d.T * C
-
-    opts = {'show_progress': False, 'abstol': 1e-50,
-            'reltol': 1e-50, 'feastol': 1e-50}
-    for k, v in opts.items():
-        solvers.options[k] = v
-
-    sol = solvers.qp(Q, q.T, A, b, None, None, None, None)
-    omega_new_temp = np.array(sol['x']).reshape(2, n_row)
+    omega_new_temp = (la.inv(gamma_m.T @ gamma_m) @
+                      gamma_m.T @ h_m).reshape(2, n_row)
     omega_new = omega_new_temp[0, :] + 1.j*omega_new_temp[1, :]
 
     etal_p = omega_new
