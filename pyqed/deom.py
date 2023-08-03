@@ -493,6 +493,7 @@ def prony_fitting(h, t, nind, scale, n, gamma_real=None, gamma_imag=None):
 
     omega_new_temp = (la.inv(gamma_m.T @ gamma_m) @
                       gamma_m.T @ h_m).reshape(2, n_row)
+    # 
     omega_new = omega_new_temp[0, :] + 1.j*omega_new_temp[1, :]
 
     etal_p = omega_new
