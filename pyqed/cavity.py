@@ -338,42 +338,43 @@ def rk4_step(a, fun, dt, *args):
     return a
 
 
-class Pulse:
-    def __init__(self, delay, sigma, omegac, amplitude=0.01, cep=0.):
-        """
-        Gaussian pulse A * exp(-(t-T)^2/2 / sigma^2)
-        A: amplitude
-        T: time delay
-        sigma: duration
-        """
-        self.delay = delay
-        self.sigma = sigma
-        self.omegac = omegac  # central frequency
-        self.unit = 'au'
-        self.amplitude = amplitude
-        self.cep = cep
+# class Pulse:
+    #  conflict with the Pulse in optics
+#     def __init__(self, delay, sigma, omegac, amplitude=0.01, cep=0.):
+#         """
+#         Gaussian pulse A * exp(-(t-T)^2/2 / sigma^2)
+#         A: amplitude
+#         T: time delay
+#         sigma: duration
+#         """
+#         self.delay = delay
+#         self.sigma = sigma
+#         self.omegac = omegac  # central frequency
+#         self.unit = 'au'
+#         self.amplitude = amplitude
+#         self.cep = cep
 
-    def envelop(self, t):
-        return np.exp(-(t-self.delay)**2/2./self.sigma**2)
+#     def envelop(self, t):
+#         return np.exp(-(t-self.delay)**2/2./self.sigma**2)
 
-    def spectrum(self, omega):
-        """
-        Fourier transform of the Gaussian pulse
-        """
-        omegac = self.omegac
-        sigma = self.sigma
-        a = self.amplitude
-        return a * sigma * np.sqrt(2.*np.pi) * np.exp(-(omega-omegac)**2 * sigma**2/2.)
+#     def spectrum(self, omega):
+#         """
+#         Fourier transform of the Gaussian pulse
+#         """
+#         omegac = self.omegac
+#         sigma = self.sigma
+#         a = self.amplitude
+#         return a * sigma * np.sqrt(2.*np.pi) * np.exp(-(omega-omegac)**2 * sigma**2/2.)
 
-    def field(self, t):
-        '''
-        electric field
-        '''
-        omegac = self.omegac
-        delay = self.delay
-        a = self.amplitude
-        sigma = self.sigma
-        return a * np.exp(-(t-delay)**2/2./sigma**2)*np.cos(omegac * (t-delay))
+#     def field(self, t):
+#         '''
+#         electric field
+#         '''
+#         omegac = self.omegac
+#         delay = self.delay
+#         a = self.amplitude
+#         sigma = self.sigma
+#         return a * np.exp(-(t-delay)**2/2./sigma**2)*np.cos(omegac * (t-delay))
 
 
 class Cavity():

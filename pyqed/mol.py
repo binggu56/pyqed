@@ -30,7 +30,7 @@ from pyqed.phys import dag, quantum_dynamics, \
     obs, basis, isdiag, jump, multimode, transform, rk4, tdse, \
         isdiag, ket2dm, tensor
 
-from pyqed.deom import DEOMSolver
+
 
 from pyqed.units import au2wavenumber, au2fs
 import pickle
@@ -707,6 +707,8 @@ class Mol:
         """
         hierarchical equations of motion
         """
+        from pyqed.deom import DEOMSolver
+        
         solver = DEOMSolver(self.H, self.edip, bath,
                             coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)
         return solver
@@ -947,6 +949,7 @@ class LVC(Mol):
 
         self.H = None
         self.dim = None
+        self._x = None # list of coordinate operators
 
     def buildH(self):
         """
@@ -999,6 +1002,7 @@ class LVC(Mol):
 
         self.H = H
         self.dim = H.shape[0]
+        self._x = xs
 
 
 
@@ -1106,6 +1110,24 @@ class LVC(Mol):
         p = jump(i=i, f=f, dim=self.nstates, isherm=isherm)
 
         return kron(p, self.idm_vib)
+    
+    def coordinate(self, n):
+        """
+        build coordinate operators in the full space 
+
+        Parameters
+        ----------
+        n : int
+            mode id
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        return kron(self.idm_el, self._x[n])
+        
 
     def dpes(self, q):
         pass
