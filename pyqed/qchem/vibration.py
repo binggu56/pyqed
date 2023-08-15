@@ -22,7 +22,7 @@ np.set_printoptions(suppress=True)
 
 class Vibration(Molecule):
     def __init__(self, mf, optimized=True):
-        
+
         self.natom = mf.mol.natm
 
         if optimized:
@@ -37,9 +37,9 @@ class Vibration(Molecule):
 
             self.mol = mol # optimized geometry
 
-            
+
             print(mol.atom_coords())
-            
+
             mf_opt = dft.RKS(mol)
             mf_opt.xc = mf.xc
 
@@ -49,12 +49,12 @@ class Vibration(Molecule):
 
         self.modes = None
         self.freq = None
-        
+
         return
-    
+
     def to_molecular_frame(self):
         pass
-    
+
 
     def atom_coords(self):
         return self.mol.atom_coords()
@@ -82,39 +82,42 @@ class Vibration(Molecule):
         return w, modes
 
     def atomic_force(self):
-        
+
         # atomic gradients [natom, 3]
         grad = self.mf.nuc_grad_method().kernel()
-        
+
         de = einsum('mai, ai -> m', self.modes, grad)
-        
+
         return de
-    
+
     # def force(self):
-        
-        
-    
+
+
+
     def dump_xyz(self, fname=None):
         f = open(fname, 'w')
         f.write('{}\n\n'.format(self.natom))
         for i in range(self.natom):
             f.write('{} {} {} {}\n'.format(self.mol.atom_symbol(i), *self.mol.atom_coord(i)))
-        return 
-    
+        return
+
     def vibronic_coupling(self):
         pass
-    
+
     def scan(mode_id, npts=16, subfolder=False):
         # scan the APES along a normal mode or a few normal modes
         pass
-    
+
     def dip_deriv(self):
         pass
-    
+
     def infrared(self, lw=0.005):
         pass
-    
+
 if __name__ == '__main__':
+
+    from pyqed.units import au2amu
+
     mol = gto.Mole()
     # mol.build(
     #     atom = '''
@@ -136,23 +139,56 @@ if __name__ == '__main__':
     #             ['H', [0.000000000000,   1.432564848792,   2.125164035930]]]
     mol.atom = [['O',   [0.000000, -0.000000, 1.271610]],
       ['H',   [0.000000, -0.770445, 1.951195]],
-      ['H',   [0.000000, 0.770446, 1.951195]]] 
-    
+      ['H',   [0.000000, 0.770446, 1.951195]]]
+
     # mol = gto.M(atom='N 0 0 0; N 0 0 2.100825', basis='def2-svp', verbose=4, unit="bohr")
-    
+
     mf = dft.RKS(mol)
     mf.xc = 'b3lyp'
     mf.kernel()
-    
-    vib = Vibration(mf, optimized=True)
-    w, modes = vib.run()
-    print(modes.shape)
-    print(vib.atomic_force())
+
+    ground_state_energy = mf.e_tot
+    mo_occ = mf.mo_occ
+    mo_coeff = mf.mo_coeff
+
+    mass_nuc = mol.atom_mass_list() / au2amu
+    print(mass_nuc)
+    # normal modes
+
+    # vib = Vibration(mf, optimized=True)
+    # w, modes = vib.run()
+
+    # print(modes.shape)
+    # print(vib.atomic_force())
+
 
 #print(vib.atom_coords())
 
-# mytd = tddft.TDDFT(mf)
+    td = tddft.TDDFT(mf)
+    td.kernel(nstates = 2)
+    excitation_energy = td.e
 
+    # # dipole moments
+    # dip = td.transition_dipole() # nstates x 3
+    # medip = td.transition_magnetic_dipole()
+
+    # print(td.e_tot)
+    grad = td.nuc_grad_method()
+    grad.kernel(state=1) # state = 1 means the first excited state.
+    print(dir(grad))
+
+    # transform to nuc derivative wrt normal modes
+
+
+    # interstate vibronic coupling: lambda
+
+
+
+
+
+    # mytd.analyze()
+
+    #
 
 #     from pyscf import gto, scf, eph
 #     mol = gto.M()

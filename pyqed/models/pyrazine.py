@@ -129,8 +129,8 @@ class Vibronic:
             DESCRIPTION.
 
         """
-
-        w, u = np.linalg.eigh(v)
+        
+        w, u = np.linalg.eigh(self.v)
 
         return w, u
     
@@ -207,7 +207,10 @@ class Vibronic:
     def spo(self):
         return SPO2(nstates=self.nstates, mass=self.mass, x=x, y=y)
 
-class DHO2:
+class LVC2:
+    """
+    2D linear vibronic coupling model
+    """
     def __init__(self, x=None, y=None, h=1, l=1, delta=0, mass=[1, 1], nstates=2):
         # super().__init__(x, y, mass, nstates=nstates)
 
@@ -846,14 +849,14 @@ if __name__ == '__main__':
     rcParams['xtick.major.pad']='2'
     rcParams['ytick.major.pad']='2'
 
-    x = np.linspace(-2, 2, 20)
-    y = np.linspace(-2, 2, 20)
+    x = np.linspace(-1, 1)
+    y = np.linspace(-1, 1)
     deltas = [-0.5, 0, 0.5, 1, 2]
 
     # loop_integral = np.zeros(len(deltas))
     # for i, delta in enumerate(deltas):
-    #     mol = DHO2(x, y, delta=delta)
-    #     # mol.plot_apes()
+    mol = LVC2(x, y, delta=0)
+    mol.plot_apes()
 
     #     loop_integral[i] = mol.berry_phase(n=1, r=3)
 

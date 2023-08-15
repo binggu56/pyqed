@@ -609,6 +609,18 @@ class SPO2:
 
         r.psi = psi
         return r
+    
+    def rdm_el(self, psi):
+        nstates = self.nstates 
+        rho = np.zeros((nstates, nstates), dtype=complex)
+        
+        for i in range(self.nstates):
+            for j in range(i, self.nstates):
+                rho[i, j] = np.sum(np.multiply(np.conj(psi[i]), psi[j]))*self.dx*self.dy
+                if i != j:
+                    rho[j, i] = rho[i, j].conj()
+
+        return rho
 
     def _PEO(self, psi):
 
@@ -1557,17 +1569,17 @@ def square_barrier(x, width, height):
     return height * (theta(x) - theta(x - width))
 
 # @jit
-def density_matrix(psi_grid):
-    """
-    compute electronic purity from the wavefunction
-    """
-    rho00 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[0]))*dx*dy
-    rho01 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[1]))*dx*dy
-    rho11 = np.sum(np.multiply(np.conj(psi_grid[1]), psi_grid[1]))*dx*dy
+# def density_matrix(psi_grid):
+#     """
+#     compute electronic purity from the wavefunction
+#     """
+#     rho00 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[0]))*dx*dy
+#     rho01 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[1]))*dx*dy
+#     rho11 = np.sum(np.multiply(np.conj(psi_grid[1]), psi_grid[1]))*dx*dy
 
-    purity = rho00**2 + 2*rho01*rho01.conj() + rho11**2
+#     purity = rho00**2 + 2*rho01*rho01.conj() + rho11**2
 
-    return rho00, rho01, rho01.conj(), rho11, purity
+#     return rho00, rho01, rho01.conj(), rho11, purity
 
 
 

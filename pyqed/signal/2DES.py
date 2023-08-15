@@ -21,8 +21,8 @@ import numpy as np
 
 from scipy.integrate import tplquad
 
-from lime.units import au2ev, au2mev
-from lime.optics import Pulse
+from pyqed.units import au2ev, au2mev
+from pyqed.optics import Pulse
 
 def f(y,x,z, fa, fb, fc, eta=1e-5):
     return  p1.efield(-z) * p2.efield(y) * p3.efield(x)/(y + x - z - fc) *\
