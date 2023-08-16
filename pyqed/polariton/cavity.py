@@ -390,7 +390,7 @@ class VibronicPolariton:
 class VibronicPolariton2:
     """
     2D vibronic model in the diabatic representation coupled to
-    a single-mode cavity
+    a single-mode optical cavity (electronic strong coupling)
 
     """
     def __init__(self, mol, cav):
@@ -467,6 +467,10 @@ class VibronicPolariton2:
         nstates = self.nstates # polariton states
 
         v = np.zeros((nx, ny, nstates, nstates))
+        
+        # build the global DPES
+        if mol.v is None:
+            mol.dpes_global()
 
         for j in range(nstates):
             a, n = np.unravel_index(j, (nel, ncav))
@@ -566,8 +570,8 @@ class VibronicPolariton2:
 
             ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
             ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
-            ax0.format(**kwargs)
-            ax1.format(**kwargs)
+            # ax0.format(**kwargs)
+            # ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 
@@ -610,10 +614,12 @@ class VibronicPolariton2:
 
 
 
-class DHO:
-    def __init__(self, x, nstates=2):
+class DHO2:
+    def __init__(self, x, y, nstates=2):
         self.x = x
+        self.y = y
         self.nx = len(x)
+        self.ny = len(y)
         self.nstates = nstates
 
         self.v = None
@@ -635,13 +641,13 @@ class DHO:
 
 if __name__ == '__main__':
 
-    x = np.linspace(-2, 2, 128)
-    y = np.linspace(-2, 2, 128)
+    x = np.linspace(-2, 2, 64)
+    y = np.linspace(-2, 2, 64)
 
     # mol = DHO(x)
     # mol.dpes(d=2, E0=2)
 
-    cav = Cavity(1, 4)
+
     # pol = VibronicPolariton(mol, cav)
     # pol.dpes(g=0.05)
     # pol.ppes()
@@ -649,20 +655,32 @@ if __name__ == '__main__':
     # pol.draw_surfaces(n=4, representation='adiabatic')
     # pol.product_state(0, 0, 0)
 
-    from pyqed.models.pyrazine import DHO2
+    from pyqed.models.pyrazine import LVC2
 
-    mol = DHO2(x, y, mass=[1,1])
-    mol.plot_surface()
+    mol = LVC2(x, y, mass=[1,1])
+    mol.plot_apes()
+    
+    
+    cav = Cavity(3/au2ev, 3)
+
+    
+    # mol.plot_surface()
+
+    
     pol = VibronicPolariton2(mol, cav)
     pol.dpes(g=0.)
-    pol.ppes()
-    pol.plot_surface(4, representation='diabatic')
+    
+    # pol.ppes()
+    pol.plot_surface(3, representation='diabatic')
 
     psi0 = np.zeros((len(x), len(y), pol.nstates), dtype=complex)
     psi0[:, :, 4] = pol.ground_state()[1]
-    # pol.plot_ground_state()
+    
+    pol.plot_ground_state()
+    
     r = pol.run(psi0=psi0, dt=0.05, Nt=20, nout=2)
-    r.plot_wavepacket(r.psilist, 4)
+
+    # r.plot_wavepacket(r.psilist, 4)
 
 
 # the diabatic potential energy surface

@@ -222,6 +222,8 @@ class LVC2:
 
         self.x = x
         self.y = y
+        self.nx = len(x)
+        self.ny = len(y)
 
         self.h = h
         self.l = l
@@ -251,9 +253,10 @@ class LVC2:
 
         v = np.zeros((nx, ny, N, N))
 
-        v[:, :, 0, 0] = X**2/2. + (Y)**2/2. + h * X + delta
-        v[:, :, 1, 1] = X**2/2. + (Y)**2/2. - h * X - delta
-
+        v[:, :, 0, 0] = X**2/2. + (Y)**2/2. + h * X + delta/2
+        v[:, :, 1, 1] = X**2/2. + (Y)**2/2. - h * X - delta/2
+        v[:, :, 0, 1] = l * Y
+        v[:, :, 1, 0] = l * Y
 
 
         self.v = v
@@ -275,7 +278,7 @@ class LVC2:
         v[0, 1] =   l * Y
         v[1, 0] = v[0, 1]
 
-        self.v = v
+        # self.v = v
         return v
 
     def apes(self, x):
@@ -361,6 +364,8 @@ class LVC2:
         mayavi([v[:,:,k] for k in range(self.nstates)])
 
 
+    def run(self):
+        pass
 
 
 class DHO:

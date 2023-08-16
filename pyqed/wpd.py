@@ -13,8 +13,8 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-# import proplot as plt
-import matplotlib.pyplot as plt
+import proplot as plt
+# import matplotlib.pyplot as plt
 
 from numpy import cos, pi
 # from numba import jit
@@ -96,7 +96,7 @@ class ResultSPO2(Result):
         # ax.plot(self.times, p0)
         # ax.plot(self.times, p1)
         self.population = [p0, p1]
-        return 
+        return p0, p1
     
     def position(self):        
         # X, Y = np.meshgrid(self.x, self.y)
@@ -611,12 +611,26 @@ class SPO2:
         return r
     
     def rdm_el(self, psi):
+        """
+        Compute the reduced electronic density matrix
+
+        Parameters
+        ----------
+        psi : TYPE
+            vibronic wavefunction.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """
         nstates = self.nstates 
         rho = np.zeros((nstates, nstates), dtype=complex)
         
         for i in range(self.nstates):
             for j in range(i, self.nstates):
-                rho[i, j] = np.sum(np.multiply(np.conj(psi[i]), psi[j]))*self.dx*self.dy
+                rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
                 if i != j:
                     rho[j, i] = rho[i, j].conj()
 
@@ -1636,12 +1650,13 @@ if __name__ == '__main__':
     print('number of grid points along y = {}'.format(ny))
 
     sigma = np.identity(2) * 1.
-    ns = 2
+    ns = nstates = 2
     psi0 = np.zeros((nx, ny, ns), dtype=complex)
-    psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
+    psi0[:, :, 0] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
 
     fig, ax = plt.subplots()
     ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
+    ax.format(title='Initial wavepacket')
 
     #psi = psi0
 
@@ -1657,7 +1672,7 @@ if __name__ == '__main__':
     # G = np.zeros((nx, ny, ndim, ndim))
     # G[:,:,0, 0] = G[:,:,1, 1] = 1.
 
-    fig, ax = plt.subplots()
+    
     extent=[xmin, xmax, ymin, ymax]
 
     # psi1 = adiabatic_2d(x, y, psi0, v, dt=dt, Nt=num_steps, coords='curvilinear',G=G)
@@ -1666,12 +1681,21 @@ if __name__ == '__main__':
     sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
 
     r = sol.run(psi0=psi0, dt=0.5, Nt=200)
-
-    r.population()
-    r.position()
     
-    for j in range(4):
-        ax.contourf(x, y, np.abs(r.psilist[j][:, :, 1]).T, cmap='viridis')
+    rho = np.zeros((nstates, nstates, len(r.times)))
+    for i in range(len(r.times)):
+        rho[:, :, i] = sol.rdm_el(r.psilist[i])
+
+    # p0, p1 = r.get_population()
+    # fig, ax = plt.subplots()
+    # ax.plot(r.times, p0)
+    # ax.plot(r.times, p1, label=r'P$_1$')
+    # ax.legend()
+
+    # r.position()
+    
+    # for j in range(4):
+    #     ax.contourf(x, y, np.abs(r.psilist[j][:, :, 1]).T, cmap='viridis')
         
     # for psi in r.psilist:
     
