@@ -633,8 +633,46 @@ class SPO2:
                 rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
                 if i != j:
                     rho[j, i] = rho[i, j].conj()
+        
+
 
         return rho
+    
+    def current_density(self, psi, state_id=0):
+        """
+        Compute the velocity field of the vibrational flow
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+        state_id : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        None.
+
+        """
+        x, y = self.x, self.y
+        
+        chi  = psi[:, :, state_id]
+        rx, ry = np.gradient(np.log(np.abs(chi)), self.dx, self.dy)
+        px, py = np.gradient(np.angle(chi), self.dx, self.dy, edge_order=2)
+        
+        
+        fig, ax = plt.subplots(ncols=1)
+        ax.contourf(x, y, np.abs(chi))
+        ax.quiver(self.x, self.y, rx, ry, transpose=True)
+        # ax1.quiver(self.x, self.y, rx, ry)
+        
+        
+        # divergence of current
+        div = divergence([rx, ry], [self.dx, self.dy])
+        
+        fig, ax = plt.subplots()
+        ax.imshow(div)
+        return [px, py], [rx, ry]
 
     def _PEO(self, psi):
 
@@ -721,6 +759,17 @@ class SPO2:
             ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
+
+
+def divergence(f,h):
+    """
+    div(F) = dFx/dx + dFy/dy + ...
+    g = np.gradient(Fx,dx, axis=1)+ np.gradient(Fy,dy, axis=0) #2D
+    g = np.gradient(Fx,dx, axis=2)+ np.gradient(Fy,dy, axis=1) +np.gradient(Fz,dz,axis=0) #3D
+    """
+    num_dims = len(f)
+    return np.ufunc.reduce(np.add, [np.gradient(f[i], h[i], axis=i) \
+                                    for i in range(num_dims)])
 
 
 def S0(x, y):
@@ -1626,8 +1675,10 @@ if __name__ == '__main__':
     X, Y = np.meshgrid(x, y)
 
     fig, ax = plt.subplots()
-    v0 = 0.5 * ((X)**2 + Y**2)
-    v1 = 0.5 * ((X-1)**2 + Y**2) + 1
+    v0 = 0.5 * ((X+1)**2 + Y**2)
+    v1 = 0.5 * ((X-1)**2 + Y**2) + 1.0
+    
+    
     
     # for i in range(nx):
     #     for j in range(ny):
@@ -1638,7 +1689,7 @@ if __name__ == '__main__':
     # specify constants
     mass = [1.0, 1.0]  # particle mass
 
-    x0, y0, kx0, ky0 = 0, 0, 0.0, 0
+    x0, y0, kx0, ky0 = -1, 0, 0.0, 0
 
     #coeff1, phase = np.sqrt(0.5), 0
 
@@ -1652,7 +1703,7 @@ if __name__ == '__main__':
     sigma = np.identity(2) * 1.
     ns = nstates = 2
     psi0 = np.zeros((nx, ny, ns), dtype=complex)
-    psi0[:, :, 0] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
+    psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
 
     fig, ax = plt.subplots()
     ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
@@ -1680,12 +1731,18 @@ if __name__ == '__main__':
 
     sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
 
-    r = sol.run(psi0=psi0, dt=0.5, Nt=200)
+    r = sol.run(psi0=psi0, dt=0.5, Nt=2000)
     
     rho = np.zeros((nstates, nstates, len(r.times)))
-    for i in range(len(r.times)):
-        rho[:, :, i] = sol.rdm_el(r.psilist[i])
 
+    sol.current_density(r.psilist[-1])
+    r.plot_wavepacket(r.psilist[-1])
+
+    # for i in range(len(r.times)):
+    #     rho[:, :, i] = sol.rdm_el(r.psilist[i])
+    
+    sol.rdm_el(r.psilist)
+    
     # p0, p1 = r.get_population()
     # fig, ax = plt.subplots()
     # ax.plot(r.times, p0)

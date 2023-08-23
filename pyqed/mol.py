@@ -28,7 +28,7 @@ from pyqed.units import au2fs, au2ev
 from pyqed.signal import sos
 from pyqed.phys import dag, quantum_dynamics, \
     obs, basis, isdiag, jump, multimode, transform, rk4, tdse, \
-        isdiag, ket2dm, tensor
+        isdiag, ket2dm, tensor, isherm
 
 
 
@@ -178,6 +178,32 @@ def load_result(fname):
         result = pickle.load(f)
     return result
 
+def eigh(a, k=None):
+    """
+    find the eigenvalues and eigenstates of matrix a
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    k : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """        
+    if k is None:
+        if issparse(a):
+            return np.linalg.eigh(a.toarray())
+        else:
+            return np.linalg.eigh(a)
+    
+    else: 
+        return scipy.sparse.linalg.eigsh(a, k=k)
+        
 
 class Mol:
     def __init__(self, H, edip=None, lowering=None, edip_rms=None, gamma=None):
@@ -210,7 +236,7 @@ class Mol:
         self.h = H
         #        self.initial_state = psi0
         self._edip = edip
-        self.dip = self.edip
+        self.dip = self.edip = edip
 
         if lowering is not None:
             self.lowering = lowering
@@ -443,9 +469,13 @@ class Mol:
         if self.H is None:
             raise ValueError('Call getH/calcH to compute H first.')
 
-        if k is None or k >= self.dim :
-            return np.linalg.eigh(self.H.toarray())
-
+        if k is None or k >= self.dim: # full spectrum
+            
+            if issparse(H):
+                return np.linalg.eigh(self.H.toarray())
+            else:
+                return np.linalg.eigh(H)
+            
         if k < self.dim:
             eigvals, eigvecs = linalg.eigs(self.H, k=k, which='SR')
 
@@ -579,50 +609,53 @@ class Mol:
         #                            e_ops=e_ops, nout=nout, t0=t0)
 
 
-    # def run(self, psi0=None, dt=0.01, e_ops=None, Nt=1, nout=1, t0=0.0, \
-    #         edip=None, pulse=None):
-    #     '''
-    #     quantum dynamics under time-independent Hamiltonian
+    def run(self, psi0=None, dt=0.01, e_ops=None, nt=1, nout=1, t0=0.0, \
+            edip=None, pulse=None):
+        '''
+        quantum dynamics under time-independent Hamiltonian
 
-    #     Parameters
-    #     ----------
-    #     pulse : TYPE
-    #         DESCRIPTION.
-    #     dt : float, optional
-    #         time interval. The default is 0.001.
-    #     Nt : int, optional
-    #         int. The default is 1.
-    #     obs_ops : TYPE, optional
-    #         DESCRIPTION. The default is None.
-    #     nout : TYPE, optional
-    #         DESCRIPTION. The default is 1.
-    #     t0: float
-    #         initial time
+        Parameters
+        ----------
+        pulse : TYPE
+            DESCRIPTION.
+        dt : float, optional
+            time interval. The default is 0.001.
+        Nt : int, optional
+            int. The default is 1.
+        obs_ops : TYPE, optional
+            DESCRIPTION. The default is None.
+        nout : TYPE, optional
+            DESCRIPTION. The default is 1.
+        t0: float
+            initial time
 
-    #     Returns
-    #     -------
-    #     None.
+        Returns
+        -------
+        None.
 
-    #     '''
-    #     if psi0 is None:
-    #         raise ValueError("Please specify initial wavefunction psi0.")
+        '''
+        if psi0 is None:
+            raise ValueError("Please specify initial wavefunction psi0.")
 
-    #     H = self.H
+        H = self.H
+        edip = self.edip
 
-    #     if pulse is None:
-    #         return quantum_dynamics(H, psi0, dt=dt, Nt=Nt, \
-    #                                 obs_ops=e_ops, nout=nout, t0=t0)
-    #     else:
+        if pulse is None:
+            return _quantum_dynamics(H, psi0, dt=dt, Nt=nt, \
+                                    e_ops=e_ops, nout=nout, t0=t0)
+        else:
 
-    #         if isinstance(pulse, list):
-    #             H = [self.H]
-    #             for i in range(len(pulse)):
-    #                 H.append([edip[i], pulse[i].efield])
-    #         else:
-    #             H = [self.H, [edip, pulse.efield]]
+            if isinstance(pulse, list):
+                
+                H = [self.H]
+                for i in range(len(pulse)):
+                    H.append([edip[i], pulse[i].efield])
+            else:
+                
+                H = [self.H, [edip, pulse.efield]]
 
-    #         return driven_dynamics(H, psi0, dt=dt, Nt=Nt, \
-    #                                e_ops=e_ops, nout=nout, t0=t0)
+            return driven_dynamics(H, psi0, dt=dt, Nt=nt, \
+                                    e_ops=e_ops, nout=nout, t0=t0)
 
     # def heom(self, env, nado=5, c_ops=None, obs_ops=None, fname=None):
     #     nt = self.nt
@@ -2034,10 +2067,12 @@ def high_frequency_drive():
     plt.show()
 
 if __name__ == '__main__':
+    
     from pyqed.phys import pauli
     import time
     import proplot as plt
-
+    from pyqed.optics import Pulse
+    
     mol = mls()
     mol.set_decay([0, 0.002, 0.002])
     omegas=np.linspace(0, 2, 200)/au2ev
@@ -2048,9 +2083,16 @@ if __name__ == '__main__':
     s0, sx, sy, sz = pauli()
     
     mol = Mol((-sz+s0)/2, edip=sx)
-    H, dip = mol.multi()
-    print(H)
-    print(dip)
+    pulse = Pulse(amplitude=0.5)
+    # print(pulse.efield(1))
+    pulse.plt_efield()
+    # H, dip = mol.multi()
+
+    psi0 = np.array([1, 0], dtype=complex)
+    r = mol.run(psi0=psi0, dt=0.05/au2fs, nt=1000, e_ops=[csr_matrix(sz)], pulse=pulse, t0=-24/au2fs)
+     0
+    r.analyze()
+
     
     # mol.absorption(omegas)
     # mol.photon_echo(pump=omegas, probe=omegas, plt_signal=True)

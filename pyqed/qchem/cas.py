@@ -16,6 +16,7 @@ A simple example to run CASSCF calculation.
 '''
 
 import pyscf
+import numpy as np
 
 mol = pyscf.M(
     atom = 'O 0 0 0; O 0 0 1.2',
@@ -36,4 +37,18 @@ mycas = myhf.CASSCF(6, 8).run()
 # See also 00-simple_casci.py for the instruction of the output of analyze()
 # method
 # mycas.verbose = 4
+
+#
+# 1pdm in AO representation
+#
+dm1 = mycas.make_rdm1()
+
+# mycas.nstates = 2
+#
+# alpha and beta 1-pdm in AO representation
+#
+dm1_alpha, dm1_beta = mycas.make_rdm1s()
+
+print(np.allclose(dm1, dm1_alpha+dm1_beta))
+
 mycas.analyze()
