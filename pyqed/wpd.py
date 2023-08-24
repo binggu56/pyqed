@@ -626,16 +626,24 @@ class SPO2:
 
         """
         nstates = self.nstates 
-        rho = np.zeros((nstates, nstates), dtype=complex)
         
-        for i in range(self.nstates):
-            for j in range(i, self.nstates):
-                rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
-                if i != j:
-                    rho[j, i] = rho[i, j].conj()
-        
-
-
+        if isinstance(psi, np.ndarray):
+            
+            rho = np.zeros((nstates, nstates), dtype=complex)
+            
+            for i in range(self.nstates):
+                for j in range(i, self.nstates):
+                    rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
+                    if i != j:
+                        rho[j, i] = rho[i, j].conj()
+                        
+        elif isinstance(psi, list):
+             
+            rho = []
+            for p in psi:
+                tmp = np.einsum('ija, ijb -> ab', p.conj(), p) * self.dx * self.dy
+                rho.append(tmp.copy())
+             
         return rho
     
     def current_density(self, psi, state_id=0):
