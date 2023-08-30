@@ -9,15 +9,15 @@ Created on Tue Mar 26 17:26:02 2019
 import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 from numpy import sqrt, exp, pi
-import proplot as plt
-
+# import proplot as plt
+import matplotlib.pyplot as plt
 from pyqed.units import au2k, au2ev, alpha, \
     au2watt_per_centimeter_squared, au2fs
 from pyqed.fft import fft, fft2
 from pyqed.phys import rect, sinc, dag, interval, ham_ho, ket2dm
 from pyqed.wigner import spectrogram
 
-from numba import jit
+# from numba import jit
 
 def intensity_to_field(I):
     """

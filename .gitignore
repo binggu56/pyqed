@@ -19,3 +19,5 @@ pyqed/qchem/.DS_Store
 pyqed/polariton/negf_leak.npz
 *.npz
 *.dat
+*.dat
+*.pyc

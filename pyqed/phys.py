@@ -12,6 +12,7 @@ import scipy as sp
 import sys
 import heapq
 
+
 def polar2cartesian(r, theta):
     """
     transform polar coordinates to Cartesian
@@ -691,16 +692,20 @@ def rgwp(x, x0=0., sigma=1.):
     psi = 1./np.sqrt(np.sqrt(np.pi) * sigma) * np.exp(-(x-x0)**2/2./sigma**2)
     return psi
 
-def gwp(x, sigma=1., x0=0., p0=0.):
+
+def gwp(x, a, x0=0., p0=0.):
     '''
     complex Gaussian wavepacket
+    
+    .. math::
+        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-(x-x_0) A (x-x_0) + i p_0(x-x_0)} 
 
     Parameters
     ----------
     x : TYPE
         DESCRIPTION.
     sigma : TYPE, optional
-        DESCRIPTION. The default is 1..
+        (co)variance matrix. 
     x0 : TYPE, optional
         DESCRIPTION. The default is 0..
     p0 : TYPE, optional
@@ -712,9 +717,38 @@ def gwp(x, sigma=1., x0=0., p0=0.):
         DESCRIPTION.
 
     '''
-    psi = np.sqrt(np.sqrt(1./np.pi/sigma**2)) * \
-        np.exp(-(x-x0)**2/2./sigma**2 + 1j * p0 * (x-x0))
-    return psi
+    
+    ndim = len(x0)
+    
+    if ndim == 1:
+        
+        return (a/np.pi)**(1/4) * np.exp(-a * (x-x0)**2/2.)\
+            * exp(1j * p0 * (x-x0))
+    
+    elif ndim == 2:
+        u = np.array(x-x0)
+        
+        delta = u @ a @ u 
+        
+        gauss_2d = np.linalg.det(a)**(1/4)/np.pi**(ndim/4) \
+                          * np.exp(-0.5 * delta + 1j * p0 * (x-x0))
+    
+        return gauss_2d
+
+    elif ndim > 2:
+        
+        # A = np.linalg.inv(sigma)
+        
+        # if isinstance(x, list):
+        #     x = np.array(x)
+            
+        u = x - x0
+        delta = u @ a @ u
+        
+        g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
+                                                             1j * p0 @ (x-x0))
+
+        return g
 
 def gwp_k(k, sigma, x0,k0):
     """

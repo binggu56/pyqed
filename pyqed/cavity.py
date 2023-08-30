@@ -378,6 +378,9 @@ def rk4_step(a, fun, dt, *args):
 
 
 class Cavity():
+    """
+    TBE. Use polariton.cavity.Cavity instead
+    """
     def __init__(self, freq, ncav, Q=None, polarization=None):
         self.frequency = self.freq = self.resonance = freq
         self.n_cav = self.ncav = ncav

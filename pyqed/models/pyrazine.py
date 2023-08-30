@@ -17,8 +17,8 @@ from scipy.linalg import eigh
 from cmath import log
 
 import sys
-import proplot as plt
-
+# import proplot as plt
+import matplotlib.pyplot as plt
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
     polar2cartesian, SPO2

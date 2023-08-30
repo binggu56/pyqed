@@ -2090,7 +2090,6 @@ if __name__ == '__main__':
 
     psi0 = np.array([1, 0], dtype=complex)
     r = mol.run(psi0=psi0, dt=0.05/au2fs, nt=1000, e_ops=[csr_matrix(sz)], pulse=pulse, t0=-24/au2fs)
-     0
     r.analyze()
 
     

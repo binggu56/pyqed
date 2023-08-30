@@ -554,6 +554,14 @@ def vector_field(f, **kwargs):
     quiver3d(u.real, v.real, w.real, **kwargs)
     return
 
+def scatter(points):
+    n = len(points)
+    x = [p[0] for p in points]
+    y = [p[1] for p in points]
+    fig, ax = plt.subplots()
+    ax.scatter(x, y)
+    return ax
+
 
 if __name__ == '__main__':
     # fig, ax = subplots(ncols=1, nrows=2)

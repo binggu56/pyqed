@@ -3,7 +3,7 @@
 """
 Created on Mon Jan  4 23:44:15 2021
 
-Wave packet dynamics solver for wavepacket dynamics with N vibrational modes
+Exact nonadiabatic wavepacket dynamics solver for vibronic models with N vibrational modes
 (N = 1 ,2)
 
 For linear coordinates, use SPO method
@@ -13,8 +13,8 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-import proplot as plt
-# import matplotlib.pyplot as plt
+# import proplot as plt
+import matplotlib.pyplot as plt
 
 from numpy import cos, pi
 # from numba import jit
@@ -790,9 +790,10 @@ def diabatic_coupling(x, y):
     pass
 
 class SPO3():
-    def __init__(self, x, y, z):
-        self.x = None
-        self.y = None
+    # def __init__(self, x, y, z, mass=[1, 1, 1]):
+    #     self.x = x
+    #     self.y = y
+    #     self.z = z
 
     """
     second-order split-operator method for nonadiabatic wavepacket dynamics
@@ -869,30 +870,32 @@ class SPO3():
 
         """
 
-        nx = len(x)
-        ny = len(y)
-        ns = self.ns
+        nx = self.nx
+        ny = self.ny 
+        nz = self.nz
+        ns = self.nstates
 
         # DPES and diabatic couplings
-        v = np.zeros([nx, ny, ns, ns])
+        v = np.zeros([nx, ny, nz, ns, ns])
 
         # assume we have analytical forms for the DPESs
-        for a in range(self.ns):
-            v[:, :, a, a] = surfaces[a]
+        for a in range(self.nstates):
+            v[:, :, :, a, a] = surfaces[a]
 
         for dc in diabatic_couplings:
             a, b = dc[0][:]
-            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+            v[:, :, :, a, b] = v[:, :, :, b, a] = dc[1]
 
-
-        if self.abc:
-            for n in range(self.ns):
-                v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
 
         self.V = v
         return v
 
-
+    def set_abc(self):
+        #set the absorbing boundary condition
+        #     for n in range(self.ns):
+        #         v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
+        pass
+    
     def build(self, dt, inertia=None):
         """
         Setup the propagators appearing in the split-operator method.
@@ -925,22 +928,26 @@ class SPO3():
         # setup kinetic energy operator
         nx = self.nx
         ny = self.ny
+        nz = self.nz
 
         dx = interval(self.x)
         dy = interval(self.y)
+        dz = self.dz
 
         self.kx = 2. * np.pi * fftfreq(nx, dx)
         self.ky = 2. * np.pi * fftfreq(ny, dy)
+        self.kz = 2. * np.pi * fftfreq(nz, dz)
 
 
         if self.coords == 'linear':
 
-            mx, my = self.masses
+            mx, my, mz = self.masses
 
-            Kx, Ky = meshgrid(self.kx, self.ky)
+            Kx, Ky, Kz = meshgrid(self.kx, self.ky, self.kz)
 
-            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
-
+            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my + Kz**2/2./mz) * dt)
+            
+            
         elif self.coords == 'jacobi':
 
             # self.exp_K = np.zeros((nx, ny, nx, ny))
@@ -972,6 +979,7 @@ class SPO3():
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
         # self.apes = np.zeros((nx, ny))
+        
         if self.abc:
             eig = scipy.linalg.eig
         else:
@@ -979,17 +987,15 @@ class SPO3():
 
         for i in range(nx):
             for j in range(ny):
+                for k in range(nz):
 
-                i
-                w, u = eig(v[i, j, :, :])
-
-                #print(np.dot(U.conj().T, Vmat.dot(U)))
-
-                V = np.diagflat(np.exp(- 1j * w * dt))
-                V2 = np.diagflat(np.exp(- 1j * w * dt2))
-
-                self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
-                self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+                    w, u = eig(v[i, j, k, :, :])
+        
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, k, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, k, :,:] = u.dot(V2.dot(dagger(u)))
 
 
         return
@@ -1027,7 +1033,7 @@ class SPO3():
         return P
 
 
-    def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
 
         print('Building the propagators ...')
 
@@ -1037,9 +1043,9 @@ class SPO3():
 
         def _V_half(psi):
 
-            return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+            return np.einsum('ijkab, ijkb -> ijka', self.exp_V_half, psi) # evolve V half step
 
-        r = Result(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
+        r = Result(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
 
         t = t0
         if self.coords == 'linear':
@@ -1053,7 +1059,7 @@ class SPO3():
         # observables
         if return_states:
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
 
                     t += dt
@@ -1068,8 +1074,9 @@ class SPO3():
 
             psi = _V_half(psi)
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
+                    
                     t += dt
 
                     psi = KEO(psi)
@@ -1085,27 +1092,30 @@ class SPO3():
                 # f.write('{} {} {} {} {} \n'.format(t, *rho))
 
             psi = KEO(psi)
-            psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+            psi = _V_half(psi) # evolve V half step
 
         r.psi = psi
         return r
 
     def _PEO(self, psi):
 
-        vpsi = np.einsum('ijab, ijb -> ija', self.exp_V, psi)
+        vpsi = np.einsum('ijkab, ijkb -> ijka', self.exp_V, psi)
         return vpsi
 
     def _KEO_linear(self, psi):
         # psik = np.zeros(psi.shape, dtype=complex)
         # for j in range(ns):
         #     psik[:,:,j] = fft2(psi[:,:,j])
-        psik = fft2(psi, axes=(0,1))
-        kpsi = np.einsum('ij, ija -> ija', self.exp_K, psik)
+        
+        psik = np.fft.fftn(psi, axes=(0,1, 2))
+
+        kpsi = np.einsum('ijk, ijka -> ijka', self.exp_K, psik)
 
         # out = np.zeros(psi.shape, dtype=complex)
         # for j in range(ns):
         #     out[:, :, j] = ifft2(kpsi[:, :, j])
-        psi = ifft2(kpsi, axes=(0,1))
+        psi = np.fft.ifftn(kpsi, axes=(0,1, 2))
+        
         return psi
 
     def _KEO_jacobi(self, psi):
@@ -1165,14 +1175,17 @@ class SPO3():
 
         if not isinstance(psilist, list): psilist = [psilist]
 
-
+        X, Y = np.meshgrid(self.x, self.y)
+        x, y = self.x, self.y 
+        
+        
         for i, psi in enumerate(psilist):
             fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
 
-            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
-            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
-            ax0.format(**kwargs)
-            ax1.format(**kwargs)
+            ax0.contour(x, y, np.abs(psi[:,:,0, 1])**2)
+            ax1.contour(x, y, np.abs(psi[:, :,0, 0])**2)
+            # ax0.format(**kwargs)
+            # ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 # @jit
@@ -1666,15 +1679,17 @@ if __name__ == '__main__':
 
     nx = 2 ** 5
     ny = 2 ** 5
+    nz = 2 ** 5
     xmin = -6
     xmax = -xmin
     ymin = -6
     ymax = -ymin
     x = np.linspace(xmin, xmax, nx)
     y = np.linspace(ymin, ymax, ny)
-
+    z = np.linspace(xmin, xmax, nz)
     dx = x[1] - x[0]
     dy = y[1] - y[0]
+
 
     # k-space grid
     kx = 2. * np.pi * fftfreq(nx, dx)
@@ -1715,7 +1730,7 @@ if __name__ == '__main__':
 
     fig, ax = plt.subplots()
     ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
-    ax.format(title='Initial wavepacket')
+    ax.set_title('Initial wavepacket')
 
     #psi = psi0
 
@@ -1743,7 +1758,7 @@ if __name__ == '__main__':
     
     rho = np.zeros((nstates, nstates, len(r.times)))
 
-    sol.current_density(r.psilist[-1])
+    # sol.current_density(r.psilist[-1])
     r.plot_wavepacket(r.psilist[-1])
 
     # for i in range(len(r.times)):
