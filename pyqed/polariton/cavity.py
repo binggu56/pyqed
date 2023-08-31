@@ -15,7 +15,11 @@ from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
 # from pyqed.cavity import Cavity
 
-import proplot as plt
+import sys
+if sys.version_info[1] < 10:
+    import proplot as plt
+else:
+    import matplotlib.pyplot as plt
 
 
 
@@ -319,7 +323,14 @@ class VibronicPolariton:
         # for i in range(nx):
         #     v[i, :, :] += g * kron(mol.edip, a + dag(a))
 
-        v += np.tile(g * kron(mol.edip, a + dag(a)).toarray(), (nx, 1, 1))
+        if mol.edip.shape == (nel, nel):
+            # Condon approximation
+            v += np.tile(g * kron(mol.edip, a + dag(a)).toarray(), (nx, 1, 1))
+
+        elif mol.edip.shape == (nx, nel, nel):
+            
+            for i in range(nx):
+                v[i, :, :] = g * kron(mol.edip[i], a + dag(a)).toarray() 
 
         self.v = v
         return v
@@ -327,6 +338,7 @@ class VibronicPolariton:
     def ppes(self):
 
         E = np.zeros((self.nx, self.nstates))
+        
         for i in range(self.nx):
             V = self.v[i, :, :]
             w, u = sort(*np.linalg.eigh(V))
@@ -379,7 +391,7 @@ class VibronicPolariton:
 
     def run(self, psi0, dt, Nt=1, t0=0, nout=1):
 
-        from pyqed.wpd import SPO
+        from pyqed.namd.diabatic import SPO
 
         spo = SPO(self.x, mass=self.mol.mass, ns=self.nstates)
         return spo.run(psi0=psi0, dt=dt, Nt=Nt, t0=t0, nout=nout)
@@ -641,46 +653,49 @@ class DHO2:
 
 if __name__ == '__main__':
 
+    from pyqed.models.pyrazine import DHO
     x = np.linspace(-2, 2, 64)
     y = np.linspace(-2, 2, 64)
 
-    # mol = DHO(x)
-    # mol.dpes(d=2, E0=2)
+    mol = DHO(x)
+    mol.dpes(d=1, e0=1)
 
+    cav = Cavity(1, 3)
 
-    # pol = VibronicPolariton(mol, cav)
-    # pol.dpes(g=0.05)
-    # pol.ppes()
+    pol = VibronicPolariton(mol, cav)
+    pol.dpes(g=0.05)
+    pol.ppes()
 
-    # pol.draw_surfaces(n=4, representation='adiabatic')
+    pol.draw_surfaces(n=4, representation='adiabatic')
     # pol.product_state(0, 0, 0)
 
-    from pyqed.models.pyrazine import LVC2
-
-    mol = LVC2(x, y, mass=[1,1])
-    mol.plot_apes()
+    def test_vp2():
+        from pyqed.models.pyrazine import LVC2
     
+        mol = LVC2(x, y, mass=[1,1])
+        mol.plot_apes()
+        
+        
+        cav = Cavity(3/au2ev, 3)
     
-    cav = Cavity(3/au2ev, 3)
-
+        
+        # mol.plot_surface()
     
-    # mol.plot_surface()
-
+        
+        pol = VibronicPolariton2(mol, cav)
+        pol.dpes(g=0.)
+        
+        # pol.ppes()
+        pol.plot_surface(3, representation='diabatic')
     
-    pol = VibronicPolariton2(mol, cav)
-    pol.dpes(g=0.)
+        psi0 = np.zeros((len(x), len(y), pol.nstates), dtype=complex)
+        psi0[:, :, 4] = pol.ground_state()[1]
+        
+        pol.plot_ground_state()
+        
+        r = pol.run(psi0=psi0, dt=0.05, Nt=20, nout=2)
     
-    # pol.ppes()
-    pol.plot_surface(3, representation='diabatic')
-
-    psi0 = np.zeros((len(x), len(y), pol.nstates), dtype=complex)
-    psi0[:, :, 4] = pol.ground_state()[1]
-    
-    pol.plot_ground_state()
-    
-    r = pol.run(psi0=psi0, dt=0.05, Nt=20, nout=2)
-
-    # r.plot_wavepacket(r.psilist, 4)
+        # r.plot_wavepacket(r.psilist, 4)
 
 
 # the diabatic potential energy surface

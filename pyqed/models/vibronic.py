@@ -14,15 +14,382 @@ from scipy.linalg import eigh
 # from cmath import log
 
 import sys
-import proplot as plt
+import matplotlib.pyplot as plt
 
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
-    polar2cartesian
+    polar2cartesian, Mol, SESolver, dag
 from pyqed.style import set_style
 # from pyqed.units import au2ev, wavenumber2hartree
 
 
+class VibronicAdiabatic(Mol):
+    """
+    1D vibronic model in the adiabatic representation 
+    """
+    def __init__(self, x=None, mass=1, nstates=2, edip=None, mdip=None, equad=None, \
+                 nac=None):
+        """
+
+        Parameters
+        ----------
+        E : 1d array
+            electronic energy at ground-state minimum
+        modes : list of Mode objs
+            vibrational modes
+
+        Raises
+        ------
+        NotImplementedError
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        self.x = x
+        self.nx = len(x)
+        self.mass = mass
+        self.nel = self.nstates = nstates
+        # self.nmodes = len(modes)
+        # self.modes = modes
+        # self.truncate = None
+        # self.fock_dims = [m.truncate for m in modes]
+        # self.nvib = np.prod(self.fock_dims)
+
+        # self.idm_vib = identity(self.nvib) # vibrational identity
+        # self.idm_el = identity(self.nstates) # electronic identity
+        # self.omegas = [mode.omega for mode in self.modes]
+
+
+        # self.H = None
+        self._v = None # adiabatic PES
+        # self.dim = None
+        # self._x = None # list of coordinate operators
+        
+        self.edip = edip 
+        self.mdip = mdip 
+        self.nac = nac
+        
+    # def buildH(self):
+    #     """
+    #     Calculate the vibronic Hamiltonian.
+
+    #     Parameters
+    #     ----------
+    #     nums : list of integers
+    #         size for the Fock space of each mode
+
+    #     Returns
+    #     -------
+    #     2d array
+    #         Hamiltonian
+
+    #     """
+
+    #     omegas = self.omegas
+    #     nmodes = self.nmodes
+
+    #     # identity matrices in each subspace
+    #     nel = self.nstates
+    #     I_el = identity(nel)
+
+    #     h_el = np.diagflat(self.e_fc)
+
+    #     # calculate the vibrational Hamiltonian
+    #     # hv, xs = multimode(omegas, nmodes, truncate=self.fock_dims[0])
+
+    #     # bare vibronic H in real e-states
+    #     # H = kron(h_el, identity(hv.shape[0])) + kron(I_el, hv)
+
+
+
+    #     # vibronic coupling, tuning + coupling
+    #     for j, mode in enumerate(self.modes):
+    #         # n = mode.truncate
+
+    #         # # vibrational Hamiltonian
+    #         # hv = boson(mode.omega, n, ZPE=False)
+
+    #         # H = kron(H, Iv) + kron(identity(H.shape), hv)
+    #         V = 0.
+    #         for c in mode.couplings:
+    #             a, b = c[0]
+    #             strength = c[1]
+    #             V += strength * jump(a, b, nel)
+
+    #         H += kron(V, xs[j])
+
+    #     self.H = H
+    #     self.dim = H.shape[0]
+    #     self._x = xs
+
+        # return self.H
+
+    # def APES(self, x):
+
+    #     V = np.diag(self.e_fc)
+
+    #     # for n in range(self.nmodes):
+    #     V += 0.5 * np.sum(self.omegas * x**2) * self.idm_el
+
+    #     # V += tmp * self.idm_el
+
+    #     for j, mode in enumerate(self.modes):
+    #         for c in mode.couplings:
+    #             a, b = c[0]
+    #             strength = c[1]
+    #             V += strength * jump(a, b, self.nstates) * x[j]
+
+    #     E = np.linalg.eigvals(V)
+    #     return np.sort(E)
+
+    # def calc_edip(self):
+    #     pass
+
+    # def promote(self, A, which='el'):
+
+    #     if which in ['el', 'e', 'electronic']:
+    #         A = kron(A, self.idm_vib)
+    #     elif which in ['v', 'vib', 'vibrational']:
+    #         A = kron(self.idm_el, A)
+
+    #     return A
+
+    # def vertical(self, n=1):
+    #     """
+    #     generate the initial state created by vertical excitation
+
+    #     Parameters
+    #     ----------
+    #     n : int, optional
+    #         initially excited state. The default is 1.
+
+    #     Returns
+    #     -------
+    #     psi : TYPE
+    #         DESCRIPTION.
+
+    #     """
+    #     psi = basis(self.nstates, n)
+
+    #     dims = self.fock_dims
+
+    #     chi = basis(dims[0], 0)
+
+    #     for j in range(1, self.nmodes):
+    #         chi = np.kron(chi, basis(dims[j], 0))
+
+    #     psi = np.kron(psi, chi)
+
+    #     return psi
+
+    def vibrational_eigenstates(self, n=0, lha=False):
+        """
+        compute the vibrational eigenstates of n-th PES by DVR
+        
+        lha: bool
+            local harmonic approximation. If true, the ground state will be a Gaussian.
+            
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        pass
+
+    # def buildop(self, i, f=None, isherm=True):
+    #     """
+    #     construct electronic operator
+
+    #         \ket{f}\bra{i}
+
+    #     if isherm:
+    #         return \ket{f}\bra{i} + \ket{i}\bra{f}
+
+    #     Parameters
+    #     -------
+    #     i: int
+    #         initial state.
+    #     f: int, optional
+    #         final state. Default None. If None, set f = i.
+
+    #     isherm: bool, optional
+    #         indicator of whether the returned matrix is Hermitian or not
+    #         Default: True
+
+    #     Returns
+    #     -------
+    #     2darray
+    #         DESCRIPTION.
+
+    #     """
+    #     if f is None:
+    #         f = i
+
+    #     p = jump(i=i, f=f, dim=self.nstates, isherm=isherm)
+
+    #     return kron(p, self.idm_vib)
+    
+    # def coordinate(self, n):
+    #     """
+    #     build coordinate operators in the full space 
+
+    #     Parameters
+    #     ----------
+    #     n : int
+    #         mode id
+
+    #     Returns
+    #     -------
+    #     TYPE
+    #         DESCRIPTION.
+
+    #     """
+    #     return kron(self.idm_el, self._x[n])
+        
+    @property
+    def v(self):
+        return self._v
+    
+    @v.setter
+    def v(self, v):
+        """
+        set up the adiabatic PESs
+
+        Parameters
+        ----------
+        v : ndarray [nx, nel, nel]
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        print(v.shape)
+        assert(v.shape == (self.nx, self.nel, self.nel))
+        self._v = v
+        
+        
+
+    def run(self, psi0, dt, nt, method='SPO'):
+        
+        if self.nac is not None and method == 'SPO':
+            return ValueError('Method SPO cannot be used for nonadiabatic couplings.')
+
+        if method == 'RK4':
+
+            sol = SESolver()
+
+            if self.H is None:
+                self.buildH()
+
+            sol.H = self.H
+
+            sol.ground_state = self.get_ground_state()
+
+            return sol
+
+        elif method == 'SPO':
+
+            from pyqed.namd.diabatic import SPO
+
+            sol = SPO(self.x, mass=self.mass, nstates=self.nstates, v=v)
+
+            # sol.V = mol.v
+            
+            return sol.run(psi0=psi0, dt=dt, nt=nt) 
+
+        #     elif self.nmodes == 2:
+        #         from pyqed.wpd import SPO2
+
+        #         sol = SPO2()
+
+        else:
+            raise ValueError('The number of modes {} is not \
+                             supported.'.format(self.nmodes) )
+
+
+
+
+            return sol
+
+    def rdm_el(self, psi):
+        """
+        Compute the electronic reduced density matrix.
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        psi_reshaped = np.reshape(psi, (self.nel, self.nvib))
+
+        return psi_reshaped.dot(dag(psi_reshaped))
+
+    def add_coupling(self, coupling):
+        """
+        add additional coupling terms to the Hamiltonian such as Stark
+        and Zeeman effects
+
+        Parameters
+        ----------
+        coupling : list, [[a, b], strength]
+            describe the coupling, a, b labels the electronic states
+
+        Returns
+        -------
+        ndarray
+            updated H.
+
+        """
+        a, b = coupling[0]
+        strength = coupling[1]
+
+        self.H += strength * kron(jump(a, b, self.nel),  self.idm_vib)
+
+        return self.H
+
+    def plot_PES(self, x, y):
+        """
+        plot the 3D adiabatic potential energy surfaces
+
+        Parameters
+        ----------
+        x : TYPE
+            DESCRIPTION.
+        y : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        from pyqed.style import plot_surfaces
+
+        if self.nmodes != 2:
+            raise ValueError('This function only works for nmodes=2.')
+
+        nx, ny = len(x), len(y)
+        E = np.zeros(nx, ny, self.nstates)
+
+        for i in range(nx):
+            for j in range(ny):
+                E[i, j, :] = self.APES([x[i], y[j]])
+
+        return plot_surfaces(x, y, [E[:,:, 1], E[:,:, 2]])
 class CI:
     """
     two-state two-mode Conical Intersection model
@@ -237,21 +604,37 @@ if __name__ == '__main__':
     rcParams['xtick.major.pad']='2'
     rcParams['ytick.major.pad']='2'
 
-    x = np.linspace(-2, 2, 20)
-    y = np.linspace(-2, 2, 20)
-    deltas = [-0.5, 0, 0.5, 1, 2]
-
-    # loop_integral = np.zeros(len(deltas))
-    # for i, delta in enumerate(deltas):
-    #     mol = DHO2(x, y, delta=delta)
-    #     # mol.plot_apes()
-
-    #     loop_integral[i] = mol.berry_phase(n=1, r=3)
-
-    # fig, ax = plt.subplots()
-    # ax.plot(deltas, loop_integral)
-
-    mol = CI(x, y, delta=0.)
-    F = mol.berry_curvature()
-    fig, ax = plt.subplots()
-    ax.matshow(F.imag)
+    def test_CI():
+        x = np.linspace(-2, 2, 20)
+        y = np.linspace(-2, 2, 20)
+        deltas = [-0.5, 0, 0.5, 1, 2]
+    
+        # loop_integral = np.zeros(len(deltas))
+        # for i, delta in enumerate(deltas):
+        #     mol = DHO2(x, y, delta=delta)
+        #     # mol.plot_apes()
+    
+        #     loop_integral[i] = mol.berry_phase(n=1, r=3)
+    
+        # fig, ax = plt.subplots()
+        # ax.plot(deltas, loop_integral)
+    
+        mol = CI(x, y, delta=0.)
+        F = mol.berry_curvature()
+        fig, ax = plt.subplots()
+        ax.matshow(F.imag)
+    
+    from pyqed import gwp
+    x = np.linspace(-2, 2)
+    nx = len(x)
+    mol = VibronicAdiabatic(x, nstates=2)
+    
+    v = np.zeros((nx, 2, 2))
+    v[:, 0, 0] = x**2/2
+    v[:, 1, 1] = x**2/2
+    
+    mol.v = v 
+    
+    psi0 = np.zeros((nx, 2), dtype=complex) 
+    psi0[:, 0] = gwp(x, a=1)
+    mol.run(psi0, dt=0.2, nt=1)

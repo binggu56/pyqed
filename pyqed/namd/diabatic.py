@@ -1,315 +1,189 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Created on Mon Jan  4 23:44:15 2021
-
-Exact nonadiabatic wavepacket dynamics solver for vibronic models with N vibrational modes
-(N = 1 ,2)
-
-For linear coordinates, use SPO method
-For curvilinear coordinates, use RK4 method
+Created on Tue Oct 10 11:14:55 2017
 
 @author: Bing Gu
+
+History:
+2/12/18 : fix a bug with the FFT frequency
+
+Several possible improvements:
+    1. use pyFFTW to replace the Scipy
+
+
 """
 
 import numpy as np
-# import proplot as plt
-import matplotlib.pyplot as plt
 
-from numpy import cos, pi
-# from numba import jit
+import sys
+if sys.version_info[1] < 10:
+    import proplot as plt
+else:
+    import matplotlib.pyplot as plt
+
+# from matplotlib import animation
+
+from scipy.linalg import expm, sinm, cosm
 import scipy
-from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
+
+
+#from lime.fft import fft, ifft
+from pyqed import dagger, gwp, meshgrid
+from numpy import cos, pi
+from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft, fftshift
 from numpy.linalg import inv, det
 
 from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
-def plot_wavepacket(x, y, psilist, **kwargs):
-
-    if not isinstance(psilist, list): psilist = [psilist]
-    
-    X, Y = np.meshgrid(x, y)
-
-    for i, psi in enumerate(psilist):
-        fig, ax0 = plt.subplots(nrows=1, sharey=True)
-        # levels = np.linspace(0, 0.005, 20)
-        ax0.contourf(X, Y, np.abs(psi)**2, colorbar='r', cmap='viridis')
-
-        # levels = np.linspace(0, 0.0005, 20)
-        ax0.format(ylim=(-0.5, 0.5), **kwargs)
-        fig.savefig('vibrational_eigenstates_D0_'+str(i)+'.png')
-
-    return ax0
-
-
-
-class ResultSPO2(Result):
-    def __init__(self, **args):
-        super().__init__(**args)
-
-        self.x = None
-        self.y = None
-        self.population = None
-        self.xAve = None
-
-    def plot_wavepacket(self, psilist, state_id=None, **kwargs):
-
-        X, Y = np.meshgrid(self.x, self.y)
-
-        if not isinstance(psilist, list): psilist = [psilist]
-
-        if isinstance(state_id, int):
-
-            for i, psi in enumerate(psilist):
-                fig, ax0 = plt.subplots(nrows=1)
-
-                ax0.contour(X, Y, np.abs(psi[:,:, state_id])**2)
-                ax0.format(**kwargs)
-
-                fig.savefig('psi'+str(i)+'.pdf')
-
-            return ax0
-
-        else:
-
-            for i, psi in enumerate(psilist):
-
-                fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
-
-                ax0.contour(X, Y, np.abs(psi[:,:, 1])**2)
-                ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
-                ax0.format(**kwargs)
-                ax1.format(**kwargs)
-                fig.savefig('psi'+str(i)+'.pdf')
-
-            return ax0, ax1
-        
-    def get_population(self):
-        dx = interval(self.x)
-        dy = interval(self.y)
-        p0 = [norm2(psi[:, :, 0]) * dx * dy for psi in self.psilist]
-        p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
-        
-        # fig, ax = plt.subplots()
-        # ax.plot(self.times, p0)
-        # ax.plot(self.times, p1)
-        self.population = [p0, p1]
-        return p0, p1
-    
-    def position(self):        
-        # X, Y = np.meshgrid(self.x, self.y)
-        x = self.x 
-        y = self.y
-        dx = interval(x)
-        dy = interval(y)
-        
-        xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
-        yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
-
-        # fig, ax = plt.subplots()
-        # ax.plot(self.times, xAve)
-        # ax.plot(self.times, yAve)
-        self.xAve = [xAve, yAve]
-        return xAve, yAve
-        
-        
-
-            
-            
-class Solver():
-    def __init__(self):
-        self.obs_ops = None
-        self.grid = None
-
-    def set_obs_ops(self, obs_ops):
-        self.obs_ops = obs_ops
-        return
-
-
 class SPO:
-    def __init__(self, x, mass=1, ns=2):
-        self.x = x
-        self.dx = interval(x)
-        self.nx = len(x)
-        self.k = 2. * pi * fftfreq(self.nx, self.dx)
-        self.ns = ns
+    def __init__(self, x, nstates, psi0=None, mass=1, v=None):
+        """
+        Non-adiabatic molecular dynamics (NAMD) simulations for one nuclear dof
+            and many electronic states.
 
-        self.V = None
-        self.mass = mass
-        self._exp_K = None
-        self._exp_V = None
-        self._exp_V_half = None
+        Args:
+            x: real array of size N
+                grid points
 
+            psi0: complex array [N, ns]
+                initial wavefunction
 
-    def set_grid(self, xmin=-1, xmax=1, npts=32):
-        self.x = np.linspace(xmin, xmax, npts)
+            mass: float, nuclear mass
 
-    def set_potential(self, potential):
-        self.V = potential(self.x)
-        return
+            nstates: integer, number of states, default 2
 
-    def build(self, dt):
-        self._exp_V = np.exp(- 1j * self.V * dt)
-        self._exp_V_half = np.exp(-1j * self.V * dt/2.)
-        m = self.mass
-        k = self.k
-        self._exp_K = np.exp(-0.5j / m * (k * k) * dt)
-        return
-
-    def run(self, psi0, dt, Nt=1, t0=0, nout=1):
+            V_x: real array [N, ns**2]
+                potential energy surfaces and vibronic couplings
 
         """
-        Time-dependent Schrodinger Equation for wavepackets on a single PES.
+        self.x = x
+        self.psi0 = psi0
+        self.mass = mass
+        self.V_x = v
+        self.nstates = nstates
+
+    def x_evolve(self, psi, vpsi):
+        """
+        vpsi = exp(-i V dt)
+        """
+
+        # for i in range(len(x)):
+
+        #     tmp = psi_x[i, :]
+        #     utmp = U[i,:,:]
+        #     psi_x[i,:] = np.dot(U,V.dot(dagger(U))).dot(tmp)
+
+        psi = np.einsum('imn, in -> im', vpsi, psi)
+
+        return psi
+
+
+    def k_evolve(self, dt, k, psi_x):
+        """
+        one time step for exp(-i * K * dt)
+        """
+        mass = self.mass
+        #x = self.x
+
+        for n in range(2):
+
+            psi_k = fft(psi_x[:,n])
+
+            psi_k *= np.exp(-0.5 * 1j / mass * (k * k) * dt)
+
+            psi_x[:,n] = ifft(psi_k)
+
+        return psi_x
+
+    def run(self, dt, psi0, nt = 1):
+
+        """
+        Perform a series of time-steps via the time-dependent
+        Schrodinger Equation.
 
         Parameters
         ----------
-        psi0: 1d array, complex
-            initial wavepacket
-        t0: float
-            initial time
         dt : float
             the small time interval over which to integrate
-        nt : float, optional
+
+        Nsteps : float, optional
             the number of intervals to compute.  The total change
             in time at the end of this method will be dt * Nsteps.
             default is N = 1
         """
-        from pyqed import Result
+        if dt > 0.0:
+            f = open('density_matrix.dat', 'w')
+        else:
+            f = open('density_matrix_backward.dat', 'w')
 
-        self.build(dt)
+        x = self.x
+        V_x = self.V_x
 
-        t = t0
-        psi_x = psi0.copy()
+        nx = len(x)
+        nstates = self.nstates
 
-        r = Result(psi0=psi0, dt=dt, Nt=Nt, t0=t0, nout=nout)
-
-        # SPO propagation
-        psi_x = self.x_evolve_half(psi_x)
-
-        for i in range(1, Nt//nout):
-            for k in range(nout):
-                t += dt
-
-                psi_x = self.k_evolve(psi_x)
-                psi_x = self.x_evolve(psi_x)
-
-            r.psilist.append(psi_x.copy())
-
-            # f.write('{} {} {} {} {} \n'.format(t, *rho))
-
-        psi_x = self.k_evolve(psi_x)
-        psi_x = self.x_evolve_half(psi_x)
-
-        t += dt
-        # f.close()
-        r.psi = psi_x
-
-        return r
-
-    def x_evolve(self, psi):
-        """
-        one time step for exp(-i * V * dt)
-
-        Parameters
-        ----------
-        psi : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
-
-        return self._exp_V * psi
-
-    def x_evolve_half(self, psi):
-        """
-        one time step for exp(-i * V * dt)
-
-        Parameters
-        ----------
-        psi : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
-
-        return self._exp_V_half * psi
-
-    def k_evolve(self, psi_x):
-        """
-        one time step for exp(-i * K * dt)
-        """
-
-        psi_k = fft(psi_x)
-        #psi_k = fftshift(psi_k)
-
-        # psi_k *= np.exp(-0.5 * 1j / m * (k * k) * dt)
-        psi_k *= self._exp_K
-
-        return ifft(psi_k)
+        dt2 = 0.5 * dt
 
 
+        vpsi = np.zeros((nx, nstates, nstates), dtype=complex)
+        vpsi2 = np.zeros((nx, nstates, nstates), dtype=complex)
+
+        for i in range(nx):
+
+            Vmat = np.reshape(V_x[i,:], (nstates, nstates))
+            w, u = scipy.linalg.eigh(Vmat)
+
+            #print(np.dot(U.conj().T, Vmat.dot(U)))
+
+            v = np.diagflat(np.exp(- 1j * w * dt))
+            v2 = np.diagflat(np.exp(- 1j * w * dt2))
+
+            vpsi[i,:,:] = u.dot(v.dot(dagger(u)))
+            vpsi2[i,:,:] = u.dot(v2.dot(dagger(u)))
 
 
-# def adiabatic_1d(x, v, psi0, dt, Nt=1, t0=0.):
-#     """
-#     Time-dependent Schrodinger Equation for wavepackets on a single PES.
+        dx = x[1] - x[0]
 
-#     Parameters
-#     ----------
-#     psi0: 1d array, complex
-#         initial wavepacket
-#     t0: float
-#         initial time
-#     dt : float
-#         the small time interval over which to integrate
-#     nt : float, optional
-#         the number of intervals to compute.  The total change
-#         in time at the end of this method will be dt * Nsteps.
-#         default is N = 1
-#     """
+        k = 2.0 * np.pi * scipy.fftpack.fftfreq(nx, dx)
 
-#     f = open('density_matrix.dat', 'w')
-#     t = t0
-#     psi_x = psi0.copy()
-#     dt2 = 0.5 * dt
+        print('Propagating the wavefunction ...')
 
-#     N = len(x)
-#     dx = interval(x)
+        t = 0.0
+        psi_x = self.x_evolve(psi0, vpsi2) # evolve V half step
 
-#     k = 2. * pi * scipy.fftpack.fftfreq(N, dx)
-#     # k[:] = 2.0 * np.pi * k[:]
+        for i in range(nt - 1):
+
+            t += dt
+
+            psi_x = self.k_evolve(dt, k, psi_x)
+            psi_x = self.x_evolve(psi_x, vpsi)
+
+            rho = density_matrix(psi_x, dx)
+
+            # store the density matrix
+            f.write('{} {} {} {} {} \n'.format(t, *rho))
+
+        # psi_x = self.k_evolve(dt, psi_x)
+        # psi_x = self.x_evolve(dt2, psi_x, vpsi2)
 
 
-#     # SPO propagation
-#     x_evolve(dt2, x, v, psi_x)
+        f.close()
 
-#     for i in range(nt - 1):
+        return psi_x
 
-#         t += dt
+def density_matrix(psi_x,dx):
+    """
+    compute purity from the vibronic wavefunction
+    """
+    rho00 = np.sum(np.abs(psi_x[:,0])**2)*dx
+    rho01 = np.vdot(psi_x[:,1], psi_x[:,0])*dx
+    rho11 = 1. - rho00
+    return rho00, rho01, rho01.conj(), rho11
 
-#         psi_x = k_evolve(dt, k, psi_x)
-#         psi_x = x_evolve(dt, x, v, psi_x)
-
-#         # rho = density_matrix(psi_x, dx)
-#         # f.write('{} {} {} {} {} \n'.format(t, *rho))
-
-#     psi_x = k_evolve(dt, k, psi_x)
-#     psi_x = x_evolve(dt2, x, v, psi_x)
-
-#     t += dt
-#     f.close()
-
-#     return psi_x
 
 class SPO2:
     """
@@ -769,26 +643,6 @@ class SPO2:
         return ax0, ax1
 
 
-def divergence(f,h):
-    """
-    div(F) = dFx/dx + dFy/dy + ...
-    g = np.gradient(Fx,dx, axis=1)+ np.gradient(Fy,dy, axis=0) #2D
-    g = np.gradient(Fx,dx, axis=2)+ np.gradient(Fy,dy, axis=1) +np.gradient(Fz,dz,axis=0) #3D
-    """
-    num_dims = len(f)
-    return np.ufunc.reduce(np.add, [np.gradient(f[i], h[i], axis=i) \
-                                    for i in range(num_dims)])
-
-
-def S0(x, y):
-    pass
-
-def S1(x, y):
-    pass
-
-def diabatic_coupling(x, y):
-    pass
-
 class SPO3():
     # def __init__(self, x, y, z, mass=[1, 1, 1]):
     #     self.x = x
@@ -1188,447 +1042,26 @@ class SPO3():
             # ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
-# @jit
-# def gwp(x, sigma=1., x0=0., p0=0.):
-#     """
-#     a Gaussian wave packet centered at x0, with momentum k0
-#     """
-
-#     a = 1./sigma**2
-#     return (a/np.sqrt(np.pi))**(-0.25)*\
-#     np.exp(-0.5 * a * (x - x0)**2 + 1j * (x-x0) * p0)
-
-# @jit
-def gauss_x_2d(sigma, x0, y0, kx0, ky0):
+    
+    
+def divergence(f,h):
     """
-    generate the gaussian distribution in 2D grid
-    :param x0: float, mean value of gaussian wavepacket along x
-    :param y0: float, mean value of gaussian wavepacket along y
-    :param sigma: float array, covariance matrix with 2X2 dimension
-    :param kx0: float, initial momentum along x
-    :param ky0: float, initial momentum along y
-    :return: gauss_2d: float array, the gaussian distribution in 2D grid
+    div(F) = dFx/dx + dFy/dy + ...
+    g = np.gradient(Fx,dx, axis=1)+ np.gradient(Fy,dy, axis=0) #2D
+    g = np.gradient(Fx,dx, axis=2)+ np.gradient(Fy,dy, axis=1) +np.gradient(Fz,dz,axis=0) #3D
     """
-    gauss_2d = np.zeros((len(x), len(y)), dtype=np.complex128)
-
-    for i in range(len(x)):
-        for j in range(len(y)):
-            delta = np.dot(np.array([x[i]-x0, y[j]-y0]), inv(sigma))\
-                      .dot(np.array([x[i]-x0, y[j]-y0]))
-            gauss_2d[i, j] = (np.sqrt(det(sigma))
-                              * np.sqrt(np.pi) ** 2) ** (-0.5) \
-                              * np.exp(-0.5 * delta + 1j
-                                       * np.dot(np.array([x[i], y[j]]),
-                                                  np.array([kx0, ky0])))
-
-    return gauss_2d
-
-
-# @jit
-def potential_2d(x_range_half, y_range_half, couple_strength, couple_type):
-    """
-    generate two symmetric harmonic potentials wrt the origin point in 2D
-    :param x_range_half: float, the displacement of potential from the origin
-                                in x
-    :param y_range_half: float, the displacement of potential from the origin
-                                in y
-    :param couple_strength: the coupling strength between these two potentials
-    :param couple_type: int, the nonadiabatic coupling type. here, we used:
-                                0) no coupling
-                                1) constant coupling
-                                2) linear coupling
-    :return: v_2d: float list, a list containing for matrices:
-                               v_2d[0]: the first potential matrix
-                               v_2d[1]: the potential coupling matrix
-                                        between the first and second
-                               v_2d[2]: the potential coupling matrix
-                                        between the second and first
-                               v_2d[3]: the second potential matrix
-    """
-    v_2d = [0, 0, 0, 0]
-    v_2d[0] = (xv + x_range_half) ** 2 / 2.0 + (yv + y_range_half) ** 2 / 2.0
-    v_2d[3] = (xv - x_range_half) ** 2 / 2.0 + (yv - y_range_half) ** 2 / 2.0
-
-    # x_cross = sympy.Symbol('x_cross')
-    # mu = sympy.solvers.solve(
-    #     (x_cross - x_range_half) ** 2 / 2.0 -
-    #     (x_cross + x_range_half) ** 2 / 2.0,
-    #     x_cross)
-
-    if couple_type == 0:
-        v_2d[1] = np.zeros(np.shape(v_2d[0]))
-        v_2d[2] = np.zeros(np.shape(v_2d[0]))
-    elif couple_type == 1:
-        v_2d[1] = np.full((np.shape(v_2d[0])), couple_strength)
-        v_2d[2] = np.full((np.shape(v_2d[0])), couple_strength)
-    elif couple_type == 2:
-        v_2d[1] = couple_strength * (xv+yv)
-        v_2d[2] = couple_strength * (xv+yv)
-    # elif couple_type == 3:
-    #     v_2d[1] = couple_strength \
-    #                 * np.exp(-(x - float(mu[0])) ** 2 / 2 / sigma ** 2)
-    #     v_2d[2] = couple_strength \
-    #                 * np.exp(-(x - float(mu[0])) ** 2 / 2 / sigma ** 2)
-    else:
-        raise 'error: coupling type not existing'
-
-    return v_2d
-
-
-# @jit
-def diabatic(x, y):
-    """
-    PESs in diabatic representation
-    :param x_range_half: float, the displacement of potential from the origin
-                                in x
-    :param y_range_half: float, the displacement of potential from the origin
-                                in y
-    :param couple_strength: the coupling strength between these two potentials
-    :param couple_type: int, the nonadiabatic coupling type. here, we used:
-                                0) no coupling
-                                1) constant coupling
-                                2) linear coupling
-    :return:
-        v:  float 2d array, matrix elements of the DPES and couplings
-    """
-    nstates = 2
-
-    v = np.zeros((nstates, nstates))
-
-    v[0,0] = (x + 4.) ** 2 / 2.0 + (y + 3.) ** 2 / 2.0
-    v[1,1] = (x - 4.) ** 2 / 2.0 + (y - 3.) ** 2 / 2.0
-
-    v[0, 1] = v[1, 0] = 0
-
-    return v
-
-# @jit
-# def x_evolve_half_2d(dt, v_2d, psi_grid):
-#     """
-#     propagate the state in grid basis half time step forward with H = V
-#     :param dt: float
-#                 time step
-#     :param v_2d: float array
-#                 the two electronic states potential operator in grid basis
-#     :param psi_grid: list
-#                 the two-electronic-states vibrational state in grid basis
-#     :return: psi_grid(update): list
-#                 the two-electronic-states vibrational state in grid basis
-#                 after being half time step forward
-#     """
-
-#     for i in range(len(x)):
-#         for j in range(len(y)):
-#             v_mat = np.array([[v_2d[0][i, j], v_2d[1][i, j]],
-#                              [v_2d[2][i, j], v_2d[3][i, j]]])
-
-#             w, u = scipy.linalg.eigh(v_mat)
-#             v = np.diagflat(np.exp(-0.5 * 1j * w / hbar * dt))
-#             array_tmp = np.array([psi_grid[0][i, j], psi_grid[1][i, j]])
-#             array_tmp = np.dot(u.conj().T, v.dot(u)).dot(array_tmp)
-#             psi_grid[0][i, j] = array_tmp[0]
-#             psi_grid[1][i, j] = array_tmp[1]
-#             #self.x_evolve = self.x_evolve_half * self.x_evolve_half
-#             #self.k_evolve = np.exp(-0.5 * 1j * self.hbar / self.m * \
-#             #               (self.k * self.k) * dt)
-
-
-# @jit
-def x_evolve_2d(dt, psi, v):
-    """
-    propagate the state in grid basis half time step forward with H = V
-    :param dt: float
-                time step
-    :param v_2d: float array
-                the two electronic states potential operator in grid basis
-    :param psi_grid: list
-                the two-electronic-states vibrational state in grid basis
-    :return: psi_grid(update): list
-                the two-electronic-states vibrational state in grid basis
-                after being half time step forward
-    """
-
-
-    vpsi = np.einsum('ijab, ijb -> ija', np.exp(- 1j * v * dt), psi)
-
-
-    return vpsi
-
-
-def k_evolve_2d(dt, masses, kx, ky, psi):
-    """
-    propagate the state in grid basis a time step forward with H = K
-    :param dt: float, time step
-    :param kx: float, momentum corresponding to x
-    :param ky: float, momentum corresponding to y
-    :param psi_grid: list, the two-electronic-states vibrational states in
-                           grid basis
-    :return: psi_grid(update): list, the two-electronic-states vibrational
-                                     states in grid basis
-    """
-
-    psi_k = fft2(psi)
-    mx, my = masses
-
-    Kx, Ky = np.meshgrid(kx, ky)
-
-    kin = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
-
-    psi_k = kin * psi_k
-    psi = ifft2(psi_k)
-
-    return psi
-
-
-def dpsi(psi, kx, ky, ndim=2):
-    '''
-    Momentum operator operates on the wavefunction
-
-    Parameters
-    ----------
-    psi : 2D complex array
-        DESCRIPTION.
-    ndim : int, default 2
-        coordinates dimension
-    Returns
-    -------
-    kpsi : (nx, ny, ndim)
-        DESCRIPTION.
-
-    '''
-
-    # Fourier transform of the wavefunction
-    psi_k = fft2(psi)
-
-    # momentum operator in the Fourier space
-    kxpsi = np.einsum('i, ij -> ij', kx, psi_k)
-    kypsi = np.einsum('j, ij -> ij', ky, psi_k)
-
-    kpsi = np.zeros((nx, ny, ndim), dtype=complex)
-
-    # transform back to coordinate space
-    kpsi[:,:,0] = ifft2(kxpsi)
-    kpsi[:,:,1] = ifft2(kypsi)
-
-    return kpsi
-
-def dxpsi(psi):
-    '''
-    Momentum operator operates on the wavefunction
-
-    Parameters
-    ----------
-    psi : 2D complex array
-        DESCRIPTION.
-
-    Returns
-    -------
-    kpsi : (nx, ny, ndim)
-        DESCRIPTION.
-
-    '''
-
-    # Fourier transform of the wavefunction
-    psi_k = fft2(psi)
-
-    # momentum operator in the Fourier space
-    kxpsi_k = np.einsum('i, ij -> ij', kx, psi_k)
-
-    # transform back to coordinate space
-    kxpsi = ifft2(kxpsi_k)
-
-    return kxpsi
-
-def dypsi(psi):
-    '''
-    Momentum operator operates on the wavefunction
-
-    Parameters
-    ----------
-    psi : 2D complex array
-        DESCRIPTION.
-
-    Returns
-    -------
-    kpsi : (nx, ny, ndim)
-        DESCRIPTION.
-
-    '''
-
-    # Fourier transform of the wavefunction
-    psi_k = fft2(psi)
-
-    # momentum operator in the Fourier space
-    kxpsi_k = np.einsum('i, ij -> ij', kx, psi_k)
-
-    # transform back to coordinate space
-    kxpsi = ifft2(kxpsi_k)
-
-    return kxpsi
-
-
-def adiabatic_2d(x, y, psi0, v, dt, Nt=0, coords='linear', mass=None, G=None):
-    """
-    propagate the adiabatic dynamics at a single surface
-
-    :param dt: time step
-    :param v: 2d array
-                potential matrices in 2D
-    :param psi: list
-                the initial state
-    mass: list of 2 elements
-        reduced mass
-
-    Nt: int
-        the number of the time steps, Nt=0 indicates that no propagation has been done,
-                   only the initial state and the initial purity would be
-                   the output
-
-    G: 4D array nx, ny, ndim, ndim
-        G-matrix
-
-    :return: psi_end: list
-                      the final state
-
-    G: 2d array
-        G matrix only used for curvilinear coordinates
-    """
-    #f = open('density_matrix.dat', 'w')
-    t = 0.0
-    dt2 = dt * 0.5
-
-    psi = psi0.copy()
-
-    nx, ny = psi.shape
-
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
-
-    kx = 2. * np.pi * fftfreq(nx, dx)
-    ky = 2. * np.pi * fftfreq(ny, dy)
-
-    if coords == 'linear':
-        # Split-operator method for linear coordinates
-
-        psi = x_evolve_2d(dt2, psi,v)
-
-        for i in range(Nt):
-            t += dt
-            psi = k_evolve_2d(dt, kx, ky, psi)
-            psi = x_evolve_2d(dt, psi, v)
-
-    elif coords == 'curvilinear':
-
-        # kxpsi = np.einsum('i, ijn -> ijn', kx, psi_k)
-        # kypsi = np.einsum('j, ijn -> ijn', ky, psi_k)
-
-        # tpsi = np.zeros((nx, ny, nstates), dtype=complex)
-        # dxpsi = np.zeros((nx, ny, nstates), dtype=complex)
-        # dypsi = np.zeros((nx, ny, nstates), dtype=complex)
-
-        # for i in range(nstates):
-
-        #     dxpsi[:,:,i] = ifft2(kxpsi[:,:,i])
-        #     dypsi[:,:,i] = ifft2(kypsi[:,:,i])
-
-        for k in range(Nt):
-            t += dt
-            psi = rk4(psi, hpsi, dt, kx, ky, v, G)
-
-        #f.write('{} {} {} {} {} \n'.format(t, *rho))
-        #purity[i] = output_tmp[4]
-
-
-
-    # t += dt
-    #f.close()
-
-    return psi
-
-def KEO(psi, kx, ky, G):
-    '''
-    compute kinetic energy operator K * psi
-
-    Parameters
-    ----------
-    psi : TYPE
-        DESCRIPTION.
-    dt : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    None.
-
-    '''
-#    kpsi = dpsi(psi, kx, ky)
-
-    # Fourier transform of the wavefunction
-    psi_k = fft2(psi)
-
-    # momentum operator in the Fourier space
-    kxpsi = np.einsum('i, ij -> ij', kx, psi_k)
-    kypsi = np.einsum('j, ij -> ij', ky, psi_k)
-
-    nx, ny = len(kx), len(ky)
-    kpsi = np.zeros((nx, ny, 2), dtype=complex)
-
-    # transform back to coordinate space
-    kpsi[:,:,0] = ifft2(kxpsi)
-    kpsi[:,:,1] = ifft2(kypsi)
-
-#   ax.contour(x, y, np.abs(kpsi[:,:,1]))
-
-    tmp = np.einsum('ijrs, ijs -> ijr', G, kpsi)
-    #G = metric_tensor(x[i], y[j]) # 2 x 2 matrix metric tensor at (x, y)
-
-    # Fourier transform of the wavefunction
-    phi_x = tmp[:,:,0]
-    phi_y = tmp[:,:,1]
-
-    phix_k = fft2(phi_x)
-    phiy_k = fft2(phi_y)
-
-    # momentum operator in the Fourier space
-    kxphi = np.einsum('i, ij -> ij', kx, phix_k)
-    kyphi = np.einsum('j, ij -> ij', ky, phiy_k)
-
-    # transform back to coordinate space
-    kxphi = ifft2(kxphi)
-    kyphi = ifft2(kyphi)
-
-    # psi += -1j * dt * 0.5 * (kxphi + kyphi)
-
-    return 0.5 * (kxphi + kyphi)
-
-def PEO(psi, v):
-    """
-    V |psi>
-    :param dt: float
-                time step
-    :param v_2d: float array
-                the two electronic states potential operator in grid basis
-    :param psi_grid: list
-                the two-electronic-states vibrational state in grid basis
-    :return: psi_grid(update): list
-                the two-electronic-states vibrational state in grid basis
-                after being half time step forward
-    """
-
-
-    vpsi = v * psi
-    return vpsi
-
-def hpsi(psi, kx, ky, v, G):
-
-    kpsi = KEO(psi, kx, ky, G)
-    vpsi = PEO(psi, v)
-
-    return -1j * (kpsi + vpsi)
-
+    num_dims = len(f)
+    return np.ufunc.reduce(np.add, [np.gradient(f[i], h[i], axis=i) \
+                                    for i in range(num_dims)])
 ######################################################################
 # Helper functions for gaussian wave-packets
 
+# def gwp(x, a, x0, k0):
+#     """
+#     a gaussian wave packet of width a, centered at x0, with momentum k0
+#     """
+#     return ((a * np.sqrt(np.pi)) ** (-0.5)
+#             * np.exp(-0.5 * ((x - x0) * 1. / a) ** 2 + 1j * x * k0))
 
 def gauss_k(k,a,x0,k0):
     """
@@ -1637,7 +1070,8 @@ def gauss_k(k,a,x0,k0):
     return ((a / np.sqrt(np.pi))**0.5
             * np.exp(-0.5 * (a * (k - k0)) ** 2 - 1j * (k - k0) * x0))
 
-# @jit
+
+######################################################################
 def theta(x):
     """
     theta function :
@@ -1648,142 +1082,77 @@ def theta(x):
     y[x > 0] = 1.0
     return y
 
-
 def square_barrier(x, width, height):
     return height * (theta(x) - theta(x - width))
 
-# @jit
-# def density_matrix(psi_grid):
-#     """
-#     compute electronic purity from the wavefunction
-#     """
-#     rho00 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[0]))*dx*dy
-#     rho01 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[1]))*dx*dy
-#     rho11 = np.sum(np.multiply(np.conj(psi_grid[1]), psi_grid[1]))*dx*dy
-
-#     purity = rho00**2 + 2*rho01*rho01.conj() + rho11**2
-
-#     return rho00, rho01, rho01.conj(), rho11, purity
-
-
 
 if __name__ == '__main__':
-
     # specify time steps and duration
-    ndim = 2 # 2D problem, DO NOT CHANGE!
-    dt = 0.01
-    print('time step = {} fs'.format(dt * au2fs))
-
-    num_steps = 10
-
-
-    nx = 2 ** 5
-    ny = 2 ** 5
-    nz = 2 ** 5
-    xmin = -6
-    xmax = -xmin
-    ymin = -6
-    ymax = -ymin
-    x = np.linspace(xmin, xmax, nx)
-    y = np.linspace(ymin, ymax, ny)
-    z = np.linspace(xmin, xmax, nz)
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
-
-
-    # k-space grid
-    kx = 2. * np.pi * fftfreq(nx, dx)
-    ky = 2. * np.pi * fftfreq(ny, dy)
-
-    X, Y = np.meshgrid(x, y)
-
-    fig, ax = plt.subplots()
-    v0 = 0.5 * ((X+1)**2 + Y**2)
-    v1 = 0.5 * ((X-1)**2 + Y**2) + 1.0
-    
-    
-    
-    # for i in range(nx):
-    #     for j in range(ny):
-    #         v[i,j] = diabatic(x[i], y[j])[0,0]
-
-    #ax.imshow(v)
+    dt = 0.05
+    # t_max = 100
+    # frames = int(t_max / float(N_steps * dt))
 
     # specify constants
-    mass = [1.0, 1.0]  # particle mass
+    hbar = 1.0   # planck's constant
+    m = 1.0      # particle mass
 
-    x0, y0, kx0, ky0 = -1, 0, 0.0, 0
-
-    #coeff1, phase = np.sqrt(0.5), 0
-
-    print('x range = ', x[0], x[-1])
+    # specify range in x coordinate
+    N = 2 ** 9
+    xmin = -6
+    xmax = -xmin
+    #dx = 0.01
+    #x = dx * (np.arange(N) - 0.5 * N)
+    x = np.linspace(xmin,xmax,N)
+    print('x range = ',x[0], x[-1])
+    dx = x[1] - x[0]
     print('dx = {}'.format(dx))
-    print('number of grid points along x = {}'.format(nx))
-    print('y range = ', y[0], y[-1])
-    print('dy = {}'.format(dy))
-    print('number of grid points along y = {}'.format(ny))
+    print('number of grid points = {}'.format(N))
 
-    sigma = np.identity(2) * 1.
-    ns = nstates = 2
-    psi0 = np.zeros((nx, ny, ns), dtype=complex)
-    psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
+    # specify potential
+    #V0 = 1.5
+    #L = hbar / np.sqrt(2 * m * V0)
+    #a = 3 * L
 
+    # diabatic surfaces with vibronic couplings
+    V_x = np.zeros((N,4))
+    V_x[:,0] = (x)**2/2.0
+    V_x[:,3] = (x-1.)**2/2.0
+    c = 0.1
+    V_x[:,1] = c
+    V_x[:,2] = c
+
+
+    print('constant vibronic coupling  = ', c)
+
+    # specify initial momentum and quantities derived from it
+    #p0 = np.sqrt(2 * m * 0.2 * V0)
+    p0 = 0.0
+    x0 = 0.0
+    #dp2 = p0 * p0 * 1./80
+    #d = hbar / np.sqrt(2 * dp2)
+    a = 1.
+
+    k0 = p0 / hbar
+    v0 = p0 / m
+    angle = 0.0  # np.pi/4.0
+    print('initial phase difference between c_g and c_e = {} Pi'.format(angle/np.pi))
+    psi0 = np.zeros((N,2), dtype=complex)
+    psi0[:,0] =  gwp(x, a, x0, k0) * np.exp(1j*angle)
+    # psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
+
+    sol = NAMD(x, 2, psi0, mass=1, V_x =V_x)
+    sol.propagate(dt, psi0, nt=1000)
+
+    rho = np.genfromtxt('density_matrix.dat')
+
+    import proplot as plt
     fig, ax = plt.subplots()
-    ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
-    ax.set_title('Initial wavepacket')
-
-    #psi = psi0
-
-    # propagate
-
-    # store the final wavefunction
-    #f = open('wft.dat','w')
-    #for i in range(N):
-    #    f.write('{} {} {} \n'.format(x[i], psi_x[i,0], psi_x[i,1]))
-    #f.close()
+    # ax.plot(rho[:, 0], rho[:, 4])
+    print(rho[:,2])
+    ax.plot(rho[:, 0], rho[:, 1].real)
+    # ax.format(ylim=(-1,1), xlim=(0,100))
 
 
-    # G = np.zeros((nx, ny, ndim, ndim))
-    # G[:,:,0, 0] = G[:,:,1, 1] = 1.
-
-    
-    extent=[xmin, xmax, ymin, ymax]
-
-    # psi1 = adiabatic_2d(x, y, psi0, v, dt=dt, Nt=num_steps, coords='curvilinear',G=G)
-    sol = SPO2(nstates=2, mass=[1, 1], x=x, y=y)
-
-    sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
-
-    r = sol.run(psi0=psi0, dt=0.5, Nt=2000)
-    
-    rho = np.zeros((nstates, nstates, len(r.times)))
-
-    # sol.current_density(r.psilist[-1])
-    r.plot_wavepacket(r.psilist[-1])
-
-    # for i in range(len(r.times)):
-    #     rho[:, :, i] = sol.rdm_el(r.psilist[i])
-    
-    sol.rdm_el(r.psilist)
-    
-    # p0, p1 = r.get_population()
-    # fig, ax = plt.subplots()
-    # ax.plot(r.times, p0)
-    # ax.plot(r.times, p1, label=r'P$_1$')
-    # ax.legend()
-
-    # r.position()
-    
-    # for j in range(4):
-    #     ax.contourf(x, y, np.abs(r.psilist[j][:, :, 1]).T, cmap='viridis')
-        
-    # for psi in r.psilist:
-    
-    
-    
-        
-    
+######################################################################
 
 
-    # psi2 = adiabatic_2d(x, y, psi0, v, mass=mass, dt=dt, Nt=num_steps)
-    # ax.contour(x,y, np.abs(psi2).T)

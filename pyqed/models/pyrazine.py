@@ -28,7 +28,7 @@ from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
 
 
-class Vibronic:
+class Vibronic2:
     """
     vibronic model in the diabatic representation with 2 nuclear coordinates
 
@@ -369,33 +369,32 @@ class LVC2:
 
 
 class DHO:
-    def __init__(self, d, mass=1, nstates=2, coupling=0):
+    def __init__(self, x, mass=1, nstates=2, coupling=0):
 
         # self.dpes()
         self.edip = sigmax()
         self.nstates = nstates
         self.mass = mass
-        self.d = d # displacement
+        self.x = x
+        self.nx = len(x)
+        # self.d = d # displacement
         self.coupling = coupling # vibronic coupling strength
         assert(self.edip.ndim == nstates)
 
 
-    # def dpes(self):
+    def dpes(self, d, e0):
 
-    #     x, y = self.x, self.y
-    #     nx = self.nx
-    #     ny = self.ny
-    #     N = self.nstates
+        x = self.x
+        nx = self.nx
+        N = self.nstates
 
-    #     X, Y = meshgrid(x, y)
+        v = np.zeros((nx, N, N))
 
-    #     v = np.zeros((nx, ny, N, N))
+        v[:, 0, 0] = x**2/2. 
+        v[:, 1, 1] = (x-d)**2/2. + e0
 
-    #     v[:, :, 0, 0] = X**2/2. + Y**2/2.
-    #     v[:, :, 1, 1] = (X-1)**2/2. + (Y-1)**2/2. + 1.
-
-    #     self.v = v
-    #     return
+        self.v = v
+        return
 
     def apes(self, x):
         d = self.d

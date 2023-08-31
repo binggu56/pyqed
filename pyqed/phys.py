@@ -717,8 +717,10 @@ def gwp(x, a, x0=0., p0=0.):
         DESCRIPTION.
 
     '''
-    
-    ndim = len(x0)
+    if isinstance(x0, float):
+        ndim = 1
+    else:
+        ndim = len(x0)
     
     if ndim == 1:
         
