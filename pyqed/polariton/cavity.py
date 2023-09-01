@@ -10,7 +10,7 @@ import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 
 from pyqed.units import au2fs, au2k, au2ev
-from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort
+from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Composite
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
 # from pyqed.cavity import Cavity
@@ -294,7 +294,7 @@ class VibronicPolariton:
     #     for n in range(nc):
     #         v[:, n, :] = mol.v
 
-    def dpes(self, g, rwa=False):
+    def dpes(self, g, rwa=False, gauge='dipole'):
 
         # if rwa == False:
         #     raise NotImplementedError('Counterrotating terms are not included yet.\
@@ -323,6 +323,7 @@ class VibronicPolariton:
         # for i in range(nx):
         #     v[i, :, :] += g * kron(mol.edip, a + dag(a))
 
+
         if mol.edip.shape == (nel, nel):
             # Condon approximation
             v += np.tile(g * kron(mol.edip, a + dag(a)).toarray(), (nx, 1, 1))
@@ -330,13 +331,41 @@ class VibronicPolariton:
         elif mol.edip.shape == (nx, nel, nel):
             
             for i in range(nx):
-                v[i, :, :] = g * kron(mol.edip[i], a + dag(a)).toarray() 
+                v[i, :, :] += g * kron(mol.edip[i], a + dag(a)).toarray() 
 
         self.v = v
         return v
 
-    def ppes(self):
+    def add_couplings(self, ops):
+        
+        nel = self.mol.nstates
+        nx = self.nx 
+        
+        for pair in range(len(ops)):
+            
+            mol_op, cav_op = pair
+            
+            if mol_op.shape == (nel, nel):
+                # Condon approximation
+                self.v += np.tile( kron(mol_op, cav_op), (nx, 1, 1))
+    
+            elif mol_op.shape == (nx, nel, nel):
+                
+                for i in range(nx):
+                    self.v[i, :, :] += kron(mol_op[i], cav_op) 
 
+        return self.v        
+
+    def ppes(self):
+        """
+        Compute polaritonic surfaces
+
+        Returns
+        -------
+        E : TYPE
+            DESCRIPTION.
+
+        """
         E = np.zeros((self.nx, self.nstates))
         
         for i in range(self.nx):
@@ -393,11 +422,19 @@ class VibronicPolariton:
 
         from pyqed.namd.diabatic import SPO
 
-        spo = SPO(self.x, mass=self.mol.mass, ns=self.nstates)
-        return spo.run(psi0=psi0, dt=dt, Nt=Nt, t0=t0, nout=nout)
+        spo = SPO(self.x, mass=self.mol.mass, nstates=self.nstates, v=self.v)
+        return spo.run(psi0=psi0, dt=dt, nt=Nt)
 
 
-
+    def plot_surface(self, state_id=0, representation='adiabatic'):
+        # from pyqed.style import plot_surface
+        fig, ax = plt.subplots()
+        if representation == 'adiabatic':
+            ax.plot(self.x, self.va[:, state_id])
+        else:
+            ax.plot(self.x, self.v[:, state_id, state_id])
+            
+        return
 
 class VibronicPolariton2:
     """
@@ -667,6 +704,7 @@ if __name__ == '__main__':
     pol.ppes()
 
     pol.draw_surfaces(n=4, representation='adiabatic')
+    
     # pol.product_state(0, 0, 0)
 
     def test_vp2():
