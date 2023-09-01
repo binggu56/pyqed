@@ -336,12 +336,12 @@ class VibronicPolariton:
         self.v = v
         return v
 
-    def add_couplings(self, ops):
+    def add_coupling(self, ops):
         
         nel = self.mol.nstates
         nx = self.nx 
         
-        for pair in range(len(ops)):
+        for pair in ops:
             
             mol_op, cav_op = pair
             
@@ -418,12 +418,12 @@ class VibronicPolariton:
 
         return
 
-    def run(self, psi0, dt, Nt=1, t0=0, nout=1):
+    def run(self, psi0, dt, nt=1, t0=0, nout=1):
 
         from pyqed.namd.diabatic import SPO
 
         spo = SPO(self.x, mass=self.mol.mass, nstates=self.nstates, v=self.v)
-        return spo.run(psi0=psi0, dt=dt, nt=Nt)
+        return spo.run(psi0=psi0, dt=dt, nt=nt)
 
 
     def plot_surface(self, state_id=0, representation='adiabatic'):
