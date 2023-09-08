@@ -662,7 +662,7 @@ class SPO3():
     For time-dependent H,
         # TODO
     """
-    def __init__(self, x, y, z, masses, nstates=2, coords='linear', G=None, abc=False):
+    def __init__(self, x, y, z, mass, nstates=2, coords='linear', G=None, abc=False):
         self.x = x
         self.y = y
         self.z = z
@@ -676,7 +676,7 @@ class SPO3():
         self.dy = interval(y) # for uniform grids
         self.dz = interval(z)
 
-        self.masses = masses
+        self.masses = mass
         self.kx = None
         self.ky = None
         self.kz = None

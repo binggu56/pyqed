@@ -142,7 +142,7 @@ def obs(A, rho):
 
 
 class Cavity():
-    def __init__(self, freq, n_cav):
+    def __init__(self, freq, n_cav, x=None):
         self.freq = self.omega = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav
@@ -152,7 +152,12 @@ class Cavity():
         # self.create = self.get_create()
 
         # self.a = self.get_annihilate()
-        self.hamiltonian = self.get_ham()
+        self.H = self.getH()
+        
+        # number of grid points to represent quadrature
+        if x is not None:
+            self.x = x
+            self.nx = len(x)
 
 #    @property
 #    def hamiltonian(self):
@@ -162,7 +167,7 @@ class Cavity():
 #    def hamiltonian(self):
 #        self._hamiltonian = ham_ho(self.resonance, self.n)
 
-    def get_ham(self, zpe=False):
+    def getH(self, zpe=False):
         return ham_ho(self.freq, self.n_cav)
 
     def create(self):
@@ -186,7 +191,7 @@ class Cavity():
         vac[0] = 1.
         return ket2dm(vac)
 
-    def get_num(self):
+    def get_number_operator(self):
         """
         number operator
         """
@@ -195,7 +200,21 @@ class Cavity():
         a.setdiag(range(ncav), 0)
         return a.tocsr()
 
+    # def x(self):
+    #     """
+    #     quadrature; corresponding to the displacement field D
+        
+    #     .. math::
+    #         D = \frac{1}{\sqrt{2}} (a + a^\dag)
 
+    #     Returns
+    #     -------
+    #     TYPE
+    #         DESCRIPTION.
+
+    #     """
+    #     a = self.annihilate()
+    #     return 1./np.sqrt(2.) * (a + dag(a))
 
 
 

@@ -693,7 +693,7 @@ def rgwp(x, x0=0., sigma=1.):
     return psi
 
 
-def gwp(x, a, x0=0., p0=0.):
+def gwp(x, a=None, x0=0., p0=0.):
     '''
     complex Gaussian wavepacket
     
@@ -717,11 +717,16 @@ def gwp(x, a, x0=0., p0=0.):
         DESCRIPTION.
 
     '''
-    if isinstance(x0, float):
+    if isinstance(x, float):
         ndim = 1
     else:
-        ndim = len(x0)
+        ndim = len(x)
     
+    x = np.array(x)
+    
+    if a is None:
+        a = np.eye(ndim)
+        
     if ndim == 1:
         
         return (a/np.pi)**(1/4) * np.exp(-a * (x-x0)**2/2.)\
@@ -743,9 +748,15 @@ def gwp(x, a, x0=0., p0=0.):
         
         # if isinstance(x, list):
         #     x = np.array(x)
+        if isinstance(x0, float):
+            x0 = np.array([x0, ] * ndim)
+        if isinstance(p0, float):
+            p0 = np.array([p0, ] * ndim)
             
+
         u = x - x0
-        delta = u @ a @ u
+        delta = u.T @ a @ u
+        print(delta)
         
         g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
                                                              1j * p0 @ (x-x0))
