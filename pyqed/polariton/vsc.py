@@ -325,13 +325,12 @@ if __name__ == '__main__':
     pol.dpes(g=[0.1, 0.1])
     
     pol.ppes()
-    pol.plot_surface(1, representation='diabatic')
+    # pol.plot_surface(1, representation='diabatic')
 
     psi0 = np.zeros((len(x), len(y), len(q), pol.nstates), dtype=complex)
     for i in range(nx):
         for j in range(ny):
             for k in range(nq):
-                tmp = gwp([x[i], y[j], q[k]])
                 psi0[i, j, k, 1] = gwp([x[i], y[j], q[k]])
     
     # pol.plot_ground_state()

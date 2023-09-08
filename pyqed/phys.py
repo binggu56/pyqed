@@ -756,7 +756,6 @@ def gwp(x, a=None, x0=0., p0=0.):
 
         u = x - x0
         delta = u.T @ a @ u
-        print(delta)
         
         g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
                                                              1j * p0 @ (x-x0))
