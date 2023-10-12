@@ -166,8 +166,10 @@ def k_evolve_1d(k, psi):
 
 def kinetic(k, B_list):
     """
-    kinetic energy (KE) component of the one-step evolution operator e^{-i * dt * K) on the MPS
-    where K is the total KE operator
+    kinetic energy (KE) component of the one-step evolution operator 
+    :math:`e^{-i * dt * K)` on the MPS
+    
+              where K is the total KE operator
     """
     for i in range(L):
         chi1, chi2 = np.shape(B_list[i])[1:]

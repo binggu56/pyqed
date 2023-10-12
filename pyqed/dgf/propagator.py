@@ -7,6 +7,8 @@ Created on Sun Jul  4 15:27:12 2021
 
 EM field pragators, largely from pyGDM2 package
 
+Gaussian units are used.
+
 """
 
 import copy
@@ -15,7 +17,14 @@ import numpy as np
 import math
 import cmath
 import numba
-from numba import cuda
+from numba import cuda 
+
+from numpy import eye 
+
+from pyqed import interval
+
+#TODO: benchmark with an exact solution 
+
 # =============================================================================
 # numba compatible propagators (CPU + CUDA)
 # =============================================================================
@@ -187,9 +196,233 @@ def G0_1D(z1, z2, k, eps):
     return np.exp(1j * k * d) * 1j/(2. * k)
 
 
+class Sphere:
+    def __init__(radius, eps):
+        pass
+    
+class Cube:
+    def __init__(self):
+        pass
+    
+class Structure:
+    def __init__(self):
+        pass
+    
+class Multilayer:
+    def __init__(self, z, eps, eps0=eye(2)):
+        """
+        
+        DGF solver for multilayer loseless materials
+        
+        Parameters
+        ----------
+        z : TYPE
+            DESCRIPTION.
+        eps : TYPE
+            dielectric function at scattering region
+        eps0 : TYPE, optional
+            background dielectric constant. The default is eye(2).
+
+        Returns
+        -------
+        None.
+
+        """
+        self.z = z
+        self.nz = len(z)
+        assert(eps.shape == (2, 2, self.nz))
+        
+        self.eps = eps
+        self.eps0 = eps0 # background dielectric constant
+        self.chi = eps - np.array([eps0, ] * nz).transpose((1, 2, 0))
+        
+        # 
+        # self.g0 = None
+        
+    def green0(self, k):
+        """
+        Green's function for layers homogenous achiral media
+        
+        .. math::
+            
+            \epsilon = \left[ \epsilon_{xx}      0  
+                                   0         \epsilon_{yy} \right]
+    
+        Parameters
+        ----------
+        k : float
+            wavevector in free space
+        eps : TYPE
+            DESCRIPTION.
+    
+        Returns
+        -------
+        None.
+    
+        """
+        eps0 = self.eps0
+
+        k0 = k * sqrt(eps0[0, 0])
+        
+        g = np.zeros((2, 2, self.nz, self.nz), dtype=complex) # the 2 dimensions refer to x, y
+        
+        Z1, Z2 = np.meshgrid(z, z)
+
+        g[0, 0] = helmholtz(Z1, Z2, k0)
+        
+        k1 = k * sqrt(eps0[1, 1])
+        g[1, 1] = helmholtz(Z1, Z2, k1)
+        
+        self.g0 = g
+        return g
+        
+    def G(self, k):
+        z = self.z 
+        nz = len(z)
+        dz = interval(z)
+        chi = np.zeros((2,2, nz, nz), dtype=complex)
+        for i in range(nz):
+            chi[:, :, i, i] = self.chi[:, :, i]
+        
+        Z1, Z2 = np.meshgrid(z, z)
+        
+        g0 = self.green0(k)
+
+        
+        I = np.kron(np.eye(2), np.eye(nz))
+
+        g0 = np.transpose(g0, (0, 2, 1, 3)).reshape(2*nz,2*nz)
+        chi = np.transpose(chi, (0, 2, 1, 3)).reshape(2*nz,2*nz)
+
+        
+        g = np.linalg.inv(I - g0 @ chi * dz) @ g0
+        return g.reshape((2, nz, 2, nz)).transpose((0, 2, 1, 3))
+
+
+class ChiralMultilayer:
+    def __init__(self, z, eps, zeta, mu=1):
+        """
+        For chiral media, we have to consider E and B together. 
+        
+        .. math::
+            
+            D = \epsilon_0 \epsilon E + \zeta H 
+            H = \mu_0 \mu B + \zeta E
+            
+        Parameters
+        ----------
+        z: 1darray 
+            real space
+        eps : TYPE
+            DESCRIPTION.
+        zeta : TYPE
+            DESCRIPTION.
+        mu : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+    def green0(self):
+        pass
+    
+    def green(self):
+        pass
+
+
+
+def helmholtz(z1, z2, k):
+    """
+    Green's function for the Helmholtz operator in 1D
+
+    .. math::
+        (\grad^2 + k^2) G(z, z') = -\delta(z - z')
+
+    Parameters
+    ----------
+    z1 : TYPE
+        DESCRIPTION.
+    z2 : TYPE
+        DESCRIPTION.
+    k : real or imaginary
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    d = abs(z1 - z2)
+    return np.exp(1j * k * d) * 1j/(2. * k)
+    
+
+
+
+class MultilayerIsotropic:
+    def __init__(self, z, eps, eps0=1., k=None):
+        self.z = z
+        
+        
+    def green0(self, z1, z2, k):
+        pass
+    
+    def green(self, z1, z2, k):
+        # 1D
+        nz = 128 * 2
+        d = 100 # length, nm
+    
+        z = np.linspace(-d, d, nz)
+        dz = z[1] - z[0]
+    
+        nmodes = np.arange(1, 10)
+        # lamda  = 2 * L/nmodes
+    
+        eps0 = np.array([1.] * nz) # background
+        eps1 = np.zeros(nz, dtype=complex) # \Delta epsilon at scattering region
+        eps1[150:] = 4.
+        eps1[:50] = 4. 
+        
+        wavelengths = np.linspace(40, 600, 200) # nm
+        ks = 2. * np.pi/wavelengths
+        #ks = np.linspace(0.005, 0.04, 150)
+        gk = np.zeros(len(ks), dtype=complex)
+    
+        # g0 = np.zeros((nz, nz), dtype=complex)
+    
+        for n, k in enumerate(ks):
+    
+            e0 = k**2 * np.diagflat(eps0)
+            e1 = k**2 * np.diagflat(eps1)
+    
+            I = np.identity(nz)
+            Z1, Z2 = np.meshgrid(z, z)
+            # for i in range(nz):
+            #     for j in range(i+1):
+            #         g0[i,j] = G0_1D(z[i], z[j], k, eps=1)
+            #         g0[j,i] = g0[i,j]
+    
+            g0 = G0_1D(Z1, Z2, k, eps=1)
+    
+            g = np.linalg.inv(I - g0 @ e1 * dz) @ g0
+    
+            gk[n] = g[nz//2+1, nz//2+1]
+    
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        c1 = c0/sqrt(5.)
+    
+        ax.plot(ks * c0, gk.imag)
+    
+        ax.vlines(c1 * np.pi * nmodes/d, ymin=0, ymax=8)
+
+
 if __name__ == '__main__':
     from math import sqrt
-    from lime.units import c0
+    from pyqed.units import c0
 
     R2 = np.array([0, 0, 0])
     lamda = 0.5
@@ -204,52 +437,58 @@ if __name__ == '__main__':
     # from lime.style import subplots
     # fig, ax = subplots()
     # ax.plot(R1s, g0.real)
-
-    # 1D
-    nz = 128 * 2
     d = 100 # length, nm
+    nz = 128 * 4
+    z = np.linspace(-d, d, nz) # this should cover all the scattering region or simply is the scattering region
+    
+    eps = np.zeros((2,2,nz), dtype=complex) 
+    eps[0, 0, :] =  eps[1, 1, :]   = 4
+    eps[0, 1, :] = 0.001j
+    eps[1, 0, :] =  eps[0, 1, :].conj()
+    
+    # eps0[0, 0, :nz//4] =     eps0[1, 1, :nz//4] = 5
+    # eps0[0, 0, 3*nz//4:] = 5
+    
+    sol = Multilayer(z, eps)
+    # sol.G(0, 0, k=1)
+    
+    def test():
+        wavelengths = np.linspace(2, 20, 100) # nm
+        ks = 2. * np.pi/wavelengths
+        #ks = np.linspace(0.005, 0.04, 150)
+        
+        # DGF at molecular location z = z0
+        gk = np.zeros((2,2, len(ks)), dtype=complex)
+    
+        # g0 = np.zeros((nz, nz), dtype=complex)
+    
+        for n, k in enumerate(ks):
+    
+            # e0 = k**2 * np.diagflat(eps0)
+            # e1 = k**2 * np.diagflat(eps1)
+    
+            I = np.identity(nz)
+            Z1, Z2 = np.meshgrid(z, z)
+            # for i in range(nz):
+            #     for j in range(i+1):
+            #         g0[i,j] = G0_1D(z[i], z[j], k, eps=1)
+            #         g0[j,i] = g0[i,j]
+            
+            g = sol.G(k)
+            gk[:, :, n] = g[:, :, nz//2+1, nz//2+2]
+    
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        c1 = c0/sqrt(5.)
+    
+        ax.plot(ks * c0, gk[0,0].imag)
+        ax.plot(ks * c0, gk[0,1].imag)
+        ax.plot(ks * c0, gk[1,1].imag)
 
-    z = np.linspace(-d, d, nz)
-    dz = z[1] - z[0]
+        # ax.plot(wavelengths, gk.imag)
 
-    nmodes = np.arange(1, 10)
-    # lamda  = 2 * L/nmodes
+        # nmodes = np.arange(1, 10)
 
-    eps0 = np.array([1.] * nz) # background
-    eps1 = np.zeros(nz, dtype=complex) # scattering region
-    eps1[:] = 4.
-
-    wavelengths = np.linspace(100, 400, 200) # nm
-    ks = 2. * np.pi/wavelengths
-    #ks = np.linspace(0.005, 0.04, 150)
-    gk = np.zeros(len(ks), dtype=complex)
-
-    # g0 = np.zeros((nz, nz), dtype=complex)
-
-    for n, k in enumerate(ks):
-
-        e0 = k**2 * np.diagflat(eps0)
-        e1 = k**2 * np.diagflat(eps1)
-
-        I = np.identity(nz)
-        Z1, Z2 = np.meshgrid(z, z)
-        # for i in range(nz):
-        #     for j in range(i+1):
-        #         g0[i,j] = G0_1D(z[i], z[j], k, eps=1)
-        #         g0[j,i] = g0[i,j]
-
-        g0 = G0_1D(Z1, Z2, k, eps=1)
-
-        g = np.linalg.inv(I - g0 @ e1 * dz) @ g0
-
-        gk[n] = g[nz//2+1, nz//2+1]
-
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots()
-    c1 = c0/sqrt(5.)
-
-    ax.plot(ks * c0, gk.imag)
-
-    ax.vlines(c1 * np.pi * nmodes/d, ymin=0, ymax=8)
-
-
+        # ax.vlines(c1 * np.pi * nmodes/d, ymin=0, ymax=8)
+    
+    test()

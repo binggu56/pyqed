@@ -1,12 +1,22 @@
 
 au2fs = 2.41888432651e-2 # femtoseconds
+
 au2as = 24.1888432651 # attoseconds
 
 au2k = 315775.13 #K
+
 au2ev = 27.2116
+
+
+
+
+
 au2kev = 27.2116e-3
 au2mev = 27.2116e3
+
 au2wn = au2wavenumber = 219474.6305
+
+
 wavenumber2hartree = wavenum2au = 4.55633525277e-06
 ev2wavenumber = 8065.73
 
@@ -66,6 +76,13 @@ atomic_mass = {'H' : 1.008,'HE' : 4.003, 'LI' : 6.941, 'BE' : 9.012,\
                  'HS' : 269, 'MT' : 268, 'DS' : 271, 'RG' : 272, 'CN' : 285,\
                  'NH' : 284, 'FL' : 289, 'MC' : 288, 'LV' : 292, 'TS' : 294,\
                  'OG' : 294}
+
+# 
+electronvolt = 1/au2ev
+wavenumber = 1/au2wavenumber
+kelvin = 1/au2k
+attosecond = 1/au2as
+femtosecond = 1/au2fs
 
 class AtomicUnits:
     def __init__(self):

@@ -142,7 +142,7 @@ def obs(A, rho):
 
 
 class Cavity():
-    def __init__(self, freq, n_cav, x=None):
+    def __init__(self, freq, n_cav=None, x=None):
         self.freq = self.omega = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav

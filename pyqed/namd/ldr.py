@@ -1421,23 +1421,7 @@ class GWP2(WPD2):
         return rho
 
 
-class Fourier(WPD2):
-    """
-    N-state two-mode conical intersection dynamics with Fourier series 
-    """
-    def __init__(self, x, y, nstates=2, ndim=2):
-        self.x = x
-        self.y = y
-        
-    
-    def run(self, dt, nt):
-        pass
-    
-    def fbr2dvr(self):
-        pass
-    
-    def dvr2fbr(self):
-        pass
+
     
 
 class Smolyak:
@@ -1717,7 +1701,7 @@ if __name__ == '__main__':
     # for i, b in enumerate(basis):
     #     print(i, b.x)
 
-    solver = NAWPD2(mol=mol, basis=basis)
+    solver = GWP2(mol=mol, basis=basis)
 
     # U = solver.xprod()
     # xmat = solver.position(d=0)

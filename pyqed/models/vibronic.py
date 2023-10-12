@@ -18,11 +18,405 @@ import matplotlib.pyplot as plt
 
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
-    polar2cartesian, Mol, SESolver, dag
+    polar2cartesian, Mol, SESolver, dag, SPO, SPO2, SPO3
 from pyqed.style import set_style
 # from pyqed.units import au2ev, wavenumber2hartree
 
 
+class Vibronic2:
+    """
+    vibronic model in the diabatic representation with 2 nuclear coordinates
+
+    """
+    def __init__(self, x, y, mass=[1,1], nstates=2, nmodes=2, coords='linear'):
+        self.x = x
+        self.y = y
+        self.X, self.Y = meshgrid(x, y)
+        self.nstates = nstates
+
+        self.nx = len(x)
+        self.ny = len(y)
+        self.dx = interval(x)
+        self.dy = interval(y) # for uniform grids
+        self.mass = mass
+        self.kx = None
+        self.ky = None
+        self.dim = 2
+        self.mass = mass
+
+
+        self.v = None # diabatic PES
+        self.apes = None
+
+        # self.h = h
+        # self.l = l
+
+    def set_grid(self, x, y):
+        self.x = x
+        self.y = y
+
+        return
+
+    def set_mass(self, mass):
+        self.mass = mass
+
+    # def diabatic(self, x, y):
+        
+    #     nstates = self.nstates
+    #     kappa = self.kappa 
+    #     v = np.zeros((nstates, nstates))
+    #     v[0, 0] = 
+    #     return v
+        
+
+    def set_DPES(self, surfaces, diabatic_couplings, abc=False, eta=None):
+        """
+        set the diabatic PES and vibronic couplings
+
+        Parameters
+        ----------
+        surfaces : TYPE
+            DESCRIPTION.
+        diabatic_couplings : TYPE
+            DESCRIPTION.
+        abc : boolean, optional
+            indicator of whether using absorbing boundary condition. This is
+            often used for dissociation.
+            The default is False.
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+
+        nx = self.nx
+        ny = self.ny
+        ns = self.ns
+
+        # DPES and diabatic couplings
+        v = np.zeros([nx, ny, ns, ns])
+
+        # assume we have analytical forms for the DPESs
+        for a in range(self.ns):
+            v[:, :, a, a] = surfaces[a]
+
+        for dc in diabatic_couplings:
+            a, b = dc[0][:]
+            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+
+
+        if abc:
+            for n in range(self.ns):
+                v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
+
+        self.v = v
+        return v
+
+    def adiabats(self, x, y):
+        """
+        Compute the adiabatic potential energy surfaces from diabats
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+        
+        w, u = np.linalg.eigh(self.v)
+
+        return w, u
+    
+    def get_apes(self):
+        """
+        Compute the adiabatic potential energy surfaces from diabats
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+        x = self.x
+        y = self.y
+        assert(x is not None)
+        
+        nstates = self.nstates
+        
+        nx = len(x)
+        ny = len(y)
+        
+        v = np.zeros((nx, ny, nstates))
+        
+        for i in range(nx):
+            for j in range(ny):
+                w, u = self.apes([x[i], y[j]])
+                v[i, j, :] = w
+        
+        self.apes = v 
+        return v
+
+    def plot_apes(self):
+        """
+        plot the APES
+        """
+        if self.apes is None:
+            self.get_apes()
+        
+        fig, (ax0, ax1) = plt.subplots(nrows=2)
+        ax0.contourf(self.X, self.Y, self.apes[:, :, 1], lw=0.7)
+        ax1.contourf(self.X, self.Y, self.apes[:, :, 0], lw=0.7)
+        return
+
+    def plot_dpes(self, style='2D'):
+        if style == '2D':
+            fig, (ax0, ax1) = plt.subplots(nrows=2)
+            ax0.contourf(self.X, self.Y, self.v[:, :, 1, 1], lw=0.7)
+            ax1.contourf(self.X, self.Y, self.v[:, :, 0, 0], lw=0.7)
+            return
+
+        else:
+            from pyqed.style import plot_surface
+            plot_surface(self.x, self.y, self.V[:,:,0,0])
+
+            return
+
+    def plt_wp(self, psilist, **kwargs):
+
+
+        if not isinstance(psilist, list): psilist = [psilist]
+
+
+        for i, psi in enumerate(psilist):
+            fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
+
+            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
+            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
+            ax0.format(**kwargs)
+            ax1.format(**kwargs)
+            fig.savefig('psi'+str(i)+'.pdf')
+        return ax0, ax1
+
+    def spo(self):
+        return SPO2(nstates=self.nstates, mass=self.mass, x=x, y=y)
+
+class LVC2:
+    """
+    2D linear vibronic coupling model
+    """
+    def __init__(self, x=None, y=None, h=1, l=1, delta=0, mass=[1, 1], nstates=2):
+        # super().__init__(x, y, mass, nstates=nstates)
+
+        # self.dpes()
+        self.edip = sigmax()
+        assert(self.edip.ndim == nstates)
+        self.mass = mass
+        self.nstates = nstates
+
+        self.x = x
+        self.y = y
+        self.nx = len(x)
+        self.ny = len(y)
+
+        self.h = h
+        self.l = l
+        self.delta = delta
+
+        self.va = None
+        self.v = None
+
+
+    def dpes_global(self):
+        """
+        compute the glocal DPES
+
+        Returns
+        -------
+        None.
+
+        """
+        x, y = self.x, self.y
+        nx = self.nx
+        ny = self.ny
+        N = self.nstates
+        h, l = self.h, self.l
+        delta = self.delta
+
+        X, Y = meshgrid(x, y)
+
+        v = np.zeros((nx, ny, N, N))
+
+        v[:, :, 0, 0] = X**2/2. + (Y)**2/2. + h * X + delta/2
+        v[:, :, 1, 1] = X**2/2. + (Y)**2/2. - h * X - delta/2
+        v[:, :, 0, 1] = l * Y
+        v[:, :, 1, 0] = l * Y
+
+
+        self.v = v
+        return
+
+    def dpes(self, x):
+
+        X, Y = x
+        h, l = self.h, self.l
+        delta = self.delta
+
+        v = np.zeros((self.nstates, self.nstates))
+
+        # v[0, 0] = (X)**2/2. + (Y)**2/2. + h * X + delta
+        # v[1, 1] = (X)**2/2. + (Y)**2/2. - h * X - delta
+        v[0, 0] =  + h * X + delta
+        v[1, 1] =  - h * X - delta
+
+        v[0, 1] =   l * Y
+        v[1, 0] = v[0, 1]
+
+        # self.v = v
+        return v
+
+    def apes(self, x):
+
+
+        v = self.dpes(x)
+
+        # self.v = v
+        w, u = eigh(v)
+        return w, u
+
+    def wilson_loop(self, n=0, r=1):
+
+
+        l = identity(self.nstates)
+
+
+        for theta in np.linspace(0, 2 * np.pi, 800):
+
+            x, y = polar2cartesian(r, theta)
+
+
+            w, u = self.apes([x, y])
+
+            # print(u[:,0])
+            # ground state projection operator
+            p = ket2dm(u[:,n])
+
+            l = l @ p
+
+        return np.trace(l)
+
+    def berry_phase(self, n=0, r=1):
+
+
+        phase = 0
+        z  = 1
+
+        w, u = self.apes([r, 0])
+        u0 = u[:, n]
+
+        uold = u0
+        loop = np.linspace(0, 2 * np.pi)
+        for i in range(1, len(loop)):
+
+            theta = loop[i]
+            x, y = polar2cartesian(r, theta)
+
+            w, u = self.apes([x, y])
+            unew = u[:,n]
+            z *= overlap(uold, unew)
+
+            uold = unew
+
+        z *= overlap(unew, u0)
+
+        return z
+        # return -np.angle(z)
+
+    def apes_global(self):
+
+        x = self.x
+        y = self.y
+        assert(x is not None)
+
+        nstates = self.nstates
+
+        nx = len(x)
+        ny = len(y)
+
+        v = np.zeros((nx, ny, nstates))
+
+        for i in range(nx):
+            for j in range(ny):
+                w, u = self.apes([x[i], y[j]])
+                v[i, j, :] = w
+
+        return v
+
+    def plot_apes(self):
+
+        v = self.apes_global()
+        mayavi([v[:,:,k] for k in range(self.nstates)])
+
+
+    def run(self):
+        pass
+
+
+class DHO:
+    def __init__(self, x, mass=1, nstates=2, coupling=0):
+
+        # self.dpes()
+        self.edip = sigmax()
+        self.nstates = nstates
+        self.mass = mass
+        self.x = x
+        self.nx = len(x)
+        # self.d = d # displacement
+        self.coupling = coupling # vibronic coupling strength
+        assert(self.edip.ndim == nstates)
+
+
+    def dpes(self, d, e0):
+
+        x = self.x
+        nx = self.nx
+        N = self.nstates
+
+        v = np.zeros((nx, N, N))
+
+        v[:, 0, 0] = x**2/2. 
+        v[:, 1, 1] = (x-d)**2/2. + e0
+
+        self.v = v
+        return
+
+    def apes(self, x):
+        d = self.d
+        c = self.coupling
+
+        x = np.atleast_1d(x)
+        nx = len(x)
+
+        ns = self.nstates
+
+        wlist = []
+        ulist = []
+
+        for i in range(nx):
+            v = np.zeros((ns, ns))
+
+            v[0, 0] = x[i]**2/2.
+            v[1, 1] = (x[i]-d)**2/2.
+            v[0, 1] = v[1, 0] = c
+
+            w, u = np.linalg.eigh(v)
+            wlist.append(w.copy())
+            ulist.append(u.copy())
+
+        return wlist, ulist
+    
+    
 class VibronicAdiabatic(Mol):
     """
     1D vibronic model in the adiabatic representation 

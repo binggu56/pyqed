@@ -484,6 +484,9 @@ class RXS:
     def viridx(self, viridx):
         self._viridx = viridx
 
+    # def run(self, nstates=2):
+    #     return self.td.kernel(nstates=nstates)
+    
     def core_excitation(self, nstates=None, energy_range=None, analyze=True):
         # occidx = self.occidx
         # viridx = self.viridx
@@ -514,7 +517,7 @@ class RXS:
 
     def tdm(self, n, representation='mo'):
         """
-        Compute the transition density matrix in MO basis
+        Compute the transition density matrix  from ground state in MO basis
 
         ..math::
 
@@ -693,6 +696,10 @@ def _denisty_matrix(x, mo_coeff, mo_occ, state_id):
     '''
     Taking the TDA amplitudes as the CIS coefficients, calculate the density
     matrix (in AO basis) of the excited states
+    
+    .. math::
+        
+        D_{ia} = \braket{\Phi_I| a^\dag i | \Phi_I}
 
     adapted from PySCF/tddft/example 22
 
@@ -718,71 +725,7 @@ def _denisty_matrix(x, mo_coeff, mo_occ, state_id):
     return dm
 
 
-def tdm_ee(X1, X2, mo_coeff, reduced_transition_space=False, occidx=None, viridx=None):
-    """
-    Compute the transition density matrix in AO basis between TDA/CIS/TDHF excited
-    states with the same excitation space.
 
-    D_{ia} = \braket{\Phi_J| a^\dag i | \Phi_I}
-
-    This only calculates the transition density matrix. For reduced density matrices,
-    call density_matrix(state_id).
-
-    The excited states are chosen as
-    .. math::
-        \Phi_I = X^I_{ia} a^\dag i \ket{\Phi_0}
-
-    Parameters
-    ----------
-    X1 : ndarray [nocc, nvir, nstates], nocc, nvir are the size of the excitation space
-        TDA coeff for ket state.
-    X2 : TYPE
-        TDA coeff for bra state.
-    mo_coeff : TYPE
-        DESCRIPTION.
-    mo_occ : TYPE
-        DESCRIPTION.
-    reduced_transition_space: bool
-        whether the transition space is reduced. If True, the occidx and viridx have to be provided.
-    occidx : list, optional
-        occupied orbitals index for the ket state. The default is None.
-    viridx : list of integers, optional
-        vir orbs index. The default is None.
-
-    Returns
-    -------
-    tdm : TYPE
-        DESCRIPTION.
-
-    """
-    # if occidx is None:
-    #     occidx = list(numpy.where(mo_occ==2)[0])
-    # if viridx is None:
-    #     viridx = list(numpy.where(mo_occ==0)[0])
-
-    # the two excited states use the same transition space
-    assert(X1.shape == X2.shape)
-
-    # occ and vir orbs in the reduced excitation ov space
-    nocc, nvir = X1.shape
-    nmo = nocc + nvir
-    tdm = np.zeros((nmo, nmo))
-    tdm_oo = -np.einsum('ia,ka->ik', X2.conj(), X1)
-    tdm_vv = np.einsum('ia,ic->ac', X1, X2.conj())
-
-    tdm[:nocc,:nocc] += tdm_oo * 2
-    tdm[nocc:,nocc:] += tdm_vv * 2
-
-    # Transform density matrix to AO basis, this is only valid
-    # for non-restricted calculations
-    if reduced_transition_space:
-        mo = mo_coeff[:, [*occidx, *viridx]]
-    else:
-        mo = mo_coeff
-
-    # tdm = np.einsum('up, pq, vq->uv', mo, tdm, mo.conj())
-    tdm = mo @ tdm @ mo.conj().T
-    return tdm
 
 
 def tdm_ee_diff_exc_space(X1, X2, mo_coeff, mo_occ, occidx=None, viridx=None,\
@@ -894,6 +837,36 @@ def transition_dipole_from_tdm(mol, tdm, mo_coeff):
 
     return dip
 
+def tda_denisty_matrix(td, state_id):
+    '''
+    Taking the TDA amplitudes as the CIS coefficients, calculate the density
+    matrix (in AO basis) of the excited states
+    
+    state_id : int
+        0 refers to the first-excited state
+    
+    From PySCF/examples/tddft/22
+    
+    '''
+    cis_t1 = td.xy[state_id][0]
+    dm_oo =-np.einsum('ia,ka->ik', cis_t1.conj(), cis_t1)
+    dm_vv = np.einsum('ia,ic->ac', cis_t1, cis_t1.conj())
+
+    # The ground state density matrix in mo_basis
+    mf = td._scf
+    dm = np.diag(mf.mo_occ)
+
+    # Add CIS contribution
+    nocc = cis_t1.shape[0]
+    # Note that dm_oo and dm_vv correspond to spin-up contribution. "*2" to
+    # include the spin-down contribution
+    dm[:nocc,:nocc] += dm_oo * 2
+    dm[nocc:,nocc:] += dm_vv * 2
+
+    # Transform density matrix to AO basis
+    mo = mf.mo_coeff
+    dm = np.einsum('pi,ij,qj->pq', mo, dm, mo.conj())
+    return dm
 
 if __name__=='__main__':
 

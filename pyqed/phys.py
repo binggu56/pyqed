@@ -12,6 +12,8 @@ import scipy as sp
 import sys
 import heapq
 
+# def integrate(f, a, b, **args):
+#     return integrate.quad(f, a, b, args=args)
 
 def polar2cartesian(r, theta):
     """

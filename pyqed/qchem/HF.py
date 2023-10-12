@@ -430,6 +430,7 @@ def hartree_fock(mol, max_cycle=100):
     # else:
     # return C, Hcore, nuclear_energy, two_electron
 
+
 if __name__ == '__main__':
     from pyscf import gto, scf
     mol = gto.M(atom='H 0 0 0; H 0 0 1.1', basis='cc-pvdz')

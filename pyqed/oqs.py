@@ -22,6 +22,9 @@ from scipy.integrate import solve_ivp
 # from scipy.sparse.linalg import eigs
 import opt_einsum as oe
 
+from scipy import integrate
+
+
 from pyqed import commutator, anticommutator, comm, anticomm, dag, ket2dm, \
     obs_dm, destroy, rk4, basis, transform, isherm, expm
 
@@ -828,13 +831,66 @@ class Env:
         """
         pass
 
-    def spectral_density(self):
+    def spectral_density(self, x, model=None):
         """
         spectral density
         """
-        pass
+        # if model == 'ohmic':
+            
+        #     return np.exp(-x/cutoff)
 
 
+def discretize(J, a, b, nmodes, mesh='linear'):
+    """
+    Discretize a harmonic bath in the range (a, b) by the mean method in Ref. 1.  
+    
+    
+    Ref:
+        [1] PRB 92, 155126 (2015)
+
+    Parameters
+    ----------
+    J : TYPE
+        DESCRIPTION.
+    n : TYPE
+        DESCRIPTION.
+    domain : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    x : array
+        mode frequecies 
+    g : array 
+        coupling strength
+
+    """
+    if mesh == 'linear':
+        
+        y = np.linspace(a, b, nmodes, endpoint=False)
+        
+    elif mesh == 'log':
+        
+        if a == 0: a += 1e-3
+        y = np.logspace(a, np.log10(b), nmodes)
+    
+    x = np.zeros(nmodes)
+    g = np.zeros(nmodes)
+    
+    
+    for n in range(nmodes-1):
+         g[n] = integrate.quad(J, y[n], y[n+1])[0]
+         x[n] = integrate.quad(lambda x: x * J(x), y[n], y[n+1])[0]
+         x[n] /= g[n]
+    
+    # last interval from y[-1] to b 
+    g[-1] = integrate.quad(J, y[-1], b)[0]
+    x[-1] = integrate.quad(lambda x: x * J(x), y[-1], b)[0]/g[-1]
+         
+    return x, g
+
+    
+    
 
 # @jit
 def func(rho, h0, c_ops, l_ops):
@@ -1969,9 +2025,7 @@ def test_lindblad():
 if __name__ == '__main__':
 
 
-    from lime.phys import pauli
-    from lime.optics import Pulse
-    from lime.units import au2ev
+    from pyqed import pauli, Pulse, au2ev
 
     import time
     start_time = time.time()

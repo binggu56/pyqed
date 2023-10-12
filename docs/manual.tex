@@ -225,9 +225,20 @@ Compute band structure from tight-binding Hamiltonians.
 \chapter{Open quantum systems}
 Quantum systems are rarely isolated from their surrounding environment. For an isolated quantum system, dynamics can be described by the time-dependent Schrödinger equation (TDSE). One straightforward approach simulating the open quantum system dynamics is to include the environment degrees of freedom directly into the TDSE. While conceptually simple, this is not always the optimal choice when the environment is complex. Alternatively, we can solve a quantum master equation describing the equation of motion for the reduced density matrix.
 
-The following methods are currently implemented
+
+Assuming the system-bath Hamiltonian reads 
+\be
+H_\textbf{SB} = \sum_\alpha A_\alpha B_\alpha   
+\ee 
+
+The following methods are currently implemented.
 
 \section{Redfield equations}
+
+For the Redfield equation, 
+\be
+\dot{\rho}(t) = \mc{L}_0 \rho -  
+\ee 
 
 \section{Lindblad quantum master equations}
 \section{Hierarchical equation of motion}
