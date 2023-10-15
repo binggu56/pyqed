@@ -1170,7 +1170,7 @@ def observe(A, rho):
     """
     return A.dot(rho).diagonal().sum()
 
-class Lindblad_solver():
+class LindbladSolver():
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
         self.e_ops = e_ops
@@ -1205,7 +1205,7 @@ class Lindblad_solver():
     def steady_state(self):
         pass
 
-    def evolve(self, rho0, dt, Nt, t0=0., e_ops=None, return_result=True):
+    def run(self, rho0, dt, Nt, t0=0., e_ops=None, return_result=True):
         """
         propagate the dynamics
 
@@ -1243,7 +1243,7 @@ class Lindblad_solver():
         else:
 
             return _lindblad(self.H, rho0, c_ops=self.c_ops, e_ops=e_ops, \
-                  Nt=Nt, dt=dt, return_result=return_result)
+                  Nt=Nt, dt=dt)
 
     def evolve_fast(self, rho0, dt, Nt, t0=0., e_ops=None, return_result=True, fast=True):
             return _fast_lindblad(self.H, rho0, c_ops=self.c_ops, e_ops=e_ops, \
@@ -1652,7 +1652,7 @@ def _fast_lindblad(H, rho0, c_ops, e_ops=None, Nt=1, dt=0.005):
 
     #     return result
 
-def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, dt=0.005, return_result=True):
+def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, t0=0, dt=0.005, return_result=True):
 
     """
     time propagation of the lindblad quantum master equation
@@ -1678,79 +1678,80 @@ def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, dt=0.005, return_result=True):
     # initialize the density matrix
     rho = rho0.copy()
     rho = rho.astype(complex)
-
+    rho = csr_matrix(rho)
+    
     if e_ops is None:
         e_ops = []
 
-    t = 0.0
+    t = t0
     # first-step
     # rho_half = rho0 + liouvillian(rho0, h0, c_ops) * dt2
     # rho1 = rho0 + liouvillian(rho_half, h0, c_ops) * dt
 
     # rho_old = rho0
     # rho = rho1
-    if return_result == False:
+    # if return_result == False:
 
-        # f_dm = open('den_mat.dat', 'w')
-        # fmt_dm = '{} ' * (nstates**2 + 1) + '\n'
+    #     # f_dm = open('den_mat.dat', 'w')
+    #     # fmt_dm = '{} ' * (nstates**2 + 1) + '\n'
 
-        f_obs = open('obs.dat', 'w')
-        fmt = '{} '* (len(e_ops) + 1) + '\n'
+    #     f_obs = open('obs.dat', 'w')
+    #     fmt = '{} '* (len(e_ops) + 1) + '\n'
 
-        for k in range(Nt):
+    #     for k in range(Nt):
 
-            # compute observables
-            observables = np.zeros(len(e_ops), dtype=complex)
+    #         # compute observables
+    #         observables = np.zeros(len(e_ops), dtype=complex)
 
-            for i, obs_op in enumerate(e_ops):
-                observables[i] = obs_dm(rho, obs_op)
+    #         for i, obs_op in enumerate(e_ops):
+    #             observables[i] = obs_dm(rho, obs_op)
 
-            t += dt
+    #         t += dt
 
-            # rho_new = rho_old + liouvillian(rho, h0, c_ops) * 2. * dt
-            # # update rho_old
-            # rho_old = rho
-            # rho = rho_new
+    #         # rho_new = rho_old + liouvillian(rho, h0, c_ops) * 2. * dt
+    #         # # update rho_old
+    #         # rho_old = rho
+    #         # rho = rho_new
 
-            rho = rk4(rho, liouvillian, dt, H, c_ops)
+    #         rho = rk4(rho, liouvillian, dt, H, c_ops)
 
-            # dipole-dipole auto-corrlation function
-            #cor = np.trace(np.matmul(d, rho))
+    #         # dipole-dipole auto-corrlation function
+    #         #cor = np.trace(np.matmul(d, rho))
 
-            # take a partial trace to obtain the rho_el
-
-
-            f_obs.write(fmt.format(t, *observables))
+    #         # take a partial trace to obtain the rho_el
 
 
-        f_obs.close()
-        # f_dm.close()
-
-        return rho
-
-    else:
-
-        rholist = [] # store density matries
-
-        result = Result(dt=dt, Nt=Nt, rho0=rho0)
-
-        observables = np.zeros((Nt, len(e_ops)), dtype=complex)
-
-        for k in range(Nt):
-
-            t += dt
-            rho = rk4(rho, liouvillian, dt, H, c_ops)
-
-            rholist.append(rho.copy())
+    #         f_obs.write(fmt.format(t, *observables))
 
 
-            observables[k, :] = [obs_dm(rho, op) for op in e_ops]
+    #     f_obs.close()
+    #     # f_dm.close()
+
+    #     return rho
+
+    # else:
+
+    rholist = [] # store density matries
+
+    result = Result(dt=dt, Nt=Nt, rho0=rho0)
+
+    observables = np.zeros((Nt, len(e_ops)), dtype=complex)
+
+    for k in range(Nt):
+
+        t += dt
+        rho = rk4(rho, liouvillian, dt, H, c_ops)
+
+        rholist.append(rho.copy())
 
 
-        result.observables = observables
-        result.rholist = rholist
+        observables[k, :] = [obs_dm(rho, op) for op in e_ops]
 
-        return result
+
+    result.observables = observables
+    result.rholist = rholist
+
+    return result
 
 
 def _lindblad_driven(H, rho0, c_ops=None, e_ops=None, Nt=1, dt=0.005, t0=0.,

@@ -346,6 +346,17 @@ class Mol:
             eg, evecs = self.eigenstates(k=1)[:]
             print('ground state energy = ', eg)
             return evecs
+    
+    def ground_state(self, method='trivial'):
+
+        if method == 'trivial':
+            return basis(self.dim, 0)
+
+        elif method == "diag":
+
+            eg, evecs = self.eigenstates(k=1)[:]
+            print('ground state energy = ', eg)
+            return evecs
 
     def energy(self, psi):
         return obs(self.H, psi)

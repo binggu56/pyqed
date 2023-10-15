@@ -146,7 +146,7 @@ class Cavity():
         self.freq = self.omega = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav
-        self.n = n_cav
+        self.n = self.dim = n_cav
 
         self.idm = identity(n_cav)
         # self.create = self.get_create()
@@ -167,6 +167,36 @@ class Cavity():
 #    def hamiltonian(self):
 #        self._hamiltonian = ham_ho(self.resonance, self.n)
 
+    def ground_state(self, sparse=True):
+        """
+        get initial density matrix for cavity vacuum state
+        """
+        vac = np.zeros(self.n_cav)
+        vac[0] = 1.
+        if sparse:
+            return csr_matrix(vac)
+        else:
+            return vac
+    
+    def vacuum(self, sparse=True):
+        """
+        get initial density matrix for cavity vacuum state
+        """
+        vac = np.zeros(self.n_cav)
+        vac[0] = 1.
+        if sparse:
+            return csr_matrix(vac)
+        else:
+            return vac
+
+    def vacuum_dm(self):
+        """
+        get initial density matrix for cavity vacuum state
+        """
+        vac = np.zeros(self.n_cav)
+        vac[0] = 1.
+        return ket2dm(vac)
+    
     def getH(self, zpe=False):
         return ham_ho(self.freq, self.n_cav)
 
@@ -200,21 +230,46 @@ class Cavity():
         a.setdiag(range(ncav), 0)
         return a.tocsr()
 
-    # def x(self):
-    #     """
-    #     quadrature; corresponding to the displacement field D
+    def quadrature(self):
+        """
+        quadrature; corresponding to the displacement field D
         
-    #     .. math::
-    #         D = \frac{1}{\sqrt{2}} (a + a^\dag)
+        .. math::
+            D = \frac{1}{\sqrt{2}} (a + a^\dag)
 
-    #     Returns
-    #     -------
-    #     TYPE
-    #         DESCRIPTION.
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
 
-    #     """
-    #     a = self.annihilate()
-    #     return 1./np.sqrt(2.) * (a + dag(a))
+        """
+        a = self.annihilate()
+        return 1./np.sqrt(2.) * (a + dag(a))
+
+    def get_nonhermitianH(self):
+        '''
+        non-Hermitian Hamiltonian for the cavity mode
+
+        Params:
+            kappa: decay constant
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        '''
+        ncav = self.n_cav
+        if self.quality_factor is not None:
+            kappa = self.freq/2./self.quality_factor
+        else:
+            raise ValueError('The quality factor cannot be None.')
+
+        self.nonhermH = self.H - 1j * kappa * np.identity(ncav)
+        return self.nonhermH
+
+    def get_nonhermH(self):
+        return self.get_nonhermitianH()
 
 class Polariton(Composite):
     def __init__(self, mol, cav):
@@ -390,6 +445,31 @@ class Polariton(Composite):
 
             return evals, evecs, n_ph
 
+    def promote_op(self, a, kind='mol'):
+        """
+        promote a local operator to the composite polariton space
+
+        Parameters
+        ----------
+        a : TYPE
+            DESCRIPTION.
+        kind : TYPE, optional
+            DESCRIPTION. The default is 'mol'.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        if kind in ['mol', 'm']:
+
+            return kron(a, self.cav.idm)
+
+        elif kind in ['cav', 'c']:
+
+            return kron(self.mol.idm, a)
+        
     def rdm_photon(self):
         """
         return the reduced density matrix for the photons
