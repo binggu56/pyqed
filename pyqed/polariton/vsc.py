@@ -23,6 +23,8 @@ else:
     import matplotlib.pyplot as plt
 
 
+
+
 class VSC:
     """
     2D vibronic model in the diabatic/adiabatic representation coupled to
@@ -647,9 +649,25 @@ if __name__ == '__main__':
     # pol.draw_surfaces(n=4, representation='adiabatic')
     # pol.product_state(0, 0, 0)
 
-    from pyqed.models.vibronic import LVC2
+    # from pyqed.models.vibronic import LVC2
 
-    mol = LVC2(x, y, mass=[1,1])
+    # mol = LVC2(x, y, mass=[1,1])
+    from pyqed import wavenumber
+    from pyqed.models.jahn_teller import JahnTeller
+    
+    omega = 660. * wavenumber
+    Eshift = np.array([0.0, 7.0, 7.0])/au2ev
+    kappa = 2.2 * omega # inter-state coupling lambda
+
+    # tuning_mode = Mode(omega, couplings=[[[1, 1], kappa], \
+    #                                      [[2, 2], -kappa]], truncate=24)
+
+    # coupling_mode = Mode(omega, [[[1, 2], kappa]], truncate=24)
+
+    # modes =  [tuning_mode, coupling_mode]
+
+    mol = JahnTeller(Eshift, omega, kappa)
+                       
     # mol.plot_apes()
     
     

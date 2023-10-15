@@ -216,43 +216,103 @@ class Cavity():
     #     a = self.annihilate()
     #     return 1./np.sqrt(2.) * (a + dag(a))
 
+class Polariton(Composite):
+    def __init__(self, mol, cav):
 
+        super(Polariton, self).__init__(mol, cav)
 
-class Polariton:
-    def __init__(self, mol, cav, g):
-        self.g = g
         self.mol = mol
         self.cav = cav
-        self._ham = None
+        self._ham = self.H = None
         self.dip = None
         self.cav_leak = None
+        self.H = None
+        self.dims = [mol.dim, cav.n_cav]
+        self.dim = mol.dim * cav.n_cav
         #self.dm = kron(mol.dm, cav.get_dm())
 
-    def getH(self, RWA=True):
+    def getH(self, g, RWA=False):
+        """
+
+
+        Parameters
+        ----------
+        g : float
+            single photon electric field strength sqrt(hbar * omegac / 2 episilon_0 V)
+        RWA : TYPE, optional
+            DESCRIPTION. The default is False.
+
+        Returns
+        -------
+        TYPE
+            Hamiltonian.
+
+        """
+
         mol = self.mol
         cav = self.cav
 
-        g = self.g
+        hmol = mol.getH()
+        hcav = cav.getH()
 
-        hmol = mol.get_ham()
-        hcav = cav.get_ham()
+        Icav = cav.idm
+        Imol = mol.idm
 
-        Icav = identity(self.cav.n_cav)
-        Imol = identity(self.mol.n_states)
+        if RWA:
 
-        if RWA == True:
-            hint = g * (kron(mol.ex, cav.get_annihilate()) + kron(mol.deex, cav.get_create()))
-        elif RWA == False:
+            hint = g * (kron(mol.raising, cav.annihilate()) +
+                        kron(mol.lowering, cav.create()))
+
+        else:
+
+            hint = g * kron(mol.edip, cav.create() + cav.annihilate())
+
+        self.H = kron(hmol, Icav) + kron(Imol, hcav) + hint
+
+        return self.H
+
+    def get_nonhermitianH(self, g, RWA=False):
+
+        mol = self.mol
+        cav = self.cav
+
+        hmol = mol.get_nonhermitianH()
+        hcav = cav.get_nonhermitianH()
+
+        Icav = cav.idm
+        Imol = mol.idm
+
+        if RWA:
+
+            hint = g * (kron(mol.raising(), cav.get_annihilate()) +
+                        kron(mol.lowering(), cav.get_create()))
+
+        else:
+
             hint = g * kron(mol.dip, cav.get_create() + cav.get_annihilate())
 
-        return kron(hmol, Icav) + kron(Imol, hcav) + hint
+        H = kron(hmol, Icav) + kron(Imol, hcav) + hint
+
+        return H
 
     def get_ham(self, RWA=False):
-        print('Deprecated. Please use getH()')
+        return self.getH(RWA)
+
+    def setH(self, h):
+        self.H = h
         return
 
-    def get_dip(self):
-        return kron(self.mol.dip, self.cav.idm)
+    def get_edip(self, basis='product'):
+        '''
+        transition dipole moment in the direct product basis
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        '''
+        return kron(self.mol.edip, self.cav.idm)
 
     def get_dm(self):
         return kron(self.mol.dm, self.cav.vacuum_dm())
@@ -266,18 +326,175 @@ class Polariton:
 
         return self.cav_leak
 
-    def spectrum(self, nstates, RWA=False):
+    def eigenstates(self, k=None):
         """
         compute the polaritonic spectrum
+
+        Parameters
+        ----------
+        k : int, optional
+            number of eigenstates. The default is 1.
+        sparse : TYPE, optional
+            if the Hamiltonian is sparse. The default is True.
+
+        Returns
+        -------
+        evals : TYPE
+            DESCRIPTION.
+        evecs : TYPE
+            DESCRIPTION.
+        n_ph : TYPE
+            photonic fractions in polaritons.
+
         """
-        ham = self.get_ham(RWA=RWA)
-        ham = csr_matrix(ham)
-        return linalg.eigsh(ham, nstates, which='SA')
+
+        if self.H == None:
+            sys.exit('Please call getH to compute the Hamiltonian first.')
+
+
+        if k is None:
+
+            """
+            compute the full polariton states with numpy
+            """
+
+            h = self.H.toarray()
+            # evals, evecs = scipy.linalg.eigh(h, subset_by_index=[0, self.dim])
+            evals, evecs = scipy.linalg.eigh(h)
+            # number of photons in polariton states
+            num_op = self.cav.num()
+            num_op = kron(self.mol.idm, num_op)
+
+            n_ph = np.zeros(self.dim)
+            for j in range(self.dim):
+                n_ph[j] = np.real(evecs[:, j].conj().dot(
+                    num_op.dot(evecs[:, j])))
+
+            self.eigvals = evals
+            self.eigvecs = evecs
+
+            return evals, evecs
+
+        elif k < self.dim:
+
+            evals, evecs = linalg.eigsh(self.H, k, which='SA')
+
+            # number of photons in polariton states
+            num_op = self.cav.num()
+            num_op = kron(self.mol.idm, num_op)
+
+            n_ph = np.zeros(k)
+            for j in range(k):
+                n_ph[j] = np.real(evecs[:, j].conj().dot(
+                    num_op.dot(evecs[:, j])))
+
+            return evals, evecs, n_ph
 
     def rdm_photon(self):
         """
         return the reduced density matrix for the photons
         """
+    def transform_basis(self, a):
+        """
+        transform the operator a from the direct product basis to polariton basis
+
+        Parameters
+        ----------
+        a : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        2d array
+
+        """
+        if self.eigvecs is None:
+            self.eigenstates()
+
+        return basis_transform(a, self.eigvecs)
+
+    def driven_dynamics(self, psi0, pulse, dt=0.001, nt=1, obs_ops=None, nout=1, t0=0.0):
+        H = self.H
+
+        if self.dip is None:
+            edip = self.get_dip()
+        else:
+            edip = self.dip
+
+        # psi0 = self.initial_state
+
+        if psi0 is None:
+            sys.exit("Error: Initial wavefunction not specified!")
+
+        H = [self.H, [edip, pulse]]
+
+        return driven_dynamics(H, psi0, dt=dt, Nt=nt, \
+                        e_ops=obs_ops, nout=nout, t0=t0)
+
+# class Polariton:
+#     def __init__(self, mol, cav, g=None):
+#         self.g = g
+#         self.mol = mol
+#         self.cav = cav
+#         self._ham = None
+#         self.dip = None
+#         self.cav_leak = None
+#         #self.dm = kron(mol.dm, cav.get_dm())
+        
+#         self.H = None
+
+#     def getH(self, g, RWA=True):
+#         mol = self.mol
+#         cav = self.cav
+
+#         # g = self.g
+
+#         hmol = mol.get_ham()
+#         hcav = cav.get_ham()
+
+#         Icav = identity(self.cav.n_cav)
+#         Imol = identity(self.mol.n_states)
+
+#         if RWA == True:
+#             hint = g * (kron(mol.ex, cav.get_annihilate()) + kron(mol.deex, cav.get_create()))
+#         elif RWA == False:
+#             hint = g * kron(mol.dip, cav.get_create() + cav.get_annihilate())
+
+#         H = kron(hmol, Icav) + kron(Imol, hcav) + hint
+#         self.H = H
+#         return H
+
+#     def get_ham(self, RWA=False):
+#         print('Deprecated. Please use getH()')
+#         return
+
+#     def get_dip(self):
+#         return kron(self.mol.dip, self.cav.idm)
+
+#     def get_dm(self):
+#         return kron(self.mol.dm, self.cav.vacuum_dm())
+
+#     def get_cav_leak(self):
+#         """
+#         damp operator for the cavity mode
+#         """
+#         if self.cav_leak == None:
+#             self.cav_leak = kron(self.mol.idm, self.cav.annihilate)
+
+#         return self.cav_leak
+
+#     def spectrum(self, nstates, RWA=False):
+#         """
+#         compute the polaritonic spectrum
+#         """
+#         ham = self.get_ham(RWA=RWA)
+#         ham = csr_matrix(ham)
+#         return linalg.eigsh(ham, nstates, which='SA')
+
+#     def rdm_photon(self):
+#         """
+#         return the reduced density matrix for the photons
+#         """
 
 
 class VibronicPolariton:

@@ -200,7 +200,8 @@ class Vibronic2:
         return ax0, ax1
 
     def spo(self):
-        return SPO2(nstates=self.nstates, mass=self.mass, x=x, y=y)
+        return SPO2(nstates=self.nstates, mass=self.mass, x=self.x, y=self.y)
+
 
 class LVC2:
     """
@@ -361,6 +362,11 @@ class LVC2:
 
     def run(self):
         pass
+    
+    def buildH(self, representation='ho'):
+        # compute the Hamiltonian using DVR or harmonic oscillator eigenstates
+        pass
+        # return H
 
 
 class DHO:
