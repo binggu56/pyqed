@@ -1799,9 +1799,7 @@ def _lindblad_driven(H, rho0, c_ops=None, e_ops=None, Nt=1, dt=0.005, t0=0.,
 
     # initialize the density matrix
     rho = rho0.copy()
-    rho = rho.astype(complex)
-
-
+    rho = csr_matrix(rho.astype(complex))
 
     t = t0
 
@@ -1852,7 +1850,7 @@ def _lindblad_driven(H, rho0, c_ops=None, e_ops=None, Nt=1, dt=0.005, t0=0.,
             t += dt
 
             Ht = calculateH(t)
-
+            
             rho = rk4(rho, liouvillian, dt, Ht, c_ops)
 
             rholist.append(rho.copy())
