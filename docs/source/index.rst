@@ -56,15 +56,16 @@ Periodically driven matter
 
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 4
    :caption: Contents:
-
+   
+   modules
    guide/guide.rst
-   pyqed
+   pyqed.polariton
+   pyqed.namd
    developers.rst
    heom
    Floquet
-
 
 
 Indices and tables

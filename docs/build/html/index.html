@@ -4,7 +4,7 @@
   <meta charset="utf-8" /><meta name="generator" content="Docutils 0.17.1: http://docutils.sourceforge.net/" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Welcome to lime’s documentation! &mdash; lime 1.0.0 documentation</title>
+  <title>Welcome to PyQED’s documentation! &mdash; PyQED 1.0.0 documentation</title>
       <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
       <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
   <!--[if lt IE 9]>
@@ -18,7 +18,7 @@
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="lime package" href="lime.html" /> 
+    <link rel="next" title="pyqed" href="modules.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -26,7 +26,7 @@
     <nav data-toggle="wy-nav-shift" class="wy-nav-side">
       <div class="wy-side-scroll">
         <div class="wy-side-nav-search" >
-            <a href="#" class="icon icon-home"> lime
+            <a href="#" class="icon icon-home"> PyQED
           </a>
 <div role="search">
   <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
@@ -38,10 +38,11 @@
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="lime.html">lime package</a></li>
-<li class="toctree-l1"><a class="reference internal" href="modules.html">models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="modules.html">pyqed</a></li>
+<li class="toctree-l1"><a class="reference internal" href="guide/guide.html">Users Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developers.html">Developers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="heom.html">heom module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet package</a></li>
 </ul>
 
         </div>
@@ -50,7 +51,7 @@
 
     <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
           <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
-          <a href="#">lime</a>
+          <a href="#">PyQED</a>
       </nav>
 
       <div class="wy-nav-content">
@@ -58,7 +59,7 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="#" class="icon icon-home"></a> &raquo;</li>
-      <li>Welcome to lime’s documentation!</li>
+      <li>Welcome to PyQED’s documentation!</li>
       <li class="wy-breadcrumbs-aside">
             <a href="_sources/index.rst.txt" rel="nofollow"> View page source</a>
       </li>
@@ -68,38 +69,16 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="welcome-to-lime-s-documentation">
-<h1>Welcome to lime’s documentation!<a class="headerlink" href="#welcome-to-lime-s-documentation" title="Permalink to this headline"></a></h1>
-<p>The goal is to provide a simple-to-use package to study how light interacts with matter.</p>
-<p>Check docs/manual.pdf for documentations.</p>
+  <section id="welcome-to-pyqed-s-documentation">
+<h1>Welcome to PyQED’s documentation!<a class="headerlink" href="#welcome-to-pyqed-s-documentation" title="Permalink to this headline"></a></h1>
+<p>The goal is to provide a simple-to-use package to study <code class="docutils literal notranslate"><span class="pre">how</span> <span class="pre">light</span> <span class="pre">interacts</span> <span class="pre">with</span> <span class="pre">matter</span></code>.</p>
+<p>Check docs/manual.pdf for theoretical details.</p>
 <p>Main modules</p>
-<section id="nonlinear-molecular-spectroscopy">
-<h2>Nonlinear molecular spectroscopy<a class="headerlink" href="#nonlinear-molecular-spectroscopy" title="Permalink to this headline"></a></h2>
-<ol class="arabic">
-<li><p>Sum-of-states (SOS) for multilevel system</p>
-<blockquote>
-<div><p>Pros: computationally cheap and intuitive</p>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>In the SOS method, decay is introduced phenomelogically.</p>
-</div>
-</div></blockquote>
-</li>
-<li><p>correlation function approach –  Direct computing the many-point correlation functions with the quantum regression theorem</p>
-<blockquote>
-<div><p>Valid for open quantum systems where environment effects can be rigirously described with quantum master equations.</p>
-<p>Visulize with double-sided Feynman diagrams instead of the time-loop diagrams.</p>
-</div></blockquote>
-</li>
-<li><p>non-perturbative approah – valid for ALL systems provided a quantum dynamics solver is provided.</p>
-<blockquote>
-<div><p>Simulating the laser-driven dynamics including explicitly all laser pulses</p>
-</div></blockquote>
-</li>
-</ol>
-</section>
-<section id="molecular-quantum-dynamics">
-<h2>Molecular quantum dynamics<a class="headerlink" href="#molecular-quantum-dynamics" title="Permalink to this headline"></a></h2>
+<ul class="simple">
+<li><p>Nonlinear molecular spectroscopy</p></li>
+<li><p>Molecular quantum dynamics</p></li>
+</ul>
+<hr class="docutils" />
 <ul class="simple">
 <li><dl class="simple">
 <dt>Adiabatic wavepacket dynamics</dt><dd><ul>
@@ -119,7 +98,13 @@
 </li>
 </ul>
 <p># Semiclassical quantum trajectory method</p>
-<p># Quantum chemistry</p>
+<section id="quantum-chemistry">
+<h2>Quantum chemistry<a class="headerlink" href="#quantum-chemistry" title="Permalink to this headline"></a></h2>
+<ul class="simple">
+<li><p>TDDFT core-level excitation</p></li>
+</ul>
+<p>** reduced excitation space
+** restricted energy window with full/reduced excitation space</p>
 </section>
 <section id="open-quantum-systems">
 <h2>Open quantum systems<a class="headerlink" href="#open-quantum-systems" title="Permalink to this headline"></a></h2>
@@ -146,44 +131,62 @@
 <div class="toctree-wrapper compound">
 <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="lime.html">lime package</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#subpackages">Subpackages</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#submodules">Submodules</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.Floquet">lime.Floquet module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.FranckCondon">lime.FranckCondon module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#lime-backup-module">lime.backup module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.beam">lime.beam module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.cavity">lime.cavity module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.common">lime.common module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.coordinates">lime.coordinates module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.correlation">lime.correlation module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.fft">lime.fft module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.group">lime.group module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.gwp">lime.gwp module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.liouville">lime.liouville module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.mol">lime.mol module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.noise">lime.noise module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.optics">lime.optics module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.oqs">lime.oqs module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.phys">lime.phys module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#lime-qnm-module">lime.qnm module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.quadrature">lime.quadrature module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.spin_boson">lime.spin_boson module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.style">lime.style module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.superoperator">lime.superoperator module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#lime-susceptibility-module">lime.susceptibility module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.units">lime.units module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.wigner">lime.wigner module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime.wpd">lime.wpd module</a></li>
-<li class="toctree-l2"><a class="reference internal" href="lime.html#module-lime">Module contents</a></li>
+<li class="toctree-l1"><a class="reference internal" href="modules.html">pyqed</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="pyqed.html">pyqed package</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#subpackages">Subpackages</a><ul class="simple">
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="modules.html">models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="models.html">models package</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#submodules">Submodules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-floquet-module">pyqed.Floquet module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-franckcondon-module">pyqed.FranckCondon module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-backup-module">pyqed.backup module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-beam-module">pyqed.beam module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-cavity-module">pyqed.cavity module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-common-module">pyqed.common module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-coordinates-module">pyqed.coordinates module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-correlation-module">pyqed.correlation module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-fft-module">pyqed.fft module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-group-module">pyqed.group module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-gwp-module">pyqed.gwp module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-liouville-module">pyqed.liouville module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-mol-module">pyqed.mol module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-noise-module">pyqed.noise module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-optics-module">pyqed.optics module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-oqs-module">pyqed.oqs module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-phys-module">pyqed.phys module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-qnm-module">pyqed.qnm module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-quadrature-module">pyqed.quadrature module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-spin-boson-module">pyqed.spin_boson module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-style-module">pyqed.style module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-superoperator-module">pyqed.superoperator module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-susceptibility-module">pyqed.susceptibility module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-units-module">pyqed.units module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-wigner-module">pyqed.wigner module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#pyqed-wpd-module">pyqed.wpd module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyqed.html#module-contents">Module contents</a></li>
 </ul>
 </li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="guide/guide.html">Users Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="guide/guide_spectroscopy.html">Nonlinear molecular spectroscopy</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="guide/guide_spectroscopy.html#sum-of-states-sos-for-multilevel-system">Sum-of-states (SOS) for multilevel system</a></li>
+<li class="toctree-l3"><a class="reference internal" href="guide/guide_spectroscopy.html#correlation-function-approach">Correlation function approach</a></li>
+<li class="toctree-l3"><a class="reference internal" href="guide/guide_spectroscopy.html#non-perturbative-approah">Non-perturbative approah</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="developers.html">Developers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="heom.html">heom module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet package</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="Floquet.html#submodules">Submodules</a><ul class="simple">
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="Floquet.html#floquet-floquet-module">Floquet.Floquet module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="Floquet.html#module-contents">Module contents</a></li>
+</ul>
+</li>
 </ul>
 </div>
 </section>
@@ -201,7 +204,7 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="lime.html" class="btn btn-neutral float-right" title="lime package" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="modules.html" class="btn btn-neutral float-right" title="pyqed" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
