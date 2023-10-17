@@ -66,6 +66,7 @@ Periodically driven matter
    developers.rst
    heom.rst
    Floquet.rst
+   pyqed.pyqed.signal.rst
 
 
 Indices and tables

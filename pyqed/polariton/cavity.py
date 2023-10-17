@@ -10,7 +10,8 @@ import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 
 from pyqed.units import au2fs, au2k, au2ev
-from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Composite
+from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol
+
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
 # from pyqed.cavity import Cavity
@@ -22,6 +23,259 @@ else:
     import matplotlib.pyplot as plt
 
 
+class Composite(Mol):
+    def __init__(self, A, B):
+        """
+
+        Parameters
+        ----------
+        A : mol object
+            Quantum system.
+        B : object
+            Quantum system.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        self.A = A
+        self.B = B
+        self.idm = kron(A.idm, B.idm)  # identity matrix
+        self.ida = A.idm
+        self.idb = B.idm
+        self.H = None
+        self.nonhermH = None
+        self.rdm_a = None
+        self.rdm_b = None
+        self.dim = A.dim * B.dim
+        self.dims = [A.dim, B.dim]
+        self.eigvals = None
+        self.eigvecs = None
+
+    def getH(self, a_ops=None, b_ops=None, g=0):
+        """
+        Compute the Hamiltonian for the composite A + B system.
+
+        The interaction between A and B are
+            V_AB = sum_i g[i] * a_ops[i] * b_ops[i]
+        Parameters
+        ----------
+        a_ops: list of arrays
+            coupling operators for subsystem A
+        b_ops: list of arrays
+            coupling operators for subsystem B
+        g: coupling constants
+
+        Returns
+        -------
+
+        """
+
+        H = kron(self.A.H, self.idb) + kron(self.ida, self.B.H)
+
+        if a_ops == None:
+
+            print('Warning: there is no coupling between the two subsystems.')
+
+
+
+        elif isinstance(a_ops, list):
+
+            for i, a_op in enumerate(a_ops):
+                b_op = b_ops[i]
+                H += g[i] * kron(a_op, b_op)
+
+
+        elif isinstance(a_ops, np.ndarray):
+
+            H += g * a_ops @ b_ops
+
+        self.H = H
+
+        return H
+
+    def get_nonhermH(self, a_ops=None, b_ops=None, g=0):
+        """
+        The interaction between A and B are
+            V_AB = sum_i g[i] * a_ops[i] * b_ops[i]
+        Parameters
+        ----------
+        a_ops: list of arrays
+            coupling operators for subsystem A
+        b_ops: list of arrays
+            coupling operators for subsystem B
+        g: coupling constants
+
+        Returns
+        -------
+
+        """
+        if self.A.nonhermH is None:
+            raise ValueError('Call get_nonhermH() for subsystem A first.')
+
+        if self.B.nonhermH is None:
+            raise ValueError('Call get_nonhermH() for subsystem B first.')
+
+        H = kron(self.A.nonhermH, self.idb) + kron(self.ida, self.B.nonhermH)
+
+        if a_ops == None:
+
+            print('Warning: there is no coupling between the two subsystems.')
+
+        elif isinstance(a_ops, list):
+
+            for i, a_op in enumerate(a_ops):
+                b_op = b_ops[i]
+                H += g[i] * kron(a_op, b_op)
+
+
+        elif isinstance(a_ops, np.ndarray):
+
+            H += g * a_ops @ b_ops
+
+        self.nonhermH = H
+
+        return H
+
+    def promote(self, o, subspace='A'):
+        """
+        promote an operator in subspace to the full Hilbert space
+        E.g. A = A \otimes I_B
+        """
+        if subspace == 'A':
+            return kron(o, self.B.idm)
+
+        elif subspace == 'B':
+            return kron(self.A.idm, o)
+        else:
+            raise ValueError('The subspace option can only be A or B.')
+
+    def promote_ops(self, ops, subspaces=None):
+        if subspaces is None:
+            subspaces = ['A'] * len(ops)
+
+        new_ops = []
+        for i, op in enumerate(ops):
+            new_ops.append(self.promote(op, subspaces[i]))
+
+        return new_ops
+
+
+    def eigenstates(self, k=None):
+        """
+        compute the polaritonic spectrum
+
+        Parameters
+        ----------
+        k : int, optional
+            number of eigenstates. The default is 1.
+        sparse : TYPE, optional
+            if the Hamiltonian is sparse. The default is True.
+
+        Returns
+        -------
+        evals : TYPE
+            DESCRIPTION.
+        evecs : TYPE
+            DESCRIPTION.
+        n_ph : TYPE
+            photonic fractions in polaritons.
+
+        """
+
+        if self.H is None:
+            sys.exit('Please call getH to compute the Hamiltonian first.')
+
+        if k is None:
+
+            # compute the full polariton states
+            if issparse(self.H):
+                evals, evecs = scipy.linalg.eigh(self.H.toarray())
+            else:
+                evals, evecs = scipy.linalg.eigh(self.H)
+
+            self.eigvals = evals
+            self.eigvecs = evecs
+            return evals, evecs
+
+        elif k < self.dim:
+
+            if issparse(self.H):
+                evals, evecs = linalg.eigsh(self.H, k, which='SA')
+            else:
+                raise TypeError('H is not sparse matrix.')
+
+            self.eigvals = evals
+            self.eigvecs = evecs
+            return evals, evecs
+
+        else:
+            raise ValueError('k cannot exceed the size of H.')
+
+    def spectrum(self):
+        if self.H is None:
+            sys.exit('Call getH() to compute the full Hamiltonian first.')
+        else:
+            eigvals, eigvecs = np.linalg.eigh(self.H.toarray())
+
+            return eigvals, eigvecs
+
+    def transform_basis(self, a):
+        """
+        transform the operator a from the direct product basis to polariton basis
+
+        Parameters
+        ----------
+        a : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        2d array
+
+        """
+        if self.eigvecs is None:
+            self.eigenstates()
+
+        return basis_transform(a, self.eigvecs)
+
+            # raise ValueError('Call eigenstates() to compute eigvecs first.')
+
+    def rdm(self, psi, which='A'):
+        """
+        compute the reduced density matrix of A/B from a pure state
+
+        Parameters
+        ----------
+        psi: array
+            pure state
+        which: str
+            indicator of which rdm A or B. Default 'A'.
+
+        Returns
+        -------
+
+        """
+        na = self.A.dim
+        nb = self.B.dim
+        psi_reshaped = psi.reshape((na, nb))
+        if which == 'A':
+
+            rdm = psi_reshaped @ dag(psi_reshaped)
+            return rdm
+
+        elif which == 'B':
+            rdm = psi_reshaped.T @ psi_reshaped.conj()
+            return rdm
+        else:
+            raise ValueError('which option can only be A or B.')
+
+    def purity(self, psi):
+        rdm = self.rdm(psi)
+
+        return np.trace(rdm @ rdm)
 
 
 def ham_ho(freq, n, ZPE=False):

@@ -134,7 +134,7 @@ def absorption(mol, omegas, linewidth=None, plt_signal=True, fname=None, normali
 
     '''
 
-    edip = mol.edip_rms
+    edip = mol.edip
 
     # set linewidth, this can be generalized to frequency-dependent linewidth
     if linewidth is None:
