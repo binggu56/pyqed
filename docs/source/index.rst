@@ -61,11 +61,11 @@ Periodically driven matter
    
    modules
    guide/guide.rst
-   pyqed.polariton
-   pyqed.namd
+   pyqed/polariton
+   pyqed/namd
    developers.rst
-   heom
-   Floquet
+   heom.rst
+   Floquet.rst
 
 
 Indices and tables
