@@ -33,7 +33,7 @@ release = '1.0.0'
 extensions = ['sphinx.ext.autodoc', 'sphinx.ext.napoleon', 'sphinx.ext.mathjax'
 ]
 
-.. autoclass:: lime.oqs.LindbladSolver
+#.. autoclass:: lime.oqs.LindbladSolver
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
