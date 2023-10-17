@@ -8,3 +8,4 @@ Users Guide
 	:maxdepth: 2 
 
 	guide_spectroscopy.rst
+	guide_open_dynamics.rst
