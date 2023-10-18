@@ -400,7 +400,7 @@ import numpy as np
 import scipy.linalg as linalg
 from scipy.optimize import newton
 
-from pyscf.lib import logger
+# from pyscf.lib import logger
 import pyscf.ao2mo
 import pyscf
 from functools import reduce

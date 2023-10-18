@@ -16,7 +16,7 @@ import sys
 from pyqed import au2fs, au2k, au2ev, dag, coth, ket2dm, comm, anticomm, pauli, destroy,\
     basis, isherm, basis_transform, driven_dynamics
 from pyqed.mol import Mol
-from pyqed.oqs import Lindblad_solver
+from pyqed.oqs import LindbladSolver
 
 
 
@@ -791,7 +791,7 @@ if __name__ == '__main__':
     psi0 = basis(2, 0)
     rho0 = ket2dm(psi0)
 
-    # mesolver = Lindblad_solver(H, c_ops=[0.2 * sx], e_ops = [sz])
+    # mesolver = LindbladSolver(H, c_ops=[0.2 * sx], e_ops = [sz])
     Nt = 200
     dt = 0.05
 

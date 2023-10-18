@@ -15,12 +15,91 @@ from scipy.linalg import eigh
 
 import sys
 import matplotlib.pyplot as plt
+import math
 
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
     polar2cartesian, Mol, SESolver, dag, SPO, SPO2, SPO3
 from pyqed.style import set_style
 # from pyqed.units import au2ev, wavenumber2hartree
+
+def hermite(x, nb):
+    """
+    hermite polynomials
+    return:
+        H: list of Hermite polynomials up to order Nb
+    """
+    cons = np.array([1. / np.sqrt(float(2**n) * float(math.factorial(n))) for n in range(nb)])
+
+    H = []
+    H.append(1.0)
+    H.append( x * 2.0 )
+    if nb > 2:
+        for n in range(2,nb):
+            Hn = 2.0 * x * H[n-1] - 2.0*(n-1) * H[n-2]
+            H.append(Hn)
+
+    for n in range(nb):
+        H[n] = H[n]*cons[n]
+
+    return H
+
+def gauss_hermite2d(x,y,nx,ny):
+    """
+    composite basis for two harmonic oscillators
+    """
+    gx = gauss_hermite(x,nx)
+    gy = gauss_hermite(y,ny)
+
+    tmp = []
+    for i in range(nx):
+        for j in range(ny):
+            tmp.append(np.einsum('i, j -> ij', gx[i], gy[j]))
+    return tmp
+
+def gauss_hermite(x, nb, alpha=1., xAve=0., pAve=0.0):
+   """
+   compute the value of Gauss-Hermite at x
+   """
+   a = alpha.real
+   z = (x - xAve) * np.sqrt(a)
+
+   gauss = (a/np.pi)**0.25 * np.exp( - alpha * (x-xAve)**2/2.0 \
+            + 1j*pAve*(x-xAve))
+
+   gh = [ gauss*h for h in hermite(z, nb)]
+   return gh
+
+def nuc_density(state, x, y, nx, ny):
+    """
+    extract nuclear density at position R
+    rdm_v: 2d array, density matrix for the nuclear dofs
+
+    """
+    # construct basis
+    gh = gauss_hermite2d(x, y, nx, ny)
+    
+    nb = nx*ny
+    
+    if state.shape in [nb, (nb, 1)]:
+        
+        psi = np.zeros((len(x),len(y)), dtype=complex)
+
+        for i in range(nb):
+            psi += gh[i] * psi[i] 
+
+        return psi 
+    
+    elif state.shape == (nb, nb):
+        
+        den = np.zeros((len(x),len(y)), dtype=complex)
+    
+        for i in range(nb):
+            for j in range(nb):
+                den += gh[i] * state[i,j] * gh[j]
+
+        return den
+
 
 
 class Vibronic2:
