@@ -70,23 +70,29 @@ def gauss_hermite(x, nb, alpha=1., xAve=0., pAve=0.0):
    gh = [ gauss*h for h in hermite(z, nb)]
    return gh
 
-def nuc_density(state, x, y, nx, ny):
+def fock2grid(state, x, y, nx, ny):
     """
-    extract nuclear density at position R
-    rdm_v: 2d array, density matrix for the nuclear dofs
-
+    transform a state or a density matrix in the Fock space to the coordinate space
+    nuclear density at position R
+    
+    state: 1d or 2d array
+        density matrix for the nuclear dofs
+    
+    Returns
+    =======
+    psi or den
     """
     # construct basis
     gh = gauss_hermite2d(x, y, nx, ny)
     
     nb = nx*ny
     
-    if state.shape in [nb, (nb, 1)]:
+    if state.shape == (nb,):
         
         psi = np.zeros((len(x),len(y)), dtype=complex)
 
         for i in range(nb):
-            psi += gh[i] * psi[i] 
+            psi += gh[i] * state[i] 
 
         return psi 
     
@@ -99,7 +105,8 @@ def nuc_density(state, x, y, nx, ny):
                 den += gh[i] * state[i,j] * gh[j]
 
         return den
-
+    else:
+        raise ValueError('Not a valid state.')
 
 
 class Vibronic2:
