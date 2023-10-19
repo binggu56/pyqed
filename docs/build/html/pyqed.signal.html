@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyqed.signal package &mdash; PyQED 1.0.0 documentation</title>
+      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="_static/jquery.js?v=5d32c60e"></script>
+        <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=af2ce170"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
+        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PyQED
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="modules.html">pyqed</a></li>
+<li class="toctree-l1"><a class="reference internal" href="guide/guide.html">Users Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developers.html">Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="heom.html">heom module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet package</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pyqed.pyqed.signal.html">pyqed.pyqed.signal package</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PyQED</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">pyqed.signal package</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/pyqed.signal.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyqed-signal-package">
+<h1>pyqed.signal package<a class="headerlink" href="#pyqed-signal-package" title="Permalink to this heading"></a></h1>
+<section id="submodules">
+<h2>Submodules<a class="headerlink" href="#submodules" title="Permalink to this heading"></a></h2>
+</section>
+<section id="pyqed-signal-2des-module">
+<h2>pyqed.signal.2DES module<a class="headerlink" href="#pyqed-signal-2des-module" title="Permalink to this heading"></a></h2>
+</section>
+<section id="pyqed-signal-etpa-module">
+<h2>pyqed.signal.ETPA module<a class="headerlink" href="#pyqed-signal-etpa-module" title="Permalink to this heading"></a></h2>
+</section>
+<section id="pyqed-signal-liouville-module">
+<h2>pyqed.signal.liouville module<a class="headerlink" href="#pyqed-signal-liouville-module" title="Permalink to this heading"></a></h2>
+</section>
+<section id="pyqed-signal-nonhermitian-module">
+<h2>pyqed.signal.nonhermitian module<a class="headerlink" href="#pyqed-signal-nonhermitian-module" title="Permalink to this heading"></a></h2>
+</section>
+<section id="module-pyqed.signal.sos">
+<span id="pyqed-signal-sos-module"></span><h2>pyqed.signal.sos module<a class="headerlink" href="#module-pyqed.signal.sos" title="Permalink to this heading"></a></h2>
+<p>Sum over system eigenstates formula for computing the nonlinear signals.</p>
+<p>This is the simpliest method for nonlinear signals without going to
+the Liouville space.</p>
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.DQC_R1">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">DQC_R1</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">evals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega3</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau1</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau3</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[0]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.DQC_R1" title="Permalink to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>Double quantum coherence, diagram 1:</dt><dd><p>gg -&gt; eg -&gt; fg -&gt; fe’ -&gt; e’e’ in the impulsive limit.</p>
+</dd>
+</dl>
+<p>The signal wave vector is ks = k1 + k2 - k3</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>dip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for ground manifold</p></li>
+<li><p><strong>e_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for excited state manifold</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>chi</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.DQC_R2">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">DQC_R2</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">evals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega3</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau1</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau3</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[0]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.DQC_R2" title="Permalink to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>Double quantum coherence, diagram 2:</dt><dd><p>gg -&gt; eg -&gt; fg -&gt; eg -&gt; gg in the impulsive limit.</p>
+</dd>
+</dl>
+<p>The signal wave vector is ks = k1 + k2 - k3</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>dip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>omega2</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is [].</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>tau1</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>tau3</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>g_idx</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is [0].</p></li>
+<li><p><strong>e_idx</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>f_idx</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>gamma</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>signal</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.ESA">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">ESA</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">evals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.ESA" title="Permalink to this definition"></a></dt>
+<dd><p>Excited state absorption component of the photon echo signal.
+In Liouville sapce, gg -&gt; ge -&gt; e’e -&gt; fe -&gt; ee</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>dip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – index for ground state (manifold)</p></li>
+<li><p><strong>e_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – index for e-states</p></li>
+<li><p><strong>f_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – index of f-states</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>signal</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>2d array (len(pump), len(probe))</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.G">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">G</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">omega</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.G" title="Permalink to this definition"></a></dt>
+<dd><p>Green’s function in the frequency domain, i.e., FT of the retarded propagator</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>omega</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>a</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>b</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>gamma</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.GF">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">GF</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">a</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">b</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.GF" title="Permalink to this definition"></a></dt>
+<dd><p>Retarded propagator of the element <a href="#id3"><span class="problematic" id="id4">|a&gt;&lt;b|</span></a> for time t</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>a</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>b</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.GSB">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">GSB</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">evals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.GSB" title="Permalink to this definition"></a></dt>
+<dd><p>gg -&gt; ge -&gt; gg’ -&gt; e’g’ -&gt; g’g’</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>dip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for ground manifold</p></li>
+<li><p><strong>e_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for excited state manifold</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>chi</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.SE">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">SE</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">evals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tau2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.SE" title="Permalink to this definition"></a></dt>
+<dd><p>Stimulated emission gg -&gt; ge -&gt; e’e -&gt; g’e -&gt; g’g’ in the impulsive limit.
+The signal wave vector is ks = -k1 + k2 + k3</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>dip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for ground manifold</p></li>
+<li><p><strong>e_idx</strong> (<em>list</em><em> of </em><em>integers</em>) – indexes for excited state manifold</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>chi</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.TPA">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">TPA</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegap</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">degenerate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.TPA" title="Permalink to this definition"></a></dt>
+<dd><p>TPA signal with classical light</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.TPA2D">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">TPA2D</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegaps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.TPA2D" title="Permalink to this definition"></a></dt>
+<dd><p>2D two-photon-absorption signal with classical light scanning the omegap = omega1 + omega2 and omega1</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.TPA2D_time_order">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">TPA2D_time_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegaps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.TPA2D_time_order" title="Permalink to this definition"></a></dt>
+<dd><p>2D two-photon-absorption signal with classical light scanning the omegap = omega1 + omega2 and omega1</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.absorption">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">absorption</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegas</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">linewidth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">plt_signal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fname</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">normalize</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">yscale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.absorption" title="Permalink to this definition"></a></dt>
+<dd><p>SOS for linear absorption signal
+..math:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">S</span><span class="p">(</span>\<span class="n">omega</span><span class="p">)</span> <span class="o">=</span> <span class="mi">2</span> \<span class="n">pi</span> \<span class="n">sum_f</span> <span class="o">|</span>\<span class="n">mu_</span><span class="p">{</span><span class="n">fg</span><span class="p">}</span><span class="o">|^</span><span class="mi">2</span> \<span class="n">delta</span><span class="p">(</span>\<span class="n">omega</span> <span class="o">-</span> \<span class="n">omega_</span><span class="p">{</span><span class="n">fg</span><span class="p">})</span><span class="o">.</span>
+</pre></div>
+</div>
+<p>The delta function is replaced with a Lorentzian function.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>omegas</strong> (<em>1d array</em>) – detection frequency window for the signal</p></li>
+<li><p><strong>H</strong> (<em>2D array</em>) – Hamiltonian</p></li>
+<li><p><strong>edip</strong> (<em>2d array</em>) – electric dipole moment</p></li>
+<li><p><strong>output</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>gamma</strong> (<em>float</em><em>, </em><em>optional</em>) – Lifetime broadening. The default is 1./au2ev.</p></li>
+<li><p><strong>normalize</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – Normalize the maximum intensity of the signal as 1. The default is False.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>signal</strong> – linear absorption signal at omegas</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>1d array</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.cars">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">cars</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shift</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0003674903350041894</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.cars" title="Permalink to this definition"></a></dt>
+<dd><p>two pump pulses followed by a stimulated raman probe.</p>
+<p>The first, second, and fourth pulses are assumed impulse,
+the thrid pulse is cw.</p>
+<dl class="simple">
+<dt>S = sum_{b,a = e} 2 * pi * delta(Eshift - omega_{ba}) * mu_{bg} *</dt><dd><p>mu_{ag} * alpha_{ba}</p>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>E</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>edip</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>t1</strong> (<em>TYPE</em>) – time decay between pulses 1 and 2</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – time delay between pulse 2 and 4 (stokes beam). The default is 0.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>S</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.etpa">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">etpa</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">omegaps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">epp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.etpa" title="Permalink to this definition"></a></dt>
+<dd><p>ETPA signal with temporal modes (TMs).
+The JSA is reconstructed with the TMs first.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>omegaps</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>e_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>f_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>signal</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.gaussian">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">gaussian</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.gaussian" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.linear_absorption">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">linear_absorption</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">omegas</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transition_energies</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dip</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.036749033500418936</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">normalize</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.linear_absorption" title="Permalink to this definition"></a></dt>
+<dd><p>SOS for linear absorption signal S = 2 pi <a href="#id1"><span class="problematic" id="id2">|</span></a>mu_{fg}|^2 delta(omega - omega_{fg}).
+The delta function is replaced with a Lorentzian function.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>omegas</strong> (<em>1d array</em>) – the frequency range for the signal</p></li>
+<li><p><strong>transition_energies</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>edip</strong> (<em>1d array</em>) – transtion dipole moment</p></li>
+<li><p><strong>output</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is None.</p></li>
+<li><p><strong>gamma</strong> (<em>float</em><em>, </em><em>optional</em>) – Lifetime broadening. The default is 1./au2ev.</p></li>
+<li><p><strong>scale</strong> (<em>float</em>) – scale the transition dipole sticks</p></li>
+<li><p><strong>normalize</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – Normalize the maximum intensity of the signal as 1. The default is False.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>signal</strong> – linear absorption signal at omegas</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>1d array</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.mcd">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">mcd</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegas</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.mcd" title="Permalink to this definition"></a></dt>
+<dd><p>magentic circular dichroism signal with SOS</p>
+<p>The electronic structure data should contain the B field ready,
+not the bare quantities.</p>
+<p>B = (0, 0, Bz)</p>
+<dl class="simple">
+<dt>Reference:</dt><dd><p>Shichao Sun, David Williams-Young, and Xiaosong Li, JCTC, 2019, 15, 3162-3169</p>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>mol</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omegas</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>signal</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.photon_echo">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">photon_echo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pump</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">probe</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[0]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fname</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'signal'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">plt_signal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pol</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.photon_echo" title="Permalink to this definition"></a></dt>
+<dd><p>Photon echo signal for a multi-level system using SOS expression.</p>
+<dl class="simple">
+<dt>Approximations:</dt><dd><ol class="arabic simple">
+<li><p>decay are included phenomelogically</p></li>
+<li><p>no population relaxation</p></li>
+</ol>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>mol</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>pump</strong> (<em>TYPE</em>) – Omega1, conjugate variable of t1</p></li>
+<li><p><strong>probe</strong> (<em>TYPE</em>) – Omega3, conjugate variable of t3</p></li>
+<li><p><strong>t2</strong> (<em>TYPE</em>) – population time.</p></li>
+<li><p><strong>g_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>e_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>f_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>gamma</strong> (<em>float</em>) – decay rates for excited states.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>ValueError</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>S</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.photon_echo_t3">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">photon_echo_t3</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">g_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">[0]</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">e_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">f_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fname</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'2DES'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">plt_signal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">separate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.photon_echo_t3" title="Permalink to this definition"></a></dt>
+<dd><p>2D photon echo signal scanning omega1 and omega2 at detection time t3.</p>
+<p>The current implementation only applies for a single ground state.</p>
+<p>For a manifold of g states, the ground state bleaching neglected here has to be considered.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>evals</strong> (<em>ndarray</em>) – eigenvalues of system.</p></li>
+<li><p><strong>edip</strong> (<em>ndarray</em>) – electric dipole matrix.</p></li>
+<li><p><strong>omega1</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>omega3</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>tau2</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>g_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>e_idx</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>gamma</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>separate</strong> (<em>bool</em>) – separate the ladder diagrams</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>DESCRIPTION.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.polarizability">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">polarizability</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">w</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">Er</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">Ev</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">d</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_rwa</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.polarizability" title="Permalink to this definition"></a></dt>
+<dd><p>Compute the vibrational/electronic polarizability using sum-over-states formula</p>
+<p>lpha_{ji}(w) = d_{jv} d_{vi}/(E_v - E_i - w)</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>w</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>Er</strong> (<em>TYPE</em>) – eigenenergies of resonant states.</p></li>
+<li><p><strong>Ev</strong> (<em>TYPE</em>) – eigenenergies of virtual states.</p></li>
+<li><p><strong>d</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>use_rwa</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is True.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>a</strong> – polarizability.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>ndarray</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.test_etpa">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">test_etpa</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.test_etpa" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.signal.sos.test_model">
+<span class="sig-prename descclassname"><span class="pre">pyqed.signal.sos.</span></span><span class="sig-name descname"><span class="pre">test_model</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.signal.sos.test_model" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</section>
+<section id="module-pyqed.signal">
+<span id="module-contents"></span><h2>Module contents<a class="headerlink" href="#module-pyqed.signal" title="Permalink to this heading"></a></h2>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2022, Bing Gu.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

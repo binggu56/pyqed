@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyqed.floquet package &mdash; PyQED 1.0.0 documentation</title>
+      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="_static/jquery.js?v=5d32c60e"></script>
+        <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=af2ce170"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
+        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script async="async" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PyQED
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="modules.html">pyqed</a></li>
+<li class="toctree-l1"><a class="reference internal" href="guide/guide.html">Users Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developers.html">Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="heom.html">heom module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="Floquet.html">Floquet package</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pyqed.pyqed.signal.html">pyqed.pyqed.signal package</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PyQED</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">pyqed.floquet package</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/pyqed.floquet.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyqed-floquet-package">
+<h1>pyqed.floquet package<a class="headerlink" href="#pyqed-floquet-package" title="Permalink to this heading"></a></h1>
+<section id="submodules">
+<h2>Submodules<a class="headerlink" href="#submodules" title="Permalink to this heading"></a></h2>
+</section>
+<section id="module-pyqed.floquet.Floquet">
+<span id="pyqed-floquet-floquet-module"></span><h2>pyqed.floquet.Floquet module<a class="headerlink" href="#module-pyqed.floquet.Floquet" title="Permalink to this heading"></a></h2>
+<p>Created on Wed Aug 15 18:53:56 2018</p>
+<p>&#64;author: binggu</p>
+<dl class="py class">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.Floquet">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyqed.floquet.Floquet.</span></span><span class="sig-name descname"><span class="pre">Floquet</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">H</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edip</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lowering</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edip_rms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gamma</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.Floquet" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <a class="reference internal" href="pyqed.html#pyqed.mol.Mol" title="pyqed.mol.Mol"><code class="xref py py-class docutils literal notranslate"><span class="pre">Mol</span></code></a></p>
+<p>peridically driven multi-level system with a single frequency</p>
+<p>TODO: add more harmonics so it can treat a second harmonic driving</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.Floquet.momentum_matrix_elements">
+<span class="sig-name descname"><span class="pre">momentum_matrix_elements</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.Floquet.momentum_matrix_elements" title="Permalink to this definition"></a></dt>
+<dd><p>get momentum matrix elements by commutation relation
+.. math:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">p_</span><span class="p">{</span><span class="n">fi</span><span class="p">}</span> <span class="o">=</span> <span class="n">i</span> <span class="n">E_</span><span class="p">{</span><span class="n">fi</span><span class="p">}</span> <span class="n">r_</span><span class="p">{</span><span class="n">fi</span><span class="p">}</span>
+</pre></div>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>p</strong> – DESCRIPTION.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>TYPE</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.Floquet.propagator">
+<span class="sig-name descname"><span class="pre">propagator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.Floquet.propagator" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.Floquet.spectrum">
+<span class="sig-name descname"><span class="pre">spectrum</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">E0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegad</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gauge</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'length'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.Floquet.spectrum" title="Permalink to this definition"></a></dt>
+<dd><blockquote>
+<div><div class="math notranslate nohighlight">
+\[E(t) = E_0 * \cos(\Omega t)
+A(t) = -\]</div>
+</div></blockquote>
+<p>rac{E_0}{Omega} * sin(Omega  t)</p>
+<blockquote>
+<div><dl class="simple">
+<dt>E0<span class="classifier">TYPE</span></dt><dd><p>electric field amplitude.</p>
+</dd>
+<dt>gauge<span class="classifier">TYPE, optional</span></dt><dd><p>DESCRIPTION. The default is ‘length’.</p>
+</dd>
+</dl>
+<dl class="simple">
+<dt>quasienergies<span class="classifier">TYPE</span></dt><dd><p>DESCRIPTION.</p>
+</dd>
+<dt>floquet_modes<span class="classifier">TYPE</span></dt><dd><p>DESCRIPTION.</p>
+</dd>
+</dl>
+</div></blockquote>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.Floquet.velocity_to_length">
+<span class="sig-name descname"><span class="pre">velocity_to_length</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.Floquet.velocity_to_length" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyqed.floquet.Floquet.</span></span><span class="sig-name descname"><span class="pre">FloquetGF</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">amplitude</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omegad</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nt</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <a class="reference internal" href="#pyqed.floquet.Floquet.Floquet" title="pyqed.floquet.Floquet.Floquet"><code class="xref py py-class docutils literal notranslate"><span class="pre">Floquet</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.advanced">
+<span class="sig-name descname"><span class="pre">advanced</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.advanced" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.bare_gf">
+<span class="sig-name descname"><span class="pre">bare_gf</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.bare_gf" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.greater">
+<span class="sig-name descname"><span class="pre">greater</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.greater" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.lesser">
+<span class="sig-name descname"><span class="pre">lesser</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.lesser" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.retarded">
+<span class="sig-name descname"><span class="pre">retarded</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">omega</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">representation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'floquet'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.retarded" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.FloquetGF.wigner_to_floquet">
+<span class="sig-name descname"><span class="pre">wigner_to_floquet</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">g</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.FloquetGF.wigner_to_floquet" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.HamiltonFT">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.Floquet.</span></span><span class="sig-name descname"><span class="pre">HamiltonFT</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">H0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">H1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">n</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.HamiltonFT" title="Permalink to this definition"></a></dt>
+<dd><p>Fourier transform of the Hamiltonian matrix, required to construct the
+Floquet Hamiltonian</p>
+<dl class="simple">
+<dt>INPUT</dt><dd><p>n : Fourier component index
+M : dipole matrix</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.Floquet.quasiE">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.Floquet.</span></span><span class="sig-name descname"><span class="pre">quasiE</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">H0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">H1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">Nt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.Floquet.quasiE" title="Permalink to this definition"></a></dt>
+<dd><p>Construct the Floquet hamiltonian of size Norbs * Nt</p>
+<p>The total Hamiltonian is
+.. math:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">H</span> <span class="o">=</span> <span class="n">H_0</span> <span class="o">+</span> <span class="n">H_1</span> \<span class="n">cos</span><span class="p">(</span>\<span class="n">Omega</span> <span class="o">*</span> <span class="n">t</span><span class="p">)</span>
+</pre></div>
+</div>
+<dl class="simple">
+<dt>INPUT</dt><dd><p>Norbs : number of orbitals
+Nt    : number of Fourier components
+E0    : electric field amplitude</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="module-pyqed.floquet.FloquetBloch">
+<span id="pyqed-floquet-floquetbloch-module"></span><h2>pyqed.floquet.FloquetBloch module<a class="headerlink" href="#module-pyqed.floquet.FloquetBloch" title="Permalink to this heading"></a></h2>
+<p>Created on Fri Jan 13 14:54:11 2017</p>
+<p>Floquet theory for periodic Hamiltonian</p>
+<p>&#64;author: bingg</p>
+<dl class="py class">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.FloquetBloch">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">FloquetBloch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">norbs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intracell</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intercell</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.FloquetBloch" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.FloquetHamilton">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">FloquetHamilton</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">Norbs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">Nt</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.FloquetHamilton" title="Permalink to this definition"></a></dt>
+<dd><p>construct a Floquet hamiltonian of the size Norbs * Nt</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.Gamma">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">Gamma</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">i</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">j</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ii</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">jj</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sys_eigvals</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.Gamma" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.Hamilton">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">Hamilton</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">Norbs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.Hamilton" title="Permalink to this definition"></a></dt>
+<dd><p>Norbs: number of atomic orbitals</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.basisTransform">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">basisTransform</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">U</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.basisTransform" title="Permalink to this definition"></a></dt>
+<dd><p>transform the electric dipole interaction from atomic basis to eigenstates of H_S
+M = - e E0 n a <a href="#id1"><span class="problematic" id="id2">|n&gt;&lt;n|</span></a></p>
+<blockquote>
+<div><p>a : atomic distance [A]
+E0 : electric field amplitude [V/A]</p>
+</div></blockquote>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.delta">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">delta</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">i</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">j</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.delta" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.heaviside">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">heaviside</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.heaviside" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.FloquetBloch.spectrum">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.FloquetBloch.</span></span><span class="sig-name descname"><span class="pre">spectrum</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.FloquetBloch.spectrum" title="Permalink to this definition"></a></dt>
+<dd><p>C : expansion coefficients
+F : eigenstates of Floquet Hamiltonian (a subset of it)
+M : dipole operator matrix element</p>
+</dd></dl>
+
+</section>
+<section id="module-pyqed.floquet.free_electron">
+<span id="pyqed-floquet-free-electron-module"></span><h2>pyqed.floquet.free_electron module<a class="headerlink" href="#module-pyqed.floquet.free_electron" title="Permalink to this heading"></a></h2>
+<p>Created on Wed Jun  8 17:18:29 2022</p>
+<p>&#64;author: Bing</p>
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.free_electron.efield">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.free_electron.</span></span><span class="sig-name descname"><span class="pre">efield</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.free_electron.efield" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.free_electron.force">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.free_electron.</span></span><span class="sig-name descname"><span class="pre">force</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">z</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.free_electron.force" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="pyqed.floquet.free_electron.light_driven_free_electron">
+<span class="sig-prename descclassname"><span class="pre">pyqed.floquet.free_electron.</span></span><span class="sig-name descname"><span class="pre">light_driven_free_electron</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">q0</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">(0.4,</span> <span class="pre">0,</span> <span class="pre">0)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">p0</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">(0,</span> <span class="pre">0,</span> <span class="pre">0)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">E0</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">omega</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cep</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyqed.floquet.free_electron.light_driven_free_electron" title="Permalink to this definition"></a></dt>
+<dd><p>a free electron in AC elctric field</p>
+<div class="math notranslate nohighlight">
+\[\dot{q} = p/m
+\dot{p} = f(q) = - e E(q, t) - m \omega_0^2 q\]</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>t</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>x0</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is (0, 0, 0).</p></li>
+<li><p><strong>v0</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is (0, 0, 0).</p></li>
+<li><p><strong>E0</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is 1.</p></li>
+<li><p><strong>omega</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is 1.</p></li>
+<li><p><strong>cep</strong> (<em>TYPE</em><em>, </em><em>optional</em>) – DESCRIPTION. The default is 0..</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><ul class="simple">
+<li><p><strong>x</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+<li><p><strong>y</strong> (<em>TYPE</em>) – DESCRIPTION.</p></li>
+</ul>
+</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="module-pyqed.floquet">
+<span id="module-contents"></span><h2>Module contents<a class="headerlink" href="#module-pyqed.floquet" title="Permalink to this heading"></a></h2>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2022, Bing Gu.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
