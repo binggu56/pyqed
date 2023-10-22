@@ -337,7 +337,7 @@ if __name__ == '__main__':
     
     
     for i, p in sg.gP.items():
-        print('coo', p.coord())
+        print('coo', p.coord(i))
 
     points = [p.coord(i) for i, p in sg.gP.items()]
 

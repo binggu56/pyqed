@@ -252,7 +252,7 @@ class Mol:
         # else:
         #     self.edip_rms = edip_rms
 
-        self._edip_rms = edip_rms
+        # self._edip_rms = edip_rms
 
         self.nstates = H.shape[0]
         self.dim = H.shape[0]
