@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\
     polar2cartesian, SPO2
+    
+from pyqed.models.vibronic import Vibronic2
+    
 from pyqed.style import set_style
 from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
@@ -243,11 +246,17 @@ def DPES(x, y, nstates=3):
     return hmol
 
 
-class Pyrazine:
+class Pyrazine(Vibronic2):
     """
-    vibronic coupling model for pyrazine
+    vibronic coupling model for pyrazine S1/S2 conical intersection
     """
-    def __init__(self):
+    def __init__(self, x=None, y=None):
+        self.x = x 
+        self.y = y
+        
+        self.nx = len(x)
+        self.ny = len(y)
+        
         self.nstates = 2
         self.mass = [1/(952. * wavenum2au), 1./(597. * wavenum2au)]
 

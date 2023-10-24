@@ -7,6 +7,7 @@ Created on Tue Mar 26 17:26:02 2019
 """
 
 import numpy as np
+import scipy
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 
 from pyqed.units import au2fs, au2k, au2ev
@@ -14,7 +15,6 @@ from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol
 
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
-# from pyqed.cavity import Cavity
 
 import sys
 if sys.version_info[1] < 10:
@@ -396,7 +396,26 @@ def obs(A, rho):
 
 
 class Cavity():
-    def __init__(self, freq, n_cav=None, x=None):
+    def __init__(self, freq, n_cav=None, x=None, decay=None):
+        """
+        class for single-mode cavity
+
+        Parameters
+        ----------
+        freq : TYPE
+            DESCRIPTION.
+        n_cav : TYPE, optional
+            DESCRIPTION. The default is None.
+        x : TYPE, optional
+            DESCRIPTION. The default is None.
+        decay : float, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        None.
+
+        """
         self.freq = self.omega = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav
@@ -412,7 +431,8 @@ class Cavity():
         if x is not None:
             self.x = x
             self.nx = len(x)
-
+        
+        self.decay = decay 
 #    @property
 #    def hamiltonian(self):
 #        return self._hamiltonian
@@ -1232,6 +1252,121 @@ class VibronicPolariton2:
 
 
 
+class VibronicPolaritonNonHermitian(VibronicPolariton2):
+    
+    def dpes(self, g, decay, rwa=False):
+        """
+        Compute the non-Hermitian diabatic potential energy surfaces
+        
+        .. math::
+            H = (\omega_\text{c} - \frac{\kappa}{2} ) a^\dag a
+
+        Parameters
+        ----------
+        g : TYPE
+            DESCRIPTION.
+        rwa : TYPE, optional
+            DESCRIPTION. The default is False.
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+        mol = self.mol
+        cav = self.cav
+
+        omegac = cav.omega - 0.5j * cav.decay
+
+        nx, ny = self.nx, self.ny
+
+        nel = mol.nstates
+        ncav = cav.ncav
+
+        nstates = self.nstates # polariton states
+
+        v = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+        
+        # build the global DPES
+        if mol.v is None:
+            mol.dpes_global()
+
+        for j in range(nstates):
+            a, n = np.unravel_index(j, (nel, ncav))
+            v[:, :, j, j] = mol.v[:, :, a, a] + n * omegac
+
+
+        # cavity-molecule coupling
+        a = cav.annihilate()
+
+        v += np.tile(g * kron(mol.edip.real, a + dag(a)).toarray(), (nx, ny, 1, 1))
+
+        self.v = v
+
+        return v  
+    
+    def ppes(self, return_transformation=True):
+        """
+        Compute the polaritonic potential energy surfaces by diagonalization
+
+        Parameters
+        ----------
+        return_transformation : TYPE, optional
+            Return transformation matrices. The default is False.
+
+        Returns
+        -------
+        E : array [nx, ny, nstates]
+            eigenvalues
+        
+        T : array [nx, ny, nstates, nstates]
+            transformation matrix from diabatic states to polaritonic states
+
+        """
+        
+        if self.cav.decay is None:
+            raise ValueError('Please set the cavity decay rate.')
+            
+        nx = self.nx
+        ny = self.ny
+        N = self.nstates
+
+        E = np.zeros((self.nx, self.ny, self.nstates))
+
+        if not return_transformation:
+
+            for i in range(self.nx):
+                for j in range(self.ny):
+                    V = self.v[i, j, :, :]
+                    w = np.linalg.eigvals(V)
+                    # E, U = sort(E, U)
+                    E[i, j, :] = w
+            
+            self.va = E
+            return E
+        
+        else:
+
+            T = np.zeros((nx, ny, N, N), dtype=complex)
+
+            for i in range(self.nx):
+                for j in range(self.ny):
+                    V = self.v[i, j, :, :]
+                    w, u = sort(*scipy.linalg.eig(V, right=True))
+
+                    E[i, j, :] = w
+                    T[i, j, :, :] = u
+
+            self._transformation = T
+
+            self.va = E
+
+            return E, T
+    
+    def ldr(self):
+        pass
+        
 
 class DHO2:
     def __init__(self, x, y, nstates=2):

@@ -1,15 +1,3 @@
-'''
-modules for open quantum systems
-
-
-
-@author: Bing Gu
-@email: bingg@uci.edu
-
-Credits:
-    QuTip
-'''
-
 import numpy as np
 from numpy import tensordot
 # from numba import jit, njit

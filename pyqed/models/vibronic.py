@@ -154,7 +154,21 @@ class Vibronic2:
     #     v[0, 0] = 
     #     return v
         
-
+    def buildV(self, vd):
+        
+        nx = self.nx 
+        ny = self.ny 
+        x = self.x
+        y = self.y 
+        
+        
+        for i in range(nx):
+            for j in range(ny):
+                self.v[i, j, :, :] = vd[[x[i], y[j]]]
+        
+        return v
+        
+    
     def set_DPES(self, surfaces, diabatic_couplings, abc=False, eta=None):
         """
         set the diabatic PES and vibronic couplings

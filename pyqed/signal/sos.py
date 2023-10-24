@@ -17,7 +17,7 @@ from matplotlib import cm
 from numpy import conj
 
 from pyqed.phys import lorentzian, dag
-from pyqed.units import au2ev, au2mev
+from pyqed import au2ev, au2mev, SESolver, Pulse
 
 from pyqed.style import subplots
 
@@ -27,7 +27,66 @@ from pyqed.style import subplots
         
 #     def absorption():
 #         pass
+
+class TransientAbsorption:
+    def __init__(self, mol, pump, probe, delays):
+        self.mol = mol 
+        self.pump = pump 
+        self.probe = probe
+        self.delays = delays 
+        
     
+    def run(self,  dt, nt, method='dynamic', t0=None):
+        
+        sigma = 1/au2fs
+        omegac = 3/au2ev
+        
+        if t0 == None:
+            t0 = 5 * pump.duration
+            
+        sol = SESolver(self.mol.H)
+        
+        res0 = sol.run(psi0=mol.ground_state(), dt=dt, nt=nt, e_ops=self.mol.edip,\
+                nout=1, t0=t0, pulse=pump)
+        
+        times = res0.times
+        
+        pol0 = res0.observables[:,0]
+
+        delays = self.delays
+        
+        S = np.zeros((200, len(delays)), dtype=complex)
+            
+        for i, delay in enumerate(delays):
+            
+            probe = Pulse(delay = delay, sigma = sigma, omegac=omegac)
+            
+            res = sol.run(psi0=mol.ground_state(), dt=dt, nt=nt, e_ops=self.mol.edip,\
+                    nout=1, t0=t0, pulse=[pump, probe])
+            
+            pol1 = res.observables[:, 0]
+            
+            S[:, i] = _fft(times, pol1 - pol0, delay)
+
+        
+            s1 = mol.run(pulses=[self.pump, self.probe])
+
+        return S
+            
+
+def _fft(t, x, delay):
+
+    freq = np.linspace(0., 6., 200) / au2ev
+
+    dt = (t[1] - t[0]).real
+
+    spec = np.zeros(len(freq), dtype=np.complex128)
+
+    for i in range(len(freq)):
+        spec[i] = np.sum(x * np.exp(1j * freq[i] * (t-delay) - 1e-5*(t-delay)**2)) * dt
+
+    return freq, spec            
+
 # def electronic_polarizability(w, gidx, eidx, vidx, E, d, use_rwa=True):
 #     """
 #     Compute the vibrational/electronic polarizability using sum-over-states formula
