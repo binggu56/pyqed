@@ -248,7 +248,7 @@ def DPES(x, y, nstates=3):
 
 class Pyrazine(Vibronic2):
     """
-    vibronic coupling model for pyrazine S1/S2 conical intersection
+    vibronic coupling model for pyrazine S0/S1/S2 conical intersection
     """
     def __init__(self, x=None, y=None):
         self.x = x 
@@ -257,8 +257,9 @@ class Pyrazine(Vibronic2):
         self.nx = len(x)
         self.ny = len(y)
         
-        self.nstates = 2
-        self.edip = sigmax()
+        self.nstates = 3
+        self.edip = np.zeros((self.nstates, self.nstates))
+        self.edip[0, 2] = self.edip[2, 0] = 1.
         
         self.mass = [1/(952. * wavenum2au), 1./(597. * wavenum2au)]
         
@@ -315,10 +316,11 @@ class Pyrazine(Vibronic2):
 
         vg = freq_vc * X**2/2. + freq_vt * Y**2/2.
         
-        v[:, :, 0, 0] = v0 
-        v[:, :, 1, 1] = v1 
-        v[:, :, 0, 1] = coup 
-        v[:, :, 1, 0] = coup 
+        v[:, :, 0, 0] = vg 
+        v[:, :, 1, 1] = v0
+        v[:, :, 2, 2] = v1
+        v[:, :, 2, 1] = coup 
+        v[:, :, 1, 2] = coup 
         
         self.v = v
         
