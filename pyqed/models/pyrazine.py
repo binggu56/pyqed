@@ -258,14 +258,16 @@ class Pyrazine(Vibronic2):
         self.ny = len(y)
         
         self.nstates = 2
+        self.edip = sigmax()
+        
         self.mass = [1/(952. * wavenum2au), 1./(597. * wavenum2au)]
+        
+        self.v = None
 
     def apes(self, x):
 
         x = np.atleast_1d(x)
         nx = len(x)
-
-        ns = self.nstates
 
         wlist = []
         ulist = []
@@ -281,6 +283,47 @@ class Pyrazine(Vibronic2):
 
 
         return wlist, ulist
+    
+    def buildV(self):
+        """
+        Build the diabatic PES
+
+        Returns
+        -------
+        None.
+
+        """
+        nx, ny = self.nx, self.ny 
+        nstates = self.nstates
+        
+        x, y = self.x, self.y
+        
+        v = np.zeros((nx, ny, nstates, nstates))
+        
+        X, Y = np.meshgrid(x, y)
+        
+        freq_vc = 952. * wavenum2au
+        freq_vt = 597. * wavenum2au
+
+        Eshift = np.array([31800.0, 39000]) * wavenum2au
+        kappa = np.array([-847.0, 1202.]) * wavenum2au
+
+        v0 = freq_vc * X**2/2. + freq_vt * Y**2/2 + kappa[0] * Y + Eshift[0]
+        v1 = freq_vc * X**2/2 + freq_vt * Y**2/2 + kappa[1] * Y + Eshift[1]
+
+        coup = 2110 * X * wavenum2au
+
+        vg = freq_vc * X**2/2. + freq_vt * Y**2/2.
+        
+        v[:, :, 0, 0] = v0 
+        v[:, :, 1, 1] = v1 
+        v[:, :, 0, 1] = coup 
+        v[:, :, 1, 0] = coup 
+        
+        self.v = v
+        
+        return v
+        
 
 
 

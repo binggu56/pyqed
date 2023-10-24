@@ -1254,7 +1254,7 @@ class VibronicPolariton2:
 
 class VibronicPolaritonNonHermitian(VibronicPolariton2):
     
-    def dpes(self, g, decay, rwa=False):
+    def dpes(self, g, rwa=False):
         """
         Compute the non-Hermitian diabatic potential energy surfaces
         
@@ -1276,7 +1276,10 @@ class VibronicPolaritonNonHermitian(VibronicPolariton2):
         """
         mol = self.mol
         cav = self.cav
-
+        
+        if cav.decay is None:
+            raise ValueError('Please set cavity decay rate.')
+            
         omegac = cav.omega - 0.5j * cav.decay
 
         nx, ny = self.nx, self.ny
@@ -1290,7 +1293,8 @@ class VibronicPolaritonNonHermitian(VibronicPolariton2):
         
         # build the global DPES
         if mol.v is None:
-            mol.dpes_global()
+            # mol.dpes_global()
+            raise ValueError('DPES is None. Build the DPES first.')
 
         for j in range(nstates):
             a, n = np.unravel_index(j, (nel, ncav))
@@ -1332,7 +1336,7 @@ class VibronicPolaritonNonHermitian(VibronicPolariton2):
         ny = self.ny
         N = self.nstates
 
-        E = np.zeros((self.nx, self.ny, self.nstates))
+        E = np.zeros((self.nx, self.ny, self.nstates), dtype=complex)
 
         if not return_transformation:
 
