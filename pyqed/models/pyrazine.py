@@ -206,44 +206,7 @@ def vibronic_hamiltonian(n_el, n_vc, n_vt):
 
     return h_s
 
-def DPES(x, y, nstates=3):
-    """
-    Diabatic PES
 
-    Parameters
-    ----------
-    x : TYPE
-        qc coupling mode coordinate
-    y : TYPE
-        qt tuning mode coordinate
-
-    Returns
-    -------
-    2D array
-        molecular Hamiltonian
-
-    """
-
-    freq_vc = 952. * wavenumber2hartree
-    freq_vt = 597. * wavenumber2hartree
-
-    Eshift = np.array([31800.0, 39000]) * wavenumber2hartree
-    kappa = np.array([-847.0, 1202.]) * wavenumber2hartree
-
-    V0 = freq_vc * x**2/2. + freq_vt * y**2/2 + kappa[0] * y + Eshift[0]
-    V1 = freq_vc * x**2/2 + freq_vt * y**2/2 + kappa[1] * y + Eshift[1]
-
-    coup = 2110 * x * wavenumber2hartree
-
-    Vg = freq_vc * x**2/2. + freq_vt * y**2/2
-
-    hmol = np.zeros((nstates, nstates))
-    hmol[0, 0] = Vg
-    hmol[1, 1] = V0
-    hmol[2, 2] = V1
-    hmol[1,2] = hmol[2,1] = coup
-
-    return hmol
 
 
 class Pyrazine(Vibronic2):
@@ -258,6 +221,9 @@ class Pyrazine(Vibronic2):
         self.ny = len(y)
         
         self.nstates = 3
+        
+        self.idm_el = np.eye(self.nstates)
+        
         self.edip = np.zeros((self.nstates, self.nstates))
         self.edip[0, 2] = self.edip[2, 0] = 1.
         
@@ -301,7 +267,7 @@ class Pyrazine(Vibronic2):
         
         v = np.zeros((nx, ny, nstates, nstates))
         
-        X, Y = np.meshgrid(x, y)
+        X, Y = np.meshgrid(x, y, indexing='ij')
         
         freq_vc = 952. * wavenum2au
         freq_vt = 597. * wavenum2au
@@ -326,7 +292,45 @@ class Pyrazine(Vibronic2):
         
         return v
         
-
+    def dpes(self, x, y):
+        """
+        Diabatic PES
+    
+        Parameters
+        ----------
+        x : TYPE
+            qc coupling mode coordinate
+        y : TYPE
+            qt tuning mode coordinate
+    
+        Returns
+        -------
+        2D array
+            molecular Hamiltonian
+    
+        """
+        nstates = self.nstates
+        
+        freq_vc = 952. * wavenumber2hartree
+        freq_vt = 597. * wavenumber2hartree
+    
+        Eshift = np.array([31800.0, 39000]) * wavenumber2hartree
+        kappa = np.array([-847.0, 1202.]) * wavenumber2hartree
+    
+        V0 = freq_vc * x**2/2. + freq_vt * y**2/2 + kappa[0] * y + Eshift[0]
+        V1 = freq_vc * x**2/2 + freq_vt * y**2/2 + kappa[1] * y + Eshift[1]
+    
+        coup = 2110 * x * wavenumber2hartree
+    
+        Vg = freq_vc * x**2/2. + freq_vt * y**2/2
+    
+        hmol = np.zeros((nstates, nstates))
+        hmol[0, 0] = Vg
+        hmol[1, 1] = V0
+        hmol[2, 2] = V1
+        hmol[1,2] = hmol[2,1] = coup
+    
+        return hmol
 
 
 def get_apes(x, y):

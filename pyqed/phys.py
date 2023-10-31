@@ -74,7 +74,7 @@ def cartesian2polar(x, y):
 def overlap(bra, ket):
     return np.vdot(bra, ket)
 
-def nlargest(a, n, with_index=False):
+def nlargest(a, n=1, with_index=False):
     """
     finds the largest n elements from a Python iterable
 
@@ -695,7 +695,7 @@ def rgwp(x, x0=0., sigma=1.):
     return psi
 
 
-def gwp(x, a=None, x0=0., p0=0.):
+def gwp(x, a=None, x0=0., p0=0., ndim=1):
     '''
     complex Gaussian wavepacket
     
@@ -719,10 +719,10 @@ def gwp(x, a=None, x0=0., p0=0.):
         DESCRIPTION.
 
     '''
-    if isinstance(x, float):
-        ndim = 1
-    else:
-        ndim = len(x)
+    # if isinstance(x, float):
+    #     ndim = 1
+    # else:
+    #     ndim = len(x)
     
     x = np.array(x)
     
@@ -735,12 +735,18 @@ def gwp(x, a=None, x0=0., p0=0.):
             * exp(1j * p0 * (x-x0))
     
     elif ndim == 2:
+        
+        if isinstance(x0, float):
+            x0 = np.array([x0, ] * ndim)
+        if isinstance(p0, float):
+            p0 = np.array([p0, ] * ndim)
+        
         u = np.array(x-x0)
         
-        delta = u @ a @ u 
+        delta = u.dot(a @ u) 
         
         gauss_2d = np.linalg.det(a)**(1/4)/np.pi**(ndim/4) \
-                          * np.exp(-0.5 * delta + 1j * p0 * (x-x0))
+                          * np.exp(-0.5 * delta + 1j * p0.dot(x-x0))
     
         return gauss_2d
 
@@ -757,10 +763,10 @@ def gwp(x, a=None, x0=0., p0=0.):
             
 
         u = x - x0
-        delta = u.T @ a @ u
+        delta = u.dot(a @ u)
         
         g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
-                                                             1j * p0 @ (x-x0))
+                                                             1j * p0.dot(x-x0))
 
         return g
 

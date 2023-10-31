@@ -284,7 +284,8 @@ def ham_ho(freq, n, ZPE=False):
         freq: fundemental frequency in units of Energy
         n : size of matrix
     output:
-        h: hamiltonian of the harmonic oscilator
+        H: 2darray, float or complex
+            hamiltonian of the harmonic oscilator
     """
 
     if ZPE:
@@ -396,7 +397,7 @@ def obs(A, rho):
 
 
 class Cavity():
-    def __init__(self, freq, n_cav=None, x=None, decay=None):
+    def __init__(self, freq, n_cav=None, x=None, decay=None, g=None):
         """
         class for single-mode cavity
 
@@ -433,6 +434,22 @@ class Cavity():
             self.nx = len(x)
         
         self.decay = decay 
+        self.g = g
+    
+    @property
+    def g(self):
+        return self._g 
+    
+    @g.setter
+    def g(self, value):
+        self._g = value 
+        
+    def nonhermH(self):
+        
+        omegac = self.omega - 0.5j * self.decay
+        
+        return ham_ho(omegac, self.ncav) 
+        
 #    @property
 #    def hamiltonian(self):
 #        return self._hamiltonian
@@ -523,6 +540,8 @@ class Cavity():
     def get_nonhermitianH(self):
         '''
         non-Hermitian Hamiltonian for the cavity mode
+        
+        WRONG!
 
         Params:
             kappa: decay constant
@@ -1032,7 +1051,7 @@ class VibronicPolariton2:
     a single-mode optical cavity (electronic strong coupling)
 
     """
-    def __init__(self, mol, cav):
+    def __init__(self, mol, cav, g=None):
         self.mol = mol
         self.cav = cav
         self.x, self.y = mol.x, mol.y
@@ -1042,11 +1061,23 @@ class VibronicPolariton2:
         self.ncav = self.cav.ncav
         self.nstates = self.nel * self.ncav
 
+        self.mass = self.mol.mass
 
         self.v = None
         self.va = None # adiabatic polaritonic PES
         self._transformation = None # diabatic to adiabatic transformation matrix
         self._ground_state = None
+        
+        self.g = g
+    
+    @property
+    def g(self):
+        return self._g
+    
+    @g.setter 
+    def g(self, value):
+        self._g = value 
+    
 
     def ground_state(self, representation='adiabatic'):
         # if rwa:
@@ -1076,7 +1107,7 @@ class VibronicPolariton2:
         return E0, self._ground_state
 
 
-    def dpes(self, g, rwa=False):
+    def dpes_global(self, rwa=False):
         """
         Compute the diabatic potential energy surfaces
 
@@ -1095,6 +1126,10 @@ class VibronicPolariton2:
         """
         mol = self.mol
         cav = self.cav
+        g = self.g 
+        
+        if g is None:
+            raise ValueError('The coupling constant is None. Set it.')
 
         omegac = cav.omega
 
@@ -1120,6 +1155,56 @@ class VibronicPolariton2:
         a = cav.annihilate()
 
         v += np.tile(g * kron(mol.edip.real, a + dag(a)).toarray(), (nx, ny, 1, 1))
+
+        self.v = v
+
+        return v
+    
+    def dpes(self, x, y):
+        """
+        Compute the diabatic potential energy surfaces
+
+        Parameters
+        ----------
+        g : TYPE
+            DESCRIPTION.
+        rwa : TYPE, optional
+            DESCRIPTION. The default is False.
+
+        Returns
+        -------
+        v : TYPE
+            DESCRIPTION.
+
+        """
+        mol = self.mol
+        cav = self.cav
+        g = self.g
+
+        omegac = cav.omega
+
+        nx, ny = self.nx, self.ny
+
+        nel = mol.nstates
+        ncav = cav.ncav
+
+        nstates = self.nstates # polariton states
+
+        v = np.zeros((nx, ny, nstates, nstates))
+        
+        # build the global DPES
+        if mol.v is None:
+            mol.dpes_global()
+
+        # for j in range(nstates):
+        # a, n = np.unravel_index(j, (nel, ncav))
+        v = kron(mol.deps(x, y), cav.idm) + kron(mol.idm, cav.H)
+
+
+        # cavity-molecule coupling
+        a = cav.annihilate()
+
+        v += g * kron(mol.edip.real, a + dag(a)).toarray()
 
         self.v = v
 
@@ -1252,124 +1337,148 @@ class VibronicPolariton2:
 
 
 
-class VibronicPolaritonNonHermitian(VibronicPolariton2):
+# class VibronicPolaritonNonHermitian(VibronicPolariton2):
     
-    def dpes(self, g, rwa=False):
-        """
-        Compute the non-Hermitian diabatic potential energy surfaces
+#     def dpes(self, g, rwa=False):
+#         """
+#         Compute the non-Hermitian diabatic potential energy surfaces
         
-        .. math::
-            H = (\omega_\text{c} - \frac{\kappa}{2} ) a^\dag a
+#         .. math::
+#             H = (\omega_\text{c} - \frac{\kappa}{2} ) a^\dag a
 
-        Parameters
-        ----------
-        g : TYPE
-            DESCRIPTION.
-        rwa : TYPE, optional
-            DESCRIPTION. The default is False.
+#         Parameters
+#         ----------
+#         g : TYPE
+#             DESCRIPTION.
+#         rwa : TYPE, optional
+#             DESCRIPTION. The default is False.
 
-        Returns
-        -------
-        v : TYPE
-            DESCRIPTION.
+#         Returns
+#         -------
+#         v : TYPE
+#             DESCRIPTION.
 
-        """
-        mol = self.mol
-        cav = self.cav
+#         """
+#         mol = self.mol
+#         cav = self.cav
         
-        if cav.decay is None:
-            raise ValueError('Please set cavity decay rate.')
+#         if cav.decay is None:
+#             raise ValueError('Please set cavity decay rate.')
             
-        omegac = cav.omega - 0.5j * cav.decay
+#         omegac = cav.omega - 0.5j * cav.decay
 
-        nx, ny = self.nx, self.ny
+#         nx, ny = self.nx, self.ny
 
-        nel = mol.nstates
-        ncav = cav.ncav
+#         nel = mol.nstates
+#         ncav = cav.ncav
 
-        nstates = self.nstates # polariton states
+#         nstates = self.nstates # polariton states
 
-        v = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+#         v = np.zeros((nx, ny, nstates, nstates), dtype=complex)
         
-        # build the global DPES
-        if mol.v is None:
-            # mol.dpes_global()
-            raise ValueError('DPES is None. Build the DPES first.')
+#         # build the global DPES
+#         if mol.v is None:
+#             # mol.dpes_global()
+#             raise ValueError('DPES is None. Build the DPES first.')
 
-        for j in range(nstates):
-            a, n = np.unravel_index(j, (nel, ncav))
-            v[:, :, j, j] = mol.v[:, :, a, a] + n * omegac
+#         for j in range(nstates):
+#             a, n = np.unravel_index(j, (nel, ncav))
+#             v[:, :, j, j] = mol.v[:, :, a, a] + n * omegac
 
 
-        # cavity-molecule coupling
-        a = cav.annihilate()
+#         # cavity-molecule coupling
+#         a = cav.annihilate()
 
-        v += np.tile(g * kron(mol.edip.real, a + dag(a)).toarray(), (nx, ny, 1, 1))
+#         v += np.tile(g * kron(mol.edip.real, a + dag(a)).toarray(), (nx, ny, 1, 1))
 
-        self.v = v
+#         self.v = v
 
-        return v  
+#         return v  
     
-    def ppes(self, return_transformation=True):
-        """
-        Compute the polaritonic potential energy surfaces by diagonalization
+#     def ppes(self, return_transformation=True):
+#         """
+#         Compute the polaritonic potential energy surfaces by diagonalization
 
-        Parameters
-        ----------
-        return_transformation : TYPE, optional
-            Return transformation matrices. The default is False.
+#         Parameters
+#         ----------
+#         return_transformation : TYPE, optional
+#             Return transformation matrices. The default is False.
 
-        Returns
-        -------
-        E : array [nx, ny, nstates]
-            eigenvalues
+#         Returns
+#         -------
+#         E : array [nx, ny, nstates]
+#             eigenvalues
         
-        T : array [nx, ny, nstates, nstates]
-            transformation matrix from diabatic states to polaritonic states
+#         T : array [nx, ny, nstates, nstates]
+#             transformation matrix from diabatic states to polaritonic states
 
-        """
+#         """
         
-        if self.cav.decay is None:
-            raise ValueError('Please set the cavity decay rate.')
+#         if self.cav.decay is None:
+#             raise ValueError('Please set the cavity decay rate.')
             
-        nx = self.nx
-        ny = self.ny
-        N = self.nstates
+#         nx = self.nx
+#         ny = self.ny
+#         N = self.nstates
 
-        E = np.zeros((self.nx, self.ny, self.nstates), dtype=complex)
+#         E = np.zeros((self.nx, self.ny, self.nstates), dtype=complex)
 
-        if not return_transformation:
+#         if not return_transformation:
 
-            for i in range(self.nx):
-                for j in range(self.ny):
-                    V = self.v[i, j, :, :]
-                    w = np.linalg.eigvals(V)
-                    # E, U = sort(E, U)
-                    E[i, j, :] = w
+#             for i in range(self.nx):
+#                 for j in range(self.ny):
+#                     V = self.v[i, j, :, :]
+#                     w = np.linalg.eigvals(V)
+#                     # E, U = sort(E, U)
+#                     E[i, j, :] = w
             
-            self.va = E
-            return E
+#             self.va = E
+#             return E
         
-        else:
+#         else:
 
-            T = np.zeros((nx, ny, N, N), dtype=complex)
+#             T = np.zeros((nx, ny, N, N), dtype=complex)
 
-            for i in range(self.nx):
-                for j in range(self.ny):
-                    V = self.v[i, j, :, :]
-                    w, u = sort(*scipy.linalg.eig(V, right=True))
+#             for i in range(self.nx):
+#                 for j in range(self.ny):
+#                     V = self.v[i, j, :, :]
+#                     w, u = sort(*scipy.linalg.eig(V, right=True))
 
-                    E[i, j, :] = w
-                    T[i, j, :, :] = u
+#                     E[i, j, :] = w
+#                     T[i, j, :, :] = u
 
-            self._transformation = T
+#             self._transformation = T
 
-            self.va = E
+#             self.va = E
 
-            return E, T
+#             return E, T
     
-    def ldr(self):
-        pass
+#     def cut(self, x=None, d=0):
+        
+#         if x is None:
+#             x = self.x 
+        
+#         ny = self.ny
+        
+#         from pyqed import nlargest
+        
+#         # find the index closest to 0
+#         ix = nlargest(-np.abs(self.x), with_index=True)[0][1]
+              
+#         E = np.zeros((ny, self.nstates), dtype=complex)
+        
+#         for i in range(self.ny):
+#             V = self.v[ix, i, :, :]
+#             w, u = sort(*scipy.linalg.eig(V))
+#             # E, U = sort(E, U)
+#             E[i, :] = w
+
+#         self.va = E
+#         return E
+    
+        
+#     def ldr(self):
+#         pass
         
 
 class DHO2:

@@ -13,8 +13,8 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-# import proplot as plt
-import matplotlib.pyplot as plt
+import proplot as plt
+# import matplotlib.pyplot as plt
 
 from numpy import cos, pi
 # from numba import jit
@@ -22,7 +22,7 @@ import scipy
 from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 from numpy.linalg import inv, det
 
-from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2
+from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2, dag
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
@@ -73,18 +73,21 @@ class ResultSPO2(Result):
             return ax0
 
         else:
+            
+            nstates = self.psi0.shape[-1]
 
             for i, psi in enumerate(psilist):
 
-                fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
-
-                ax0.contour(X, Y, np.abs(psi[:,:, 1])**2)
-                ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
-                ax0.format(**kwargs)
-                ax1.format(**kwargs)
+                fig, axes = plt.subplots(nrows=nstates, sharey=True)
+                for n in range(nstates):
+                    axes[n].contour(X, Y, np.abs(psi[:,:, n])**2)
+                    
+                # ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
+                    axes[n].format(**kwargs)
+                # ax1.format(**kwargs)
                 fig.savefig('psi'+str(i)+'.pdf')
 
-            return ax0, ax1
+            return axes
         
     def get_population(self):
         dx = interval(self.x)
@@ -490,24 +493,43 @@ class SPO2:
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
         # self.apes = np.zeros((nx, ny))
-        if self.abc:
-            eig = scipy.linalg.eig
-        else:
-            eig = scipy.linalg.eigh
-
-        for i in range(nx):
-            for j in range(ny):
-
-                i
-                w, u = eig(v[i, j, :, :])
-
-                #print(np.dot(U.conj().T, Vmat.dot(U)))
-
-                V = np.diagflat(np.exp(- 1j * w * dt))
-                V2 = np.diagflat(np.exp(- 1j * w * dt2))
-
-                self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
-                self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+        
+        # if self.abc:
+        #     eig = scipy.linalg.eig
+        # else:
+        #     eig = scipy.linalg.eigh
+        
+        if np.iscomplexobj(v):
+            
+            # complex potential
+            for i in range(nx):
+                for j in range(ny):
+                    
+                    _v = v[i, j]
+                    
+                    w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+    
+    
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, :,:] = ur @ V @ dag(ul)
+                    self.exp_V_half[i, j, :,:] = ur @ V2 @ dag(ul)
+                    
+        else: 
+            
+            for i in range(nx):
+                for j in range(ny):
+    
+                    w, u = scipy.linalg.eigh(v[i, j, :, :])
+    
+                    #print(np.dot(U.conj().T, Vmat.dot(U)))
+    
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
 
 
         return

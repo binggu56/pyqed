@@ -305,7 +305,7 @@ class Vibronic2:
 
 class LVC2:
     """
-    2D linear vibronic coupling model
+    2D linear vibronic coupling model with one tuning mode (x) and one coupling mode (y)
     """
     def __init__(self, x=None, y=None, h=1, l=1, delta=0, mass=[1, 1], nstates=2):
         # super().__init__(x, y, mass, nstates=nstates)
@@ -358,32 +358,26 @@ class LVC2:
         self.v = v
         return
 
-    def dpes(self, x):
+    def dpes(self, x, y):
 
-        X, Y = x
+        # X, Y = x
         h, l = self.h, self.l
         delta = self.delta
 
         v = np.zeros((self.nstates, self.nstates))
 
-        # v[0, 0] = (X)**2/2. + (Y)**2/2. + h * X + delta
-        # v[1, 1] = (X)**2/2. + (Y)**2/2. - h * X - delta
-        v[0, 0] =  + h * X + delta
-        v[1, 1] =  - h * X - delta
-
-        v[0, 1] =   l * Y
+        v[0, 0] = (x)**2/2. + (y)**2/2. + h * x + delta
+        v[1, 1] = (x)**2/2. + (y)**2/2. - h * x - delta
+        v[0, 1] =   l * y
         v[1, 0] = v[0, 1]
 
-        # self.v = v
         return v
 
-    def apes(self, x):
+    def apes(self, x, y):
 
-
-        v = self.dpes(x)
-
-        # self.v = v
+        v = self.dpes(x, y)
         w, u = eigh(v)
+        
         return w, u
 
     def wilson_loop(self, n=0, r=1):
@@ -962,7 +956,8 @@ class CI:
         # v[0, 0] =  + h * X + delta
         # v[1, 1] =  - h * X - delta
 
-        v[0, 1] =   l * Y - 0.5j
+        v[0, 1] =   l * Y
+        
         v[1, 0] = v[0, 1].conj()
 
         self.v = v
@@ -1041,32 +1036,53 @@ class CI:
         return F
 
 
-    def berry_phase(self, n=0, r=1):
+    def berry_phase(self, state_id=0, loc=np.array([0, 0]), r=1):
+        """
+        Compute the Berry phase along a circle centered at loc with radius r
+
+        Parameters
+        ----------
+        state_id : int, optional
+            DESCRIPTION. The default is 0.
+        loc : TYPE, optional
+            DESCRIPTION. The default is (0, 0).
+        r : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        z : TYPE
+            DESCRIPTION.
+
+        """
 
 
         phase = 0
         z  = 1
 
+        # initial point set to real x axis (r, 0)        
         w, u = self.apes([r, 0])
-        u0 = u[:, n]
+        
+        u0 = u[:, state_id]
 
         uold = u0
-        loop = np.linspace(0, 2 * np.pi)
+        loop = np.linspace(0, 2 * np.pi, endpoint=False)
+        
         for i in range(1, len(loop)):
 
             theta = loop[i]
-            x, y = polar2cartesian(r, theta)
+            x, y = loc + polar2cartesian(r, theta)
 
             w, u = self.apes([x, y])
-            unew = u[:,n]
+            unew = u[:, state_id]
             z *= overlap(uold, unew)
 
             uold = unew
 
         z *= overlap(unew, u0)
 
-        return z
-        # return -np.angle(z)
+    
+        return -np.angle(z)
 
     def apes_global(self):
 
@@ -1120,21 +1136,27 @@ if __name__ == '__main__':
         # ax.plot(deltas, loop_integral)
     
         mol = CI(x, y, delta=0.)
+        for j in range(2):
+            print(mol.berry_phase(j))
+            print(mol.wilson_loop(j))
         F = mol.berry_curvature()
         fig, ax = plt.subplots()
         ax.matshow(F.imag)
     
-    from pyqed import gwp
-    x = np.linspace(-2, 2)
-    nx = len(x)
-    mol = VibronicAdiabatic(x, nstates=2)
+    def test_VibronicAdiabatic():
+        from pyqed import gwp
+        x = np.linspace(-2, 2)
+        nx = len(x)
+        mol = VibronicAdiabatic(x, nstates=2)
+        
+        v = np.zeros((nx, 2, 2))
+        v[:, 0, 0] = x**2/2
+        v[:, 1, 1] = x**2/2
+        
+        mol.v = v 
+        
+        psi0 = np.zeros((nx, 2), dtype=complex) 
+        psi0[:, 0] = gwp(x, a=1)
+        mol.run(psi0, dt=0.2, nt=1)
     
-    v = np.zeros((nx, 2, 2))
-    v[:, 0, 0] = x**2/2
-    v[:, 1, 1] = x**2/2
-    
-    mol.v = v 
-    
-    psi0 = np.zeros((nx, 2), dtype=complex) 
-    psi0[:, 0] = gwp(x, a=1)
-    mol.run(psi0, dt=0.2, nt=1)
+    test_CI()

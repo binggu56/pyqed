@@ -17,7 +17,9 @@ from matplotlib import cm
 from numpy import conj
 
 from pyqed.phys import lorentzian, dag
-from pyqed import au2ev, au2mev, SESolver, Pulse
+from pyqed.units import au2ev, au2mev
+# from ..mol import SESolver 
+from pyqed.optics import Pulse
 
 from pyqed.style import subplots
 
@@ -1472,14 +1474,14 @@ def test_model():
 if __name__ == '__main__':
 
     from pyqed.units import au2fs
-    from lime.style import subplots
+    # from lime.style import subplots
 
     fig, ax = plt.subplots(figsize=(4.2, 3.2))
     E = np.array([0., 0.5, 1.1, 1.3])/au2ev
     gamma = [0, 0.002, 0.002, 0.002]
     H = np.diag(E)
 
-    from lime.mol import Mol
+    from pyqed.mol import Mol
     from lime.optics import Biphoton
 
     from matplotlib import cm

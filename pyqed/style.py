@@ -339,8 +339,8 @@ def two_scales(x, yl, yr, xlabel=None, ylabels=None, xlim=None, yllim=None, yrli
     fig.savefig(fname)
     return
 
-def surf(f, x, y, fname='output.png', xlabel='X', \
-         ylabel='Y', zlabel='Z', title=None, method='matplotlib'):
+def surf(x, y, f, fname='output.png', xlabel='X', \
+         ylabel='Y', zlabel='Z', cmap=None, title=None, method='matplotlib'):
 
     if method == 'matplotlib':
         
@@ -469,7 +469,7 @@ def plot_surfaces(x, y, surfaces):
     #data = [go.Surface(z=apes)]
     #fig = go.Figure(data = data)
     import matplotlib.pyplot as plt
-    from lime.units import au2ev
+    from pyqed.units import au2ev
 
     fig = plt.figure(figsize=(5,4))
 
