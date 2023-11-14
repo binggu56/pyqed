@@ -214,60 +214,108 @@ def spectrogram(x, d=1):
 def wigner(x, d=1):
     """
     Wigner transform of an input signal with FFT.
-    W(t, w) = int dtau x(t + tau/2) x^*(t - tau/2) e^{i w tau}
+    
+    For a state vector 
+    
+    .. math::
+        
+        W(t, w) = \int d\tau x(t + \tau/2) x^*(t - \tau/2) e^{i w \tau}
+        
+    For density matrices 
+    
+    .. matH::
+        
+        W(t, w) = \int d\tau \rho(t + tau/2, t - tau/2) e^{i w \tau}
+        
 
     Parameters
     ----------
     x : TYPE
-        DESCRIPTION.
+        a state vector/density matrix.
 
     Returns
     -------
     TYPE
         DESCRIPTION.
-    TYPE
-        DESCRIPTION.
-    TYPE
-        DESCRIPTION.
+    freqs
+        ranges of the frequency/momentum space
 
     """
 
-    N = len(x)
-    tausec = N//2
+    if x.ndim ==1: # input is a state vector
+    
+        N = len(x)
+        tausec = N//2
+    
+        # taus = np.linspace(-N//2*dt)
+        winlength = tausec - 1
+    
+        taulens = np.min(np.c_[np.arange(N),
+                                N - np.arange(N) - 1,
+                          winlength * np.ones(N)], axis=1)
+    
+        taus = np.arange(-tausec, tausec) * d
+    
+        # complex conjugate
+        xc = np.conj(x)
+    
+        # the wigner function, axis 0 is the new axis
+        w = zeros((N, N), dtype=complex)
+    
+        for j in range(N):
+    
+            taumax = taulens[j]
+    
+            tau = np.arange(-taumax, taumax + 1).astype(int)
+    
+            indices = (tau + tausec).astype(int)
+    
+            # if j == 2: sys.exit()
+    
+            w[indices, j] = x[j + tau] * xc[j - tau]
+    
+    
+            # if (icol <= N - tausec) and (icol >= tausec + 1):
+            #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
+            #         np.conj(signal[icol - tausec, 0]) + \
+            #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
+            freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
 
-    # taus = np.linspace(-N//2*dt)
-    winlength = tausec - 1
 
-    taulens = np.min(np.c_[np.arange(N),
-                            N - np.arange(N) - 1,
-                      winlength * np.ones(N)], axis=1)
+    elif x.ndim == 2: # input is a density matrix
+        
+        N, M = x.shape
+        assert(N == M) # check if density matrix is square
+        
+        tausec = N//2
 
-    taus = np.arange(-tausec, tausec) * d
+        # taus = np.linspace(-N//2*dt)
+        winlength = tausec - 1
 
-    # complex conjugate
-    xc = np.conj(x)
+        taulens = np.min(np.c_[np.arange(N),
+                                N - np.arange(N) - 1,
+                          winlength * np.ones(N)], axis=1)
 
-    # the wigner function, axis 0 is the new axis
-    w = zeros((N, N), dtype=complex)
+        taus = np.arange(-tausec, tausec) * d
 
-    for j in range(N):
+        # complex conjugate
+        xc = np.conj(x)
 
-        taumax = taulens[j]
+        # the wigner function, axis 0 is the new axis
+        w = zeros((N, N), dtype=complex)
 
-        tau = np.arange(-taumax, taumax + 1).astype(int)
+        for j in range(N):
 
-        indices = (tau + tausec).astype(int)
+            taumax = taulens[j]
 
-        # if j == 2: sys.exit()
+            tau = np.arange(-taumax, taumax + 1).astype(int)
 
-        w[indices, j] = x[j + tau] * xc[j - tau]
+            indices = (tau + tausec).astype(int)
 
+            w[indices, j] = x[j + tau, j - tau]
 
-        # if (icol <= N - tausec) and (icol >= tausec + 1):
-        #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
-        #         np.conj(signal[icol - tausec, 0]) + \
-        #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-        freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
+            freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
+
 
     # fig, ax = plt.subplots()
     # ax.matshow(w.real)

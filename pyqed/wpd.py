@@ -13,8 +13,11 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-import proplot as plt
-# import matplotlib.pyplot as plt
+
+try:    
+    import proplot as plt
+except:
+    import matplotlib.pyplot as plt
 
 from numpy import cos, pi
 # from numba import jit
@@ -95,9 +98,10 @@ class ResultSPO2(Result):
         p0 = [norm2(psi[:, :, 0]) * dx * dy for psi in self.psilist]
         p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
         
-        # fig, ax = plt.subplots()
-        # ax.plot(self.times, p0)
-        # ax.plot(self.times, p1)
+        fig, ax = plt.subplots()
+        ax.plot(self.times, p0)
+        ax.plot(self.times, p1)
+        
         self.population = [p0, p1]
         return p0, p1
     
@@ -111,9 +115,10 @@ class ResultSPO2(Result):
         xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
         yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
 
-        # fig, ax = plt.subplots()
-        # ax.plot(self.times, xAve)
-        # ax.plot(self.times, yAve)
+        fig, ax = plt.subplots()
+        ax.plot(self.times, xAve)
+        ax.plot(self.times, yAve)
+        
         self.xAve = [xAve, yAve]
         return xAve, yAve
         
@@ -326,7 +331,7 @@ class SPO2:
     For time-dependent H,
         TBI
     """
-    def __init__(self, x, y, mass, nstates=2, coords='linear', G=None, abc=False):
+    def __init__(self, x, y, mass=None, nstates=2, coords='linear', G=None, abc=False):
         self.x = x
         self.y = y
         self.X, self.Y = meshgrid(x, y)
@@ -335,6 +340,8 @@ class SPO2:
         self.ny = len(y)
         self.dx = interval(x)
         self.dy = interval(y) # for uniform grids
+        if mass is None:
+            mass  = [1, 1]
         self.mass = self.masses = mass
         self.kx = None
         self.ky = None
@@ -347,6 +354,9 @@ class SPO2:
         self.nstates = self.ns = nstates
         self.coords =  coords
         self.abc = abc
+        
+        self.d2a = None # diabatic to adiabatic transformation
+        self.a2d = None # adiabatic to diabatic transformation
 
     def set_grid(self, x, y):
         self.x = x
@@ -446,6 +456,7 @@ class SPO2:
         # setup kinetic energy operator
         nx = self.nx
         ny = self.ny
+        nstates = self.nstates
 
         dx = interval(self.x)
         dy = interval(self.y)
@@ -518,6 +529,8 @@ class SPO2:
                     
         else: 
             
+            self.d2a = np.zeros((nx, ny, nstates, nstates))
+            
             for i in range(nx):
                 for j in range(ny):
     
@@ -530,11 +543,12 @@ class SPO2:
     
                     self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
                     self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
-
+                    
+                    self.d2a[i, j] = u
 
         return
 
-    def population(self, psi):
+    def population(self, psi, representation='diabatic'):
         """
         return the electronic populations
 
@@ -545,24 +559,54 @@ class SPO2:
 
         Returns
         -------
-        None.
+        2darray, nt, nstates
 
         """
-        if isinstance(psi, np.ndarray):
-            P = np.zeros(self.ns)
-            for j in range(self.ns):
-                P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
-
-            assert(np.close(np.sum(P), 1))
-
-        elif isinstance(psi, list):
-
-            N = len(psi)
-            P = np.zeros((N, self.nstates))
-            for k in range(N):
-                P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
-                           for j in range(self.nstates)]
-
+        if representation == 'diabatic':
+            
+            if isinstance(psi, np.ndarray):
+                P = np.zeros(self.ns)
+                for j in range(self.ns):
+                    P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+    
+                assert(np.close(np.sum(P), 1))
+    
+            elif isinstance(psi, list):
+    
+                N = len(psi)
+                P = np.zeros((N, self.nstates))
+                for k in range(N):
+                    P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                               for j in range(self.nstates)]
+        
+        elif representation == 'adiabatic':
+            
+            if isinstance(psi, np.ndarray):
+                
+                psi = np.einsum('ijab, ijb -> ija', self.d2a, psi)
+                
+                P = np.zeros(self.ns)
+                for j in range(self.ns):
+                    P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+    
+                assert(np.close(np.sum(P), 1))
+    
+            elif isinstance(psi, list):
+                
+                psi = [np.einsum('ijab, ijb -> ija', self.d2a, phi) \
+                       for phi in psi]
+    
+                N = len(psi)
+                P = np.zeros((N, self.nstates))
+                for k in range(N):
+                    P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                               for j in range(self.nstates)]
+            
+        
+        else:
+            raise ValueError('Representation = {}, which can only be \
+                             diabatic or adiabatic'.format(representation))
+    
 
         return P
 
@@ -1787,12 +1831,14 @@ if __name__ == '__main__':
     #     rho[:, :, i] = sol.rdm_el(r.psilist[i])
     
     sol.rdm_el(r.psilist)
+    P = sol.population(r.psilist, representation='adiabatic')
+
     
     # p0, p1 = r.get_population()
-    # fig, ax = plt.subplots()
-    # ax.plot(r.times, p0)
-    # ax.plot(r.times, p1, label=r'P$_1$')
-    # ax.legend()
+    fig, ax = plt.subplots()
+    ax.plot(r.times, P[:, 0])
+    ax.plot(r.times, P[:, 1], label=r'P$_1$')
+    ax.legend()
 
     # r.position()
     

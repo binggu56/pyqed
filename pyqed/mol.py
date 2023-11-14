@@ -1640,7 +1640,8 @@ def _quantum_dynamics(H, psi0, dt=0.001, Nt=1, e_ops=[], t0=0.0,
         result = Result(dt=dt, Nt=Nt, psi0=psi0, t0=t0, nout=nout)
 
         observables = np.zeros((Nt // nout, len(e_ops)), dtype=complex)
-        # psilist = [psi0.copy()]
+        
+        result.psilist = [psi0.copy()]
 
         # compute observables for t0
 
