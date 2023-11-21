@@ -554,6 +554,7 @@ if __name__=="__main__":
     ntot = nx * ny
     grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
             
+    
     psi0 = np.zeros((nx, ny, 2),dtype=complex)
     for i in range(nx):
         for j in range(ny):

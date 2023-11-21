@@ -7,9 +7,14 @@ the Liouville space.
 '''
 
 import numpy as np
-# import proplot as plt
-import matplotlib.pyplot as plt
-# from numba import jit
+try:
+    import proplot as plt
+except:
+    import matplotlib.pyplot as plt
+    
+# try:
+#     from numba import jit
+
 import sys
 from numpy import heaviside
 from matplotlib import cm

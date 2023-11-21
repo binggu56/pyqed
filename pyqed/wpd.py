@@ -25,7 +25,7 @@ import scipy
 from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 from numpy.linalg import inv, det
 
-from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2, dag
+from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2, dag, sort
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
@@ -92,20 +92,25 @@ class ResultSPO2(Result):
 
             return axes
         
-    def get_population(self):
+    def get_population(self, fname=None, plot=False):
         dx = interval(self.x)
         dy = interval(self.y)
         p0 = [norm2(psi[:, :, 0]) * dx * dy for psi in self.psilist]
         p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
         
-        fig, ax = plt.subplots()
-        ax.plot(self.times, p0)
-        ax.plot(self.times, p1)
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(self.times, p0)
+            ax.plot(self.times, p1)
         
         self.population = [p0, p1]
+        if fname is not None:
+            # fname = 'population'
+            np.savez(fname, p0, p1)
+            
         return p0, p1
     
-    def position(self):        
+    def position(self, plot=False):        
         # X, Y = np.meshgrid(self.x, self.y)
         x = self.x 
         y = self.y
@@ -115,15 +120,34 @@ class ResultSPO2(Result):
         xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
         yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
 
-        fig, ax = plt.subplots()
-        ax.plot(self.times, xAve)
-        ax.plot(self.times, yAve)
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(self.times, xAve)
+            ax.plot(self.times, yAve)
         
         self.xAve = [xAve, yAve]
+        np.savez('xAve', xAve, yAve)
+        
         return xAve, yAve
         
         
+    def dump(self, fname):
+        """
+        save results to disk
 
+        Parameters
+        ----------
+        fname : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        import pickle
+        with open(fname, 'wb') as f:
+            pickle.dump(self, f)
             
             
 class Solver():
@@ -345,6 +369,8 @@ class SPO2:
         self.mass = self.masses = mass
         self.kx = None
         self.ky = None
+        
+        self.apes = None
         self.dim = 2
         self.exp_V = None
         self.exp_V_half = None
@@ -510,6 +536,7 @@ class SPO2:
         # else:
         #     eig = scipy.linalg.eigh
         
+        
         if np.iscomplexobj(v):
             
             # complex potential
@@ -530,14 +557,16 @@ class SPO2:
         else: 
             
             self.d2a = np.zeros((nx, ny, nstates, nstates))
+            self.apes = np.zeros((nx, ny, nstates))
             
             for i in range(nx):
                 for j in range(ny):
     
-                    w, u = scipy.linalg.eigh(v[i, j, :, :])
+                    w, u = sort(*scipy.linalg.eigh(v[i, j, :, :]))
     
                     #print(np.dot(U.conj().T, Vmat.dot(U)))
-    
+                    self.apes[i, j] = w 
+                    
                     V = np.diagflat(np.exp(- 1j * w * dt))
                     V2 = np.diagflat(np.exp(- 1j * w * dt2))
     
@@ -626,6 +655,7 @@ class SPO2:
         r = ResultSPO2(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
         r.x = self.x
         r.y = self.y
+        r.psilist = [psi0]
 
         t = t0
         if self.coords == 'linear':
@@ -813,7 +843,7 @@ class SPO2:
             return
 
         else:
-            from lime.style import plot_surface
+            from pyqed.style import plot_surface
             plot_surface(self.x, self.y, self.V[:,:,0,0])
 
             return
@@ -1825,7 +1855,7 @@ if __name__ == '__main__':
     rho = np.zeros((nstates, nstates, len(r.times)))
 
     # sol.current_density(r.psilist[-1])
-    r.plot_wavepacket(r.psilist[-1])
+    # r.plot_wavepacket(r.psilist[-1])
 
     # for i in range(len(r.times)):
     #     rho[:, :, i] = sol.rdm_el(r.psilist[i])

@@ -309,6 +309,7 @@ class SincDVRPeriodic(SincDVR):
             x_m = np.asarray(x)[:, np.newaxis]
         x_n = self.x[np.newaxis, :]
         f = np.sinc((x_m-x_n)/self.a)/np.sinc((x_m-x_n)/self.L)/np.sqrt(self.a)
+        
         if (0 == self.npts % 2):
             f *= np.exp(-1j*np.pi*(x_m-x_n)/self.L)
         return f

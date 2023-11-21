@@ -351,9 +351,14 @@ def surf(x, y, f, fname='output.png', xlabel='X', \
         # ax.set_ylim(ymin=-6, ymax=6)
         # ymax = 6
         # f[Y>ymax] = np.nan
-
-        ax.plot_surface(X, Y, f, rstride=1, cstride=1, linewidth=0,
+        if isinstance(f, list):
+            for g in f:
+                ax.plot_surface(X, Y, g, rstride=1, cstride=1, linewidth=0,
                         cmap='viridis', edgecolor='none')
+        else:
+            ax.plot_surface(X, Y, f, rstride=1, cstride=1, linewidth=0,
+                        cmap='viridis', edgecolor='none')
+            
 
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -377,9 +382,9 @@ def surf(x, y, f, fname='output.png', xlabel='X', \
 
         if isinstance(f, list):
             for g in f:
-                s = mlab.surf(g)
+                s = mlab.surf(g, warp_scale='auto')
         else:
-            s = mlab.surf(f)
+            s = mlab.surf(f, warp_scale='auto')
 
         mlab.axes(s, xlabel = xlabel, ylabel = ylabel, zlabel = zlabel)
 

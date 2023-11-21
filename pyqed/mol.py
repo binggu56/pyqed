@@ -111,7 +111,7 @@ class Result:
         self.rho0 = rho0
         self.psi0 = psi0
         self.nout = nout
-        self.times = t0 + np.arange(Nt//nout) * dt * nout
+        self.times = t0 + np.arange(Nt//nout + 1) * dt * nout
         return
 
     # @property
