@@ -18,7 +18,8 @@ from numpy import abs, arange, shape, array, ceil, zeros, conj, ix_,\
 import numpy as np
 from scipy.signal import hilbert
 from scipy import interpolate
-from scipy.fft import fft, fftfreq, fftshift, ifft
+# from scipy.fft import fft, fftfreq, fftshift, ifft
+from pyqed.fft import fft, ifft
 from math import log, ceil, floor
 import sys
 
@@ -170,7 +171,8 @@ def spectrogram(x, d=1):
         sample frequencies.
 
     """
-
+    from pyqed.fft import ifft
+    
     N = len(x)
     tausec = N//2
 
@@ -206,7 +208,7 @@ def spectrogram(x, d=1):
         #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
         #         np.conj(signal[icol - tausec, 0]) + \
         #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-        w[:, j], freqs = pyqed.fft.ifft(w[:, j], taus)
+        w[:, j], freqs = ifft(w[:, j], taus)
 
     return w, freqs/2
 
@@ -241,6 +243,8 @@ def wigner(x, d=1):
         ranges of the frequency/momentum space
 
     """
+    
+
 
     if x.ndim ==1: # input is a state vector
     
@@ -270,7 +274,6 @@ def wigner(x, d=1):
     
             indices = (tau + tausec).astype(int)
     
-            # if j == 2: sys.exit()
     
             w[indices, j] = x[j + tau] * xc[j - tau]
     
@@ -279,7 +282,7 @@ def wigner(x, d=1):
             #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
             #         np.conj(signal[icol - tausec, 0]) + \
             #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-            freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
+            w[:, j], freqs = ifft(w[:, j], taus)
 
 
     elif x.ndim == 2: # input is a density matrix
@@ -314,7 +317,7 @@ def wigner(x, d=1):
 
             w[indices, j] = x[j + tau, j - tau]
 
-            freqs, w[:, j] = pyqed.fft.fft(w[:, j], taus)
+            freqs, w[:, j] = fft(w[:, j], taus)
 
 
     # fig, ax = plt.subplots()
@@ -343,16 +346,18 @@ if __name__=='__main__':
     dt = interval(t)
 
     # w = wvd(efield.real, N=None, trace=0, make_analytic=False)[0]
-    # w = wigner(efield)
-    wvd, freqs = spectrogram(efield, dt)
+    w, freqs = wigner(efield, dt)
+    # w, freqs = spectrogram(efield, dt)
 
     # import matplotlib.pyplot as plt
     # fig, ax = plt.subplots()
     # ax.imshow(wvd)
+    # print(w)
 
     from pyqed.style import imshow
-
-    imshow(freqs, t, wvd.T.real, xlabel=r'$\omega$', ylabel='$t$')
+    fig, ax = plt.subplots()
+    ax.imshow(w.real)
+    # imshow(freqs, t, np.real(w.T), xlabel=r'$\omega$', ylabel='$t$')
 
     # from pyqed.style import surf
     # ax = surf(wvd, t, freqs)

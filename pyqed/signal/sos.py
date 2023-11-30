@@ -175,7 +175,9 @@ def absorption(mol, omegas, linewidth=None, plt_signal=True, fname=None, normali
     '''
     SOS for linear absorption signal
     ..math::
+        
         S(\omega) = 2 \pi \sum_f |\mu_{fg}|^2 \delta(\omega - \omega_{fg}).
+    
     The delta function is replaced with a Lorentzian function.
 
     Parameters
@@ -205,7 +207,7 @@ def absorption(mol, omegas, linewidth=None, plt_signal=True, fname=None, normali
     # set linewidth, this can be generalized to frequency-dependent linewidth
     if linewidth is None:
         print('Linewidth not specified, using 20 meV.')
-        gamma = [20/au2mev, ] * mol.nstates
+        gamma = [50/au2mev, ] * mol.nstates
     else:
         gamma = [linewidth, ] * mol.nstates
 

@@ -331,7 +331,7 @@ class SineDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, npts, xmin=-1., xmax=1.):
+    def __init__(self, xmin, xmax, npts):
         self.npts = npts
         self.L = float(xmax) - float(xmin)
         self.a = self.L / float(npts + 1.)
@@ -349,11 +349,14 @@ class SineDVR(DVR):
         _i = self.n[:, np.newaxis]
         _j = self.n[np.newaxis, :]
         m = self.npts + 1
+        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            
             T = ((-1.)**(_i-_j)
                 * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
                 - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
+        
         T[self.n - 1, self.n - 1] = 0.
         T += np.diag((2. * m**2. + 1.) / 3.
                      - 1./np.square(np.sin(np.pi * self.n / m)))

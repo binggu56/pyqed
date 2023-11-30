@@ -29,6 +29,9 @@ from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2, dag, sort
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
+from pyqed.nonherm import eig
+
+
 def plot_wavepacket(x, y, psilist, **kwargs):
 
     if not isinstance(psilist, list): psilist = [psilist]
@@ -545,14 +548,14 @@ class SPO2:
                     
                     _v = v[i, j]
                     
-                    w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
-    
+                    # w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+                    w, ur, ul = eig(_v)
     
                     V = np.diagflat(np.exp(- 1j * w * dt))
                     V2 = np.diagflat(np.exp(- 1j * w * dt2))
     
-                    self.exp_V[i, j, :,:] = ur @ V @ dag(ul)
-                    self.exp_V_half[i, j, :,:] = ur @ V2 @ dag(ul)
+                    self.exp_V[i, j, :,:] = ur @ V @ ul
+                    self.exp_V_half[i, j, :,:] = ur @ V2 @ ul
                     
         else: 
             
@@ -640,7 +643,7 @@ class SPO2:
         return P
 
 
-    def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
 
         print('Building the propagators ...')
 
@@ -652,7 +655,8 @@ class SPO2:
 
             return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
 
-        r = ResultSPO2(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        
         r.x = self.x
         r.y = self.y
         r.psilist = [psi0]
@@ -669,7 +673,7 @@ class SPO2:
         # observables
         if return_states:
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
 
                     t += dt
@@ -684,7 +688,7 @@ class SPO2:
 
             psi = _V_half(psi)
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
                     t += dt
 
