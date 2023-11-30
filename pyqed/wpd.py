@@ -84,12 +84,14 @@ class ResultSPO2(Result):
 
             for i, psi in enumerate(psilist):
 
-                fig, axes = plt.subplots(nrows=nstates, sharey=True)
+                fig, axes = plt.subplots(nrows=nstates, sharey=True, sharex=True,\
+                                         figsize=(5,4))
+                
                 for n in range(nstates):
                     axes[n].contour(X, Y, np.abs(psi[:,:, n])**2)
                     
                 # ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
-                    axes[n].format(**kwargs)
+                    # axes[n].format(**kwargs)
                 # ax1.format(**kwargs)
                 fig.savefig('psi'+str(i)+'.pdf')
 

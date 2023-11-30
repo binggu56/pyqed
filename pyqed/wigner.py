@@ -282,7 +282,7 @@ def wigner(x, d=1):
             #     tfr[tausec, icol] = signal[icol + tausec, 0] * \
             #         np.conj(signal[icol - tausec, 0]) + \
             #         signal[icol - tausec, 0] * conj_signal[icol + tausec, 0]
-            w[:, j], freqs = ifft(w[:, j], taus)
+            w[:, j], freqs = fft(w[:, j], taus)
 
 
     elif x.ndim == 2: # input is a density matrix
@@ -317,7 +317,7 @@ def wigner(x, d=1):
 
             w[indices, j] = x[j + tau, j - tau]
 
-            freqs, w[:, j] = fft(w[:, j], taus)
+            w[:, j], freqs  = fft(w[:, j], taus)
 
 
     # fig, ax = plt.subplots()
