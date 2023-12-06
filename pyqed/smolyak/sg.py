@@ -38,6 +38,46 @@ try:
 except:
     import matplotlib.pyplot as plt
 
+
+def discretize(a=0, b=1, level=5, border=False):
+    """
+    uniform grid with 2^l points 
+    
+    Without border 
+    
+    .. math::
+        x_0 = a + dx, 
+        x_{N-1} = b - dx
+        
+    Without border 
+    
+    .. math::
+        x_0 = a
+        x_N = b
+
+    Parameters
+    ----------
+    a : TYPE, optional
+        DESCRIPTION. The default is 0.
+    b : TYPE, optional
+        DESCRIPTION. The default is 1.
+    level : TYPE, optional
+        DESCRIPTION. The default is 5.
+    border : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    if border:
+        return np.linspace(0, 1, 2**5, endpoint=False)[1:]
+    else:
+        return np.linspace(0, 1, 2**5+1, endpoint=True)
+
+
 class gridPoint: 
     """ position of a grid point, 
           also stores function value 
@@ -129,7 +169,7 @@ class SparseGrid:
         index_set = []
         c = [] 
         l = [self.level, ] * self.dim # isotropic, can be generalized to anisotropic
-        print(l)
+
         # for i in range(l[0] - q +1, l[0]+1):
             # for j in range( np.maximum(sum(l)-q-i, l[1]-q+1), sum(l)+2-q-i):
         for i in range(l[0] - q +1, l[0]+1):
@@ -352,7 +392,16 @@ class SparseGrid:
     # def nodal2hierachiral(self):
     #     return self.nodal2Hier()
 
-        
+
+class ASG(SparseGrid):
+    """
+    Dimension-Adapative Sparse Grid
+    
+    
+    """
+    def __init__(self):
+        pass
+    
         
     
 def cross(*args):

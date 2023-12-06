@@ -1723,7 +1723,8 @@ def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, t0=0, dt=0.005, return_result=Tr
 
     result = Result(dt=dt, Nt=Nt, rho0=rho0)
 
-    observables = np.zeros((Nt, len(e_ops)), dtype=complex)
+    observables = np.zeros((Nt+1, len(e_ops)), dtype=complex)
+    observables[0, :] = [obs_dm(rho, op) for op in e_ops]
 
     for k in range(Nt):
 
@@ -1733,7 +1734,7 @@ def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, t0=0, dt=0.005, return_result=Tr
         rholist.append(rho.copy())
 
 
-        observables[k, :] = [obs_dm(rho, op) for op in e_ops]
+        observables[k+1, :] = [obs_dm(rho, op) for op in e_ops]
 
 
     result.observables = observables

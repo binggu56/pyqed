@@ -48,7 +48,7 @@ def fft(a, x=None, axis=-1, **kwargs):
 
     g = np.fft.fft(a, axis=axis, **kwargs)
     g = np.fft.fftshift(g, axes=(axis, ))
-    g *= dx
+    g *= dx 
 
     freq = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
 
@@ -87,7 +87,7 @@ def ifft(a, x=None, axis=-1):
     g = np.fft.ifft(a, axis=axis)
     g = np.fft.fftshift(g, axes=(axis, ))
 
-    g = g * dx
+    g = g * dx * nx
     # g = g * dx /2./np.pi * len(x)
     freq = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
 

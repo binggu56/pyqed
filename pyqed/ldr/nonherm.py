@@ -10,7 +10,7 @@ Created on Wed Nov 29 15:40:01 2023
 import numpy as np
 from numpy import exp, pi, sqrt, meshgrid
 from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, interval
-from pyqed.wpd import ResultSPO2
+from pyqed.wpd import ResultSPO2, SPO2
 from pyqed.namd.ldr import WPD2
 from pyqed.nonherm import eig
 import warnings
@@ -149,7 +149,10 @@ def kinetic(x, mass=1, dvr='sinc'):
         raise ValueError("DVR {} does not exist. Please use sinc, sinc_periodic, sine.")
 
     return T
-    
+
+
+
+
 class SincDVR(WPD2):
     """
     N-state two-mode conical intersection dynamics with Fourier series 
@@ -194,6 +197,7 @@ class SincDVR(WPD2):
         self.right_eigenstates = None
         self.left_eigenstates = None
         self.apes = None
+        self.norm_right = None
         
     @property
     def v(self):
@@ -290,30 +294,35 @@ class SincDVR(WPD2):
         
         self.right_eigenstates = np.zeros((nx, ny, nstates, nstates), dtype=complex)  # diabatic to adiabatic transformation 
         self.left_eigenstates = np.zeros((nx, ny, nstates, nstates), dtype=complex)  # diabatic to adiabatic transformation 
-        self.norm = np.zeros((nx, ny, nstates))
+        self.norm_right = np.zeros((nx, ny, nstates, nstates), dtype=complex)
         
         for i in range(nx):
             for j in range(ny):
                 
                 vij = self.v[i, j]
                 
-                w, ul, ur = scipy.linalg.eig(vij, left=True, right=True)
+                # w, ul, ur = scipy.linalg.eig(vij, left=True, right=True)
                 
-                norm = np.diag(dag(ul) @ ur)
                 
-                ur = np.einsum('ij, j -> ij', ur, 1./np.sqrt(norm))
-                ul = np.einsum('ij, j -> ij', ul, 1./np.sqrt(norm))
+                # norm = np.diag(dag(ul) @ ur)
+
+                # ur = np.einsum('ij, j -> ij', ur, 1./sqrt(norm))
+                # ul = np.einsum('ij, j -> ij', ul, 1./np.sqrt(norm))
                 
-                # w, ur, ul = eig(vij)
-                self.norm[i,j] = 1./norm
+                w, ur, ul = eig(vij)
             
                 
-                idx = np.argsort(w.real)
-                w = w[idx]               
-                self.right_eigenstates[i,j] = ur[:, idx]
-                self.left_eigenstates[i, j] = ul[:, idx]
+                # idx = np.argsort(w.real)
+                # w = w[idx]     
+                # ur = ur[:, idx]
+                # # ul = ul[:, idx]
+                
+                self.right_eigenstates[i,j] = ur
+                self.left_eigenstates[i, j] = dag(ul)
                 
                 va[i,j] = w 
+                
+                self.norm_right[i,j] = dag(ur) @ ur
 
                 
                 # ur[i,j] = ur
@@ -558,8 +567,11 @@ class SincDVR(WPD2):
         r.x = self.x
         r.y = self.y
         r.psilist = [psi0.copy()]
+        
+        # project the intial state onto the left eigenvectors
+        # psi = np.einsum('ijal, ija -> ijl', self.left_eigenstates.conj(), psi0)
         psi = psi0.copy()
-
+        
         # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
         psi = self.exp_V_half * psi
         
@@ -647,9 +659,15 @@ class SincDVR(WPD2):
     def position(self, psi, d=0):
         x = self.x
         if isinstance(psi, list):
-            xAve = [np.einsum('i, ija, ija', x, self.norm, np.abs(_psi)**2) for _psi in psi]
+            xAve = [np.einsum('ijb, i, ijba, ija ->', _psi.conj(), x, self.norm_right, _psi)\
+                     for _psi in psi]
+            # xAve = [np.einsum('ija, i, ija', _psi.conj(), x, _psi) for _psi in psi]
+            yAve = [np.einsum('ijb, j, ijba, ija ->', _psi.conj(), self.y, self.norm_right, _psi)\
+                     for _psi in psi]
+                #[np.einsum('j, ija, ija', self.y, self.norm_right, np.abs(_psi)**2) for _psi in psi]
     
-        return xAve 
+        
+        return np.array(xAve)*self.dx*self.dy, np.array(yAve) * self.dx * self.dy 
     
         
         

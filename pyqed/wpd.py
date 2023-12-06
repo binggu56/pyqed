@@ -32,6 +32,9 @@ from pyqed.mol import Result
 from pyqed.nonherm import eig
 
 
+
+
+
 def plot_wavepacket(x, y, psilist, **kwargs):
 
     if not isinstance(psilist, list): psilist = [psilist]
@@ -62,7 +65,7 @@ class ResultSPO2(Result):
 
     def plot_wavepacket(self, psilist, state_id=None, **kwargs):
 
-        X, Y = np.meshgrid(self.x, self.y)
+        X, Y = np.meshgrid(self.x, self.y, indexing='ij')
 
         if not isinstance(psilist, list): psilist = [psilist]
 
@@ -85,10 +88,10 @@ class ResultSPO2(Result):
             for i, psi in enumerate(psilist):
 
                 fig, axes = plt.subplots(nrows=nstates, sharey=True, sharex=True,\
-                                         figsize=(5,4))
+                                         figsize=(3.5,4))
                 
                 for n in range(nstates):
-                    axes[n].contour(X, Y, np.abs(psi[:,:, n])**2)
+                    axes[n].contourf(X, Y, np.abs(psi[:,:, n])**2)
                     
                 # ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
                     # axes[n].format(**kwargs)
@@ -380,7 +383,7 @@ class SPO2:
         self.exp_V = None
         self.exp_V_half = None
         self.exp_K = None
-        self.V = None
+        self.v = self.V = None
         self.G = G
         self.nstates = self.ns = nstates
         self.coords =  coords
@@ -451,7 +454,7 @@ class SPO2:
         return v
     
     def set_dpes(self, v):
-        self.V = v
+        self.V = self.v = v
         return 
 
 
@@ -869,6 +872,107 @@ class SPO2:
             ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
+
+
+
+
+class SPO2NH(SPO2):
+    
+    def __init__(self, x, y, *args, **kwargs):
+        self.right_eigenstates = None
+        super().__init__(x, y, *args, **kwargs)
+
+
+    
+    def build(self, dt):
+        nx = self.nx
+        ny = self.ny
+        nstates = self.nstates
+
+        dx = interval(self.x)
+        dy = interval(self.y)
+
+        self.kx = 2. * np.pi * fftfreq(nx, dx)
+        self.ky = 2. * np.pi * fftfreq(ny, dy)
+        
+        v = self.v 
+        
+        dt2 = 0.5 * dt
+        
+        if self.coords == 'linear':
+
+            mx, my = self.masses
+
+            Kx, Ky = meshgrid(self.kx, self.ky)
+
+            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+        elif self.coords == 'jacobi':
+
+            # self.exp_K = np.zeros((nx, ny, nx, ny))
+            mx = self.masses[0]
+
+            self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
+
+            Iinv = 1./self.masses[1](self.x) # y is the angle
+            ky = self.ky
+
+            self.exp_Ky = np.exp(-1j * np.outer(Iinv, ky**2/2.) * dt)
+
+        
+        self.right_eigenstates = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+        self.ovlp_rr = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+        
+        self.exp_V = np.zeros(v.shape, dtype=complex)
+        self.exp_V_half = np.zeros(v.shape, dtype=complex)
+        
+        # complex potential
+        for i in range(nx):
+            for j in range(ny):
+                
+                _v = v[i, j]
+                
+                # w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+                w, ur, ul = eig(_v)
+                
+                self.right_eigenstates[i,j] = ur
+                
+                self.ovlp_rr[i,j] = dag(ur) @ ur
+                
+                V = np.diagflat(np.exp(- 1j * w * dt))
+                V2 = np.diagflat(np.exp(- 1j * w * dt2))
+
+                self.exp_V[i, j, :,:] = ur @ V @ ul
+                self.exp_V_half[i, j, :,:] = ur @ V2 @ ul
+                
+
+        return
+    
+    def position(self, psilist, plot=False):
+        
+        x = self.x 
+        y = self.y
+        dx = interval(x)
+        dy = interval(y)
+        
+        S = self.ovlp_rr
+        
+        xAve = [np.einsum('ijm, i, ijmn, ijn ->', psi.conj(), x, S, psi) * dx*dy for psi in psilist]
+        yAve = [np.einsum('ijn, j, ijmn, ijn ->', psi.conj(), y, S, psi) * dx*dy for psi in psilist]
+
+        
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(xAve)
+            ax.plot(yAve)
+        
+        self.xAve = [xAve, yAve]
+        np.savez('xAve', xAve, yAve)
+        
+        return xAve, yAve
+    
+
+
 
 
 def divergence(f,h):

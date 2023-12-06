@@ -784,7 +784,7 @@ class Mol:
 
             return sos.absorption(self, omegas, **kwargs)
 
-        elif method == 'superoperator':
+        elif method == 'tcf': # time-correlation function
 
             raise NotImplementedError('The method {} has not been implemented. \
                               Try "sos"'.format(method))

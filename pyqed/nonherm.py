@@ -8,8 +8,20 @@ Created on Sun Oct 15 11:10:08 2023
 
 import scipy
 import numpy as np
+from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 
-from pyqed import dag, sort
+from pyqed.phys import dag, sort, interval, meshgrid
+# from pyqed.wpd import SPO2
+
+import sys
+if sys.version_info[1] < 10:
+    import proplot as plt
+else:
+    import matplotlib.pyplot as plt
+    
+
+
+
 
 def eig(a, norm=False):
     """

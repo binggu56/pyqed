@@ -35,6 +35,24 @@ from pyqed.style import subplots
 #     def absorption():
 #         pass
 
+def issorted(a):
+    """
+    check if the numpy array is sorted or not
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return np.all(np.diff(a) >= 0)
+
+
 class TransientAbsorption:
     def __init__(self, mol, pump, probe, delays):
         self.mol = mol 
@@ -207,7 +225,7 @@ def absorption(mol, omegas, linewidth=None, plt_signal=True, fname=None, normali
     # set linewidth, this can be generalized to frequency-dependent linewidth
     if linewidth is None:
         print('Linewidth not specified, using 20 meV.')
-        gamma = [50/au2mev, ] * mol.nstates
+        gamma = [20/au2mev, ] * mol.nstates
     else:
         gamma = [linewidth, ] * mol.nstates
 
@@ -217,6 +235,10 @@ def absorption(mol, omegas, linewidth=None, plt_signal=True, fname=None, normali
     #     gamma = mol.gamma
 
     eigenergies = mol.eigvals()
+    
+    if not issorted(eigenergies):
+        raise ValueError('Eigenenergies are not sorted.')
+        
     # set the ground state energy to 0
     eigenergies = eigenergies - eigenergies[0]
 
