@@ -114,7 +114,7 @@ class Vibronic2:
     vibronic model in the diabatic representation with 2 nuclear coordinates
 
     """
-    def __init__(self, x, y, mass=[1,1], nstates=2, nmodes=2, coords='linear'):
+    def __init__(self, x, y, mass=None, nstates=2, nmodes=2, coords='linear'):
         self.x = x
         self.y = y
         self.X, self.Y = meshgrid(x, y)
@@ -124,6 +124,8 @@ class Vibronic2:
         self.ny = len(y)
         self.dx = interval(x)
         self.dy = interval(y) # for uniform grids
+        if mass is None:
+            mass = [1, ] * nmodes
         self.mass = mass
         self.kx = None
         self.ky = None
@@ -131,8 +133,8 @@ class Vibronic2:
         self.mass = mass
 
 
-        self.v = None # diabatic PES
-        self.apes = None
+        self.v = self.dpes = None # diabatic PES
+        self.apes = None # diabatic PES
 
         # self.h = h
         # self.l = l
@@ -166,7 +168,7 @@ class Vibronic2:
             for j in range(ny):
                 self.v[i, j, :, :] = vd[[x[i], y[j]]]
         
-        return v
+        return self.v
         
     
     def set_DPES(self, surfaces, diabatic_couplings, abc=False, eta=None):
@@ -204,8 +206,8 @@ class Vibronic2:
 
         for dc in diabatic_couplings:
             a, b = dc[0][:]
-            v[:, :, a, b] = v[:, :, b, a] = dc[1]
-
+            v[:, :, a, b] = dc[1]
+            v[:, :, b, a] = v[:, :, a, b].conj()
 
         if abc:
             for n in range(self.ns):
@@ -252,7 +254,8 @@ class Vibronic2:
         
         for i in range(nx):
             for j in range(ny):
-                w, u = self.apes([x[i], y[j]])
+                # w, u = self.apes([x[i], y[j]])
+                w, u = np.linalg.eigh(self.v[i,j])
                 v[i, j, :] = w
         
         self.apes = v 
@@ -301,6 +304,81 @@ class Vibronic2:
 
     def spo(self):
         return SPO2(nstates=self.nstates, mass=self.mass, x=self.x, y=self.y)
+    
+    def LDR(self):
+        # return SincDVR2()
+        pass
+
+
+
+def SpinVibronic(Vibronic2):
+    """
+    single unpaired electron in the Coulomb field of three nuclei in a linear geometry
+    
+    The bending modes are doubly degenerate. 
+
+    Refs    
+        Chemical Physics 2004, 301, 111-127
+    """
+
+    def __init__(self, x, y, mass=None, nstates=4, nmodes=2, coords='linear'):
+        self.x = x
+        self.y = y
+        self.X, self.Y = meshgrid(x, y)
+        self.nstates = nstates
+
+        self.nx = len(x)
+        self.ny = len(y)
+        self.dx = interval(x)
+        self.dy = interval(y) # for uniform grids
+        if mass is None:
+            mass = [1, ] * nmodes
+        self.mass = mass
+        self.kx = None
+        self.ky = None
+        self.dim = 2
+        self.mass = mass
+
+
+        self.v = None # diabatic PES
+        self.apes = None # diabatic PES
+        
+    def set_dpes(self, e_so, omega, kappa, g):
+        nstates = self.nstates 
+        x, y = self.x, self.y
+        nx, ny = self.nx, self.ny
+        
+        v = np.zeros((nx, ny, nstates, nstates))
+        
+        for i in range(self.nx):
+            for j in range(self.ny):
+                v[i, j] = self.single_point(x[i], y[j], e_so, kappa, g)
+                v[i, j] += np.eye(4) * omega/2 *(x[i]**2 + y[j]**2)
+        
+        self.v = v
+        
+        return v 
+    
+    def single_point(self, x, y, e_so, kappa, g):
+        xp = x + 1j * y
+        xm = x - 1j * y        
+        h = np.diag([e_so/2, -e_so/2, -e_so/2, e_so/2])
+        h[0, 1] = kappa * xp 
+        h[0, 2] = g/2 * xp**2
+        h[1, 3] = -g/2 * xp**2
+        h[2, 3] = kappa * xp
+        
+        h[1, 0] = h[0, 1].conj()
+        h[2, 0] = h[2, 0].conj()
+        h[3, 1] = h[1, 3].conj()
+        h[3, 2] = h[2, 3].conj()
+        return h
+        
+        
+    
+        
+        
+
 
 
 class LVC2:
@@ -1119,6 +1197,8 @@ if __name__ == '__main__':
     rcParams['axes.labelpad'] = 6
     rcParams['xtick.major.pad']='2'
     rcParams['ytick.major.pad']='2'
+    
+    from pyqed import discretize
 
     def test_CI():
         x = np.linspace(-2, 2, 20)
@@ -1159,4 +1239,28 @@ if __name__ == '__main__':
         psi0[:, 0] = gwp(x, a=1)
         mol.run(psi0, dt=0.2, nt=1)
     
-    test_CI()
+    def diabatic_potential(x, y, e_so, omega, kappa, g):
+        xp = x + 1j * y
+        xm = x - 1j * y        
+        h = np.diag([e_so/2, -e_so/2, -e_so/2, e_so/2])+0j
+        h[0, 1] = kappa * xp 
+        h[0, 2] = g/2 * xp**2
+        h[1, 3] = -g/2 * xp**2
+        h[2, 3] = kappa * xp
+        
+        h[1, 0] = h[0, 1].conj()
+        h[2, 0] = h[0, 2].conj()
+        h[3, 1] = h[1, 3].conj()
+        h[3, 2] = h[2, 3].conj()
+        return h + np.eye(4) * omega/2 * (x**2 + y**2)
+            
+    x = discretize(0,2, l=6)
+    nx = len(x)
+    va = np.zeros((nx, 4))
+    for i in range(nx):
+        va[i] = np.linalg.eigh(diabatic_potential(x[i], y=0, e_so=0.2, omega=1, kappa=0.6, g=0.2))[0]
+    
+    fig, ax = plt.subplots()
+    for n in range(4):
+        ax.plot(x, va[:, n])
+    

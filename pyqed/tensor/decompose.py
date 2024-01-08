@@ -14,15 +14,16 @@ from tensorly.decomposition import tensor_train
 # tensor = random.random_tensor((10, 10, 10))
 # # This will be a NumPy array by default
 
-from lime.phys import dag
+# from lime.phys import dag
 
 import numpy as np
 import warnings
 from scipy.linalg import svd
 
+import logging
 
 
-def my_tensor_train(input_tensor, rank, verbose=False):
+def tensor_train(input_tensor, rank):
     """
     TT decomposition via recursive SVD
 
@@ -32,6 +33,7 @@ def my_tensor_train(input_tensor, rank, verbose=False):
         In left canonical form.
 
     Adapated from Tensorly package.
+    
     Parameters
     ----------
     input_tensor : tensorly.tensor
@@ -53,6 +55,7 @@ def my_tensor_train(input_tensor, rank, verbose=False):
     """
     rank = validate_tt_rank(tl.shape(input_tensor), rank=rank)
     tensor_size = input_tensor.shape # list of phys dims
+    
     n_dim = len(tensor_size)
 
     # this is not correct
@@ -64,6 +67,7 @@ def my_tensor_train(input_tensor, rank, verbose=False):
 
     S0 = np.array([1.])
     Ss = [S0]
+    
     # Getting the TT factors up to n_dim - 1
     for k in range(n_dim - 1):
 
@@ -84,8 +88,8 @@ def my_tensor_train(input_tensor, rank, verbose=False):
         # Get kth TT factor
         factors[k] = tl.reshape(U, (rank[k], tensor_size[k], rank[k+1]))
 
-        if(verbose is True):
-            print("TT factor " + str(k) + " computed with shape " + str(factors[k].shape))
+
+        logging.info("TT factor " + str(k) + " computed with shape " + str(factors[k].shape))
 
         # Get new unfolding matrix for the remaining factors
         unfolding= tl.reshape(S, (-1, 1))*V
@@ -95,8 +99,8 @@ def my_tensor_train(input_tensor, rank, verbose=False):
     (prev_rank, last_dim) = unfolding.shape
     factors[-1] = np.reshape(unfolding, (prev_rank, last_dim, 1))
 
-    if(verbose is True):
-        print("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
+    
+    logging.info("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
 
     return factors, Ss
 
@@ -180,11 +184,11 @@ def tt_to_tensor(factors):
 
     return tl.reshape(full_tensor, full_shape)
 
-def compress(B_list, s_list, chi_max):
+def compress(B_list, chi_max):
     " Compress the MPS by reducing the bond dimension."
     # d = B_list[0].shape[0]
     L = len(B_list)
-    # s_list  = [None] * L
+    s_list  = [None] * L
     # for p in [0,1]:
 
     for i_bond in np.arange(L-1):
@@ -199,8 +203,10 @@ def compress(B_list, s_list, chi_max):
 
         # Construct theta matrix
         # C[chi1, i, j, chi3] = B1[chi1, i, chi2] B2[chi2, j, chi3]
-        C = np.tensordot(B_list[i1], B_list[i2],axes=1)
-
+        
+        # C = np.tensordot(B_list[i1], B_list[i2],axes=1)
+        C = np.einsum('aib, bjc -> aijc', B_list[i1], B_list[i2])
+        
         theta = np.reshape(C, (chi1 * d1, d2*chi3))
 
         # theta = np.reshape(np.einsum('a, aijb->aijb', s_list[i1], C),\
@@ -228,54 +234,80 @@ def compress(B_list, s_list, chi_max):
         B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
 
 
-    return B_list
+    return B_list, s_list
 
-def mps_to_tensor(b):
-    return np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
-
-a = np.random.randn(3, 3, 3)
-
-# print(np.einsum('ijk, ijk', a, a))
-
-# print(inner(a, a))
-a = a/tl.norm(a)
-
-rank = 4
-
-As, Ss = my_tensor_train(a,rank=rank)
-b = As.copy()
-print('values', Ss[1])
-# b_to_tensor = np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
-
-# b = a_tt
-print('norm a', tl.norm(a))
-
-# print('norm a_tt', tl.norm(b_to_tensor))
-
-# b2 = my_tensor_train(a, rank=4)
-
-# print(validate_tt_rank(tl.shape(a), rank=rank))
-
-tl.set_backend('numpy')
-# c = tensor_train(a, rank=rank)
+# def mps_to_tensor(b):
+#     return np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
 
 
+if __name__ == '__main__':
+    
+    def pes(x):
+        dim = len(x)
+        v = 0 
+        for d in range(dim):
+            v += 0.5 * x[d]**2
+        v += 0.1 * x[0] * x[1] + x[0]**4 * 0.2
+        return v
+    
+    
+    # a = np.random.randn(3, 3, 3)
+    level = 4
+    n = 2**level - 1 # number of grid points for each dim
+    x = np.linspace(-6, 6, 2**level, endpoint=False)[1:]
 
-# print(b == c)
-# print(len(b))
-# for j in range(len(b)):
-#     print(b[j].shape)
-#     print(c[j].shape)
+    
+    v = np.zeros((n, n, n))
+    for i in range(n):
+        for j in range(n):
+            for k in range(n):
+                v[i, j, k] = pes([x[i], x[j], x[k]])
 
-
-b_compressed = compress(b, Ss, chi_max=2)
-a_compressed = mps_to_tensor(b_compressed)
-
-# tmp = np.tensordot(b_compressed[1],  b_compressed[2][:,:,0], axes=1) # aib, bj -> aij
-# tmp = b_compressed[1]
-# r = np.einsum('aib, cib ->ac', tmp, tmp)
-print(a_compressed - mps_to_tensor(As)
-    )
+    dt = 0.05
+    v = np.exp(-1j * v * dt)                
+    # print(np.einsum('ijk, ijk', a, a))
+    
+    # print(inner(a, a))
+    # a = a/tl.norm(a)
+    
+    rank = 4
+    
+    As, Ss = tensor_train(v,rank=rank)
+    b = As.copy()
+    print('singular values', Ss[0],Ss[1], Ss[2])
+    
+    # b_to_tensor = np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
+    b = tt_to_tensor(As)    
+    print(b.shape)
+    print(b[:, 0, 0]-v[:, 0, 0])
+    
+    # print('norm a', tl.norm(a))
+    
+    # print('norm a_tt', tl.norm(b_to_tensor))
+    
+    # b2 = my_tensor_train(a, rank=4)
+    
+    # print(validate_tt_rank(tl.shape(a), rank=rank))
+    
+    # tl.set_backend('numpy')
+    # c = tensor_train(a, rank=rank)
+    
+    
+    
+    # print(b == c)
+    # print(len(b))
+    # for j in range(len(b)):
+    #     print(b[j].shape)
+    #     print(c[j].shape)
+    
+    
+    b_compressed, slist = compress(As, chi_max=4)
+    # a_compressed = mps_to_tensor(b_compressed)
+    
+    # tmp = np.tensordot(b_compressed[1],  b_compressed[2][:,:,0], axes=1) # aib, bj -> aij
+    # tmp = b_compressed[1]
+    # r = np.einsum('aib, cib ->ac', tmp, tmp)
+    print(tt_to_tensor(b_compressed)[:, 0, 0] - v[:, 0, 0])
 
 # print(b_compressed[0])
 # print(As[0]

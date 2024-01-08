@@ -18,7 +18,7 @@ import numpy as np
 import pylab as pl
 from scipy.linalg import expm
 
-from scipy.fftpack import fft, ifft, fftfreq
+from scipy.fftpack import fft, ifft, fftfreq, fftn, ifftn
 
 
 
@@ -159,7 +159,7 @@ def k_evolve_1d(k, psi):
                                      states in grid basis
     """
     psi_k = fft(psi)
-    psi_k = psi_k * np.exp(-0.5 * 1j * k**2 * dt)
+    psi_k = psi_k * np.exp(-0.5j * k**2 * dt)
     psi = ifft(psi_k)
 
     return psi
@@ -173,10 +173,12 @@ def kinetic(k, B_list):
     """
     for i in range(L):
         chi1, chi2 = np.shape(B_list[i])[1:]
-        for a in range(chi1):
-            for b in range(chi2):
-                B_list[i][:,a,b] = k_evolve_1d(k, B_list[i][:,a,b])
-
+        # for a in range(chi1):
+        #     for b in range(chi2):
+                # B_list[i][:,a,b] = k_evolve_1d(k, B_list[i][:,a,b])
+        B_list[i] = ifftn(np.einsum('i, iab -> iab', np.exp(-0.5j * k**2 * dt), \
+                                    fftn(B_list[i], axes=(0))), axes=(0))
+        
     return B_list
 
 def make_V_list(X, Y):

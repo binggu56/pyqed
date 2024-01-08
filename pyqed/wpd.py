@@ -62,6 +62,7 @@ class ResultSPO2(Result):
         self.y = None
         self.population = None
         self.xAve = None
+        self.nstates = self.psi0.shape[-1]
 
     def plot_wavepacket(self, psilist, state_id=None, **kwargs):
 
@@ -103,22 +104,34 @@ class ResultSPO2(Result):
     def get_population(self, fname=None, plot=False):
         dx = interval(self.x)
         dy = interval(self.y)
-        p0 = [norm2(psi[:, :, 0]) * dx * dy for psi in self.psilist]
-        p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
+        p = np.zeros((len(self.psilist), self.nstates))
+        for n in range(self.nstates):
+            p[:, n] = [norm2(psi[:, :, n]).real * dx * dy for psi in self.psilist]
+        # p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
         
         if plot:
             fig, ax = plt.subplots()
-            ax.plot(self.times, p0)
-            ax.plot(self.times, p1)
+            for n in range(self.nstates):
+                ax.plot(self.times, p[:,n])
+            # ax.plot(self.times, p1)
         
-        self.population = [p0, p1]
+        self.population = p
         if fname is not None:
             # fname = 'population'
-            np.savez(fname, p0, p1)
+            np.savez(fname, p)
             
-        return p0, p1
+        return p
     
-    def position(self, plot=False):        
+    def plot_population(self, p):
+        
+        fig, ax = plt.subplots()
+        for n in range(self.nstates):
+            ax.plot(self.times, p[:,n])
+            
+        return fig, ax
+        
+    
+    def position(self, plot=False, fname=None):        
         # X, Y = np.meshgrid(self.x, self.y)
         x = self.x 
         y = self.y
@@ -127,7 +140,10 @@ class ResultSPO2(Result):
         
         xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
         yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
-
+        
+        xAve = np.real_if_close(xAve)
+        yAve = np.real_if_close(yAve)
+        
         if plot:
             fig, ax = plt.subplots()
             ax.plot(self.times, xAve)
@@ -530,10 +546,10 @@ class SPO2:
 
         dt2 = 0.5 * dt
 
-        if self.V is None:
+        if self.v is None:
             raise ValueError('The diabatic PES is not specified.')
 
-        v = self.V
+        v = self.v
 
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
@@ -545,8 +561,10 @@ class SPO2:
         #     eig = scipy.linalg.eigh
         
         
-        if np.iscomplexobj(v):
+        if np.iscomplexobj(v): # complex Hermitian H
             
+            self.d2a = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+
             # complex potential
             for i in range(nx):
                 for j in range(ny):
@@ -554,13 +572,15 @@ class SPO2:
                     _v = v[i, j]
                     
                     # w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
-                    w, ur, ul = eig(_v)
+                    w, u = sort(*scipy.linalg.eigh(_v))
     
                     V = np.diagflat(np.exp(- 1j * w * dt))
                     V2 = np.diagflat(np.exp(- 1j * w * dt2))
     
-                    self.exp_V[i, j, :,:] = ur @ V @ ul
-                    self.exp_V_half[i, j, :,:] = ur @ V2 @ ul
+                    self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+                    
+                    self.d2a[i, j] = u
                     
         else: 
             
@@ -585,7 +605,7 @@ class SPO2:
 
         return
 
-    def population(self, psi, representation='diabatic'):
+    def population(self, psi, representation='diabatic', plot=False):
         """
         return the electronic populations
 
@@ -618,6 +638,8 @@ class SPO2:
         
         elif representation == 'adiabatic':
             
+            assert(self.d2a is not None)
+            
             if isinstance(psi, np.ndarray):
                 
                 psi = np.einsum('ijab, ijb -> ija', self.d2a, psi)
@@ -644,7 +666,7 @@ class SPO2:
             raise ValueError('Representation = {}, which can only be \
                              diabatic or adiabatic'.format(representation))
     
-
+        
         return P
 
 
@@ -971,7 +993,72 @@ class SPO2NH(SPO2):
         
         return xAve, yAve
     
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
 
+        print('Building the propagators ...')
+
+        self.build(dt=dt)
+
+        psi = psi0.copy()
+
+        def _V_half(psi):
+
+            return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
+
+        t = t0
+        if self.coords == 'linear':
+
+            KEO = self._KEO_linear
+
+        elif self.coords == 'jacobi':
+
+            KEO = self._KEO_jacobi
+
+        # observables
+        if return_states:
+
+            for i in range(nt//nout):
+                for n in range(nout):
+
+                    t += dt
+
+                    psi = _V_half(psi)
+                    psi = KEO(psi)
+                    psi = _V_half(psi)
+
+                r.psilist.append(psi.copy())
+
+        else:
+
+            psi = _V_half(psi)
+
+            for i in range(nt//nout):
+                for n in range(nout):
+                    t += dt
+
+                    psi = KEO(psi)
+                    psi = self._PEO(psi)
+
+
+                r.psilist.append(psi.copy())
+                # tlist.append(t)
+
+                # rho = density_matrix(psi_x, dx)
+
+                # # store the density matrix
+                # f.write('{} {} {} {} {} \n'.format(t, *rho))
+
+            psi = KEO(psi)
+            psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r.psi = psi
+        return r
 
 
 

@@ -161,23 +161,71 @@ class QT:
             
             
 
-class QTNonadiabatic:
+class NAQT:
     """
-    quantum trajectory method with internal space
+    nonadiabatic dynamics with quantum trajectory method 
+    
+    valid for slow variables with internal space
     """
     def __init__(self, ntraj, ndim, nstates, mass=None):
         self.c = np.zeros((ntraj, nstates),dtype=np.complex128)
         self.ntraj = ntraj
         self.ndim = ndim
         self.nstates = nstates
-        self.w = 1./ntraj
+        
+        self.w = 1./ntraj # weights
+        
+        if mass is None:
+            mass = [1, ] * ndim
         self.mass = mass
 
         self.p = np.zeros((ntraj, ndim))
         self.x = np.zeros((ntraj, ndim))
 
-    def sample(self):
-        pass
+    def sample(self, a, x0=None, p0=None):
+        """
+        Monte Carlo sampling for a Gaussian distribution
+        
+        Warning: This is only valid for Gaussian.
+
+        Parameters
+        ----------
+        a : array of ndim
+            Gaussian width parameters
+        x0 : TYPE, optional
+            DESCRIPTION. The default is None.
+        p0 : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        None.
+
+        """
+        ndim = self.ndim 
+        ntraj = self.ntraj 
+        
+        # a = np.array([4.0, ] * ndim)
+        
+        if x0 is None:
+            x0 = np.zeros(ndim)
+        assert(len(x0) == ndim)
+        
+        if p0 is None:
+            p0 = np.zeros(ndim)
+        
+        x = np.random.randn(ntraj, ndim)
+        
+        for j in range(ndim):
+            x[:,j] = x[:,j] / np.sqrt(2.0 * a[j]) + x0[j]
+        
+        p = p0 * np.ones((ntraj, ndim))
+        
+        self.x = x 
+        self.p = p
+
+        return x, p 
+            
 
 
     def quantum_force(self):
@@ -641,25 +689,104 @@ def norm(c,w):
         anm += np.vdot(c[k,:], c[k,:]).real * w[k]
     return anm
 
-@numba.jit
-def fit_c(c,y):
+# @numba.jit
+# def fit_c(c,y):
+#     """
+#     global approximation of c vs y to obtain the derivative c'',c'
+#     """
+#     dc = np.zeros((Ntraj,M),dtype=np.complex128)
+#     ddc = np.zeros((Ntraj,M),dtype=np.complex128)
+
+#     for j in range(M):
+
+#         z = c[:,j]
+#         pars = np.polyfit(y,z,nfit)
+#         p0 = np.poly1d(pars)
+#         p1 = np.polyder(p0)
+#         p2 = np.polyder(p1)
+# #for k in range(Ntraj):
+#         dc[:,j] = p1(y)
+#         ddc[:,j] = p2(y)
+
+#     return dc, ddc
+
+def fit_c(c, x, deg=1):
     """
-    global approximation of c vs y to obtain the derivative c'',c'
+    global approximation of :math:`C_\alpha(R)` to obtain the derivative C'', C'    
+    
+    output fitting coefficients 
+    
+    params
+    =======
+    c: complex array (ntraj, nstates) 
+        expansion coefficients
+    
+    x: array (ntraj, ndim)
+        trajectories.
+        
     """
-    dc = np.zeros((Ntraj,M),dtype=np.complex128)
-    ddc = np.zeros((Ntraj,M),dtype=np.complex128)
+    ntraj, ndim = x.shape
+    nstates = c.shape[-1]
+    
+    if ndim == 1:
+        
+        dc = np.zeros((ntraj, nstates), dtype=np.complex128)
+        ddc = np.zeros((ntraj, nstates), dtype=np.complex128)
+    
+        for j in range(nstates): # states 
+    
+            z = c[:,j]
+            pars = np.polyfit(y,z,deg)
+            p0 = np.poly1d(pars)
+            p1 = np.polyder(p0)
+            p2 = np.polyder(p1)
+            
+    #for k in range(Ntraj):
+            dc[:,j] = p1(x)
+            ddc[:,j] = p2(x)
 
-    for j in range(M):
+    elif ndim > 1:
 
-        z = c[:,j]
-        pars = np.polyfit(y,z,nfit)
-        p0 = np.poly1d(pars)
-        p1 = np.polyder(p0)
-        p2 = np.polyder(p1)
-#for k in range(Ntraj):
-        dc[:,j] = p1(y)
-        ddc[:,j] = p2(y)
+        dc = np.zeros((ntraj, nstates, ndim), dtype=np.complex128)
+        ddc = np.zeros((ntraj, nstates, ndim), dtype=np.complex128)
+        
+        if deg == 1:
+            nbasis = ndim + 1
 
+            S = np.zeros((ndim + 1, ndim+1))
+            b = np.zeros((ndim+1, nstates), dtype=complex)
+            
+            for i in range(ntraj):
+         
+                f = np.array([*x[i,:],1.0]) # fitting basis
+         
+                for m in range(ndim+1):
+                    
+                    for a in range(nstates):
+                        b[m, a] += w[i] * c[i, a] * f[m]
+                    
+                    for n in range(m+1):
+         
+                        S[m,n] += w[i] * f[m] * f[n]
+            S = Sym(S)
+            
+            coeff = np.linalg.solve(S, b)
+            
+            
+            for a in range(nstates):
+                for m in range(ndim):
+                    dc[:, a, m] = coeff[m, a]
+
+        elif deg == 2:
+            nbasis = 1 + ndim + ndim**2
+            pass 
+
+        elif deg > 2:
+            raise NotImplementedError('Only linear basis has been implemented. Set deg=1.')
+
+    # error analysis
+    # err = np.sum(c - x )
+    
     return dc, ddc
 
 @numba.jit

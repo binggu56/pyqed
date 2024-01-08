@@ -254,7 +254,7 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 
 
 
-def hartree_fock(mol, max_cycle=100):
+def hartree_fock(mol, max_cycle=50):
 
     #print("constructing basis set")
 

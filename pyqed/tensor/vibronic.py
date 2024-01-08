@@ -429,6 +429,9 @@ class MatrixState(object):
 class MatrixProductState(object):
     """
     A doubly linked list of `MatrixState`. The matrix product state of the whole wave function.
+    
+    partially based on https://tenpy.readthedocs.io/en/latest/toycode_stubs/a_mps.html
+    
     """
 
     # initial bond order when using `error_threshold` as criterion for compression
@@ -541,8 +544,9 @@ class MatrixProductState(object):
             "-".join([str(ms.bond_order2) for ms in self.iter_ms_left2right()][:-1])
         )
 
+
 class MPS:
-    def __init__(self, mps, homogenous=True):
+    def __init__(self, Bs, Ss, homogenous=True, bc='open', form="B"):
         """
         class for matrix product states.
 
@@ -556,17 +560,32 @@ class MPS:
         None.
 
         """
-        self.data = mps
-        self.nsites = len(mps)
+        assert bc in ['finite', 'infinite']
+        self.Bs = Bs
+        self.Ss = Ss
+        self.bc = bc
+        self.L = len(Bs)
+        self.nbonds = self.L - 1 if self.bc == 'open' else self.L
+
+
+        self.data = self.factors = Bs
+        # self.nsites = self.L = len(mps)
         if homogenous:
-            self.dim = mps[0].shape[1]
+            self.dim = Bs[0].shape[1]
         else:
-            self.dims = [t.shape[1] for t in mps] # physical dims of each site
+            self.dims = [B.shape[1] for B in Bs] # physical dims of each site
         
         self._mpo = None
         
-    def decompose(self, chi_max):
-        pass
+    def copy(self):
+        return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss], self.bc)
+
+    def get_chi(self):
+        """Return bond dimensions."""
+        return [self.Bs[i].shape[2] for i in range(self.nbonds)]
+    
+    # def decompose(self, chi_max):
+    #     pass
 
     def __add__(self, other):
         assert len(self.data) == len(other.data)
@@ -578,14 +597,165 @@ class MPS:
 
         return MPS(C)
 
-    def build_mpo_list(self):
-        # build MPO representation of the propagator
+    def entanglement_entropy(self):
+        """Return the (von-Neumann) entanglement entropy for a bipartition at any of the bonds."""
+        bonds = range(1, self.L) if self.bc == 'finite' else range(0, self.L)
+        result = []
+        for i in bonds:
+            S = self.Ss[i].copy()
+            S[S < 1.e-20] = 0.  # 0*log(0) should give 0; avoid warning or NaN.
+            S2 = S * S
+            assert abs(np.linalg.norm(S) - 1.) < 1.e-13
+            result.append(-np.sum(S2 * np.log(S2)))
+        return np.array(result)
+
+    def get_theta1(self, i):
+        """Calculate effective single-site wave function on sites i in mixed canonical form.
+
+        The returned array has legs ``vL, i, vR`` (as one of the Bs).
+        """
+        return np.tensordot(np.diag(self.Ss[i]), self.Bs[i], [1, 0])  # vL [vL'], [vL] i vR
+
+    def get_theta2(self, i):
+        """Calculate effective two-site wave function on sites i,j=(i+1) in mixed canonical form.
+
+        The returned array has legs ``vL, i, j, vR``.
+        """
+        j = (i + 1) % self.L
+        return np.tensordot(self.get_theta1(i), self.Bs[j], [2, 0])  # vL i [vR], [vL] j vR
+    
+    def site_expectation_value(self, op):
+        """Calculate expectation values of a local operator at each site."""
+        result = []
+        for i in range(self.L):
+            theta = self.get_theta1(i)  # vL i vR
+            op_theta = np.tensordot(op, theta, axes=(1, 1))  # i [i*], vL [i] vR
+            result.append(np.tensordot(theta.conj(), op_theta, [[0, 1, 2], [1, 0, 2]]))
+            # [vL*] [i*] [vR*], [i] [vL] [vR]
+        return np.real_if_close(result)
+
+    def bond_expectation_value(self, op):
+        """Calculate expectation values of a local operator at each bond."""
+        result = []
+        for i in range(self.nbonds):
+            theta = self.get_theta2(i)  # vL i j vR
+            op_theta = np.tensordot(op[i], theta, axes=([2, 3], [1, 2]))
+            # i j [i*] [j*], vL [i] [j] vR
+            result.append(np.tensordot(theta.conj(), op_theta, [[0, 1, 2, 3], [2, 0, 1, 3]]))
+            # [vL*] [i*] [j*] [vR*], [i] [j] [vL] [vR]
+        return np.real_if_close(result)
+    
+    def correlation_length(self):
+        """Diagonalize transfer matrix to obtain the correlation length."""
+        from scipy.sparse.linalg import eigs
+        if self.get_chi()[0] > 100:
+            warnings.warn("Skip calculating correlation_length() for large chi: could take long")
+            return -1.
+        assert self.bc == 'infinite'  # works only in the infinite case
+        B = self.Bs[0]  # vL i vR
+        chi = B.shape[0]
+        T = np.tensordot(B, np.conj(B), axes=(1, 1))  # vL [i] vR, vL* [i*] vR*
+        T = np.transpose(T, [0, 2, 1, 3])  # vL vL* vR vR*
+        for i in range(1, self.L):
+            B = self.Bs[i]
+            T = np.tensordot(T, B, axes=(2, 0))  # vL vL* [vR] vR*, [vL] i vR
+            T = np.tensordot(T, np.conj(B), axes=([2, 3], [0, 1]))
+            # vL vL* [vR*] [i] vR, [vL*] [i*] vR*
+        T = np.reshape(T, (chi**2, chi**2))
+        # Obtain the 2nd largest eigenvalue
+        eta = eigs(T, k=2, which='LM', return_eigenvectors=False, ncv=20)
+        xi =  -self.L / np.log(np.min(np.abs(eta)))
+        if xi > 1000.:
+            return np.inf
+        return xi
+
+    def correlation_function(self, op_i, i, op_j, j):
+        """Correlation function between two distant operators on sites i < j.
+
+        Note: calling this function in a loop over `j` is inefficient for large j >> i.
+        The optimization is left as an exercise to the user.
+        Hint: Re-use the partial contractions up to but excluding site `j`.
+        """
+        assert i < j
+        theta = self.get_theta1(i) # vL i vR
+        C = np.tensordot(op_i, theta, axes=(1, 1)) # i [i*], vL [i] vR
+        C = np.tensordot(theta.conj(), C, axes=([0, 1], [1, 0]))  # [vL*] [i*] vR*, [i] [vL] vR
+        for k in range(i + 1, j):
+            k = k % self.L
+            B = self.Bs[k]  # vL k vR
+            C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] k vR
+            C = np.tensordot(B.conj(), C, axes=([0, 1], [0, 1])) # [vL*] [k*] vR*, [vR*] [k] vR
+        j = j % self.L
+        B = self.Bs[j]  # vL k vR
+        C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] j vR
+        C = np.tensordot(op_j, C, axes=(1, 1))  # j [j*], vR* [j] vR
+        C = np.tensordot(B.conj(), C, axes=([0, 1, 2], [1, 0, 2])) # [vL*] [j*] [vR*], [j] [vR*] [vR]
+        return C
+
+    def evolve_v(self, other):
+        """
+        apply the evolution operator due to V(R) to the wavefunction in the TT format
+        
+                   |   |   
+                ---V---V---
+                   |   |
+                   |   |
+                ---A---A---
+            = 
+                   |   |
+                ===B===B===
+                
+        .. math::
+            
+            U_{\beta_i \beta_{i+1}}^{j_i} A_{\alpha_i \alpha_{i+1}}^{j_i} = 
+            A^{j_i}_{\beta_i \alpha_i, \beta_{i+1} \alpha_{i+1}}
+            
+        Parameters
+        ----------
+        other : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        MPS object.
+
+        """
+        assert(other.L == self.L)
+        assert(other.dims == self.dims)
+        
+        As = []
+        for n in range(self.L):
+        
+            al, d, ar = self.factors[n].shape 
+            bl, d, br = other.factors[n].shape 
+            
+            c = np.einsum('aib, cid -> acibd', other.factors[n], self.factors[n])
+            c.reshape((al * bl, d, ar * br))
+            As.append(c.copy())
+        
+        return MPS(As)
+    
+    def evolve_t(self):
+        pass
+        
+        
+
+    def build_U_mpo(self):
+        # build MPO representation of the short-time propagator
         pass
     
     def run(self, dt=0.1, Nt=10):
         pass
 
-    def obs_local(self, e_op, n):
+    # def obs_local(self, e_op, n):
+    #     pass
+    
+    def apply_mpo(self):
+        pass
+    
+    def compress(self, rank):
+        # compress the MPS to a lower rank
+        pass
         
 
 def build_mpo_list(single_mpo, L, regularize=False):
@@ -739,7 +909,7 @@ def compress(B_list, s_list, chi_max):
 
         # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
 
-        B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
+        B_list[i1] = np.reshape(X[:,:chi2], (chi1, d1, chi2))
 
         B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
 
@@ -812,7 +982,48 @@ def initial_state(dims, chi_max,L,dtype=complex):
 
     return B_list,s_list
 
+def split_truncate_theta(theta, chi_max, eps):
+    """Split and truncate a two-site wave function in mixed canonical form.
 
+    Split a two-site wave function as follows::
+          vL --(theta)-- vR     =>    vL --(A)--diag(S)--(B)-- vR
+                |   |                       |             |
+                i   j                       i             j
+
+    Afterwards, truncate in the new leg (labeled ``vC``).
+
+    Parameters
+    ----------
+    theta : np.Array[ndim=4]
+        Two-site wave function in mixed canonical form, with legs ``vL, i, j, vR``.
+    chi_max : int
+        Maximum number of singular values to keep
+    eps : float
+        Discard any singular values smaller than that.
+
+    Returns
+    -------
+    A : np.Array[ndim=3]
+        Left-canonical matrix on site i, with legs ``vL, i, vC``
+    S : np.Array[ndim=1]
+        Singular/Schmidt values.
+    B : np.Array[ndim=3]
+        Right-canonical matrix on site j, with legs ``vC, j, vR``
+    """
+    chivL, dL, dR, chivR = theta.shape
+    theta = np.reshape(theta, [chivL * dL, dR * chivR])
+    X, Y, Z = svd(theta, full_matrices=False)
+    # truncate
+    chivC = min(chi_max, np.sum(Y > eps))
+    assert chivC >= 1
+    piv = np.argsort(Y)[::-1][:chivC]  # keep the largest `chivC` singular values
+    X, Y, Z = X[:, piv], Y[piv], Z[piv, :]
+    # renormalize
+    S = Y / np.linalg.norm(Y)  # == Y/sqrt(sum(Y**2))
+    # split legs of X and Z
+    A = np.reshape(X, [chivL, dL, chivC])
+    B = np.reshape(Z, [chivC, dR, chivR])
+    return A, S, B
 
 
 

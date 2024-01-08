@@ -15,6 +15,45 @@ import heapq
 # def integrate(f, a, b, **args):
 #     return integrate.quad(f, a, b, args=args)
 
+def discretize(a=0, b=1, l=4, endpoints=True):
+    """
+    Create a uniform math with size with level l in the range [a, b]
+    
+    mesh size is :math:`(b-a)/2^l`
+
+    Parameters
+    ----------
+    a : TYPE, optional
+        DESCRIPTION. The default is 0.
+    b : TYPE, optional
+        DESCRIPTION. The default is 1.
+    l : TYPE, optional
+        DESCRIPTION. The default is 4.
+    endpoints : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    if endpoints:
+        return np.linspace(a, b, 2**l+1, endpoint=True)
+    else:
+        return np.linspace(a, b, 2**l, endpoint=False)[1:]
+    
+    # if startpoint is False and endpoint is False:
+    #     return x[1:-1]
+
+    # elif startpoint and endpoint is False:
+    #     return x
+    
+    # elif startpoint and endpoint:
+        
+    #     return np.linspace(a, b, 2**l+1, endpoint=True)
+    
+
 def polar2cartesian(r, theta):
     """
     transform polar coordinates to Cartesian

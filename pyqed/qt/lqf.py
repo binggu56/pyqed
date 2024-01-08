@@ -16,6 +16,10 @@ import numba
 import sys 
 import math 
 
+from pyqed import Result
+import matplotlib.pyplot as plt
+
+
 
 
 bohr_angstrom = 0.52917721092
@@ -23,19 +27,55 @@ hartree_wavenumber = 219474.63
 
 #hartree_wavenumber = scipy.constants.value(u'hartree-inverse meter relationship') / 1e2 
 
+class ResultQT(Result):
+    def __init__(self, ntraj, ndim, nstates, **kwargs):
+        super(ResultQT, self).__init__(**kwargs)
+        self.ntraj = ntraj
+        self.ndim = ndim
+        self.nstates = nstates
+        
+        self.c = None
+        self.xlist = None
+        self.p = None
+        self.r = None
+        self.rholist = None # electronic density matrices
+    
+    def expect(self):
+        pass
+    
+    def plot_traj(self, d=0):
+        
+
+        
+        if self.xlist is None:
+            raise ValueError('No data for trajectories.')
+        
+        fig, ax = plt.subplots()
+        for n in range(10):
+            ax.plot(self.times, [x[n, d] for x in self.xlist], 'k', lw=1)
+        
+        return 
+    
+    def plot_rdm(self):
+        # plot the electronic density matrices including populations and coherences
+        fig, ax = plt.subplots()
+        
+        for j in range(self.nstates):
+            ax.plot(self.times, [rho[j, j] for rho in self.rholist])
+    
 
 def M1mat(a, Nb):
     """
     matrix representation of position operators in harmonic oscilator eigenstates
     
     .. math::
-        x^n_{ij} = \braket{i| x^n | j}
+        [x^n]_{ij} = \braket{i| x^n | j}
 
     Parameters
     ----------
-    a : TYPE
-        DESCRIPTION.
-    Nb : TYPE
+    a : float
+        Gaussian width parameter, :math:`\alpha = m \omega`
+    Nb : int
         DESCRIPTION.
 
     Returns
@@ -262,22 +302,27 @@ def Vint(a,Q):
         
     return v0 
 
-def Vb(Q,xAve):
+def Vb(Q, szAve, xAve=None):
     """
     bath potential and force for one configuration 
-    harmonic bath     
-    """
-    omegac = 2.5 # cutoff frequency 
-    
-    omega = np.linspace(0.2, omegac, Ndim)
+    harmonic bath
 
-    v0 = np.zeros(Ntraj)
-    dv = np.zeros((Ntraj,Ndim))
+    Parameters
+    ==========
+    omega: array of ndim
+        bath frquencies     
+    """
+    # omegac = 2.5 # cutoff frequency 
     
-    for i in range(Ntraj):
-        for j in range(Ndim):
-            v0 += amy[j] * omega[j]**2 * Q[i,j]**2/2.0  
-            dv[i,j] = amy[j] * omega[j]**2 * Q[i,j] 
+    # omega = np.linspace(0.2, omegac, Ndim)
+
+    v0 = np.zeros(ntraj)
+    dv = np.zeros((ntraj, ndim))
+    
+    for i in range(ntraj):
+        for j in range(ndim):
+            v0 += mass[j] * omega[j]**2 * Q[i,j]**2/2.0 + szAve * g[j] * Q[i, j]  
+            dv[i,j] = mass[j] * omega[j]**2 * Q[i,j] + szAve * g[j]
 
     return v0,dv 
 
@@ -303,8 +348,10 @@ def Vb(Q,xAve):
 # @numba.jit
 def LQF(x,w):
     
-    ndim = Ndim = x.shape[-1]
-
+    ntraj, ndim = x.shape
+    Ndim = ndim
+    Ntraj = ntraj 
+    
     # C_{j \mu} = -1/2 \pa_\mu f_j
     c = np.zeros((ndim+1, ndim))
     for j in range(ndim):
@@ -313,7 +360,7 @@ def LQF(x,w):
      
     S = np.zeros((Ndim+1,Ndim+1))
  
-    for i in range(Ntraj):
+    for i in range(ntraj):
  
         f = np.array([*x[i,:],1.0])
  
@@ -350,7 +397,7 @@ def LQF(x,w):
         for j in range(Ndim):
             for k in range(Ndim):
         
-                du[i,j] -= (2.0 * r[i,k] * dr[j,k])/ (2.0 * amy[k])
+                du[i,j] -= (2.0 * r[i,k] * dr[j,k])/ (2.0 * mass[k])
   
     return r,du
 
@@ -429,34 +476,45 @@ class NAQT:
     The sys-bath state is represented by an ensemble of quantum trajectories (x, p, r)
     and expansion coefficients C(R)
     """
-    def __init__(self, ntraj, ndim, nstates=1):
+    def __init__(self, ntraj, ndim, nstates=1, mass=None):
         self.ntraj = ntraj
         self.ndim = ndim
         self.nstates = nstates
 
-        self.weights = self.w = None
+        # self.weights = self.w = None
+        self.w = np.array([1./ntraj] * ntraj)
+        
+        if mass is None:
+            mass = np.array([1] * ndim)
+        self.mass = mass
     
-    def init_sampling(self, a, x0, p0):
+    def sample(self, a, x0=0, p0=0):
         ndim = self.ndim 
         ntraj = self.ntraj
         
-        x = np.random.randn((ntraj, ndim)) 
+        # if isinstance(x0, float):
+        #     x0 = [x0] * ndim
+        
+        x = np.random.randn(ntraj, ndim) 
 
         for j in range(ndim):            
             x[:,j] = x[:,j] / np.sqrt(2.0 * a[j]) + x0[j]
             
-        print('trajectory range {}, {}'.format(min(x),max(x)))
+        # print('trajectory range {}, {}'.format(min(x),max(x)))
         
         p = np.zeros((ntraj, ndim))
-        p = p0
+        # p = p0
 
-        r = np.zeros((Ntraj,Ndim))
+        r = np.zeros((ntraj, ndim))
 
         for j in range(ndim):
             r[:,j] = - a[j] * (x[:,j] - x0[j]) 
         
         # weights
-        self.w = np.array([1./ntraj] * ntraj)
+
+        
+        c = np.zeros((ntraj, nstates), dtype=complex)
+        c[:, 1] = 1. 
         
         return x, p, r, c
     
@@ -468,34 +526,262 @@ class NAQT:
             anm += np.vdot(c[k,:], c[k,:]).real * self.w[k]
         return anm
 
-    def xAve(self, c, y):
+    def obs(self, s, c):
+        
+        # confirm s is an system operator
+        assert(s.shape == (self.nstates, self.nstates))
+        
+        return np.einsum('km, mn, kn, k ->', c.conj(), s, c, self.w).real
+
+
+    def expect(self, op, c):
         """
-        compute expectation value of x     
+        compute expectation value of an system operator      
         """
         w = self.w 
-        M = self.nstates
-        
-        Xmat = M1mat(ax, M)
+        # nstates = self.nstates        
+        # Xmat = M1mat(ax, M)
+        # x_ave = 0.0+0.0j    
+        # for k in range(self.ntraj):
+        #     for m in range(M):
+        #         for n in range(M):
+        #             x_ave += Xmat[m,n] * np.conjugate(c[k,m]) * c[k,n] * w[k]
+        xAve = np.einsum('mn, km, kn, k', op, c.conj(), c, w)
+        return np.real_if_close(xAve)
     
-        x_ave = 0.0+0.0j    
-        for k in range(self.ntraj):
-            for m in range(M):
-                for n in range(M):
-                    x_ave += Xmat[m,n] * np.conjugate(c[k,m]) * c[k,n] * w[k]
-        
-        return x_ave.real 
+    def xAve(self, x):
+        pass
     
     # @numba.autojit 
     def rdm(self, c):
         """
             compute electronic reduced density matrix elements 
         """
+        w = self.w 
         # nstates = self.nstates
         # rho = np.zeros((nstates, nstates),dtype=np.complex128)
         
         rho = np.einsum('ka, kb, k -> ab', c, c.conj(), w)
         
         return rho 
+
+    def run(self, dt=0.001, nt=10, nout=1, e_ops=[], friction=0,\
+            t0=0):
+        
+        # H = self.H  
+        
+        mass = self.mass 
+        a = omega * mass
+        w = self.w
+        
+        # initial conditions
+        # x, p, c = x0.copy(), p0.copy(), c0.copy()
+        x0, p0, r0, c0 = self.sample(a, x0=-1/omega, p0=[0]*ndim)
+        #TODO: use mass-scaled coordinates
+        x = x0.copy()
+        p = p0.copy()
+        r = r0.copy()
+        c = c0.copy()        
+        # classical and quantum force 
+        
+        szAve = self.obs(sz, c)
+        v0, dv = Vb(x, szAve)
+        
+        ry, du = LQF(x, w)
+
+        cold = c0
+        dcdt = get_dcdt(H, c, x,ry,p, w, mass, szAve)
+        c  += dcdt * dt
+        
+        rho = self.rdm(c)
+        xlist = [x0]
+        plist = [p0]
+        rholist = [rho.copy()]
+        clist = [c0]
+        
+        result = ResultQT(ntraj, ndim, nstates=nstates, dt=dt, Nt=nt)
+        
+        t = t0
+        dt2 = dt/2
+        
+        for k in range(nt//nout):
+            
+            for k1 in range(nout):    
+                
+                t += dt 
+    
+                p += (- dv - du) * dt2 - friction * p * dt2   
+                
+                for j in range(ndim):
+                    x[:,j] +=  p[:,j] * dt/mass[j] 
+    
+                # force field 
+                ry, du = LQF(x, w)
+                
+                szAve = self.obs(sz, c)
+                v0, dv = Vb(x, szAve)
+    
+                p += (- dv - du) * dt2 - friction * p * dt2 
+                
+                # renormalization 
+    
+                # anm = norm(c,w)
+                # c /= np.sqrt(anm)
+                
+                # update c 
+               
+                dcdt = get_dcdt(H, c, x, ry, p, w, mass, szAve)
+                cnew = cold + dcdt * dt * 2.0
+                cold = c 
+                c = cnew
+    
+                
+                #  output data for each timestep 
+            #    d = c
+            #    for k in range(Ntraj):
+            #        for i in range(M):
+            #            d[k,i] = np.exp(-1j*t*H[i,i])*c[k,i]
+    
+    
+                # fx.write('{} {} \n'.format(t, szAve))
+                       
+                # f.write(fmt.format(t,*x[0:nout,0]))
+    
+                # fnorm.write(' {} {} \n'.format(t,anm))
+    
+                # output density matrix elements 
+                rho = self.rdm(c)
+                rholist.append(rho.copy())
+                xlist.append(x.copy())
+                clist.append(c.copy())
+                plist.append(p.copy())
+            
+
+            # fden.write(' {} {} {} {} {}\n'.format(t,*rho.flatten()))
+            
+        #    Ek = np.dot(py*py,w)/2./amy  
+        #    Ev = np.dot(v0,w) 
+        #    Eu = Eu 
+        #    Etot = Ek + Ev + Eu
+        #    
+        #    fe.write('{} {} {} {} {} \n'.format(t,Ek,Ev,Eu,Etot))
+        #
+        #
+        #print('The total energy = {} Hartree. \n'.format(Etot))
+
+        # print trajectory and coefficients 
+        # for k in range(ntraj):
+        #     fc.write( '{} {} {} {} \n'.format(x[k], c[k,0],c[k,-2],c[k,-1]))
+
+        # fe.close()
+        # f.close() 
+        # fc.close()
+        # fx.close()
+        
+        result.xlist = xlist
+        result.p = plist 
+        result.rholist = rholist 
+        
+        return result
+    
+    # def run(self, dt=0.001, nt=10):
+        
+    #     a = omega * self.mass
+    #     w = self.w 
+    #     mass = self.mass
+    #     ndim = self.ndim
+        
+    #     x, p, r, c = self.sample(a, x0=[0] * ndim, p0=[0]*ndim)
+
+    #     szAve = self.expect(sz, c)
+    #     v0, dv = Vb(x, szAve)
+    #     r, du = LQF(x, w)
+
+    #     cold = c 
+    #     dcdt = prop_c(c, x, r, p, w, szAve)
+    #     c = c + dcdt * dt
+        
+    #     result = ResultQT(ntraj, ndim, nstates=nstates, dt=dt, Nt=nt)
+
+        
+    #     print('time range for propagation is [0,{}]'.format(nt*dt))
+    #     print('timestep  = {}'.format(dt))
+        
+    #     print(dv.shape, du.shape, fric_cons, p.shape)
+        
+    #     t = 0
+    #     dt2 = dt/2
+    #     for k in range(nt):
+            
+    #         t += dt 
+
+    #         p += (- dv - du) * dt2 - fric_cons * p * dt2   
+            
+    #         # for j in range(ndim):
+    #         #     x[:,j] +=  p[:,j] * dt/mass[j] 
+            
+    #         x += np.einsum('nj, j -> nj', p, 1/mass) * dt
+            
+    #         # force field 
+    #         r, du = LQF(x, w)
+                
+    #         szAve = self.expect(sz, c)
+    #         v0, dv = Vb(x, szAve)
+            
+
+
+    #         p += (- dv - du) * dt2 - fric_cons * p * dt2 
+            
+    #         # renormalization 
+
+    #         anm = norm(c,w)
+    #         c /= np.sqrt(anm)
+            
+    #         # update c 
+           
+    #         dcdt = prop_c(c, x, r, p, w, szAve)
+
+    #         cnew = cold + dcdt * dt * 2.0
+    #         cold = c 
+    #         c = cnew
+
+            
+    #         #  output data for each timestep 
+    #     #    d = c
+    #     #    for k in range(Ntraj):
+    #     #        for i in range(M):
+    #     #            d[k,i] = np.exp(-1j*t*H[i,i])*c[k,i]
+
+
+    #         fx.write('{} {} \n'.format(t, szAve))
+                   
+    #         f.write(fmt.format(t, *x[0:nout,0]))
+
+    #         fnorm.write(' {} {} \n'.format(t,anm))
+
+    #         # output density matrix elements 
+    #         rho = qt.rdm(c)
+    #         fden.write(' {} {} \n'.format(t,rho))
+            
+    #     #    Ek = np.dot(py*py,w)/2./amy  
+    #     #    Ev = np.dot(v0,w) 
+    #     #    Eu = Eu 
+    #     #    Etot = Ek + Ev + Eu
+    #     #    
+    #     #    fe.write('{} {} {} {} {} \n'.format(t,Ek,Ev,Eu,Etot))
+    #     #
+    #     #
+    #     #print('The total energy = {} Hartree. \n'.format(Etot))
+
+    #     # print trajectory and coefficients 
+    #     for k in range(ntraj):
+    #         fc.write( '{} {} {} {} \n'.format(x[k], c[k,0],c[k,-2],c[k,-1]))
+
+    #     fe.close()
+    #     f.close() 
+    #     fc.close()
+    #     fx.close()
+        
 
 def norm(c, w):
     
@@ -509,15 +795,14 @@ def norm(c, w):
 # for nuclear DOF  : an ensemble of trajectories 
 # for electron DOF : for each trajectory associate a complex vector C of dimension nstates 
    
-ntraj = Ntraj = 1024
-nstates = M = 2
-nfit = 4
-ax = 1.0 # width of the GH basis 
+
+# nfit = 4
+# ax = 1.0 # width of the GH basis 
    
   
-x0 = 0.5
+# x0 = 0.5
 # initial conditions for c 
-c = np.zeros((Ntraj,M),dtype=np.complex128)
+# c = np.zeros((Ntraj,M),dtype=np.complex128)
 
 # mixture of ground and first excited state
 
@@ -527,69 +812,65 @@ c = np.zeros((Ntraj,M),dtype=np.complex128)
 #    c[:,i] = 0.0+0.0j
 
 # coherent state 
-z = 1.0/np.sqrt(2.0) * x0 
-for i in range(M):
-    c[:,i] = np.exp(-0.5 * np.abs(z)**2) * z**i / np.sqrt(math.factorial(i))
+# z = 1.0/np.sqrt(2.0) * x0 
+# for i in range(M):
+#     c[:,i] = np.exp(-0.5 * np.abs(z)**2) * z**i / np.sqrt(math.factorial(i))
 
-print('initial occupation \n',c[0,:])
-print('trace of density matrix',np.vdot(c[0,:], c[0,:]))
+# print('initial occupation \n',c[0,:])
+# print('trace of density matrix',np.vdot(c[0,:], c[0,:]))
 # ---------------------------------
 # initial conditions for QTs     
-ndim = Ndim = 2 # dimensionality of bath 
-y0 = np.zeros(Ndim)
-ay0 = np.array([4.0, 4.0])
+# ndim = Ndim = 2 # dimensionality of bath 
+# y0 = np.zeros(Ndim)
+# ay0 = np.array([4.0, 4.0])
 
-amy = np.array([10.0, 10.0])
+# amy = np.array([10.0, 10.0])
 
-y = np.random.randn(ntraj, ndim) 
+# y = np.random.randn(ntraj, ndim) 
 
-for j in range(Ndim):            
-    y[:,j] = y[:,j] / np.sqrt(2.0 * ay0[j]) + y0[j]
+# for j in range(Ndim):            
+#     y[:,j] = y[:,j] / np.sqrt(2.0 * ay0[j]) + y0[j]
     
-#print('trajectory range {}, {}'.format(min(y),max(y)))
-py = np.zeros((Ntraj,Ndim))
-ry = np.zeros((Ntraj,Ndim))
+# #print('trajectory range {}, {}'.format(min(y),max(y)))
+# py = np.zeros((Ntraj,Ndim))
+# ry = np.zeros((Ntraj,Ndim))
 
-for j in range(Ndim):
-    ry[:,j] = - ay0[j] * (y[:,j] - y0[j]) 
+# for j in range(Ndim):
+#     ry[:,j] = - ay0[j] * (y[:,j] - y0[j]) 
 
-w = np.array([1./Ntraj]*Ntraj)
+# w = np.array([1./Ntraj]*Ntraj)
 
 # -------------------------------
 
-amx = 1.0 
+# amx = 1.0 
 
-f_MSE = open('rMSE.out','w')
-nout = 20       # number of trajectories to print 
-fmt =  ' {}' * (nout+1)  + '\n'  
-Eu = 0.  
-
-
-fric_cons = 0.0      # friction constant  
+# f_MSE = open('rMSE.out','w')
+# nout = 20       # number of trajectories to print 
+# fmt =  ' {}' * (nout+1)  + '\n'  
+# Eu = 0.  
 
 
-Nt = 200
-dt = 0.001
-dt2 = dt/2.0 
-t = 0.0 
+# fric_cons = 0.0      # friction constant  
 
-print('time range for propagation is [0,{}]'.format(Nt*dt))
-print('timestep  = {}'.format(dt))
+
+# Nt = 200
+# dt = 0.001
+# dt2 = dt/2.0 
+# t = 0.0 
+
+
     
 # construct the Hamiltonian matrix for the system
 # In the diabatic representation, H is the same for all trajectories whereas
 # for adiabatic representation, H parameterically depends on the positions of each trajectory
 
-from pyqed import pauli 
-from pyqed.units import * 
 
-s0, sx, sy, sz = pauli()
-omega0 = 1 * electronvolt
-H = -0.5 * omega0 * sz
+# omega0 = 1 * electronvolt
+# H = -0.5 * omega0 * sz
 
-print('Hamiltonian matrix in DOF x = \n')
-print(H)
-print('\n')
+# print('Hamiltonian matrix in DOF x = \n')
+# print(H)
+# print('\n')
 
   
         
@@ -603,7 +884,7 @@ print('\n')
 #     return anm
 
 # @numba.autojit
-def fit_c(c, x, deg=1):
+def fit_c(c, x, w, deg=1):
     """
     global approximation of :math:`C_\alpha(R)` to obtain the derivative C'', C'    
     
@@ -684,139 +965,152 @@ def fit_c(c, x, deg=1):
 
 def linear(x):
     return np.append(x, [1.0])
-    
+
+def H(x, szAve):
+    h = 0.5 * sx 
+    for i in range(ndim):
+        h += (sz  - szAve * s0)* g[i] * x[i] #- np.eye(nstates) * g[i] * x[i] * szAve
+    return h
+
 # @numba.autojit 
-def prop_c(H,c,y,ry,py,x_ave):
+def prop_c(c, x, r, p, w, szAve):
     
     ntraj, nstates = c.shape
     
-    dc, ddc = fit_c(c,y)
+    dc, ddc = fit_c(c, x, w)
+    
+    # M = nstates
+
+    dcdt = np.zeros([ntraj, nstates], dtype=np.complex128)
+        
+    # Vcoup = Vint(a=1, Q)
+    # X2 = M2mat(1, nstates)
+    
+    for k in range(ntraj):
+        
+        hk = Hs(x[k, :], szAve)
+        
+        # tmp = (H + Vp).dot(c[k,:]) - ddc[k,:]/2.0/amy - dc[k,:] * ry[k]/amy + Va * c[k,:]
+        tmp = hk.dot(c[k,:])  - dc[k,:,:] @ (r[k,:]/mass)
+
+        dcdt[k,:] = -1j * tmp
+       
+    return dcdt
+
+def get_dcdt(H,c,y,ry,py, w, mass, *args):
+    
+    ntraj, nstates = c.shape
+    
+    dc, ddc = fit_c(c,y, w)
     
     # M = nstates
 
     dcdt = np.zeros([ntraj, nstates], dtype=np.complex128)
     
-    eps = 0.20 # nonlinear coupling Vint = eps*x**2*y
+    # eps = 0.20 # nonlinear coupling Vint = eps*x**2*y
     
     # Vcoup = Vint(a=1, Q)
-    X2 = M2mat(1, nstates)
+    # X2 = M2mat(1, nstates)
     
-    for k in range(Ntraj):
+    for k in range(ntraj):
         
-        Vp = eps * y[k] * X2 
-        
-        # anharmonic term in the bath potential 
-        Va = 0.0 
+        hk = H(y[k], args)
         
         # tmp = (H + Vp).dot(c[k,:]) - ddc[k,:]/2.0/amy - dc[k,:] * ry[k]/amy + Va * c[k,:]
-        tmp = (H + Vp).dot(c[k,:])  - dc[k,:,:] @ ry[k,:]/amy
+        
+        tmp = hk.dot(c[k])
+        
+        for d in range(ndim):
+            tmp += (- ddc[k, :, d]/2. - dc[k,:, d] * ry[k,d])/mass[d] 
 
         dcdt[k,:] = -1j * tmp
        
     return dcdt
     
 # # @numba.autojit 
-def xAve(c,y,w):
-    """
-    compute expectation value of x     
-    """
-    Xmat = M1mat(ax,M)
+# def xAve(c,y,w):
+#     """
+#     compute expectation value of x     
+#     """
+#     Xmat = M1mat(ax,M)
 
-    x_ave = 0.0+0.0j    
-    for k in range(Ntraj):
-        for m in range(M):
-            for n in range(M):
-                x_ave += Xmat[m,n] * np.conjugate(c[k,m]) * c[k,n] * w[k]
+#     x_ave = 0.0+0.0j    
+#     for k in range(Ntraj):
+#         for m in range(M):
+#             for n in range(M):
+#                 x_ave += Xmat[m,n] * np.conjugate(c[k,m]) * c[k,n] * w[k]
     
-    return x_ave.real 
+#     return x_ave.real 
     
-# propagate the QTs for y 
+
+
+
 
 
 # update the coeffcients for each trajectory 
-fmt_c = ' {} '* (M+1)
+# fmt_c = ' {} '* (M+1)
   
-f = open('traj.dat','w')
-fe = open('en.out','w')
-fc = open('c.dat','w')
-fx = open('xAve.dat','w')
-fnorm = open('norm.dat', 'w')
-fden = open('den.dat','w')
+# f = open('traj.dat','w')
+# fe = open('en.out','w')
+# fc = open('c.dat','w')
+# fx = open('xAve.dat','w')
+# fnorm = open('norm.dat', 'w')
+# fden = open('den.dat','w')
 
-qt = NAQT(ntraj, ndim, nstates=nstates)
 
-v0, dv = Vb(y,x0)
-ry, du = LQF(y,w)
+from pyqed.phys import discretize
 
-cold = c 
-dcdt = prop_c(H,c,y,ry,py,x0)
-c = c + dcdt * dt
+def J(omega, reorg=0, cutoff=1):
+    return 2 * reorg * omega * cutoff/(omega**2 + cutoff**2) 
 
-for k in range(Nt):
+def ohmic(omega, alpha=1, cutoff=2):
+    """
     
-    t = t + dt 
 
-    py += (- dv - du) * dt2 - fric_cons * py * dt2   
+    Parameters
+    ----------
+    omega : TYPE
+        DESCRIPTION.
+    alpha : TYPE
+        dimensionless Kondo parameter that characterizes the system–bath 
+        coupling strength
+    cutoff : float
+        the characteristic frequency of the bath
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return np.pi/2 * alpha * omega * np.exp(-omega/cutoff)
+
+if __name__=='__main__':
     
-    for j in range(Ndim):
-        y[:,j] +=  py[:,j]*dt/amy[j] 
-
-    # force field 
-    ry, du = LQF(y,w)
-        
-    x_ave = xAve(c,y,w)
-    v0, dv = Vb(y,x_ave)
-
-    py += (- dv - du) * dt2 - fric_cons * py * dt2 
+    from pyqed import pauli 
+    from pyqed.units import * 
     
-    # renormalization 
-
-    anm = norm(c,w)
-    c /= np.sqrt(anm)
+    s0, sx, sy, sz = pauli()
     
-    # update c 
-   
-    dcdt = prop_c(H,c,y,ry,py,x_ave)
-    cnew = cold + dcdt * dt * 2.0
-    cold = c 
-    c = cnew
-
+    # spin-boson model
     
-    #  output data for each timestep 
-#    d = c
-#    for k in range(Ntraj):
-#        for i in range(M):
-#            d[k,i] = np.exp(-1j*t*H[i,i])*c[k,i]
-
-
-    fx.write('{} {} \n'.format(t,x_ave))
-           
-    f.write(fmt.format(t,*y[0:nout,0]))
-
-    fnorm.write(' {} {} \n'.format(t,anm))
-
-    # output density matrix elements 
-    rho = qt.rdm(c)
-    fden.write(' {} {} \n'.format(t,rho))
+    ntraj = 256
+    nstates = M = 2
+    ndim = 32
     
-#    Ek = np.dot(py*py,w)/2./amy  
-#    Ev = np.dot(v0,w) 
-#    Eu = Eu 
-#    Etot = Ek + Ev + Eu
-#    
-#    fe.write('{} {} {} {} {} \n'.format(t,Ek,Ev,Eu,Etot))
-#
-#
-#print('The total energy = {} Hartree. \n'.format(Etot))
-
-# print trajectory and coefficients 
-for k in range(Ntraj):
-    fc.write( '{} {} {} {} \n'.format(y[k], c[k,0],c[k,-2],c[k,-1]))
-
-fe.close()
-f.close() 
-fc.close()
-fx.close()
+    # alpha = 0.4 # 1? is the critial point
+    cutoff = 2
+    omega, g = discretize(ohmic, a=0, b= 8 * cutoff, nmodes=ndim, mesh='log')
+    mass = [1] * ndim
+    print('mode frequencies = ', omega)
+    print('coupling strength = ', g)
+    
+    print(ntraj, ndim)
+    qt = NAQT(ntraj=ntraj, ndim=ndim, nstates=nstates)
+    
+    result = qt.run(dt=0.005, nt=400)
+    result.plot_traj(d=0)
+    result.plot_rdm()
 
 
 #a, x0, De = 1.02, 1.4, 0.176/100 

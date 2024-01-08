@@ -13,10 +13,8 @@ From Qutip
 #
 
 import numpy as np
-from lime.units import au2k, au2wavenumber
-from lime.mol import Mol
-from lime.phys import pauli
-from lime.superoperator import left, right
+from pyqed import au2k, au2wavenumber, Mol, pauli
+from pyqed.superoperator import left, right
 
 def state_number_enumerate(dims, excitations=None, state=None, idx=0):
     """
@@ -142,9 +140,10 @@ def _calc_matsubara_params(N_exp, coup_strength, cut_freq, temperature):
 if __name__ == '__main__':
     N_c = 4
     N_m = 2
-    N_he, he2idx, idx2he = enr_state_dictionaries([N_c + 1]*N_m , N_c)
+    N_he, he2idx, idx2he = enr_state_dictionaries([N_c + 1]*3 , N_c)
     print(N_he)
     print(he2idx)
+    print(idx2he)
 
     s0, sx, sy, sz = pauli()
     mol = Mol(sz, dip=sx)

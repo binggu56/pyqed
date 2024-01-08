@@ -102,7 +102,7 @@ from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
 class JahnTeller(LVC):
     """
-    E \otimes e Jahn-Teller model with two degenerate modes and two degenerate electronic states
+    :math:`E \otimes e` Jahn-Teller model with two degenerate modes and two degenerate electronic states
     (+ the ground state)
     """
     def __init__(self, E, omega, kappa, truncate=24):

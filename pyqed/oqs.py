@@ -860,20 +860,20 @@ def discretize(J, a, b, nmodes, mesh='linear'):
     elif mesh == 'log':
         
         if a == 0: a += 1e-3
-        y = np.logspace(a, np.log10(b), nmodes)
+        y = np.logspace(a, np.log10(b), nmodes+1)
     
     x = np.zeros(nmodes)
     g = np.zeros(nmodes)
     
     
-    for n in range(nmodes-1):
+    for n in range(nmodes):
          g[n] = integrate.quad(J, y[n], y[n+1])[0]
          x[n] = integrate.quad(lambda x: x * J(x), y[n], y[n+1])[0]
          x[n] /= g[n]
     
     # last interval from y[-1] to b 
-    g[-1] = integrate.quad(J, y[-1], b)[0]
-    x[-1] = integrate.quad(lambda x: x * J(x), y[-1], b)[0]/g[-1]
+    # g[-1] = integrate.quad(J, y[-1], b)[0]
+    # x[-1] = integrate.quad(lambda x: x * J(x), y[-1], b)[0]/g[-1]
          
     return x, g
 

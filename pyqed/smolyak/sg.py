@@ -31,15 +31,125 @@ Created on Sun Oct 22 16:12:16 2023
 #    Jochen Garcke,
 #    A sparse grid tutorial.
 #
+import itertools, operator
+
 import math, copy
 import numpy as np
 try:
     import proplot as plt
 except:
     import matplotlib.pyplot as plt
+import logging
 
 
-def discretize(a=0, b=1, level=5, border=False):
+def balls_in_boxes(n, m, minimum=1):
+    l = [0 for i in range(0, m)]
+    result = []
+    put_balls_in_boxes(n, m-1, l, 0, result, minimum)
+    return result
+    
+def put_balls_in_boxes(n, m, l, idx, result, minimum):
+    if m == 0:
+        l[idx] = n
+        result.append(l.copy())
+
+        return
+    
+    for i in range(minimum, n-minimum+1):
+        l[idx] = i
+        put_balls_in_boxes(n-i, m-1, l, idx+1, result, minimum)
+        
+
+def state_number_enumerate(dims, excitations=None, state=None, idx=0):
+    """
+    An iterator that enumerate all the state number arrays (quantum numbers on
+    the form [n1, n2, n3, ...]) for a system with dimensions given by dims.
+
+    Example:
+
+        >>> for state in state_number_enumerate([2,2]):
+        >>>     print(state)
+        [ 0  0 ]
+        [ 0  1 ]
+        [ 1  0 ]
+        [ 1  1 ]
+
+    Parameters
+    ----------
+    dims : list or array
+        The quantum state dimensions array, as it would appear in a Qobj.
+
+    state : list
+        Current state in the iteration. Used internally.
+
+    excitations : integer (None)
+        Restrict state space to states with excitation numbers below or
+        equal to this value.
+
+    idx : integer
+        Current index in the iteration. Used internally.
+
+    Returns
+    -------
+    state_number : list
+        Successive state number arrays that can be used in loops and other
+        iterations, using standard state enumeration *by definition*.
+
+    """
+
+    if state is None:
+        state = np.zeros(len(dims), dtype=int)
+
+    if excitations and sum(state[0:idx]) > excitations:
+        pass
+    elif idx == len(dims):
+        if excitations is None:
+            yield np.array(state)
+        else:
+            yield tuple(state)
+    else:
+        for n in range(1, dims[idx]+1):
+            state[idx] = n
+            for s in state_number_enumerate(dims, excitations, state, idx + 1):
+                yield s
+
+
+#
+# Excitation-number restricted (enr) states
+#
+def enr_state_dictionaries(dims, excitations):
+    """
+    Return the number of states, and lookup-dictionaries for translating
+    a state tuple to a state index, and vice versa, for a system with a given
+    number of components and maximum number of excitations.
+
+    Parameters
+    ----------
+    dims: list
+        A list with the number of states in each sub-system.
+
+    excitations : integer
+        The maximum numbers of dimension
+
+    Returns
+    -------
+    nstates, state2idx, idx2state: integer, dict, dict
+        The number of states `nstates`, a dictionary for looking up state
+        indices from a state tuple, and a dictionary for looking up state
+        state tuples from state indices.
+    """
+    nstates = 0
+    state2idx = {}
+    idx2state = {}
+
+    for state in state_number_enumerate(dims, excitations):
+        state2idx[state] = nstates
+        idx2state[nstates] = state
+        nstates += 1
+
+    return nstates, state2idx, idx2state
+
+def discretize(a=0, b=1, level=5, endpoints=True):
     """
     uniform grid with 2^l points 
     
@@ -72,12 +182,21 @@ def discretize(a=0, b=1, level=5, border=False):
         DESCRIPTION.
 
     """
-    if border:
-        return np.linspace(0, 1, 2**5, endpoint=False)[1:]
-    else:
-        return np.linspace(0, 1, 2**5+1, endpoint=True)
+    if endpoints == True:
+        return np.linspace(0, 1, 2**level+1, endpoint=True)
+    elif endpoints == False:
+        return np.linspace(0, 1, 2**level, endpoint=False)[1:]
+    elif endpoints == [True, False]:
+        return np.linspace(0, 1, 2**level, endpoint=False)
+        
 
-
+def combinations_with_replacement_counts(n, r):
+    size = n + r - 1
+    for indices in itertools.combinations(range(size), n-1):
+        starts = [0] + [index+1 for index in indices]
+        stops = indices + (size,)
+        yield tuple(map(operator.sub, stops, starts))
+        
 class gridPoint: 
     """ position of a grid point, 
           also stores function value 
@@ -123,7 +242,7 @@ class gridPoint:
                         *index[2*i+1] / 2.**index[2*i] + domain[i][0])
         return coord
   
-    def coords(self, index, domain=None):
+    def coord(self, index, domain=None):
         return self.pointPosition(index, domain)
          
     def printPoint(self):
@@ -140,9 +259,39 @@ class SparseGrid:
     """ A sparse grid of a certain level consists of a set of indices and 
         associated grid points gP on a given domain of dimension dim.
         Action is what happens when one traverses the sparse grid.
+    
+    https://people.math.sc.edu/Burkardt/py_src/sparse_grid/pysg.py
+    
+    with endpoints, the level index starts with 0.
+    
+    Refs:
+    [1] Jochen Garcke,
+        Sparse Grid Tutorial.
+    
+    [2] Sergey Smolyak, Quadrature and Interpolation Formulas for Tensor Products 
+        of Certain Classes of Functions, Doklady Akademii Nauk SSSR, 
+        Volume 4, 1963, pages 240-243.
     """
-    def __init__(self,dim=1,level=1, domain=None):
-        self.dim = dim
+    def __init__(self, dim=1, level=1, domain=None):
+        """
+        
+
+        Parameters
+        ----------
+        dim : int, optional
+            dimensions of the problem. The default is 1.
+        level : TYPE, optional
+            desired discretization level. The default is 1.
+        domain : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+        self.ndim = self.dim = dim
         # if isinstance(level, int):
             # self.level = [level, ] * dim
         
@@ -151,44 +300,78 @@ class SparseGrid:
         self.indices = [] # entries: [l_1,p_1,...,l_d,p_d], level,position
         
         if domain is None:
-            domain = ((0.0,1.0),)*dim
+            domain = ((0.0, 1.0),) * dim
+            
         self.domain = domain 
         
         self.action = ()
         
-        self.hSpace = None
+        # self.hSpace = None
         
-        index_set = []
-        for i in range(1, level+1):
-            for j in range(1, level + dim-1 - (i-1)):
-                index_set.append([i, j])
-        self.index_set = index_set
+
+        # index_set = []
+        # for i in range(1, level+1):
+        #     for j in range(1, level + dim-1 - (i-1)):
+        #         index_set.append([i, j])
+        # self.index_set = index_set
+
+        nset, num2idx, idx2num = enr_state_dictionaries([level]*dim, level + dim - 1)
+        self.index_set = num2idx.keys()
     
-    def combination_technique(self, q=1):
+    def combination_technique(self, q=None):
+        # Sparse grid combination technique
         
+        d = self.dim
         index_set = []
         c = [] 
         l = [self.level, ] * self.dim # isotropic, can be generalized to anisotropic
-
+        
+        index_set = [] # level sets included in the SGCT technique
+        c = []
+        
+        for j in range(d):
+            # levels = list(combinations_with_replacement_counts(d, self.level -j))
+            levels = balls_in_boxes(self.level-j, d)
+            index_set.append(levels)
+            c += [(-1)**j * math.comb(d-1, j)] * len(levels)     
+        
+        
         # for i in range(l[0] - q +1, l[0]+1):
             # for j in range( np.maximum(sum(l)-q-i, l[1]-q+1), sum(l)+2-q-i):
-        for i in range(l[0] - q +1, l[0]+1):
-            for j in range(l[1] - q +1, l[1]+1):
-                if  sum(l) - q <= i+j <= sum(l)-q+1: 
-                    index_set.append([i, j])
-                    c.append((-1)**(sum(l) + 1 - q - (i+j))) # check
-        self.index_set = index_set
+        # for i in range(l[0] - q +1, l[0]+1):
+        #     for j in range(l[1] - q +1, l[1]+1):
+        #         if  sum(l) - q <= i+j <= sum(l)-q+1: 
+        #             index_set.append([i, j])
+        #             c.append((-1)**(sum(l) + 1 - q - (i+j))) # check
+        
+                    
+        # self.index_set = index_set
         # self.coeff 
         return index_set, c
                 
     def printGrid(self):
         print(self.hSpace)
     
+    def print_points(self):
+        # print('l0, i0, l1, i1, ...  position \n')
+        
+        print("""
+              Coordinates of points in {}D sparse grid of level {}.
+              """.format(self.dim, self.level))
+      
+        print('number of sparse grid points = ', len(self.indices)) 
+        print('number of regular grid points = ', (2**self.level + 1)**self.dim) 
+            
+        for i in range ( len(self.indices) ):
+            print(self.indices[i], self.gP[tuple(self.indices[i])].pos)
+
+        return 
+    
     def plot_grid(self):
 
         from pyqed.style import scatter
         
-        points = [p.coords(i) for i, p in self.gP.items()]
+        points = [p.coord(i) for i, p in self.gP.items()]
         scatter(points)
               
     def evalAction(self):
@@ -429,6 +612,95 @@ def evalBasis1D(x, basis,interval=None):
     return 1. - abs(pos*2**basis[0]-basis[1])
 
 
+class SGCT_LDR(SparseGrid):
+    def __init__(self, dim, level, domain=None):
+        assert(len(domains) == ndim)
+        
+        #
+        # self.sg = sg
+        # self.solver = solver 
+        # self.ndim = ndim
+        
+        
+    def run(self, dt=0.01, nt=1):
+        
+        sg = self.sg 
+        ndim = self.ndim 
+        domain = self.domain
+        
+        self.generatePoints()
+        npts = len(self.gP)
+        
+        # compute the electronic states at all grid points
+        v = np.zeros(npts)
+        for gP in self.gP:
+            coord = gP.coord()
+            
+        index_set, c = self.combination_technique(3) 
+        logging.info('SG combination technique q = 3')
+        
+        # s = 0
+        # for index in index_set:
+        #     i, j = index
+        #     s += 2**(i+j)
+        # print(s)
+        # print(index_set)
+        logging.info('Combination coefficient', c)
+        
+        result = []
+        points = []
+        xAve = 0
+        for n, index in enumerate(index_set):
+            
+            logging.info('Creating the D-dimensional grid corresponding to each level set.')
+            
+            x = []
+            for d in range(ndim):
+                x.append(discretize(*domain[d], index[d]))
+                         
+                # print(len(x), interval(x))
+            
+            # points = genpoints(x, y)
+            # scatter(points)
+        
+        
+            # call SPO solver. It is a bad idea to call the electronic 
+            # structure calculation for every level set. The more efficient way 
+            # is to compute the PES once at the beginning, and then construct the 
+            # potential energy matrix. 
+            # v = dpes(x, y)
+            
+            sol = DVRn(x)
+            sol.set_dpes(v)
+            
+            X, Y = np.meshgrid(x, y)
+            nx, ny = len(x), len(y)
+            ntot = nx * ny
+            grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
+                    
+            psi0 = np.zeros((nx, ny, 2),dtype=complex)
+            for i in range(nx):
+                for j in range(ny):
+                    psi0[i, j, 1] = gwp([x[i], y[j]], x0=[-1.0, 0], ndim=2)
+                    
+            r = sol.run(psi0=psi0, dt=0.25, Nt=80)
+            x = r.position()
+            x = np.array(x)
+            
+            xAve += c[n] * x
+            
+        # sg.printGrid()
+        # xAve = 0
+        # for i in range(len(index_set)):
+        #     xAve += c[i] * result[i]
+        print(xAve.shape)
+        # import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        ax.plot(xAve[0, :])
+        ax.plot(xAve[1, :])
+        ax.set_title('Sparse Grid')
+        return 
+    
 #! /usr/bin/env python
 #
 #  Modified:
@@ -541,17 +813,7 @@ class testFunctest(unittest.TestCase):
 
 
 
-def dpes(x, y):
-    nx, ny = len(x), len(y)
-    v = np.zeros(shape = (nx, ny, 2,2))
-    
-    X, Y = np.meshgrid(x, y, indexing='ij')
-    
-    v[:, :, 0, 0] = 0.5 * (X+1)**2 + 0.5 * Y**2
-    v[:, :, 1, 1] = 0.5 * (X-1)**2 + 0.5 * Y**2 + 2
-    v[:, :, 0, 1] = v[:, :, 1, 0] = 0.2 * Y
-    
-    return v
+
 
 
 def genpoints(x, y):
@@ -582,6 +844,17 @@ if __name__=="__main__":
 #  SG is a sparse grid of dimension 2 and level 3.
 #  Create sg.indices which stores level and position for each point.
 #    
+    def dpes(x, y):
+        nx, ny = len(x), len(y)
+        v = np.zeros(shape = (nx, ny, 2,2))
+        
+        X, Y = np.meshgrid(x, y, indexing='ij')
+        
+        v[:, :, 0, 0] = 0.5 * (X+1)**2 + 0.5 * Y**2
+        v[:, :, 1, 1] = 0.5 * (X-1)**2 + 0.5 * Y**2 + 2
+        v[:, :, 0, 1] = v[:, :, 1, 0] = 0.2 * Y
+        
+        return v
 
     level = 5
     dim = 2
@@ -628,7 +901,9 @@ if __name__=="__main__":
     # ax.format(title='Ref')
     
     
-    
+
+        
+        
     # Sparse grid solver
     sg = SparseGrid(dim=dim, level=level, domain=[[-6, 6], [-6, 6]])
     #
