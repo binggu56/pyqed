@@ -20,6 +20,7 @@ from scipy.linalg import expm
 
 from scipy.fftpack import fft, ifft, fftfreq, fftn, ifftn
 
+from decompose import decompose
 
 
 s0 = np.eye(2)
@@ -167,12 +168,14 @@ def k_evolve_1d(k, psi):
 def kinetic(k, B_list):
     """
     kinetic energy (KE) component of the one-step evolution operator 
-    :math:`e^{-i * dt * K)` on the MPS
+    :math:`e^{-i T \delta t )` on the MPS
     
-              where K is the total KE operator
+              where T is the total KE operator
     """
+    L = len(B_list)
+    
     for i in range(L):
-        chi1, chi2 = np.shape(B_list[i])[1:]
+        _, chi1, chi2 = np.shape(B_list[i])
         # for a in range(chi1):
         #     for b in range(chi2):
                 # B_list[i][:,a,b] = k_evolve_1d(k, B_list[i][:,a,b])
@@ -204,7 +207,7 @@ def potential(B_list, s_list, V, chi_max):
         L: int
             number of sites
     """
-    U = np.exp(-1j * dt * V)
+    # U = np.exp(-1j * dt * V)
 
     for i in range(L-1):
 
@@ -222,6 +225,7 @@ def potential(B_list, s_list, V, chi_max):
             theta = np.reshape(np.transpose(np.transpose(C)*s_list[i1],(1,3,0,2)),(d*chi1,d*chi3))
 
             C = np.reshape(np.transpose(C,(2,0,3,1)),(d*chi1,d*chi3))
+            
             # Schmidt decomposition #
             X, Y, Z = np.linalg.svd(theta)
             Z=Z.T
@@ -237,27 +241,57 @@ def potential(B_list, s_list, V, chi_max):
 
     return B_list, s_list
 
-def qd(B_list,s_list,U_list,chi_max):
-    """
-    Use TEBD to optmize the MPS and to project it back.
-    """
-    d = B_list[0].shape[0]
-    L = len(B_list)
 
-    make_V_list(X, Y)
 
-    B_list = kinetic(B_list)
-    B_list, s_list = potential(B_list, s_list, V, chi_max)
 
-def expectation():
-    """
-    how to compute the observables?
-    """
 
-    return
+class SPO:
+    def __init__(self, B_list,s_list,U_list,chi_max):
+        """
+        Use TEBD to optmize the MPS and to project it back.
+        """
+        self.dims = [B.shape[0] for B in B_list]
+        self.nsites = len(B_list) # nuclear degrees of freedom
+    
+        # make_V_list(X, Y)
+    
+
+    
+        self.v = None 
+        
+    def set_apes(self, v):
+        assert(v.shape == self.dims)
+        self.v = v
+                
+    
+        
+    def run(self, B_list, s_list, dt, nt, chi_max):
+        
+        v = self.v 
+        V = np.exp(-1j * v * dt)
+
+        # decompose the potential propagator        
+        vf, vs = decompose(V, chi_max)
+        
+        for k in range(nt):
+            B_list = kinetic(B_list)
+            B_list, s_list = potential(B_list, s_list, V, chi_max)
+        
+        return B_list, s_list
+        
+
+    def expect(self):
+        """
+        how to compute the observables?
+        """
+    
+        return
 
 
 if __name__ == "__main__":
+    
+    from pyqed import interval
+    
     # Define Pararemeter here
     delta = dt = 0.02
     L = 2
@@ -266,11 +300,15 @@ if __name__ == "__main__":
 
     # grid
     d = 2**4 # local size of Hilbert space
-    x = np.linspace(-2,2,d)
-    y = np.linspace(-2,2,d)
+    x = np.linspace(-2,2,d, endpoint=False)
+    y = np.linspace(-2,2,d, endpoint=False)
+    
+    print(interval(x))
+    
     X, Y = np.meshgrid(x,y)
 
     V = make_V_list(X,Y)
+    
     # frequency space
     k = 2. * np.pi * fftfreq(d)
 

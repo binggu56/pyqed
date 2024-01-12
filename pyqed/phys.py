@@ -12,8 +12,44 @@ import scipy as sp
 import sys
 import heapq
 
-# def integrate(f, a, b, **args):
-#     return integrate.quad(f, a, b, args=args)
+def integrate(f, a, b, **args):
+    """
+    
+    Compute a definite integral.
+
+    Parameters
+    ----------
+    f : TYPE
+        DESCRIPTION.
+    a : TYPE
+        DESCRIPTION.
+    b : TYPE
+        DESCRIPTION.
+    **args : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    return integrate.quad(f, a, b, args=args)
+
+def cartesian(*args):
+    """ compute Cartesian product of args """
+    # ans = []
+    # for arg in args[0]:
+    #     for arg2 in args[1]:
+    #         ans.append(arg+arg2)
+    # return ans
+  #alternatively:
+    ans = [[]]
+    for arg in args:
+        ans = [x+[y] for x in ans for y in arg]
+      
+    return ans
 
 def discretize(a=0, b=1, l=4, endpoints=True):
     """

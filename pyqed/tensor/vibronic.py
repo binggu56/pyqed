@@ -744,8 +744,8 @@ class MPS:
         # build MPO representation of the short-time propagator
         pass
     
-    def run(self, dt=0.1, Nt=10):
-        pass
+    # def run(self, dt=0.1, Nt=10):
+    #     pass
 
     # def obs_local(self, e_op, n):
     #     pass
@@ -1025,68 +1025,74 @@ def split_truncate_theta(theta, chi_max, eps):
     B = np.reshape(Z, [chivC, dR, chivR])
     return A, S, B
 
+def TDSE_MPO(B_list, s_list, chi_max):
+    for k in range(Nt):
+        # evolve dt
+        B_list, s_list = apply_mpo_svd(B_list,s_list,w_list,chi_max)
+    
+        psi = tensor_to_vec(mps_to_tensor(B_list))
+        print(np.linalg.norm(psi))
+    
+        # e[k] = dag(psi) @ e_op @ psi
+        # e[k] = obs(psi, e_op)
+        # compute vN entropy
+        s2 = np.array(s_list[L//2])**2
+        S.append(-np.sum(s2*np.log(s2)))
+        
 
+if __name__=='__main__':
 
-dims = [2, 4, 4] # dims of the local space
-L = 3 # nsites
-chi_max = 3
+    dims = [2, 4, 4] # dims of the local space
+    L = 3 # nsites
+    chi_max = 3
+    
+    onsite = 1./au2ev
+    omega0 = 500/au2wavenumber
+    g = 0.8 * omega0
+    
+    B_list, s_list = initial_state(dims, chi_max=chi_max, L=L)
+    S = [0]
+    Nt = 20
+    dt = 0.02/au2fs
+    
+    w_list = make_U_mpo(dims, L, dt)
+    # print(w_list[1][2 ,0])
+    sm = lowering().toarray()
+    sp = dag(sm)
+    
+    from pyqed import obs, tensor, destroy, pauli, obs
+    
+    B0 = B_list[0]
+    print(np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :]))
+    
+    s0, sx, sy, sz = pauli()
+    
+    e = np.zeros(Nt, dtype=complex)
+    a = destroy(4)
+    idv = identity(dims[-1])
+    
+    e_op = kron(s0, kron(a+dag(a), idv)).toarray()
+    # e_op = kron(sz, kron(idv, idv)).toarray()
+    
+    # print(e_op.shape)
+    
+    # def mps_to_tensor(mps):
+    #     B0, B1, B2 = mps
+    
+    #     # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
+    #     psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
+    #     return psi
+    
+    # def tensor_to_vec(psi):
+    #     return psi.flatten()
+    
 
-onsite = 1./au2ev
-omega0 = 500/au2wavenumber
-g = 0.8 * omega0
-
-B_list, s_list = initial_state(dims, chi_max=chi_max, L=L)
-S = [0]
-Nt = 2000
-dt = 0.02/au2fs
-
-w_list = make_U_mpo(dims, L, dt)
-# print(w_list[1][2 ,0])
-sm = lowering().toarray()
-sp = dag(sm)
-
-from pyqed import obs, tensor, destroy, pauli, obs
-
-B0 = B_list[0]
-print(np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :]))
-
-s0, sx, sy, sz = pauli()
-
-e = np.zeros(Nt, dtype=complex)
-a = destroy(4)
-idv = identity(dims[-1])
-
-# e_op = kron(s0, kron(a+dag(a), idv)).toarray()
-# e_op = kron(sz, kron(idv, idv)).toarray()
-
-print(e_op.shape)
-
-def mps_to_tensor(mps):
-    B0, B1, B2 = mps
-
-    # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
-    psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
-    return psi
-
-def tensor_to_vec(psi):
-    return psi.flatten()
-
-for k in range(Nt):
-    # evolve dt
-    B_list, s_list = apply_mpo_svd(B_list,s_list,w_list,chi_max)
-
-    psi = tensor_to_vec(mps_to_tensor(B_list))
-    print(np.linalg.norm(psi))
-
-    # e[k] = dag(psi) @ e_op @ psi
-    e[k] = obs(psi, e_op)
-    # compute vN entropy
-    s2 = np.array(s_list[L//2])**2
-    S.append(-np.sum(s2*np.log(s2)))
-
-import proplot as plt
-fig, ax = plt.subplots()
-ax.plot(dt*np.arange(Nt), e.real)
+    
+    # import proplot as plt
+    import matplotlib.pyplot as plt
+    
+    fig, ax = plt.subplots()
+    ax.plot(dt*np.arange(Nt), e.real)
 # psi0 = [tensor(shap1), tensor(shape2)]
 
 # def spo_single_step(psi):

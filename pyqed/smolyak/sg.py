@@ -576,7 +576,7 @@ class SparseGrid:
     #     return self.nodal2Hier()
 
 
-class ASG(SparseGrid):
+class AdapativeSparseGrid(SparseGrid):
     """
     Dimension-Adapative Sparse Grid
     

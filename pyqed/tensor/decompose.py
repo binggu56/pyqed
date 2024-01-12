@@ -3,7 +3,13 @@
 """
 Created on Thu Dec 23 22:00:26 2021
 
-@author: bing
+Quantum molecular dynamics using matrix product states
+
+Based on the Tensorly package 
+https://github.com/tensorly/tensorly
+
+@author: Bing Gu (gubing@westlake.edu.cn)
+
 """
 
 import tensorly as tl
@@ -11,8 +17,7 @@ from tensorly import random, validate_tt_rank
 from tensorly.tenalg import inner
 from tensorly.decomposition import tensor_train
 
-# tensor = random.random_tensor((10, 10, 10))
-# # This will be a NumPy array by default
+
 
 # from lime.phys import dag
 
@@ -23,7 +28,7 @@ from scipy.linalg import svd
 import logging
 
 
-def tensor_train(input_tensor, rank):
+def decompose(input_tensor, rank):
     """
     TT decomposition via recursive SVD
 
@@ -154,6 +159,12 @@ def truncated_svd(matrix, k=None, **kwargs):
 
     return U, S, V
 
+def contract(factors):
+    """
+    contract a list of tensors to a full tensor 
+    """
+    return tt_to_tensor(factors)
+
 def tt_to_tensor(factors):
     """Returns the full tensor whose TT decomposition is given by 'factors'
 
@@ -241,73 +252,84 @@ def compress(B_list, chi_max):
 
 
 if __name__ == '__main__':
-    
-    def pes(x):
-        dim = len(x)
-        v = 0 
-        for d in range(dim):
-            v += 0.5 * x[d]**2
-        v += 0.1 * x[0] * x[1] + x[0]**4 * 0.2
-        return v
-    
-    
-    # a = np.random.randn(3, 3, 3)
-    level = 4
-    n = 2**level - 1 # number of grid points for each dim
-    x = np.linspace(-6, 6, 2**level, endpoint=False)[1:]
 
-    
-    v = np.zeros((n, n, n))
-    for i in range(n):
-        for j in range(n):
-            for k in range(n):
-                v[i, j, k] = pes([x[i], x[j], x[k]])
+    # test: decompose a tensor and recombine
+    d = 4
+    a = random.random_tensor((d, d, d))
+    # # This will be a NumPy array by default
+    As, Ss = decompose(a, rank=4)
 
-    dt = 0.05
-    v = np.exp(-1j * v * dt)                
-    # print(np.einsum('ijk, ijk', a, a))
-    
-    # print(inner(a, a))
-    # a = a/tl.norm(a)
-    
-    rank = 4
-    
-    As, Ss = tensor_train(v,rank=rank)
-    b = As.copy()
-    print('singular values', Ss[0],Ss[1], Ss[2])
-    
-    # b_to_tensor = np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
-    b = tt_to_tensor(As)    
-    print(b.shape)
-    print(b[:, 0, 0]-v[:, 0, 0])
-    
-    # print('norm a', tl.norm(a))
-    
-    # print('norm a_tt', tl.norm(b_to_tensor))
-    
-    # b2 = my_tensor_train(a, rank=4)
-    
-    # print(validate_tt_rank(tl.shape(a), rank=rank))
-    
-    # tl.set_backend('numpy')
-    # c = tensor_train(a, rank=rank)
-    
-    
-    
-    # print(b == c)
-    # print(len(b))
-    # for j in range(len(b)):
-    #     print(b[j].shape)
-    #     print(c[j].shape)
-    
-    
-    b_compressed, slist = compress(As, chi_max=4)
-    # a_compressed = mps_to_tensor(b_compressed)
-    
-    # tmp = np.tensordot(b_compressed[1],  b_compressed[2][:,:,0], axes=1) # aib, bj -> aij
-    # tmp = b_compressed[1]
-    # r = np.einsum('aib, cib ->ac', tmp, tmp)
-    print(tt_to_tensor(b_compressed)[:, 0, 0] - v[:, 0, 0])
+    b = contract(As)
+    print(tl.norm(a-b))
+
+    def dynamics():
+
+        def pes(x):
+            dim = len(x)
+            v = 0 
+            for d in range(dim):
+                v += 0.5 * x[d]**2
+            v += 0.1 * x[0] * x[1] + x[0]**4 * 0.2
+            return v
+        
+        
+        # a = np.random.randn(3, 3, 3)
+        level = 4
+        n = 2**level - 1 # number of grid points for each dim
+        x = np.linspace(-6, 6, 2**level, endpoint=False)[1:]
+
+        
+        v = np.zeros((n, n, n))
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    v[i, j, k] = pes([x[i], x[j], x[k]])
+
+        dt = 0.05
+        v = np.exp(-1j * v * dt)                
+        # print(np.einsum('ijk, ijk', a, a))
+        
+        # print(inner(a, a))
+        # a = a/tl.norm(a)
+        
+        rank = 4
+        
+        As, Ss = decompose(v,rank=rank)
+        b = As.copy()
+        print('singular values', Ss[0],Ss[1], Ss[2])
+        
+        # b_to_tensor = np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
+        b = tt_to_tensor(As)    
+        print(b.shape)
+        print(b[:, 0, 0]-v[:, 0, 0])
+        
+        # print('norm a', tl.norm(a))
+        
+        # print('norm a_tt', tl.norm(b_to_tensor))
+        
+        # b2 = my_tensor_train(a, rank=4)
+        
+        # print(validate_tt_rank(tl.shape(a), rank=rank))
+        
+        # tl.set_backend('numpy')
+        # c = tensor_train(a, rank=rank)
+        
+        
+        
+        # print(b == c)
+        # print(len(b))
+        # for j in range(len(b)):
+        #     print(b[j].shape)
+        #     print(c[j].shape)
+        
+        
+        b_compressed, slist = compress(As, chi_max=4)
+        # a_compressed = mps_to_tensor(b_compressed)
+        
+        # tmp = np.tensordot(b_compressed[1],  b_compressed[2][:,:,0], axes=1) # aib, bj -> aij
+        # tmp = b_compressed[1]
+        # r = np.einsum('aib, cib ->ac', tmp, tmp)
+        print(tt_to_tensor(b_compressed)[:, 0, 0] - v[:, 0, 0])
 
 # print(b_compressed[0])
 # print(As[0]

@@ -540,6 +540,7 @@ class MatrixProductState(object):
             "-".join([str(ms.bond_order2) for ms in self.iter_ms_left2right()][:-1])
         )
 
+
 class MPS:
     def __init__(self, mps, chi_max, homogenous=True):
         """
@@ -557,7 +558,9 @@ class MPS:
         """
         self.data = mps
         self.nsites = len(mps)
+        self.nbonds = self.nsites - 1
         self.chi_max = chi_max
+        self.factors = mps
         
         if homogenous:
             self.dim = mps[0].shape[1]
@@ -565,9 +568,7 @@ class MPS:
             self.dims = [t.shape[1] for t in mps] # physical dims of each site
         
         self._mpo = None
-        
-    def decompose(self, chi_max):
-        pass
+
     
     def compress(self, chi_max):
         pass
@@ -589,7 +590,17 @@ class MPS:
     def run(self, dt=0.1, Nt=10):
         pass
 
-    def obs_local(self, e_op, n):
+    def obs_single_site(self, e_op, n):
+        pass
+        
+    def two_site(self):
+        pass
+    
+    def to_tensor(self):
+        return mps_to_tensor(self.factors)
+    
+    def to_vec(self):
+        return mps_to_tensor(self.factors)
         
 
 def build_mpo_list(single_mpo, L, regularize=False):
@@ -631,13 +642,13 @@ def build_mpo_list(single_mpo, L, regularize=False):
     return [mpo_1] + [single_mpo.copy() for i in range(L - 2)] + [mpo_L]
 
 
-m = 10 # truncate values
-d = 2 # dimensionality for each dof
-shape1 = (d, 1, m)
-shape2 = (d, m, 1)
+# m = 10 # truncate values
+# d = 2 # dimensionality for each dof
+# shape1 = (d, 1, m)
+# shape2 = (d, m, 1)
 
-def ham_single_site():
-    return np.identity(2)
+# def ham_single_site():
+#     return np.identity(2)
 
 
 def apply_mpo_svd(B_list,s_list,w_list,chi_max):
@@ -854,7 +865,7 @@ idv = identity(dims[-1])
 # e_op = kron(s0, kron(a+dag(a), idv)).toarray()
 # e_op = kron(sz, kron(idv, idv)).toarray()
 
-print(e_op.shape)
+
 
 def mps_to_tensor(mps):
     B0, B1, B2 = mps
