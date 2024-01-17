@@ -44,7 +44,7 @@ def __cartesian_product(arrays):
 class DVRn(object):
     
     def __init__(self, domains, levels, ndim=3, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
-        # self.dvr1d = dvr1d
+        # self.dvr1d = dvr1d00000
 
         # self.nx = nx
         # self.xmin, self.xmax = xlim

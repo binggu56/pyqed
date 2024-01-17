@@ -33,6 +33,8 @@ Created on Sun Oct 22 16:12:16 2023
 #
 import itertools, operator
 
+from pyqed import discretize
+
 import math, copy
 import numpy as np
 try:
@@ -149,45 +151,45 @@ def enr_state_dictionaries(dims, excitations):
 
     return nstates, state2idx, idx2state
 
-def discretize(a=0, b=1, level=5, endpoints=True):
-    """
-    uniform grid with 2^l points 
+# def discretize(a=0, b=1, level=5, endpoints=True):
+#     """
+#     uniform grid with 2^l points 
     
-    Without border 
+#     Without border 
     
-    .. math::
-        x_0 = a + dx, 
-        x_{N-1} = b - dx
+#     .. math::
+#         x_0 = a + dx, 
+#         x_{N-1} = b - dx
         
-    Without border 
+#     Without border 
     
-    .. math::
-        x_0 = a
-        x_N = b
+#     .. math::
+#         x_0 = a
+#         x_N = b
 
-    Parameters
-    ----------
-    a : TYPE, optional
-        DESCRIPTION. The default is 0.
-    b : TYPE, optional
-        DESCRIPTION. The default is 1.
-    level : TYPE, optional
-        DESCRIPTION. The default is 5.
-    border : TYPE, optional
-        DESCRIPTION. The default is False.
+#     Parameters
+#     ----------
+#     a : TYPE, optional
+#         DESCRIPTION. The default is 0.
+#     b : TYPE, optional
+#         DESCRIPTION. The default is 1.
+#     level : TYPE, optional
+#         DESCRIPTION. The default is 5.
+#     border : TYPE, optional
+#         DESCRIPTION. The default is False.
 
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
+#     Returns
+#     -------
+#     TYPE
+#         DESCRIPTION.
 
-    """
-    if endpoints == True:
-        return np.linspace(0, 1, 2**level+1, endpoint=True)
-    elif endpoints == False:
-        return np.linspace(0, 1, 2**level, endpoint=False)[1:]
-    elif endpoints == [True, False]:
-        return np.linspace(0, 1, 2**level, endpoint=False)
+#     """
+#     if endpoints == True:
+#         return np.linspace(0, 1, 2**level+1, endpoint=True)
+#     elif endpoints == False:
+#         return np.linspace(0, 1, 2**level, endpoint=False)[1:]
+#     elif endpoints == [True, False]:
+#         return np.linspace(0, 1, 2**level, endpoint=False)
         
 
 def combinations_with_replacement_counts(n, r):

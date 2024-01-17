@@ -541,67 +541,6 @@ class MatrixProductState(object):
         )
 
 
-class MPS:
-    def __init__(self, mps, chi_max, homogenous=True):
-        """
-        class for matrix product states.
-
-        Parameters
-        ----------
-        mps : list
-            list of 3-tensors.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.data = mps
-        self.nsites = len(mps)
-        self.nbonds = self.nsites - 1
-        self.chi_max = chi_max
-        self.factors = mps
-        
-        if homogenous:
-            self.dim = mps[0].shape[1]
-        else:
-            self.dims = [t.shape[1] for t in mps] # physical dims of each site
-        
-        self._mpo = None
-
-    
-    def compress(self, chi_max):
-        pass
-
-    def __add__(self, other):
-        assert len(self.data) == len(other.data)
-        # for different length, we should choose the maximum one
-        C = []
-        for j in range(self.sites):
-            tmp = block_diag(self.data[j], other.data[j])
-            C.append(tmp.copy())
-
-        return MPS(C)
-
-    def build_mpo_list(self):
-        # build MPO representation of the propagator
-        pass
-    
-    def run(self, dt=0.1, Nt=10):
-        pass
-
-    def obs_single_site(self, e_op, n):
-        pass
-        
-    def two_site(self):
-        pass
-    
-    def to_tensor(self):
-        return mps_to_tensor(self.factors)
-    
-    def to_vec(self):
-        return mps_to_tensor(self.factors)
-        
 
 def build_mpo_list(single_mpo, L, regularize=False):
     """
@@ -711,55 +650,55 @@ def apply_mpo_svd(B_list,s_list,w_list,chi_max):
     return B_list, s_list
 
 
-def compress(B_list, s_list, chi_max):
-    " Compress the MPS by reducing the bond dimension."
-    # d = B_list[0].shape[0]
-    L = len(B_list)
-    # s_list  = [None] * L
-    # for p in [0,1]:
+# def compress(B_list, s_list, chi_max):
+#     " Compress the MPS by reducing the bond dimension."
+#     # d = B_list[0].shape[0]
+#     L = len(B_list)
+#     # s_list  = [None] * L
+#     # for p in [0,1]:
 
-    for i_bond in np.arange(L-1):
+#     for i_bond in np.arange(L-1):
 
-        i1=i_bond
-        i2=i_bond+1
+#         i1=i_bond
+#         i2=i_bond+1
 
-        chi1, d1, _ = B_list[i1].shape
-        _, d2, chi3 = B_list[i2].shape
+#         chi1, d1, _ = B_list[i1].shape
+#         _, d2, chi3 = B_list[i2].shape
 
-        print(r'bond {}, dims, {} {} {} {}'.format(i_bond, chi1, d1, d2, chi3))
+#         print(r'bond {}, dims, {} {} {} {}'.format(i_bond, chi1, d1, d2, chi3))
 
-        # Construct theta matrix
-        # C[chi1, i, j, chi3] = B1[chi1, i, chi2] B2[chi2, j, chi3]
-        C = np.tensordot(B_list[i1], B_list[i2],axes=1)
+#         # Construct theta matrix
+#         # C[chi1, i, j, chi3] = B1[chi1, i, chi2] B2[chi2, j, chi3]
+#         C = np.tensordot(B_list[i1], B_list[i2],axes=1)
 
-        theta = np.reshape(C, (chi1 * d1, d2*chi3))
+#         theta = np.reshape(C, (chi1 * d1, d2*chi3))
 
-        # theta = np.reshape(np.einsum('a, aijb->aijb', s_list[i1], C),\
-        #                     (d1*chi1, d2*chi3))
-        # C = np.reshape(C,(d1*chi1,d2*chi3))
+#         # theta = np.reshape(np.einsum('a, aijb->aijb', s_list[i1], C),\
+#         #                     (d1*chi1, d2*chi3))
+#         # C = np.reshape(C,(d1*chi1,d2*chi3))
 
-        # C = theta.copy()
+#         # C = theta.copy()
 
-        # Schmidt decomposition X Y Z^T = theta
-        X, Y, Z = svd(theta)
-        # Z=Z.T # d2*chi3, chi2
+#         # Schmidt decomposition X Y Z^T = theta
+#         X, Y, Z = svd(theta)
+#         # Z=Z.T # d2*chi3, chi2
 
-        # W = np.dot(C,Z.T.conj())
-        chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
+#         # W = np.dot(C,Z.T.conj())
+#         chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
 
-        # Obtain the new values for B and l #
-        invsq = np.sqrt(sum(Y[:chi2]**2))
+#         # Obtain the new values for B and l #
+#         invsq = np.sqrt(sum(Y[:chi2]**2))
 
-        s_list[i2] = Y[:chi2]/invsq
+#         s_list[i2] = Y[:chi2]/invsq
 
-        # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
+#         # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
 
-        B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
+#         B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
 
-        B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
+#         B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
 
 
-    return B_list, s_list
+#     return B_list, s_list
 
 def make_U_mpo(d, L, dt, dtype=float):
     """
@@ -867,15 +806,7 @@ idv = identity(dims[-1])
 
 
 
-def mps_to_tensor(mps):
-    B0, B1, B2 = mps
 
-    # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
-    psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
-    return psi
-
-def tensor_to_vec(psi):
-    return psi.flatten()
 
 for k in range(Nt):
     # evolve dt

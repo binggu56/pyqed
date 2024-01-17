@@ -28,7 +28,7 @@ from scipy.linalg import svd
 import logging
 
 
-def decompose(input_tensor, rank):
+def decompose(input_tensor, rank, verbose=False):
     """
     TT decomposition via recursive SVD
 
@@ -93,8 +93,11 @@ def decompose(input_tensor, rank):
         # Get kth TT factor
         factors[k] = tl.reshape(U, (rank[k], tensor_size[k], rank[k+1]))
 
-
-        logging.info("TT factor " + str(k) + " computed with shape " + str(factors[k].shape))
+        if verbose is True:
+            print(
+                "TT factor " + str(k) + " computed with shape " + str(factors[k].shape)
+            )
+        # logging.info("TT factor " + str(k) + " computed with shape " + str(factors[k].shape))
 
         # Get new unfolding matrix for the remaining factors
         unfolding= tl.reshape(S, (-1, 1))*V
@@ -105,8 +108,14 @@ def decompose(input_tensor, rank):
     factors[-1] = np.reshape(unfolding, (prev_rank, last_dim, 1))
 
     
-    logging.info("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
-
+    # logging.info("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
+    if verbose is True:
+        print(
+            "TT factor "
+            + str(n_dim - 1)
+            + " computed with shape "
+            + str(factors[n_dim - 1].shape)
+        )
     return factors, Ss
 
 def truncated_svd(matrix, k=None, **kwargs):
@@ -210,7 +219,7 @@ def compress(B_list, chi_max):
         chi1, d1, _ = B_list[i1].shape
         _, d2, chi3 = B_list[i2].shape
 
-        print(r'bond {}, dims, {} {} {} {}'.format(i_bond, chi1, d1, d2, chi3))
+        logging.info(r'bond {}, dims, {} {} {} {}'.format(i_bond, chi1, d1, d2, chi3))
 
         # Construct theta matrix
         # C[chi1, i, j, chi3] = B1[chi1, i, chi2] B2[chi2, j, chi3]
@@ -253,14 +262,32 @@ def compress(B_list, chi_max):
 
 if __name__ == '__main__':
 
+    from pyqed import gwp2, discretize, dag, interval
     # test: decompose a tensor and recombine
-    d = 4
-    a = random.random_tensor((d, d, d))
-    # # This will be a NumPy array by default
-    As, Ss = decompose(a, rank=4)
+    l = 4 
+    x = discretize(-6, 6, l)
+    y = discretize(-6, 6, l)
+    dx = interval(x)
+    dy = interval(y)
+    
+    X, Y = np.meshgrid(x, y)
+    a = gwp2(X, Y, sigma=[[1, 0.2], [0.2, 1]])
+    
+    print(np.einsum('ij, ij ->', a.conj(), a) * dx * dy)
+    
+    print(a.shape) 
 
-    b = contract(As)
-    print(tl.norm(a-b))
+    # # This will be a NumPy array by default
+    As, Ss = decompose(a, rank=4, verbose=True)
+    print(Ss)
+    A = As[0][0]
+    B = As[1][:, :, 0]
+    print(dag(A) @ A)
+    print(B @ B.T)
+    
+
+    # b = contract(As)
+
 
     def dynamics():
 
