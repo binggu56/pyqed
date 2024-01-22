@@ -16,7 +16,7 @@ from scipy.sparse import identity
 from functools import reduce
 import warnings
 
-from pyqed import meshgrid, interval
+from pyqed import meshgrid, interval, cartesian_product
 from pyqed.phys import discretize
 from scipy.io import savemat
 
@@ -27,21 +27,9 @@ def export_to_matlab(fname, psi, fmt='matlab'):
     savemat(fname, mdic)
     return
 
-def __cartesian_product(arrays):
-    """
-    A fast cartesion product function
-    """
-    broadcastable = np.ix_(*arrays)
-    broadcasted = np.broadcast_arrays(*broadcastable)
-    rows, cols = reduce(np.multiply, broadcasted[0].shape), len(broadcasted)
-    out = np.empty(rows * cols, dtype=broadcasted[0].dtype)
-    start, end = 0, rows
-    for a in broadcasted:
-        out[start:end] = a.reshape(-1)
-        start, end = end, end + rows
-    return out.reshape(cols, rows).T
+
     
-class DVRn(object):
+class DVRN(object):
     
     def __init__(self, domains, levels, ndim=3, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
         # self.dvr1d = dvr1d00000
@@ -86,7 +74,7 @@ class DVRn(object):
             mass = [1, ] * ndim
 
         # self.X, self.Y = meshgrid(self.x, self.y)
-        self.points = np.fliplr(__cartesian_product(x))
+        self.points = np.fliplr(cartesian_product(x))
         self.npts = len(self.points)
 
         ###

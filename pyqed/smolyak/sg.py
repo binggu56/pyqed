@@ -274,7 +274,7 @@ class SparseGrid:
         of Certain Classes of Functions, Doklady Akademii Nauk SSSR, 
         Volume 4, 1963, pages 240-243.
     """
-    def __init__(self, dim=1, level=1, domain=None):
+    def __init__(self, ndim=1, level=1, domain=None):
         """
         
 
@@ -293,7 +293,7 @@ class SparseGrid:
 
         """
         
-        self.ndim = self.dim = dim
+        self.ndim = self.dim = ndim
         # if isinstance(level, int):
             # self.level = [level, ] * dim
         
@@ -302,7 +302,7 @@ class SparseGrid:
         self.indices = [] # entries: [l_1,p_1,...,l_d,p_d], level,position
         
         if domain is None:
-            domain = ((0.0, 1.0),) * dim
+            domain = ((0.0, 1.0),) * ndim
             
         self.domain = domain 
         
@@ -317,7 +317,7 @@ class SparseGrid:
         #         index_set.append([i, j])
         # self.index_set = index_set
 
-        nset, num2idx, idx2num = enr_state_dictionaries([level]*dim, level + dim - 1)
+        nset, num2idx, idx2num = enr_state_dictionaries([level]*ndim, level + ndim - 1)
         self.index_set = num2idx.keys()
     
     def combination_technique(self, q=None):
@@ -334,7 +334,7 @@ class SparseGrid:
         for j in range(d):
             # levels = list(combinations_with_replacement_counts(d, self.level -j))
             levels = balls_in_boxes(self.level-j, d)
-            index_set.append(levels)
+            index_set += levels
             c += [(-1)**j * math.comb(d-1, j)] * len(levels)     
         
         
@@ -859,55 +859,52 @@ if __name__=="__main__":
         return v
 
     level = 5
-    dim = 2
+    dim = 3
     
-    # reference calculation
-    x = np.linspace(-6, 6, 2**level, endpoint=False)
-    y = np.linspace(-6, 6, 2**level, endpoint=False)
+    # # reference calculation
+    # x = np.linspace(-6, 6, 2**level, endpoint=False)
+    # y = np.linspace(-6, 6, 2**level, endpoint=False)
         
-    # points = genpoints(x, y)
-    # scatter(points)
+    # # points = genpoints(x, y)
+    # # scatter(points)
     
-    # call SPO solver
-    v = dpes(x, y)
+    # # call SPO solver
+    # v = dpes(x, y)
     
-    sol = SPO2(x, y)
-    sol.set_dpes(v)
+    # sol = SPO2(x, y)
+    # sol.set_dpes(v)
     
-    X, Y = np.meshgrid(x, y)
-    nx, ny = len(x), len(y)
-    ntot = nx * ny
-    grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
+    # X, Y = np.meshgrid(x, y)
+    # nx, ny = len(x), len(y)
+    # ntot = nx * ny
+    # grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
             
     
-    psi0 = np.zeros((nx, ny, 2),dtype=complex)
-    for i in range(nx):
-        for j in range(ny):
-            psi0[i, j, 1] = gwp([x[i], y[j]], x0=[-1.0, 0], ndim=2)
+    # psi0 = np.zeros((nx, ny, 2),dtype=complex)
+    # for i in range(nx):
+    #     for j in range(ny):
+    #         psi0[i, j, 1] = gwp([x[i], y[j]], x0=[-1.0, 0], ndim=2)
             
-    r = sol.run(psi0=psi0, dt=0.25, Nt=80)
-    r.position()
-    # r.get_population()
+    # r = sol.run(psi0=psi0, dt=0.25, Nt=80)
+    # r.position()
+    # # r.get_population()
     
-    P = sol.population(r.psilist, representation='adiabatic')
-    fig, ax = plt.subplots()
-    ax.plot(r.times, P[:, 0])
-    ax.plot(r.times, P[:, 1], label=r'P$_1$')
-    ax.legend()
+    # P = sol.population(r.psilist, representation='adiabatic')
+    # fig, ax = plt.subplots()
+    # ax.plot(r.times, P[:, 0])
+    # ax.plot(r.times, P[:, 1], label=r'P$_1$')
+    # ax.legend()
     
-    xAve = np.array(r.position())
+    # xAve = np.array(r.position())
 
-    fig, ax = plt.subplots()
-    ax.plot(r.times, xAve[0, :])
-    ax.plot(r.times, xAve[1, :])
-    # ax.format(title='Ref')
-    
+    # fig, ax = plt.subplots()
+    # ax.plot(r.times, xAve[0, :])
+    # ax.plot(r.times, xAve[1, :])
+    # # ax.format(title='Ref')
     
 
-        
-        
     # Sparse grid solver
-    sg = SparseGrid(dim=dim, level=level, domain=[[-6, 6], [-6, 6]])
+    sg = SparseGrid(ndim=dim, level=level)
     #
     #  Determine sg.gP with the coordinates of the points 
     #  associated with the sparse grid index set.
@@ -922,7 +919,7 @@ if __name__=="__main__":
           Coordinates of points in {}D sparse grid of level {}.
           """.format(dim, level))
           
-    print('l0, i0, l1, i1  location \n')
+    # print('l0, i0, l1, i1  location \n')
     for i in range ( len(sg.indices) ):
         print(sg.indices[i], sg.gP[tuple(sg.indices[i])].pos)
         
@@ -933,96 +930,96 @@ if __name__=="__main__":
     print('number of sparse grid points = ', len(sg.indices)) 
     print('number of regular grid points = ', 2**(2*level)) 
 
-    
-    
 
-    # sg.plot_grid()
+    # # sg.plot_grid()
     
-    #
-    #  Evaluate the initial wavepacket at each grid point.
-    #
-    for i in range(len(sg.indices)):
-        # sum = 1.0
-        pos = sg.gP[tuple(sg.indices[i])].pos
-        # for j in range(len(pos)):
-            # sum *= 4.*pos[j]*(1.0-pos[j])
+    # #
+    # #  Evaluate the initial wavepacket at each grid point.
+    # #
+    # for i in range(len(sg.indices)):
+    #     # sum = 1.0
+    #     pos = sg.gP[tuple(sg.indices[i])].pos
+    #     # for j in range(len(pos)):
+    #         # sum *= 4.*pos[j]*(1.0-pos[j])
             
-        sg.gP[tuple(sg.indices[i])].fv = gwp(pos)
-    #
-    #  Convert to hierarchical values.
-    #
-    # sg.nodal2Hier()
+    #     sg.gP[tuple(sg.indices[i])].fv = gwp(pos)
+    # #
+    # #  Convert to hierarchical values.
+    # #
+    # # sg.nodal2Hier()
     
-    # x = np.linspace(-6, 6, 2**5, endpoint=False)[1:]
+    # # x = np.linspace(-6, 6, 2**5, endpoint=False)[1:]
 
     index_set, c = sg.combination_technique(3) 
     
-    s = 0
-    for index in index_set:
-        i, j = index
-        s += 2**(i+j)
-    print(s)
     print(index_set)
-    print('Combination coefficient', c)
+    s = 0
+    for n, index in enumerate(index_set):
+        i, j,z = index
+        s += 2**(i+j)
+        print('Level set =', index, 'with combination coefficient', c[n])
+    print(s)
+
     
-    result = []
-    points = []
-    xAve = 0
-    for l, index in enumerate(index_set):
-        l1, l2 = index
-        x = np.linspace(-6, 6, 2**l1, endpoint=False)
-        y = np.linspace(-6, 6, 2**l2, endpoint=False)
-        
-        print(len(x), interval(x))
-        
-        # points = genpoints(x, y)
-        # scatter(points)
-        
-        # call SPO solver
-        v = dpes(x, y)
-        
-        sol = SPO2(x, y)
-        sol.set_dpes(v)
-        
-        X, Y = np.meshgrid(x, y)
-        nx, ny = len(x), len(y)
-        ntot = nx * ny
-        grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
-                
-        psi0 = np.zeros((nx, ny, 2),dtype=complex)
-        for i in range(nx):
-            for j in range(ny):
-                psi0[i, j, 1] = gwp([x[i], y[j]], x0=[-1.0, 0], ndim=2)
-                
-        r = sol.run(psi0=psi0, dt=0.25, Nt=80)
-        x = r.position()
-        x = np.array(x)
-        
-        xAve += c[l] * x
-        
-    # sg.printGrid()
+    
+    # result = []
+    # points = []
     # xAve = 0
-    # for i in range(len(index_set)):
-    #     xAve += c[i] * result[i]
-    print(xAve.shape)
-    # import matplotlib.pyplot as plt
-    fig, ax = plt.subplots()
-    ax.plot(xAve[0, :])
-    ax.plot(xAve[1, :])
-    ax.set_title('Sparse Grid')
+    # for l, index in enumerate(index_set):
+    #     l1, l2 = index
+    #     x = np.linspace(-6, 6, 2**l1, endpoint=False)
+    #     y = np.linspace(-6, 6, 2**l2, endpoint=False)
+        
+    #     print(len(x), interval(x))
+        
+    #     # points = genpoints(x, y)
+    #     # scatter(points)
+        
+    #     # call SPO solver
+    #     v = dpes(x, y)
+        
+    #     sol = SPO2(x, y)
+    #     sol.set_dpes(v)
+        
+    #     X, Y = np.meshgrid(x, y)
+    #     nx, ny = len(x), len(y)
+    #     ntot = nx * ny
+    #     grid = np.asarray([X.reshape(ntot), Y.reshape(ntot)]).T
+                
+    #     psi0 = np.zeros((nx, ny, 2),dtype=complex)
+    #     for i in range(nx):
+    #         for j in range(ny):
+    #             psi0[i, j, 1] = gwp([x[i], y[j]], x0=[-1.0, 0], ndim=2)
+                
+    #     r = sol.run(psi0=psi0, dt=0.25, Nt=80)
+    #     x = r.position()
+    #     x = np.array(x)
+        
+    #     xAve += c[l] * x
+        
+    # # sg.printGrid()
+    # # xAve = 0
+    # # for i in range(len(index_set)):
+    # #     xAve += c[i] * result[i]
+    # print(xAve.shape)
+    # # import matplotlib.pyplot as plt
+    # fig, ax = plt.subplots()
+    # ax.plot(xAve[0, :])
+    # ax.plot(xAve[1, :])
+    # ax.set_title('Sparse Grid')
     
-    # scatter(points)
+    # # scatter(points)
     
-    #
-    #  Does the evaluation of sparse grid function in
-    #  hierarchical values give the correct value gv?
-    #
-    # for i in range(len(sg.indices)):
-    #     print(sg.gP[tuple(sg.indices[i])].fv, sg.gP[tuple(sg.indices[i])].hv)
+    # #
+    # #  Does the evaluation of sparse grid function in
+    # #  hierarchical values give the correct value gv?
+    # #
+    # # for i in range(len(sg.indices)):
+    # #     print(sg.gP[tuple(sg.indices[i])].fv, sg.gP[tuple(sg.indices[i])].hv)
    
-    # print(sg.evalFunct((0.52, 0.73)))
+    # # print(sg.evalFunct((0.52, 0.73)))
     
-    # def f(x):
-    #     return 4 * x[0] * (1-x[0]) * 4 * x[1] * (1-x[1])
+    # # def f(x):
+    # #     return 4 * x[0] * (1-x[0]) * 4 * x[1] * (1-x[1])
     
-    # print(f((0.52, 0.73)))        
+    # # print(f((0.52, 0.73)))        

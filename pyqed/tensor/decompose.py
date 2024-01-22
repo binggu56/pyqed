@@ -82,6 +82,7 @@ def decompose(input_tensor, rank, verbose=False):
 
         # SVD of unfolding matrix
         (n_row, n_column) = unfolding.shape
+        print(n_row, n_column)
 
         current_rank = min(n_row, n_column, rank[k+1])
         U, S, V = truncated_svd(unfolding, current_rank)
@@ -271,19 +272,19 @@ if __name__ == '__main__':
     dy = interval(y)
     
     X, Y = np.meshgrid(x, y)
-    a = gwp2(X, Y, sigma=[[1, 0.2], [0.2, 1]])
+    # a = gwp2(X, Y, sigma=[[1, 0.2], [0.2, 1]])
     
-    print(np.einsum('ij, ij ->', a.conj(), a) * dx * dy)
+    # print(np.einsum('ij, ij ->', a.conj(), a) * dx * dy)
     
-    print(a.shape) 
+    a = np.random.rand(10, 10, 10)
 
     # # This will be a NumPy array by default
     As, Ss = decompose(a, rank=4, verbose=True)
     print(Ss)
     A = As[0][0]
-    B = As[1][:, :, 0]
-    print(dag(A) @ A)
-    print(B @ B.T)
+    # B = As[1][:, :, 0]
+    # print(dag(A) @ A)
+    # print(B @ B.T)
     
 
     # b = contract(As)

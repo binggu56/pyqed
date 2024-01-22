@@ -1,163 +1,164 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Sun Aug 13 20:07:34 2023
+Created on Wed Jan 17 12:44:37 2024
 
-
-Using Gaussian basis/Fourier series set to propagate the nonadiabatic molecular dynamics
-
-@author: Bing Gu
-
+@author: Bing Gu (gubing@westlake.edu.cn)
 """
 
 import numpy as np
 from numpy import exp, pi, sqrt, meshgrid
-from pyqed import transform, dag, isunitary, rk4, isdiag
+from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, interval,\
+    cartesian_product
+from pyqed.wpd import ResultSPO2
+from pyqed.ldr.ldr import WPD2
 
-from pyqed.mol import Result
+import warnings
+
+# from pyqed.wpd import Result
 
 import scipy
+import string
 
 from scipy.linalg import inv
 from scipy.sparse import kron, eye
 from scipy.linalg import eigh
+import logging
 
-import matplotlib.pyplot as plt
-# import proplot as plt
-
-# class ResultLDR(Result):
-#     def nuclear_density(self):
-        
-
-class DHO2:
-    def __init__(self, x=None, y=None, mass=[1, 1], nstates=2):
-        # super().__init__(x, y, mass, nstates=nstates)
-
-        # self.dpes()
-        self.edip = sigmax()
-        assert(self.edip.ndim == nstates)
-        self.mass = mass
-        self.nstates = nstates
-
-
+try:
+    import proplot as plt
+except ImportError:
+    import matplotlib.pyplot as plt
     
-    def apes(self, x):
 
-        X, Y = x
+def kinetic(x, mass=1, dvr='sinc'):
+    """
+    kinetic enegy operator for the DVR set
 
-        N = self.nstates
+    Parameters
+    ----------
+    x : TYPE
+        DESCRIPTION.
+    mass : TYPE, optional
+        DESCRIPTION. The default is 1.
+    dvr : TYPE, optional
+        DESCRIPTION. The default is 'sinc'.
 
-        v = np.zeros((N, N))
-
-        v[0, 0] = (X+1)**2/2. + Y**2/2.
-        v[1, 1] = (X-1)**2/2. + (Y)**2/2. + 2
-        v[0, 1] = 0.2 * Y
-        v[1, 0] = v[0, 1]
-
-        # self.v = v
-        return eigh(v)
-
-
-
-
-def gram_schmidt():
-    pass
-
-class GWP:
-    def __init__(self, q, p=0, a=1, phase=0, ndim=1):
-        """
-        normalized multidimensional Gaussian wavepackets
-        .. math::
-            g(x) ~ e^{- 1/2 (x-q)^T A (x-q) + ip(x-q) + i \theta}
-
-        Parameters
-        ----------
-        q : TYPE
-            DESCRIPTION.
-        p : TYPE, optional
-            DESCRIPTION. The default is 0.
-        a : TYPE, optional
-            DESCRIPTION. The default is 1.
-        phase : TYPE, optional
-            DESCRIPTION. The default is 0.
-        ndim : TYPE, optional
-            DESCRIPTION. The default is 1.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.q = self.x = np.array(q)
-        self.p = np.array(p)
-
-        self.phase = phase
-        # self.coeff = coeff # electronic coefficients
-        self.ndim = ndim
-        # self.a = a
+    Returns
+    -------
+    Tx : TYPE
+        DESCRIPTION.
         
-        if self.ndim == 1:
-            self.var = 1./sqrt(a)
-            self.fwhm = 2.*sqrt(2. * np.log(2)) / sqrt(a)
-            self.a = a 
-            
+        
+    Refs:
+        
+        M.H. Beck et al. Physics Reports 324 (2000) 1-105
 
+
+    """
+
+    # L = xmax - xmin 
+    # a = L / npts
+    nx = len(x)
+        # self.n = np.arange(npts)
+        # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
+        # self.w = np.ones(npts, dtype=np.float64) * self.a
+        # self.k_max = np.pi/self.a
+    
+    L = x[-1] - x[0]
+    dx = interval(x)
+    n = np.arange(nx)
+    nx = npts = len(x)
+    
+
+    if dvr == 'sinc':
+        
+        # Colbert-Miller DVR 1992
+        
+        _m = n[:, np.newaxis]
+        _n = n[np.newaxis, :]
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
+            
+        T[n, n] = np.pi**2. / 3. / dx**2
+        T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+        
+    elif dvr == 'sine':
+       
+        # Sine DVR (particle in-a-box)
+        # n = np.arange(1, npts + 1)
+        # dx = (xmax - xmin)/(npts + 1)
+        # x = float(xmin) + self.a * self.n
+        
+        npts = N = len(x)
+        n = np.arange(1, npts + 1)
+        
+        _i = n[:, np.newaxis]
+        _j = n[np.newaxis, :]
+        
+        m = npts + 1
+        
+        # with warnings.catch_warnings():
+        #     warnings.simplefilter("ignore")
+        #     T = ((-1.)**(_i-_j)
+        #         * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
+        #         - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
+        
+        # T[n - 1, n - 1] = 0.
+        # T += np.diag((2. * m**2. + 1.) / 3.
+        #              - 1./np.square(np.sin(np.pi * n / m)))
+        # T *= np.pi**2. / 2. / L**2. #prefactor common to all of T
+        # T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            T = 2 * (-1.)**(_i-_j)/(N+1)**2 * \
+                np.sin(np.pi * _i/(N+1)) * np.sin(np.pi * _j/(N+1))\
+                /(np.cos(np.pi * _i /(N+1)) - np.cos(_j * np.pi/(N+1)))**2
+        
+        T[n - 1, n - 1] = 0.
+        T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2)) 
+                                               
+        T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
+
+    elif dvr == 'SincPeriodic':
+        
+        _m = n[:, np.newaxis]
+        _n = n[np.newaxis, :]
+        
+        _arg = np.pi*(_m-_n)/nx
+        
+        if (0 == nx % 2):
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
+                
+            T[n, n] = (nx**2. + 2.)/3.
         else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
+            T[n, n] = (nx**2. - 1.)/3.
             
-            if isinstance(a, (float, int)):
-                a = [a] * ndim # homogenous width
-            
-            self.a = a 
-            
-            if isinstance(p, (float, int)):
-                p = np.array([p] * ndim)
-                self.p = p
-            
-            if isinstance(q, (float, int)):
-                q = np.array([q] * ndim) 
-                self.q = q
-            
-            # assert(self.a.shape == (ndim, ndim))
-            assert(len(self.q) == ndim)
-            assert(len(self.p) == ndim)
-            # assert(isdiag(self.a))
+        T *= (np.pi/L)**2.
+        T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
+    
+    else:
+        raise ValueError("DVR {} does not exist. Please use sinc, sinc_periodic, sine.")
+
+    return T
         
-        self.params = (a, q, p)
-
-
-    def evaluate(self, x):
-        a, q, p = self.params
-        phase = self.phase 
-        
-        if self.ndim == 1:
-            return (a/pi)**(1/4) * exp(-0.5 * a * (x-q)**2 + 1j * p * (x-q))
-
-        else: 
-            
-            a = np.diag(a)
-            if isinstance(x, list):
-                x = np.array(x)
-            # the following expression is valid for non-diagonal matrix A
-            return (np.linalg.det(a)/pi)**(1/4) * exp(-0.5 * (x-q) @ a @ (x-q) \
-                                                      + 1j * p @ (x-q) + 1j * phase)
-
-    def __mult__(self, other):
-        pass
-        # return GWP(a, q)
-
-def _overlap(aj, qj, ak, qk):
+def sigma(n):
     """
-    overlap for real GWPs
+    zigzag function mapping integers to Fourier components
 
     Parameters
     ----------
-    aj : TYPE
-        DESCRIPTION.
-    qj : TYPE
-        DESCRIPTION.
-    ak : TYPE
-        DESCRIPTION.
-    qk : TYPE
+    n : TYPE
         DESCRIPTION.
 
     Returns
@@ -166,1203 +167,143 @@ def _overlap(aj, qj, ak, qk):
         DESCRIPTION.
 
     """
-
-    dq = qk - qj
-
-    return (aj*ak)**0.25 * np.sqrt(2./(aj+ak)) * np.exp(    \
-    -0.5 * aj*ak/(aj+ak) * dq**2)
-
-def _moment(aj, qj, ak, qk, n=1):
-    """
-    overlap for real GWPs
-
-    Parameters
-    ----------
-    aj : TYPE
-        DESCRIPTION.
-    qj : TYPE
-        DESCRIPTION.
-    ak : TYPE
-        DESCRIPTION.
-    qk : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    """
-
-    dq = qj - qk
-
-    S = _overlap(aj, qj, ak, qk)
-
-    if n == 0:
-        return S
-    elif n == 1:
-        return (aj * dq/(aj + ak) + qk) * S
-    # elif n == 2:
-    #     return (1./(aj + ak) + aj**2 * dq**2/(aj + ak)**2) * S
-
-    # return (aj*ak)**0.25 * np.sqrt(2./(aj+ak)) * np.exp(    \
-    # -0.5 * aj*ak/(aj+ak) * (dq**2))
-
-def moment(gj, gk, d=0, order=1):
-    """
-    compute moments between two GWPs
+    if np.mod(n, 2):
+        return -n//2
+    else:
+        return (n+1)//2
     
-    .. math::
-        \mu_n = \braket{g_j| x^n |g_k}
+# class LDR2(WPD2):
+    
+#     def __init__(self, x, y, nstates=2, ndim=2, mass=None):
+#         self.x = x
+#         self.y = y
+#         self.dx = interval(x)
+#         self.dy = interval(y)
+#         self.nstates = nstates
+        
+#         self.kx = 2 * np.pi * scipy.fft.fftfreq(len(x), self.dx)
+#         self.ky = 2 * np.pi * scipy.fft.fftfreq(len(y), self.dy)
 
-    Parameters
-    ----------
-    g1 : TYPE
-        DESCRIPTION.
-    g2 : TYPE
-        DESCRIPTION.
-    d : int
-        which DOF
-    order : TYPE, optional
-        DESCRIPTION. The default is 0.
+#         self.nx = len(x)
+#         self.ny = len(y)
+        
+#         if mass is None:
+#             mass = [1, ] * ndim 
+#         self.mass = mass
+        
+#         self.ngrid = [nx, ny]
 
-    Returns
-    -------
-    None.
+#         self.kmax = np.pi/self.dx # energy range [-K, K]
+#         self.shift = (self.nx - 1)//2
+        
+#         self.nbasis = self.nx * self.ny # for product DVR
+        
+#         self.X = None
+#         self.K = None
+#         self.V = None
+#         self.H = None 
+#         self._v = None
+        
+#         self.geometies = None
+#         self.adiabatic_states = []
+#         self.apes = None
 
+def ip(nx, dx):
     """
-    aj, qj, pj, sj = gj.a, gj.x, gj.p, gj.phase
-    ak, qk, pk, sk = gk.a, gk.x, gk.p, gk.phase
-
-    ndim = gj.ndim 
-    
-    # overlap for each dof 
-    # S = [overlap_1d(aj[d], qj[d], pj[d], sj, ak[d], qk[d], pk[d], sk) \
-         # for d in range(ndim)]
-    S = [_overlap(aj[n], qj[n], ak[n], qk[n]) for n in range(ndim)]       
-    
-    M = _moment(aj[d], qj[d], ak[d], qk[d], order)
-
-    
-    where = [True] * ndim
-    where[d] = False
-    res = M * np.prod(S, where=where)
-    
-    return res
-    
-
-class WPD:
+    (i) * momentum matrix elements = :math:`\nabla`
     """
-    multi-dimensional wavepacket dynamics in a single PES with fixed REAL Gaussian basis set
+
+    p = np.zeros((nx, nx))
+    for n in range(nx):
+        for m in range(nx):
+            p[n, m] = 1/dx * (-1)**(n-m)/(n-m)
+    return p
+
+def gen_enisum_string(D):
+    alphabet = list(string.ascii_lowercase)
+    if (D > 10):
+        raise ValueError('Dimension D = {} cannot be larger than 10.'.format(D))
+    
+    ini = "".join(alphabet[:D]) + 'x' + "".join(alphabet[D:2*D])+'y'
+    einsum_string = ini  
+    for n in range(D):
+        einsum_string += ','
+        einsum_string += alphabet[n] + alphabet[n+D]
+
+    return (einsum_string + ' -> ' + ini)
+
+
+class LDRN:
     """
-    def __init__(self, basis, mass=None, coeff=None, ndim=1):
-        self.nbasis = len(basis)
-        # self.nstates = len(basis[0].coeff)
-        self.ndim = self.dim = ndim
-        self.coeff = self.c = coeff
-        self.basis = basis
-        self.mass = mass
+    many-dimensional many-state nonadiabatic conical intersection dynamics in 
+    DVR + LDR + SPO
+    """
+    def __init__(self, domains, levels, ndim=3, mass=None, dvr_type='sinc'): 
 
-        self.v = None
-        self.x = None
-        self.x_evals = None
-        self.x_evecs = None
-        self.x2 = None
-        self.p = None
-        self._K = None # kinetic energy operator
-        self._V = None # potential
-        self.H = None
-        self.S = None
+        assert(len(domains) == len(levels) == ndim)
+        
+        self.L = [domain[1] - domain[0] for domain in domains]
 
-    def set_potential(self, v):
-        assert(v.ndim == self.ndim)
-        self.v = v
-
-    def buildH(self, representation='dvr'):
-
-        if representation == 'gwp':
-            U = self.x_evecs
-            # self.H = (U) @ self.buildK() @ dag(U) + self.buildV()
-            # self.H = self.buildK() + dag(U) @ self.buildV() @ (U)
-            self.H = self.buildK() + self.buildV()
-
-        elif representation == 'dvr':
-
-            U = self.x_evecs
-            self.H = dag(U) @ self.buildK() @ U + np.diag(self.v)
-
-        return self.H
-
-    def eigenstates(self, representation='dvr'):
-
-        self.buildH(representation=representation)
-
-        return scipy.linalg.eigh(self.H)
-
-
-    def norm(self):
-        pass
-
-    def overlap(self):
-
-        """
-        construct overlap matrix from GWPs defined by {a,x,p}
-        This calculation can be significantly reduced if a uniform GWP is used
-        """
-        N = self.nbasis
-        S = np.identity(N)
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.q
-
-                S[j, k] = _overlap(aj, qj, ak, qk)
-
-                S[k, j] = S[j, k]
-
-        self.S = S
-        return S
-
-    def buildK(self):
-        N = self.nbasis
-        K = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.x
-
-                dq = qj - qk
-
-                K[j, k] = -1./(2.*self.mass) * (ak**2 * _moment(aj, qj, ak, qk, n=2)\
-                                              - ak * _overlap(aj, qj, ak, qk))
-
-                K[k, j] = K[j, k]
-
-        self._K = K
-        return K
-
-    def buildV(self, method='dvr'):
-        # potential energy operator
-        # x = self.x
-        # v = x @ inv(self.overlap()) @ x
-        # # self._V = v
-
-        # print('potential', v)
-
-
-        # # print(dag(U) @ self.S @ U)
-
-        # # print(dag(U) @ np.diag(self.x_evals**2 @ (U) == self.x)
-        # # v = U @ v @ dag(U)
-        # v *= 0.5
-
-
-        if method == 'dvr':
-            U = self.x_evecs
-            U = inv(U)
-
-            # print(dag(U) @ np.diag(self.x_evals**2 @ (U) == self.x)
-            v = dag(U) @ np.diag(self.v) @ U
-
-        elif method == 'lha': # local harmonic approximation
-
-            N = self.nbasis
-            v = np.zeros((N, N))
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    v[j, k] = _moment(aj, qj, ak, qk, n=2) + 2*qk*_moment(aj,qj,ak,qk)\
-                                                  + qk**2 * _overlap(aj, qj, ak, qk)
-
-                    v[k, j] = v[j, k]
-
-            v *= 0.5
-
-
-        self._V = v
-        return v
-
-    def position(self):
-        """
-        position matrix elements
-        .. math::
-            x_{jk} = \braket{\phi_j | x | \phi_k}
-
-        Parameters
-        ----------
-        shift : TYPE, optional
-            DESCRIPTION. The default is False.
-
-        Returns
-        -------
-        None.
-
-        """
-
-        N = self.nbasis
-        x = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.q
-
-                dq = qj - qk
-
-                x[j, k] = (aj * dq/(aj + ak) + qk) * _overlap(aj, qj, ak, qk)
-
-                x[k, j] = x[j, k]
-
+        
+        x = []
+        if dvr_type in ['sinc', 'sine']:
+        
+            for d in range(ndim):
+                x.append(discretize(*domains[d], levels[d], endpoints=False))
+        # elif dvr_type == 'sine':
+        else:
+            raise ValueError('DVR {} is not supported. Please use sinc.')
+            
+        
         self.x = x
-
-        return x
-
-    def momentum(self):
-        pass
-
-    def moment(self, n=2):
-        # return np.diag(self.x_evals**n)
-        # self.central_moment(2) + 2.*
-        pass
-
-    def central_moment(self, n=1):
-        if n == 1:
-
-            N = self.nbasis
-            x = np.identity(N)
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    x[j, k] = (aj * dq/(aj + ak)) * _overlap(aj, qj, ak, qk)
-
-                    x[k, j] = x[j, k]
-
-        elif n == 2:
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    x[j, k] = (1./(aj + ak) + aj**2 * dq**2/(aj + ak)**2) * \
-                        _overlap(aj, qj, ak, qk)
-
-                    x[k, j] = x[j, k]
-
-        return x
-
-    def diag_x(self):
-        """
-        diagonalize the x matrix
-
-        Returns
-        -------
-        w : TYPE
-            DESCRIPTION.
-        u : TYPE
-            DESCRIPTION.
-
-        """
-        if self.x is None:
-            self.position()
-            
-        x = self.x
-
-        if self.S is None:
-            self.overlap()
-
-        w, u = scipy.linalg.eigh(x, self.S)
-
-        self.x_evals = w
-        self.x_evecs = u
-
-        return w, u
-
-    def gwp2dvr(self, a):
-        """
-        transform from Gaussian basis to the orthogonal basis
-        """
-        U = self.x_evecs # shape [old, new]
-        return dag(U) @ a @ U
-
-    def run(self):
-        pass
-
-    def plot_wavepacket(self, c, x):
-
-        psi = 0
-        for i, g in enumerate(self.basis):
-            psi += c[i] * g.evaluate(x)
-
-        fig, ax = plt.subplots()
-        ax.plot(x, psi.real)
-        return
-
-
-class WPD2:
-    """
-    multi-dimensional wavepacket dynamics in a single PES with fixed REAL Gaussian basis set
-    """
-    def __init__(self, basis, mass, coeff=None, ndim=2):
-        """
+        self.dx = [interval[_x] for _x in x]
+        self.nx = [len(_x) for _x in x] 
         
-
-        Parameters
-        ----------
-        basis : TYPE
-            DESCRIPTION.
-        mass : TYPE
-            use mass-scaled coordinates.
-        coeff : TYPE, optional
-            DESCRIPTION. The default is None.
-        ndim : TYPE, optional
-            DESCRIPTION. The default is 2.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.nbasis = len(basis)
-        # self.nstates = len(basis[0].coeff)
-        self.ndim = self.dim = ndim
-        self.coeff = self.c = coeff
-        self.basis = basis
-        self.mass = mass
-
-        self.v = None
-        self.x = [None] * ndim
-        self.x_evals = None
-        self.x_evecs = None
-        self.x2 = None
-        self.p = None
-        self._K = None # kinetic energy operator
-        self._V = None # potential
-        self.H = None
-        self.S = None
-
-    def set_potential(self, v):
-        assert(v.ndim == self.ndim)
-        self.v = v
-
-    def buildH(self, representation='dvr'):
-
-        if representation == 'gwp':
-            
-            U = self.x_evecs
-            
-            # U = kron(U, U)
-            
-            # self.H = (U) @ self.buildK() @ dag(U) + self.buildV()
-            # self.H = self.buildK() + dag(U) @ self.buildV() @ (U)
-            self.H = self.buildK() + self.buildV()
-
-        elif representation == 'dvr':
-
-            U = self.x_evecs
-            self.H = dag(U) @ self.buildK() @ U + np.diag(self.v)
-
-        return self.H
-
-    def eigenstates(self, representation='dvr'):
-
-        self.buildH(representation=representation)
-
-        return scipy.linalg.eigh(self.H)
-
-
-    def norm(self):
-        pass
-
-    def overlap(self):
-
-        """
-        construct overlap matrix from GWPs defined by {a,x,p}
-        This calculation can be significantly reduced if a uniform GWP is used
-        """
-        N = self.nbasis
-        S = np.identity(N)
-
-        for k in range(N):
-            gk = self.basis[k]
-            # ak, qk = gk.a, gk.q
-
-            for j in range(k):
-                gj = self.basis[j]
-                # aj, qj = gj.a, gj.q
-
-                # S[j, k] = _overlap(aj, qj, ak, qk)
-                S[j, k] = overlap(gj, gk)
-                S[k, j] = S[j, k]
-
-        self.S = S
-        return S
-
-    def buildK(self):
-        N = self.nbasis
-        K = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.x
-
-                dq = qj - qk
-
-                K[j, k] = -1./(2.*self.mass) * (ak**2 * _moment(aj, qj, ak, qk, n=2)\
-                                              - ak * _overlap(aj, qj, ak, qk))
-
-                K[k, j] = K[j, k]
-
-        self._K = K
-        return K
-
-    def buildV(self, method='dvr'):
-        # potential energy operator
-        # x = self.x
-        # v = x @ inv(self.overlap()) @ x
-        # # self._V = v
-
-        # print('potential', v)
-
-
-        # # print(dag(U) @ self.S @ U)
-
-        # # print(dag(U) @ np.diag(self.x_evals**2 @ (U) == self.x)
-        # # v = U @ v @ dag(U)
-        # v *= 0.5
-
-
-        if method == 'dvr':
-            U = self.x_evecs
-            U = inv(U)
-
-            # print(dag(U) @ np.diag(self.x_evals**2 @ (U) == self.x)
-            v = dag(U) @ np.diag(self.v) @ U
-
-        elif method == 'lha': # local harmonic approximation
-
-            N = self.nbasis
-            v = np.zeros((N, N))
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    v[j, k] = _moment(aj, qj, ak, qk, n=2) + 2*qk*_moment(aj,qj,ak,qk)\
-                                                  + qk**2 * _overlap(aj, qj, ak, qk)
-
-                    v[k, j] = v[j, k]
-
-            v *= 0.5
-
-
-        self._V = v
-        return v
-
-    def position(self, d=0):
-        """
-        position operator matrix elements
+        self.dvr_type = dvr_type
         
-        .. math::
-            x_{\mu, jk} = \braket{\phi_j | x_\mu | \phi_k}
+        if mass is None:
+            mass = [1, ] * ndim
 
-        Parameters
-        ----------
-        d: int
-            which DOF
-        shift : TYPE, optional
-            DESCRIPTION. The default is False.
+        # all configurations in a vector
+        self.points = np.fliplr(cartesian_product(x))
+        self.npts = len(self.points)
 
-        Returns
-        -------
-        None.
-
-        """
-
-        N = self.nbasis
-        x = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.q
-
-                # dq = qj - qk
-
-                # x[j, k] = (aj * dq/(aj + ak) + qk) * _overlap(aj, qj, ak, qk)
-                x[j, k] = moment(gj, gk, d=d, order=1)
-
-                x[k, j] = x[j, k]
-
-        self.x[d] = x
-
-        return x
-
-    def xprod(self):
-        N = self.nbasis
-        x = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.q
-
-                dq = qj - qk
-
-                x[j, k] = np.prod([(aj[d] * dq[d]/(aj[d] + ak[d]) + qk[d]) * \
-                                _overlap(aj[d], qj[d], ak[d], qk[d]) for d in \
-                                    range(self.ndim)])
-                # x[j, k] = moment(gj, gk, d=d, order=1)
-
-                x[k, j] = x[j, k]
-
-        w, u = eigh(x)
-        return u
-    
-    def momentum(self):
-        pass
-
-    def moment(self, n=2):
-        # return np.diag(self.x_evals**n)
-        # self.central_moment(2) + 2.*
-        pass
-
-    def central_moment(self, n=1):
-        if n == 1:
-
-            N = self.nbasis
-            x = np.identity(N)
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    x[j, k] = (aj * dq/(aj + ak)) * _overlap(aj, qj, ak, qk)
-
-                    x[k, j] = x[j, k]
-
-        elif n == 2:
-
-            for k in range(N):
-                gk = self.basis[k]
-                ak, qk = gk.a, gk.q
-
-                for j in range(k+1):
-                    gj = self.basis[j]
-                    aj, qj = gj.a, gj.x
-
-                    dq = qj - qk
-
-                    x[j, k] = (1./(aj + ak) + aj**2 * dq**2/(aj + ak)**2) * \
-                        _overlap(aj, qj, ak, qk)
-
-                    x[k, j] = x[j, k]
-
-        return x
-
-    def diag_x(self, d=0):
-        """
-        diagonalize the x matrix
-        Parameters
-        ----------
-        m: int
-            which DOF
-            
-        Returns
-        -------
-        w : TYPE
-            DESCRIPTION.
-        u : TYPE
-            DESCRIPTION.
-
-        """
-        if self.x[d] is None:
-            self.position(d)
-            
-        x = self.x[d]
-
-        if self.S is None:
-            self.overlap()
-
-        w, u = scipy.linalg.eigh(x, self.S)
-
-        self.x_evals = w
-        self.x_evecs = u
-
-        return w, u
-
-    def gwp2dvr(self, a):
-        """
-        transform from Gaussian basis to the orthogonal basis
-        
-        Parameters
-        ----------
-        a: ndarray
-            operator represented in GWPs
-        """
-        U = self.x_evecs # shape [old, new]
-        # U = kron(U, U)
-        return dag(U) @ a @ U
-
-    def run(self):
-        pass
-
-    def plot_wavepacket(self, c, x):
-
-        psi = 0
-        for i, g in enumerate(self.basis):
-            psi += c[i] * g.evaluate(x)
-
-        fig, ax = plt.subplots()
-        ax.plot(x, psi.real)
-        return
-
-
-def braket(ket, bra):
-    return np.vdot(bra, ket)
-
-class NAWPD(WPD):
-    """
-    multi-dimensional nonadiabatic wavepacket dynamics (NAWPD) with locally diabatic
-    representation
-
-    This method requires adiabatic electronic states at DVR grids, obtained by
-    diagonalizing the x matrix.
-    """
-    def __init__(self, basis, mol=None, nstates=2, ndim=1):
-        """
-
-
-        Parameters
-        ----------
-        mol : object
-            Vibronic coupling model.
-        basis : TYPE
-            DESCRIPTION.
-        nstates : TYPE, optional
-            DESCRIPTION. The default is 2.
-        ndim : TYPE, optional
-            DESCRIPTION. The default is 1.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.nbasis = len(basis)
-        self.mol = mol
-        # nb, nel = coeff.shape
-        # assert(nb == self.nbasis)
-
-        self.basis = basis
-        self.nstates = nstates
-        self.ndim = ndim
-
-
-        self.v = None
-        self.S = None # overlap matrix
+        ###
         self.H = None
         self._K = None
-        self._V = None
-
-        self.adiabatic_states = None # electronic states
-
-
-    def buildH(self):
-        """
-        The potential energy operator is straightforward as it only requires the
-        adiabatic PES.
-
-        The T_N construction requires the electronic overlap
-        .. math::
-            T_{m \beta, n\alpha} = K_{mn} \braket{\beta(R_m)| \alpha(R_n)}
-
-        """
-        self._H = self.buildK() + self.buildV()
-
-        pass
-
-    def buildK(self, dtype=float):
-        # \braket{x_n|T_N| x_m}
-        N = self.nbasis
-        M = self.nstates
-        mass = self.mol.mass
-
-        K = np.zeros((N, N), dtype=dtype)
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.x
-
-                K[j, k] = -1./(2.*mass) * (ak**2 * _moment(aj, qj, ak, qk, n=2)\
-                                              - ak * _overlap(aj, qj, ak, qk))
-
-                K[k, j] = K[j, k]
-
-        K = self.gwp2dvr(K)
-        # print(K.shape)
-
-        # K = kron(K, eye(M)).toarray().reshape(N, M, N, M)
-
-        # K = scipy.linalg.kron(K, eye(M))
-        # K = np.reshape(K, (N, M, N, M))
-
-        # overlap of electronic states
-        A = np.zeros((N, N, M, M), dtype=dtype)
-
-        for i in range(N):
-            psi1 = self.adiabatic_states[i]
-
-            A[i, i] = np.eye(M) * K[i, i] # identity matrix at the same geometry
-
-            for j in range(i):
-                psi2 = self.adiabatic_states[j]
-
-                # for a in range(M):
-                #     for b in range(M):
-                #         A[i, j, a, b] = braket(psi1[:, a], psi2[:, b])
-                #         A[j, i, b, a] = A[i, j, a, b].conj()
-                A[i, j] = dag(psi1) @ psi2 * K[i, j]
-                A[j, i] = dag(A[i, j])
-
-        A = np.transpose(A, (0, 2, 1, 3))
-
-        self._K = A
-        # self._K = np.einsum('ba, mbna ->mbna', K, A)
-
-        return A
-
-    def buildV(self, v=None):
-        """
-        adiabatic potential energy surface
-
-        Parameters
-        ----------
-        v : TYPE, size nb, nstates
-            DESCRIPTION. The default is None.
-
-        Returns
-        -------
-        v : TYPE
-            DESCRIPTION.
-
-        """
-        if v is None:
-            mol = self.mol
-            x = self.x_evals
-            v, u = mol.apes(x)
-
-            self._V = np.array(v)
-            assert(self._V.shape == (self.nbasis, self.nstates))
-
-            self.adiabatic_states = u # u should be a list of eigenvectors
-        else:
-            self._V = np.array(v)
-
-        return self._V
-
-
-    def run(self, psi0, dt, nt, nout=1, e_ops=[]):
-        psi = psi0.copy()
-
-        if self._V is None:
-            self.buildV()
-        V = self._V
-
-        K = self.buildK()
-
-        # assert(V.shape == , K.shape)
-
-        # assert(e_op.shape = (self.nstates)
-
-        result = np.zeros((len(e_ops), nt//nout), dtype=complex)
-
-        for k in range(nt//nout):
-            for j in range(nout):
-                psi = rk4(psi, tdse, dt, K, V)
-
-            # calculate observables
-            result[:, k] = [self.obs_el(psi, e_op) for e_op in e_ops]
-
-        return result
-
-
-
-    def obs_el(self, psi, a, kind='electronic'):
-        # assume Condon approximation O^n_{ba} = O_{ba}
-        if a.ndim == 2:
-            return np.trace(psi.conj() @ a @ psi.T)
-        elif a.ndim == 3:
-            return np.einsum('nb, nba, na', psi.conj(), a, psi)
-
-    def obs_nuc(self):
-        pass
-
-
-class GWP2(WPD2):
-    """
-    2-dimensional nonadiabatic wavepacket dynamics (NAWPD) with locally diabatic
-    representation
-
-    This method requires adiabatic electronic states at DVR grids, obtained by
-    diagonalizing the x matrix.
-    """
-    def __init__(self, basis, mol=None, nstates=2, ndim=2):
-        """
-
-        Use mass-scaled coordinates.
+        # self._V = None
         
-        Use direct product basis set first, the transformation to Wannier basis 
-        is simply a tensor product of 1D transformation matrix. This should be generalized 
-        to non-product basis set. 
+        self._v = None
+        self.exp_K = None
+        self.exp_V = None
         
-
-        Parameters
-        ----------
-        mol : object
-            Vibronic coupling model.
-        basis : TYPE
-            DESCRIPTION.
-        nstates : TYPE, optional
-            DESCRIPTION. The default is 2.
-        ndim : TYPE, optional
-            DESCRIPTION. The default is 2.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.nbasis = len(basis)
-        self.mol = mol
-        self.mass = mol.mass
-        assert(len(self.mass) == ndim)
-        # nb, nel = coeff.shape
-        # assert(nb == self.nbasis)
-
-        self.basis = basis
-        self.nstates = nstates
-        self.ndim = ndim
-
-        self.x = [None] * ndim
-
-        self.v = None
-        self.S = None # nuclear overlap matrix
-        self.H = None
-        self._K = None
-        self._V = None
-        self.A = None # electronic state overlap matrix
         
-        self.U = None # transformation matrix from GWP to DVR
-        self.x_evals = None # eigenvalues of the position operators
-
-        self.adiabatic_states = None # electronic states
-
-    def position(self, d=0):
-        """
-        position operator matrix elements
-        
-        .. math::
-            x_{\mu, jk} = \braket{\phi_j | x_\mu | \phi_k}
-
-        Parameters
-        ----------
-        d: int
-            which DOF
-        shift : TYPE, optional
-            DESCRIPTION. The default is False.
-
-        Returns
-        -------
-        None.
-
-        """
-
-        N = self.nbasis
-        x = np.zeros((N, N))
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.q
-
-                # dq = qj - qk
-
-                # x[j, k] = (aj * dq/(aj + ak) + qk) * _overlap(aj, qj, ak, qk)
-                x[j, k] = moment(gj, gk, d=d, order=1)
-
-                x[k, j] = x[j, k].conj()
-
-        self.x[d] = x
-
-        return x
-
-    # def buildH(self):
-    #     """
-    #     The potential energy operator is straightforward as it only requires the
-    #     adiabatic PES.
-
-    #     The T_N construction requires the electronic overlap
-    #     .. math::
-    #         T_{m \beta, n\alpha} = K_{mn} \braket{\beta(R_m)| \alpha(R_n)}
-
-    #     """
-    #     self._H = self.buildK() + self.buildV()
-
-    #     pass
-    def gwp2dvr(self, a):
-        """
-        transform from Gaussian basis to the orthogonal basis
-        
-        Parameters
-        ----------
-        a: ndarray
-            operator represented in GWPs
-        """
-        if self.U is None:
-            raise ValueError('Transformation matrix is None.')
-        U = self.U # shape [old, new]
-        # U = kron(U, U)
-        return dag(U) @ a @ U
+    @property
+    def v(self):
+        return self._v 
     
-    def buildK(self, dtype=complex):
-        # \braket{x_n|T_N| x_m}
-        N = self.nbasis
-        M = self.nstates
-        mass = self.mol.mass
-
-        K = np.zeros((N, N), dtype=dtype)
-
-        for k in range(N):
-            gk = self.basis[k]
-            ak, qk = gk.a, gk.q
-
-            for j in range(k+1):
-                gj = self.basis[j]
-                aj, qj = gj.a, gj.x
-
-                # K[j, k] = -0.5 * (ak**2 * _moment(aj, qj, ak, qk, n=2)\
-                #                               - ak * _overlap(aj, qj, ak, qk))
-                K[j, k] = kin_me(gj, gk, mass)
-                
-                K[k, j] = K[j, k]
-
-        # transform to Wannier basis
-        K = self.gwp2dvr(K)
-
-
-        # overlap of electronic states
-        A = np.zeros((N, N, M, M), dtype=dtype)
-        self._K = np.zeros((N, N, M, M), dtype=dtype)
-
-
-        for i in range(N):
-            psi1 = self.adiabatic_states[i]
-
-            A[i, i] = np.eye(M) #* K[i, i] # identity matrix at the same geometry
-
-            for j in range(i):
-                psi2 = self.adiabatic_states[j]
-
-                # for a in range(M):
-                #     for b in range(M):
-                #         A[i, j, a, b] = braket(psi1[:, a], psi2[:, b])
-                #         A[j, i, b, a] = A[i, j, a, b].conj()
-                A[i, j] = dag(psi1) @ psi2 #* K[i, j]
-                A[j, i] = dag(A[i, j])
-
-
-        # self._K = A
-        for a in range(ns):
-            for b in range(ns):        
-                self._K[:, :, a, b] = A[:, :, a, b] * K 
-
-        self._K = np.transpose(self._K, (0, 2, 1, 3))
-
-        A = np.transpose(A, (0, 2, 1, 3))
-        self.A = A
+    @v.setter
+    def v(self, v):
+        assert(v.shape == (self.nx, self.ny, self.nstates, self.nstates))
         
-        return self._K
+        self._v = v
 
-    def buildV(self, v=None):
+    def buildK(self, dt):
         """
-        adiabatic potential energy surface
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
 
         Parameters
         ----------
-        v : TYPE, size nb, nstates
-            DESCRIPTION. The default is None.
-
-        Returns
-        -------
-        v : TYPE
-            DESCRIPTION.
-
-        """
-        if v is None:
-            mol = self.mol
-            x = self.x_evals
-            ns = self.nstates
-            
-            wlist = []
-            ulist = []
-
-            for i in range(nb):
-                v = np.zeros((ns, ns))
-
-                w, u = mol.apes(x[i])
-                wlist.append(w.copy())
-                ulist.append(u.copy())
-
-            self._V = np.array(wlist)
-            assert(self._V.shape == (self.nbasis, self.nstates))
-
-            self.adiabatic_states = ulist # u should be a list of eigenvectors
-        else:
-            self._V = np.array(v)
-
-        return self._V
-
-
-    def run(self, psi0, dt, nt, nout=1, e_ops=[], nuc_ops=[]):
-        """
-        
-
-        Parameters
-        ----------
-        psi0 : TYPE
-            DESCRIPTION.
         dt : TYPE
-            DESCRIPTION.
-        nt : TYPE
-            DESCRIPTION.
-        nout : TYPE, optional
-            DESCRIPTION. The default is 1.
-        e_ops : TYPE, optional
-            list of electronic operators. The default is [].
-        nuc_ops : TYPE, optional
-            list of nuclear operators. The default is [].
-
-        Returns
-        -------
-        result : TYPE
-            DESCRIPTION.
-
-        """
-        psi = psi0.copy()
-
-        if self._V is None:
-            self.buildV()
-        V = self._V
-
-        K = self.buildK()
-
-        # assert(V.shape == , K.shape)
-
-        # assert(e_op.shape = (self.nstates)
-        result = Result(dt=dt, Nt=nt, nout=nout, t0=0.)
-        result.psilist = [psi0]
-        
-        
-        obs = np.zeros((len(e_ops) + len(nuc_ops), nt//nout), dtype=complex)
-        
-        # observables at t0
-        obs[:, 0] = [self.obs_nuc(psi0, e_op) for e_op in nuc_ops] + \
-            [self.obs_el(psi0, a) for a in e_ops]
-                
-        for k in range(1, nt//nout):
-            for j in range(nout):
-                psi = rk4(psi, tdse, dt, K, V)
-            
-            result.psilist.append(psi.copy())
-            
-            # calculate observables
-            obs[:, k] = [self.obs_nuc(psi, e_op) for e_op in nuc_ops] + \
-                [self.obs_el(psi, a) for a in e_ops]
-        
-        result.observables = obs
-        
-        return result
-
-
-
-    def obs_el(self, psi, a, kind='electronic'):
-        # assume Condon approximation A^n_{ba} = A_{ba}
-        if a.ndim == 2:
-            return np.trace(psi.conj() @ a @ psi.T)
-        elif a.ndim == 3:
-            return np.einsum('nb, nba, na', psi.conj(), a, psi)
-
-    def obs_nuc(self, psi, a):
-        """
-        Compute the expectation value of an nuclear operator A.
-
-        Parameters
-        ----------
-        psi : TYPE
-            DESCRIPTION.
-        a : TYPE
             DESCRIPTION.
 
         Returns
@@ -1371,431 +312,1429 @@ class GWP2(WPD2):
             DESCRIPTION.
 
         """
-        return np.einsum('mb, mn, mbna, na', psi.conj(), a, self.A, psi)
+
+
+        self.exp_K = []
         
-    def rdm_nuc(self, psi):
-        return np.einsum('mb, mbna, na -> nm', psi.conj(), self.A, psi)
+        for d in self.ndim:
+                    
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr)
+        
+            expKx = scipy.linalg.expm(-1j * Tx * dt)
+
+            self.exp_K.append(expKx.copy())
+            
+        return self.exp_K
     
-    def nuclear_density(self, psi, x, y):
+    def buildV(self, dt):
         """
-        compute the nuclear density 
-        .. math::
-            \rho(\bf R, t) = \sum_{n,m} \sum_{\beta, \alpha} \
-                C_{m\beta}^* A_{m\beta, n\alpha} C_{n\alpha} \chi_n(\bf R) \chi^*_m(\bf R)
+        Setup the propagators appearing in the split-operator method.
+
+
 
         Parameters
         ----------
-        x : TYPE, optional
-            DESCRIPTION. The default is None.
-        y : TYPE, optional
-            DESCRIPTION. The default is None.
+        dt : TYPE
+            DESCRIPTION.
+
+        intertia: func
+            moment of inertia, only used for Jocabi coordinates.
 
         Returns
         -------
         None.
 
-        """ 
-        # reduced 
-        rdm = self.rdm_nuc(psi)
+        """
         
-        # if x is None:
-        #     x = self.x 
-        # if y is None:
-        #     y = self.y 
+        dt2 = 0.5 * dt
+        self.exp_V = np.exp(-1j * dt * self.apes)
+
+        self.exp_V_half = np.exp(-1j * dt2 * self.apes)
+
+        return
+    
+    def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        assert(psi0.shape == (*self.nx, self.nstates))
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+        
+
+
+        # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+        # if self.ndim == 2:
+        
+            # expKx, expKy = self.exp_K
+        einsum_string = gen_enisum_string(self.ndim)
+        exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
+        
             
-        # X, Y = meshgrid(x, y)
-        nx = len(x)
-        ny = len(y)
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
         
-        g = np.zeros((nb, nx, ny))
-        for n in range(nb):
-            for i in range(nx):
-                for j in range(ny):
-                    g[n, i, j] = self.basis[n].evaluate([x[i], y[j]])
+        alphabet = list(string.ascii_lowercase)
+        D = self.ndim
+        _string = "".join(alphabet[:D]) + 'x' + "".join(alphabet[D:2*D])+'y, ' + \
+            "".join(alphabet[D:2*D])+'y -> ' + "".join(alphabet[:D]) + 'x'
+            
+        psi = psi0.copy()
+        psi = self.exp_V_half * psi
+        # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
         
+        for k in range(nt//nout):
+            for kk in range(nout):
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+
+                # psi = self._KEO_linear(psi)
+                # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
+                psi = np.einsum(_string, exp_T, psi) 
+                psi = self.exp_V * psi 
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+                
+            r.psilist.append(psi.copy())
         
-        chi = np.einsum('aij, an -> nij', g, U.toarray()) # nij 
+        psi = self.exp_V_half * psi
         
-        rho = np.einsum('nm, nij, mij -> ij', rdm, chi, chi.conj())
+        return r
+    
+    def rdm_el(self, psi):
+        """
+        compute the reduced electronic density matrices 
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """        
+        D = self.ndim 
+        alphabet = list(string.ascii_lowercase)
         
+        einsum_string = "".join(alphabet[:D]) + 'x, ' + "".join(alphabet[:D])+'y ->  xy'
+        
+        rho = np.einsum(einsum_string, psi.conj(), psi)
         return rho
-
-
-
     
 
-class Smolyak:
+class LDR2(WPD2):
     """
-    Conical intersection dynamcis with Smolyak sparse grid
-    """
-    def __init__(self, lmax, ndim=2):
-        self.lmax = lmax
+    N-state two-mode conical intersection dynamics with Fourier series 
     
+    LDR-SPO-SincDVR
+    
+    """
+    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sinc'):
+        self.x = x
+        self.y = y
+        self.dx = interval(x)
+        self.dy = interval(y)
+        self.nstates = nstates
+        
+        self.kx = 2 * np.pi * scipy.fft.fftfreq(len(x), self.dx)
+        self.ky = 2 * np.pi * scipy.fft.fftfreq(len(y), self.dy)
+
+        self.nx = len(x)
+        self.ny = len(y)
+        
+        self.dvr = dvr
+        
+        if mass is None:
+            mass = [1, ] * ndim 
+        self.mass = mass
+        
+        self.ngrid = [self.nx, self.ny]
+
+        self.kmax = np.pi/self.dx # energy range [-K, K]
+        self.shift = (self.nx - 1)//2
+        
+        self.nbasis = self.nx * self.ny # for product DVR
+        
+        self.X = None
+        self.K = None
+        self.V = None
+        self.H = None 
+        self._v = None # diabatic potential matrix
+        
+        
+        self.geometies = None
+        self.adiabatic_states = []
+        self.apes = None
+        self.electronic_overlap = self.A = None
+        
+    @property
+    def v(self):
+        return self._v 
+    
+    @v.setter
+    def v(self, v):
+        assert(v.shape == (self.nx, self.ny, self.nstates, self.nstates))
+        
+        self._v = v
+    
+    def primitive_basis(self, n):
+        # the index n \in [-N, ... 0, 1, ... N]
+        n = sigma(n)
+        dx = self.dx
+        x = self.x
+
+        return 
+        # return 1/sqrt(dx) * sinc(np.pi * (x/dx - n))
+    
+
+    
+    # def kinetic(self, npts, L, x0=0.):
+    #     L = float(L)
+    #     # self.npts = npts
+    #     # self.L = L
+    #     # self.x0 = x0
+    #     dx = L / npts
+    #     n = np.arange(npts)
+    #     x = x0 + n * dx - L / 2. + dx / 2.
+    #     # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #     # self.k_max = np.pi/self.a
+        
+    # # L = xmax - xmin 
+    # # a = L / npts
+    #     n = np.arange(npts)
+
+    #     # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #     # self.k_max = np.pi/self.a
+
+
+
+        
+    #     _m = n[:, np.newaxis]
+    #     _n = n[np.newaxis, :]
+        
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore")
+    #         T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
             
+    #     T[n, n] = np.pi**2. / 3. / dx**2
+    #     T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+
+    
+    # def kinetic(self):
+        
+    #     x = self.x         
+    #     nx = self.nx
+    #         # self.n = np.arange(npts)
+    #         # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
+    #         # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #         # self.k_max = np.pi/self.a
+        
+    #     L = x[-1] - x[0]
+    #     dx = interval(x)
+    #     n = np.arange(nx)
+
+
+            
+    #     # Colbert-Miller DVR 1992
+        
+    #     _m = n[:, np.newaxis]
+    #     _n = n[np.newaxis, :]
+        
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore")
+    #         T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
+            
+    #     T[n, n] = np.pi**2. / 3. / dx**2
+    #     T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+    
+    #     return T
+    
+    def buildK(self, dt):
+        
+        # dx = self.dx
+        # Tx = np.zeros((self.nx, self.nx))
+        mx, my = self.mass 
         
 
-
-def tdse(psi, K, V):
-    # return -1j * (np.einsum('ijkl, kl -> ij', K, psi) + V * psi)
-    return -1j * (np.tensordot(K, psi) + V * psi)
-
-def overlap_1d(aj, x, px, sj, ak, y, py, sk):
-    """
-    overlap between two 1D GWPs
-    """
-    dp = py - px
-    dq = y - x
-
-    return (aj*ak)**0.25 * np.sqrt(2./(aj+ak)) * np.exp(    \
-            -0.5 * aj*ak/(aj+ak) * (dp**2/aj/ak + dq**2  \
-            + 2.0*1j* (px/aj + py/ak) *dq) ) * np.exp(1j * (sk-sj))
-
-
-def overlap(gj, gk):
-    """
-    overlap between two GWPs defined by {a,x,p}
-    """
-
-    aj, qj, pj, sj = gj.a, gj.x, gj.p, gj.phase
-    ak, qk, pk, sk = gk.a, gk.x, gk.p, gk.phase
-
-    assert(gj.ndim == gk.ndim)
-
-    ndim = gj.ndim
-
-    if ndim == 1:
-        return overlap_1d(aj, qj, pj, sj, ak, qk, pk, sk)
-    
-    else:
-        tmp = 1.0
-        for d in range(ndim):
-            tmp *= overlap_1d(aj[d], qj[d], pj[d], sj, ak[d], qk[d], pk[d], sk)
-
-        return tmp
-
-def kin_me(gj, gk, am):
-    """
-    kinetic energy matrix elements between two multidimensional GWPs
-    """
-
-    aj, qj, pj, sj = gj.a, gj.x, gj.p, gj.phase
-    ak, qk, pk, sk = gk.a, gk.x, gk.p, gk.phase
-
-    ndim = gj.ndim 
-    
-    # overlap for each dof 
-    S = [overlap_1d(aj[d], qj[d], pj[d], sj, ak[d], qk[d], pk[d], sk) \
-         for d in range(ndim)]
+        # for n in range(nx):
+        #     Tx[n, n] = np.pi**2/3 * 1/(2 * mx * dx**2)
+            
+        #     for m in range(n):
+        #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Tx[m, n] = Tx[n, m]
         
+
+        Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
+        # p2 = kron(p2, np.eye(self.ny))
+        
+        expKx = scipy.linalg.expm(-1j * Tx * dt)
+        
+        Ty = kinetic(self.y, my, dvr=self.dvr)
+        # dy = self.dy 
+        # Ty = np.zeros((self.ny, self.ny))
+        
+        # for n in range(ny):
+        #     Ty[n, n] = np.pi**2/3 * 1/(2 * my * dy**2)
+            
+        #     for m in range(n):
+        #         Ty[n, m] = 1/(2 * my * dy**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Ty[m, n] = Ty[n,m]
+        
+        # p2_y = kron(np.eye(self.nx, p2_y))
+        expKy = scipy.linalg.expm(-1j * Ty * dt)
+
+        # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
+
+        self.exp_K = [expKx, expKy]
+        return 
     
-    K = [kin_1d(aj[d], qj[d], pj[d], sj, ak[d], qk[d], pk[d], sk, am[d])\
-         for d in range(ndim)]
+    # def build_apes(self, apes):
+    #     nb = self.nbasis
+    #     # compute electronic overlap matrix elements 
+    #     # self.A = 
+        
+    #     # build the adiabatic PES
+    #     v = np.zeros((self.nbasis, self.nstates))
+    #     for i in range(nb):
+            
+    #         v[i, :], u = apes(self.geometries[i])
 
-    res = 0
-    for d in range(ndim):
-        where = [True] * ndim
-        where[d] = False
-        res += K[d] * np.prod(S, where=where)
+    #         self.adiabatic_states.append(u.copy()) # electronic states
+ 
+    #     self.apes = v
+            
+    #     return 
+    
+    def build_apes(self):
+        """
+        build the APES by diagonalizing the diabatic potential matrix.
+        
+        This should only be used for diabatic models.
 
-    return res
+        Returns
+        -------
+        va : TYPE
+            DESCRIPTION.
 
-# @numba.jit
-def kin_1d(aj, qj, pj, sj, ak, qk, pk, sk, am):
+        """
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+
+        va = np.zeros((nx, ny, nstates))
+        
+        if np.iscomplexobj(self.v):
+            
+            u = np.zeros((nx, ny, nstates, nstates), dtype=complex)  # diabatic to adiabatic transformation 
+        else:
+            u = np.zeros((nx, ny, nstates, nstates))  # diabatic to adiabatic transformation 
+        
+
+        for i in range(nx):
+            for j in range(ny):
+                
+                vij = self.v[i, j]
+
+                w, v = sort(*scipy.linalg.eigh(vij))
+                
+                va[i,j] = w 
+                u[i,j] = v
+                #print(np.dot(U.conj().T, Vmat.dot(U)))
+
+        # self.apes = va.reshape((self.nbasis, nstates))
+        # self.adiabatic_states = u.reshape((self.nbasis, nstates, nstates))
+        
+        self.apes = va
+        self.adiabatic_states = u    
+        
+        
+
+        return va
+    
+    @property
+    def apes(self):
+        return self.apes 
+    
+    @apes.setter
+    def apes(self, v):
+        self.apes = v
+
+
+    
+    def buildV(self, dt):
+        """
+        Setup the propagators appearing in the split-operator method.
+
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        intertia: func
+            moment of inertia, only used for Jocabi coordinates.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # setup kinetic energy operator
+        # kx, ky = self.kx, self.ky 
+
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        # if self.coords == 'linear':
+
+        # mx, my = self.mass
+
+        # Kx, Ky = meshgrid(self.kx, self.ky)
+
+        # self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+        
+
+        # elif self.coords == 'jacobi':
+
+        #     # self.exp_K = np.zeros((nx, ny, nx, ny))
+        #     mx = self.masses[0]
+
+        #     self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
+
+        #     Iinv = 1./self.masses[1](self.x) # y is the angle
+        #     ky = self.ky
+
+        #     self.exp_Ky = np.exp(-1j * np.outer(Iinv, ky**2/2.) * dt)
+
+        #     # psik = fft(typsi, axis=0)
+        #     # kpsi = np.einsum('i, ija -> ija', np.exp(-1j * kx**2/2./mx * dt), psik)
+
+        #     # # for i in range(nx):
+        #     # #     for j in range(ny):
+        #     # #         my = self.masses[1](y[j])
+        #     # #         self.exp_K[i, j, :, :] = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+
+        # dt2 = 0.5 * dt
+
+        # if self.V is None:
+        #     raise ValueError('The diabatic PES is not specified.')
+
+        # v = self.V
+
+        # self.exp_V = np.zeros((nx, ny, nstates), dtype=complex)
+        # self.exp_V_half = np.zeros((nx, ny, nstates), dtype=complex)
+        # self.apes = np.zeros((nx, ny))
+        
+        # if self.abc:
+        #     eig = scipy.linalg.eig
+        # else:
+        #     eig = scipy.linalg.eigh
+        
+        dt2 = 0.5 * dt
+        self.exp_V = np.exp(-1j * dt * self.apes)
+
+        self.exp_V_half = np.exp(-1j * dt2 * self.apes)
+        
+        # if np.iscomplexobj(v):
+            
+        #     # complex potential
+        #     for i in range(nx):
+        #         for j in range(ny):
+                    
+        #             _v = v[i, j]
+                    
+        #             w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+    
+    
+        #             V = np.diagflat(np.exp(- 1j * w * dt))
+        #             V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+        #             self.exp_V[i, j, :,:] = ur @ V @ dag(ul)
+        #             self.exp_V_half[i, j, :,:] = ur @ V2 @ dag(ul)
+                    
+        # else: 
+            
+            # for i in range(nx):
+            #     for j in range(ny):
+    
+            #         w, u = scipy.linalg.eigh(v[i, j, :, :])
+    
+            #         #print(np.dot(U.conj().T, Vmat.dot(U)))
+    
+            #         self.exp_V[i,j] = np.diagflat(np.exp(- 1j * w * dt))
+            #         self.exp_V_half[i,j] = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    # self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    # self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+
+        return
+    
+    def build_ovlp(self):
+        
+
+        N = self.nbasis
+        nstates = self.nstates
+        nx, ny = self.nx, self.ny
+        
+        # K = self.buildK().reshape((N, N))
+        
+        # overlap of electronic states
+        A = np.zeros((nx, ny, nx, ny, nstates, nstates), dtype=complex)
+        # self._K = np.zeros((N, N, M, M), dtype=dtype)
+
+
+        for k in range(N):
+            
+            i, j = np.unravel_index(k, (nx, ny))
+        # for i in range(nx):
+        #     for j in range(ny):
+            
+            psi1 = self.adiabatic_states[i, j]
+
+            A[i, j, i, j] = np.eye(nstates) #* K[i, i] # identity matrix at the same geometry
+
+            for l in range(k):
+                ii, jj = np.unravel_index(l, (nx, ny))
+                # for ii in range(nx):
+                #     for jj in range(ny):
+                psi2 = self.adiabatic_states[ii, jj]
+
+                # for a in range(M):
+                #     for b in range(M):
+                #         A[i, j, a, b] = braket(psi1[:, a], psi2[:, b])
+                #         A[j, i, b, a] = A[i, j, a, b].conj()
+                A[i, j, ii, jj] = dag(psi1) @ psi2 #* K[i, j]
+                A[ii, jj, i, j] = dag(A[i, j, ii, jj])
+
+
+        
+        # for a in range(nstates):
+        #     for b in range(nstates):        
+        #         self._K[:, :, a, b] = A[:, :, a, b] * K 
+
+        # self._K = np.transpose(self._K, (0, 2, 1, 3))
+
+    
+        A = np.transpose(A, (0, 1, 4, 2, 3, 5))
+        self.A = A
+        return A
+        
+        # return self._K
+
+        
+    # def xmat(self, d=0):
+    #     """
+    #     position operator matrix elements 
+        
+    #     .. math::
+    #         e^{i x_\mu}_{jk} = \braket{\phi_j | e^{i x_\mu} | \phi_k}
+
+    #     Parameters
+    #     ----------
+    #     d: int
+    #         which DOF
+    #     shift : TYPE, optional
+    #         DESCRIPTION. The default is False.
+
+    #     Returns
+    #     -------
+    #     None.
+
+    #     """
+
+    #     N = self.nbasis
+    #     x = np.zeros((N, N))
+
+    #     # for k in range(N):
+            
+
+    #     # self.x[d] = x
+
+    #     # return x
+    #     return 
+    
+    def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        assert(psi0.shape == (self.nx, self.ny, self.nstates))
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+        
+        expKx, expKy = self.exp_K
+
+        # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+        self.exp_T = np.einsum('ijaklb, ik, jl -> ijaklb', self.A, expKx, expKy)
+        
+        
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
+        
+        psi = psi0.copy()
+        psi = self.exp_V_half * psi
+        # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+        
+        for k in range(nt//nout):
+            for kk in range(nout):
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+
+                # psi = self._KEO_linear(psi)
+                # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
+                psi = np.einsum('ijaklb, klb->ija', self.exp_T, psi) 
+                psi = self.exp_V * psi 
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+                
+            r.psilist.append(psi.copy())
+        
+        psi = self.exp_V_half * psi
+        
+        return r
+    
+    def rdm_el(self, psi):
+        """
+        Compute the reduced electronic density matrix
+
+        Parameters
+        ----------
+        psi : TYPE
+            vibronic wavefunction.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """
+        nstates = self.nstates 
+        
+        if isinstance(psi, np.ndarray):
+            
+            rho = np.zeros((nstates, nstates), dtype=complex)
+            
+            for i in range(self.nstates):
+                for j in range(i, self.nstates):
+                    rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
+                    if i != j:
+                        rho[j, i] = rho[i, j].conj()
+                        
+        elif isinstance(psi, list):
+             
+            rho = []
+            for p in psi:
+                tmp = np.einsum('ija, ijb -> ab', p.conj(), p) * self.dx * self.dy
+                rho.append(tmp.copy())
+             
+        return rho
+    
+    def _KEO_linear(self, psi):
+        # psik = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     psik[:,:,j] = fft2(psi[:,:,j])
+        psik = scipy.fft.fft2(psi, axes=(0,1))
+        kpsi = np.einsum('ij, ija -> ija', self.exp_K, psik)
+
+        # out = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     out[:, :, j] = ifft2(kpsi[:, :, j])
+        psi = scipy.fft.ifft2(kpsi, axes=(0,1))
+        return psi
+    
+    def fbr2dvr(self):
+        # this is simply the FFT.
+        pass
+    
+    def dvr2fbr(self):
+        pass
+
+
+    def x_evolve(self, psi):
+        return self.expV * psi
+    
+    def k_evolve(self, psi):
+        return self.expK @ psi
+    
+class SincDVR2(WPD2):
     """
-    kinetic energy matrix elements between two multidimensional GWPs
+    N-state two-mode conical intersection dynamics with Fourier series 
+    
+    LDR-SPO-SincDVR
+    
+    Deprecated. Use LDR2 instead.
     """
+    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sinc'):
+        self.x = x
+        self.y = y
+        self.dx = interval(x)
+        self.dy = interval(y)
+        self.nstates = nstates
+        
+        self.kx = 2 * np.pi * scipy.fft.fftfreq(len(x), self.dx)
+        self.ky = 2 * np.pi * scipy.fft.fftfreq(len(y), self.dy)
 
-    p0 = (aj*pk + ak*pj)/(aj+ak)
-    d0 = 0.5/am * ( (p0 + 1j*aj*ak/(aj+ak)*(qj-qk))**2 + aj*ak/(aj+ak) )
+        self.nx = len(x)
+        self.ny = len(y)
+        
+        self.dvr = dvr
+        
+        if mass is None:
+            mass = [1, ] * ndim 
+        self.mass = mass
+        
+        self.ngrid = [self.nx, self.ny]
 
-    l = d0 * overlap_1d(aj, qj, pj, sj, ak, qk, pk, sk)
+        self.kmax = np.pi/self.dx # energy range [-K, K]
+        self.shift = (self.nx - 1)//2
+        
+        self.nbasis = self.nx * self.ny # for product DVR
+        
+        self.X = None
+        self.K = None
+        self.V = None
+        self.H = None 
+        self._v = None # diabatic potential matrix
+        
+        
+        self.geometies = None
+        self.adiabatic_states = []
+        self.apes = None
+        self.electronic_overlap = self.A = None
+        
+    @property
+    def v(self):
+        return self._v 
+    
+    @v.setter
+    def v(self, v):
+        assert(v.shape == (self.nx, self.ny, self.nstates, self.nstates))
+        
+        self._v = v
+    
+    def primitive_basis(self, n):
+        # the index n \in [-N, ... 0, 1, ... N]
+        n = sigma(n)
+        dx = self.dx
+        x = self.x
 
-    return l
+        return 
+        # return 1/sqrt(dx) * sinc(np.pi * (x/dx - n))
+    
 
-def kmat(bset):
+    
+    # def kinetic(self, npts, L, x0=0.):
+    #     L = float(L)
+    #     # self.npts = npts
+    #     # self.L = L
+    #     # self.x0 = x0
+    #     dx = L / npts
+    #     n = np.arange(npts)
+    #     x = x0 + n * dx - L / 2. + dx / 2.
+    #     # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #     # self.k_max = np.pi/self.a
+        
+    # # L = xmax - xmin 
+    # # a = L / npts
+    #     n = np.arange(npts)
+
+    #     # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #     # self.k_max = np.pi/self.a
+
+
+
+        
+    #     _m = n[:, np.newaxis]
+    #     _n = n[np.newaxis, :]
+        
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore")
+    #         T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
+            
+    #     T[n, n] = np.pi**2. / 3. / dx**2
+    #     T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+
+    
+    # def kinetic(self):
+        
+    #     x = self.x         
+    #     nx = self.nx
+    #         # self.n = np.arange(npts)
+    #         # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
+    #         # self.w = np.ones(npts, dtype=np.float64) * self.a
+    #         # self.k_max = np.pi/self.a
+        
+    #     L = x[-1] - x[0]
+    #     dx = interval(x)
+    #     n = np.arange(nx)
+
+
+            
+    #     # Colbert-Miller DVR 1992
+        
+    #     _m = n[:, np.newaxis]
+    #     _n = n[np.newaxis, :]
+        
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore")
+    #         T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
+            
+    #     T[n, n] = np.pi**2. / 3. / dx**2
+    #     T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+    
+    #     return T
+    
+    def buildK(self, dt):
+        
+        # dx = self.dx
+        # Tx = np.zeros((self.nx, self.nx))
+        mx, my = self.mass 
+        
+
+        # for n in range(nx):
+        #     Tx[n, n] = np.pi**2/3 * 1/(2 * mx * dx**2)
+            
+        #     for m in range(n):
+        #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Tx[m, n] = Tx[n, m]
+        
+
+        Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
+        # p2 = kron(p2, np.eye(self.ny))
+        
+        expKx = scipy.linalg.expm(-1j * Tx * dt)
+        
+        Ty = kinetic(self.y, my, dvr=self.dvr)
+        # dy = self.dy 
+        # Ty = np.zeros((self.ny, self.ny))
+        
+        # for n in range(ny):
+        #     Ty[n, n] = np.pi**2/3 * 1/(2 * my * dy**2)
+            
+        #     for m in range(n):
+        #         Ty[n, m] = 1/(2 * my * dy**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Ty[m, n] = Ty[n,m]
+        
+        # p2_y = kron(np.eye(self.nx, p2_y))
+        expKy = scipy.linalg.expm(-1j * Ty * dt)
+
+        # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
+
+        self.exp_K = [expKx, expKy]
+        return 
+    
+    # def build_apes(self, apes):
+    #     nb = self.nbasis
+    #     # compute electronic overlap matrix elements 
+    #     # self.A = 
+        
+    #     # build the adiabatic PES
+    #     v = np.zeros((self.nbasis, self.nstates))
+    #     for i in range(nb):
+            
+    #         v[i, :], u = apes(self.geometries[i])
+
+    #         self.adiabatic_states.append(u.copy()) # electronic states
+ 
+    #     self.apes = v
+            
+    #     return 
+    
+    def build_apes(self):
+        """
+        build the APES by diagonalizing the diabatic potential matrix.
+        
+        This should only be used for diabatic models.
+
+        Returns
+        -------
+        va : TYPE
+            DESCRIPTION.
+
+        """
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+
+        va = np.zeros((nx, ny, nstates))
+        
+        if np.iscomplexobj(self.v):
+            
+            u = np.zeros((nx, ny, nstates, nstates), dtype=complex)  # diabatic to adiabatic transformation 
+        else:
+            u = np.zeros((nx, ny, nstates, nstates))  # diabatic to adiabatic transformation 
+        
+
+        for i in range(nx):
+            for j in range(ny):
+                
+                vij = self.v[i, j]
+
+                w, v = sort(*scipy.linalg.eigh(vij))
+                
+                va[i,j] = w 
+                u[i,j] = v
+                #print(np.dot(U.conj().T, Vmat.dot(U)))
+
+        # self.apes = va.reshape((self.nbasis, nstates))
+        # self.adiabatic_states = u.reshape((self.nbasis, nstates, nstates))
+        
+        self.apes = va
+        self.adiabatic_states = u    
+        
+        
+
+        return va
+    
+    @property
+    def apes(self):
+        return self.apes 
+    
+    @apes.setter
+    def apes(self, v):
+        self.apes = v
+
+
+    
+    def buildV(self, dt):
+        """
+        Setup the propagators appearing in the split-operator method.
+
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        intertia: func
+            moment of inertia, only used for Jocabi coordinates.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # setup kinetic energy operator
+        # kx, ky = self.kx, self.ky 
+
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        # if self.coords == 'linear':
+
+        # mx, my = self.mass
+
+        # Kx, Ky = meshgrid(self.kx, self.ky)
+
+        # self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+        
+
+        # elif self.coords == 'jacobi':
+
+        #     # self.exp_K = np.zeros((nx, ny, nx, ny))
+        #     mx = self.masses[0]
+
+        #     self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
+
+        #     Iinv = 1./self.masses[1](self.x) # y is the angle
+        #     ky = self.ky
+
+        #     self.exp_Ky = np.exp(-1j * np.outer(Iinv, ky**2/2.) * dt)
+
+        #     # psik = fft(typsi, axis=0)
+        #     # kpsi = np.einsum('i, ija -> ija', np.exp(-1j * kx**2/2./mx * dt), psik)
+
+        #     # # for i in range(nx):
+        #     # #     for j in range(ny):
+        #     # #         my = self.masses[1](y[j])
+        #     # #         self.exp_K[i, j, :, :] = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+
+        # dt2 = 0.5 * dt
+
+        # if self.V is None:
+        #     raise ValueError('The diabatic PES is not specified.')
+
+        # v = self.V
+
+        # self.exp_V = np.zeros((nx, ny, nstates), dtype=complex)
+        # self.exp_V_half = np.zeros((nx, ny, nstates), dtype=complex)
+        # self.apes = np.zeros((nx, ny))
+        
+        # if self.abc:
+        #     eig = scipy.linalg.eig
+        # else:
+        #     eig = scipy.linalg.eigh
+        
+        dt2 = 0.5 * dt
+        self.exp_V = np.exp(-1j * dt * self.apes)
+
+        self.exp_V_half = np.exp(-1j * dt2 * self.apes)
+        
+        # if np.iscomplexobj(v):
+            
+        #     # complex potential
+        #     for i in range(nx):
+        #         for j in range(ny):
+                    
+        #             _v = v[i, j]
+                    
+        #             w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+    
+    
+        #             V = np.diagflat(np.exp(- 1j * w * dt))
+        #             V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+        #             self.exp_V[i, j, :,:] = ur @ V @ dag(ul)
+        #             self.exp_V_half[i, j, :,:] = ur @ V2 @ dag(ul)
+                    
+        # else: 
+            
+            # for i in range(nx):
+            #     for j in range(ny):
+    
+            #         w, u = scipy.linalg.eigh(v[i, j, :, :])
+    
+            #         #print(np.dot(U.conj().T, Vmat.dot(U)))
+    
+            #         self.exp_V[i,j] = np.diagflat(np.exp(- 1j * w * dt))
+            #         self.exp_V_half[i,j] = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    # self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    # self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+
+        return
+    
+    def build_ovlp(self):
+        
+
+        N = self.nbasis
+        nstates = self.nstates
+        nx, ny = self.nx, self.ny
+        
+        # K = self.buildK().reshape((N, N))
+        
+        # overlap of electronic states
+        A = np.zeros((nx, ny, nx, ny, nstates, nstates), dtype=complex)
+        # self._K = np.zeros((N, N, M, M), dtype=dtype)
+
+
+        for k in range(N):
+            
+            i, j = np.unravel_index(k, (nx, ny))
+        # for i in range(nx):
+        #     for j in range(ny):
+            
+            psi1 = self.adiabatic_states[i, j]
+
+            A[i, j, i, j] = np.eye(nstates) #* K[i, i] # identity matrix at the same geometry
+
+            for l in range(k):
+                ii, jj = np.unravel_index(l, (nx, ny))
+                # for ii in range(nx):
+                #     for jj in range(ny):
+                psi2 = self.adiabatic_states[ii, jj]
+
+                # for a in range(M):
+                #     for b in range(M):
+                #         A[i, j, a, b] = braket(psi1[:, a], psi2[:, b])
+                #         A[j, i, b, a] = A[i, j, a, b].conj()
+                A[i, j, ii, jj] = dag(psi1) @ psi2 #* K[i, j]
+                A[ii, jj, i, j] = dag(A[i, j, ii, jj])
+
+
+        
+        # for a in range(nstates):
+        #     for b in range(nstates):        
+        #         self._K[:, :, a, b] = A[:, :, a, b] * K 
+
+        # self._K = np.transpose(self._K, (0, 2, 1, 3))
+
+    
+        A = np.transpose(A, (0, 1, 4, 2, 3, 5))
+        self.A = A
+        return A
+        
+        # return self._K
+
+        
+    # def xmat(self, d=0):
+    #     """
+    #     position operator matrix elements 
+        
+    #     .. math::
+    #         e^{i x_\mu}_{jk} = \braket{\phi_j | e^{i x_\mu} | \phi_k}
+
+    #     Parameters
+    #     ----------
+    #     d: int
+    #         which DOF
+    #     shift : TYPE, optional
+    #         DESCRIPTION. The default is False.
+
+    #     Returns
+    #     -------
+    #     None.
+
+    #     """
+
+    #     N = self.nbasis
+    #     x = np.zeros((N, N))
+
+    #     # for k in range(N):
+            
+
+    #     # self.x[d] = x
+
+    #     # return x
+    #     return 
+    
+    def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        assert(psi0.shape == (self.nx, self.ny, self.nstates))
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+        
+        expKx, expKy = self.exp_K
+
+        # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+        self.exp_T = np.einsum('ijaklb, ik, jl -> ijaklb', self.A, expKx, expKy)
+        
+        
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
+        
+        psi = psi0.copy()
+        psi = self.exp_V_half * psi
+        # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+        
+        for k in range(nt//nout):
+            for kk in range(nout):
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+
+                # psi = self._KEO_linear(psi)
+                # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
+                psi = np.einsum('ijaklb, klb->ija', self.exp_T, psi) 
+                psi = self.exp_V * psi 
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+                
+            r.psilist.append(psi.copy())
+        
+        psi = self.exp_V_half * psi
+        
+        return r
+    
+    def rdm_el(self, psi):
+        """
+        Compute the reduced electronic density matrix
+
+        Parameters
+        ----------
+        psi : TYPE
+            vibronic wavefunction.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """
+        nstates = self.nstates 
+        
+        if isinstance(psi, np.ndarray):
+            
+            rho = np.zeros((nstates, nstates), dtype=complex)
+            
+            for i in range(self.nstates):
+                for j in range(i, self.nstates):
+                    rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
+                    if i != j:
+                        rho[j, i] = rho[i, j].conj()
+                        
+        elif isinstance(psi, list):
+             
+            rho = []
+            for p in psi:
+                tmp = np.einsum('ija, ijb -> ab', p.conj(), p) * self.dx * self.dy
+                rho.append(tmp.copy())
+             
+        return rho
+    
+    def _KEO_linear(self, psi):
+        # psik = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     psik[:,:,j] = fft2(psi[:,:,j])
+        psik = scipy.fft.fft2(psi, axes=(0,1))
+        kpsi = np.einsum('ij, ija -> ija', self.exp_K, psik)
+
+        # out = np.zeros(psi.shape, dtype=complex)
+        # for j in range(ns):
+        #     out[:, :, j] = ifft2(kpsi[:, :, j])
+        psi = scipy.fft.ifft2(kpsi, axes=(0,1))
+        return psi
+    
+    def fbr2dvr(self):
+        # this is simply the FFT.
+        pass
+    
+    def dvr2fbr(self):
+        pass
+
+
+    def x_evolve(self, psi):
+        return self.expV * psi
+    
+    def k_evolve(self, psi):
+        return self.expK @ psi
+
+
+class SineDVR2(SincDVR2):
     """
-    kinetic energy matrix
+    https://www.pci.uni-heidelberg.de/tc/usr/mctdh/lit/NumericalMethods.pdf
     """
+    
+    def buildK(self, dt):
+ 
+        mx, my = self.mass 
+        
+        Tx = kinetic(self.x, mx, dvr='sine')
+        
+        # p2 = kron(p2, np.eye(self.ny))
+        
+        expKx = scipy.linalg.expm(-1j * Tx * dt)
+        
+        Ty = kinetic(self.y, my, dvr='sine')
+        
+        # p2_y = kron(np.eye(self.nx, p2_y))
+        expKy = scipy.linalg.expm(-1j * Ty * dt)
 
-    nb = len(bset)
+        # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
 
-    kin = np.zeros((nb, nb), dtype=complex)
+        self.exp_K = [expKx, expKy]
+        return 
+    
+# def position_eigenstate(x, n, npts, L):
+#     """
+#     nth position eigenstate for sine DVR, n= 1, \cdots, npts
+    
+#     Both ends are not included in the grid.
 
-    for i in range(nb):
-        gi = bset[i]
+#     Parameters
+#     ----------
+#     x : TYPE
+#         DESCRIPTION.
+#     n : TYPE
+#         DESCRIPTION.
+#     npts : TYPE
+#         DESCRIPTION.
+#     L : TYPE
+#         DESCRIPTION.
 
-        for j in range(i+1):
-            gj = bset[j]
+#     Returns
+#     -------
+#     chi : TYPE
+#         DESCRIPTION.
 
-            kin[i,j] = kin_me(gi, gj)
-            kin[j,i] = np.conj(kin[i,j])
+#     """
+#     dx = L/(npts + 1)
+#     xn = grid[n]
+#     chi = np.sin(np.pi/2 *(2 * npts + 1) * (x - xn)/L)/np.sin(np.pi/2 * (x - xn)/L) -\
+#           np.sin(np.pi/2 *(2 * npts + 1) * (x + xn)/L)/np.sin(np.pi/2 * (x + xn)/L)
+#     chi *= 1/2/np.sqrt(L * (npts + 1))
+    
+#     return chi
+    
+        
 
-    return kin
+class SincDVR_PBC(SincDVR2):
+    
+    def buildK(self, dt):
+ 
+        mx, my = self.mass 
+        
 
-def H():
-    """
-    construct the hamiltonian matrix
-    Kinetic energy operator can be computed exactly.
-    Potential energy operator - approximation
-    Nonadiabatic coupling -
-    """
-    pass
+        # for n in range(nx):
+        #     Tx[n, n] = np.pi**2/3 * 1/(2 * mx * dx**2)
+            
+        #     for m in range(n):
+        #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Tx[m, n] = Tx[n, m]
+        
+        Tx = kinetic(self.x, mx, dvr='sinc_periodic')
+        
+        # p2 = kron(p2, np.eye(self.ny))
+        
+        expKx = scipy.linalg.expm(-1j * Tx * dt)
+        
+        Ty = kinetic(self.y, my, dvr='sinc_periodic')
+        # dy = self.dy 
+        # Ty = np.zeros((self.ny, self.ny))
+        
+        # for n in range(ny):
+        #     Ty[n, n] = np.pi**2/3 * 1/(2 * my * dy**2)
+            
+        #     for m in range(n):
+        #         Ty[n, m] = 1/(2 * my * dy**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Ty[m, n] = Ty[n,m]
+        
+        # p2_y = kron(np.eye(self.nx, p2_y))
+        expKy = scipy.linalg.expm(-1j * Ty * dt)
 
+        # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
+
+        self.exp_K = [expKx, expKy]
+        return 
 
 if __name__ == '__main__':
 
-
-
-    def testWPD():
-        sol = WPD(basis = [GWP(y, a=4) for y in x], mass=1)
-
-        sol.position()
-        w, u = sol.diag_x()
-
-        v = 0.5 * sol.x_evals**2 #+ 0.1*sol.x_evals ** 4
-
-        sol.set_potential(v)
-
-        # sol.buildH()
-        # # print(sol.x)
-        # # print('potential', np.diag(sol._V))
-        # w, v = scipy.linalg.eigh(sol.H, sol.S)
-        # w, v = scipy.linalg.eigh(sol.H)
-        w, v = sol.eigenstates()
-
-        print('eigvalues', w)
-
-
-        # y = np.linspace(-8, 8, 100)
-        # for j in range(10):
-        #     sol.plot_wavepacket(u[:, j], y)
-
-        fig, ax = plt.subplots()
-        ax.plot(sol.x_evals**2, 'o')
-
-    def testWPD2():
-        x = np.linspace(-8, 8, 15)
-        y = np.linspace(-10, 6, 15)
-        nx = len(x)
-        ny = len(y)
-        
-        nb = len(x) * len(y)
-        print('dx = ', interval(x))
     
-        pyrazine = Pyrazine()
-        # dho = DHO(d=1, coupling=0.1)
-        # ns = dho.nstates
-        # for x in range():
-        #     w, u = pyrazine.apes(x, y=0)
+    # from pyqed.models.pyrazine import DHO
+    from pyqed import sigmaz, interval, sigmax, norm, gwp
+    from pyqed.models.pyrazine import Pyrazine
+    from pyqed.phys import gwp, discretize
+    from pyqed.units import au2fs, au2wavenumber
+    from pyqed.wpd import SPO2
+    import time    
+
+
+    def diabatic_potential(x, y, e_so, omega, kappa, g):
+        xp = x + 1j * y
+        # xm = x - 1j * y        
+        h = np.diag([e_so/2, -e_so/2, -e_so/2, e_so/2])+0j
+        h[0, 1] = kappa * xp 
+        h[0, 2] = g/2 * xp**2
+        h[1, 3] = -g/2 * xp**2
+        h[2, 3] = kappa * xp
+        
+        h[1, 0] = h[0, 1].conj()
+        h[2, 0] = h[0, 2].conj()
+        h[3, 1] = h[1, 3].conj()
+        h[3, 2] = h[2, 3].conj()
+        return h + np.eye(4) * omega/2 * (x**2 + y**2)
+
+
+    x = discretize(-6, 6, 5, endpoints=False)
+    y = discretize(-6, 6, 5, endpoints=False)
     
-        basis_x = [GWP(_x, a=1) for _x in x]
-        basis_y = [GWP(_y, a=1) for _y in y]
-        
-        solx = WPD(basis_x)
-        wx, ux = solx.diag_x()
-        xmat = solx.position()
-        
-        # print(isdiag(solx.gwp2dvr(xmat)))
-        
-        soly = WPD(basis_y)
-        wy, uy = soly.diag_x()
-        
-    
-        U = kron(ux, uy)  
-    
-        basis = []
-        for i in range(nx):
-            for j in range(ny):
-                q = [x[i], y[j]]
-                basis.append(GWP(q, a=1, ndim=2))
-        
-        nb = len(basis)
-        # print('FWHM = ', basis[0].fwhm)
-        print('# of basis =', nb)
-        # print(basis[0].a)
-        solver = WPD2(mol=pyrazine, basis = basis)
-        
-
-        v = 0.5 * sol.x_evals**2 #+ 0.1*sol.x_evals ** 4
-
-        sol.set_potential(v)
-
-        # sol.buildH()
-        # # print(sol.x)
-        # # print('potential', np.diag(sol._V))
-        # w, v = scipy.linalg.eigh(sol.H, sol.S)
-        # w, v = scipy.linalg.eigh(sol.H)
-        w, v = sol.eigenstates()
-
-        print('eigvalues', w)
-
-
-        # y = np.linspace(-8, 8, 100)
-        # for j in range(10):
-        #     sol.plot_wavepacket(u[:, j], y)
-
-        fig, ax = plt.subplots()
-        ax.plot(sol.x_evals**2, 'o')
-        
-        
-    def draw_pes():
-        v = solver.buildV()
-        
-        fig, (ax, ax1) = plt.subplots(nrows=2)
-        v0 = np.array([w[0] for w in v]).reshape((nx, ny))
-        v1 = np.array([w[1] for w in v]).reshape((nx, ny))
-    
-        ax.matshow(v0, cmap='viridis')
-        ax1.matshow(v1, cmap='viridis')
-
-    from pyqed.models.pyrazine import DHO
-    from pyqed import sigmaz, interval, sigmax, norm
-    from pyqed.units import au2fs
-
-    # from pyqed.models.dho import DHO
-
-    x = np.linspace(-6, 6, 21)
-    y = np.linspace(-6, 6, 21)
     nx = len(x)
     ny = len(y)
     
     nb = len(x) * len(y)
     print('dx = ', interval(x))
 
-    # pyrazine = Pyrazine()
-    mol = DHO2()
-    # dho = DHO(d=1, coupling=0.1)
-    # ns = dho.nstates
-    # for x in range():
-    #     w, u = pyrazine.apes(x, y=0)
+    #mol = Pyrazine(x, y)
+    #v = mol.buildV() #(65, 65, 3, 3)    
+    # v = dpes(x, y) #(65, 65, 2, 2) 
 
-    basis_x = [GWP(_x, a=1) for _x in x]
-    basis_y = [GWP(_y, a=1) for _y in y]
     
-    solx = WPD(basis_x)
-    wx, ux = solx.diag_x()
-    xmat = solx.position()
-    
-    # print(isdiag(solx.gwp2dvr(xmat)))
-    
-    soly = WPD(basis_y)
-    wy, uy = soly.diag_x()
-    
+    nstates = 4
+    #mass = mol.mass
+        
 
-    U = kron(ux, uy)  
-
-    # build DVR basis set
-    basis = []
-    k = 0
-    for i in range(nx):
-        for j in range(ny):
-            k += 1
-            q = [x[i], y[j]]
-            print(k, q)
-            basis.append(GWP(q, a=1, ndim=2))
-    
-    nb = len(basis)
-    # print('FWHM = ', basis[0].fwhm)
-    print('number of basis =', nb)
-    print('width of Gaussian wavepacket = {}'.format(basis[0].a))
-    # for i, b in enumerate(basis):
-    #     print(i, b.x)
-
-    solver = GWP2(mol=mol, basis=basis)
-
-    # U = solver.xprod()
-    # xmat = solver.position(d=0)
-
-    # print('position', x)
-    # print('overlap matrix', solver.overlap().shape)
-    # w, u = solver.diag_x()
-    
-    solver.U = U
-    
-    Y = solver.position(d=0)
-    Y = solver.gwp2dvr(Y)
  
-    print(isdiag(Y))
+    omega = 700 / au2wavenumber
+    e_so = 0.2 * omega    
+    kappa = 0.1 * omega
+    g = 0.0 * omega 
+
+    v = np.zeros((nx, ny, nstates, nstates), dtype=complex)
     
-    
-    
-    x = [] 
     for i in range(nx):
         for j in range(ny):
-            x.append([wx[i], wy[j]])
-    print('len x =', len(x))
-    solver.x_evals =  x   
-    # print('eigvals of x = ', w)
-    v = solver.buildV()
-
-    ns = mol.nstates
+            v[i,j] = diabatic_potential(x[i], y[j], e_so, omega, kappa, g)
+     
+    print('The shape of global diabatic potential matrix is: ', v.shape)   
     
-    # initial state in GWP
-    psi0 = np.zeros((nb, ns), dtype=complex)
-    # print(x[len(x)//2])
-    # psi0[(len(x)//2), 0] = 1
+    
+    # ---------------------------
+    # ------ LDR dynamics -------
+    # ---------------------------
+    start_time = time.time()
+    
+    solver = SincDVR2(x, y, nstates = nstates, mass = [1/omega, ] * 2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
-    # psi0 = dag(solver.x_evecs) @ solver.S @ psi0
-    x0 = (-1, 0)
-    chi0 = GWP(x0, ndim=2)
-    tmp = [overlap(chi0, g) for g in basis]
+    solver.v = v
+    solver.build_apes()
+    
+    psi0 = np.zeros((nx, ny, nstates), dtype=complex)
+    for i in range(nx):
+        for j in range(ny):
+            psi0[i,j,3] = gwp(np.array([x[i], y[j]]), x0=[0, 0], ndim=2)
+    
+    # transfrom the initial state to the adiabatic representation
+    psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
 
-    psi0[:, 1] =   np.conj(np.array(tmp) @ solver.U)
-
-    print('norm of initial state', norm(psi0[:,1]))
-    # psi0[:, 0] = chi0.evaluate(solver.x_evals)
-
-    p0 = np.zeros((2,2))
-    p0[0, 0] = 1.
-
-    # diabatic population
-    u = solver.adiabatic_states
-
-    o = np.zeros((nb, ns, ns))
-    for i in range(nb):
-        ui = u[i]
-        # print(isunitary(ui))
-        # o[i] = np.outer(ui[0,:].conj(), ui[0, :])
-        # o[i] = dag(ui) @ p0 @ ui
-        o[i] = ui @ p0 @ dag(ui)
-
-    dt = 0.02
-    nt = 2000
+    dt = 0.2/au2fs
+    nt = 100
     nout = 1
-    print('time', nt * dt * au2fs)
-    result = solver.run(psi0, dt, nt, e_ops = [o], nuc_ops=[Y], nout=nout)
-    
-    # plot A
-    # fig, ax = plt.subplots(figsize=(4,4))
-    # ax.matshow(np.abs(solver.A[:, 0, 112, 0].reshape((nx, ny))))
-    
-    # # fig, ax = plt.subplots(figsize=(4,4))
-    # # ax.imshow(np.abs(solver.A[:, 0, :, 1]))
-    # fig, ax = plt.subplots(figsize=(4,4))
-    # ax.matshow(np.abs(solver.A[:, 1, 112, 0].reshape((nx, ny))))
-    
-    # fig, ax = plt.subplots(figsize=(4,4))
-    # ax.imshow(np.abs(solver.A[:, 1, :, 1]))
-
-    
-    result.save('gwp')
+    result = solver.run(psi0=psi0, dt=dt, nt=nt, nout=nout)
 
     fig, ax = plt.subplots()
-    # ax.plot(result[1, :].real)
-    # ax.plot(result[0, :].real)
-    # ax.plot(result.times, result.observables[0, :].real)
-
-    # fig, ax = plt.subplots()
-    # ax.plot(result.times, result.observables[1, :].real)
+    for n in range(nstates):
+        ax.plot(x, solver.apes[:, ny//2, n], label='{}'.format(n))
+    ax.legend()
     
-    x = np.linspace(-6,6)
-    y = np.linspace(-6,6)
-    rho = solver.nuclear_density(result.psilist[-1], x, y)
-    np.savez('nuclear_density_{}'.format(int(nt*dt)), x, y, rho)
-    fig, ax = plt.subplots()
-    ax.contour(rho.real, levels=40, origin='lower')
-    
-    # c = [result.psilist[k][112, :] for k in range(nt//nout)]
-    # fig, ax = plt.subplots()
-    # ax.plot(result.times, [np.prod(_c).real for _c in c])
-
+        
+    end_time = time.time()    
+    execution_time = end_time - start_time
+    print(f"----- The total time of exact dynamics is： {execution_time} seconds. -----")    
+             
+    result.dump('ldr') # level = 6
+            
+    result.get_population(plot=True) 
+    result.position(plot=True)
+    result.plot_wavepacket(result.psilist[0])
+    result.plot_wavepacket(result.psilist[-1])
