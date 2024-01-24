@@ -24,7 +24,7 @@ from pyqed.tensor.decompose import compress
 class SPO:
     def __init__(self, nstates, domains, levels, chi_max, dvr_type='sinc'):
         """
-         MPS representation for LDR dynamics using the SPO integrator
+         MPS/TT representation for LDR dynamics using the SPO integrator
          
          The first N sites are nuclear while last site is the electronic.
          modes. :math:`| \alpha n_1 n_2 \cdots n_d\rangle`
@@ -72,7 +72,26 @@ class SPO:
         self.apes = None
         self.electronic_overlap = None 
     
-    def kinetic(self, B_list, dt):
+    def evolve_k(self, B_list, dt):
+        """
+        Apply the kinetic energy evolution operator to the MPS
+        
+        .. math::
+            \ket{TT'} = e^{-i \sum_{i = 1}^D T_i \delta t} \ket{TT} 
+
+        Parameters
+        ----------
+        B_list : TYPE
+            DESCRIPTION.
+        dt : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        B_list : TYPE
+            DESCRIPTION.
+
+        """
         for i in range(self.ndim):
             
             # kx = 2. * np.pi * fftfreq(self.dims[i], self.dx[i])
@@ -84,12 +103,33 @@ class SPO:
             #                             fftn(B_list[i], axes=(1))), axes=(1))
             return B_list
         
-    def potential(self, B_list, v_tt, chi_max):
+    def evolve_v(self, B_list, v_tt, chi_max):
+        """
+        apply the potential energy evolution operator 
+        
+        .. math::
+            U = np.exp(-i  dt  V_{\mathbf{l}})
+
+
+        Parameters
+        ----------
+        B_list : TYPE
+            DESCRIPTION.
+        v_tt : TYPE
+            DESCRIPTION.
+        chi_max : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        As : TYPE
+            DESCRIPTION.
+
+        """
         
         # L = len(B_list)
         L = self.L        
         
-        # U = np.exp(-1j * dt * V)
         
         # decompose the potential energy matrix
         

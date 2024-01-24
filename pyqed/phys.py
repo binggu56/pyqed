@@ -11,6 +11,8 @@ import scipy as sp
 # from numba import jit
 import sys
 import heapq
+from functools import reduce
+
 
 def integrate(f, a, b, **args):
     """
@@ -36,6 +38,21 @@ def integrate(f, a, b, **args):
     """
 
     return integrate.quad(f, a, b, args=args)
+
+def cartesian_product(arrays):
+    """
+    A fast cartesion product function
+    """
+    broadcastable = np.ix_(*arrays)
+    broadcasted = np.broadcast_arrays(*broadcastable)
+    rows, cols = reduce(np.multiply, broadcasted[0].shape), len(broadcasted)
+    out = np.empty(rows * cols, dtype=broadcasted[0].dtype)
+    start, end = 0, rows
+    for a in broadcasted:
+        out[start:end] = a.reshape(-1)
+        start, end = end, end + rows
+    return out.reshape(cols, rows).T
+
 
 def cartesian(*args):
     """ compute Cartesian product of args """
@@ -1755,7 +1772,7 @@ def tensor_power(a, n:int):
 #
 #    fig.savefig('polariton_spectrum.eps', transparent=True)
 
-def expm(a, t=1, method='diag'):
+def expm(A, t, method='EOM'):
     """
     exponentiate a matrix at t
         U(t) = e^{A t}
@@ -1775,7 +1792,7 @@ def expm(a, t=1, method='diag'):
             d/dt U(t) = A U(t)
             This can be generalized for time-dependent Hamiltonians A(t)
 
-        diagonalization/diag: diagonalize A
+        diagonalization: diagonalize A
 
             for Hermitian matrices only, this is prefered
 
@@ -1790,7 +1807,7 @@ def expm(a, t=1, method='diag'):
     if method == 'EOM':
 
         # identity matrix at t = 0
-        U = identity(a.shape[-1], dtype=complex)
+        U = identity(A.shape[-1], dtype=complex)
 
         # set the ground state energy to 0
         print('Computing the propagator. '
@@ -1802,20 +1819,14 @@ def expm(a, t=1, method='diag'):
 
         for k in range(Nt):
             Ulist.append(U.copy())
-            U = rk4(U, ldo, dt, a)
+            U = rk4(U, ldo, dt, A)
 
         return Ulist
 
-    elif method == 'diag':
-        assert(isherm(a))
-        e, u = np.linalg.eigh(a)
-        return u @ np.diag(np.exp(e * t)) @ dag(u)
-    
-    elif method == 'scipy':
-        return sp.linalg.expm(a)
-    
-        # raise NotImplementedError('Method of {} has not been implemented.\
-        #                           Choose from EOM'.format(method))
+    elif method == 'SOS':
+
+        raise NotImplementedError('Method of {} has not been implemented.\
+                                  Choose from EOM'.format(method))
 
 def propagator(H, dt, nt):
     """

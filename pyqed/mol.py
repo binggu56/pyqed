@@ -100,7 +100,7 @@ class Result:
                  Nt=None, times=None, t0=0, nout=1):
         self.description = description
         self.dt = dt
-        self.timesteps = Nt
+        self.timesteps = self.nt = Nt
         self.observables = None
         self.rholist = None
         # self.psilist = [psi0]

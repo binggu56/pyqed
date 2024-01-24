@@ -11,7 +11,7 @@ from numpy import exp, pi, sqrt, meshgrid
 from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, interval,\
     cartesian_product
 from pyqed.wpd import ResultSPO2
-from pyqed.ldr.ldr import WPD2
+from pyqed.ldr.gwp import WPD2
 
 import warnings
 
@@ -477,7 +477,7 @@ class LDR2(WPD2):
         
         self.geometies = None
         self.adiabatic_states = []
-        self.apes = None
+        self._apes = None
         self.electronic_overlap = self.A = None
         
     @property
@@ -664,11 +664,11 @@ class LDR2(WPD2):
     
     @property
     def apes(self):
-        return self.apes 
+        return self._apes 
     
     @apes.setter
     def apes(self, v):
-        self.apes = v
+        self._apes = v
 
 
     
@@ -1704,7 +1704,7 @@ if __name__ == '__main__':
     # ---------------------------
     start_time = time.time()
     
-    solver = SincDVR2(x, y, nstates = nstates, mass = [1/omega, ] * 2) # mol.mass = [230.5405791702069, 367.62919827476884]
+    solver = LDR2(x, y, nstates = nstates, mass = [1/omega, ] * 2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
     solver.v = v
     solver.build_apes()
