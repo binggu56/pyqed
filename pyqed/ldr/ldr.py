@@ -238,7 +238,7 @@ class LDRN:
     many-dimensional many-state nonadiabatic conical intersection dynamics in 
     DVR + LDR + SPO
     """
-    def __init__(self, domains, levels, ndim=3, mass=None, dvr_type='sinc'): 
+    def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sinc'): 
 
         assert(len(domains) == len(levels) == ndim)
         
@@ -263,7 +263,9 @@ class LDRN:
         
         if mass is None:
             mass = [1, ] * ndim
-
+        
+        self.nstates = nstates
+        
         # all configurations in a vector
         self.points = np.fliplr(cartesian_product(x))
         self.npts = len(self.points)
@@ -276,6 +278,7 @@ class LDRN:
         self._v = None
         self.exp_K = None
         self.exp_V = None
+        self.wf_overlap = self.A = None
         
         
     @property
@@ -284,7 +287,7 @@ class LDRN:
     
     @v.setter
     def v(self, v):
-        assert(v.shape == (self.nx, self.ny, self.nstates, self.nstates))
+        assert(v.shape == (*self.nx, self.nstates, self.nstates))
         
         self._v = v
 

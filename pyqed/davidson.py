@@ -3,20 +3,151 @@
 """
 Created on Tue Jan  9 19:32:53 2024
 
+Src: 
+    https://github.com/NLESC-JCER/DavidsonPython/blob/master/davidson.py
 
-@author: bingg
+
 """
-
-#-------------------------------------------------------------------------------
-# Attempt at Block Davidson algorithm 
-# Sree Ganesh (sreeuci@gmail.com)
-# Summer 2017
-#-------------------------------------------------------------------------------
 
 import numpy as np
 import math
 import time 
 import logging
+
+
+def digaonal_dominant(n,sparsity=1E-4):
+    
+    A = np.zeros((n,n))
+    for i in range(0,n):
+        A[i,i] = 1E3*np.random.rand() 
+        #A[i,i] = i+1
+    A = A + sparsity*np.random.randn(n,n) 
+    A = (A.T + A)/2 
+    return A
+
+def diag_non_tda(n,sparsity=1E-4):
+
+    A = digaonal_dominant(n)
+    C = sparsity*np.random.rand(n,n)
+
+    return np.block([ [A,C],[-C.T,-A.T] ])
+
+
+
+def jacobi_correction(uj,A,thetaj):
+    I = np.eye(A.shape[0])
+    Pj = I-np.dot(uj,uj.T)
+    rj = np.dot((A - thetaj*I),uj) 
+
+    w = np.dot(Pj,np.dot((A-thetaj*I),Pj))
+    return np.linalg.solve(w,rj)
+
+
+def get_initial_guess(A,neigen):
+    nrows, ncols = A.shape
+    d = np.diag(A)
+    index = np.argsort(d)
+    guess = np.zeros((nrows,neigen))
+    for i in range(neigen):
+        guess[index[i],i] = 1
+    
+    return guess
+
+
+def reorder_matrix(A):
+    
+    n = A.shape[0]
+    tmp = np.zeros((n,n))
+
+    index = np.argsort(np.diagonal(A))
+
+    for i in range(n):
+        for j in range(i,n):
+            tmp[i,j] = A[index[i],index[j]]
+            tmp[j,i] = tmp[i,j]
+    return tmp
+
+def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
+    """Davidosn solver for eigenvalue problem
+
+    Args :
+        A (numpy matrix) : the matrix to diagonalize
+        neigen (int)     : the number of eigenvalue requied
+        tol (float)      : the rpecision required
+        itermax (int)    : the maximum number of iteration
+        jacobi (bool)    : do the jacobi correction
+    Returns :
+        eigenvalues (array) : lowest eigenvalues
+        eigenvectors (numpy.array) : eigenvectors
+    """
+    n = A.shape[0]
+    k = 2*neigen            # number of initial guess vectors 
+    V = np.eye(n,k)         # set of k unit vectors as guess
+    I = np.eye(n)           # identity matrix same dimen as A
+    Adiag = np.diag(A)
+
+    V = get_initial_guess(A,k)
+    
+    print('\n'+'='*20)
+    print("= Davidson Solver ")
+    print('='*20)
+
+    #invA = np.linalg.inv(A)
+    #inv_approx_0 = 2*I - A
+    #invA2 = np.dot(invA,invA)
+    #invA3 = np.dot(invA2,invA)
+
+    norm = np.zeros(neigen)
+
+    # Begin block Davidson routine
+    print("iter size norm (%e)" %tol)
+    for i in range(itermax):
+    
+        # QR of V t oorthonormalize the V matrix
+        # this uses GrahmShmidtd in the back
+        V,R = np.linalg.qr(V)
+
+        # form the projected matrix 
+        T = np.dot(V.T,np.dot(A,V))
+
+
+        # Diagonalize the projected matrix
+        theta,s = np.linalg.eigh(T)
+
+        # Ritz eigenvector
+        q = np.dot(V,s)
+
+        # compute the residual append append it to the 
+        # set of eigenvectors
+        
+        for j in range(neigen):
+
+            # residue vetor
+            res = np.dot((A - theta[j]*I),q[:,j]) 
+            norm[j] = np.linalg.norm(res)
+
+            # correction vector
+            if(jacobi):
+            	delta = jacobi_correction(q[:,j],A,theta[j])
+            else:
+            	delta = res / (theta[j]-Adiag+1E-16)
+                #C = inv_approx_0 + theta[j]*I
+                #delta = -np.dot(C,res)
+
+            delta /= np.linalg.norm(delta)
+
+            # expand the basis
+            V = np.hstack((V,delta.reshape(-1,1)))
+
+        # comute the norm to se if eigenvalue converge
+        print(" %03d %03d %e" %(i,V.shape[1],np.max(norm)))
+        if np.all(norm < tol):
+            print("= Davidson has converged")
+            break
+        
+    return theta[:neigen], q[:,:neigen]
+
+
 
 
 def davidson(A, neig=3, max_iterations=20, tol = 1e-9):
@@ -141,11 +272,11 @@ if __name__=='__main__':
     A = (A.T + A)/2
     
     neig = 3
-    
-    w, u = davidson(A, neig)
+    start = time.time()
+    w, u = davidson_solver(A, neig)
     print(w)
-    
-
+    end = time.time() 
+    print ('Davidson Diagonalization time:',end-start)
     
     start = time.time()
     eig, eigvecs = sort(*np.linalg.eig(A))
