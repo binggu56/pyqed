@@ -69,6 +69,8 @@ def reorder_matrix(A):
 
 def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
     """Davidosn solver for eigenvalue problem
+    
+    Seems quite slow!
 
     Args :
         A (numpy matrix) : the matrix to diagonalize
@@ -140,7 +142,7 @@ def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
             V = np.hstack((V,delta.reshape(-1,1)))
 
         # comute the norm to se if eigenvalue converge
-        print(" %03d %03d %e" %(i,V.shape[1],np.max(norm)))
+        logging.info(" %03d %03d %e" %(i,V.shape[1],np.max(norm)))
         if np.all(norm < tol):
             print("= Davidson has converged")
             break
@@ -150,7 +152,7 @@ def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
 
 
 
-def davidson(A, neig=3, max_iterations=20, tol = 1e-9):
+def block_davidson(A, neig=3, max_iterations=20, tol = 1e-9):
     """
     Bloch davidson algorithm
 

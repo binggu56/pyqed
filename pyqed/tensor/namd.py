@@ -16,13 +16,15 @@ from scipy.fftpack import fft, ifft, fftfreq, fftn, ifftn
 from decompose import decompose, compress
 
 from pyqed import gwp, discretize, pauli, sigmaz, interval
+from pyqed.ldr.ldr import kinetic
 
 from pyqed.tensor.mps import MPS
 from pyqed.tensor.decompose import compress
 
 
-class SPO:
-    def __init__(self, nstates, domains, levels, chi_max, dvr_type='sinc'):
+
+class TT_LDR:
+    def __init__(self, domains, levels, nstates=2, rank=None, dvr_type='sinc'):
         """
          MPS/TT representation for LDR dynamics using the SPO integrator
          
@@ -38,10 +40,12 @@ class SPO:
             range for nuclear dofs
         levels : TYPE
             discretization levels for all nuclear coordinates.
-        chi_max : TYPE
-            bond dimension
+        rank : TYPE
+            bond maximum dimension for TT decomposition for the states, V, and 
+            the overlap matrix
+            
         dvr_type : TYPE, optional
-            DESCRIPTION. The default is 'sinc'.
+            DVR type. The default is 'sinc'.
 
         Returns
         -------
@@ -61,23 +65,64 @@ class SPO:
             for d in range(self.ndim):
                 a, b = domains[d]
                 self.x.append(discretize(a, b, levels[d], endpoints=False))
-            
-        self.dims = [len(_x) for _x in self.x] # [B.shape[1] for B in B_list]
+        
+        self.nx = [len(_x) for _x in self.x] # [B.shape[1] for B in B_list]
+        self.dims = self.nx + [self.nstates]
+        
         self.dx = [interval(x) for x in self.x]
-        self.chi_max = chi_max
+        self.rank = rank 
         self.kx = [2. * np.pi * fftfreq(self.dims[l], self.dx[l]) for l in self.L]
 
         # make_V_list(X, Y)
     
         self.apes = None
         self.electronic_overlap = None 
-    
+        
+    def buildK(self, dt):
+        """
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+
+
+        self.exp_K = []
+        
+        for d in self.ndim:
+                    
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr)
+        
+            expKx = expm(-1j * Tx * dt)
+
+            self.exp_K.append(expKx.copy())
+            
+        return self.exp_K
+        
     def evolve_k(self, B_list, dt):
         """
         Apply the kinetic energy evolution operator to the MPS
         
         .. math::
-            \ket{TT'} = e^{-i \sum_{i = 1}^D T_i \delta t} \ket{TT} 
+            \ket{TT'} = A_{m_1 m_2 \dots, m_d \beta, n_1 n_2 \dots n_d \alpha}\
+                 e^{-i \sum_{i = 1}^d T_i \Delta t} \ket{n \alpha} C^{\mathbf{n} \alpha} 
 
         Parameters
         ----------
@@ -92,15 +137,49 @@ class SPO:
             DESCRIPTION.
 
         """
-        for i in range(self.ndim):
+        d = self.ndim 
+        rank = self.rank 
+        
+        axes = (0, d+1)
+        for i in range(1, d+1):
+            axes += (i, d+1+i)
+            
+        A = np.transpose(self.A, axes=axes) 
+        
+        n = self.nx + [self.nstates]
+        
+        shape = [] 
+        for i in range(d+1):
+            shape.append(n[i]**2)
+            
+        A = np.reshape(A, shape)
+        
+        # TT decomposition
+        factors = decompose(A, rank=self.rank)
+        
+        # reshape the factors from b_i, n_i**2, b_{i+1} -> b_i, n_i, n_i', b_{i+1}
+        T = []
+        
+        for i, f in enumerate(factors):
+            b1, d1, b2 = f.shape 
+            t = f.reshape(b1, n[i], n[i], b2)
+            t = np.einsum('bijc, ij -> bijc', t, self.exp_K[i])
+            T.append(t.copy())
+        
+        # for l in range(self.L):
             
             # kx = 2. * np.pi * fftfreq(self.dims[i], self.dx[i])
+            
+        Bs = apply_mpo_svd(T, B_list)
+        
+        Bs = compress(B_list, rank=rank)
 
-            _, chi1, chi2 = np.shape(B_list[i])
 
             # The FFT cannot be used in LDR, different from the BO dynamics.
             # B_list[i] = ifftn(np.einsum('i, aib -> aib', np.exp(-0.5j * kx**2 * dt), \
             #                             fftn(B_list[i], axes=(1))), axes=(1))
+            
+            
             return B_list
         
     def evolve_v(self, B_list, v_tt, chi_max):
@@ -108,7 +187,7 @@ class SPO:
         apply the potential energy evolution operator 
         
         .. math::
-            U = np.exp(-i  dt  V_{\mathbf{l}})
+            U = np.exp(-i  dt  V_{\mathbf{n} \alpha})
 
 
         Parameters
@@ -156,7 +235,9 @@ class SPO:
         chi_max = self.chi_max
         
         v = self.apes
-        assert(v.shape[-1] == self.nstates)
+        assert(v.shape == self.dims)
+        
+        self.buildK(dt)
         
         V = np.exp(-1j * v * dt)
 
@@ -176,7 +257,7 @@ class SPO:
                     
                 # potential energy evolution
                 
-                B_list, s_list = self.potential(B_list, vf, chi_max)
+                B_list = self.potential(B_list, vf, chi_max)
             
             Xs.append(self.expect_one_site(B_list, X))
             

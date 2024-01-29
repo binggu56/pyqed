@@ -237,6 +237,8 @@ class LDRN:
     """
     many-dimensional many-state nonadiabatic conical intersection dynamics in 
     DVR + LDR + SPO
+    
+    The required input to run is APES and electronic overlap matrix.
     """
     def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sinc'): 
 
@@ -256,7 +258,7 @@ class LDRN:
             
         
         self.x = x
-        self.dx = [interval[_x] for _x in x]
+        self.dx = [interval(_x) for _x in x]
         self.nx = [len(_x) for _x in x] 
         
         self.dvr_type = dvr_type
@@ -436,6 +438,210 @@ class LDRN:
         
         rho = np.einsum(einsum_string, psi.conj(), psi)
         return rho
+
+# class LDRN:
+#     """
+#     many-dimensional many-state nonadiabatic conical intersection dynamics in 
+#     DVR + LDR + SPO
+#     """
+#     def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sinc'): 
+
+#         assert(len(domains) == len(levels) == ndim)
+        
+#         self.L = [domain[1] - domain[0] for domain in domains]
+
+        
+#         x = []
+#         if dvr_type in ['sinc', 'sine']:
+        
+#             for d in range(ndim):
+#                 x.append(discretize(*domains[d], levels[d], endpoints=False))
+#         # elif dvr_type == 'sine':
+#         else:
+#             raise ValueError('DVR {} is not supported. Please use sinc.')
+            
+        
+#         self.x = x
+#         self.dx = [interval(_x) for _x in x]
+#         self.nx = [len(_x) for _x in x] 
+        
+#         self.dvr_type = dvr_type
+        
+#         if mass is None:
+#             mass = [1, ] * ndim
+        
+#         self.nstates = nstates
+        
+#         # all configurations in a vector
+#         self.points = np.fliplr(cartesian_product(x))
+#         self.npts = len(self.points)
+
+#         ###
+#         self.H = None
+#         self._K = None
+#         # self._V = None
+        
+#         self._v = None
+#         self.exp_K = None
+#         self.exp_V = None
+#         self.wf_overlap = self.A = None
+        
+        
+#     @property
+#     def v(self):
+#         return self._v 
+    
+#     @v.setter
+#     def v(self, v):
+#         assert(v.shape == (*self.nx, self.nstates, self.nstates))
+        
+#         self._v = v
+
+#     def buildK(self, dt):
+#         """
+#         For the kinetic energy operator with Jacobi coordinates
+
+#             K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+#         Since the two KEOs for each dof do not commute, it has to be factorized as
+
+#         e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+
+#         where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+#         Parameters
+#         ----------
+#         dt : TYPE
+#             DESCRIPTION.
+
+#         Returns
+#         -------
+#         TYPE
+#             DESCRIPTION.
+
+#         """
+
+
+#         self.exp_K = []
+        
+#         for d in self.ndim:
+                    
+#             Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr)
+        
+#             expKx = scipy.linalg.expm(-1j * Tx * dt)
+
+#             self.exp_K.append(expKx.copy())
+            
+#         return self.exp_K
+    
+#     def buildV(self, dt):
+#         """
+#         Setup the propagators appearing in the split-operator method.
+
+
+
+#         Parameters
+#         ----------
+#         dt : TYPE
+#             DESCRIPTION.
+
+#         intertia: func
+#             moment of inertia, only used for Jocabi coordinates.
+
+#         Returns
+#         -------
+#         None.
+
+#         """
+        
+#         dt2 = 0.5 * dt
+#         self.exp_V = np.exp(-1j * dt * self.apes)
+
+#         self.exp_V_half = np.exp(-1j * dt2 * self.apes)
+
+#         return
+    
+#     def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+#         assert(psi0.shape == (*self.nx, self.nstates))
+        
+#         if self.apes is None:
+#             print('building the adibatic potential energy surfaces ...')
+#             self.build_apes()
+        
+#         self.buildV(dt)
+        
+#         print('building the kinetic energy propagator')
+#         self.buildK(dt)
+
+        
+#         if self.A is None:
+#             logging.info('building the electronic overlap matrix')
+#             self.build_ovlp()
+        
+
+
+#         # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+#         # if self.ndim == 2:
+        
+#             # expKx, expKy = self.exp_K
+#         einsum_string = gen_enisum_string(self.ndim)
+#         exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
+        
+            
+#         r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+#         r.x = self.x
+#         r.y = self.y
+#         r.psilist = [psi0]
+        
+#         alphabet = list(string.ascii_lowercase)
+#         D = self.ndim
+#         _string = "".join(alphabet[:D]) + 'x' + "".join(alphabet[D:2*D])+'y, ' + \
+#             "".join(alphabet[D:2*D])+'y -> ' + "".join(alphabet[:D]) + 'x'
+            
+#         psi = psi0.copy()
+#         psi = self.exp_V_half * psi
+#         # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+        
+#         for k in range(nt//nout):
+#             for kk in range(nout):
+#                 # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+
+#                 # psi = self._KEO_linear(psi)
+#                 # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
+#                 psi = np.einsum(_string, exp_T, psi) 
+#                 psi = self.exp_V * psi 
+#                 # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+                
+#             r.psilist.append(psi.copy())
+        
+#         psi = self.exp_V_half * psi
+        
+#         return r
+    
+#     def rdm_el(self, psi):
+#         """
+#         compute the reduced electronic density matrices 
+
+#         Parameters
+#         ----------
+#         psi : TYPE
+#             DESCRIPTION.
+
+#         Returns
+#         -------
+#         rho : TYPE
+#             DESCRIPTION.
+
+#         """        
+#         D = self.ndim 
+#         alphabet = list(string.ascii_lowercase)
+        
+#         einsum_string = "".join(alphabet[:D]) + 'x, ' + "".join(alphabet[:D])+'y ->  xy'
+        
+#         rho = np.einsum(einsum_string, psi.conj(), psi)
+#         return rho
     
 
 class LDR2(WPD2):
@@ -1707,7 +1913,10 @@ if __name__ == '__main__':
     # ---------------------------
     start_time = time.time()
     
-    solver = LDR2(x, y, nstates = nstates, mass = [1/omega, ] * 2) # mol.mass = [230.5405791702069, 367.62919827476884]
+    domains = [[-6,6], ]*2
+    levels = [5, ] * 2 
+    solver = LDRN(domains=domains, levels=levels, nstates = nstates, \
+                  mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
     solver.v = v
     solver.build_apes()
