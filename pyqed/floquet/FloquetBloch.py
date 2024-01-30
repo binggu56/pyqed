@@ -10,6 +10,8 @@ Floquet theory for periodic Hamiltonian
 import numpy as np 
 import matplotlib.pyplot as plt 
 
+# from pyqed import 
+
 import sys 
 
 def delta(i,j):
@@ -17,6 +19,12 @@ def delta(i,j):
         return 1
     else:
         return 0 
+
+
+class FloquetBloch:
+    def __init__(self, norbs, intracell, intercell):
+        pass
+
         
 def Hamilton(Norbs):
     """

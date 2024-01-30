@@ -1,0 +1,22 @@
+Initial Conditions
+
+Ntraj   =  12800
+Ndim    =      4
+kmax    =   4000
+dt      =   0.0010
+fric    =   8.0000
+Mass    =   0.100000E+01  0.100000E+01  0.100000E+01  0.100000E+01
+
+Initial Wavepacket
+
+alpha0   =   2.0000  2.0000  2.0000  2.0000
+center   =  -3.7500 -1.2500  1.2500  3.7500
+momentum =   0.0000  0.0000  0.0000  0.0000
+
+interparticle distance =   5.0000
+
+Expectation value of x(2,ntraj) =  -1.249085
+Total Energy =   4.00000
+MISSION COMPLETE.
+ Dispersion of atom 1 =   0.48876256911013460     
+ Dispersion/Interparticle Distance =   0.19550502764405384     

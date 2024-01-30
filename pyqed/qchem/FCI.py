@@ -17,6 +17,8 @@ from scipy.special import erf
 from numpy import sqrt, exp
 import scipy
 
+import logging
+
 
 pi = np.pi
 
@@ -29,8 +31,8 @@ class Gaussian1s:
         self.center = x
         self.alpha = ax
 
-#Slater Type Orbital fit with N primative gausians (STO-NG) type basis
 class STONG:
+    #Slater Type Orbital fit with N primative gausians (STO-NG) type basis
     def __init__(self,n,d,g):
         """
         d : contraction coeffiecents
@@ -60,11 +62,17 @@ def sto3g_helium(center):
 
 
 
-#The overlap integrals describe how the basis functions overlap
-#as the atom centered gaussian basis functions are non-orthognal
-#they have a non-zero overlap. The integral has the following form:
-#S_{ij} = \int \phi_i(r-R_a) \phi_j(r-R_b) \mathrm{d}r
+
 def overlap_integral_sto(b1, b2):
+    """
+    The overlap integrals describe how the basis functions overlap
+    #as the atom centered gaussian basis functions are non-orthognal
+    #they have a non-zero overlap. The integral has the following form:
+    
+    .. math::
+        
+        S_{ij} = \int \phi_i(r-R_a) \phi_j(r-R_b) \mathrm{d}r
+    """
     return two_center_contraction(b1, b2, overlap_integral)
 
 def overlap_integral(g1,g2):
@@ -91,6 +99,9 @@ def nuclear_attraction_gto(Zc, Rc, g1, g2):
     """
     Zc - charge of the nuclei
     Rc - postion of the nuclei
+    .. math::
+        
+        \int \mathrm{d}\mathbf{r} g^*_1(r - R_A) \frac{1}{r - R_c} g_2(r - R_B)
     """
     alpha = g1.alpha
     beta  = g2.alpha
@@ -240,7 +251,6 @@ def hartree_fock(R, Z, CI=False):
         for j in range( (i+1),len(phi)):
             S[i,j] = S[j,i] = overlap_integral_sto(phi[i], phi[j])
 
-    print("S: ", S)
 
 
     #calculate the kinetic energy matrix T
@@ -260,14 +270,15 @@ def hartree_fock(R, Z, CI=False):
     #print("building nuclear attraction matrices")
 
     V = np.zeros((K,K))
+    nao = K
+    
 
     for A in range(K):
-        for i in range(K):
-            for j in range(i,K):
+        for i in range(nao):
+            for j in range(i, nao):
                 v = nuclear_attraction_integral(Z[A], R[A], phi[i], phi[j])
                 V[i,j] += v
-                if i != j:
-                    V[j,i] += v
+                if i != j: V[j,i] += v
     #print("V: ", V)
 
     #build core-Hamiltonian matrix
@@ -321,7 +332,7 @@ def hartree_fock(R, Z, CI=False):
     print("E_nclr = ", nuclear_energy)
 
     print("\n {:4s} {:13s} de\n".format("iter", "total energy"))
-    for scf_iter in range(100):
+    for scf_iter in range(50):
         #calculate the two electron part of the Fock matrix
         G = np.zeros(Hcore.shape)
 
@@ -390,6 +401,30 @@ def hartree_fock(R, Z, CI=False):
     else:
         return C, Hcore, nuclear_energy, two_electron
 
+class RHF:
+    
+    def __init__(self, mol, R, Z, init_guess=None):
+        
+        self.mol = mol
+        
+        self.mol = mol
+        self.max_cycle = 100
+        self.init_guess = init_guess
+
+        self.mo_occ = None
+        self.mo_coeff = None
+        self.e_tot = None
+        self.e_nuc = None
+        self.e_kin = None
+        self.e_ne = None
+        self.e_j = None
+        self.e_k = None
+
+        
+    def run(self):
+        
+        hartree_fock(R, Z)
+        
 #def energy_functional(Hcore, two_electron, P):
 #    """
 #    density functional of the one-body density matrix P

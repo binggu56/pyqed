@@ -10,6 +10,186 @@ import scipy as sp
 # import numba
 # from numba import jit
 import sys
+import heapq
+from functools import reduce
+
+
+def integrate(f, a, b, **args):
+    """
+    
+    Compute a definite integral.
+
+    Parameters
+    ----------
+    f : TYPE
+        DESCRIPTION.
+    a : TYPE
+        DESCRIPTION.
+    b : TYPE
+        DESCRIPTION.
+    **args : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    return integrate.quad(f, a, b, args=args)
+
+def cartesian_product(arrays):
+    """
+    A fast cartesion product function
+    """
+    broadcastable = np.ix_(*arrays)
+    broadcasted = np.broadcast_arrays(*broadcastable)
+    rows, cols = reduce(np.multiply, broadcasted[0].shape), len(broadcasted)
+    out = np.empty(rows * cols, dtype=broadcasted[0].dtype)
+    start, end = 0, rows
+    for a in broadcasted:
+        out[start:end] = a.reshape(-1)
+        start, end = end, end + rows
+    return out.reshape(cols, rows).T
+
+
+def cartesian(*args):
+    """ compute Cartesian product of args """
+    # ans = []
+    # for arg in args[0]:
+    #     for arg2 in args[1]:
+    #         ans.append(arg+arg2)
+    # return ans
+  #alternatively:
+    ans = [[]]
+    for arg in args:
+        ans = [x+[y] for x in ans for y in arg]
+      
+    return ans
+
+def discretize(a=0, b=1, l=4, endpoints=True):
+    """
+    Create a uniform math with size with level l in the range [a, b]
+    
+    mesh size is :math:`(b-a)/2^l`
+
+    Parameters
+    ----------
+    a : TYPE, optional
+        DESCRIPTION. The default is 0.
+    b : TYPE, optional
+        DESCRIPTION. The default is 1.
+    l : TYPE, optional
+        DESCRIPTION. The default is 4.
+    endpoints : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    if endpoints:
+        return np.linspace(a, b, 2**l+1, endpoint=True)
+    else:
+        return np.linspace(a, b, 2**l, endpoint=False)[1:]
+    
+    # if startpoint is False and endpoint is False:
+    #     return x[1:-1]
+
+    # elif startpoint and endpoint is False:
+    #     return x
+    
+    # elif startpoint and endpoint:
+        
+    #     return np.linspace(a, b, 2**l+1, endpoint=True)
+    
+
+def polar2cartesian(r, theta):
+    """
+    transform polar coordinates to Cartesian
+
+    .. math::
+
+        x = r  \cos(\theta)
+        y = r \sin(\theta)
+
+    Parameters
+    ----------
+    r : TYPE
+        DESCRIPTION.
+    theta : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    x : TYPE
+        DESCRIPTION.
+    y : TYPE
+        DESCRIPTION.
+
+    """
+    x, y = r * np.cos(theta), r * np.sin(theta)
+    return x, y
+
+def cartesian2polar(x, y):
+    """
+    transform Cartesian coordinates to polar
+
+    .. math::
+
+        x = r  \cos(\theta)
+        y = r \sin(\theta)
+
+    Parameters
+    ----------
+    r : TYPE
+        DESCRIPTION.
+    theta : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    x : TYPE
+        DESCRIPTION.
+    y : TYPE
+        DESCRIPTION.
+
+    """
+    r = sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+
+    return r, theta
+
+def overlap(bra, ket):
+    return np.vdot(bra, ket)
+
+def nlargest(a, n=1, with_index=False):
+    """
+    finds the largest n elements from a Python iterable
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    n : int
+        DESCRIPTION.
+    with_index: bool
+        if index is needed.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    if with_index:
+
+        return heapq.nlargest(n, zip(a, range(len(a))))
+    else:
+        return heapq.nlargest(n, a)
 
 def jacobi_anger(n, z=1):
     """
@@ -216,11 +396,11 @@ def gwp2(x, y, sigma=np.identity(2), xc=[0, 0], kc=[0, 0]):
     x0, y0 = xc
     kx, ky = kc
 
-    A = inv(sigma)
+    A = np.linalg.inv(sigma)
 
     delta = A[0, 0] * (x-x0)**2 + A[1, 1] * (y-y0)**2 + 2. * A[0, 1]*(x-x0)*(y-y0)
 
-    gauss_2d = (sqrt(det(sigma)) * sqrt(pi) ** 2) ** (-0.5) \
+    gauss_2d = (sqrt(np.linalg.det(sigma)) * sqrt(pi) ** 2) ** (-0.5) \
                               * exp(-0.5 * delta + 1j * kx * (x-x0) + 1j * ky * (y-y0))
 
     return gauss_2d
@@ -337,6 +517,10 @@ def rect(x):
     return np.heaviside(x+0.5, 0.5) - np.heaviside(x - 0.5, 0.5)
 
 def interval(x):
+    # Deprecated use step().
+    return x[1] - x[0]
+
+def stepsize(x):
     return x[1] - x[0]
 
 def fftfreq(times):
@@ -356,7 +540,7 @@ def fftfreq(times):
     """
     return np.fft.fftshift(np.fft.fftfreq(len(times), interval(times)))
 
-def tensor(*args):
+def tensor(*args, **kwargs):
     """Calculates the tensor product of input operators.
 
     Build from QuTip.
@@ -371,6 +555,11 @@ def tensor(*args):
 
 
     """
+    
+    # if kwargs['sparse']:
+    #     kron = sp.kron
+    # else:
+    #     kron = np.kron
 
     if not args:
         raise TypeError("Requires at least one input argument")
@@ -385,11 +574,10 @@ def tensor(*args):
         # tensor(q1, q2, q3, ...)
         qlist = args
 
-    for n, q in enumerate(qlist):
-        if n == 0:
-            out = q
-        else:
-            out = sp.kron(out, q, format='csr')
+    out = qlist[0]
+    for n in range(1, len(qlist)):
+
+        out = kron(out, qlist[n], format='csr')
 
     return out
 
@@ -598,16 +786,20 @@ def rgwp(x, x0=0., sigma=1.):
     psi = 1./np.sqrt(np.sqrt(np.pi) * sigma) * np.exp(-(x-x0)**2/2./sigma**2)
     return psi
 
-def gwp(x, sigma=1., x0=0., p0=0.):
+
+def gwp(x, a=None, x0=0., p0=0., ndim=1):
     '''
     complex Gaussian wavepacket
+    
+    .. math::
+        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-(x-x_0) A (x-x_0) + i p_0(x-x_0)} 
 
     Parameters
     ----------
     x : TYPE
         DESCRIPTION.
     sigma : TYPE, optional
-        DESCRIPTION. The default is 1..
+        (co)variance matrix. 
     x0 : TYPE, optional
         DESCRIPTION. The default is 0..
     p0 : TYPE, optional
@@ -619,9 +811,56 @@ def gwp(x, sigma=1., x0=0., p0=0.):
         DESCRIPTION.
 
     '''
-    psi = np.sqrt(np.sqrt(1./np.pi/sigma**2)) * \
-        np.exp(-(x-x0)**2/2./sigma**2 + 1j * p0 * (x-x0))
-    return psi
+    # if isinstance(x, float):
+    #     ndim = 1
+    # else:
+    #     ndim = len(x)
+    
+    x = np.array(x)
+    
+    if a is None:
+        a = np.eye(ndim)
+        
+    if ndim == 1:
+        
+        return (a/np.pi)**(1/4) * np.exp(-a * (x-x0)**2/2.)\
+            * exp(1j * p0 * (x-x0))
+    
+    elif ndim == 2:
+        
+        if isinstance(x0, float):
+            x0 = np.array([x0, ] * ndim)
+        if isinstance(p0, float):
+            p0 = np.array([p0, ] * ndim)
+        
+        u = np.array(x-x0)
+        
+        delta = u.dot(a @ u) 
+        
+        gauss_2d = np.linalg.det(a)**(1/4)/np.pi**(ndim/4) \
+                          * np.exp(-0.5 * delta + 1j * p0.dot(x-x0))
+    
+        return gauss_2d
+
+    elif ndim > 2:
+        
+        # A = np.linalg.inv(sigma)
+        
+        # if isinstance(x, list):
+        #     x = np.array(x)
+        if isinstance(x0, float):
+            x0 = np.array([x0, ] * ndim)
+        if isinstance(p0, float):
+            p0 = np.array([p0, ] * ndim)
+            
+
+        u = x - x0
+        delta = u.dot(a @ u)
+        
+        g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
+                                                             1j * p0.dot(x-x0))
+
+        return g
 
 def gwp_k(k, sigma, x0,k0):
     """
@@ -1165,15 +1404,101 @@ def driven_dissipative_dynamics(ham, dip, rho0, pulse, dt=0.001, Nt=1, \
 ####################
 # spin chains
 ####################
+def multispin(onsite, hopping, nsites):
+
+    # if not isinstance(hopping, float):
+    #     raise ValueError('Hopping must be float.')
+
+    # if isinstance(onsite, (float, int)):
+    #     onsite = [onsite, ] * nsites
+
+    # return multimode(omegas=onsite, nmodes=nsites, J=hopping, truncate=2)
+
+    s0, sx, sy, sz = pauli()
+    sm, sp = lowering(), raising()
+    J = hopping
+
+    sz = 0.5 * (s0 - sz)
+    
+    if isinstance(onsite, float):
+        onsite = [onsite, ] * nsites
+        
+    h0 = 0.5 * onsite[0] * sz
+    x = sx
+    idm = s0
+
+    assert len(onsite) == nsites
+
+    if nsites == 1:
+
+        return h0, sm
+
+    elif nsites == 2:
+
+        J = hopping
+        h0 = 0.5 * onsite[0] * sz
+
+        hf = 0.5 * onsite[-1] * sz
+        ham = kron(idm, hf) + kron(h0, idm) + J * (kron(sm, sp) + kron(sp, sm))
+
+        xs = [kron(sm, idm), kron(idm, sm)]
+        return ham, xs
+
+    elif nsites > 2:
+        h0 = 0.5 * onsite[0] * sz
+        hf = 0.5 * onsite[-1] * sz
+
+        head = kron(h0, tensor_power(idm, nsites-1))
+        tail = kron(tensor_power(idm, nsites-1), hf)
+        ham = head + tail
+
+        for i in range(1, nsites-1):
+            h = 0.5 * onsite[i] * sz
+            ham += kron(tensor_power(idm, i), \
+                                      kron(h, tensor_power(idm, nsites-i-1)))
+
+        hop_head = J * kron(kron(sm, sp) + kron(sp, sm), tensor_power(idm, nsites-2))
+        hop_tail = J * kron(tensor_power(idm, nsites-2), kron(sm, sp) + kron(sp, sm))
+
+        ham += hop_head + hop_tail
+
+        for i in range(1, nsites-2):
+            ham += J * kron(tensor_power(idm, i), \
+                                kron(kron(x, x), tensor_power(idm, nsites-i-2)))
+
+        # connect the last mode to the first mode
+
+        lower_head = kron(sm, tensor_power(idm, nsites-1))
+        xs = []
+        xs.append(lower_head)
+
+        for i in range(1, nsites-1):
+            # x = quadrature(dims[i])
+            lower = kron(tensor_power(idm, i), kron(sm, tensor_power(idm, nsites-i-1)))
+            xs.append(lower.copy())
+
+        lower_tail = kron(tensor_power(idm, nsites-1), sm)
+        xs.append(lower_tail)
+
+        return ham, xs
+
 def multi_spin(onsite, nsites):
     """
     construct the hamiltonian for a multi-spin system
     params:
         onsite: array, transition energy for each spin
         nsites: number of spins
+    Returns
+    =======
+    ham: ndarray
+        Hamiltonian
+    lower: ndnarry
+        lowering operator
     """
 
     s0, sx, sy, sz = pauli()
+    sz = (s0 - sz)/2
+
     sm = lowering()
 
     head = onsite[0] * kron(sz, tensor_power(s0, nsites-1))
@@ -1191,8 +1516,17 @@ def multi_spin(onsite, nsites):
         lower += kron(tensor_power(s0, i), kron(sm, tensor_power(s0, nsites-i-1)))
 
 
+    # edip
+    edip_head = kron(sx, tensor_power(s0, nsites-1))
+    edip_tail = kron(tensor_power(s0, nsites-1), sx)
+    edip = edip_head + edip_tail
+
+    for i in range(1, nsites-1):
+        edip += kron(tensor_power(s0, i), kron(sx, tensor_power(s0, nsites-i-1)))
+
 
     return ham, lower
+
 
 def multiboson(omega, nmodes, J=0, truncate=2):
     """
@@ -1494,6 +1828,96 @@ def expm(A, t, method='EOM'):
         raise NotImplementedError('Method of {} has not been implemented.\
                                   Choose from EOM'.format(method))
 
+def propagator(H, dt, nt):
+    """
+    compute the propagator for time-dependent and time-independent H
+    U(t) = e^{-i H t}
+
+    Parameters
+    -----------
+    H: ndarray or list of ndarray or callable
+        Hamiltonian.
+        if H is ndarray, H is time-independent. Otherwise H is time-dependent.
+    t: float or list
+        times
+    """
+
+
+
+    # propagator
+
+
+    # set the ground state energy to 0
+    print('Computing the propagator. '
+          'Please make sure that the ground-state energy is 0.')
+
+
+    if callable(H):
+        H = [H(k*dt) for k in range(nt)]
+
+    if isinstance(H, list): # time-dependent H
+
+        U = np.eye(H[0].shape[-1], dtype=complex)
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H[k])
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    elif isinstance(H, np.ndarray): # time-independent
+
+        assert(isherm(H))
+
+        # if method == 'eom':
+        U = np.eye(H.shape[-1], dtype=complex)
+
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H)
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    #     elif method == 'diag':
+    #         w, v = np.linalg.eigh(H) # H = v @ diag(w) @ v.H
+    #         return [v @ np.diag(np.exp(-1j * w * k * dt)) @ dag(v) for k in range(nt+1)]
+
+
+def propagator_H_const(H, dt, nt, method='diag'):
+    """
+    compute the propagator for time-dependent and time-independent H
+    U(t) = e^{-i H t}
+
+    Parameters
+    -----------
+    H: ndarray or list of ndarray or callable
+        Hamiltonian.
+        if H is ndarray, H is time-independent. Otherwise H is time-dependent.
+    t: float or list
+        times
+    """
+
+    assert(isherm(H))
+
+    if method == 'eom':
+        # propagator
+        U = np.eye(H.shape[-1], dtype=complex)
+        Ulist = [U.copy()]
+
+        for k in range(nt):
+            U = rk4(U, tdse, dt, H)
+            Ulist.append(U.copy())
+
+        return Ulist
+
+    elif method == 'diag':
+
+        w, v = np.linalg.eigh(H) # H = v @ diag(w) @ v.H
+        return [v @ np.diag(np.exp(-1j * w * k * dt)) @ dag(v) for k in range(nt+1)]
+
 
 def ldo(b, A):
     '''
@@ -1518,6 +1942,10 @@ def ldo(b, A):
 def isherm(a):
     return np.allclose(a, dag(a))
 
+def isunitary(m):
+    return np.allclose(np.eye(len(m)), m.dot(m.T.conj()))
+    # return np.allclose(np.eye(len(m)), m.T.conj() @ m)
+
 def isdiag(M):
     """
     Check if a matrix is diagonal.
@@ -1533,7 +1961,7 @@ def isdiag(M):
         DESCRIPTION.
 
     """
-    return np.all(M == np.diag(np.diagonal(M)))
+    return np.allclose(M, np.diag(np.diagonal(M)))
 
 
 def pdf_normal(x, mu=0, sigma=1.):
@@ -1541,10 +1969,24 @@ def pdf_normal(x, mu=0, sigma=1.):
             np.exp(- (x - mu) ** 2 / (2 * sigma ** 2))
 
 if __name__ == '__main__':
-    a = sigmaz() - 1j * sigmax()
-    print(isherm(a))
+    H = sigmaz() -  sigmax()
+    s0, sx, sy, sz = pauli()
+    
+    print(kron(sz, s0) != tensor(csr_matrix(sz), csr_matrix(s0)))
+    # print(isherm(H))
 
-    import matplotlib.pyplot as plt
-    x = np.linspace(-1, 1)
-    plt.plot(x, pdf_normal(x))
-    plt.show()
+    # import matplotlib.pyplot as plt
+    # x = np.linspace(-1, 1)
+    # plt.plot(x, pdf_normal(x))
+    # plt.show()
+
+    # dt = 0.005
+    # nt = 50
+    # U1 = propagator(H, dt, nt, method='diag')
+    # U2 = propagator(H, dt, nt, method='eom')
+    # print(U1[-1])
+    # print(U2[-1])
+
+
+
+

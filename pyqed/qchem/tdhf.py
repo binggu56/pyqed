@@ -108,7 +108,13 @@ def get_ab(gw, method='TDH'):
 
     return A, B
 
-
+class TDH:
+    '''
+    Time-dependent Hartree 
+    '''
+    def __init__(self):
+        pass
+    
 class TDHF:
     def __init__(self, mf):
 
@@ -218,21 +224,23 @@ class TDHF:
             #     e, x = eigh(ham_rpa)
             # return e, x
         else:
-            if not using_casida:
-                ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-                assert is_positive_def(ham_rpa)
-                e, xy = eig_asymm(ham_rpa)
-                return e, xy
-            else:
+            if using_casida:
                 assert is_positive_def(A-B)
                 sqrt_A_minus_B = sqrtm(A-B)
                 ham_rpa = np.dot(sqrt_A_minus_B, np.dot((A+B),sqrt_A_minus_B))
 
                 esq, t = eig(ham_rpa, k=nstates, which='SM')
                 e = np.sqrt(esq)
-                print(e*au2ev)
-
+                print('Roots (eV) = ', e*au2ev)
                 return e, t
+
+            else:
+                ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
+                assert is_positive_def(ham_rpa)
+                e, xy = eig_asymm(ham_rpa)
+                return e, xy
+
+
 
 
     def get_ab(self, method='TDHF'):
@@ -250,9 +258,9 @@ def eig(a, k=None, **kwargs):
     a : TYPE
         DESCRIPTION.
     k : TYPE, optional
-        DESCRIPTION. The default is None.
+        number of required eigenstates. If None, do the full calculation. The default is None.
     **kwargs : TYPE
-        DESCRIPTION.
+        kwargs for scipy.sparse.linalg.eigsh()
 
     Returns
     -------

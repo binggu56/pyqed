@@ -24,7 +24,7 @@ from scipy.linalg import expm, sinm, cosm
 import scipy
 from numba import jit
 
-from lime.phys import dagger, interval
+from pyqed import dagger, interval
 
 
 def x_evolve(dt, x, V_x, psi_x):
@@ -93,7 +93,7 @@ def evolve(x, v, psi0, dt, nt=1, t0=0.):
     t = t0
     psi_x = psi0
     dt2 = 0.5 * dt
-    
+
     N = len(x)
     dx = interval(x)
 
@@ -196,9 +196,9 @@ print('number of grid points = {}'.format(N))
 
 # diabatic surfaces with vibronic couplings
 V_x = np.zeros((N,4))
-V_x[:,0] = (x-1.)**2/2.0
-V_x[:,3] = (x+1.)**2/2.0
-c = 0.5
+V_x[:,0] = (x)**2/2.0
+V_x[:,3] = (x-1.)**2/2.0 + 1.
+c = 0.1
 V_x[:,1] = c
 V_x[:,2] = c
 
@@ -211,7 +211,7 @@ p0 = 0.0
 x0 = 0.0
 #dp2 = p0 * p0 * 1./80
 #d = hbar / np.sqrt(2 * dp2)
-a = 1.
+a = 4.
 
 k0 = p0 / hbar
 v0 = p0 / m
@@ -219,13 +219,13 @@ angle = 0.0  # np.pi/4.0
 print('initial phase difference between c_g and c_e = {} Pi'.format(angle/np.pi))
 psi_x0 = np.zeros((N,2), dtype=np.complex128)
 psi_x0[:,0] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0) * np.exp(1j*angle)
-psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
+# psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
 
 
 # propagate
 psi_x = evolve(dt=dt, x=x, v=V_x, psi0=psi_x0, nt=t_max)
 
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 fig, ax = plt.subplots()
 ax.plot(x, psi_x0)
 ax.plot(x, psi_x)

@@ -18,18 +18,23 @@ from scipy.sparse import csr_matrix, lil_matrix, identity, kron, \
     linalg, issparse
 from dataclasses import dataclass
 
-import numba
+# import numba
 import sys
 import warnings
 
-import proplot as plt
+# import proplot as plt
 
 from pyqed.units import au2fs, au2ev
 from pyqed.signal import sos
 from pyqed.phys import dag, quantum_dynamics, \
-    obs, basis, isdiag, jump, multimode, transform, rk4, tdse
+    obs, basis, isdiag, jump, multimode, transform, rk4, tdse, \
+        isdiag, ket2dm, tensor, isherm
+
+
 
 from pyqed.units import au2wavenumber, au2fs
+import pickle
+
 
 # def rk4(rho, fun, dt, *args):
 #     """
@@ -92,19 +97,21 @@ def read_input(fname_e, fname_edip,  g_included=True):
 
 class Result:
     def __init__(self, description=None, psi0=None, rho0=None, dt=None, \
-                 Nt=None, times=None, t0=None, nout=None):
+                 Nt=None, times=None, t0=0, nout=1):
         self.description = description
         self.dt = dt
-        self.timesteps = Nt
+        self.timesteps = self.nt = Nt
         self.observables = None
         self.rholist = None
-        self.psilist = [psi0]
+        # self.psilist = [psi0]
+        self.psilist = []
+
         # self._psilist = None
         self.psi = None
         self.rho0 = rho0
         self.psi0 = psi0
         self.nout = nout
-        self.times = t0 + np.arange(Nt//nout) * dt * nout
+        self.times = t0 + np.arange(Nt//nout + 1) * dt * nout
         return
 
     # @property
@@ -154,6 +161,8 @@ class Result:
         with open(fname, 'wb') as f:
             pickle.dump(self, f)
 
+    def save(self, fname):
+        self.dump(fname)
 
     # def times(self):
     #     if dt is not None & Nt is not None:
@@ -161,9 +170,43 @@ class Result:
     #     else:
     #         sys.exit("ERROR: Either dt or Nt is None.")
 
+def load_result(fname):
+    '''
+    read result obj saved with pickle
+    '''
+    with open(fname, 'rb') as f:
+        result = pickle.load(f)
+    return result
+
+def eigh(a, k=None):
+    """
+    find the eigenvalues and eigenstates of matrix a
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    k : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """        
+    if k is None:
+        if issparse(a):
+            return np.linalg.eigh(a.toarray())
+        else:
+            return np.linalg.eigh(a)
+    
+    else: 
+        return scipy.sparse.linalg.eigsh(a, k=k)
+        
 
 class Mol:
-    def __init__(self, H, edip=None, edip_rms=None, gamma=None):
+    def __init__(self, H, edip=None, lowering=None, edip_rms=None, gamma=None):
         """
         Class for multi-level systems.
 
@@ -193,7 +236,12 @@ class Mol:
         self.h = H
         #        self.initial_state = psi0
         self._edip = edip
-        self.dip = self.edip
+        self.dip = self.edip = edip
+
+        if lowering is not None:
+            self.lowering = lowering
+            self.raising = dag(self.lowering)
+
         # if edip is not None:
         #     self.edip_x = edip[:,:, 0]
         #     self.edip_y = edip[:, :, 1]
@@ -204,7 +252,7 @@ class Mol:
         # else:
         #     self.edip_rms = edip_rms
 
-        self._edip_rms = edip_rms
+        # self._edip_rms = edip_rms
 
         self.nstates = H.shape[0]
         self.dim = H.shape[0]
@@ -221,6 +269,11 @@ class Mol:
         self.gamma = gamma
         self.mdip = None
         self.dephasing = 0.
+
+        # if isdiag(H):
+        #     self.E = np.diag(H)
+        # else:
+        self.E = self.eigenenergies()
 
     # def raising(self):
     #     return self.raising
@@ -293,6 +346,17 @@ class Mol:
             eg, evecs = self.eigenstates(k=1)[:]
             print('ground state energy = ', eg)
             return evecs
+    
+    def ground_state(self, method='trivial'):
+
+        if method == 'trivial':
+            return basis(self.dim, 0)
+
+        elif method == "diag":
+
+            eg, evecs = self.eigenstates(k=1)[:]
+            print('ground state energy = ', eg)
+            return evecs
 
     def energy(self, psi):
         return obs(self.H, psi)
@@ -349,13 +413,8 @@ class Mol:
         self.gamma = gamma
         return
 
-
-    # def get_ham(self):
-    #     return self.H
-
-
-    # def getH(self):
-    #     return self.H
+    def getH(self):
+        return self.H
 
     def get_nonhermitianH(self):
         H = self.H
@@ -394,7 +453,10 @@ class Mol:
         self.lifetime = tau
 
     def eigenenergies(self):
-        return np.linalg.eigvals(self.H)
+        H = self.H
+        if issparse(H):
+            H = H.toarray()
+        return np.linalg.eigvals(H)
 
     def eigvals(self):
         if isdiag(self.H):
@@ -402,7 +464,7 @@ class Mol:
         else:
             return np.linalg.eigvals(self.H)
 
-    def eigenstates(self, k=6):
+    def eigenstates(self, k=None):
         """
 
         Parameters
@@ -418,6 +480,13 @@ class Mol:
         if self.H is None:
             raise ValueError('Call getH/calcH to compute H first.')
 
+        if k is None or k >= self.dim: # full spectrum
+            
+            if issparse(H):
+                return np.linalg.eigh(self.H.toarray())
+            else:
+                return np.linalg.eigh(H)
+            
         if k < self.dim:
             eigvals, eigvecs = linalg.eigs(self.H, k=k, which='SR')
 
@@ -426,10 +495,10 @@ class Mol:
             eigvecs = eigvecs[:, idx]
             return eigvals, eigvecs
 
-        if k == self.dim:
-            return np.linalg.eigh(self.H.toarray())
+        # if k == self.dim:
+        #     return np.linalg.eigh(self.H.toarray())
 
-    def driven_dynamics(self, pulse, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
+    def driven_dynamics(self, psi0, pulse, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''
         wavepacket dynamics in the presence of laser pulses
 
@@ -454,13 +523,15 @@ class Mol:
 
         '''
         H = self.H
-        dip = self.dip
-        psi0 = self.initial_state
+        edip = self.dip
+        # psi0 = self.initial_state
 
         if psi0 is None:
             sys.exit("Error: Initial wavefunction not specified!")
 
-        driven_dynamics(H, dip, psi0, pulse, dt=dt, Nt=Nt, \
+        H = [self.H, [edip, pulse]]
+
+        driven_dynamics(H, psi0, dt=dt, Nt=Nt, \
                         e_ops=obs_ops, nout=nout, t0=t0)
 
         return
@@ -549,50 +620,53 @@ class Mol:
         #                            e_ops=e_ops, nout=nout, t0=t0)
 
 
-    # def run(self, psi0=None, dt=0.01, e_ops=None, Nt=1, nout=1, t0=0.0, \
-    #         edip=None, pulse=None):
-    #     '''
-    #     quantum dynamics under time-independent Hamiltonian
+    def run(self, psi0=None, dt=0.01, e_ops=None, nt=1, nout=1, t0=0.0, \
+            edip=None, pulse=None):
+        '''
+        quantum dynamics under time-independent Hamiltonian
 
-    #     Parameters
-    #     ----------
-    #     pulse : TYPE
-    #         DESCRIPTION.
-    #     dt : float, optional
-    #         time interval. The default is 0.001.
-    #     Nt : int, optional
-    #         int. The default is 1.
-    #     obs_ops : TYPE, optional
-    #         DESCRIPTION. The default is None.
-    #     nout : TYPE, optional
-    #         DESCRIPTION. The default is 1.
-    #     t0: float
-    #         initial time
+        Parameters
+        ----------
+        pulse : TYPE
+            DESCRIPTION.
+        dt : float, optional
+            time interval. The default is 0.001.
+        Nt : int, optional
+            int. The default is 1.
+        obs_ops : TYPE, optional
+            DESCRIPTION. The default is None.
+        nout : TYPE, optional
+            DESCRIPTION. The default is 1.
+        t0: float
+            initial time
 
-    #     Returns
-    #     -------
-    #     None.
+        Returns
+        -------
+        None.
 
-    #     '''
-    #     if psi0 is None:
-    #         raise ValueError("Please specify initial wavefunction psi0.")
+        '''
+        if psi0 is None:
+            raise ValueError("Please specify initial wavefunction psi0.")
 
-    #     H = self.H
+        H = self.H
+        edip = self.edip
 
-    #     if pulse is None:
-    #         return quantum_dynamics(H, psi0, dt=dt, Nt=Nt, \
-    #                                 obs_ops=e_ops, nout=nout, t0=t0)
-    #     else:
+        if pulse is None:
+            return _quantum_dynamics(H, psi0, dt=dt, Nt=nt, \
+                                    e_ops=e_ops, nout=nout, t0=t0)
+        else:
 
-    #         if isinstance(pulse, list):
-    #             H = [self.H]
-    #             for i in range(len(pulse)):
-    #                 H.append([edip[i], pulse[i].efield])
-    #         else:
-    #             H = [self.H, [edip, pulse.efield]]
+            if isinstance(pulse, list):
+                
+                H = [self.H]
+                for i in range(len(pulse)):
+                    H.append([edip[i], pulse[i].efield])
+            else:
+                
+                H = [self.H, [edip, pulse.efield]]
 
-    #         return driven_dynamics(H, psi0, dt=dt, Nt=Nt, \
-    #                                e_ops=e_ops, nout=nout, t0=t0)
+            return driven_dynamics(H, psi0, dt=dt, Nt=nt, \
+                                    e_ops=e_ops, nout=nout, t0=t0)
 
     # def heom(self, env, nado=5, c_ops=None, obs_ops=None, fname=None):
     #     nt = self.nt
@@ -672,6 +746,18 @@ class Mol:
         """
         pass
 
+
+    def deom(self, bath, coupling, coupling_dipole=None, pulse_system_func=None, pulse_coupling_func=None, mode=None):
+        """
+        hierarchical equations of motion
+        """
+        from pyqed.deom import DEOMSolver
+        
+        solver = DEOMSolver(self.H, self.edip, bath,
+                            coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)
+        return solver
+
+
     def absorption(self, omegas, method='sos', **kwargs):
         '''
         Linear absorption of the model.
@@ -698,7 +784,7 @@ class Mol:
 
             return sos.absorption(self, omegas, **kwargs)
 
-        elif method == 'superoperator':
+        elif method == 'tcf': # time-correlation function
 
             raise NotImplementedError('The method {} has not been implemented. \
                               Try "sos"'.format(method))
@@ -795,6 +881,68 @@ class Mol:
             fig.savefig(fname+'.pdf')
 
             return S, fig, ax
+        
+    def multi(self, nmol=2):
+        H = csr_matrix(self.H)
+        I = csr_matrix(self.idm)
+        edip = csr_matrix(self.edip) 
+    
+        
+        #+ kron(I, H))
+        l = [H] + [I, ] * (nmol-1)
+        h_tot = tensor(l)
+        for n in range(1, nmol):
+            l = [I, ] * nmol
+            l[n] = H
+            # print(l[0], l[1])
+            # print(n, tensor(l))
+            h_tot += tensor(l)
+        
+
+        edip_tot = 0
+        for n in range(nmol):
+            l = [I, ] * nmol
+            l[n] = edip
+            edip_tot += tensor(l)
+            
+            
+            
+
+        return h_tot, edip_tot
+
+
+def direct_product(a, n):
+    """
+    Single-molecule operator in the direct product space of N molecules
+    
+    .. math::
+        A = a \otimes I \cdots I + I \otimes A \otimes I \cdots I + \cdots
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    n : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atot : TYPE
+        DESCRIPTION.
+
+    """
+    I = identity(a)
+    atot = 0
+    
+    for j in range(n):
+        l = [I, ] * n
+        l[j] = a
+        atot += tensor(l)
+
+    return atot
+
+    
+            
 
 @dataclass
 class Mode:
@@ -845,6 +993,7 @@ class LVC(Mol):
 
         self.H = None
         self.dim = None
+        self._x = None # list of coordinate operators
 
     def buildH(self):
         """
@@ -897,6 +1046,7 @@ class LVC(Mol):
 
         self.H = H
         self.dim = H.shape[0]
+        self._x = xs
 
 
 
@@ -1004,6 +1154,24 @@ class LVC(Mol):
         p = jump(i=i, f=f, dim=self.nstates, isherm=isherm)
 
         return kron(p, self.idm_vib)
+    
+    def coordinate(self, n):
+        """
+        build coordinate operators in the full space 
+
+        Parameters
+        ----------
+        n : int
+            mode id
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        return kron(self.idm_el, self._x[n])
+        
 
     def dpes(self, q):
         pass
@@ -1125,88 +1293,73 @@ def polar(x, y):
     phi = np.arctan2(y, x)
     return(rho, phi)
 
-class JahnTeller(LVC):
-    """
-    E \otimes e Jahn-Teller model with two degenerate modes and two degenerate electronic states
-    (+ the ground state)
-    """
-    def __init__(self, E, omega, kappa, truncate=24):
-        """
 
 
-        Parameters
-        ----------
-        E : TYPE
-            DESCRIPTION.
-        omega : TYPE
-            DESCRIPTION.
-        kappa : TYPE
-            DESCRIPTION.
-        truncate : TYPE, optional
-            DESCRIPTION. The default is 24.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.omega = omega
-        self.kappa = kappa
-
-        tuning_mode = Mode(omega, couplings=[[[1, 1], kappa], \
-                                             [[2, 2], -kappa]], truncate=24)
-        coupling_mode = Mode(omega, [[[1, 2], kappa]], truncate=24)
-
-        modes = [tuning_mode, coupling_mode]
-        super().__init__(E, modes)
+# class Vibronic:
+#     '''
+#     2-dimensional grid based vibronic model
+#     '''
+#     def __init__(self, nelec, xlim, ylim):
+#         self.xlim = xlim
+#         self.ylim = ylim
 
 
-    def APES(self, x, y, B=None):
 
-        V = np.diag(self.e_fc).astype(complex)
+# class LvNSolver:
+#     """
+#     do we need a separate class for LvN equation?
+#     """
+#     def __init__(self, H=None):
+#         self.H = H
+#         self.groundstate = None
 
-        rho, theta = polar(x, y)
-        V += 0.5 * self.omega * rho**2 * self.idm_el
+#     def run(self, rho0=None, dt=0.01, Nt=1,\
+#             e_ops=None, nout=1, t0=0.0, edip=None, pulse=None, sparse=True):
 
-        # coupling
-        C = self.kappa * rho * np.exp(-1j * theta) * jump(1, 2, dim=3, isherm=False)
-        V += C + dag(C)
+#         if rho0 is None:
+#             print("Initial state not specified. Using the ground state.")
+#             rho0 = ket2dm(self.groundstate)
 
-        # for j, mode in enumerate(self.modes):
-        #     for c in mode.couplings:
-        #         a, b = c[0]
-        #         strength = c[1]
-        #         V += strength * jump(a, b, self.nstates) * xvec[j]
+#         # H0 = self.H
 
-        # # reverse transformation from |+/-> to |x/y>
-        # R = np.zeros((self.nstates, self.nstates))
-        # R[0, 0] = 1.
-        # R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1], [-1j, 1j]])
+#         if pulse is None:
+#             pass
+#             # return _quantum_dynamics(H0, psi0, dt=dt, Nt=Nt,
+#             #                          e_ops=e_ops, nout=nout, t0=t0)
+#         else:
+#             if edip is None:
+#                 raise ValueError('Electric dipole must be provided for \
+#                                  laser-driven dynamics.')
 
-        if B is not None:
-            V += B * np.diag([0, -0.5, 0.5])
+#             if isinstance(pulse, list): # multi pulses
 
-        E = np.linalg.eigvals(V)
-        return np.sort(E)
+#                 H = [self.H]
 
-    def buildH(self, B=None):
-        H = super().buildH()
+#                 for i in range(len(pulse)):
+#                     H.append([edip[i], pulse[i].efield])
 
-        # rotate the electronic states into ring-current carrying eigenstates of Lz ???
-        # |+/-> = (|x> +/- |y>)/sqrt(2)
-        R = np.zeros((self.nstates, self.nstates), dtype=complex)
-        R[0, 0] = 1.
-        R[1:, 1:] = 1./np.sqrt(2) * np.array([[1, 1j], [1, -1j]])
+#                 # return driven_dynamics(H=H, psi0=psi0, dt=dt, Nt=Nt, \
+#                 #                    e_ops=e_ops, nout=nout, t0=t0)
 
-        R = kron(R, self.idm_vib)
+#             else: # single pulse
 
-        self.H = transform(H, R)
+#                 if edip.ndim == 2: # dipole projected on the laser polarization
 
-        if B is not None:
-            H += B * kron(np.diag([0, -0.5, 0.5]), self.idm_vib)
+#                     H = [self.H]
+#                     H.append([edip, pulse.efield])
 
-        self.H = H
-        return H
+#                     # return driven_dynamics(H=H, psi0=psi0, dt=dt, Nt=Nt, \
+#                     #                e_ops=e_ops, nout=nout, t0=t0, \
+#                     #                    use_sparse=use_sparse)
+
+#                 elif edip.ndim == 3: # full dipole
+#                     pass
+#                     # return _driven_dynamics(H=H0, psi0=psi0, edip=edip,\
+#                     #                         E=pulse.E, dt=dt, Nt=Nt, \
+#                     #                e_ops=e_ops, nout=nout, t0=t0)
+
+
+
 
 class SESolver:
     def __init__(self, H=None):
@@ -1226,6 +1379,7 @@ class SESolver:
         self.H = H
         self.groundstate = None
         # self._isherm = isherm
+
 
 
 
@@ -1407,7 +1561,7 @@ class SESolver:
         return self.correlation_3op_2t(psi0, [a_op, b_op @ c_op, d_op], dt, Nt, Ntau)
 
 
-def _propagator(H, dt, Nt):
+def _propagator(H, dt, Nt, integrator='rk4'):
     """
     compute the resolvent for the multi-point correlation function signals
     U(t) = e^{-i H t}
@@ -1419,15 +1573,24 @@ def _propagator(H, dt, Nt):
     """
 
     # propagator
-    U = identity(H.shape[-1], dtype=complex)
-
+    I = identity(H.shape[-1], dtype=complex)
+    U = I
     # set the ground state energy to 0
     print('Computing the propagator. '
           'Please make sure that the ground-state energy is 0.')
-    Ulist = []
-    for k in range(Nt):
-        Ulist.append(U.copy())
-        U = rk4(U, tdse, dt, H)
+    Ulist = [U]
+
+    if integrator == 'rk4':
+
+        for k in range(Nt):
+            Ulist.append(U.copy())
+            U = rk4(U, tdse, dt, H)
+
+    elif integrator == 'crank_nicolson':
+
+        for k in range(Nt):
+            U = np.linalg.solve(I + 1j * H * dt/2.0, np.dot(I - 1j * H * dt/2.0, U))
+            Ulist.append(U.copy())
 
     return Ulist
 
@@ -1477,7 +1640,8 @@ def _quantum_dynamics(H, psi0, dt=0.001, Nt=1, e_ops=[], t0=0.0,
         result = Result(dt=dt, Nt=Nt, psi0=psi0, t0=t0, nout=nout)
 
         observables = np.zeros((Nt // nout, len(e_ops)), dtype=complex)
-        # psilist = [psi0.copy()]
+        
+        result.psilist = [psi0.copy()]
 
         # compute observables for t0
 
@@ -1915,17 +2079,32 @@ def high_frequency_drive():
     plt.show()
 
 if __name__ == '__main__':
+    
     from pyqed.phys import pauli
     import time
     import proplot as plt
-
+    from pyqed.optics import Pulse
+    
     mol = mls()
     mol.set_decay([0, 0.002, 0.002])
     omegas=np.linspace(0, 2, 200)/au2ev
     shift = np.linspace(0, 1)/au2ev
 
 
-    high_frequency_drive()
+    # high_frequency_drive()
+    s0, sx, sy, sz = pauli()
+    
+    mol = Mol((-sz+s0)/2, edip=sx)
+    pulse = Pulse(amplitude=0.5)
+    # print(pulse.efield(1))
+    pulse.plt_efield()
+    # H, dip = mol.multi()
+
+    psi0 = np.array([1, 0], dtype=complex)
+    r = mol.run(psi0=psi0, dt=0.05/au2fs, nt=1000, e_ops=[csr_matrix(sz)], pulse=pulse, t0=-24/au2fs)
+    r.analyze()
+
+    
     # mol.absorption(omegas)
     # mol.photon_echo(pump=omegas, probe=omegas, plt_signal=True)
     # S = mol.cars(shift=shift, omega1=omegas, plt_signal=True)

@@ -6,6 +6,16 @@ import matplotlib as mpl
 from matplotlib.collections import LineCollection
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
+import pickle
+
+
+def read_result(fname):
+    '''
+    read result obj saved with pickle
+    '''
+    with open(fname, 'rb') as f:
+        result = pickle.load(f)
+    return result
 
 
 def subplots(nrows=1, ncols=1, figsize = (4, 3), sharex=True, \
@@ -329,10 +339,11 @@ def two_scales(x, yl, yr, xlabel=None, ylabels=None, xlim=None, yllim=None, yrli
     fig.savefig(fname)
     return
 
-def surf(f, x, y, fname='output.png', xlabel='X', \
-         ylabel='Y', zlabel='Z', title=None, method='matplotlib'):
+def surf(x, y, f, fname='output.png', xlabel='X', \
+         ylabel='Y', zlabel='Z', cmap=None, title=None, method='matplotlib'):
 
     if method == 'matplotlib':
+        
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
 
@@ -340,9 +351,14 @@ def surf(f, x, y, fname='output.png', xlabel='X', \
         # ax.set_ylim(ymin=-6, ymax=6)
         # ymax = 6
         # f[Y>ymax] = np.nan
-
-        ax.plot_surface(X, Y, f, rstride=1, cstride=1, linewidth=0,
+        if isinstance(f, list):
+            for g in f:
+                ax.plot_surface(X, Y, g, rstride=1, cstride=1, linewidth=0,
                         cmap='viridis', edgecolor='none')
+        else:
+            ax.plot_surface(X, Y, f, rstride=1, cstride=1, linewidth=0,
+                        cmap='viridis', edgecolor='none')
+            
 
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -366,9 +382,9 @@ def surf(f, x, y, fname='output.png', xlabel='X', \
 
         if isinstance(f, list):
             for g in f:
-                s = mlab.surf(g)
+                s = mlab.surf(g, warp_scale='auto')
         else:
-            s = mlab.surf(f)
+            s = mlab.surf(f, warp_scale='auto')
 
         mlab.axes(s, xlabel = xlabel, ylabel = ylabel, zlabel = zlabel)
 
@@ -417,7 +433,7 @@ def plot_surface(x, y, surface):
     #data = [go.Surface(z=apes)]
     #fig = go.Figure(data = data)
     import matplotlib.pyplot as plt
-    from lime.units import au2ev
+    from pyqed.units import au2ev
 
     fig = plt.figure(figsize=(5,4))
 
@@ -458,7 +474,7 @@ def plot_surfaces(x, y, surfaces):
     #data = [go.Surface(z=apes)]
     #fig = go.Figure(data = data)
     import matplotlib.pyplot as plt
-    from lime.units import au2ev
+    from pyqed.units import au2ev
 
     fig = plt.figure(figsize=(5,4))
 
@@ -542,6 +558,14 @@ def vector_field(f, **kwargs):
     u, v, w = f
     quiver3d(u.real, v.real, w.real, **kwargs)
     return
+
+def scatter(points):
+    n = len(points)
+    x = [p[0] for p in points]
+    y = [p[1] for p in points]
+    fig, ax = plt.subplots()
+    ax.scatter(x, y)
+    return ax
 
 
 if __name__ == '__main__':

@@ -3,7 +3,7 @@
 """
 Created on Mon Jan  4 23:44:15 2021
 
-Wave packet dynamics solver for wavepacket dynamics with N vibrational modes
+Exact nonadiabatic wavepacket dynamics solver for vibronic models with N vibrational modes
 (N = 1 ,2)
 
 For linear coordinates, use SPO method
@@ -13,20 +13,167 @@ For curvilinear coordinates, use RK4 method
 """
 
 import numpy as np
-import proplot as plt
+
+try:    
+    import proplot as plt
+except:
+    import matplotlib.pyplot as plt
+
 from numpy import cos, pi
-from numba import jit
+# from numba import jit
 import scipy
 from scipy.fftpack import fft2, ifft2, fftfreq, fft, ifft
 from numpy.linalg import inv, det
 
-from pyqed import rk4, dagger, gwp, interval, meshgrid
+from pyqed import rk4, dagger, gwp, interval, meshgrid, norm2, dag, sort
 from pyqed.units import au2fs
 from pyqed.mol import Result
 
+from pyqed.nonherm import eig
 
 
 
+
+
+def plot_wavepacket(x, y, psilist, **kwargs):
+
+    if not isinstance(psilist, list): psilist = [psilist]
+    
+    X, Y = np.meshgrid(x, y)
+
+    for i, psi in enumerate(psilist):
+        fig, ax0 = plt.subplots(nrows=1, sharey=True)
+        # levels = np.linspace(0, 0.005, 20)
+        ax0.contourf(X, Y, np.abs(psi)**2, colorbar='r', cmap='viridis')
+
+        # levels = np.linspace(0, 0.0005, 20)
+        ax0.format(ylim=(-0.5, 0.5), **kwargs)
+        fig.savefig('vibrational_eigenstates_D0_'+str(i)+'.png')
+
+    return ax0
+
+
+
+class ResultSPO2(Result):
+    def __init__(self, **args):
+        super().__init__(**args)
+
+        self.x = None
+        self.y = None
+        self.population = None
+        self.xAve = None
+        self.nstates = self.psi0.shape[-1]
+
+    def plot_wavepacket(self, psilist, state_id=None, **kwargs):
+
+        X, Y = np.meshgrid(self.x, self.y, indexing='ij')
+
+        if not isinstance(psilist, list): psilist = [psilist]
+
+        if isinstance(state_id, int):
+
+            for i, psi in enumerate(psilist):
+                fig, ax0 = plt.subplots(nrows=1)
+
+                ax0.contour(X, Y, np.abs(psi[:,:, state_id])**2)
+                ax0.format(**kwargs)
+
+                fig.savefig('psi'+str(i)+'.pdf')
+
+            return ax0
+
+        else:
+            
+            nstates = self.psi0.shape[-1]
+
+            for i, psi in enumerate(psilist):
+
+                fig, axes = plt.subplots(nrows=nstates, sharey=True, sharex=True,\
+                                         figsize=(3.5,4))
+                
+                for n in range(nstates):
+                    axes[n].contourf(X, Y, np.abs(psi[:,:, n])**2)
+                    
+                # ax1.contour(X, Y, np.abs(psi[:, :,0])**2)
+                    # axes[n].format(**kwargs)
+                # ax1.format(**kwargs)
+                fig.savefig('psi'+str(i)+'.pdf')
+
+            return axes
+        
+    def get_population(self, fname=None, plot=False):
+        dx = interval(self.x)
+        dy = interval(self.y)
+        p = np.zeros((len(self.psilist), self.nstates))
+        for n in range(self.nstates):
+            p[:, n] = [norm2(psi[:, :, n]).real * dx * dy for psi in self.psilist]
+        # p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
+        
+        if plot:
+            fig, ax = plt.subplots()
+            for n in range(self.nstates):
+                ax.plot(self.times, p[:,n])
+            # ax.plot(self.times, p1)
+        
+        self.population = p
+        if fname is not None:
+            # fname = 'population'
+            np.savez(fname, p)
+            
+        return p
+    
+    def plot_population(self, p):
+        
+        fig, ax = plt.subplots()
+        for n in range(self.nstates):
+            ax.plot(self.times, p[:,n])
+            
+        return fig, ax
+        
+    
+    def position(self, plot=False, fname=None):        
+        # X, Y = np.meshgrid(self.x, self.y)
+        x = self.x 
+        y = self.y
+        dx = interval(x)
+        dy = interval(y)
+        
+        xAve = [np.einsum('ijn, i, ijn', psi.conj(), x, psi) * dx*dy for psi in self.psilist]
+        yAve = [np.einsum('ijn, j, ijn', psi.conj(), y, psi) * dx*dy for psi in self.psilist]
+        
+        xAve = np.real_if_close(xAve)
+        yAve = np.real_if_close(yAve)
+        
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(self.times, xAve)
+            ax.plot(self.times, yAve)
+        
+        self.xAve = [xAve, yAve]
+        np.savez('xAve', xAve, yAve)
+        
+        return xAve, yAve
+        
+        
+    def dump(self, fname):
+        """
+        save results to disk
+
+        Parameters
+        ----------
+        fname : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        import pickle
+        with open(fname, 'wb') as f:
+            pickle.dump(self, f)
+            
+            
 class Solver():
     def __init__(self):
         self.obs_ops = None
@@ -64,7 +211,7 @@ class SPO:
         self._exp_V_half = np.exp(-1j * self.V * dt/2.)
         m = self.mass
         k = self.k
-        self._exp_K = np.exp(-0.5 * 1j / m * (k * k) * dt)
+        self._exp_K = np.exp(-0.5j / m * (k * k) * dt)
         return
 
     def run(self, psi0, dt, Nt=1, t0=0, nout=1):
@@ -85,7 +232,7 @@ class SPO:
             in time at the end of this method will be dt * Nsteps.
             default is N = 1
         """
-        from lime.mol import Result
+        from pyqed import Result
 
         self.build(dt)
 
@@ -232,7 +379,7 @@ class SPO2:
     For time-dependent H,
         TBI
     """
-    def __init__(self, x, y, masses, nstates=2, coords='linear', G=None, abc=False):
+    def __init__(self, x, y, mass=None, nstates=2, coords='linear', G=None, abc=False):
         self.x = x
         self.y = y
         self.X, self.Y = meshgrid(x, y)
@@ -241,18 +388,25 @@ class SPO2:
         self.ny = len(y)
         self.dx = interval(x)
         self.dy = interval(y) # for uniform grids
-        self.masses = masses
+        if mass is None:
+            mass  = [1, 1]
+        self.mass = self.masses = mass
         self.kx = None
         self.ky = None
+        
+        self.apes = None
         self.dim = 2
         self.exp_V = None
         self.exp_V_half = None
         self.exp_K = None
-        self.V = None
+        self.v = self.V = None
         self.G = G
-        self.nstates = nstates
+        self.nstates = self.ns = nstates
         self.coords =  coords
         self.abc = abc
+        
+        self.d2a = None # diabatic to adiabatic transformation
+        self.a2d = None # adiabatic to diabatic transformation
 
     def set_grid(self, x, y):
         self.x = x
@@ -260,8 +414,8 @@ class SPO2:
 
         return
 
-    def set_masses(self, masses):
-        self.masses = masses
+    def set_masses(self, mass):
+        self.mass = mass
 
 
     def setG(self, G):
@@ -269,7 +423,7 @@ class SPO2:
 
     def set_DPES(self, surfaces, diabatic_couplings, eta=None):
         """
-        set the diabatic PES and vibronic couplings
+        set the potential energy operatpr from the diabatic PES and vibronic couplings
 
         Parameters
         ----------
@@ -289,8 +443,10 @@ class SPO2:
 
         """
 
-        nx = len(x)
-        ny = len(y)
+        # nx = len(x)
+        # ny = len(y)
+        nx = self.nx 
+        ny = self.ny
         ns = self.ns
 
         # DPES and diabatic couplings
@@ -302,7 +458,8 @@ class SPO2:
 
         for dc in diabatic_couplings:
             a, b = dc[0][:]
-            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+            v[:, :, a, b] = dc[1] 
+            v[:, :, b, a] = v[:, :, a, b].conj()
 
 
         if self.abc:
@@ -311,6 +468,10 @@ class SPO2:
 
         self.V = v
         return v
+    
+    def set_dpes(self, v):
+        self.V = self.v = v
+        return 
 
 
     def build(self, dt, inertia=None):
@@ -345,6 +506,7 @@ class SPO2:
         # setup kinetic energy operator
         nx = self.nx
         ny = self.ny
+        nstates = self.nstates
 
         dx = interval(self.x)
         dy = interval(self.y)
@@ -354,7 +516,7 @@ class SPO2:
 
 
         if self.coords == 'linear':
-            
+
             mx, my = self.masses
 
             Kx, Ky = meshgrid(self.kx, self.ky)
@@ -384,37 +546,66 @@ class SPO2:
 
         dt2 = 0.5 * dt
 
-        if self.V is None:
+        if self.v is None:
             raise ValueError('The diabatic PES is not specified.')
 
-        v = self.V
+        v = self.v
 
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
         # self.apes = np.zeros((nx, ny))
-        if self.abc:
-            eig = scipy.linalg.eig 
-        else:
-            eig = scipy.linalg.eigh 
+        
+        # if self.abc:
+        #     eig = scipy.linalg.eig
+        # else:
+        #     eig = scipy.linalg.eigh
+        
+        
+        if np.iscomplexobj(v): # complex Hermitian H
             
-        for i in range(nx):
-            for j in range(ny):
+            self.d2a = np.zeros((nx, ny, nstates, nstates), dtype=complex)
 
-                i
-                w, u = eig(v[i, j, :, :])
-
-                #print(np.dot(U.conj().T, Vmat.dot(U)))
-
-                V = np.diagflat(np.exp(- 1j * w * dt))
-                V2 = np.diagflat(np.exp(- 1j * w * dt2))
-
-                self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
-                self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
-
+            # complex potential
+            for i in range(nx):
+                for j in range(ny):
+                    
+                    _v = v[i, j]
+                    
+                    # w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+                    w, u = sort(*scipy.linalg.eigh(_v))
+    
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+                    
+                    self.d2a[i, j] = u
+                    
+        else: 
+            
+            self.d2a = np.zeros((nx, ny, nstates, nstates))
+            self.apes = np.zeros((nx, ny, nstates))
+            
+            for i in range(nx):
+                for j in range(ny):
+    
+                    w, u = sort(*scipy.linalg.eigh(v[i, j, :, :]))
+    
+                    #print(np.dot(U.conj().T, Vmat.dot(U)))
+                    self.apes[i, j] = w 
+                    
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+                    
+                    self.d2a[i, j] = u
 
         return
 
-    def population(self, psi):
+    def population(self, psi, representation='diabatic', plot=False):
         """
         return the electronic populations
 
@@ -425,29 +616,61 @@ class SPO2:
 
         Returns
         -------
-        None.
+        2darray, nt, nstates
 
         """
-        if isinstance(psi, np.ndarray):
-            P = np.zeros(self.ns)
-            for j in range(self.ns):
-                P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
-
-            assert(np.close(np.sum(P), 1))
-
-        elif isinstance(psi, list):
-
-            N = len(psi)
-            P = np.zeros((N, self.nstates))
-            for k in range(N):
-                P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
-                           for j in range(self.nstates)]
-
-
+        if representation == 'diabatic':
+            
+            if isinstance(psi, np.ndarray):
+                P = np.zeros(self.ns)
+                for j in range(self.ns):
+                    P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+    
+                assert(np.close(np.sum(P), 1))
+    
+            elif isinstance(psi, list):
+    
+                N = len(psi)
+                P = np.zeros((N, self.nstates))
+                for k in range(N):
+                    P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                               for j in range(self.nstates)]
+        
+        elif representation == 'adiabatic':
+            
+            assert(self.d2a is not None)
+            
+            if isinstance(psi, np.ndarray):
+                
+                psi = np.einsum('ijab, ijb -> ija', self.d2a, psi)
+                
+                P = np.zeros(self.ns)
+                for j in range(self.ns):
+                    P[j] = np.linalg.norm(psi[:, :, j])**2 * self.dx * self.dy
+    
+                assert(np.close(np.sum(P), 1))
+    
+            elif isinstance(psi, list):
+                
+                psi = [np.einsum('ijab, ijb -> ija', self.d2a, phi) \
+                       for phi in psi]
+    
+                N = len(psi)
+                P = np.zeros((N, self.nstates))
+                for k in range(N):
+                    P[k, :] = [np.linalg.norm(psi[k][:, :, j])**2 * self.dx * self.dy \
+                               for j in range(self.nstates)]
+            
+        
+        else:
+            raise ValueError('Representation = {}, which can only be \
+                             diabatic or adiabatic'.format(representation))
+    
+        
         return P
 
 
-    def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
 
         print('Building the propagators ...')
 
@@ -459,7 +682,11 @@ class SPO2:
 
             return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
 
-        r = Result(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
 
         t = t0
         if self.coords == 'linear':
@@ -473,7 +700,7 @@ class SPO2:
         # observables
         if return_states:
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
 
                     t += dt
@@ -488,7 +715,7 @@ class SPO2:
 
             psi = _V_half(psi)
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
                     t += dt
 
@@ -509,6 +736,78 @@ class SPO2:
 
         r.psi = psi
         return r
+    
+    def rdm_el(self, psi):
+        """
+        Compute the reduced electronic density matrix
+
+        Parameters
+        ----------
+        psi : TYPE
+            vibronic wavefunction.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """
+        nstates = self.nstates 
+        
+        if isinstance(psi, np.ndarray):
+            
+            rho = np.zeros((nstates, nstates), dtype=complex)
+            
+            for i in range(self.nstates):
+                for j in range(i, self.nstates):
+                    rho[i, j] = np.sum(np.multiply(np.conj(psi[:, :, i]), psi[:, :, j]))*self.dx*self.dy
+                    if i != j:
+                        rho[j, i] = rho[i, j].conj()
+                        
+        elif isinstance(psi, list):
+             
+            rho = []
+            for p in psi:
+                tmp = np.einsum('ija, ijb -> ab', p.conj(), p) * self.dx * self.dy
+                rho.append(tmp.copy())
+             
+        return rho
+    
+    def current_density(self, psi, state_id=0):
+        """
+        Compute the velocity field of the vibrational flow
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+        state_id : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        None.
+
+        """
+        x, y = self.x, self.y
+        
+        chi  = psi[:, :, state_id]
+        rx, ry = np.gradient(np.log(np.abs(chi)), self.dx, self.dy)
+        px, py = np.gradient(np.angle(chi), self.dx, self.dy, edge_order=2)
+        
+        
+        fig, ax = plt.subplots(ncols=1)
+        ax.contourf(x, y, np.abs(chi))
+        ax.quiver(self.x, self.y, rx, ry, transpose=True)
+        # ax1.quiver(self.x, self.y, rx, ry)
+        
+        
+        # divergence of current
+        div = divergence([rx, ry], [self.dx, self.dy])
+        
+        fig, ax = plt.subplots()
+        ax.imshow(div)
+        return [px, py], [rx, ry]
 
     def _PEO(self, psi):
 
@@ -570,12 +869,12 @@ class SPO2:
     def plot_surface(self, style='2D'):
         if style == '2D':
             fig, (ax0, ax1) = plt.subplots(nrows=2)
-            ax0.contourf(self.X, self.Y, self.V[:, :, 1, 1], lw=0.7)
-            ax1.contourf(self.X, self.Y, self.V[:, :, 0, 0], lw=0.7)
+            ax0.contourf(self.X, self.Y, self.V[:, :, 1, 1], lw=0.7, cmap='viridis')
+            ax1.contourf(self.X, self.Y, self.V[:, :, 0, 0], lw=0.7, cmap='viridis')
             return
 
         else:
-            from lime.style import plot_surface
+            from pyqed.style import plot_surface
             plot_surface(self.x, self.y, self.V[:,:,0,0])
 
             return
@@ -589,12 +888,189 @@ class SPO2:
         for i, psi in enumerate(psilist):
             fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
 
-            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
-            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
+            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2, cmap='viridis')
+            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2, cmap='viridis')
             ax0.format(**kwargs)
             ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
+
+
+
+
+class SPO2NH(SPO2):
+    
+    def __init__(self, x, y, *args, **kwargs):
+        self.right_eigenstates = None
+        super().__init__(x, y, *args, **kwargs)
+
+
+    
+    def build(self, dt):
+        nx = self.nx
+        ny = self.ny
+        nstates = self.nstates
+
+        dx = interval(self.x)
+        dy = interval(self.y)
+
+        self.kx = 2. * np.pi * fftfreq(nx, dx)
+        self.ky = 2. * np.pi * fftfreq(ny, dy)
+        
+        v = self.v 
+        
+        dt2 = 0.5 * dt
+        
+        if self.coords == 'linear':
+
+            mx, my = self.masses
+
+            Kx, Ky = meshgrid(self.kx, self.ky)
+
+            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+
+        elif self.coords == 'jacobi':
+
+            # self.exp_K = np.zeros((nx, ny, nx, ny))
+            mx = self.masses[0]
+
+            self.exp_Kx = np.exp(-1j * self.kx**2/2./mx * dt)
+
+            Iinv = 1./self.masses[1](self.x) # y is the angle
+            ky = self.ky
+
+            self.exp_Ky = np.exp(-1j * np.outer(Iinv, ky**2/2.) * dt)
+
+        
+        self.right_eigenstates = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+        self.ovlp_rr = np.zeros((nx, ny, nstates, nstates), dtype=complex)
+        
+        self.exp_V = np.zeros(v.shape, dtype=complex)
+        self.exp_V_half = np.zeros(v.shape, dtype=complex)
+        
+        # complex potential
+        for i in range(nx):
+            for j in range(ny):
+                
+                _v = v[i, j]
+                
+                # w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+                w, ur, ul = eig(_v)
+                
+                self.right_eigenstates[i,j] = ur
+                
+                self.ovlp_rr[i,j] = dag(ur) @ ur
+                
+                V = np.diagflat(np.exp(- 1j * w * dt))
+                V2 = np.diagflat(np.exp(- 1j * w * dt2))
+
+                self.exp_V[i, j, :,:] = ur @ V @ ul
+                self.exp_V_half[i, j, :,:] = ur @ V2 @ ul
+                
+
+        return
+    
+    def position(self, psilist, plot=False):
+        
+        x = self.x 
+        y = self.y
+        dx = interval(x)
+        dy = interval(y)
+        
+        S = self.ovlp_rr
+        
+        xAve = [np.einsum('ijm, i, ijmn, ijn ->', psi.conj(), x, S, psi) * dx*dy for psi in psilist]
+        yAve = [np.einsum('ijn, j, ijmn, ijn ->', psi.conj(), y, S, psi) * dx*dy for psi in psilist]
+
+        
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(xAve)
+            ax.plot(yAve)
+        
+        self.xAve = [xAve, yAve]
+        np.savez('xAve', xAve, yAve)
+        
+        return xAve, yAve
+    
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
+
+        print('Building the propagators ...')
+
+        self.build(dt=dt)
+
+        psi = psi0.copy()
+
+        def _V_half(psi):
+
+            return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
+
+        t = t0
+        if self.coords == 'linear':
+
+            KEO = self._KEO_linear
+
+        elif self.coords == 'jacobi':
+
+            KEO = self._KEO_jacobi
+
+        # observables
+        if return_states:
+
+            for i in range(nt//nout):
+                for n in range(nout):
+
+                    t += dt
+
+                    psi = _V_half(psi)
+                    psi = KEO(psi)
+                    psi = _V_half(psi)
+
+                r.psilist.append(psi.copy())
+
+        else:
+
+            psi = _V_half(psi)
+
+            for i in range(nt//nout):
+                for n in range(nout):
+                    t += dt
+
+                    psi = KEO(psi)
+                    psi = self._PEO(psi)
+
+
+                r.psilist.append(psi.copy())
+                # tlist.append(t)
+
+                # rho = density_matrix(psi_x, dx)
+
+                # # store the density matrix
+                # f.write('{} {} {} {} {} \n'.format(t, *rho))
+
+            psi = KEO(psi)
+            psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+
+        r.psi = psi
+        return r
+
+
+
+def divergence(f,h):
+    """
+    div(F) = dFx/dx + dFy/dy + ...
+    g = np.gradient(Fx,dx, axis=1)+ np.gradient(Fy,dy, axis=0) #2D
+    g = np.gradient(Fx,dx, axis=2)+ np.gradient(Fy,dy, axis=1) +np.gradient(Fz,dz,axis=0) #3D
+    """
+    num_dims = len(f)
+    return np.ufunc.reduce(np.add, [np.gradient(f[i], h[i], axis=i) \
+                                    for i in range(num_dims)])
 
 
 def S0(x, y):
@@ -607,18 +1083,19 @@ def diabatic_coupling(x, y):
     pass
 
 class SPO3():
-    def __init__(self, x, y, z):
-        self.x = None
-        self.y = None
+    # def __init__(self, x, y, z, mass=[1, 1, 1]):
+    #     self.x = x
+    #     self.y = y
+    #     self.z = z
 
     """
     second-order split-operator method for nonadiabatic wavepacket dynamics
     in the diabatic representation with three-dimensional nuclear space
 
     For time-independent Hamiltonian
-    
+
     .. math::
-        
+
         e^{-i H \Delta t} = e^{- i V \Delta t/2} e^{-i K \Delta t} e^{-iV\Delta t/2}
 
     For time-dependent H,
@@ -633,11 +1110,11 @@ class SPO3():
         self.nx = len(x)
         self.ny = len(y)
         self.nz = len(z)
-        
+
         self.dx = interval(x)
         self.dy = interval(y) # for uniform grids
         self.dz = interval(z)
-        
+
         self.masses = masses
         self.kx = None
         self.ky = None
@@ -686,30 +1163,32 @@ class SPO3():
 
         """
 
-        nx = len(x)
-        ny = len(y)
-        ns = self.ns
+        nx = self.nx
+        ny = self.ny 
+        nz = self.nz
+        ns = self.nstates
 
         # DPES and diabatic couplings
-        v = np.zeros([nx, ny, ns, ns])
+        v = np.zeros([nx, ny, nz, ns, ns])
 
         # assume we have analytical forms for the DPESs
-        for a in range(self.ns):
-            v[:, :, a, a] = surfaces[a]
+        for a in range(self.nstates):
+            v[:, :, :, a, a] = surfaces[a]
 
         for dc in diabatic_couplings:
             a, b = dc[0][:]
-            v[:, :, a, b] = v[:, :, b, a] = dc[1]
+            v[:, :, :, a, b] = v[:, :, :, b, a] = dc[1]
 
-
-        if self.abc:
-            for n in range(self.ns):
-                v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
 
         self.V = v
         return v
 
-
+    def set_abc(self):
+        #set the absorbing boundary condition
+        #     for n in range(self.ns):
+        #         v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
+        pass
+    
     def build(self, dt, inertia=None):
         """
         Setup the propagators appearing in the split-operator method.
@@ -742,22 +1221,26 @@ class SPO3():
         # setup kinetic energy operator
         nx = self.nx
         ny = self.ny
+        nz = self.nz
 
         dx = interval(self.x)
         dy = interval(self.y)
+        dz = self.dz
 
         self.kx = 2. * np.pi * fftfreq(nx, dx)
         self.ky = 2. * np.pi * fftfreq(ny, dy)
+        self.kz = 2. * np.pi * fftfreq(nz, dz)
 
 
         if self.coords == 'linear':
+
+            mx, my, mz = self.masses
+
+            Kx, Ky, Kz = meshgrid(self.kx, self.ky, self.kz)
+
+            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my + Kz**2/2./mz) * dt)
             
-            mx, my = self.masses
-
-            Kx, Ky = meshgrid(self.kx, self.ky)
-
-            self.exp_K = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
-
+            
         elif self.coords == 'jacobi':
 
             # self.exp_K = np.zeros((nx, ny, nx, ny))
@@ -789,24 +1272,23 @@ class SPO3():
         self.exp_V = np.zeros(v.shape, dtype=complex)
         self.exp_V_half = np.zeros(v.shape, dtype=complex)
         # self.apes = np.zeros((nx, ny))
+        
         if self.abc:
-            eig = scipy.linalg.eig 
+            eig = scipy.linalg.eig
         else:
-            eig = scipy.linalg.eigh 
-            
+            eig = scipy.linalg.eigh
+
         for i in range(nx):
             for j in range(ny):
+                for k in range(nz):
 
-                i
-                w, u = eig(v[i, j, :, :])
-
-                #print(np.dot(U.conj().T, Vmat.dot(U)))
-
-                V = np.diagflat(np.exp(- 1j * w * dt))
-                V2 = np.diagflat(np.exp(- 1j * w * dt2))
-
-                self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
-                self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+                    w, u = eig(v[i, j, k, :, :])
+        
+                    V = np.diagflat(np.exp(- 1j * w * dt))
+                    V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    self.exp_V[i, j, k, :,:] = u.dot(V.dot(dagger(u)))
+                    self.exp_V_half[i, j, k, :,:] = u.dot(V2.dot(dagger(u)))
 
 
         return
@@ -844,7 +1326,7 @@ class SPO3():
         return P
 
 
-    def run(self, psi0, e_ops=[], dt=0.01, Nt=1, t0=0., nout=1, return_states=True):
+    def run(self, psi0, e_ops=[], dt=0.01, nt=1, t0=0., nout=1, return_states=True):
 
         print('Building the propagators ...')
 
@@ -854,9 +1336,9 @@ class SPO3():
 
         def _V_half(psi):
 
-            return np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+            return np.einsum('ijkab, ijkb -> ijka', self.exp_V_half, psi) # evolve V half step
 
-        r = Result(dt=dt, psi0=psi0, Nt=Nt, t0=t0, nout=nout)
+        r = Result(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
 
         t = t0
         if self.coords == 'linear':
@@ -870,7 +1352,7 @@ class SPO3():
         # observables
         if return_states:
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
 
                     t += dt
@@ -885,8 +1367,9 @@ class SPO3():
 
             psi = _V_half(psi)
 
-            for i in range(Nt//nout):
+            for i in range(nt//nout):
                 for n in range(nout):
+                    
                     t += dt
 
                     psi = KEO(psi)
@@ -902,27 +1385,30 @@ class SPO3():
                 # f.write('{} {} {} {} {} \n'.format(t, *rho))
 
             psi = KEO(psi)
-            psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
+            psi = _V_half(psi) # evolve V half step
 
         r.psi = psi
         return r
 
     def _PEO(self, psi):
 
-        vpsi = np.einsum('ijab, ijb -> ija', self.exp_V, psi)
+        vpsi = np.einsum('ijkab, ijkb -> ijka', self.exp_V, psi)
         return vpsi
 
     def _KEO_linear(self, psi):
         # psik = np.zeros(psi.shape, dtype=complex)
         # for j in range(ns):
         #     psik[:,:,j] = fft2(psi[:,:,j])
-        psik = fft2(psi, axes=(0,1))
-        kpsi = np.einsum('ij, ija -> ija', self.exp_K, psik)
+        
+        psik = np.fft.fftn(psi, axes=(0,1, 2))
+
+        kpsi = np.einsum('ijk, ijka -> ijka', self.exp_K, psik)
 
         # out = np.zeros(psi.shape, dtype=complex)
         # for j in range(ns):
         #     out[:, :, j] = ifft2(kpsi[:, :, j])
-        psi = ifft2(kpsi, axes=(0,1))
+        psi = np.fft.ifftn(kpsi, axes=(0,1, 2))
+        
         return psi
 
     def _KEO_jacobi(self, psi):
@@ -982,14 +1468,17 @@ class SPO3():
 
         if not isinstance(psilist, list): psilist = [psilist]
 
-
+        X, Y = np.meshgrid(self.x, self.y)
+        x, y = self.x, self.y 
+        
+        
         for i, psi in enumerate(psilist):
             fig, (ax0, ax1) = plt.subplots(nrows=2, sharey=True)
 
-            ax0.contour(self.X, self.Y, np.abs(psi[:,:, 1])**2)
-            ax1.contour(self.X, self.Y, np.abs(psi[:, :,0])**2)
-            ax0.format(**kwargs)
-            ax1.format(**kwargs)
+            ax0.contour(x, y, np.abs(psi[:,:,0, 1])**2)
+            ax1.contour(x, y, np.abs(psi[:, :,0, 0])**2)
+            # ax0.format(**kwargs)
+            # ax1.format(**kwargs)
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 # @jit
@@ -1002,7 +1491,7 @@ class SPO3():
 #     return (a/np.sqrt(np.pi))**(-0.25)*\
 #     np.exp(-0.5 * a * (x - x0)**2 + 1j * (x-x0) * p0)
 
-@jit
+# @jit
 def gauss_x_2d(sigma, x0, y0, kx0, ky0):
     """
     generate the gaussian distribution in 2D grid
@@ -1028,7 +1517,7 @@ def gauss_x_2d(sigma, x0, y0, kx0, ky0):
     return gauss_2d
 
 
-@jit
+# @jit
 def potential_2d(x_range_half, y_range_half, couple_strength, couple_type):
     """
     generate two symmetric harmonic potentials wrt the origin point in 2D
@@ -1079,7 +1568,7 @@ def potential_2d(x_range_half, y_range_half, couple_strength, couple_type):
     return v_2d
 
 
-@jit
+# @jit
 def diabatic(x, y):
     """
     PESs in diabatic representation
@@ -1137,7 +1626,7 @@ def diabatic(x, y):
 #             #               (self.k * self.k) * dt)
 
 
-@jit
+# @jit
 def x_evolve_2d(dt, psi, v):
     """
     propagate the state in grid basis half time step forward with H = V
@@ -1441,7 +1930,7 @@ def gauss_k(k,a,x0,k0):
     return ((a / np.sqrt(np.pi))**0.5
             * np.exp(-0.5 * (a * (k - k0)) ** 2 - 1j * (k - k0) * x0))
 
-@jit
+# @jit
 def theta(x):
     """
     theta function :
@@ -1456,18 +1945,18 @@ def theta(x):
 def square_barrier(x, width, height):
     return height * (theta(x) - theta(x - width))
 
-@jit
-def density_matrix(psi_grid):
-    """
-    compute electronic purity from the wavefunction
-    """
-    rho00 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[0]))*dx*dy
-    rho01 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[1]))*dx*dy
-    rho11 = np.sum(np.multiply(np.conj(psi_grid[1]), psi_grid[1]))*dx*dy
+# @jit
+# def density_matrix(psi_grid):
+#     """
+#     compute electronic purity from the wavefunction
+#     """
+#     rho00 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[0]))*dx*dy
+#     rho01 = np.sum(np.multiply(np.conj(psi_grid[0]), psi_grid[1]))*dx*dy
+#     rho11 = np.sum(np.multiply(np.conj(psi_grid[1]), psi_grid[1]))*dx*dy
 
-    purity = rho00**2 + 2*rho01*rho01.conj() + rho11**2
+#     purity = rho00**2 + 2*rho01*rho01.conj() + rho11**2
 
-    return rho00, rho01, rho01.conj(), rho11, purity
+#     return rho00, rho01, rho01.conj(), rho11, purity
 
 
 
@@ -1483,15 +1972,17 @@ if __name__ == '__main__':
 
     nx = 2 ** 5
     ny = 2 ** 5
+    nz = 2 ** 5
     xmin = -6
     xmax = -xmin
     ymin = -6
     ymax = -ymin
     x = np.linspace(xmin, xmax, nx)
     y = np.linspace(ymin, ymax, ny)
-
+    z = np.linspace(xmin, xmax, nz)
     dx = x[1] - x[0]
     dy = y[1] - y[0]
+
 
     # k-space grid
     kx = 2. * np.pi * fftfreq(nx, dx)
@@ -1500,8 +1991,11 @@ if __name__ == '__main__':
     X, Y = np.meshgrid(x, y)
 
     fig, ax = plt.subplots()
-    v = 0.5 * (X**2 + Y**2)
-
+    v0 = 0.5 * ((X+1)**2 + Y**2)
+    v1 = 0.5 * ((X-1)**2 + Y**2) + 1.0
+    
+    
+    
     # for i in range(nx):
     #     for j in range(ny):
     #         v[i,j] = diabatic(x[i], y[j])[0,0]
@@ -1511,7 +2005,7 @@ if __name__ == '__main__':
     # specify constants
     mass = [1.0, 1.0]  # particle mass
 
-    x0, y0, kx0, ky0 = -1., -1, 0.0, 0
+    x0, y0, kx0, ky0 = -1, 0, 0.0, 0
 
     #coeff1, phase = np.sqrt(0.5), 0
 
@@ -1523,12 +2017,13 @@ if __name__ == '__main__':
     print('number of grid points along y = {}'.format(ny))
 
     sigma = np.identity(2) * 1.
-    ns = 2
+    ns = nstates = 2
     psi0 = np.zeros((nx, ny, ns), dtype=complex)
-    psi0[:, :, 0] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
+    psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
 
     fig, ax = plt.subplots()
-    ax.contour(x, y, np.abs(psi0[:, :, 0]).T)
+    ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
+    ax.set_title('Initial wavepacket')
 
     #psi = psi0
 
@@ -1541,23 +2036,49 @@ if __name__ == '__main__':
     #f.close()
 
 
-    G = np.zeros((nx, ny, ndim, ndim))
-    G[:,:,0, 0] = G[:,:,1, 1] = 1.
+    # G = np.zeros((nx, ny, ndim, ndim))
+    # G[:,:,0, 0] = G[:,:,1, 1] = 1.
 
-    fig, ax = plt.subplots()
+    
     extent=[xmin, xmax, ymin, ymax]
 
     # psi1 = adiabatic_2d(x, y, psi0, v, dt=dt, Nt=num_steps, coords='curvilinear',G=G)
-    sol = SPO2(ns=2, masses=[1, 1], x=x, y=y)
+    sol = SPO2(nstates=2, mass=[1, 1], x=x, y=y)
 
-    sol.set_DPES(surfaces = [v, v], diabatic_couplings = [[[0, 1], np.zeros((nx, ny))]])
+    sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
 
-    r = sol.run(psi0=psi0, dt=0.5, Nt=40)
+    r = sol.run(psi0=psi0, dt=0.5, Nt=2000)
+    
+    rho = np.zeros((nstates, nstates, len(r.times)))
 
-    for j in range(4):
-        ax.contour(x, y, np.abs(r.psilist[j][:, :, 0]).T)
+    # sol.current_density(r.psilist[-1])
+    # r.plot_wavepacket(r.psilist[-1])
 
-    # fig, ax = plt.subplots()
+    # for i in range(len(r.times)):
+    #     rho[:, :, i] = sol.rdm_el(r.psilist[i])
+    
+    sol.rdm_el(r.psilist)
+    P = sol.population(r.psilist, representation='adiabatic')
+
+    
+    # p0, p1 = r.get_population()
+    fig, ax = plt.subplots()
+    ax.plot(r.times, P[:, 0])
+    ax.plot(r.times, P[:, 1], label=r'P$_1$')
+    ax.legend()
+
+    # r.position()
+    
+    # for j in range(4):
+    #     ax.contourf(x, y, np.abs(r.psilist[j][:, :, 1]).T, cmap='viridis')
+        
+    # for psi in r.psilist:
+    
+    
+    
+        
+    
+
 
     # psi2 = adiabatic_2d(x, y, psi0, v, mass=mass, dt=dt, Nt=num_steps)
     # ax.contour(x,y, np.abs(psi2).T)

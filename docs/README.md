@@ -2,7 +2,7 @@
 
 The ultimate goal is to provide a simple-to-use package to study how light interacts with matter.  
 
-Check manual.pdf for documentations! 
+Check manual.pdf for documentation! 
 
 Main modules
 

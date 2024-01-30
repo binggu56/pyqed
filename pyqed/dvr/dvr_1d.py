@@ -13,7 +13,10 @@ import scipy.special.orthogonal as ortho
 # import bessel
 import warnings
 
+from pyqed import interval
+
 class DVR(object):
+        
     def v(self, V):
         """
         Return the potential matrix with the given potential.
@@ -81,7 +84,18 @@ class DVR(object):
         else:
             E, U = sla.eigsh(h, k=num_eigs, which='LM',
                              sigma=V(self.x).min())
-
+  
+        self.eigvals = E
+        self.eigvecs = U
+        self.potential = V 
+        return E, U
+    
+    def draw_states(self, **kwargs):
+        E, U = self.eigvals, self.eigvecs
+        V = self.potential
+        
+        num_eigs = len(E)
+        
         xmin = kwargs.get('xmin', self.x.min())
         xmax = kwargs.get('xmax', self.x.max())
         ymin = kwargs.get('ymin', np.ceil(V(self.x).min() - 1.))
@@ -200,16 +214,22 @@ class SincDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, npts, L, x0=0.):
-        # L = float(L)
-        self.npts = npts
-        self.L = L
-        self.x0 = x0
-        self.a = L / npts
-        self.n = np.arange(npts)
-        self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
-        self.w = np.ones(npts, dtype=np.float64) * self.a
+    def __init__(self, x): #npts, L, x0=0.):
+
+        self.npts = len(x)
+        self.L = x.max() - x.min()
+        self.x0 = x[self.npts//2]
+        # self.a = L / npts
+        self.a = interval(x)
+        self.n = np.arange(self.npts)
+        # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
+        self.x = x 
+        self.w = np.ones(self.npts, dtype=np.float64) * self.a
         self.k_max = np.pi/self.a
+        
+        self.potential = None 
+        self.eigvals = None
+        self.eigvecs = None
 
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
@@ -289,6 +309,7 @@ class SincDVRPeriodic(SincDVR):
             x_m = np.asarray(x)[:, np.newaxis]
         x_n = self.x[np.newaxis, :]
         f = np.sinc((x_m-x_n)/self.a)/np.sinc((x_m-x_n)/self.L)/np.sqrt(self.a)
+        
         if (0 == self.npts % 2):
             f *= np.exp(-1j*np.pi*(x_m-x_n)/self.L)
         return f
@@ -310,7 +331,7 @@ class SineDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, npts, xmin=-1., xmax=1.):
+    def __init__(self, xmin, xmax, npts):
         self.npts = npts
         self.L = float(xmax) - float(xmin)
         self.a = self.L / float(npts + 1.)
@@ -328,11 +349,14 @@ class SineDVR(DVR):
         _i = self.n[:, np.newaxis]
         _j = self.n[np.newaxis, :]
         m = self.npts + 1
+        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            
             T = ((-1.)**(_i-_j)
                 * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
                 - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
+        
         T[self.n - 1, self.n - 1] = 0.
         T += np.diag((2. * m**2. + 1.) / 3.
                      - 1./np.square(np.sin(np.pi * self.n / m)))
@@ -654,12 +678,13 @@ class VFactory(object):
 
 
 if __name__ == '__main__':
-    dvr = SincDVR(npts=200, L=14)
+    x = np.linspace(-7, 7, 200)
+    dvr = SincDVR(x)
     x = dvr.x 
     
     def v(x):
         return x**2
     
-    dvr.run(v, num_eigs=8)
-
+    w, u = dvr.run(v, num_eigs=2)
+    dvr.draw_states()
     # dvr = HermiteDVR(npts=20)

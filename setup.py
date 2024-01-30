@@ -33,7 +33,7 @@ setup(
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
     ],
-    description="Molecular quantum electrodynamics",
+    description=" ultrafast spectroscopy, cavity quantum electrodynamics",
     entry_points={
         'console_scripts': [
             'pyqed=pyqed.cli:main',
@@ -45,13 +45,13 @@ setup(
     include_package_data=True,
     keywords='pyqed',
     name='pyqed',
-#    packages=find_packages(include=['pyqed']),
-    packages=['pyqed.qchem'],
+    packages=find_packages(),
+#    packages=['pyqed.qchem'],
     setup_requires=setup_requirements,
     test_suite='tests',
     tests_require=test_requirements,
 #    package_dir={'': 'pyqed'},
     url='https://github.com/binggu56/pyqed',
-    version='0.1.1',
+    version='0.1.3',
     zip_safe=False,
 )

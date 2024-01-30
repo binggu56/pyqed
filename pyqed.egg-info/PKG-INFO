@@ -1,7 +1,7 @@
 Metadata-Version: 1.1
 Name: pyqed
-Version: 0.1.1
-Summary: Molecular quantum electrodynamics
+Version: 0.1.3
+Summary:  ultrafast spectroscopy, cavity quantum electrodynamics
 Home-page: https://github.com/binggu56/pyqed
 Author: Bing Gu
 Author-email: binggu56@gmail.com
@@ -26,7 +26,7 @@ Description: ==============
         
         
         * Free software: MIT license
-        * Documentation: https://mqed.readthedocs.io/en/latest/
+        * Documentation: https://pyqed.readthedocs.io/en/latest/
         
         
         Features

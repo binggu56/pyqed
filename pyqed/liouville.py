@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jun 19 20:05:24 2019
+
+@author: binggu
+
+@aims: superoperator algebra in Liouville space
+"""
+
 from scipy.sparse import identity, kron
 import numpy as np
 

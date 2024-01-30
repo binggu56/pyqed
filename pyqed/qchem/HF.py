@@ -254,7 +254,7 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 
 
 
-def hartree_fock(mol, max_cycle=100):
+def hartree_fock(mol, max_cycle=50):
 
     #print("constructing basis set")
 
@@ -429,6 +429,7 @@ def hartree_fock(mol, max_cycle=100):
     return total_energy, nuclear_energy, mo_energy, mo_coeff, mo_occ
     # else:
     # return C, Hcore, nuclear_energy, two_electron
+
 
 if __name__ == '__main__':
     from pyscf import gto, scf

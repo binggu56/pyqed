@@ -9,15 +9,15 @@ Created on Tue Mar 26 17:26:02 2019
 import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 from numpy import sqrt, exp, pi
-import proplot as plt
-
+# import proplot as plt
+import matplotlib.pyplot as plt
 from pyqed.units import au2k, au2ev, alpha, \
     au2watt_per_centimeter_squared, au2fs
 from pyqed.fft import fft, fft2
-from pyqed.phys import rect, sinc, dag, interval
+from pyqed.phys import rect, sinc, dag, interval, ham_ho, ket2dm
 from pyqed.wigner import spectrogram
 
-from numba import jit
+# from numba import jit
 
 def intensity_to_field(I):
     """
@@ -60,6 +60,123 @@ def std_to_fwhm(tau):
 
 def fwhm_to_std(fwhm):
     return fwhm/(2.* np.sqrt(2. * np.log(2.)))
+
+
+class Mode:
+    def __init__(self, freq, nmax, decay=None, polarization=None):
+        self.frequency = self.freq = self.resonance = freq
+        self.nmax = self.dim = nmax
+        # self.n = ncav
+
+        self.idm = identity(nmax)
+
+        self.H = self.getH()
+        self.nonhermH = None
+
+        self.decay = decay
+        self.polarization = polarization
+
+    def getH(self, ZPE=False):
+        self.H = ham_ho(self.freq, self.n_cav, ZPE=ZPE)
+        return self.H
+
+    def setQ(self, Q):
+        self.quality_factor = Q
+
+    def get_nonhermitianH(self):
+        '''
+        non-Hermitian Hamiltonian for the cavity mode
+
+        Params:
+            kappa: decay constant
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        '''
+        ncav = self.nmax
+        # if self.quality_factor is not None:
+        #     kappa = self.freq/2./self.quality_factor
+        # else:
+        #     raise ValueError('The quality factor cannot be None.')
+
+        self.nonhermH = self.H - 1j * self.decay * np.identity(ncav)
+        return self.nonhermH
+
+    def get_nonhermH(self):
+        return self.get_nonhermitianH()
+
+    def ham(self, ZPE=False):
+        return ham_ho(self.freq, self.n_cav, ZPE=ZPE)
+
+    def get_create(self):
+        n_cav = self.n_cav
+        c = lil_matrix((n_cav, n_cav))
+        c.setdiag(np.sqrt(np.arange(1, n_cav)), -1)
+        return c.tocsr()
+
+    def get_annihilate(self):
+        n_cav = self.n_cav
+        a = lil_matrix((n_cav, n_cav))
+        a.setdiag(np.sqrt(np.arange(1, n_cav)), 1)
+
+        return a.tocsr()
+
+    def create(self):
+        n_cav = self.n_cav
+        c = lil_matrix((n_cav, n_cav))
+        c.setdiag(np.sqrt(np.arange(1, n_cav)), -1)
+        return c.tocsr()
+
+    def annihilate(self):
+        n_cav = self.n_cav
+        a = lil_matrix((n_cav, n_cav))
+        a.setdiag(np.sqrt(np.arange(1, n_cav)), 1)
+
+        return a.tocsr()
+
+    def vacuum(self, sparse=True):
+        """
+        get initial density matrix for cavity vacuum state
+        """
+        vac = np.zeros(self.n_cav)
+        vac[0] = 1.
+        if sparse:
+            return csr_matrix(vac)
+        else:
+            return vac
+
+    def vacuum_dm(self):
+        """
+        get initial density matrix for cavity vacuum state
+        """
+        vac = np.zeros(self.n_cav)
+        vac[0] = 1.
+        return ket2dm(vac)
+
+    def get_num(self):
+        """
+        number operator
+        """
+        ncav = self.n_cav
+        a = lil_matrix((ncav, ncav))
+        a.setdiag(range(ncav), 0)
+
+        return a.tocsr()
+
+    def number_operator(self):
+        """
+        number operator
+        input:
+            N: integer
+                number of states
+        """
+        N = self.dim
+        a = lil_matrix((N, N))
+        a.setdiag(range(N), 0)
+        return a.tocsr()
 
 
 class Analyser:
@@ -106,6 +223,9 @@ class Analyser:
         ax.format(xlabel='Time (fs)', ylabel='Frequency (eV)', ylim=(0, None))
         return fig, ax
 
+    def propagator(self):
+        pass
+
 
 class Pulse:
     def __init__(self, omegac=3./au2ev, tau=5./au2fs, tc=0, delay=0., \
@@ -135,12 +255,12 @@ class Pulse:
         self.sigma = tau # for compatibility only
         self.omegac = omegac # central frequency
         self.unit = 'au'
-        
+
         if intensity is None:
             self.amplitude = amplitude
         else:
             self.amplitude = intensity_to_field(intensity)
-            
+
         self.cep = cep
         self.bandwidth = 1./tau
         self.duration = 2. * tau
