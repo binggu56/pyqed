@@ -59,7 +59,7 @@ Periodically driven matter
    :maxdepth: 4
    :caption: Contents:
    
-   modules
+   installation.rst
    guide/guide.rst
    pyqed/polariton
    pyqed/namd
@@ -67,6 +67,7 @@ Periodically driven matter
    heom.rst
    Floquet.rst
    pyqed.pyqed.signal.rst
+   modules
 
 
 Indices and tables

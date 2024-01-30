@@ -9,7 +9,7 @@ Created on Wed Jan 17 12:44:37 2024
 import numpy as np
 from numpy import exp, pi, sqrt, meshgrid
 from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, interval,\
-    cartesian_product
+    cartesian_product, discretize, norm2
 from pyqed.wpd import ResultSPO2
 from pyqed.ldr.gwp import WPD2
 
@@ -232,6 +232,33 @@ def gen_enisum_string(D):
 
     return (einsum_string + ' -> ' + ini)
 
+class ResultLDR(ResultSPO2):
+    def __init__(self, dx=None, **kwargs):
+        super().__init__(**kwargs)
+        
+        
+        self.dx = dx
+    
+    def get_population(self, fname=None, plot=True):
+        
+        d = np.prod(self.dx)
+        p = np.zeros((len(self.psilist), self.nstates))
+        for n in range(self.nstates):
+            p[:, n] = [norm2(psi[:, :, n]).real * d for psi in self.psilist]
+        # p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
+        
+        if plot:
+            fig, ax = plt.subplots()
+            for n in range(self.nstates):
+                ax.plot(self.times, p[:,n])
+            # ax.plot(self.times, p1)
+        
+        self.population = p
+        if fname is not None:
+            # fname = 'population'
+            np.savez(fname, p)
+            
+        return p
 
 class LDRN:
     """
@@ -265,8 +292,10 @@ class LDRN:
         
         if mass is None:
             mass = [1, ] * ndim
+        self.mass = mass
         
         self.nstates = nstates
+        self.ndim = ndim
         
         # all configurations in a vector
         self.points = np.fliplr(cartesian_product(x))
@@ -321,9 +350,9 @@ class LDRN:
 
         self.exp_K = []
         
-        for d in self.ndim:
+        for d in range(self.ndim):
                     
-            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr)
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type)
         
             expKx = scipy.linalg.expm(-1j * Tx * dt)
 
@@ -386,9 +415,9 @@ class LDRN:
         exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
         
             
-        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
-        r.x = self.x
-        r.y = self.y
+        r = ResultLDR(dx=self.dx, dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        # r.x = self.x
+        # r.y = self.y
         r.psilist = [psi0]
         
         alphabet = list(string.ascii_lowercase)
@@ -399,6 +428,8 @@ class LDRN:
         psi = psi0.copy()
         psi = self.exp_V_half * psi
         # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+        
+        
         
         for k in range(nt//nout):
             for kk in range(nout):
@@ -432,12 +463,15 @@ class LDRN:
 
         """        
         D = self.ndim 
+        vol = np.prod(self.dx)
+        
         alphabet = list(string.ascii_lowercase)
         
         einsum_string = "".join(alphabet[:D]) + 'x, ' + "".join(alphabet[:D])+'y ->  xy'
         
-        rho = np.einsum(einsum_string, psi.conj(), psi)
+        rho = np.einsum(einsum_string, psi.conj(), psi) * vol
         return rho
+    
 
 # class LDRN:
 #     """
@@ -1919,7 +1953,7 @@ if __name__ == '__main__':
                   mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
     solver.v = v
-    solver.build_apes()
+    # solver.build_apes()
     
     psi0 = np.zeros((nx, ny, nstates), dtype=complex)
     for i in range(nx):

@@ -205,7 +205,7 @@ def time_local_generator(t):
         DESCRIPTION.
 
     """
-    # D = corr(t)
+
     D = corr(t[:, np.newaxis] - t[np.newaxis, :])
     D -= np.tril(D, k=-1)
     
@@ -302,31 +302,29 @@ class TCL2:
     
     
         print('Time propagation start ... \n')
-        ns = self.n
-        Lambda1 = csr_matrix((ns, ns), dtype=np.complex128)
-        Lambda2 = csr_matrix((ns, ns), dtype=np.complex128)
+        # ns = self.n
+        # Lambda1 = csr_matrix((ns, ns), dtype=np.complex128)
+        # Lambda2 = csr_matrix((ns, ns), dtype=np.complex128)
+        
+        G = time_local_generator(t)
     
         for k in tqdm(range(nt)):
-    
-    
-            #k1 = func(rho, h0, S1, S2, Lambda1, Lambda2)
-            #k2 = func(rho + k1*dt2, h0, S1, S2, Lambda1, Lambda2)
-            #k3 = func(rho + k2*dt2, h0, S1, S2, Lambda1, Lambda2)
-            #k4 = func(rho + k3*dt, h0, S1, S2, Lambda1, Lambda2)
-            #rho += (k1 + 2*k2 + 2*k3 + k4)/6. * dt
-    
-            rho = rk4(rho, func, dt, H, c_ops, l_ops)
-
-
-            Lambda1 += s1_int * corr(t) * dt2
-
-            Sm = op2sop( sz_int(t) )
             
-            for c_op in c_ops:
-                c_op = rk4(c_op, liouville, -dt, H)
-            # s2_int = rk4_step(s2_int, liouville, -dt, H)
-            for l_op in l_ops:
-                l_op += c_ops[i] * corr(t) * dt2
+
+            rho += G[k] @ rho * dt
+            # rho = rk4(rho, func, dt, H, c_ops, l_ops)
+
+
+            # Lambda1 += s1_int * corr(t) * dt2
+
+            # Sm = op2sop( sz_int(t) )
+            
+            # for c_op in c_ops:
+            #     c_op = rk4(c_op, liouville, -dt, H)
+            # # s2_int = rk4_step(s2_int, liouville, -dt, H)
+            # for l_op in l_ops:
+            #     l_op += c_ops[i] * corr(t) * dt2
+            
             # Lambda2 += s2_int * corr(t) * dt2
     
     
