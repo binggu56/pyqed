@@ -8,4 +8,4 @@ Using ``pip``
 
 One can install ``pyqed`` using ``pip``:
 
-      pip install pyscf
+      pip install pyqed
