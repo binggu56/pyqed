@@ -12,6 +12,7 @@ import scipy.linalg as la
 import scipy 
 from scipy.sparse import csr_matrix
 from scipy.linalg import kron, norm, eigh
+from scipy.special import erf
 import warnings
 from tqdm import tqdm
 # import matplotlib.pyplot as plt
@@ -21,6 +22,7 @@ from tqdm import tqdm
 
 from pyqed import discretize, sort, dagger
 from pyqed.davidson import davidson_solver
+from pyqed import au2ev, au2angstrom
 
 from pyqed.ldr.ldr import kinetic
 
@@ -50,15 +52,21 @@ from pyqed.ldr.ldr import kinetic
 
 class ShinMetiu:
     def __init__(self, method = 'scipy', nstates=3, dvr_type='sinc', mass=1836):
-        self.a = 0.5
-        self.b = 10 
-        self.R0 = 3.5  
-        self.L = 4*(np.sqrt(3))/5 
-        # self.m = m
-        # a, b, R0, L, m = 0.5, 10.0, 3.5, 1.2, 3
         
-        self.left = np.array([-self.L/2, 0])
-        self.right = np.array([self.L/2, 0])
+        self.Rc = 1.5/au2angstrom  # Adjustable parameter in the pseudopotential
+        # self.Rf = 1.5/au2angstrom  # Adjustable parameter in the pseudopotential
+        
+        # self.Z = 1     # Ion charge
+        # self.e = 1     # Electron charge, should be set to actual value in atomic units
+        
+        self.L = 10/au2angstrom
+        # print(self.L)
+        self.mass = mass  # nuclear mass
+        self.left = np.array([-self.L/2])
+        self.right = np.array([self.L/2])
+    
+        # self.left = np.array([-self.L/2, 0])
+        # self.right = np.array([self.L/2, 0])
     
         self.x = None
         self.y = None
@@ -67,8 +75,6 @@ class ShinMetiu:
         self.u = None
         self.X = None
         self.Y = None
-        
-        self.mass = mass # nuclear mass
         
         self.dvr_type = 'sinc'
         
@@ -104,7 +110,8 @@ class ShinMetiu:
         # idy = np.eye(self.ny)
         
         # T = kron(tx, idy) + kron(idx, ty)
-        # T = kinetic_energy(self.lx, self.nx)
+        # Te = kinetic_energy(self.lx, self.nx)
+        # Tn = kinetic_energy(self.lx, self.nx, mass=1836)
         T = kinetic(self.x, dvr=self.dvr_type)        
         # print(T.shape)
         
@@ -119,12 +126,14 @@ class ShinMetiu:
         
         H = T + V 
         
+        # if np.any(np.isnan(H)) or np.any(np.isinf(H)):
+        #     raise ValueError("H matrix contains NaNs or infs.")
+        
         if self.method == 'exact':
             w, u = eigh(H)
         elif self.method == 'davidson':
             w, u = davidson_solver(H, neigen=self.nstates)
         elif self.method == 'scipy':
-
             w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
             self.v0 = u[:,0] # store the eigenvectors for next calculation
 
@@ -138,16 +147,39 @@ class ShinMetiu:
         """
         Electron-nucleus interaction potential.
         """
-        a = self.a
         
-        return -1 / np.sqrt(a + np.linalg.norm(r - R)**2)
+        r_R_distance = np.linalg.norm(r - R)
+        
+        if r_R_distance < 10**(-10):
+        # if r_R_distance == 0:
+            return 1/self.Rc
+        
+        # ze2 = self.Z * self.e**2
+        return -erf(np.linalg.norm(r - R) / self.Rc) / np.linalg.norm(r - R)
+        # return -ze2 * erf(np.linalg.norm(r - R) / self.Rc) / np.linalg.norm(r - R)
+        
+    # def V_en1(self, r, R):
+    #      """
+    #      Electron-nucleus interaction potential.
+    #      """
+         
+    #      r_R_distance = np.linalg.norm(r - R)
+         
+    #      if r_R_distance < 1e-10:
+    #      # if r_R_distance == 0:
+    #          return 1/self.Rf
+         
+    #      # ze2 = self.Z * self.e**2
+          
+    #      return -erf(np.linalg.norm(r - R) / self.Rf) / np.linalg.norm(r - R)
 
     def V_nn(self, R1, R2):
         """
         Nucleus-nucleus interaction potential.
         """
-        b = self.b
-        return 1 / np.sqrt(b + norm(R1 - R2)**2) 
+
+        # return self.e**2 / np.linalg.norm(R2 - R1)
+        return 1 / np.linalg.norm(R2 - R1)
 
     def potential_energy(self, r, R):
         """
@@ -161,19 +193,16 @@ class ShinMetiu:
         v = self.V_en(r, Ra) + self.V_en(r, Rb) + self.V_en(r, R)
 
         # nuclei-nuclei interaction
-        v += self.V_nn(R, Ra) + self.V_nn(R, Rb) + self.V_nn(Ra, Rb)
+        v += self.V_nn(R, Ra) + self.V_nn(R, Rb)# + self.V_nn(Ra, Rb)
                 
-        # Additional term to make the system bound
-        v += (np.linalg.norm(R) / self.R0)**4
-        
         return v
       
 
-    def pes(self, domain=[-2,2], level=4, nstates=3):
+    def pes(self, domain=[-2,2], level=5, nstates=3):
         
         # calc PES
         # L = self.L 
-        X = discretize(*domain, level)
+        X = discretize(*domain, level) #endpoints=False)
         E = np.zeros((len(X), nstates))
         U = np.zeros((len(X), self.nx, nstates))
         
@@ -185,24 +214,27 @@ class ShinMetiu:
             #w, u = self.single_point(R)
             w, u = sort(*self.single_point(R))
             # print(u_temp.shape)
-            E[i, :] = w #[:nstates]
-            U[i] = u.reshape(self.nx, nstates)
+            E[i, :] = w[:nstates]
+            U[i] = u[:, :nstates].reshape(self.nx, nstates)
             # print(u[:, :nstates].shape)
-            # save states
             
         self.u = U  
         self.X = X
-    
-        
         # fig, ax = plt.subplots()
         
         # ax.plot(X, Y, E[:, 0], label='Ground state')
         # ax.plot(X, Y, E[:, 1], label='Excited state')
         # print(E)
-        return X, E, U   
+        return X, E, U 
+    
+    def electronic_overlap(self):
 
-
-
+        U = self.u # adiabatic states
+        
+        A = np.einsum('aim, cin -> amcn', U.conj(), U)
+        
+        # print(A)
+        return A
 
 
 class ShinMetiu2:
