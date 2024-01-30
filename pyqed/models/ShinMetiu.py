@@ -150,9 +150,9 @@ class ShinMetiu:
         
         r_R_distance = np.linalg.norm(r - R)
         
-        if r_R_distance < 10**(-10):
-        # if r_R_distance == 0:
-            return 1/self.Rc
+        if r_R_distance == 0:
+            # return 2 / (self.Rc)
+            return -2 / (self.Rc * np.sqrt(np.pi))
         
         # ze2 = self.Z * self.e**2
         return -erf(np.linalg.norm(r - R) / self.Rc) / np.linalg.norm(r - R)
