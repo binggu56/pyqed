@@ -27,6 +27,35 @@ from scipy.linalg import svd
 
 import logging
 
+'''
+    Function that makes the following contractions (numbers denote leg order):
+    
+         /--3--**--1--Mt--3--
+         |             |
+         |             2
+         |             |
+         |             *
+         |             *
+         |             |
+         |             4                 /--3-- 
+         |             |                 |
+        Tl--2--**--1---O--3--     =     Tf--2--
+         |             |                 |
+         |             2                 \--1--
+         |             |
+         |             *
+         |             *
+         |             |
+         |             2 
+         |             |
+         \--1--**--3--Mb--1-- 
+'''
+def ZipperLeft(Tl,Mb,O,Mt):
+    Taux = np.einsum('ijk,klm',Mb,Tl)
+    Taux = np.einsum('ijkl,kjmn',Taux,O)
+    Tf = np.einsum('ijkl,jlm',Taux,Mt)
+    
+    return Tf
 
 def decompose(input_tensor, rank, verbose=False):
     """

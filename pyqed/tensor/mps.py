@@ -107,6 +107,117 @@ class MPS:
         pass
 
 
+
+
+def LeftCanonical(M):
+    '''
+        Function that takes an MPS 'M' as input (order of legs: left-bottom-right) and returns a copy of it that is
+            transformed into left canonical form and normalized.
+            
+    Src:
+        https://github.com/GCatarina/DMRG_MPS_didactic/blob/main/DMRG-MPS_implementation.ipynb
+    '''
+    Mcopy = M.copy() #create copy of M
+    
+    N = len(Mcopy) #nr of sites
+    
+    for l in range(N):
+        # reshape
+        Taux = Mcopy[l]
+        Taux = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1],np.shape(Taux)[2]))
+        
+        # SVD
+        U,S,Vdag = np.linalg.svd(Taux,full_matrices=False)
+        '''
+            Note: full_matrices=False leads to a trivial truncation of the matrices (thin SVD).
+        '''
+        
+        # update M[l]
+        Mcopy[l] = np.reshape(U,(np.shape(Mcopy[l])[0],np.shape(Mcopy[l])[1],np.shape(U)[1]))
+        
+        # update M[l+1]
+        SVdag = np.matmul(np.diag(S),Vdag)
+        if l < N-1:         
+            Mcopy[l+1] = np.einsum('ij,jkl',SVdag,Mcopy[l+1])
+        else:
+            '''
+                Note: in the last site (l=N-1), S*Vdag is a number that determines the normalization of the MPS. 
+                    We discard this number, which corresponds to normalizing the MPS.
+            '''
+            
+    return Mcopy
+
+'''
+    Function that takes an MPS 'M' as input (order of legs: left-bottom-right) and returns a copy of it that is
+        transformed into right canonical form and normalized.
+'''
+def RightCanonical(M):
+    Mcopy = M.copy() #create copy of M
+    
+    N = len(Mcopy) #nr of sites
+    
+    for l in range(N-1,-1,-1):
+        # reshape
+        Taux = Mcopy[l]
+        Taux = np.reshape(Taux,(np.shape(Taux)[0],np.shape(Taux)[1]*np.shape(Taux)[2]))
+        
+        # SVD
+        U,S,Vdag = np.linalg.svd(Taux,full_matrices=False)
+        
+        # update M[l]
+        Mcopy[l] = np.reshape(Vdag,(np.shape(Vdag)[0],np.shape(Mcopy[l])[1],np.shape(Mcopy[l])[2]))
+        
+        # update M[l-1]
+        US = np.matmul(U,np.diag(S))
+        if l > 0:         
+            Mcopy[l-1] = np.einsum('ijk,kl',Mcopy[l-1],US)
+        else:
+            '''
+                Note: in the first site (l=0), U*S is a number that determines the normalization of the MPS. We 
+                    discard this number, which corresponds to normalizing the MPS.
+            '''
+            
+    return Mcopy
+
+def is_right_canonical(M):
+    N = len(M)
+    for l in range(N):
+        Mdag = M[l].conj().T #right-top-left
+        MMdag = np.einsum('ijk,kjl',M[l],Mdag) #top-bottom
+        I = np.eye(np.shape(M[l])[0]) #(leg order is indiferent)
+        print('l =', l, ': max(|M[l] · M[l]^† - I|) =', np.max(abs(MMdag-I)))
+            
+# parameters
+N = 10
+d = 3
+D = 20
+
+# random MPS
+'''
+    Order of legs: left-bottom-right. 
+    Note: this is the conventional order used for MPSs in the code.
+'''
+Mrand = []
+Mrand.append(np.random.rand(1,d,D))
+for l in range(1,N-1):
+    Mrand.append(np.random.rand(D,d,D))
+Mrand.append(np.random.rand(D,d,1))
+
+Mleft = LeftCanonical(Mrand)
+
+def is_left_canonical(M):
+    L = len(M)
+    for l in range(L):
+        Mdag = Mleft[l].conj().T #right-top-left
+        '''
+            Note: as a consequence of the conventional leg order chosen for the MPSs, the corresponding hermitian
+                conjugate versions are ordered as right-top-left.
+        ''' 
+        MdagM = np.einsum('ijk,kjl',Mdag,Mleft[l]) #bottom-top
+        I = np.eye(np.shape(Mleft[l])[2]) #(leg order is indiferent)
+        print('l =', l, ': max(|M[l]^† · M[l] - I|) =', np.max(abs(MdagM-I)))
+        
+
 def mps_to_tensor(mps):
     B0, B1, B2 = mps
 
@@ -117,6 +228,86 @@ def mps_to_tensor(mps):
 def tensor_to_vec(psi):
     return psi.flatten()
 
+
+
+'''
+    Function that makes the following contractions (numbers denote leg order):
+    
+         /--3--**--1--Mt--3--
+         |             |
+         |             2
+         |             |
+         |             *
+         |             *
+         |             |
+         |             4                 /--3-- 
+         |             |                 |
+        Tl--2--**--1---O--3--     =     Tf--2--
+         |             |                 |
+         |             2                 \--1--
+         |             |
+         |             *
+         |             *
+         |             |
+         |             2 
+         |             |
+         \--1--**--3--Mb--1-- 
+'''
+def ZipperLeft(Tl,Mb,O,Mt):
+    Taux = np.einsum('ijk,klm',Mb,Tl)
+    Taux = np.einsum('ijkl,kjmn',Taux,O)
+    Tf = np.einsum('ijkl,jlm',Taux,Mt)
+    
+    return Tf
+
+def expect(mpo, mps):
+    # <GS| O |GS> , closing the zipper from the left
+    Taux = np.ones((1,1,1))
+    for l in range(N):
+        Taux = ZipperLeft(Taux, mps[l].conj().T, mpo[l], mps[l])
+    print('<GS| H |GS> = ', Taux[0,0,0])
+    # print('analytical result = ', -2*(N-1)/3)
+    return Taux[0, 0, 0]
+
+'''
+    Function that makes the following contractions (numbers denote leg order):
+    
+         --1--Mt--3--**--1--\
+               |            |
+               2            | 
+               |            |  
+               *            |
+               *            |
+               |            |
+               4            |            --1--\ 
+               |            |                 |
+         --1---O--3--**--2--Tr     =     --2--Tf
+               |            |                 |
+               2            |            --3--/
+               |            |
+               *            |
+               *            |
+               |            |
+               2            | 
+               |            |
+         --3--Mb--1--**--3--/
+'''
+def ZipperRight(Tr,Mb,O,Mt):
+    Taux = np.einsum('ijk,klm',Mt,Tr)
+    Taux = np.einsum('ijkl,mnkj',Taux,O)
+    Tf = np.einsum('ijkl,jlm',Taux,Mb)
+    
+    return Tf
+
+def expect_zipper_right(mpo, mps):
+    # <GS| H |GS> for AKLT model, closing the zipper from the right
+    Taux = np.ones((1,1,1))
+    for l in range(N-1,-1,-1):
+        Taux = ZipperRight(Taux, mps[l].conj().T, mpo[l], mps[l])
+    # print('<GS| H |GS> = ', Taux[0,0,0])
+    # print('analytical result = ', -2*(N-1)/3)
+    
+    return Taux[0,0,0]
 
 s0 = np.eye(2)
 sp = np.array([[0.,1.],[0.,0.]])

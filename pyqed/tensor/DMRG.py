@@ -9,6 +9,8 @@ import scipy.sparse.linalg
 import scipy.sparse as sparse
 import math
 from copy import deepcopy
+from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian matrices
+
 
 # MPS A-matrix is a 3-index tensor, A[s,i,j]
 #    s
@@ -224,6 +226,135 @@ def Expectation(AList, MPO, BList):
         E = contract_from_left(MPO[i], AList[i], E, BList[i])
     return E[0][0][0]
 
+
+from pyqed.tensor.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
+
+'''
+    Function that implements finite-system DMRG (one-site update version) to obtain the ground state of an input 
+        Hamiltonian MPO (order of legs: left-bottom-right-top), 'H', that represents a system with open boundary 
+        conditions.
+        
+    Notes:
+        - the outputs are the ground state energy at every step of the algorithm, 'E_list', and the ground state 
+            MPS (order of legs: left-bottom-right) at the final step, 'M'.
+        - the maximum bond dimension allowed for the ground state MPS is an input, 'D'.
+        - the number of sweeps is an input, 'Nsweeps'.
+'''
+def fDMRG_1site_GS_OBC(H,D,Nsweeps):
+    N = len(H) #nr of sites
+    
+    # random MPS (left-bottom-right)
+    M = []
+    M.append(np.random.rand(1,np.shape(H[0])[3],D))
+    for l in range(1,N-1):
+        M.append(np.random.rand(D,np.shape(H[l])[3],D))
+    M.append(np.random.rand(D,np.shape(H[N-1])[3],1))
+    ## normalized MPS in right canonical form
+    M = LeftCanonical(M)
+    M = RightCanonical(M)
+    
+    # Hzip
+    '''
+        Every step of the finite-system DMRG consists in optimizing a local tensor M[l] of an MPS in site 
+            canonical form. The value of l is sweeped back and forth between 0 and N-1.
+            
+        For a given l, we define Hzip as a list with N+2 elements where:
+
+            - Hzip[0] = Hzip[N+1] = np.ones((1,1,1))
+
+            - Hzip[it] =
+
+                /--------------M[it-1]--3--
+                |             \|
+                |              |          
+                |              |               
+                Hzip[it-1]-----H[it-1]--2--          for it = 1, 2, ..., l
+                |              |
+                |              |
+                |             /|
+                \--------------M[it-1]^†--1--
+
+            - Hzip[it] =
+
+                --1--M[it-1]-----\
+                     |/          |
+                     |           |           
+                     |           |             
+                --2--H[it-1]-----Hzip[it+1]          for it = l+1, l+2, ..., N     
+                     |           |                 
+                     |           |
+                     |\          |
+                --3--M[it-1]^†---/
+              
+        Here, we initialize Hzip considering l=0 (note that this is consistent with starting with a random MPS in
+            right canonical form). Consistently, we will start the DMRG routine with a right sweep.
+    '''
+    Hzip = [np.ones((1,1,1)) for it in range(N+2)]
+    for l in range(N-1,-1,-1):
+        Hzip[l+1] = ZipperRight(Hzip[l+2],M[l].conj().T,H[l],M[l])
+    
+    # DMRG routine
+    E_list = []
+    for itsweeps in range(Nsweeps):
+        ## right sweep
+        for l in range(N):
+            ### H matrix
+            Taux = np.einsum('ijk,jlmn',Hzip[l],H[l])
+            Taux = np.einsum('ijklm,nlo',Taux,Hzip[l+2])
+            Taux = np.transpose(Taux,(0,2,5,1,3,4))
+            Hmat = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1]*np.shape(Taux)[2],
+                                    np.shape(Taux)[3]*np.shape(Taux)[4]*np.shape(Taux)[5]))
+            
+            ### Lanczos diagonalization of H matrix (lowest energy eigenvalue)
+            '''
+                Note: for performance purposes, we initialize Lanczos with the previous version of the local
+                    tensor M[l].
+            '''
+            val,vec = eigsh(Hmat, k=1, which='SA', v0=M[l])
+            E_list.append(val[0])
+            
+            ### update M[l]
+            '''
+                Note: in the right sweep, the local tensor M[l] obtained from Lanczos has to be left normalized. 
+                    This is achieved by SVD. The remaining S*Vdag is contracted with M[l+1].
+            '''
+            Taux2 = np.reshape(vec,(np.shape(Taux)[0]*np.shape(Taux)[1],np.shape(Taux)[2]))
+            U,S,Vdag = np.linalg.svd(Taux2,full_matrices=False)
+            M[l] = np.reshape(U,(np.shape(Taux)[0],np.shape(Taux)[1],np.shape(U)[1]))
+            if l < N-1:
+                M[l+1] = np.einsum('ij,jkl',np.matmul(np.diag(S),Vdag),M[l+1])
+                
+            ### update Hzip
+            Hzip[l+1] = ZipperLeft(Hzip[l],M[l].conj().T,H[l],M[l])
+            
+        ## left sweep
+        for l in range(N-1,-1,-1):
+            ### H matrix
+            Taux = np.einsum('ijk,jlmn',Hzip[l],H[l])
+            Taux = np.einsum('ijklm,nlo',Taux,Hzip[l+2])
+            Taux = np.transpose(Taux,(0,2,5,1,3,4))
+            Hmat = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1]*np.shape(Taux)[2],
+                                   np.shape(Taux)[3]*np.shape(Taux)[4]*np.shape(Taux)[5]))
+            
+            ### Lanczos diagonalization of H matrix (lowest energy eigenvalue)
+            val,vec = eigsh(Hmat, k=1, which='SA', v0=M[l])
+            E_list.append(val[0])
+            
+            ### update M[l]
+            '''
+                Note: in the left sweep, the local tensor M[l] obtained from Lanczos has to be right normalized. 
+                    This is achieved by SVD. The remaining U*S is contracted with M[l-1].
+            '''
+            Taux2 = np.reshape(vec,(np.shape(Taux)[0],np.shape(Taux)[1]*np.shape(Taux)[2]))
+            U,S,Vdag = np.linalg.svd(Taux2,full_matrices=False)
+            M[l] = np.reshape(Vdag,(np.shape(Vdag)[0],np.shape(Taux)[1],np.shape(Taux)[2]))
+            if l > 0:
+                M[l-1] = np.einsum('ijk,kl',M[l-1],np.matmul(U,np.diag(S)))
+                
+            ### update Hzip
+            Hzip[l+1] = ZipperRight(Hzip[l+2],M[l].conj().T,H[l],M[l])
+        
+    return E_list,M
 ##
 ## Parameters for the DMRG simulation
 ##
