@@ -18,8 +18,10 @@ from decompose import decompose, compress
 
 from pyqed import gwp, discretize, pauli, sigmaz, interval
 
-from pyqed.tensor.mps import MPS, apply_mpo_svd
-from pyqed.tensor.decompose import compress
+from pyqed.tensor.mps import MPS, MPO, apply_mpo
+from pyqed.tensor.decompose import compress, tt_to_tensor
+
+
 
 def kinetic(x, mass=1, dvr='sinc'):
     """
@@ -205,9 +207,9 @@ class TT_LDR:
                    for l in range(self.ndim)]
 
         # make_V_list(X, Y)
-        if mass is None:
-            print('Nuclear mass not given, set to 1.')
-            mass = [1] * self.ndim 
+        # if mass is None:
+        #     print('Nuclear mass not given, set to 1.')
+        #     mass = [1] * self.ndim 
         self.mass = mass
         
         self.apes = None
@@ -239,7 +241,6 @@ class TT_LDR:
 
         """
 
-
         self.exp_K = []
         
         for d in range(self.ndim):
@@ -252,71 +253,54 @@ class TT_LDR:
             
         return self.exp_K
         
-    def evolve_k(self, B_list, dt):
-        """
-        Apply the kinetic energy evolution operator to the MPS
+    # def evolve_k(self, B_list, mpo, rank, dt):
+    #     """
+    #     Apply the kinetic energy evolution operator to the MPS
         
-        .. math::
-            \ket{TT'} = A_{m_1 m_2 \dots, m_d \beta, n_1 n_2 \dots n_d \alpha}\
-                 e^{-i \sum_{i = 1}^d T_i \Delta t} \ket{n \alpha} C^{\mathbf{n} \alpha} 
+    #     .. math::
+    #         \ket{TT'} = A_{m_1 m_2 \dots, m_d \beta, n_1 n_2 \dots n_d \alpha}\
+    #              e^{-i \sum_{i = 1}^d T_i \Delta t} \ket{n \alpha} C^{\mathbf{n} \alpha} 
 
-        Parameters
-        ----------
-        B_list : TYPE
-            DESCRIPTION.
-        dt : TYPE
-            DESCRIPTION.
+    #     Parameters
+    #     ----------
+    #     B_list : TYPE
+    #         DESCRIPTION.
+    #     dt : TYPE
+    #         DESCRIPTION.
 
-        Returns
-        -------
-        B_list : TYPE
-            DESCRIPTION.
+    #     Returns
+    #     -------
+    #     B_list : TYPE
+    #         DESCRIPTION.
 
-        """
-        d = self.ndim 
-        rank = self.rank 
+    #     """
+
+    #     # reshape the factors from b_i, n_i**2, b_{i+1} -> b_i, n_i, n_i', b_{i+1}
+    #     T = []
         
-        axes = (0, d+1)
-        for i in range(1, d+1):
-            axes += (i, d+1+i)
+    #     # for l, f in enumerate(factors):
+    #     for l in range(self.L-1):
+    #         f = factors[l]
+    #         b1, d1, b2 = f.shape 
+    #         t = f.reshape(b1, n[l], n[l], b2)
+    #         t = np.einsum('bijc, ij -> bijc', t, self.exp_K[l])
+    #         T.append(t.copy())
+        
+    #     # for l in range(self.L):
             
-        A = np.transpose(self.A, axes=axes) 
-        
-        n = self.nx + [self.nstates]
-        
-        shape = [] 
-        for i in range(d+1):
-            shape.append(n[i]**2)
+    #         # kx = 2. * np.pi * fftfreq(self.dims[i], self.dx[i])
             
-        A = np.reshape(A, shape)
+    #     Bs = apply_mpo_svd(T, B_list)
         
-        # TT decomposition
-        factors = decompose(A, rank=self.rank)
-        
-        # reshape the factors from b_i, n_i**2, b_{i+1} -> b_i, n_i, n_i', b_{i+1}
-        T = []
-        
-        for i, f in enumerate(factors):
-            b1, d1, b2 = f.shape 
-            t = f.reshape(b1, n[i], n[i], b2)
-            t = np.einsum('bijc, ij -> bijc', t, self.exp_K[i])
-            T.append(t.copy())
-        
-        # for l in range(self.L):
-            
-            # kx = 2. * np.pi * fftfreq(self.dims[i], self.dx[i])
-            
-        Bs = apply_mpo_svd(T, B_list)
-        
-        Bs = compress(Bs, rank=rank)
+    #     Bs = compress(Bs, rank=rank)
 
 
-            # The FFT cannot be used in LDR, different from the BO dynamics.
-            # B_list[i] = ifftn(np.einsum('i, aib -> aib', np.exp(-0.5j * kx**2 * dt), \
-            #                             fftn(B_list[i], axes=(1))), axes=(1))
+    #         # The FFT cannot be used in LDR, different from the BO dynamics.
+    #         # B_list[i] = ifftn(np.einsum('i, aib -> aib', np.exp(-0.5j * kx**2 * dt), \
+    #         #                             fftn(B_list[i], axes=(1))), axes=(1))
             
             
-        return B_list
+    #     return B_list
         
     def evolve_v(self, B_list, v_tt, chi_max):
         """
@@ -361,51 +345,109 @@ class TT_LDR:
             
             As.append(A.copy())
         
-        As, Ss = compress(As, chi_max=chi_max)   
+        As = compress(As, chi_max=chi_max)   
         return As
         
-    def run(self, psi0, dt, nt, rank, nout=1):
+    def run(self, psi0, dt, nt, rank_state, rank_pes, rank_ovlp, nout=1):
         
-        # v = self.apes 
+        # chi_max = rank
+        # nstates = self.nstates
         
-        chi_max = rank
         if self.apes is None:
             raise ValueError('APES has not been constructed.')
             
         v = self.apes
-        
+        V = np.exp(-1j * v * dt)
         # assert(v.shape == self.dims)
+        print('Physical dimensions of local Hilbert space', self.dims)
         
+        # decompose the potential propagator        
+        v_tt = decompose(V, rank_pes, verbose=True)
+        
+        # v_app = tt_to_tensor(v_tt)
+        # print(np.allclose(V, v_app))
+        
+        # decompose the overlap matrix into a MPO
+        
+        d = self.ndim 
+        
+        logging.info("reshape the overlap matrix A into ii', jj',...,\beta \alpha")
+        axes = (0, d+1)
+        for i in range(1, d+1):
+            axes += (i, d+1+i)
+        A = np.transpose(self.A, axes=axes) 
+        
+
+        
+        n = self.nx + [self.nstates]
+        
+        # TT decomposition
+        shape = [] 
+        for i in range(d+1):
+            shape.append(n[i]**2)
+            
+        A = np.reshape(A, shape)
+        
+        factors = decompose(A, rank=rank_ovlp, verbose=True)
+        
+        A_app = tt_to_tensor(factors)
+        print(A - A_app)
+        print(np.allclose(A, A_app))
+        
+        # muliply by the free-particle propagator
         self.buildK(dt)
         
-        V = np.exp(-1j * v * dt)
-
-        # decompose the potential propagator        
-        vf, vs = decompose(V, chi_max)
+        T = []
+        for l in range(self.L-1):
+            f = factors[l]
+            b1, d1, b2 = f.shape 
+            t = f.reshape(b1, n[l], n[l], b2)
+            t = np.einsum('bijc, ij -> bijc', t, self.exp_K[l])
+            # T.append(t.copy())
+            T.append(np.transpose(t, (0,1,3,2)).copy())
         
-        X = sigmaz()
-        Xs = []
+        D1, _, D2 = factors[L-1].shape
+        t = np.reshape(factors[L-1], (D1, n[-1], n[-1], D2))
+        T.append(np.transpose(t, (0,1,3,2)).copy())
         
-        B_list = psi0
+        # T = MPO(T)
+        # print('shape', [f.shape for f in T.factors])
+        # print('shape', [f.shape for f in psi0.factors])
+        
+        # observables
+        # X = sigmaz()
+        # Xs = []
+        
+        B_list = psi0.copy()
+        mps_list = [B_list.copy()]
         
         for n in range(nt):
             for k1 in range(nout):
                 
                 # kinetic energy evolution
+                B_list = apply_mpo(T, B_list, rank_state)
 
-                B_list = self.evolve_k(B_list, dt)
+                # B_list = self.evolve_k(B_list, rank=rank, dt=dt)
                 # potential energy evolution
                 
-                B_list = self.evolve_v(B_list, vf, chi_max)
+                B_list = self.evolve_v(B_list, v_tt, rank_state)
             
-            Xs.append(self.expect_one_site(B_list, X))
+            # Xs.append(self.expect_one_site(B_list, X))
+            mps_list.append(B_list.copy())
             
-        return Xs
+        return mps_list
+    
+    def rdm_el(self, mps):
+        f = mps[L-1][:, :, 0]
+        
+        return f.conj().T @ f
 
 
 if __name__=="__main__":
     
-    def vibronic_state(x, nstates=2, ndim=3, dtype=complex):
+    from pyqed.ldr.ldr import LDR2
+    
+    def vibronic_state(x, nstates=2, ndim=2, dtype=complex):
         """
         Create an initial product vibronic state.
         input:
@@ -425,9 +467,9 @@ if __name__=="__main__":
         
         L = ndim + 1 # the last site represents electronic space
         
-        g = gwp(x, x0=-1)
+        g = gwp(x, x0=0)
         
-        for i in range(L-1):
+        for i in range(ndim):
             B = np.zeros((1, n, 1),dtype=dtype)
             B[0, :, 0] = g
             
@@ -436,14 +478,18 @@ if __name__=="__main__":
             B_list.append(B)
             s_list.append(s)
 
-        B[0, 1, 0] = 1. 
+        B = np.zeros((1, nstates, 1),dtype=dtype)
+
+        B[0, 2, 0] = 1. 
         B_list.append(B)
         
         s[0] = 1.
         s_list.append(s)
         
         # return B_list,s_list
-        return MPS(B_list)
+        return B_list
+        # return MPS(B_list)
+
     
     # Define Pararemeter here
     delta = dt = 0.02
@@ -498,14 +544,96 @@ if __name__=="__main__":
     
     # initialize a vibronic state
     # mps = initial_state(n, chi_max, L, dtype=complex)
-    mps = vibronic_state(x)
+
     domains=[[-6, 6]] *2 
     levels = [4] * 2
-    sol = TT_LDR(domains=domains, levels=levels)
-    sol.apes = v
-    sol.A = A
-    sol.run(mps, dt=0.002, nt=5, rank=2)
     
+    
+    from pyqed.models.pyrazine import Pyrazine
+    from pyqed import au2fs, surf
+    from pyqed.tensor.mps import is_left_canonical
+    
+    sol = TT_LDR(domains=domains, levels=levels, nstates=3)
+
+    x, y = sol.x
+    nx, ny = sol.nx 
+    mol = Pyrazine(x, y)
+    v = mol.buildV()
+    
+    ldr2 = LDR2(x, y, nstates=3, mass=mol.mass)
+    ldr2.v = v
+    apes = ldr2.build_apes()
+    
+    # surf(x, y, apes[:, :, 2])
+    
+    A = ldr2.build_ovlp()
+    
+    psi0 = np.zeros((nx, ny, 3), dtype=complex)
+    for i in range(nx):
+        for j in range(ny):
+            psi0[i,j,2] = gwp(np.array([x[i], y[j]]), x0=[0, 0], ndim=2)
+    
+    dt = 0.5/au2fs
+    nt = 60
+    r = ldr2.run(psi0, dt, nt)
+    # r.get_population(plot=True)
+    
+    
+    
+    # # TT_LDR solver
+    
+    sol.apes = apes
+    sol.A = A
+    sol.mass = mol.mass
+
+    mps = vibronic_state(x, nstates=3)
+    
+    
+
+    # d = 2    
+    # axes = (0, d+1)
+    # for i in range(1, d+1):
+    #     axes += (i, d+1+i)
+    # A = np.transpose(A, axes=axes) 
+    
+    # n = [15, 15, 3]
+    
+    # # TT decomposition
+    # shape = [] 
+    # for i in range(d+1):
+    #     shape.append(n[i]**2)
+        
+    # AA = np.reshape(A, shape)
+    
+    # factors = decompose(AA, rank=200, verbose=True)
+    
+    # A_app = tt_to_tensor(factors)
+    # print(AA - A_app)
+    # print(np.allclose(A, A_app))
+    
+    # for j in range(9):
+    #     A = AA[:, :, j]
+    #     b, a = np.unravel_index(j, (3,3))
+    #     print(b, a)
+        
+    #     # A = ldr2.exp_T
+    #     factors = decompose(A, rank=100, verbose=True)
+        
+    #     A_app = tt_to_tensor(factors)
+        
+    #     print(A - A_app)
+        # print(np.allclose(A, A_app))
+    
+    mps_list = sol.run(mps, dt, nt, rank_state=40, rank_pes=10, rank_ovlp=200)
+    
+    rho_list = [sol.rdm_el(mps) for mps in mps_list]
+    
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    ax.plot([rho[2, 2] for rho in rho_list])
+    ax.plot([rho[1, 1] for rho in rho_list])
+    ax.plot([rho[0, 0] for rho in rho_list])
+
     
     
  

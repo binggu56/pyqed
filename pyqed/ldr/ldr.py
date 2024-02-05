@@ -27,7 +27,7 @@ import logging
 
 try:
     import proplot as plt
-except ImportError:
+except:
     import matplotlib.pyplot as plt
     
 
@@ -722,6 +722,7 @@ class LDR2(WPD2):
         self.adiabatic_states = []
         self._apes = None
         self.electronic_overlap = self.A = None
+        self.exp_T = None
         
     @property
     def v(self):
@@ -1961,7 +1962,7 @@ if __name__ == '__main__':
             psi0[i,j,3] = gwp(np.array([x[i], y[j]]), x0=[0, 0], ndim=2)
     
     # transfrom the initial state to the adiabatic representation
-    psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
+    # psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
 
     dt = 0.2/au2fs
     nt = 100

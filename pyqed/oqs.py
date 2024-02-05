@@ -14,7 +14,7 @@ from scipy import integrate
 
 
 from pyqed import commutator, anticommutator, comm, anticomm, dag, ket2dm, \
-    obs_dm, destroy, rk4, basis, transform, isherm, expm
+    obs_dm, destroy, rk4, basis, transform, isherm, expm, coth
 
 # from lime.superoperator import lindblad_dissipator
 from pyqed.superoperator import op2sop, dm2vec, obs, left, right, operator_to_superoperator
@@ -28,7 +28,8 @@ import pyqed.superoperator as superop
 
 
 
-class Redfield_solver:
+class RedfieldSolver:
+# class Redfield_solver:
     def __init__(self, H, c_ops=None, spectra=None, e_ops=None):
         self.H = H
         self.c_ops = c_ops
@@ -1872,10 +1873,11 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
 
 
     gamma = cutoff # cutoff frequency of the environment, larger gamma --> more Makovian
-    T = temperature/au2k
+    # T = temperature/au2k
+    T = temperature
     reorg = reorganization
     print('Temperature of the environment = {}'.format(T))
-    print('High-Temperature check gamma/(kT) = {}'.format(gamma/T))
+    print('Cutoff gamma/(kT) = {}'.format(gamma/T))
 
     if gamma/T > 0.8:
         print('WARNING: High-Temperature Approximation may fail.')
@@ -1883,39 +1885,42 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     print('Reorganization energy = {}'.format(reorg))
 
     # D(t) = (a + ib) * exp(- gamma * t)
-    a = np.pi * reorg * T  # initial value of the correlation function D(0) = pi * lambda * kB * T
-    b = 0.0
-    print('Amplitude of the fluctuations = {}'.format(a))
+    # a = np.pi * reorg * T  # initial value of the correlation function D(0) = pi * lambda * kB * T
+    # b = 0.0
+    
+    # leading term of the Matsubara expansion
+    D0 = reorg * gamma * (coth(gamma/(2. * T)) - 1j)
+    # D0 = reorg * (2. * T - 1j * gamma)
+    
+    print('Amplitude of the fluctuations = {}'.format(D0))
 
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
     sz = c_ops[0] # collapse opeartor
 
 
-    # f = open(fname,'w')
-    # fmt = '{} '* 5 + '\n'
-
     # propagation time loop - HEOM
+    observables = np.zeros((len(e_ops), nt), dtype=complex)
     t = 0.0
     for k in range(nt):
 
         t += dt # time increments
 
-        ado[:,:,0] += -1j * commutator(H, ado[:,:,0]) * dt - \
-            commutator(sz, ado[:,:,1]) * dt
+        ado[:,:,0] = ado[:,:,0]  - 1j * comm(H, ado[:,:,0]) * dt - \
+            comm(sz, ado[:,:,1]) * dt
 
-        for n in range(nado-1):
-            ado[:,:,n] += -1j * commutator(H, ado[:,:,n]) * dt + \
-                        (- commutator(sz, ado[:,:,n+1]) - n * gamma * ado[:,:,n] + n * \
-                        (a * commutator(sz, ado[:,:,n-1]) + \
-                         1j * b * anticommutator(sz, ado[:,:,n-1]))) * dt
+        for n in range(1, nado-1):
+            ado[:,:,n] += -1j * comm(H, ado[:,:,n]) * dt + \
+                        (- comm(sz, ado[:,:,n+1]) - n * gamma * ado[:,:,n] + n * \
+                        (D0.real * commutator(sz, ado[:,:,n-1]) + \
+                         1j * D0.imag * anticommutator(sz, ado[:,:,n-1]))) * dt
 
     #     # store the reduced density matrix
     #     f.write(fmt.format(t, ado[0,0,0], ado[0,1,0], ado[1,0,0], ado[1,1,0]))
 
     #     #sz += -1j * commutator(sz, H) * dt
-
+        observables[:, k] = [obs(ado[:, :, 0], e) for e in e_ops]
     # f.close()
-    return ado[:,:,0]
+    return observables
 
 def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
              nado, dt, nt, fname=None):

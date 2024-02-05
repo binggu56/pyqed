@@ -388,44 +388,45 @@ W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z],
               [Z,  Z,      Z,      Z,  Sp],
               [Z,  Z,      Z,      Z,   I]])
 
-# left-hand edge is 1x5 matrix
-Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z]])
+print(W.shape)
+# # left-hand edge is 1x5 matrix
+# Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z]])
 
-# right-hand edge is 5x1 matrix
-Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])
+# # right-hand edge is 5x1 matrix
+# Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])
 
-# the complete MPO
-MPO = [Wfirst] + ([W] * (N-2)) + [Wlast]
+# # the complete MPO
+# MPO = [Wfirst] + ([W] * (N-2)) + [Wlast]
 
-# MPO for H^2, to calculate the variance
-HamSquared = product_MPO(MPO, MPO)
+# # MPO for H^2, to calculate the variance
+# HamSquared = product_MPO(MPO, MPO)
 
-# 8 sweeps with m=10 states
-two_site_dmrg(MPS, MPO, 10, 8)
+# # 8 sweeps with m=10 states
+# two_site_dmrg(MPS, MPO, 10, 8)
 
-# energy and energy squared
-E_10 = Expectation(MPS, MPO, MPS);
-Esq_10 = Expectation(MPS, HamSquared, MPS); 
+# # energy and energy squared
+# E_10 = Expectation(MPS, MPO, MPS);
+# Esq_10 = Expectation(MPS, HamSquared, MPS); 
 
-# 2 sweeps with m=20 states
-two_site_dmrg(MPS, MPO, 20, 2)
+# # 2 sweeps with m=20 states
+# two_site_dmrg(MPS, MPO, 20, 2)
 
-# energy and energy squared
-E_20 = Expectation(MPS, MPO, MPS);
-Esq_20 = Expectation(MPS, HamSquared, MPS); 
+# # energy and energy squared
+# E_20 = Expectation(MPS, MPO, MPS);
+# Esq_20 = Expectation(MPS, HamSquared, MPS); 
 
-# 2 sweeps with m=30 states
-two_site_dmrg(MPS, MPO, 30, 2)
+# # 2 sweeps with m=30 states
+# two_site_dmrg(MPS, MPO, 30, 2)
 
-# energy and energy squared
-E_30 = Expectation(MPS, MPO, MPS);
-Esq_30 = Expectation(MPS, HamSquared, MPS); 
+# # energy and energy squared
+# E_30 = Expectation(MPS, MPO, MPS);
+# Esq_30 = Expectation(MPS, HamSquared, MPS); 
 
-Energy = Expectation(MPS, MPO, MPS)
-print("Final energy expectation value {}".format(Energy))
+# Energy = Expectation(MPS, MPO, MPS)
+# print("Final energy expectation value {}".format(Energy))
 
-# calculate the variance <(H-E)^2> = <H^2> - E^2
+# # calculate the variance <(H-E)^2> = <H^2> - E^2
 
-print("m=10 variance = {:16.12f}".format(Esq_10 - E_10*E_10))
-print("m=20 variance = {:16.12f}".format(Esq_20 - E_20*E_20))
-print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))
+# print("m=10 variance = {:16.12f}".format(Esq_10 - E_10*E_10))
+# print("m=20 variance = {:16.12f}".format(Esq_20 - E_20*E_20))
+# print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))

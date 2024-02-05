@@ -87,6 +87,8 @@ def decompose(input_tensor, rank, verbose=False):
     ----------
     .. [1] Ivan V. Oseledets. "Tensor-train decomposition", SIAM J. Scientific Computing, 33(5):2295–2317, 2011.
     """
+
+
     rank = validate_tt_rank(tl.shape(input_tensor), rank=rank)
     tensor_size = input_tensor.shape # list of phys dims
     
@@ -111,7 +113,7 @@ def decompose(input_tensor, rank, verbose=False):
 
         # SVD of unfolding matrix
         (n_row, n_column) = unfolding.shape
-        print(n_row, n_column)
+
 
         current_rank = min(n_row, n_column, rank[k+1])
         U, S, V = truncated_svd(unfolding, current_rank)
@@ -138,15 +140,15 @@ def decompose(input_tensor, rank, verbose=False):
     factors[-1] = np.reshape(unfolding, (prev_rank, last_dim, 1))
 
     
-    # logging.info("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
-    if verbose is True:
-        print(
-            "TT factor "
-            + str(n_dim - 1)
-            + " computed with shape "
-            + str(factors[n_dim - 1].shape)
-        )
-    return factors, Ss
+    logging.info("TT factor " + str(n_dim-1) + " computed with shape " + str(factors[n_dim-1].shape))
+    # if verbose is True:
+    #     print(
+    #         "TT factor "
+    #         + str(n_dim - 1)
+    #         + " computed with shape "
+    #         + str(factors[n_dim - 1].shape)
+    #     )
+    return factors
 
 def truncated_svd(matrix, k=None, **kwargs):
     """Computes a truncated SVD on `matrix` using the backends's standard SVD
@@ -234,8 +236,31 @@ def tt_to_tensor(factors):
 
     return tl.reshape(full_tensor, full_shape)
 
-def compress(B_list, chi_max):
-    " Compress the MPS by reducing the bond dimension."
+def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
+    """
+    
+    Compress the MPS by reducing the bond dimension.
+    
+    States are renormalized to ensure norm.
+
+    Parameters
+    ----------
+    B_list : TYPE
+        DESCRIPTION.
+    chi_max : TYPE
+        DESCRIPTION.
+    renormalize : TYPE, optional
+        DESCRIPTION. The default is True.
+    return_singular_values : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
     # d = B_list[0].shape[0]
     L = len(B_list)
     s_list  = [None] * L
@@ -283,11 +308,10 @@ def compress(B_list, chi_max):
 
         B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
 
-
-    return B_list, s_list
-
-# def mps_to_tensor(b):
-#     return np.einsum('ib, bjc, ck->ijk', b[0][0,:,:], b[1], b[2][:,:,0])
+    if return_singular_values:
+        return B_list, s_list
+    else:
+        return B_list
 
 
 if __name__ == '__main__':
