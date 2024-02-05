@@ -28,7 +28,7 @@ Models
 
 
 .. math::
-	H = \frac{\Delta}{2} \sigma_x  + \sum_k \sigma_z {g_k a_k^\dag + g_k^*a_k} + \sum_k \omega_k a^\dag_k a_k 
+	H = \frac{\Delta}{2} \sigma_x  + \sum_k \sigma_z {g_k a_k^\dagger + g_k^*a_k} + \sum_k \omega_k a^\dagger_k a_k 
 
 The environmental influence to the system dynamics is encoded in the so-called spectral density, 
 
@@ -45,6 +45,6 @@ with a single exponential for the time-correlation function.
 
 .. math::
 
-	D(t) = \pi^{-1} \int_0^\infty d \omega J(\omega)    ... \approx \lambda (2T - i \gamma) e^{-\gamma t}
+	D(t) = \pi^{-1} \int_0^\infty d \omega J(\omega)(\coth(\beta\omega/2) - i \sin(\omega t)) \approx \lambda (2T - i \gamma) e^{-\gamma t}
 
 
