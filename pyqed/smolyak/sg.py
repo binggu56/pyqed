@@ -324,8 +324,7 @@ class SparseGrid:
         # Sparse grid combination technique
         
         d = self.dim
-        index_set = []
-        c = [] 
+
         l = [self.level, ] * self.dim # isotropic, can be generalized to anisotropic
         
         index_set = [] # level sets included in the SGCT technique
@@ -333,7 +332,7 @@ class SparseGrid:
         
         for j in range(d):
             # levels = list(combinations_with_replacement_counts(d, self.level -j))
-            levels = balls_in_boxes(self.level-j, d)
+            levels = balls_in_boxes(self.level + (d-1) -j, d)
             index_set += levels
             c += [(-1)**j * math.comb(d-1, j)] * len(levels)     
         
@@ -350,6 +349,9 @@ class SparseGrid:
         # self.index_set = index_set
         # self.coeff 
         return index_set, c
+    
+    def truncated_combination_technique(self, tau):
+        pass
                 
     def printGrid(self):
         print(self.hSpace)
@@ -858,8 +860,8 @@ if __name__=="__main__":
         
         return v
 
-    level = 5
-    dim = 3
+    level = 4
+    dim = 2
     
     # # reference calculation
     # x = np.linspace(-6, 6, 2**level, endpoint=False)
@@ -911,7 +913,7 @@ if __name__=="__main__":
     #
     sg.generatePoints()
     
-    print('index set for SGCT\n', sg.index_set)
+    # print('index set for SGCT\n', sg.index_set)
     #
     #  Print the points in the grid.
     #
@@ -953,12 +955,13 @@ if __name__=="__main__":
     index_set, c = sg.combination_technique(3) 
     
     print(index_set)
-    s = 0
-    for n, index in enumerate(index_set):
-        i, j,z = index
-        s += 2**(i+j)
-        print('Level set =', index, 'with combination coefficient', c[n])
-    print(s)
+    print(c)
+    # s = 0
+    # for n, index in enumerate(index_set):
+    #     i, j,z = index
+    #     s += 2**(i+j)
+    #     print('Level set =', index, 'with combination coefficient', c[n])
+    # print(s)
 
     
     

@@ -173,6 +173,28 @@ def sz_int(t):
     
     return sz * np.cos(t) + sy * np.sin(t)
 
+def dSz(t):
+    """
+    Compute the operator :math:`\sigma_z` in the interaction picture of\
+        :math:`\sigma_x/2`
+
+    .. math::
+        \sigma_z(t) = e^{+ i H t} \sigma_z e^{-i H t}
+        
+    Parameters
+    ----------
+    t : float
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    
+    
+    return -sz * np.sin(t) + sy * np.cos(t)
+
 
 def time_local_generator(t):
     """
@@ -222,6 +244,98 @@ def time_local_generator(t):
     G = np.tensordot(K, Sm, axes=(1, 0)) * dt + 1j * dt * np.tensordot(C, Sp, axes=(1,0)) # shape [nt, N^2, N^2] 
     G = - np.einsum('tij, tjk -> tik', Sm, G)
     return G
+
+def gradientG(t):
+    """
+    
+    time-derivative of the second-order TCL generator for Gaussian environments
+    
+    .. math::
+        
+        \dot{G}(t)
+        
+        G(t) = -  S^-(t)  \int_0^t \dif t_1  D_K(t,t_1) S^-(t_1) + \
+            i D_C(t,t_1) S^+(t_1)
+
+    Parameters
+    ----------
+    t : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    G : TYPE
+        DESCRIPTION.
+
+    """
+
+
+    D = corr(np.abs(t[:, np.newaxis] - t[np.newaxis, :]))
+    D -= np.triu(D, k=1) # impose time-ordering
+    # D(t0)
+    D0 = reorg * (2 * T  - 1j * gamma)
+    
+    print('D', D[2, :])
+
+    
+    # nt = len(t)
+    # D = np.zeros((nt, nt), dtype=complex)
+    # for i in range(nt):
+    #     for j in range(i):
+    #         D[i,j] = corr(t[i] - t[j])
+    
+    K = np.real(D)  # keldysh correlation function
+    C = np.imag(D)  # commutator correlation function
+    
+    K -= np.triu(K) # impose time-ordering
+    C -= np.triu(C) # impose time-ordering
+
+    
+    
+    S = [sz_int(_t) for _t in t]
+    dS = [dSz(_t) for _t in t]
+    
+    Sm = [op2sop(_S, kind='commutator').toarray() for _S in S]
+    Sp = [op2sop(_S, kind='anticommutator').toarray() for _S in S]
+    
+    # G3 =  [-Sm[i] @ (D0.real * Sm[i] + 1j*D0.imag * Sp[i]) for i in range(len(t))]  
+    # G3 = np.array(G3)
+    
+    Sm = np.array(Sm)
+    Sp = np.array(Sp)
+    
+    dSm = [op2sop(_S, kind='commutator').toarray() for _S in dS]
+    dSm = np.array(dSm)
+    
+    # the derivative of G^{(2)} contains three terms 
+    # first term
+    
+    L = np.tensordot(K, Sm, axes=(1, 0)) * dt + 1j * dt * np.tensordot(C, Sp, axes=(1,0)) # shape [nt, N^2, N^2] 
+    
+    print('L', L)
+    # for i in range(len(t)):
+    #     Li = K[:i, :i] 
+        
+    # L = np.einsum('ts, sij->tij', K, Sm) * dt + 1j * dt * np.tensordot(C, Sp, axes=(1,0)) # shape [nt, N^2, N^2] 
+
+    G1 = - np.einsum('tij, tjk -> tik', dSm, L)
+    
+    # second-term (for Drude spectral density)
+    # dK = - gamma * K 
+    # dC = - gamma * C
+    
+    # G2 = np.tensordot(dK, Sm, axes=(1, 0)) * dt + 1j * dt * np.tensordot(dC, Sp, axes=(1,0)) # shape [nt, N^2, N^2] 
+    # G2 = - gamma * L
+    G2 = gamma *  np.einsum('tij, tjk -> tik', Sm, L)
+    
+    G3 =  D0.real * Sm + 1j * D0.imag * Sp  
+    G3 =  - np.einsum('tij, tjk -> tik', Sm, G3)
+    
+    # print('GGG', G[0], G2[0], G3[0])
+        
+    dg =  G1 + G3 + G2
+    return dg 
+
 
 class TCL2:
     def __init__(self, H, c_ops, e_ops=None):
@@ -378,15 +492,20 @@ class CTOE(TCL2):
         
         g2 = time_local_generator(t)
         
-        # dg2 = (g2[1:] - g2[:-1])/dt
         
-        dg = np.zeros_like(g2, dtype=complex)
+        # dg = np.zeros_like(g2, dtype=complex)
         
-        dg[0] = (g2[1] - g2[0])/dt
-        for i in range(1, nt-1):
-            dg[i] = (g2[i+1] - g2[i-1])/(dt * 2)
+        # dg[0] = (g2[1] - g2[0])/dt
+        # for i in range(1, nt-1):
+        #     dg[i] = (g2[i+1] - g2[i-1])/(dt * 2)
+            
+        # print('dG', dg[-1])
+        # dg = np.gradient(g2, dt, axis=0)
+            
+        dg = gradientG(t)
+        # print('DG', dg[-1])
+        
 
-        
         I = np.eye(self.nstates**2)
         
         observables = np.zeros((len(e_ops), nt-1), dtype=complex)
@@ -494,8 +613,8 @@ if __name__=='__main__':
     # nt = 100 
     # rho = sol.run(rho0=rho0, dt=0.001, nt=nt, temperature=3e5, cutoff=5, reorganization=0.2, nado=5)
     # print(rho)
-    dt = 0.04
-    nt = 5000
+    dt = 0.0025
+    nt = 8000 * 2
     t = dt * np.arange(nt)
 
     
@@ -505,9 +624,9 @@ if __name__=='__main__':
 
 #    # G = time_local_generator(t)
 
-    gamma=2
-    reorg=0.002
-    T = 2
+    gamma=1
+    reorg=0.004
+    T = 1
     
     def corr(t, gamma=gamma, reorg=reorg, T=T):
         """
@@ -533,22 +652,23 @@ if __name__=='__main__':
         return reorg * (2 * T  - 1j * gamma) * np.exp(-gamma * t)
         # return reorg * gamma * (coth(gamma/(2. * T)) - 1j) * np.exp(-gamma * t)
 
+    fig, ax = plt.subplots()
+
     
     heom = sbm.HEOM(e_ops = [sz, sx])
     observables = heom.run(rho0, dt=dt, nt=nt, nado=6, \
                             temperature=T, cutoff=gamma, reorganization=reorg)
     
-    fig, ax = plt.subplots()
 
     # ax.plot(dt/4 * np.arange(nt*4), observables[0,:], 'k')
     ax.plot(t, observables[1,:], 'k', lw=2,label='HEOM')
     
     rho0 = dm2vec(rho0)
-    observables, szAve = sbm.TCL2(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
+    # observables, szAve = sbm.TCL2(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
 
-    # ax.plot(t, observables[0,:])
-    ax.plot(t, observables[1,:], 'C0-',label='TCL2')
-    # ax.plot(t, szAve, 'C0', label='TCL2')    
+    # # ax.plot(t, observables[0,:])
+    # ax.plot(t, observables[1,:], 'C0-',label='TCL2')
+    # # ax.plot(t, szAve, 'C0', label='TCL2')    
     
     
     observables, szAve = sbm.CTOE(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
