@@ -21,3 +21,5 @@ pyqed/polariton/negf_leak.npz
 *.dat
 *.dat
 *.pyc
+pyqed/FCIDUMP.UHF
+pyqed/FCIDUMP
