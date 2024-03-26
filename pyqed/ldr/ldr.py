@@ -151,7 +151,32 @@ def kinetic(x, mass=1, dvr='sinc'):
         raise ValueError("DVR {} does not exist. Please use sinc, sinc_periodic, sine.")
 
     return T
+
+
+
+def free_propagator(x, t, mass=1):
+    """
+    propagator of a one-dimensional free particle
+
+    Parameters
+    ----------
+    mass : TYPE
+        DESCRIPTION.
+    t : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    U = np.sqrt(mass/(2j * np.pi * t)) * np.exp(-mass * x**2/(2j * t))
         
+    return U
+
+
+
+
 def sigma(n):
     """
     zigzag function mapping integers to Fourier components
@@ -239,6 +264,8 @@ class ResultLDR(ResultSPO2):
         
         self.dx = dx
     
+
+    
     def get_population(self, fname=None, plot=True):
         
         d = np.prod(self.dx)
@@ -247,27 +274,35 @@ class ResultLDR(ResultSPO2):
             p[:, n] = [norm2(psi[:, :, n]).real * d for psi in self.psilist]
         # p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
         
-        if plot:
-            fig, ax = plt.subplots()
-            for n in range(self.nstates):
-                ax.plot(self.times, p[:,n])
-            # ax.plot(self.times, p1)
-        
         self.population = p
         if fname is not None:
             # fname = 'population'
             np.savez(fname, p)
             
-        return p
+            
+        if plot:
+            fig, ax = plt.subplots()
+            for n in range(self.nstates):
+                ax.plot(self.times, p[:,n])
+            # ax.plot(self.times, p1)
+            return fig, ax
+        else:
+                
+            return p
 
 class LDRN:
     """
     many-dimensional many-state nonadiabatic conical intersection dynamics in 
     DVR + LDR + SPO
     
+    
     The required input to run is APES and electronic overlap matrix.
+    
+    
+    This is extremely expansive, the maximum dimension should be < 4. 
+    
     """
-    def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sinc'): 
+    def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sine'): 
 
         assert(len(domains) == len(levels) == ndim)
         
@@ -310,6 +345,7 @@ class LDRN:
         self.exp_K = None
         self.exp_V = None
         self.wf_overlap = self.A = None
+        self.apes = None
         
         
     @property
@@ -319,6 +355,9 @@ class LDRN:
     @v.setter
     def v(self, v):
         assert(v.shape == (*self.nx, self.nstates, self.nstates))
+        
+        if abs(np.min(v)) > 0.1:
+            raise ValueError('The PES minimum is not 0. Shift the PES.')
         
         self._v = v
 
@@ -353,8 +392,11 @@ class LDRN:
         for d in range(self.ndim):
                     
             Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type)
-        
+            
+            # we can use free-particle propagator for the e^{-i K \Delta t}
             expKx = scipy.linalg.expm(-1j * Tx * dt)
+            
+            
 
             self.exp_K.append(expKx.copy())
             
@@ -386,6 +428,62 @@ class LDRN:
         self.exp_V_half = np.exp(-1j * dt2 * self.apes)
 
         return
+    
+    
+    def gen_enisum_string(self, D):
+        """
+        Generate einsum string for computing the short-time propagator
+        
+        ij...a, ij...a, kl...b, lk...b -> ija, klb
+
+        Parameters
+        ----------
+        D : TYPE
+            DESCRIPTION.
+
+        Raises
+        ------
+        ValueError
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        alphabet = list(string.ascii_lowercase)
+        if (D > 10):
+            raise ValueError('Dimension D = {} cannot be larger than 10.'.format(D))
+        
+        s1 = "".join(alphabet[:D]) + 'x' 
+        # s2 = "".join(alphabet[:D]) + 'x' + "".join(alphabet[D:2*D])+'y'
+        s3 = "".join(alphabet[D:2*D])+'y'
+        s2 = s1 + s3 
+        
+        einsum_string = s1 + ',' + s2 + ',' + s3 + '->' + s2 
+
+        return einsum_string
+    
+    def short_time_propagator(self, dt):
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+        
+        einsum_string = self.gen_enisum_string(self.ndim)
+        U = np.einsum(einsum_string, self.exp_V_half, self.exp_T, self.exp_V_half)
+        return U
     
     def run(self, psi0, dt, nt, nout=1, t0=0):
         
@@ -685,18 +783,21 @@ class LDR2(WPD2):
     LDR-SPO-SincDVR
     
     """
-    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sinc'):
+    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sine'):
         self.x = x
         self.y = y
         self.dx = interval(x)
         self.dy = interval(y)
         self.nstates = nstates
+        self.nx = len(x)
+        self.ny = len(y)
+        
+        self.size = self.nx * self.ny * nstates # size of Hilbert space
         
         self.kx = 2 * np.pi * scipy.fft.fftfreq(len(x), self.dx)
         self.ky = 2 * np.pi * scipy.fft.fftfreq(len(y), self.dy)
 
-        self.nx = len(x)
-        self.ny = len(y)
+
         
         self.dvr = dvr
         
@@ -712,7 +813,7 @@ class LDR2(WPD2):
         self.nbasis = self.nx * self.ny # for product DVR
         
         self.X = None
-        self.K = None
+        self.T = None
         self.V = None
         self.H = None 
         self._v = None # diabatic potential matrix
@@ -821,24 +922,24 @@ class LDR2(WPD2):
         #         Tx[m, n] = Tx[n, m]
         
 
+        
         Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
-        # p2 = kron(p2, np.eye(self.ny))
         
         expKx = scipy.linalg.expm(-1j * Tx * dt)
+
         
         Ty = kinetic(self.y, my, dvr=self.dvr)
-        # dy = self.dy 
-        # Ty = np.zeros((self.ny, self.ny))
-        
-        # for n in range(ny):
-        #     Ty[n, n] = np.pi**2/3 * 1/(2 * my * dy**2)
-            
-        #     for m in range(n):
-        #         Ty[n, m] = 1/(2 * my * dy**2) * (-1)**(n-m) * 2/(n-m)**2
-        #         Ty[m, n] = Ty[n,m]
-        
-        # p2_y = kron(np.eye(self.nx, p2_y))
+
         expKy = scipy.linalg.expm(-1j * Ty * dt)
+
+        # x, y = self.x, self.y 
+        # X = x[:, None] - x[None, :]
+        # expKx = free_propagator(X, dt, mass=mx)
+        
+        # Y = y[:, None] - y[None, :]
+        # expKy = free_propagator(Y, dt, mass=my)
+ 
+
 
         # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
 
@@ -1035,7 +1136,7 @@ class LDR2(WPD2):
 
         return
     
-    def build_ovlp(self):
+    def build_ovlp(self, dtype=float):
         
 
         N = self.nbasis
@@ -1045,7 +1146,7 @@ class LDR2(WPD2):
         # K = self.buildK().reshape((N, N))
         
         # overlap of electronic states
-        A = np.zeros((nx, ny, nx, ny, nstates, nstates), dtype=complex)
+        A = np.zeros((nx, ny, nx, ny, nstates, nstates), dtype=dtype)
         # self._K = np.zeros((N, N, M, M), dtype=dtype)
 
 
@@ -1168,6 +1269,30 @@ class LDR2(WPD2):
         
         return r
     
+    def fast_run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        U = self.short_time_propagator(dt)
+        U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
+        
+        results = {} 
+        results['psilist'] = []
+        
+        psi0 = psi0.reshape((nx * ny * nstates))
+        
+        times = np.power(2, range(1, nt+1)) * dt
+        results['times'] = times 
+        
+        for k in range(nt):
+            U = U @ U
+            psi = U @ psi0
+            
+            psi = psi.reshape((nx, ny, nstates))
+            results['psilist'].append(psi.copy())
+            
+        return results 
+    
     def rdm_el(self, psi):
         """
         Compute the reduced electronic density matrix
@@ -1204,6 +1329,30 @@ class LDR2(WPD2):
              
         return rho
     
+    def short_time_propagator(self, dt):
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+
+        expKx, expKy = self.exp_K
+
+        # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+        self.exp_T = np.einsum('ijaklb, ik, jl -> ijaklb', self.A, expKx, expKy)
+
+        U = np.einsum('ija, ijaklb, klb -> ijaklb', self.exp_V_half, self.exp_T, self.exp_V_half)
+        return U
+    
     def _KEO_linear(self, psi):
         # psik = np.zeros(psi.shape, dtype=complex)
         # for j in range(ns):
@@ -1230,6 +1379,147 @@ class LDR2(WPD2):
     
     def k_evolve(self, psi):
         return self.expK @ psi
+
+class LDR2_IT(LDR2):
+    """
+    imaginary-time local diabatic representation
+    """
+    def buildV(self, dt):
+        """
+        Setup the propagators appearing in the split-operator method.
+
+        For the kinetic energy operator with Jacobi coordinates
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        e^{- K \tau} = e{- K_1 \delta \tau} e^{- i K_2 \delta t}
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        intertia: func
+            moment of inertia, only used for Jocabi coordinates.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # setup kinetic energy operator
+        # kx, ky = self.kx, self.ky 
+        
+        dt2 = 0.5 * dt
+        self.exp_V = np.exp(-  dt * self.apes)
+
+        self.exp_V_half = np.exp(- dt2 * self.apes)
+        
+        # if np.iscomplexobj(v):
+            
+        #     # complex potential
+        #     for i in range(nx):
+        #         for j in range(ny):
+                    
+        #             _v = v[i, j]
+                    
+        #             w, ul, ur = scipy.linalg.eig(_v, left=True, right=True)
+    
+    
+        #             V = np.diagflat(np.exp(- 1j * w * dt))
+        #             V2 = np.diagflat(np.exp(- 1j * w * dt2))
+    
+        #             self.exp_V[i, j, :,:] = ur @ V @ dag(ul)
+        #             self.exp_V_half[i, j, :,:] = ur @ V2 @ dag(ul)
+                    
+        # else: 
+            
+            # for i in range(nx):
+            #     for j in range(ny):
+    
+            #         w, u = scipy.linalg.eigh(v[i, j, :, :])
+    
+            #         #print(np.dot(U.conj().T, Vmat.dot(U)))
+    
+            #         self.exp_V[i,j] = np.diagflat(np.exp(- 1j * w * dt))
+            #         self.exp_V_half[i,j] = np.diagflat(np.exp(- 1j * w * dt2))
+    
+                    # self.exp_V[i, j, :,:] = u.dot(V.dot(dagger(u)))
+                    # self.exp_V_half[i, j, :,:] = u.dot(V2.dot(dagger(u)))
+
+        return 
+    
+    def buildK(self, dt):
+        
+        # dx = self.dx
+        # Tx = np.zeros((self.nx, self.nx))
+        mx, my = self.mass 
+        
+
+        # for n in range(nx):
+        #     Tx[n, n] = np.pi**2/3 * 1/(2 * mx * dx**2)
+            
+        #     for m in range(n):
+        #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
+        #         Tx[m, n] = Tx[n, m]
+        
+
+        
+        Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
+        
+        expKx = scipy.linalg.expm(- Tx * dt)
+
+        
+        Ty = kinetic(self.y, my, dvr=self.dvr)
+
+        expKy = scipy.linalg.expm(- Ty * dt)
+
+        # x, y = self.x, self.y 
+        # X = x[:, None] - x[None, :]
+        # expKx = free_propagator(X, dt, mass=mx)
+        
+        # Y = y[:, None] - y[None, :]
+        # expKy = free_propagator(Y, dt, mass=my)
+ 
+
+
+        # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
+        self.T = [Tx, Ty]
+        self.exp_K = [expKx, expKy]
+        return 
+    
+    def run(self, dt, nt, nout=1, t0=0):
+        
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        U = self.short_time_propagator(dt)
+        U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
+        
+        results = {} 
+        results['rholist'] = []
+        
+        # psi0 = psi0.reshape((nx * ny * nstates))
+        
+        beta = np.power(2, range(1, nt+1)) * dt # inverse temperature
+        results['beta'] = beta 
+        
+        for k in range(nt):
+            U = U @ U
+            results['rholist'].append(U.copy())
+
+            # psi = U @ psi0
+            
+            # psi = psi.reshape((nx, ny, nstates))
+            # results['psilist'].append(psi.copy())
+            
+        return results 
+    
     
 class SincDVR2(WPD2):
     """
@@ -1882,6 +2172,7 @@ class SincDVR_PBC(SincDVR2):
         self.exp_K = [expKx, expKy]
         return 
 
+
 if __name__ == '__main__':
 
     
@@ -1917,11 +2208,10 @@ if __name__ == '__main__':
     ny = len(y)
     
     nb = len(x) * len(y)
-    print('dx = ', interval(x))
+    dx = interval(x)
+    dy = interval(y)
 
-    #mol = Pyrazine(x, y)
-    #v = mol.buildV() #(65, 65, 3, 3)    
-    # v = dpes(x, y) #(65, 65, 2, 2) 
+
 
     
     nstates = 4
@@ -1950,7 +2240,7 @@ if __name__ == '__main__':
     
     domains = [[-6,6], ]*2
     levels = [5, ] * 2 
-    solver = LDRN(domains=domains, levels=levels, nstates = nstates, \
+    solver = LDR2(x, y, nstates = nstates, \
                   mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
     solver.v = v
@@ -1961,18 +2251,35 @@ if __name__ == '__main__':
         for j in range(ny):
             psi0[i,j,3] = gwp(np.array([x[i], y[j]]), x0=[0, 0], ndim=2)
     
+    # psi0 = np.reshape(psi0, (nx*ny*nstates,1))
+    
     # transfrom the initial state to the adiabatic representation
     # psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
 
     dt = 0.2/au2fs
     nt = 100
     nout = 1
+    
+    def rdm(psi):
+        rho = np.einsum('ija, ijb -> ab', psi.conj(), psi) * dx * dy
+        return rho 
+                
+    # U = solver.short_time_propagator(dt)
+    # U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
+    
+    # for k in range(6):
+    #     U = U @ U
+    #     psi = U @ psi0
+    #     psi = psi.reshape((nx, ny, nstates))
+    #     rho = rdm(psi)
+    #     print(rho[0,0], rho[1,1], rho[2,2], rho[3,3])
+    
     result = solver.run(psi0=psi0, dt=dt, nt=nt, nout=nout)
 
-    fig, ax = plt.subplots()
-    for n in range(nstates):
-        ax.plot(x, solver.apes[:, ny//2, n], label='{}'.format(n))
-    ax.legend()
+    # fig, ax = plt.subplots()
+    # for n in range(nstates):
+    #     ax.plot(x, solver.apes[:, ny//2, n], label='{}'.format(n))
+    # ax.legend()
     
         
     end_time = time.time()    

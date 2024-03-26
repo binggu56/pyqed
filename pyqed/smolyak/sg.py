@@ -952,7 +952,7 @@ if __name__=="__main__":
     
     # # x = np.linspace(-6, 6, 2**5, endpoint=False)[1:]
 
-    index_set, c = sg.combination_technique(3) 
+    index_set, c = sg.combination_technique() 
     
     print(index_set)
     print(c)

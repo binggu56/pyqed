@@ -109,10 +109,7 @@ class ResultSPO2(Result):
             p[:, n] = [norm2(psi[:, :, n]).real * dx * dy for psi in self.psilist]
         # p1 = [norm2(psi[:, :, 1]) * dx * dy for psi in self.psilist]
         
-        if plot:
-            fig, ax = plt.subplots()
-            for n in range(self.nstates):
-                ax.plot(self.times, p[:,n])
+
             # ax.plot(self.times, p1)
         
         self.population = p
@@ -120,7 +117,14 @@ class ResultSPO2(Result):
             # fname = 'population'
             np.savez(fname, p)
             
-        return p
+        if plot:
+            fig, ax = plt.subplots()
+            for n in range(self.nstates):
+                ax.plot(self.times, p[:,n])
+            return fig, ax
+        
+        else:   
+            return p
     
     def plot_population(self, p):
         

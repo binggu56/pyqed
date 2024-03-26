@@ -494,15 +494,14 @@ class CTOE(TCL2):
         
         
         # dg = np.zeros_like(g2, dtype=complex)
-        
         # dg[0] = (g2[1] - g2[0])/dt
         # for i in range(1, nt-1):
         #     dg[i] = (g2[i+1] - g2[i-1])/(dt * 2)
             
         # print('dG', dg[-1])
-        # dg = np.gradient(g2, dt, axis=0)
+        dg = np.gradient(g2, dt, axis=0)
             
-        dg = gradientG(t)
+        # dg = gradientG(t)
         # print('DG', dg[-1])
         
 
@@ -613,8 +612,8 @@ if __name__=='__main__':
     # nt = 100 
     # rho = sol.run(rho0=rho0, dt=0.001, nt=nt, temperature=3e5, cutoff=5, reorganization=0.2, nado=5)
     # print(rho)
-    dt = 0.0025
-    nt = 8000 * 2
+    dt = 0.05
+    nt = 8000
     t = dt * np.arange(nt)
 
     
@@ -625,7 +624,7 @@ if __name__=='__main__':
 #    # G = time_local_generator(t)
 
     gamma=1
-    reorg=0.004
+    reorg=0.002
     T = 1
     
     def corr(t, gamma=gamma, reorg=reorg, T=T):
@@ -664,11 +663,12 @@ if __name__=='__main__':
     ax.plot(t, observables[1,:], 'k', lw=2,label='HEOM')
     
     rho0 = dm2vec(rho0)
-    # observables, szAve = sbm.TCL2(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
+    
+    observables, szAve = sbm.TCL2(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
 
-    # # ax.plot(t, observables[0,:])
-    # ax.plot(t, observables[1,:], 'C0-',label='TCL2')
-    # # ax.plot(t, szAve, 'C0', label='TCL2')    
+    # ax.plot(t, observables[0,:])
+    ax.plot(t, observables[1,:], 'C0-',label='TCL2')
+    # ax.plot(t, szAve, 'C0', label='TCL2')    
     
     
     observables, szAve = sbm.CTOE(e_ops = [sz, sx]).run(rho0, dt=dt, nt=nt)
@@ -680,8 +680,9 @@ if __name__=='__main__':
     # ax.plot(t[:-1], observables[0,:])
     ax.plot(t[:-1], observables[1,:], 'C1',label='CTOE' )
     
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, ncols=1)
 
+    fig.savefig('sx.pdf')
     
     
     
