@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 import scipy.sparse.linalg as sla
 import scipy.special.orthogonal as ortho
+import scipy
 # import bessel
 import warnings
 
@@ -214,16 +215,20 @@ class SincDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, x): #npts, L, x0=0.):
+    def __init__(self,  L, npts, x0=0.):
 
-        self.npts = len(x)
-        self.L = x.max() - x.min()
-        self.x0 = x[self.npts//2]
-        # self.a = L / npts
-        self.a = interval(x)
+        self.npts = npts
+        # self.L = x.max() - x.min()
+        self.L = L
+        # self.x0 = x[self.npts//2]
+        self.a = self.dx = L / npts
+        self.x0 = x0
+        # self.a = interval(x)
         self.n = np.arange(self.npts)
         # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
-        self.x = x 
+        self.x = self.x0 + self.n * self.a - self.L / 2. 
+
+        # self.x = x 
         self.w = np.ones(self.npts, dtype=np.float64) * self.a
         self.k_max = np.pi/self.a
         
@@ -273,13 +278,29 @@ class SincDVR(DVR):
         x_n = self.x[np.newaxis, :]
         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
 
-class SincDVRPeriodic(SincDVR):
-    r"""Sinc function basis for periodic functions over an interval
-    `x0 +- L/2` with `N` points."""
-    def __init__(self, *v, **kw):
+# class SincDVRPeriodic(SincDVR):
+class ExponentialDVR(SincDVR):
+    r"""
+    Sinc function basis for periodic functions over an interval
+    `x0 +- L/2` with `N = 2n + 1` points.
+    
+    Refs
+        M.H. Beck et al. Physics Reports 324 (2000) 1-105, P94
+        
+    """
+    def __init__(self, n, L=1 ,x0=0, *v, **kw):
         # Small shift here for consistent abscissa
-        SincDVR.__init__(self, *v, **kw)
-        self.x -= self.a/2.
+        # SincDVR.__init__(self, *v, **kw)
+        # self.x -= self.a/2.
+        self.npts = self.N = 2*n + 1
+        self.L = L
+        self.n = np.arange(self.npts)
+        self.x0 = x0
+        self.a = self.L/self.npts
+        self.x = self.x0 + self.n * self.a - self.L / 2. 
+
+        self.kx = (self.n - n) * 2 * np.pi/self.L
+        scipy.fftpack.fftfreq
 
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
@@ -300,6 +321,27 @@ class SincDVRPeriodic(SincDVR):
         T *= (np.pi/self.L)**2.
         T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
         return T
+    
+    def derivative(self):
+        """
+        DVR expression for derivative operator d/dx
+
+        Returns
+        -------
+        D : TYPE
+            DESCRIPTION.
+
+        """
+        _m = self.n[:, np.newaxis]
+        _n = self.n[np.newaxis, :]
+        
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            D = np.pi/self.L * (-1.)**(_m-_n)/np.sin(np.pi * (_m - _n)/self.npts)
+        
+        return D        
+        
 
     def f(self, x=None):
         """Return the DVR basis vectors"""
@@ -313,6 +355,35 @@ class SincDVRPeriodic(SincDVR):
         if (0 == self.npts % 2):
             f *= np.exp(-1j*np.pi*(x_m-x_n)/self.L)
         return f
+    
+    def run(self, v, k=6):
+        if callable(v):
+            V = np.diag(v(self.x)) 
+        else:
+            V = np.diag(v)
+        
+        h = V + self.t()
+                
+
+        # Get the eigenpairs
+        # There are multiple options here.
+        # If the user is asking for all of the eigenvalues,
+        # then we need to use np.linalg.eigh()
+        if k == h.shape[0]:
+            E, U = np.linalg.eigh(h)
+        # But if we don't need all eigenvalues, only the smallest ones,
+        # then when the size of the H matrix becomes large enough, it is
+        # better to use sla.eigsh() with a shift-invert method. Here we
+        # have to have a good guess for the smallest eigenvalue so we
+        # ask for eigenvalues closest to the minimum of the potential.
+        else:
+            E, U = sla.eigsh(h, k=k, which='LM',
+                             sigma=v.min())
+  
+        self.eigvals = E
+        self.eigvecs = U
+        # self.potential = V 
+        return E, U
 
 class SineDVR(DVR):
     r"""Sine function basis for non-periodic functions over an interval
@@ -679,12 +750,19 @@ class VFactory(object):
 
 if __name__ == '__main__':
     x = np.linspace(-7, 7, 200)
-    dvr = SincDVR(x)
-    x = dvr.x 
-    
     def v(x):
-        return x**2
+        return x**2/2
+        
+    def test_sincdvr():
+        dvr = SincDVR(npts=20, L=10)
     
-    w, u = dvr.run(v, num_eigs=2)
-    dvr.draw_states()
-    # dvr = HermiteDVR(npts=20)
+        # dvr = HermiteDVR(npts=10)
+        x = dvr.x 
+        
+
+        w, u = dvr.run(v, num_eigs=10)
+        dvr.draw_states()
+    
+    dvr = ExponentialDVR(n=6)
+    print(dvr.kx)
+    dvr.run(v, k=5)

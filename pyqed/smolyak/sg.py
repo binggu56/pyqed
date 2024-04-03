@@ -321,6 +321,24 @@ class SparseGrid:
         self.index_set = num2idx.keys()
     
     def combination_technique(self, q=None):
+        """
+
+        Refs
+            Sparse grid tutorial
+
+        Parameters
+        ----------
+        q : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        index_set : TYPE
+            DESCRIPTION.
+        c : TYPE
+            DESCRIPTION.
+
+        """
         # Sparse grid combination technique
         
         d = self.dim
@@ -330,11 +348,11 @@ class SparseGrid:
         index_set = [] # level sets included in the SGCT technique
         c = []
         
-        for j in range(d):
+        for q in range(d):
             # levels = list(combinations_with_replacement_counts(d, self.level -j))
-            levels = balls_in_boxes(self.level + (d-1) -j, d)
+            levels = balls_in_boxes(self.level - q, d)
             index_set += levels
-            c += [(-1)**j * math.comb(d-1, j)] * len(levels)     
+            c += [(-1)**q * math.comb(d-1, q)] * len(levels)     
         
         
         # for i in range(l[0] - q +1, l[0]+1):
@@ -350,8 +368,24 @@ class SparseGrid:
         # self.coeff 
         return index_set, c
     
-    def truncated_combination_technique(self, tau):
-        pass
+    def truncated_combination_technique(self, tau=1):
+        d = self.dim
+
+        # l = [self.level, ] * self.dim # isotropic, can be generalized to anisotropic
+        
+        index_set = [] # level sets included in the SGCT technique
+        c = []
+        
+        # level = self.level + tau
+        
+        for q in range(d):
+            # levels = list(combinations_with_replacement_counts(d, self.level -j))
+            levels = balls_in_boxes(self.level + tau - q, d, minimum=int(self.level/2))
+            index_set += levels
+            c += [(-1)**q * math.comb(d-1, q)] * len(levels)     
+
+        
+        return index_set, c
                 
     def printGrid(self):
         print(self.hSpace)
@@ -860,7 +894,7 @@ if __name__=="__main__":
         
         return v
 
-    level = 4
+    level = 8
     dim = 2
     
     # # reference calculation
@@ -955,7 +989,16 @@ if __name__=="__main__":
     index_set, c = sg.combination_technique() 
     
     print(index_set)
+    print(len(c))
     print(c)
+    
+    
+    index_set, c = sg.truncated_combination_technique(tau=5) 
+    print('truncated')
+    print(index_set)
+    print(len(c))
+    print(c)
+
     # s = 0
     # for n, index in enumerate(index_set):
     #     i, j,z = index

@@ -12,6 +12,7 @@ from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, in
     cartesian_product, discretize, norm2
 from pyqed.wpd import ResultSPO2
 from pyqed.ldr.gwp import WPD2
+from pyqed.dvr.dvr_1d import HermiteDVR, SincDVR
 
 import warnings
 
@@ -146,9 +147,6 @@ def kinetic(x, mass=1, dvr='sinc'):
             
         T *= (np.pi/L)**2.
         T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
-    
-    else:
-        raise ValueError("DVR {} does not exist. Please use sinc, sinc_periodic, sine.")
 
     return T
 
@@ -302,7 +300,7 @@ class LDRN:
     This is extremely expansive, the maximum dimension should be < 4. 
     
     """
-    def __init__(self, domains, levels, ndim=3, nstates=2, mass=None, dvr_type='sine'): 
+    def __init__(self, domains, levels, ndim=3, nstates=2, x0=None, mass=None, dvr_type='sine'): 
 
         assert(len(domains) == len(levels) == ndim)
         
@@ -310,20 +308,37 @@ class LDRN:
 
         
         x = []
+        w = [] 
+        dvr = []
         if dvr_type in ['sinc', 'sine']:
-        
+            # uniform grid 
             for d in range(ndim):
+                l = levels[d]
                 x.append(discretize(*domains[d], levels[d], endpoints=False))
-        # elif dvr_type == 'sine':
+                _w = [1/(2**l-1), ] * (2**l-1)
+                w.append(_w)
+                
+        elif dvr_type == 'gauss_hermite':
+            
+            assert x0 is not None
+            
+            for d in range(ndim):
+                _dvr = HermiteDVR(x0[d], levels[d])
+                x.append(_dvr.x)
+                w.append(_dvr.w)
+                dvr.append(_dvr.copy())
+        
         else:
             raise ValueError('DVR {} is not supported. Please use sinc.')
             
         
         self.x = x
-        self.dx = [interval(_x) for _x in x]
+        self.w = w # weights
+        self.dvr = dvr 
+        # self.dx = [interval(_x) for _x in x]
         self.nx = [len(_x) for _x in x] 
         
-        self.dvr_type = dvr_type
+        self.dvr_type = [dvr_type, ] * ndim
         
         if mass is None:
             mass = [1, ] * ndim
@@ -391,7 +406,7 @@ class LDRN:
         
         for d in range(self.ndim):
                     
-            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type)
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
             
             # we can use free-particle propagator for the e^{-i K \Delta t}
             expKx = scipy.linalg.expm(-1j * Tx * dt)
@@ -569,7 +584,98 @@ class LDRN:
         
         rho = np.einsum(einsum_string, psi.conj(), psi) * vol
         return rho
+
+def gauss_hermite_quadrature(npts, xmax=None, x0=0.):
+        assert (npts < 269), \
+            "Must make npts < 269 for numpy to find quadrature points."
+        n = np.arange(npts)
+        c = np.zeros(npts+1)
+        c[-1] = 1.
+        x = np.polynomial.hermite.hermroots(c)
+        if xmax is None:
+            gamma = 1.
+        else:
+            assert xmax is None, "Sorry, xmax is currently broken"
+            gamma = x.max() / float(xmax)
+
+        x = x0 + x / gamma
+        w = np.exp(-np.square(x))
+        L = x.max() - x.min()
+        a = None
+        k_max = None
+        return x, w 
+        
+class GaussHermiteLDRN(LDRN):
     
+    def __init__(self, x0, levels, ndim=3, nstates=2, mass=None): 
+
+        assert(len(domains) == len(levels) == ndim)
+        
+        self.L = [domain[1] - domain[0] for domain in domains]
+
+        
+        x = []
+        if dvr_type in ['sinc', 'sine']:
+        
+            for d in range(ndim):
+                x.append(discretize(*domains[d], levels[d], endpoints=False))
+        # elif dvr_type == 'sine':
+        else:
+            raise ValueError('DVR {} is not supported. Please use sinc.')
+            
+        
+        self.x = x
+        self.dx = [interval(_x) for _x in x]
+        self.nx = [len(_x) for _x in x] 
+        
+        self.dvr_type = dvr_type
+        
+        if mass is None:
+            mass = [1, ] * ndim
+        self.mass = mass
+        
+        self.nstates = nstates
+        self.ndim = ndim
+        
+        # all configurations in a vector
+        self.points = np.fliplr(cartesian_product(x))
+        self.npts = len(self.points)
+
+        ###
+        self.H = None
+        self._K = None
+        # self._V = None
+        
+        self._v = None
+        self.exp_K = None
+        self.exp_V = None
+        self.wf_overlap = self.A = None
+        self.apes = None
+        
+
+
+    def t(self, hc=1., mc2=1.):
+        """Return the kinetic energy matrix.
+        Usage:
+            T = self.t(V)
+
+        @returns T kinetic energy matrix
+        """
+        _i = self.n[:, np.newaxis]
+        _j = self.n[np.newaxis, :]
+        _xi = self.x[:, np.newaxis]
+        _xj = self.x[np.newaxis, :]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            T = 2.*(-1.)**(_i-_j)/(_xi-_xj)**2.
+
+        T[self.n, self.n] = 0.
+        T += np.diag((2. * self.npts + 1.
+                      - np.square(self.x)) / 3.)
+        T *= self.gamma
+        T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
+        return T
 
 # class LDRN:
 #     """
@@ -783,7 +889,7 @@ class LDR2(WPD2):
     LDR-SPO-SincDVR
     
     """
-    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sine'):
+    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sinc'):
         self.x = x
         self.y = y
         self.dx = interval(x)
@@ -1293,6 +1399,52 @@ class LDR2(WPD2):
             
         return results 
     
+    def fast_LvN(self, rho0, dt, nt, nout=1, t0=0):
+        """
+        solve Liouville von Newnman equation by exponential integrator
+
+        Parameters
+        ----------
+        rho0 : TYPE
+            DESCRIPTION.
+        dt : TYPE
+            DESCRIPTION.
+        nt : TYPE
+            DESCRIPTION.
+        nout : TYPE, optional
+            DESCRIPTION. The default is 1.
+        t0 : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        results : TYPE
+            DESCRIPTION.
+
+        """
+        
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        U = self.short_time_propagator(dt)
+        U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
+        
+        results = {} 
+        results['psilist'] = []
+        
+        rho0 = rho0.reshape((nx * ny * nstates, nx * ny * nstates))
+        
+        times = np.power(2, range(1, nt+1)) * dt
+        results['times'] = times 
+        
+        for k in range(nt):
+            U = U @ U
+            rho = U @ rho0 @ dag(U)
+            
+            rho = rho.reshape((nx, ny, nstates, nx, ny, nstates))
+            results['rho'].append(rho.copy())
+            
+        return results 
+    
     def rdm_el(self, psi):
         """
         Compute the reduced electronic density matrix
@@ -1382,7 +1534,7 @@ class LDR2(WPD2):
 
 class LDR2_IT(LDR2):
     """
-    imaginary-time local diabatic representation
+    imaginary-time local diabatic representation in 2D
     """
     def buildV(self, dt):
         """
@@ -1461,16 +1613,6 @@ class LDR2_IT(LDR2):
         # Tx = np.zeros((self.nx, self.nx))
         mx, my = self.mass 
         
-
-        # for n in range(nx):
-        #     Tx[n, n] = np.pi**2/3 * 1/(2 * mx * dx**2)
-            
-        #     for m in range(n):
-        #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
-        #         Tx[m, n] = Tx[n, m]
-        
-
-        
         Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
         
         expKx = scipy.linalg.expm(- Tx * dt)
@@ -1494,15 +1636,16 @@ class LDR2_IT(LDR2):
         self.exp_K = [expKx, expKy]
         return 
     
-    def run(self, dt, nt, nout=1, t0=0):
+    def run(self, dt, nt):
         
         nx, ny, nstates = self.nx, self.ny, self.nstates
         
         U = self.short_time_propagator(dt)
+
         U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
         
         results = {} 
-        results['rholist'] = []
+        results['rho'] = []
         
         # psi0 = psi0.reshape((nx * ny * nstates))
         
@@ -1511,7 +1654,8 @@ class LDR2_IT(LDR2):
         
         for k in range(nt):
             U = U @ U
-            results['rholist'].append(U.copy())
+
+            results['rho'].append(U.copy())
 
             # psi = U @ psi0
             
