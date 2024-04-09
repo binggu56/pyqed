@@ -22,6 +22,7 @@ ev2wavenumber = 8065.73
 
 au2debye =  2.541765 # hbar^2/(m_e * e)
 au2amu  =  5.4857990e-4   # 1 electron mass to  u ( unified atomic mass unit)
+amu_to_au = amu2au = 1822.888486217313
 
 
 au2nm = bohr2nanometer = 0.0529177249 # nanometer
