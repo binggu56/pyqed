@@ -31,6 +31,12 @@ def toarray(psilist):
 
 
 class Pyrrole:
+    """
+    S2/S0 conical intersection model for photodissociation of pyrrole
+    
+    Refs
+        Domcke
+    """
     def __init__(self):
 
         self.r0 = 1.959 # equilibrium bond length at theta = 0

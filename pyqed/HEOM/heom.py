@@ -319,7 +319,7 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     def L(ado):
         rhs = np.zeros_like(ado)
         
-        rhs[:,:,0] = - 1j * comm(H, ado[:,:,0]) * dt - \
+        rhs[:,:,0] = - 1j * comm(H, ado[:,:,0]) - \
                 comm(sz, ado[:,:,1])
 
         for n in range(1, nado-1):
