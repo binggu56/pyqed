@@ -280,6 +280,7 @@ def scan_pes_along_normal_mode(mf, mode_id, excited=False):
         
     # Calculate Hessian
     h_GS = mf.Hessian().kernel()
+    mol = mf.mol
     
     # The structure of h is
     # h[Atom_1, Atom_2, Atom_1_XYZ, Atom_1_XYZ]
@@ -364,9 +365,13 @@ def scan_pes_along_normal_mode(mf, mode_id, excited=False):
             # atom = build_atom_from_coords(atom_symbol_list, coords)
             mol.set_geom_(coords)
             
-            eg = mol.RKS().run().e_tot
+            mf = mol.RKS()
+            mf.kernel()
             
-            ee = mf.TDDFT().run().e_tot
+            eg = mf.e_tot
+            
+            td = mf.TDDFT().run()
+            ee = td.e_tot
             # eks.append([eg] + [ee])
             
             pes[i, 0] = eg
@@ -655,6 +660,23 @@ def isrelaxed(mf):
     return (abs(grad).sum()<1e-5) # making sure the geometry is relaxed
 
 
+def geom_opt(mf):
+    
+    from pyscf.geomopt.berny_solver import optimize
+
+    mol = optimize(mf)
+
+    # self.mol = mol # optimized geometry
+
+    # self.coords = mol.atom_coords()
+
+    # mf_opt = dft.RKS(mol)
+    # mf_opt.xc = mf.xc
+
+    # mf_opt.kernel()
+    
+    return mol
+            
 if __name__=='__main__':
     
     from pyscf.hessian import thermo
@@ -663,10 +685,10 @@ if __name__=='__main__':
     mol = gto.M(
         basis = 'ccpvdz')
     
-    # mol.atom = [['O', [0.000000000000,  -0.000000000775,   0.923671924285]],
-    #             ['H', [-0.000000000000,  -1.432564848017,   2.125164039823]],
-    #             ['H', [0.000000000000,   1.432564848792,   2.125164035930]]]
-    mol.unit = 'A'
+#     # mol.atom = [['O', [0.000000000000,  -0.000000000775,   0.923671924285]],
+#     #             ['H', [-0.000000000000,  -1.432564848017,   2.125164039823]],
+#     #             ['H', [0.000000000000,   1.432564848792,   2.125164035930]]]
+#     mol.unit = 'A'
     
     mol.atom =    '''
     C                  0.00000000    0.41886300    0.00000000
@@ -675,39 +697,51 @@ if __name__=='__main__':
     H                  0.44628800    1.42845900    0.00000000
     H                  1.91767800   -0.34615900    0.00000000
     H                  0.64667800   -1.52603300    0.00000000
-     '''
+      '''
     mol.build()
     
     mf = mol.RKS().run()
     
     
-
-# Build pyrazine molecule
-# mol = gto.Mole()
-# mol.build(
-#     atom = '''
-#     N   -2.912892    0.444945    0.040859
-#     C   -3.191128   -0.790170    0.027261
-#     C   -4.458793   -1.235223   -0.013632
-#     N   -5.447661   -0.444953   -0.040858
-#     C   -5.169422    0.790163   -0.027260
-#     C   -3.901761    1.235215    0.013633
-#     H   -2.344820   -1.496317    0.050492
-#     H   -4.678296   -2.315552   -0.024843
-#     H   -6.015733    1.496310   -0.050491
-#     H   -3.682256    2.315544    0.024844
-#     ''',
-#     basis = 'sto-3g',
-#     symmetry = False,
-# )    
-
-    # qx, ex = scan_pes_along_normal_mode(mf, mode_id=3, excited=False)
-    # plt.plot(qx, ex, '-o')
     
-    create_displaced_geometries(mol, mode_id=3)
+    from pyscf.geomopt.berny_solver import optimize
+
+    mol = optimize(mf)
     
+    save_to_xyz(mol, 'formamide.xyz')    
+    # mf = mol.RKS().kernel()
+    # print(isrelaxed(mf))
 
+    
+    # print(mol.atom_coords())
 
+# # Build pyrazine molecule
+# # mol = gto.Mole()
+# # mol.build(
+# #     atom = '''
+# #     N   -2.912892    0.444945    0.040859
+# #     C   -3.191128   -0.790170    0.027261
+# #     C   -4.458793   -1.235223   -0.013632
+# #     N   -5.447661   -0.444953   -0.040858
+# #     C   -5.169422    0.790163   -0.027260
+# #     C   -3.901761    1.235215    0.013633
+# #     H   -2.344820   -1.496317    0.050492
+# #     H   -4.678296   -2.315552   -0.024843
+# #     H   -6.015733    1.496310   -0.050491
+# #     H   -3.682256    2.315544    0.024844
+# #     ''',
+# #     basis = 'sto-3g',
+# #     symmetry = False,
+# # )    
+
+#     # qx, ex = scan_pes_along_normal_mode(mf, mode_id=3, excited=False)
+#     # plt.plot(qx, ex, '-o')
+    
+#     create_displaced_geometries(mol, mode_id=3)
+    
+    # mol = gto.M(atom="geometry5.xyz", basis = 'ccpvdz')
+    # mf = mol.RKS().run()
+    # ee = mf.TDDFT().run().e_tot
     
     # plt.plot(qx, ex[:, 1], '-o')
     # plt.plot(qx, ex[:, 2], '-o')
