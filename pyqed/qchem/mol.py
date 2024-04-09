@@ -17,9 +17,36 @@ from numpy import sin, cos, pi
 from numpy.linalg import norm
 import numpy as np
 
+from pyscf import dft, scf, gto
+
 # Suppress scientific notation printouts and change default precision
 np.set_printoptions(precision=4)
 np.set_printoptions(suppress=True)
+
+
+def build_atom_from_coords(atom_symbol_list, coords):
+    """
+    construct the atom data format (i.e. xyz format) used in pyscf from coordinates and atom symbols
+
+    Parameters
+    ----------
+    atom_symbol_list : TYPE
+        DESCRIPTION.
+    coords : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atom : TYPE
+        DESCRIPTION.
+
+    """
+    natm = len(atom_symbol_list)
+    atom = []
+    for n in range(natm):
+        atom.append([atom_symbol_list[n],  coords[n, :].tolist()])
+
+    return atom 
 
 # try:
 #     from cclib.parser.data import ccData
@@ -453,13 +480,15 @@ def intertia_moment(mass, coords):
 #         pass
 
 
-# class Molecule(pyscf.gto.Mole):
+# class Molecule(gto.M):
 class Molecule:
     def __init__(self, **kwargs):
 
+        # mol = super(Molecule, self).__init__(**kwargs)        
+        
         mol = gto.M(**kwargs)
-
-        self.mol = mol
+        
+        self.mol = mol 
         # self.atom_coord = mol.atom_coord
         self.atom_coords = (mol.atom_coords()) # shape 3, natoms
         # print(self.atom_coords.shape)
@@ -876,8 +905,30 @@ def eckart(reference, changed, mass, option=None):
     return xyz_rot
 
 
+def scan_pes(method='dft'):
+    x = np.arange(0.7, 4.01, .1)
+    
+    mol = gto.Mole()
+    if method == 'hf':
+        mf_scanner = scf.RHF(mol).as_scanner()
+    elif method == 'dft':
+        mf_scanner = dft.RKS(mol).set(xc='b3lyp').as_scanner()
+
+    ehf1 = []
+    for b in np.arange(0.7, 4.01, 0.1):
+        mol = gto.M(verbose = 5,
+                    output = 'out_hf-%2.1f' % b,
+                    atom = [["F", (0., 0., 0.)],
+                            ["H", (0., 0., b)],],
+                    basis = 'cc-pvdz')
+        ehf1.append(mf_scanner(mol))
+        
+    import matplotlib.pyplot as plt
+    plt.plot(x, ehf1, '-o', label='HF,0.7->4.0')    
+
+
 if __name__ == '__main__':
-    from pyscf import scf, gto, tdscf
+    from pyscf import gto, tdscf
     # from lime.units import au2fs, au2ev
     import proplot as plt
 
@@ -908,7 +959,8 @@ if __name__ == '__main__':
     print(mol2.eckart_frame(mol.atom_coords()))
 
     # print(mol.natm)
-
+    
+    scan_pes()
     # mole = Molecule(mol)
     # mol.zmat(rvar=True)
     # mf = scf.RHF(mol).run()
