@@ -63,7 +63,7 @@ class Hessian(Molecule):
 
         return
 
-    def normal_modes(self, imaginary_freq=True):
+    def run(self, imaginary_freq=True):
         """
         
 
@@ -247,7 +247,7 @@ class Scanner:
 def atom_symbols(mol):
     return [mol.atom_symbol(i) for i in range(mol.natm)]
 
-def scan_pes_along_normal_mode(mf, mode_id, excited=False):
+def scan_pes_along_normal_mode(mf, mode_id, npts=9, excited=False):
     """
     create geometries for scanning the APES along chosen normal coordinates
     
@@ -331,7 +331,7 @@ def scan_pes_along_normal_mode(mf, mode_id, excited=False):
     print('Scanning mode {} '.format(mode_id), 'frequency', freq1*au2wavenumber)
 
 
-    Qx = np.linspace(-4, 4, 9)  # mass- and frequency-weighted dimensionless coordinates
+    Qx = np.linspace(-8, 8, npts)  # mass- and frequency-weighted dimensionless coordinates
     qx = Qx/np.sqrt(freq1) # mass-weighted coordinates
     
     configurations = []
@@ -350,6 +350,9 @@ def scan_pes_along_normal_mode(mf, mode_id, excited=False):
             mol.set_geom_(coords)
             eks.append(mol.RKS().run().e_tot)
             # configurations.append(atom.copy())
+            
+        
+        return Qx, np.array(eks)
         
     else:
         
@@ -439,7 +442,7 @@ def save_to_xyz(mol, fname=None):
         f.write('{} {} {} {}\n'.format(mol.atom_symbol(i), *mol.atom_coord(i)))
     return
 
-def create_displaced_geometries(mol, mode_id, npts=9, sampling='scan'):
+def create_displaced_geometries(mf, mode_id, npts=9, sampling='scan'):
     """
     create geometries for scanning the APES along chosen normal coordinates
     
@@ -486,6 +489,7 @@ def create_displaced_geometries(mol, mode_id, npts=9, sampling='scan'):
         
     # Calculate Hessian
     h_GS = mf.Hessian().kernel()
+    mol = mf.mol
     
     # The structure of h is
     # h[Atom_1, Atom_2, Atom_1_XYZ, Atom_1_XYZ]
@@ -567,6 +571,8 @@ def create_displaced_geometries(mol, mode_id, npts=9, sampling='scan'):
             save_to_xyz(mol, fname=fname)
     
         num_configs = len(configurations)
+        
+        return Qx
 
         
     elif len(mode_id) == 2:
@@ -574,52 +580,62 @@ def create_displaced_geometries(mol, mode_id, npts=9, sampling='scan'):
         # Choose two normal models        
         
         m, n = mode_id
-        mode1 = modes_GS_last[:, 2]  # third mode
-        mode2 = modes_GS_last[:, 5]  # Sixth mode
-        freq1 = freq_GS_last[2] 
-        freq2 = freq_GS_last[5]
+        mode1 = modes_GS_last[:, m]  
+        mode2 = modes_GS_last[:, n]
+        freq1 = freq_GS_last[m] 
+        freq2 = freq_GS_last[n]
+        
+        print('Scanning modes {} and {} with frequencies (cm^-1) {} {}.'.format(m, n, \
+                                freq1*au2wavenumber, freq2*au2wavenumber))
+
         
         # Step 2: Set up the grid for mass-weighted normal coordinates Q in unit of sqrt(mass)*length 
-        Qx = np.linspace(-6, 6, 8)  # mass- and frequency-weighted coordinates
+        Qx = np.linspace(-6, 6, npts)  # mass- and frequency-weighted coordinates
         qx = Qx/np.sqrt(freq1) # mass-weighted coordinates
-        Qy = np.linspace(-6, 6, 8) 
+        Qy = np.linspace(-6, 6, npts) 
         qy = Qy/np.sqrt(freq2) # 33 points from -6 to 6
     
     
         configurations = []
         
         # # Step 3: Generate configurations: transform mass weighted coordinates to real coordinates
-        for displacement1 in qx:
-            for displacement2 in qy:
+        for i in range(npts):
+            displacement1 = qx[i] 
+            for j in range(npts): 
+                displacement2 = qy[j] 
                 
                 # Displace pyrazine along the two modes
                 displacement_vector = displacement1 * mode1 + displacement2 * mode2
                 scaled_displacement = displacement_vector / np.sqrt(atom_masses)
-                new_config = R0 + scaled_displacement.reshape(-1, 3)
                 
-                configurations.append(new_config.copy())
+                coords = R0 + scaled_displacement.reshape(-1, 3)
+                mol.set_geom_(coords)
                 
-
+                fname = 'geometry{}_{}.xyz'.format(i,j)
+                
+                save_to_xyz(mol, fname=fname)
+                
+                configurations.append(coords.copy())
     
         num_configs = len(configurations)
         # num_configs = len(grid_x) * len(grid_y)
         
-        for i in range(num_configs):
-            x_index, y_index = np.unravel_index(i, (len(Qx), len(Qy)))
-            print(f"Config {i} corresponds grid_x[{x_index}] and grid_y[{y_index}]")
+        # for i in range(num_configs):
+        #     x_index, y_index = np.unravel_index(i, (len(Qx), len(Qy)))
+        #     print(f"Config {i} corresponds grid_x[{x_index}] and grid_y[{y_index}]")
         
-        # save to file
-        for i, config in enumerate(configurations):
-            with open(f"config_{i}.xyz", 'w') as file:
-                file.write(f"{len(config)}\n")  
-                file.write(f"Configuration {i}\n")  
-                for atom, (x, y, z) in enumerate(config):
-                    atom_symbol = mol._atom[atom][0]  # Get the symbol of the atom
-                    file.write(f'{atom_symbol} {x} {y} {z}\n')
+        # # save to file
+        # for i, config in enumerate(configurations):
+        #     with open(f"config_{i}.xyz", 'w') as file:
+        #         file.write(f"{len(config)}\n")  
+        #         file.write(f"Configuration {i}\n")  
+        #         for atom, (x, y, z) in enumerate(config):
+        #             atom_symbol = mol._atom[atom][0]  # Get the symbol of the atom
+        #             file.write(f'{atom_symbol} {x} {y} {z}\n')
                 # for atom, coord in zip(mol.atom_symbols(), config):
                 #     file.write(f"{atom} {coord[0]} {coord[1]} {coord[2]}\n")
     
-    return Qx, eks
+        return Qx, Qy 
 
 
 # from pyqed import au2ev 
@@ -737,7 +753,7 @@ if __name__=='__main__':
 #     # qx, ex = scan_pes_along_normal_mode(mf, mode_id=3, excited=False)
 #     # plt.plot(qx, ex, '-o')
     
-#     create_displaced_geometries(mol, mode_id=3)
+    create_displaced_geometries(mol, mode_id=[2,5])
     
     # mol = gto.M(atom="geometry5.xyz", basis = 'ccpvdz')
     # mf = mol.RKS().run()
