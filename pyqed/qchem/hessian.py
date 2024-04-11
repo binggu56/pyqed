@@ -195,9 +195,10 @@ class Hessian(Molecule):
     def vibronic_coupling(self):
         pass
 
-    def scan(mode_id, npts=16, subfolder=False):
+    def scan(self, mode_id, npts=9, subfolder=False):
         # scan the APES along a normal mode or a few normal modes
-        pass
+        return scan_pes_along_normal_mode(self.mf, mode_id, npts)
+        
 
     def dip_derivative(self, mode_id, delta=0.01):
         # dipole derivative along a chosen normal mode by finite difference
@@ -373,9 +374,11 @@ def scan_pes_along_normal_mode(mf, mode_id, npts=9, excited=False):
             
             eg = mf.e_tot
             
+            
+            # excited-state calculations
             td = mf.TDDFT().run()
             ee = td.e_tot
-            # eks.append([eg] + [ee])
+            
             
             pes[i, 0] = eg
             pes[i, 1:] = ee
@@ -692,39 +695,64 @@ def geom_opt(mf):
     # mf_opt.kernel()
     
     return mol
-            
-if __name__=='__main__':
-    
-    from pyscf.hessian import thermo
-    import matplotlib.pyplot as plt
-    
-    mol = gto.M(
-        basis = 'ccpvdz')
-    
-#     # mol.atom = [['O', [0.000000000000,  -0.000000000775,   0.923671924285]],
-#     #             ['H', [-0.000000000000,  -1.432564848017,   2.125164039823]],
-#     #             ['H', [0.000000000000,   1.432564848792,   2.125164035930]]]
-#     mol.unit = 'A'
-    
-    mol.atom =    '''
-    C                  0.00000000    0.41886300    0.00000000
-    O                 -1.19648100    0.23330300    0.00000000
-    N                  0.93731400   -0.56226700    0.00000000
-    H                  0.44628800    1.42845900    0.00000000
-    H                  1.91767800   -0.34615900    0.00000000
-    H                  0.64667800   -1.52603300    0.00000000
-      '''
-    mol.build()
-    
-    mf = mol.RKS().run()
-    
-    
-    
+
+def opt(mf):
     from pyscf.geomopt.berny_solver import optimize
 
     mol = optimize(mf)
     
-    save_to_xyz(mol, 'formamide.xyz')    
+    save_to_xyz(mol, 'formamide.xyz')   
+    
+    return 
+
+if __name__=='__main__':
+    
+    # from pyscf.hessian import thermo
+    # import matplotlib.pyplot as plt
+    
+    mol = gto.M(basis = 'augccpvdz')
+    
+    mol.atom = [['O', [0.000000000000,  -0.000000000775,   0.923671924285]],
+                ['H', [-0.000000000000,  -1.432564848017,   2.125164039823]],
+                ['H', [0.000000000000,   1.432564848792,   2.125164035930]]]
+    mol.unit = 'A'
+    
+    # mol.atom =    '''
+    # C                  0.00000000    0.41886300    0.00000000
+    # O                 -1.19648100    0.23330300    0.00000000
+    # N                  0.93731400   -0.56226700    0.00000000
+    # H                  0.44628800    1.42845900    0.00000000
+    # H                  1.91767800   -0.34615900    0.00000000
+    # H                  0.64667800   -1.52603300    0.00000000
+    #   '''
+    mol.build()
+    
+    mf = mol.RKS().run()
+    mf.dip_moment()
+    
+    
+    td = mf.TDDFT().run(nstates=3)
+    
+    edip = td.transition_dipole()
+    mdip = td.transition_magnetic_dipole()
+    equad = td.transition_quadrupole()
+
+    print(edip.shape)
+    print(edip)
+    
+    print(mdip.shape)
+    
+    print(equad.shape)
+    
+    np.savez('dip', edip, mdip, equad)
+    
+
+    from pyscf.geomopt.geometric_solver import optimize
+    mol_eq = optimize(mf, maxsteps=100)
+
+    # save_to_xyz(mol, 'formamide_eq.xyz')   
+
+    
     # mf = mol.RKS().kernel()
     # print(isrelaxed(mf))
 
@@ -753,7 +781,7 @@ if __name__=='__main__':
 #     # qx, ex = scan_pes_along_normal_mode(mf, mode_id=3, excited=False)
 #     # plt.plot(qx, ex, '-o')
     
-    create_displaced_geometries(mol, mode_id=[2,5])
+    # create_displaced_geometries(mol, mode_id=[2,5])
     
     # mol = gto.M(atom="geometry5.xyz", basis = 'ccpvdz')
     # mf = mol.RKS().run()

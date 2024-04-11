@@ -122,7 +122,7 @@ def kinetic(x, mass=1, dvr='sinc'):
                                                
         T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
 
-    elif dvr == 'SincPeriodic':
+    elif dvr == 'periodic':
         
         _m = n[:, np.newaxis]
         _n = n[np.newaxis, :]
@@ -153,9 +153,9 @@ def kinetic(x, mass=1, dvr='sinc'):
 
 
 
-class SincDVR(WPD2):
+class NonHermitianLDR2(WPD2):
     """
-    N-state two-mode conical intersection dynamics with Fourier series 
+    N-state two-mode non-Hermitian conical intersection dynamics 
     
     LDR-SincDVR
     """
@@ -287,7 +287,7 @@ class SincDVR(WPD2):
             
     #     return 
     
-    def build_apes(self):
+    def buildV(self):
         nx, ny, nstates = self.nx, self.ny, self.nstates
 
         va = np.zeros((nx, ny, nstates), dtype=complex)
