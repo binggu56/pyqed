@@ -189,7 +189,21 @@ class Pyrrole:
 
         return
     
-    def inertia(self, r):
+    def moment_of_inertia(self, r):
+        """
+        return moment of inertia at bond length r
+
+        Parameters
+        ----------
+        r : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
         mH = atomic_mass['H'] /au2amu
         mN = atomic_mass['N'] /au2amu
         mM = 4. *(atomic_mass['C']/au2amu + mH)
@@ -197,9 +211,27 @@ class Pyrrole:
         mu_MN = mM * mN/(mM + mN)
 
         rMN = 2.7512
-        I = 1./(mu * r**2) + 1./(mu_MN * rMN**2)
+        Iinv = 1./(mu * r**2) + 1./(mu_MN * rMN**2)
 
-        return 1./I
+        return 1./Iinv
+    
+    def inertia(self, r):
+        """
+        Deprecated. Use moment_of_inertia(). 
+        Retained for compatibility. 
+
+        Parameters
+        ----------
+        r : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        return self.moment_of_inertia(r)
 
     def eigenstates(self, nstates=0, method='dvr'):
         

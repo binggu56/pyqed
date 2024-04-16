@@ -151,6 +151,26 @@ def kinetic(x, mass=1, dvr='sinc'):
     return T
 
 
+# def kinetic_energy_matrix(N):
+#     """
+#     Collbert-Miller DVR for an azimuthal coordinate [0, 2\pi] and the boundary conditions 
+#     in this case are that the wave function is periodic.
+    
+#     The basis functions are 
+#     .. math::
+#         \chi_i(\phi) = \frac{1}{\sqrt{2 \pi}} e^{i n \phi}, n = 0, \pm 1, ... \pm N
+
+#     Parameters
+#     ----------
+#     n : TYPE
+#         DESCRIPTION.
+
+#     Returns
+#     -------
+#     None.
+
+#     """
+    
 
 def free_propagator(x, t, mass=1):
     """
@@ -584,6 +604,90 @@ class LDRN:
         
         rho = np.einsum(einsum_string, psi.conj(), psi) * vol
         return rho
+
+
+
+class LDRN_Jacobi(LDRN):
+    """
+    LDRN solver for curvilinear coordinates with metric g_{\mu \nu}
+    The kinetic energy operator reads 
+    
+    .. math::
+        T_N = -\frac{1}{2} g_{\mu \nu}(\bf q) \frac{\partial}{\partial q^\mu}\
+            \frac{\partial}{\partial q^\nu}
+    """
+    def __init__(self, domains, levels, dvr_types, mass=None, ndim=2):
+        
+        assert(len(domains) == len(levels) == ndim)
+        
+        self.L = [domain[1] - domain[0] for domain in domains]
+        
+        # center of grids
+        self.x0 = [0.5 * (domain[1] + domain[0]) for domain in domains]
+        
+        x = []
+        w = [] 
+        dvr = []
+        for d in range(ndim):
+            dvr_type = dvr_types[d]
+            
+            if dvr_type in ['sinc', 'sine']:
+            # uniform grid 
+                l = levels[d]
+                x.append(discretize(*domains[d], levels[d], endpoints=False))
+                _w = [1/(2**l-1), ] * (2**l-1)
+                w.append(_w)
+                
+            elif dvr_type == 'gauss_hermite':
+                
+                for d in range(ndim):
+                    _dvr = HermiteDVR(self.x0[d], levels[d])
+                    x.append(_dvr.x)
+                    w.append(_dvr.w)
+                    dvr.append(_dvr.copy())
+            
+            elif dvr_type == 'fourier':
+                # _dvr = FourierDVR()
+                pass
+                
+            else:
+                raise ValueError('DVR {} is not supported. Please use sinc.'.format(dvr_type))
+            
+        
+        self.x = x
+        self.w = w # weights
+        self.dvr = dvr 
+        # self.dx = [interval(_x) for _x in x]
+        self.nx = [len(_x) for _x in x] 
+        
+        self.dvr_types = dvr_types
+        
+        if mass is None:
+            mass = [1, ] * ndim
+        self.mass = mass
+        
+        self.nstates = nstates
+        self.ndim = ndim
+        
+        # all configurations in a vector
+        self.points = np.fliplr(cartesian_product(x))
+        self.npts = len(self.points)
+
+        ###
+        self.H = None
+        self._K = None
+        # self._V = None
+        
+        self._v = None
+        self.exp_K = None
+        self.exp_V = None
+        self.wf_overlap = self.A = None
+        self.apes = None
+    
+    def metric(self, q):
+        # Cartesian/normal coordinates
+        g = np.diag(1/self.mass)
+        return g        
 
 def gauss_hermite_quadrature(npts, xmax=None, x0=0.):
         assert (npts < 269), \

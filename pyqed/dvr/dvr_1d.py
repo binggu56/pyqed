@@ -279,7 +279,7 @@ class SincDVR(DVR):
         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
 
 # class SincDVRPeriodic(SincDVR):
-class ExponentialDVR(SincDVR):
+class FourierDVR(SincDVR):
     r"""
     Sinc function basis for periodic functions over an interval
     `x0 +- L/2` with `N = 2n + 1` points.
@@ -300,7 +300,7 @@ class ExponentialDVR(SincDVR):
         self.x = self.x0 + self.n * self.a - self.L / 2. 
 
         self.kx = (self.n - n) * 2 * np.pi/self.L
-        scipy.fftpack.fftfreq
+        # scipy.fftpack.fftfreq
 
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.

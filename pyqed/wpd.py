@@ -428,7 +428,9 @@ class SPO2:
     def set_DPES(self, surfaces, diabatic_couplings, eta=None):
         """
         set the potential energy operatpr from the diabatic PES and vibronic couplings
-
+        
+        To be deprecated. 
+        
         Parameters
         ----------
         surfaces : TYPE
