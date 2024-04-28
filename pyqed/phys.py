@@ -792,7 +792,7 @@ def gwp(x, a=None, x0=0., p0=0., ndim=1):
     complex Gaussian wavepacket
     
     .. math::
-        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-(x-x_0) A (x-x_0) + i p_0(x-x_0)} 
+        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-1/2 (x-x_0) A (x-x_0) + i p_0(x-x_0)} 
 
     Parameters
     ----------

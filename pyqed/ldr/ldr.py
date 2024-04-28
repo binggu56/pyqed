@@ -355,7 +355,7 @@ class LDRN:
         self.x = x
         self.w = w # weights
         self.dvr = dvr 
-        # self.dx = [interval(_x) for _x in x]
+        self.dx = [interval(_x) for _x in x]
         self.nx = [len(_x) for _x in x] 
         
         self.dvr_type = [dvr_type, ] * ndim
@@ -688,6 +688,54 @@ class LDRN_Jacobi(LDRN):
         # Cartesian/normal coordinates
         g = np.diag(1/self.mass)
         return g        
+    
+    def buildK(self):
+        """
+        For the kinetic energy operator with Jacobi coordinates
+        
+        .. math::
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{2I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        .. math::
+            
+            e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+        
+        Does the ordering matter here?
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+
+
+        self.exp_K = []
+        
+        for d in range(self.ndim):
+                    
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
+            
+            # we can use free-particle propagator for the e^{-i K \Delta t}
+            expKx = scipy.linalg.expm(-1j * Tx * dt)
+            
+            
+
+            self.exp_K.append(expKx.copy())
+            
+        return self.exp_K
+        
 
 def gauss_hermite_quadrature(npts, xmax=None, x0=0.):
         assert (npts < 269), \
