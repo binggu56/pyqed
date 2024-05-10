@@ -544,10 +544,14 @@ class LDRN:
         if self.A is None:
             logging.info('building the electronic overlap matrix')
             self.build_ovlp()
+
+        size = np.prod(self.nx) * self.nstates        
         
         einsum_string = gen_enisum_string(self.ndim)
-        H = np.diag(self.apes) + contract(einsum_string, self.A, *self.K)
-            
+        H = np.diag(self.apes.flatten()) + \
+            contract(einsum_string, self.A, *self.K).reshape(size, size)
+        
+        
         self.H = H
         
         return H
@@ -557,7 +561,8 @@ class LDRN:
         
         assert(psi0.shape == (*self.nx, self.nstates))
         
-        self.buildH()
+        if self.H is None:
+            self.buildH(dt)
 
     
         # T_{mn} A_{mb, na} = kinetic energy operator in LDR
