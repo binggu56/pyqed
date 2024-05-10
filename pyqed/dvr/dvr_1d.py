@@ -279,7 +279,7 @@ class SincDVR(DVR):
         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
 
 # class SincDVRPeriodic(SincDVR):
-class FourierDVR(SincDVR):
+class ExponentialDVR(SincDVR):
     r"""
     Sinc function basis for periodic functions over an interval
     `x0 +- L/2` with `N = 2n + 1` points.
@@ -316,8 +316,13 @@ class FourierDVR(SincDVR):
             T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
             T[self.n, self.n] = (self.npts**2. + 2.)/3.
         else:
-            T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
+
             T[self.n, self.n] = (self.npts**2. - 1.)/3.
+        
         T *= (np.pi/self.L)**2.
         T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
         return T
@@ -378,7 +383,7 @@ class FourierDVR(SincDVR):
         # ask for eigenvalues closest to the minimum of the potential.
         else:
             E, U = sla.eigsh(h, k=k, which='LM',
-                             sigma=v.min())
+                             sigma=V.min())
   
         self.eigvals = E
         self.eigvecs = U
@@ -754,15 +759,21 @@ if __name__ == '__main__':
         return x**2/2
         
     def test_sincdvr():
-        dvr = SincDVR(npts=20, L=10)
+        # dvr = SincDVR(npts=20, L=10)
     
-        # dvr = HermiteDVR(npts=10)
+        dvr = HermiteDVR(npts=10)
         x = dvr.x 
         
 
         w, u = dvr.run(v, num_eigs=10)
         dvr.draw_states()
     
-    dvr = ExponentialDVR(n=6)
-    print(dvr.kx)
-    dvr.run(v, k=5)
+    def test_expdvr():
+        
+        dvr = ExponentialDVR(n=6, L=10)
+        E, U = dvr.run(v, k=5)
+    
+        print(E)
+    
+    test_sincdvr()
+    

@@ -15,6 +15,8 @@ from pyqed.ldr.gwp import WPD2
 from pyqed.dvr.dvr_1d import HermiteDVR, SincDVR
 
 import warnings
+from opt_einsum import contract
+from tqdm import tqdm
 
 # from pyqed.wpd import Result
 
@@ -320,7 +322,8 @@ class LDRN:
     This is extremely expansive, the maximum dimension should be < 4. 
     
     """
-    def __init__(self, domains, levels, ndim=3, nstates=2, x0=None, mass=None, dvr_type='sine'): 
+    def __init__(self, domains, levels, ndim=3, nstates=2, x0=None, mass=None, \
+                 dvr_type='sine'): 
 
         assert(len(domains) == len(levels) == ndim)
         
@@ -373,12 +376,13 @@ class LDRN:
 
         ###
         self.H = None
-        self._K = None
+        self.K = None
         # self._V = None
         
         self._v = None
         self.exp_K = None
         self.exp_V = None
+        self.exp_T = None # KEO in LDR
         self.wf_overlap = self.A = None
         self.apes = None
         
@@ -423,6 +427,7 @@ class LDRN:
 
 
         self.exp_K = []
+        self.K = []
         
         for d in range(self.ndim):
                     
@@ -431,9 +436,8 @@ class LDRN:
             # we can use free-particle propagator for the e^{-i K \Delta t}
             expKx = scipy.linalg.expm(-1j * Tx * dt)
             
-            
-
             self.exp_K.append(expKx.copy())
+            self.K.append(Tx.copy())
             
         return self.exp_K
     
@@ -516,37 +520,53 @@ class LDRN:
             logging.info('building the electronic overlap matrix')
             self.build_ovlp()
         
+        
+        einsum_string = gen_enisum_string(self.ndim)
+        exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
+        
+        
         einsum_string = self.gen_enisum_string(self.ndim)
-        U = np.einsum(einsum_string, self.exp_V_half, self.exp_T, self.exp_V_half)
+        U = np.einsum(einsum_string, self.exp_V_half, exp_T, self.exp_V_half)
         return U
     
-    def run(self, psi0, dt, nt, nout=1, t0=0):
-        
-        assert(psi0.shape == (*self.nx, self.nstates))
+    def buildH(self, dt):
         
         if self.apes is None:
             print('building the adibatic potential energy surfaces ...')
             self.build_apes()
         
+        print('building the potential energy propagator')
         self.buildV(dt)
         
         print('building the kinetic energy propagator')
         self.buildK(dt)
-
         
         if self.A is None:
             logging.info('building the electronic overlap matrix')
             self.build_ovlp()
         
+        einsum_string = gen_enisum_string(self.ndim)
+        H = np.diag(self.apes) + contract(einsum_string, self.A, *self.K)
+            
+        self.H = H
+        
+        return H
+    
+            
+    def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        assert(psi0.shape == (*self.nx, self.nstates))
+        
+        self.buildH()
 
-
+    
         # T_{mn} A_{mb, na} = kinetic energy operator in LDR
         # if self.ndim == 2:
         
             # expKx, expKy = self.exp_K
         einsum_string = gen_enisum_string(self.ndim)
         exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
-        
+        # self.exp_T = exp_T
             
         r = ResultLDR(dx=self.dx, dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
         # r.x = self.x
@@ -606,6 +626,119 @@ class LDRN:
         return rho
 
 
+class LDRN_LvN(LDRN):
+    """
+    Liouville von Newmann equation in the LDR
+    """
+    def run(self, rho0, dt, nt, nout=1, t0=0):
+        
+        nx = self.nx
+        nstates = self.nstates
+
+        U = self.short_time_propagator(dt)
+        
+        size = np.prod(self.nx) * self.nstates
+        
+        print('Size of vibronic space ', size)
+        
+        U = np.reshape(U, (size, size))
+        
+        results = {} 
+        results['rho'] = [rho0]
+        
+        rho0 = rho0.reshape((size, size))
+        
+        # times = np.arange(nt) * dt
+        times = np.power(2, range(1, nt+1)) * dt
+        results['times'] = times 
+        
+        U = np.identity(size)
+        # t = t0
+        for k in tqdm(range(nt)):
+            # for k1 in range(nout):
+                # t += dt
+            U = U @ U
+            
+            rho = U @ rho0 @ dag(U)
+            
+            rho = rho.reshape((*nx, self.nstates, *nx, self.nstates))
+            results['rho'].append(rho.copy())
+            
+        return results 
+    
+    def fast_LvN(self, rho0, dt, nt, nout=1, t0=0):
+        """
+        solve Liouville von Newnman equation by exponential integrator
+
+        Parameters
+        ----------
+        rho0 : TYPE
+            DESCRIPTION.
+        dt : TYPE
+            DESCRIPTION.
+        nt : TYPE
+            DESCRIPTION.
+        nout : TYPE, optional
+            DESCRIPTION. The default is 1.
+        t0 : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        results : TYPE
+            DESCRIPTION.
+
+        """
+        
+        nx, ny, nstates = self.nx, self.ny, self.nstates
+        
+        U = self.short_time_propagator(dt)
+        U = np.reshape(U, (nx*ny*nstates, nx*ny*nstates))
+        
+        results = {} 
+        results['psilist'] = []
+        
+        rho0 = rho0.reshape((nx * ny * nstates, nx * ny * nstates))
+        
+        times = np.power(2, range(1, nt+1)) * dt
+        results['times'] = times 
+        
+        for k in range(nt):
+            U = U @ U
+            rho = U @ rho0 @ dag(U)
+            
+            rho = rho.reshape((nx, ny, nstates, nx, ny, nstates))
+            results['rho'].append(rho.copy())
+            
+        return results 
+    
+    def rdm_el(self, rho):
+        """
+        reduced electronic density matrix
+
+        Parameters
+        ----------
+        rho : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """
+        D = self.ndim 
+        # vol = np.prod(self.dx)
+        
+        alphabet = list(string.ascii_lowercase)
+        
+        einsum_string = "".join(alphabet[:D]) + 'x ' + "".join(alphabet[:D])+'y ->  xy'
+        
+        rho_el = contract(einsum_string, rho)
+        
+        return rho_el
+        
+        
 
 class LDRN_Jacobi(LDRN):
     """
@@ -1202,6 +1335,8 @@ class LDR2(WPD2):
         # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
 
         self.exp_K = [expKx, expKy]
+        self.K = [Tx, Ty]
+        
         return 
     
     # def build_apes(self, apes):
@@ -1446,7 +1581,8 @@ class LDR2(WPD2):
         
         # return self._K
 
-        
+    def buildH(self):
+        H = np.diag(self.apes) + self.build
     # def xmat(self, d=0):
     #     """
     #     position operator matrix elements 
