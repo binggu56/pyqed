@@ -14,6 +14,7 @@ from pyqed.wpd import ResultSPO2
 from pyqed.ldr.gwp import WPD2
 from pyqed.dvr.dvr_1d import HermiteDVR, SincDVR
 
+
 import warnings
 from opt_einsum import contract
 from tqdm import tqdm
@@ -522,11 +523,11 @@ class LDRN:
         
         
         einsum_string = gen_enisum_string(self.ndim)
-        exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
+        exp_T = contract(einsum_string, self.A, *self.exp_K)
         
         
         einsum_string = self.gen_enisum_string(self.ndim)
-        U = np.einsum(einsum_string, self.exp_V_half, exp_T, self.exp_V_half)
+        U = contract(einsum_string, self.exp_V_half, exp_T, self.exp_V_half)
         return U
     
     def buildH(self, dt):
@@ -570,7 +571,7 @@ class LDRN:
         
             # expKx, expKy = self.exp_K
         einsum_string = gen_enisum_string(self.ndim)
-        exp_T = np.einsum(einsum_string, self.A, *self.exp_K)
+        exp_T = contract(einsum_string, self.A, *self.exp_K)
         # self.exp_T = exp_T
             
         r = ResultLDR(dx=self.dx, dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
@@ -595,7 +596,7 @@ class LDRN:
 
                 # psi = self._KEO_linear(psi)
                 # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
-                psi = np.einsum(_string, exp_T, psi) 
+                psi = contract(_string, exp_T, psi) 
                 psi = self.exp_V * psi 
                 # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
                 
@@ -745,134 +746,7 @@ class LDRN_LvN(LDRN):
         
         
 
-class LDRN_Jacobi(LDRN):
-    """
-    LDRN solver for curvilinear coordinates with metric g_{\mu \nu}
-    The kinetic energy operator reads 
-    
-    .. math::
-        T_N = -\frac{1}{2} g_{\mu \nu}(\bf q) \frac{\partial}{\partial q^\mu}\
-            \frac{\partial}{\partial q^\nu}
-    """
-    def __init__(self, domains, levels, dvr_types, mass=None, ndim=2):
-        
-        assert(len(domains) == len(levels) == ndim)
-        
-        self.L = [domain[1] - domain[0] for domain in domains]
-        
-        # center of grids
-        self.x0 = [0.5 * (domain[1] + domain[0]) for domain in domains]
-        
-        x = []
-        w = [] 
-        dvr = []
-        for d in range(ndim):
-            dvr_type = dvr_types[d]
-            
-            if dvr_type in ['sinc', 'sine']:
-            # uniform grid 
-                l = levels[d]
-                x.append(discretize(*domains[d], levels[d], endpoints=False))
-                _w = [1/(2**l-1), ] * (2**l-1)
-                w.append(_w)
-                
-            elif dvr_type == 'gauss_hermite':
-                
-                for d in range(ndim):
-                    _dvr = HermiteDVR(self.x0[d], levels[d])
-                    x.append(_dvr.x)
-                    w.append(_dvr.w)
-                    dvr.append(_dvr.copy())
-            
-            elif dvr_type == 'fourier':
-                # _dvr = FourierDVR()
-                pass
-                
-            else:
-                raise ValueError('DVR {} is not supported. Please use sinc.'.format(dvr_type))
-            
-        
-        self.x = x
-        self.w = w # weights
-        self.dvr = dvr 
-        # self.dx = [interval(_x) for _x in x]
-        self.nx = [len(_x) for _x in x] 
-        
-        self.dvr_types = dvr_types
-        
-        if mass is None:
-            mass = [1, ] * ndim
-        self.mass = mass
-        
-        self.nstates = nstates
-        self.ndim = ndim
-        
-        # all configurations in a vector
-        self.points = np.fliplr(cartesian_product(x))
-        self.npts = len(self.points)
 
-        ###
-        self.H = None
-        self._K = None
-        # self._V = None
-        
-        self._v = None
-        self.exp_K = None
-        self.exp_V = None
-        self.wf_overlap = self.A = None
-        self.apes = None
-    
-    def metric(self, q):
-        # Cartesian/normal coordinates
-        g = np.diag(1/self.mass)
-        return g        
-    
-    def buildK(self):
-        """
-        For the kinetic energy operator with Jacobi coordinates
-        
-        .. math::
-
-            K = \frac{p_r^2}{2\mu} + \frac{1}{2I(r)} p_\theta^2
-
-        Since the two KEOs for each dof do not commute, it has to be factorized as
-
-        .. math::
-            
-            e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
-        
-        Does the ordering matter here?
-
-        where $p_\theta = -i \pa_\theta$ is the momentum operator.
-
-
-        Parameters
-        ----------
-        dt : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
-
-
-        self.exp_K = []
-        
-        for d in range(self.ndim):
-                    
-            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
-            
-            # we can use free-particle propagator for the e^{-i K \Delta t}
-            expKx = scipy.linalg.expm(-1j * Tx * dt)
-            
-            
-
-            self.exp_K.append(expKx.copy())
-            
-        return self.exp_K
         
 
 def gauss_hermite_quadrature(npts, xmax=None, x0=0.):
@@ -1824,6 +1698,141 @@ class LDR2(WPD2):
     
     def k_evolve(self, psi):
         return self.expK @ psi
+    
+    
+class LDR2_Jacobi(LDR2):
+    """
+    LDRN solver for curvilinear coordinates with metric g_{\mu \nu}
+    The kinetic energy operator reads 
+    
+    .. math::
+        T_N = -\frac{1}{2} g_{\mu \nu}(\bf q) \frac{\partial}{\partial q^\mu}\
+            \frac{\partial}{\partial q^\nu}
+    """
+    def __init__(self, domains, levels, dvr_types, mass=None, ndim=2):
+        
+        assert(len(domains) == len(levels) == ndim)
+        
+        self.L = [domain[1] - domain[0] for domain in domains]
+        
+        # center of grids
+        self.x0 = [0.5 * (domain[1] + domain[0]) for domain in domains]
+        
+        x = []
+        w = [] 
+        dvr = []
+        for d in range(ndim):
+            dvr_type = dvr_types[d]
+            
+            if dvr_type in ['sinc', 'sine']:
+            # uniform grid 
+                l = levels[d]
+                x.append(discretize(*domains[d], levels[d], endpoints=False))
+                _w = [1/(2**l-1), ] * (2**l-1)
+                
+                w.append(_w)
+                
+            elif dvr_type == 'gauss_hermite':
+                
+                for d in range(ndim):
+                    _dvr = HermiteDVR(self.x0[d], levels[d])
+                    x.append(_dvr.x)
+                    w.append(_dvr.w)
+                    dvr.append(_dvr.copy())
+            
+            elif dvr_type == 'fourier':
+                # _dvr = FourierDVR()
+                pass
+                
+            else:
+                raise ValueError('DVR {} is not supported. Please use sinc.'.format(dvr_type))
+            
+        
+        self.x = x
+        self.w = w # weights
+        self.dvr = dvr 
+        # self.dx = [interval(_x) for _x in x]
+        self.nx = [len(_x) for _x in x] 
+        
+        self.dvr_types = dvr_types
+        
+        if mass is None:
+            mass = [1, ] * ndim
+        self.mass = mass
+        
+        self.nstates = nstates
+        self.ndim = ndim
+        
+        # all configurations in a vector
+        self.points = np.fliplr(cartesian_product(x))
+        self.npts = len(self.points)
+
+        ###
+        self.H = None
+        self._K = None
+        # self._V = None
+        
+        self._v = None
+        self.exp_K = None
+        self.exp_V = None
+        self.wf_overlap = self.A = None
+        self.apes = None
+    
+    def metric(self, q):
+        # Cartesian/normal coordinates
+        g = np.diag(1/self.mass)
+        return g        
+    
+    def buildK(self):
+        """
+        For the kinetic energy operator with Jacobi coordinates
+        
+        .. math::
+
+            K = \frac{p_r^2}{2\mu} + \frac{1}{2I(r)} p_\theta^2
+
+        Since the two KEOs for each dof do not commute, it has to be factorized as
+
+        .. math::
+            
+            e^{-i K \delta t} = e{-i K_1 \delta t} e^{- i K_2 \delta t}
+        
+        Does the ordering matter here?
+
+        where $p_\theta = -i \pa_\theta$ is the momentum operator.
+
+
+        Parameters
+        ----------
+        dt : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+
+        x, y = self.x 
+        mx, moment_of_inertia = self.mass 
+        
+        I = moment_of_inertia(x)
+        
+        self.exp_K = []
+        
+        for d in range(self.ndim):
+                    
+            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
+            
+            # we can use free-particle propagator for the e^{-i K \Delta t}
+            expKx = scipy.linalg.expm(-1j * Tx * dt)
+            
+            
+
+            self.exp_K.append(expKx.copy())
+            
+        return self.exp_K
 
 class LDR2_IT(LDR2):
     """

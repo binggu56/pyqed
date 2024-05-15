@@ -13,6 +13,7 @@ import scipy.special.orthogonal as ortho
 import scipy
 # import bessel
 import warnings
+from opt_einsum import contract
 
 from pyqed import interval
 
@@ -390,30 +391,56 @@ class ExponentialDVR(SincDVR):
         # self.potential = V 
         return E, U
 
+
+
 class SineDVR(DVR):
     r"""Sine function basis for non-periodic functions over an interval
     `x_min ... x_max` with `npts` points.
     Usage:
         d = sincDVR1D(npts, xmin, xmax)
 
-    @param[in] npts number of points
-    @param[in] xmin "left" end of interval
-    @param[in] xmax "right" end of interval
-    @attribute a step size
-    @attribute n vector of x-domain indices
-    @attribute x discretized x-domain
-    @attribute k_max cutoff frequency
-    @attribute L size of x-domain
-    @method h return hamiltonian matrix
-    @method f return DVR basis vectors
+        @param[in] npts number of points
+        @param[in] xmin "left" end of interval
+        @param[in] xmax "right" end of interval
+        @attribute a step size
+        @attribute n vector of x-domain indices
+        @attribute x discretized x-domain
+        @attribute k_max cutoff frequency
+        @attribute L size of x-domain
+        @method h return hamiltonian matrix
+        @method f return DVR basis vectors
+        
+        
     """
-    def __init__(self, xmin, xmax, npts):
+    def __init__(self, xmin, xmax, npts, mass=1):
+        """
+        
+
+        Parameters
+        ----------
+        xmin : TYPE
+            DESCRIPTION.
+        xmax : TYPE
+            DESCRIPTION.
+        npts : int
+            number of basis functions/grids points (excluding boundary, 2^l -1).
+
+        Returns
+        -------
+        None.
+
+        """
         self.npts = npts
-        self.L = float(xmax) - float(xmin)
-        self.a = self.L / float(npts + 1.)
+        self.L = float(xmax - xmin)
+        self.a = self.L /(npts + 1)
         self.n = np.arange(1, npts + 1)
         self.x = float(xmin) + self.a * self.n
         self.k_max = None
+        self.mass = mass
+        
+        
+        ###
+        self.T = None
 
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
@@ -436,10 +463,85 @@ class SineDVR(DVR):
         T[self.n - 1, self.n - 1] = 0.
         T += np.diag((2. * m**2. + 1.) / 3.
                      - 1./np.square(np.sin(np.pi * self.n / m)))
-        T *= np.pi**2. / 2. / self.L**2. #prefactor common to all of T
-        T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
+        
+        T *= np.pi**2. / 2. / self.L**2 #prefactor common to all of T
+        T *= 0.5 * hc**2. / self.mass   # (pc)^2 / (2 mc^2)
+        
+        self.T = T 
         return T
 
+    def momentum(self):
+        
+        if self.U is None:
+            self.fbr2dvr()
+            
+        U = self.U
+        p = np.zeros((self.npts, self.npts))
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            p = (np.subtract.outer(self.n, self.n) % 2) * np.outer(self.n, self.n)/np.subtract.outer(self.n**2, self.n**2)
+        
+        p[np.isnan(p)] = 0
+        p = p * (-4j)/self.L
+        
+        return contract('ia, ij, jb -> ab', U.conj(), p, U)
+    
+    def expT(self, dt=1):
+        """
+        kinetic energy propagator
+
+        .. math::
+            e^{-i T t}
+            
+        Parameters
+        ----------
+        dt : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        
+        U = self.fbr2dvr()
+        
+        _t = np.exp(-1j * dt/(2 * self.mass) * self.n**2 * np.pi**2/self.L**2)
+        
+        return contract('ia, i, ib -> ab', U.conj(), _t, U)
+        # return U.conj().T @ np.diag(_t) @ U        
+        
+
+    def fbr2dvr(self):
+        """
+        transformation matrix from FBR to DVR 
+        
+        .. math::
+            
+            U_{j\alpha} = \sqrt{2/(n+1)} \sin(j \alpha \pi/(n+1))
+        
+        for j, \alpha = 1, 2, ..., n. 
+        
+        Returns
+        -------
+        U : TYPE
+            DESCRIPTION.
+
+        """
+        n = self.npts 
+        
+        U = np.sin(np.outer(self.n, self.n) * np.pi/(n+1)) * np.sqrt(2./(n+1))
+        
+        self.U = U 
+        return U
+        
+
+    def dvr_set(self, n):
+        pass 
+    
 #     def f(self, x=None):
 #         """Return the DVR basis vectors"""
 #         if x is None:
@@ -754,6 +856,7 @@ class VFactory(object):
 
 
 if __name__ == '__main__':
+    import time
     x = np.linspace(-7, 7, 200)
     def v(x):
         return x**2/2
@@ -775,5 +878,24 @@ if __name__ == '__main__':
     
         print(E)
     
-    test_sincdvr()
+    dvr = SineDVR(0, 1, npts=3)
     
+    U = dvr.fbr2dvr()
+
+    print((np.subtract.outer(dvr.n, dvr.n) % 2))
+    
+    start = time.time()    
+    T = dvr.t()
+    p = dvr.momentum()
+    print(p)
+    # scipy.linalg.expm(-1j * T * 0.2)
+    
+    time1 = time.time()
+    # print('expm', time1 - start)
+    
+    dvr.expT(0.2)
+    
+    time2 = time.time()
+    print(time2 - time1)
+    
+    # print(np.sin(1 * 3 * np.pi/4) * np.sqrt(2/4 ))
