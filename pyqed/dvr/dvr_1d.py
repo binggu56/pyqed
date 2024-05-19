@@ -441,6 +441,7 @@ class SineDVR(DVR):
         
         ###
         self.T = None
+        self.U = None
 
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.

@@ -8,8 +8,8 @@ au2k = 315775.13 #K
 au2ev = 27.2116
 
 
-
-
+au2tesla = 2.35051756758e5
+tesla = 1/au2tesla
 
 au2kev = 27.2116e-3
 au2mev = 27.2116e3

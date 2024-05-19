@@ -12,7 +12,7 @@ from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, in
     cartesian_product, discretize, norm2
 from pyqed.wpd import ResultSPO2
 from pyqed.ldr.gwp import WPD2
-from pyqed.dvr.dvr_1d import HermiteDVR, SincDVR
+from pyqed.dvr.dvr_1d import HermiteDVR, SineDVR, SincDVR
 
 
 import warnings
@@ -1709,9 +1709,12 @@ class LDR2_Jacobi(LDR2):
         T_N = -\frac{1}{2} g_{\mu \nu}(\bf q) \frac{\partial}{\partial q^\mu}\
             \frac{\partial}{\partial q^\nu}
     """
-    def __init__(self, domains, levels, dvr_types, mass=None, ndim=2):
+    def __init__(self, domains, levels, dvr_types, mass=None, ndim=2, \
+                 dt=None, nt=None, nout=1):
         
         assert(len(domains) == len(levels) == ndim)
+        
+        self.domains = domains
         
         self.L = [domain[1] - domain[0] for domain in domains]
         
@@ -1777,6 +1780,11 @@ class LDR2_Jacobi(LDR2):
         self.exp_V = None
         self.wf_overlap = self.A = None
         self.apes = None
+        
+        # integration
+        self.dt = dt
+        self.nt = nt
+        self.nout = nout
     
     def metric(self, q):
         # Cartesian/normal coordinates
@@ -1816,21 +1824,32 @@ class LDR2_Jacobi(LDR2):
 
         x, y = self.x 
         mx, moment_of_inertia = self.mass 
+        nx, ny = self.nx
+        dt = self.dt
         
         I = moment_of_inertia(x)
         
         self.exp_K = []
         
-        for d in range(self.ndim):
-                    
-            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
+
+        dvr = SineDVR(domain[0], mass=mx)
+        Tx = dvr.t()
+        expTx = dvr.expT(dt)
+        
+        # Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
             
             # we can use free-particle propagator for the e^{-i K \Delta t}
-            expKx = scipy.linalg.expm(-1j * Tx * dt)
+            # expKx = scipy.linalg.expm(-1j * Tx * dt)
             
             
+        self.exp_K.append(expTx)
+        
+        for i in range(nx):
+            my = moment_of_inertia(x[i])
+            dvr_y = SineDVR(domain[1], mass=my)
+            _expTy = dvr_y.expT(dt)
 
-            self.exp_K.append(expKx.copy())
+            
             
         return self.exp_K
 

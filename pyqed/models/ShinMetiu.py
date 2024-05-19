@@ -10,8 +10,8 @@ import numpy as np
 import scipy.constants as const
 import scipy.linalg as la
 import scipy 
-from scipy.sparse import csr_matrix
-from scipy.linalg import kron, norm, eigh
+from scipy.sparse import csr_matrix, identity, kron
+from scipy.linalg import norm, eigh
 from scipy.special import erf
 import warnings
 from tqdm import tqdm
@@ -20,11 +20,14 @@ from tqdm import tqdm
 # from matplotlib.ticker import MaxNLocator, NullLocator
 # from mpl_toolkits.mplot3d import Axes3D
 
-from pyqed import discretize, sort, dagger
+from pyqed import discretize, sort, dag
+from pyqed.dvr import SineDVR
 from pyqed.davidson import davidson_solver
 from pyqed import au2ev, au2angstrom
 
 from pyqed.ldr.ldr import kinetic
+
+from pyqed.units import au2tesla
 
 
 # def kinetic_energy(L, npts, mass=1):
@@ -268,10 +271,12 @@ class ShinMetiu2:
         self.left = np.array([-self.L/2, 0])
         self.right = np.array([self.L/2, 0])
     
+        #######
         self.x = None
         self.y = None
         self.nx = None
         self.ny = None 
+        self.domains = None 
         
         self.u = None
         self.X = None
@@ -283,10 +288,12 @@ class ShinMetiu2:
         self.v0 = None # trial vectors for diagnalization
         
         
+        
+        
     def create_grid(self, level, domain):
         
-        x = discretize(*domain[0], level)
-        y = discretize(*domain[1], level)
+        x = discretize(*domain[0], level, endpoints=False)
+        y = discretize(*domain[1], level, endpoints=False)
         
         self.x = x 
         self.y = y
@@ -296,6 +303,7 @@ class ShinMetiu2:
         self.ly = domain[1][1]-domain[1][0]
         self.dx = self.lx / (self.nx - 1)
         self.dy = self.ly / (self.ny - 1)
+        self.domains = domain
         
     def single_point(self, R):
         # if the matrix size 
@@ -378,6 +386,8 @@ class ShinMetiu2:
         v += (np.linalg.norm(R) / self.R0)**4
         
         return v
+    
+
       
 
     def pes(self, domains=[[-2,2], [0,2]], levels=[4, 4]):
@@ -431,7 +441,7 @@ class ShinMetiu2:
         
         A = np.einsum('abijm, cdijn -> abmcdn', U.conj(), U)
         
-        # print(A)
+
         return A
     
     def dipole_moment(self):#, l, r, nstates):
@@ -482,43 +492,349 @@ class ShinMetiu2:
         print(w)
         print('Scipy excutation time',  t3 - t2)
         
+
+class ShinMetiu2InMagneticField(ShinMetiu2):
+    """
+    2D Shin Metiu model in a static magnetic field
+    """
+    
+    def __init__(self, method = 'scipy', nstates=3, dvr_type='sine', B=0, gauge='landau'):
+        """
         
 
+        Parameters
+        ----------
+        method : TYPE, optional
+            DESCRIPTION. The default is 'scipy'.
+        nstates : TYPE, optional
+            DESCRIPTION. The default is 3.
+        dvr_type : TYPE, optional
+            DESCRIPTION. The default is 'sine'.
+        B : TYPE, optional
+            Magnetic field in z in Tesla. The default is 0 T.
+        gauge : TYPE, optional
+            DESCRIPTION. The default is 'landau'.
+
+        Returns
+        -------
+        None.
+
+        """
+        super().__init__(method, nstates, dvr_type)
+        
+        self.B = B/au2tesla # magnetic field 
+        self.gauge = gauge 
+        
+        
+        self.hcore = None
+        
+        
+    # def apply_magnetic_field(self, B, gauge='landau'):
+        
+
+        # B = B/au2tesla
+        # if gauge == 'landau':
+            
+        #     # self.A = (0, B, 0)
+            
+            
+            
+        # elif gauge == 'symmetric':
+        #     raise NotImplementedError()
+            
+        # else:
+        #     raise ValueError('There is no {} gauge. Please use `landau`, `symmetric`.'.format(gauge))
+        
+        # return 
+    def build(self):
+        
+        # H(r; R)
+        B = self.B 
+        
+        x, y = self.x, self.y 
+        nx, ny = self.nx, self.ny 
+        
+        # T 
+        
+        dvr_x = SineDVR(*self.domains[0], nx)
+        
+        # tx = kinetic(self.x, dvr=self.dvr_type)
+        tx = dvr_x.t()
+        
+        idx = identity(self.nx)
+        
+        dvr_y = SineDVR(*self.domains[1], ny)
+        ty = dvr_y.t()
+        # ty = kinetic_energy(self.ly, self.ny)
+        # ty = kinetic(self.y, dvr=self.dvr_type)
+        idy = identity(self.ny)
+        
+        T = kron(tx, idy) + kron(idx, ty)
+        
+        X = np.diag(dvr_x.x)
+
+        Py = dvr_y.momentum()
+        
+        self.hcore = T + B * kron(X, Py)
+        return 
+        
+    def single_point(self, R):
+        # if the matrix size 
+        
+        x, y = self.x, self.y 
+        nx, ny = self.nx, self.ny 
+        
+        B = self.B
+        
+        # V
+        v = np.zeros((nx, ny))
+        for i in range(nx):
+            for j in range(ny):
+                r = np.array([x[i], y[j]])
+                v[i,j] = self.potential_energy(r, R) + 0.5 * B**2 * x[i]**2
+        
+        V = np.diag(v.ravel())
+        # print(V.shape)
+
+        
+        
+        H = self.hcore +  V 
+        
+        if self.method == 'exact':
+            w, u = eigh(H)
+        elif self.method == 'davidson':
+            w, u = davidson_solver(H, neigen=self.nstates)
+        elif self.method == 'scipy':
+        
+            w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
+            self.v0 = u[:,0] # store the eigenvectors for next calculation
+        
+        else:
+            raise ValueError("Invalid method specified")
+        
+        
+        
+        return w[:self.nstates], u[:, :self.nstates] 
+
+    def pes(self, domains=[[-2,2], [0,2]], levels=[4, 4]):
+        
+        # calc PES
+        # L = self.L 
+        l1, l2 = levels
+        X = discretize(*domains[0], l1, endpoints=False)
+        Y = discretize(*domains[1], l2, endpoints=False)
+        E = np.zeros((len(X), len(Y), self.nstates))
+        U = np.zeros((len(X), len(Y), self.nx, self.ny, self.nstates), dtype=complex)
+        
+        print('Scanning the APES ')
+        for i in tqdm(range(len(X))):
+            for j in range(len(Y)):
+                R = [X[i], Y[j]]
+                
+                w, u = self.single_point(R)
+                # print(u.shape)
+                # w, u = sort(*self.single_point(R)) # The sort function sorts the eigenvalues from low to high
+                # print(u_temp.shape)
+                E[i, j, :] = w #[:nstates]
+                U[i, j] = u.reshape(self.nx, self.ny, self.nstates)
+                # print(U[i, j])
+                # U[i, j] = u.reshape(self.nx, self.ny, nstates)
+                # U[i, j] = u[:, :nstates].reshape(self.nx, self.ny, nstates)
+            # save states
+        self.u = U  
+        self.X = X
+        self.Y = Y
+        # fig, ax = plt.subplots()
+        
+        # ax.plot(X, Y, E[:, 0], label='Ground state')
+        # ax.plot(X, Y, E[:, 1], label='Excited state')
+        # print(E)
+        return X, Y, E, U
+    
+    
+class ShinMetiu2InElectricField(ShinMetiu2):
+    """
+    2D Shin Metiu model in a static electric field
+    """
+    
+    def __init__(self, method = 'scipy', nstates=3, dvr_type='sine', E=0, gauge='length'):
+        """
+
+        Parameters
+        ----------
+        method : TYPE, optional
+            DESCRIPTION. The default is 'scipy'.
+        nstates : TYPE, optional
+            DESCRIPTION. The default is 3.
+        dvr_type : TYPE, optional
+            DESCRIPTION. The default is 'sine'.
+        B : TYPE, optional
+            Magnetic field in z in Tesla. The default is 0 T.
+        gauge : TYPE, optional
+            DESCRIPTION. The default is 'landau'.
+
+        Returns
+        -------
+        None.
+
+        """
+        super().__init__(method, nstates, dvr_type)
+        
+        self.E = E # magnetic field 
+        self.gauge = gauge 
+        
+        
+        self.hcore = None
+        
+        
+    def build(self):
+        
+        # H(r; R)
+        
+        x, y = self.x, self.y 
+        nx, ny = self.nx, self.ny 
+        
+        # T 
+        
+        dvr_x = SineDVR(*self.domains[0], nx)
+        
+        # tx = kinetic(self.x, dvr=self.dvr_type)
+        tx = dvr_x.t()
+        
+        idx = identity(self.nx)
+        
+        dvr_y = SineDVR(*self.domains[1], ny)
+        ty = dvr_y.t()
+        # ty = kinetic_energy(self.ly, self.ny)
+        # ty = kinetic(self.y, dvr=self.dvr_type)
+        idy = identity(self.ny)
+        
+        T = kron(tx, idy) + kron(idx, ty)
+        
+        X = np.diag(dvr_x.x)
+
+        Py = dvr_y.momentum()
+        
+        self.hcore = T + B * kron(X, Py)
+        return 
+        
+    def single_point(self, R):
+        # if the matrix size 
+        
+        x, y = self.x, self.y 
+        nx, ny = self.nx, self.ny 
+        
+        B = self.B
+        
+        # V
+        v = np.zeros((nx, ny))
+        for i in range(nx):
+            for j in range(ny):
+                r = np.array([x[i], y[j]])
+                v[i,j] = self.potential_energy(r, R) + 0.5 * B**2 * x[i]**2
+        
+        V = np.diag(v.ravel())
+        # print(V.shape)
+
+        
+        
+        H = self.hcore +  V 
+        
+        if self.method == 'exact':
+            w, u = eigh(H)
+        elif self.method == 'davidson':
+            w, u = davidson_solver(H, neigen=self.nstates)
+        elif self.method == 'scipy':
+        
+            w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
+            self.v0 = u[:,0] # store the eigenvectors for next calculation
+        
+        else:
+            raise ValueError("Invalid method specified")
+        
+        
+        
+        return w[:self.nstates], u[:, :self.nstates] 
+
+    def pes(self, domains=[[-2,2], [0,2]], levels=[4, 4]):
+        
+        # calc PES
+        # L = self.L 
+        l1, l2 = levels
+        X = discretize(*domains[0], l1, endpoints=False)
+        Y = discretize(*domains[1], l2, endpoints=False)
+        E = np.zeros((len(X), len(Y), self.nstates))
+        U = np.zeros((len(X), len(Y), self.nx, self.ny, self.nstates), dtype=complex)
+        
+        print('Scanning the APES ')
+        for i in tqdm(range(len(X))):
+            for j in range(len(Y)):
+                R = [X[i], Y[j]]
+                
+                w, u = self.single_point(R)
+                # print(u.shape)
+                # w, u = sort(*self.single_point(R)) # The sort function sorts the eigenvalues from low to high
+                # print(u_temp.shape)
+                E[i, j, :] = w #[:nstates]
+                U[i, j] = u.reshape(self.nx, self.ny, self.nstates)
+                # print(U[i, j])
+                # U[i, j] = u.reshape(self.nx, self.ny, nstates)
+                # U[i, j] = u[:, :nstates].reshape(self.nx, self.ny, nstates)
+            # save states
+        self.u = U  
+        self.X = X
+        self.Y = Y
+        # fig, ax = plt.subplots()
+        
+        # ax.plot(X, Y, E[:, 0], label='Ground state')
+        # ax.plot(X, Y, E[:, 1], label='Excited state')
+        # print(E)
+        return X, Y, E, U
 
 if __name__=='__main__':
     import time
     from pyqed.ldr.ldr import LDRN
     
-    import proplot as plt
+    # import proplot as plt
     
     
     # Example usage:
-    mol = ShinMetiu(dvr_type='sine')
-    mol.create_grid(6, domain=[[-6, 6]]) # check whether the domain enough big
-    X, E, U = mol.pes(domain=[-2,2], level = 5)
-    print(E)
+    # mol = ShinMetiu(dvr_type='sine')
+    # mol.create_grid(6, domain=[[-6, 6]]) # check whether the domain enough big
+    # X, E, U = mol.pes(domain=[-2,2], level = 5)
+    # print(E)
     
-    print(U.shape)
+    # print(U.shape)
     
-    fig, ax = plt.subplots()
+    # fig, ax = plt.subplots()
 
-    for i in range(3):
-        ax.plot(X, E[:,i])
+    # for i in range(3):
+    #     ax.plot(X, E[:,i])
 
 
     # # Example usage:
-    # mol = ShinMetiu2(method='scipy')
+    mol = ShinMetiu2InMagneticField(B=40)
     
-    # mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
+    mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
+    mol.build()
     
-    # levels = (3,3)
-    # domains = [[-2, 2], [-2, 2]]
-    # X, Y, E, U = mol.pes(domains=domains, levels = levels)
-    # # start = time.time()
-    # print(X)
-    # A = mol.electronic_overlap()
     
-    # print(A.shape)
+    levels = (2, 2)
+    domains = [[-2, 2], [-2, 2]]
+    
+    
+    # w, u = mol.single_point([0, 0])
+    
+
+    X, Y, E, U = mol.pes(domains=domains, levels = levels)
+    
+    
+    # start = time.time()
+
+    A = mol.electronic_overlap()
+    
+    print(A.shape)
+    print(A[:, :, 0, :, :, 0])
     
     
     # ######################
