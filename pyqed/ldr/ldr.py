@@ -104,29 +104,29 @@ def kinetic(x, mass=1, dvr='sinc'):
         
         m = npts + 1
         
-        # with warnings.catch_warnings():
-        #     warnings.simplefilter("ignore")
-        #     T = ((-1.)**(_i-_j)
-        #         * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
-        #         - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
-        
-        # T[n - 1, n - 1] = 0.
-        # T += np.diag((2. * m**2. + 1.) / 3.
-        #              - 1./np.square(np.sin(np.pi * n / m)))
-        # T *= np.pi**2. / 2. / L**2. #prefactor common to all of T
-        # T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
-        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            
-            T = 2 * (-1.)**(_i-_j)/(N+1)**2 * \
-                np.sin(np.pi * _i/(N+1)) * np.sin(np.pi * _j/(N+1))\
-                /(np.cos(np.pi * _i /(N+1)) - np.cos(_j * np.pi/(N+1)))**2
+            T = ((-1.)**(_i-_j)
+                * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
+                - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
         
         T[n - 1, n - 1] = 0.
-        T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2)) 
+        T += np.diag((2. * m**2. + 1.) / 3.
+                      - 1./np.square(np.sin(np.pi * n / m)))
+        T *= np.pi**2. / 2. / L**2. #prefactor common to all of T
+        T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
+        
+        # with warnings.catch_warnings():
+        #     warnings.simplefilter("ignore")
+            
+        #     T = 2 * (-1.)**(_i-_j)/(N+1)**2 * \
+        #         np.sin(np.pi * _i/(N+1)) * np.sin(np.pi * _j/(N+1))\
+        #         /(np.cos(np.pi * _i /(N+1)) - np.cos(_j * np.pi/(N+1)))**2
+        
+        # T[n - 1, n - 1] = 0.
+        # T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2)) 
                                                
-        T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
+        # T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
 
     elif dvr == 'SincPeriodic':
         
@@ -432,10 +432,12 @@ class LDRN:
         
         for d in range(self.ndim):
                     
-            Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
-            
+            # Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
+            dvr = SineDVR(*self.domains[d], mass=self.mass[d])
             # we can use free-particle propagator for the e^{-i K \Delta t}
-            expKx = scipy.linalg.expm(-1j * Tx * dt)
+            # expKx = scipy.linalg.expm(-1j * Tx * dt)
+            Tx = dvr.t()
+            expKx = dvr.expT(dt)
             
             self.exp_K.append(expKx.copy())
             self.K.append(Tx.copy())

@@ -17,6 +17,127 @@ from opt_einsum import contract
 
 from pyqed import interval
 
+
+def kinetic(x, mass=1, dvr='sinc'):
+    """
+    kinetic enegy operator for the DVR set
+    
+    Parameters
+    ----------
+    x : TYPE
+        DESCRIPTION.
+    mass : TYPE, optional
+        DESCRIPTION. The default is 1.
+    dvr : TYPE, optional
+        DESCRIPTION. The default is 'sinc'.
+    
+    Returns
+    -------
+    Tx : TYPE
+        DESCRIPTION.
+        
+        
+    Refs:
+        
+        M.H. Beck et al. Physics Reports 324 (2000) 1-105
+    
+    
+    """
+    
+    # L = xmax - xmin 
+    # a = L / npts
+    nx = len(x)
+        # self.n = np.arange(npts)
+        # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
+        # self.w = np.ones(npts, dtype=np.float64) * self.a
+        # self.k_max = np.pi/self.a
+    
+    L = x[-1] - x[0]
+    dx = interval(x)
+    n = np.arange(nx)
+    nx = npts = len(x)
+    
+    
+    if dvr == 'sinc':
+        
+        # Colbert-Miller DVR 1992
+        
+        _m = n[:, np.newaxis]
+        _n = n[np.newaxis, :]
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
+            
+        T[n, n] = np.pi**2. / 3. / dx**2
+        T *= 0.5/mass   # (pc)^2 / (2 mc^2)
+        
+    elif dvr == 'sine':
+
+        # Sine DVR (particle in-a-box)
+        # n = np.arange(1, npts + 1)
+        # dx = (xmax - xmin)/(npts + 1)
+        # x = float(xmin) + self.a * self.n
+        
+        npts = N = len(x)
+        n = np.arange(1, npts + 1)
+        
+        
+        _i = n[:, np.newaxis]
+        _j = n[np.newaxis, :]
+        
+        L = dx * (npts + 1)
+        
+        m = npts + 1
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            T = ((-1.)**(_i-_j)
+                * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
+                - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
+        
+        T[n - 1, n - 1] = 0.
+        T += np.diag((2. * m**2. + 1.) / 3.
+                      - 1./np.square(np.sin(np.pi * n / m)))
+        T *= np.pi**2. / 2. / L**2. #prefactor common to all of T
+        T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
+        
+        # with warnings.catch_warnings():
+        #     warnings.simplefilter("ignore")
+            
+        #     T = 2 * (-1.)**(_i-_j)/(N+1)**2 * \
+        #         np.sin(np.pi * _i/(N+1)) * np.sin(np.pi * _j/(N+1))\
+        #         /(np.cos(np.pi * _i /(N+1)) - np.cos(_j * np.pi/(N+1)))**2
+        
+        # T[n - 1, n - 1] = 0.
+        # T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2)) 
+                                               
+        # T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
+    
+    elif dvr == 'SincPeriodic':
+        
+        _m = n[:, np.newaxis]
+        _n = n[np.newaxis, :]
+        
+        _arg = np.pi*(_m-_n)/nx
+        
+        if (0 == nx % 2):
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
+                
+            T[n, n] = (nx**2. + 2.)/3.
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
+            T[n, n] = (nx**2. - 1.)/3.
+            
+        T *= (np.pi/L)**2.
+        T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
+    
+    return T
 class DVR(object):
         
     def v(self, V):
@@ -442,7 +563,13 @@ class SineDVR(DVR):
         ###
         self.T = None
         self.U = None
-
+        
+    def t_fbr(self):
+        m = self.mass 
+        l = self.L
+        
+        return (0.5 / m) * (np.pi / l)**2 * np.arange(1, self.npts + 1)**2
+    
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
         Usage:
@@ -878,17 +1005,33 @@ if __name__ == '__main__':
         E, U = dvr.run(v, k=5)
     
         print(E)
+        
+    def test_sineDVR():
+        dvr = SineDVR(-5, 5, 20)
+        E, U = dvr.run(v, k=5)
     
-    dvr = SineDVR(0, 1, npts=3)
+        print(E)
+        
+    
+    # test_sineDVR()
+    
+    
+    dvr = SineDVR(0, 1, npts=6)
+    
     
     U = dvr.fbr2dvr()
 
-    print((np.subtract.outer(dvr.n, dvr.n) % 2))
+    # print((np.subtract.outer(dvr.n, dvr.n) % 2))
     
     start = time.time()    
     T = dvr.t()
-    p = dvr.momentum()
-    print(p)
+    print(T)
+    
+    print(U.conj().T @ np.diagflat(dvr.t_fbr()) @ U)
+    print(kinetic(dvr.x, dvr='sine'))
+    
+    # p = dvr.momentum()
+    # print(p)
     # scipy.linalg.expm(-1j * T * 0.2)
     
     time1 = time.time()

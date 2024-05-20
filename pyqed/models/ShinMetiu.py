@@ -270,6 +270,8 @@ class ShinMetiu2:
         
         self.left = np.array([-self.L/2, 0])
         self.right = np.array([self.L/2, 0])
+        
+        self.dvr_type = dvr_type
     
         #######
         self.x = None
@@ -315,6 +317,9 @@ class ShinMetiu2:
         # T 
         # tx = kinetic_energy(self.lx, self.nx)
         tx = kinetic(self.x, dvr=self.dvr_type)
+        
+        print(tx)
+        
         idx = np.eye(self.nx)
         
         # ty = kinetic_energy(self.ly, self.ny)
@@ -322,6 +327,8 @@ class ShinMetiu2:
         idy = np.eye(self.ny)
         
         T = kron(tx, idy) + kron(idx, ty)
+        
+        print(T)
         
         # print(T.shape)
         
@@ -561,6 +568,8 @@ class ShinMetiu2InMagneticField(ShinMetiu2):
         # tx = kinetic(self.x, dvr=self.dvr_type)
         tx = dvr_x.t()
         
+        print(tx)
+        
         idx = identity(self.nx)
         
         dvr_y = SineDVR(*self.domains[1], ny)
@@ -570,6 +579,8 @@ class ShinMetiu2InMagneticField(ShinMetiu2):
         idy = identity(self.ny)
         
         T = kron(tx, idy) + kron(idx, ty)
+        
+        # print(T)
         
         X = np.diag(dvr_x.x)
 
@@ -801,8 +812,10 @@ if __name__=='__main__':
     
     
     # Example usage:
-    # mol = ShinMetiu(dvr_type='sine')
-    # mol.create_grid(6, domain=[[-6, 6]]) # check whether the domain enough big
+    mol = ShinMetiu2()
+    mol.create_grid(5, domain=[[-6, 6], [-6,6]]) # check whether the domain enough big
+    w, u = mol.single_point([0,0])
+    print(w)
     # X, E, U = mol.pes(domain=[-2,2], level = 5)
     # print(E)
     
@@ -815,7 +828,7 @@ if __name__=='__main__':
 
 
     # # Example usage:
-    mol = ShinMetiu2InMagneticField(B=40)
+    mol = ShinMetiu2InMagneticField(B=0)
     
     mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
     mol.build()
@@ -825,18 +838,18 @@ if __name__=='__main__':
     domains = [[-2, 2], [-2, 2]]
     
     
-    # w, u = mol.single_point([0, 0])
-    
+    w, u = mol.single_point([0, 0])
+    print(w)
 
-    X, Y, E, U = mol.pes(domains=domains, levels = levels)
+    # X, Y, E, U = mol.pes(domains=domains, levels = levels)
     
     
     # start = time.time()
 
-    A = mol.electronic_overlap()
+    # A = mol.electronic_overlap()
     
-    print(A.shape)
-    print(A[:, :, 0, :, :, 0])
+    # print(A.shape)
+    # print(A[:, :, 0, :, :, 0])
     
     
     # ######################
