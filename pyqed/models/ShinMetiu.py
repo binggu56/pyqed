@@ -606,8 +606,10 @@ class ShinMetiu2InMagneticField(ShinMetiu2):
             w, u = davidson_solver(H, neigen=self.nstates)
         elif self.method == 'scipy':
         
-            w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
+            w, u = sort(*scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates,\
+                                                   which='SA', v0=self.v0))
             self.v0 = u[:,0] # store the eigenvectors for next calculation
+            
         
         else:
             raise ValueError("Invalid method specified")
