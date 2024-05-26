@@ -138,7 +138,9 @@ def kinetic(x, mass=1, dvr='sinc'):
         T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
     
     return T
+
 class DVR(object):
+    
         
     def v(self, V):
         """
@@ -320,6 +322,8 @@ class DVR(object):
         self.morse_test(precision=precision)
         self.sombrero_test(precision=precision)
         self.woods_saxon_test(precision=precision)
+    
+
 
 class SincDVR(DVR):
     r"""Sinc function basis for non-periodic functions over an interval
@@ -557,12 +561,25 @@ class SineDVR(DVR):
         self.n = np.arange(1, npts + 1)
         self.x = float(xmin) + self.a * self.n
         self.k_max = None
-        self.mass = mass
+        
+
         
         
         ###
         self.T = None
         self.U = None
+        
+        self._mass = mass
+        
+    @property
+    def mass(self):
+        return self._mass
+        
+    @mass.setter
+    def set_mass(self, value):
+        self._mass = value
+        
+        
         
     def t_fbr(self):
         m = self.mass 

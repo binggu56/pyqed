@@ -1834,7 +1834,7 @@ class LDR2_Jacobi(LDR2):
         self.exp_K = []
         
 
-        dvr = SineDVR(domain[0], mass=mx)
+        dvr = SineDVR(x, mass=mx)
         Tx = dvr.t()
         expTx = dvr.expT(dt)
         
@@ -1846,14 +1846,68 @@ class LDR2_Jacobi(LDR2):
             
         self.exp_K.append(expTx)
         
+        expTy = np.zeros((nx, ny, nx, ny), dtype=complex)
+        
+        dvr_y = SineDVR(y)
+
         for i in range(nx):
-            my = moment_of_inertia(x[i])
-            dvr_y = SineDVR(domain[1], mass=my)
-            _expTy = dvr_y.expT(dt)
+            dvr_y.mass = I[i]
+            expTy[i, :, i, :] = dvr_y.expT(dt)
+
+        
+        self.exp_K.append(expTy)
 
             
-            
         return self.exp_K
+
+    def run(self, psi0, dt, nt, nout=1, t0=0):
+        
+        assert(psi0.shape == (self.nx, self.ny, self.nstates))
+        
+        if self.apes is None:
+            print('building the adibatic potential energy surfaces ...')
+            self.build_apes()
+        
+        self.buildV(dt)
+        
+        print('building the kinetic energy propagator')
+        self.buildK(dt)
+
+        
+        if self.A is None:
+            logging.info('building the electronic overlap matrix')
+            self.build_ovlp()
+        
+        expKx, expKy = self.exp_K
+
+        # T_{mn} A_{mb, na} = kinetic energy operator in LDR
+        self.exp_T = np.einsum('ijaklb, ik, kjl -> ijaklb', self.A, expKx, expKy)
+        
+        
+        r = ResultSPO2(dt=dt, psi0=psi0, Nt=nt, t0=t0, nout=nout)
+        r.x = self.x
+        r.y = self.y
+        r.psilist = [psi0]
+        
+        psi = psi0.copy()
+        psi = self.exp_V_half * psi
+        # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+        
+        for k in range(nt//nout):
+            for kk in range(nout):
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+
+                # psi = self._KEO_linear(psi)
+                # psi = np.einsum('ijaklb, klb->ija', self.A, psi)
+                psi = np.einsum('ijaklb, klb->ija', self.exp_T, psi) 
+                psi = self.exp_V * psi 
+                # psi = np.einsum('ija, ija -> ija', self.exp_V_half, psi)
+                
+            r.psilist.append(psi.copy())
+        
+        psi = self.exp_V_half * psi
+        
+        return r
 
 class LDR2_IT(LDR2):
     """
