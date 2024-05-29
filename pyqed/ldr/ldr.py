@@ -284,6 +284,7 @@ class ResultLDR(ResultSPO2):
         
         
         self.dx = dx
+        self.x = x
     
 
     
@@ -327,6 +328,8 @@ class LDRN:
                  dvr_type='sine'): 
 
         assert(len(domains) == len(levels) == ndim)
+        
+        self.domains = domains
         
         self.L = [domain[1] - domain[0] for domain in domains]
 
@@ -373,7 +376,7 @@ class LDRN:
         
         # all configurations in a vector
         self.points = np.fliplr(cartesian_product(x))
-        self.npts = len(self.points)
+        self.ntot = len(self.points)
 
         ###
         self.H = None
@@ -433,7 +436,7 @@ class LDRN:
         for d in range(self.ndim):
                     
             # Tx = kinetic(self.x[d], mass=self.mass[d], dvr=self.dvr_type[d])
-            dvr = SineDVR(*self.domains[d], mass=self.mass[d])
+            dvr = SineDVR(*self.domains[d], self.nx[d], mass=self.mass[d])
             # we can use free-particle propagator for the e^{-i K \Delta t}
             # expKx = scipy.linalg.expm(-1j * Tx * dt)
             Tx = dvr.t()
@@ -1846,13 +1849,13 @@ class LDR2_Jacobi(LDR2):
             
         self.exp_K.append(expTx)
         
-        expTy = np.zeros((nx, ny, nx, ny), dtype=complex)
+        expTy = np.zeros((nx, ny, ny), dtype=complex)
         
         dvr_y = SineDVR(y)
 
         for i in range(nx):
             dvr_y.mass = I[i]
-            expTy[i, :, i, :] = dvr_y.expT(dt)
+            expTy[i, :, :] = dvr_y.expT(dt)
 
         
         self.exp_K.append(expTy)

@@ -27,7 +27,7 @@ from pyqed import au2ev, au2angstrom
 
 from pyqed.ldr.ldr import kinetic
 
-from pyqed.units import au2tesla
+from pyqed.units import au2tesla, au2volt_per_angstrom
 
 
 # def kinetic_energy(L, npts, mass=1):
@@ -670,8 +670,11 @@ class ShinMetiu2InElectricField(ShinMetiu2):
     2D Shin Metiu model in a static electric field
     """
     
-    def __init__(self, method = 'scipy', nstates=3, dvr_type='sine', E=0, gauge='length'):
+    def __init__(self, method = 'scipy', nstates=3, E=[0, 0], dvr_type='sine', \
+                 dipole_self_energy=False, gauge='length'):
         """
+        
+        The electric field is in the x-y place. 
 
         Parameters
         ----------
@@ -681,8 +684,8 @@ class ShinMetiu2InElectricField(ShinMetiu2):
             DESCRIPTION. The default is 3.
         dvr_type : TYPE, optional
             DESCRIPTION. The default is 'sine'.
-        B : TYPE, optional
-            Magnetic field in z in Tesla. The default is 0 T.
+        E : array, optional
+            Electric field in z in V/A. The default is 0.
         gauge : TYPE, optional
             DESCRIPTION. The default is 'landau'.
 
@@ -693,7 +696,7 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         """
         super().__init__(method, nstates, dvr_type)
         
-        self.E = E # magnetic field 
+        self.E = E/au2volt_per_angstrom # electric field in au
         self.gauge = gauge 
         
         
@@ -725,10 +728,16 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         T = kron(tx, idy) + kron(idx, ty)
         
         X = np.diag(dvr_x.x)
+        Y = np.diag(dvr_y.x)
 
-        Py = dvr_y.momentum()
+        # Py = dvr_y.momentum()
         
-        self.hcore = T + B * kron(X, Py)
+        Ex, Ey = self.E 
+        
+        # dipole self-energy
+        DSE = 0
+        
+        self.hcore = T + kron(X, idy) * Ex + kron(idx, Y) * Ey + DSE
         return 
         
     def single_point(self, R):
@@ -803,6 +812,11 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         # ax.plot(X, Y, E[:, 1], label='Excited state')
         # print(E)
         return X, Y, E, U
+
+
+class ShinMetiu2e1D:
+    pass
+
 
 if __name__=='__main__':
     import time
