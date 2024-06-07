@@ -231,7 +231,13 @@ class Mol:
         None.
 
         """
+        
         self.H = H
+        if isdiag(H):
+            self.E = np.diag(H) # eigenvalues
+        else:
+            self.E = None
+            
         self.nonhermH = None
         self.h = H
         #        self.initial_state = psi0
@@ -273,7 +279,7 @@ class Mol:
         # if isdiag(H):
         #     self.E = np.diag(H)
         # else:
-        self.E = self.eigenenergies()
+        # self.E = self.eigenenergies()
 
     # def raising(self):
     #     return self.raising
@@ -313,7 +319,23 @@ class Mol:
     def edip_rms(self, edip):
         self._edip_rms = edip
 
+    def get_p_from_r(self):
+        """
+        .. math::
+            p_{ji} = -i m (\omega_i - \omega_j) x_{ji} = i \omega_{ij} \mu_ji
 
+        Returns
+        -------
+        None.
+
+        """
+        if self.E is None:
+            self.E = self.eigenenergies()
+            
+        return -1j * np.substract.outer(self.E, self.E) * self.edip
+            
+        
+    
     # @property
     # def H(self):
     #     return self.H
@@ -479,7 +501,9 @@ class Mol:
         """
         if self.H is None:
             raise ValueError('Call getH/calcH to compute H first.')
-
+        
+        H = self.H
+        
         if k is None or k >= self.dim: # full spectrum
             
             if issparse(H):
@@ -535,7 +559,10 @@ class Mol:
                         e_ops=obs_ops, nout=nout, t0=t0)
 
         return
-
+    
+    def Floquet(self):
+        pass 
+    
     def quantum_dynamics(self, psi0, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''
         quantum dynamics under time-independent hamiltonian

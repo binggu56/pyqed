@@ -565,28 +565,54 @@ class Cavity():
         return self.get_nonhermitianH()
 
 class Polariton(Composite):
-    def __init__(self, mol, cav):
+    
+    def __init__(self, mol, cav, g=None, gauge='length'):
 
         super(Polariton, self).__init__(mol, cav)
+        
+        assert isinstance(mol, Mol)
 
         self.mol = mol
         self.cav = cav
         self._ham = self.H = None
         self.dip = None
         self.cav_leak = None
-        self.H = None
+
         self.dims = [mol.dim, cav.n_cav]
         self.dim = mol.dim * cav.n_cav
+        self.gauge = gauge
         #self.dm = kron(mol.dm, cav.get_dm())
 
+        self._g = g
+        self.H = None
+        
+    @property
+    def g(self):
+        return self._g 
+    
+    @g.setter
+    def g(self, value):
+        self._g = value
+        
+    
     def getH(self, g, RWA=False):
         """
+        The coupling strength is defined as 
+        
+        .. math:: 
+            g \equiv \sqrt( \omega_c / 2 episilon_0 V) = \sqrt{2\pi\omega_c/V}
+            
+        The dipole self-energy 
+        .. math::
+            DSE = \frac{1}{2\epsilon_0 V} (\bm \mu \cdot \bm \varepsilon)^2
 
 
         Parameters
         ----------
         g : float
-            single photon electric field strength sqrt(hbar * omegac / 2 episilon_0 V)
+            single photon electric field strength 
+
+                
         RWA : TYPE, optional
             DESCRIPTION. The default is False.
 
@@ -599,22 +625,42 @@ class Polariton(Composite):
 
         mol = self.mol
         cav = self.cav
+        
+        omegac = cav.omegac
 
         hmol = mol.getH()
         hcav = cav.getH()
 
+        edip = mol.edip
+        
         Icav = cav.idm
         Imol = mol.idm
-
-        if RWA:
-
-            hint = g * (kron(mol.raising, cav.annihilate()) +
-                        kron(mol.lowering, cav.create()))
-
-        else:
-
-            hint = g * kron(mol.edip, cav.create() + cav.annihilate())
-
+        
+        a = cav.annihilate()
+        ad = dag(a)
+        qc = a + ad
+        
+        if self.gauge in ['length', 'dipole', 'dip']:
+            
+            if RWA:
+    
+                hint = g * (kron(mol.raising, a) +
+                            kron(mol.lowering, ad))
+    
+            else:
+                
+                DSE = g**2/omegac * kron(edip @ edip, Icav)
+                
+                hint = 1j * g * kron(edip,  a - ad) + DSE
+        
+        elif self.gauge in ['velocity']:
+            
+            p = self.mol.get_p_from_r()
+            
+            A = g/omegac * qc
+            
+            hint =  np.kron(p, A) + 0.5 * kron(Imol, A @ A)
+            
         self.H = kron(hmol, Icav) + kron(Imol, hcav) + hint
 
         return self.H
@@ -697,7 +743,7 @@ class Polariton(Composite):
         """
 
         if self.H == None:
-            sys.exit('Please call getH to compute the Hamiltonian first.')
+            sys.exit('Please call getH() to compute the Hamiltonian first.')
 
 
         if k is None:

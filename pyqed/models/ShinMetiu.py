@@ -146,6 +146,11 @@ class ShinMetiu:
         
         return w, u
 
+    def energy_nuc(self, R):   
+        Ra = self.left
+        Rb = self.right 
+        return self.V_nn(R, Ra) + self.V_nn(R, Rb) 
+    
     def V_en(self, r, R):
         """
         Electron-nucleus interaction potential.

@@ -1452,12 +1452,12 @@ class GWP2(WPD2):
 
     
 
-class Smolyak:
-    """
-    Conical intersection dynamcis with Smolyak sparse grid
-    """
-    def __init__(self, lmax, ndim=2):
-        self.lmax = lmax
+# class Smolyak:
+#     """
+#     Conical intersection dynamcis with Smolyak sparse grid
+#     """
+#     def __init__(self, lmax, ndim=2):
+#         self.lmax = lmax
     
             
         

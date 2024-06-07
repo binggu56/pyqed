@@ -284,7 +284,7 @@ class ResultLDR(ResultSPO2):
         
         
         self.dx = dx
-        self.x = x
+        # self.x = x
     
 
     
@@ -305,8 +305,9 @@ class ResultLDR(ResultSPO2):
         if plot:
             fig, ax = plt.subplots()
             for n in range(self.nstates):
-                ax.plot(self.times, p[:,n])
+                ax.plot(self.times, p[:,n], label=str(n))
             # ax.plot(self.times, p1)
+            plt.legend()
             return fig, ax
         else:
                 
@@ -1058,7 +1059,7 @@ class LDR2(WPD2):
     LDR-SPO-SincDVR
     
     """
-    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sinc'):
+    def __init__(self, x, y, nstates=2, ndim=2, mass=None, dvr='sine'):
         self.x = x
         self.y = y
         self.dx = interval(x)
@@ -1201,11 +1202,15 @@ class LDR2(WPD2):
         Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
         
         expKx = scipy.linalg.expm(-1j * Tx * dt)
-
         
-        Ty = kinetic(self.y, my, dvr=self.dvr)
+        dvr_x = SineDVR(x[0], x[-1], nx, mass=mx)
+        Tx = dvr_x.t()
+        expTx = dvr_x.expT(dt)
 
-        expKy = scipy.linalg.expm(-1j * Ty * dt)
+        dvr_y = SineDVR(y[0], y[-1], ny, mass=my)
+        Ty = dvr_y.t()
+        expTx = dvr_y.expT(dt)
+
 
         # x, y = self.x, self.y 
         # X = x[:, None] - x[None, :]
@@ -1715,12 +1720,12 @@ class LDR2_Jacobi(LDR2):
             \frac{\partial}{\partial q^\nu}
     """
     def __init__(self, domains, levels, dvr_types, mass=None, ndim=2, \
-                 dt=None, nt=None, nout=1):
+                 nstates=2, dt=None, nt=None, nout=1):
         
         assert(len(domains) == len(levels) == ndim)
         
         self.domains = domains
-        
+        self.nstates = nstates
         self.L = [domain[1] - domain[0] for domain in domains]
         
         # center of grids
@@ -1756,11 +1761,11 @@ class LDR2_Jacobi(LDR2):
                 raise ValueError('DVR {} is not supported. Please use sinc.'.format(dvr_type))
             
         
-        self.x = x
+        self.x, self.y = x
         self.w = w # weights
         self.dvr = dvr 
         # self.dx = [interval(_x) for _x in x]
-        self.nx = [len(_x) for _x in x] 
+        self.nx, self.ny = [len(_x) for _x in x] 
         
         self.dvr_types = dvr_types
         
@@ -1796,7 +1801,7 @@ class LDR2_Jacobi(LDR2):
         g = np.diag(1/self.mass)
         return g        
     
-    def buildK(self):
+    def buildK(self, dt):
         """
         For the kinetic energy operator with Jacobi coordinates
         
@@ -1827,9 +1832,9 @@ class LDR2_Jacobi(LDR2):
 
         """
 
-        x, y = self.x 
+        x, y = self.x, self.y
         mx, moment_of_inertia = self.mass 
-        nx, ny = self.nx
+        nx, ny = self.nx, self.ny
         dt = self.dt
         
         I = moment_of_inertia(x)
@@ -1837,7 +1842,7 @@ class LDR2_Jacobi(LDR2):
         self.exp_K = []
         
 
-        dvr = SineDVR(x, mass=mx)
+        dvr = SineDVR(*self.domains[0], nx, mass=mx)
         Tx = dvr.t()
         expTx = dvr.expT(dt)
         
@@ -1851,10 +1856,11 @@ class LDR2_Jacobi(LDR2):
         
         expTy = np.zeros((nx, ny, ny), dtype=complex)
         
-        dvr_y = SineDVR(y)
+        dvr_y = SineDVR(*self.domains[1], ny)
 
         for i in range(nx):
             dvr_y.mass = I[i]
+
             expTy[i, :, :] = dvr_y.expT(dt)
 
         
@@ -1865,6 +1871,8 @@ class LDR2_Jacobi(LDR2):
 
     def run(self, psi0, dt, nt, nout=1, t0=0):
         
+        print(psi0.shape)
+        print(self.nx, self.ny, self.nstates)
         assert(psi0.shape == (self.nx, self.ny, self.nstates))
         
         if self.apes is None:

@@ -67,7 +67,7 @@ def reorder_matrix(A):
             tmp[j,i] = tmp[i,j]
     return tmp
 
-def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
+def davidson(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
     """Davidosn solver for eigenvalue problem
     
     Seems quite slow!
@@ -102,7 +102,7 @@ def davidson_solver(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
     norm = np.zeros(neigen)
 
     # Begin block Davidson routine
-    print("iter size norm (%e)" %tol)
+    logging.info("iter size norm (%e)" %tol)
     for i in range(itermax):
     
         # QR of V t oorthonormalize the V matrix
@@ -275,7 +275,7 @@ if __name__=='__main__':
     
     neig = 3
     start = time.time()
-    w, u = davidson_solver(A, neig)
+    w, u = davidson(A, neig)
     print(w)
     end = time.time() 
     print ('Davidson Diagonalization time:',end-start)

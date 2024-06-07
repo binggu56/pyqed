@@ -576,7 +576,7 @@ class SineDVR(DVR):
         return self._mass
         
     @mass.setter
-    def set_mass(self, value):
+    def mass(self, value):
         self._mass = value
         
         

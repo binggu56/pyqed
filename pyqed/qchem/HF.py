@@ -197,6 +197,7 @@ def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
 def energy_elec(dm, h1e=None, vhf=None):
     r'''Electronic part of Hartree-Fock energy, for given core hamiltonian and
     HF potential
+    
     ... math::
         E = \sum_{ij}h_{ij} \gamma_{ji}
           + \frac{1}{2}\sum_{ijkl} \gamma_{ji}\gamma_{lk} \langle ik||jl\rangle
