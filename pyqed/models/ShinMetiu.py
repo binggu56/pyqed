@@ -22,13 +22,14 @@ from tqdm import tqdm
 
 from pyqed import discretize, sort, dag
 from pyqed.dvr import SineDVR
-from pyqed.davidson import davidson_solver
+from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom
 
 from pyqed.ldr.ldr import kinetic
 
 from pyqed.units import au2tesla, au2volt_per_angstrom
 
+from opt_einsum import contract
 
 # def kinetic_energy(L, npts, mass=1):
 #     """
@@ -52,9 +53,28 @@ from pyqed.units import au2tesla, au2volt_per_angstrom
 
 #     return T
 
+def soft_coulomb(r, R=1):
+    if np.isclose(r, 0):
+            # if r_R_distance == 0:
+        return 2 / (R * np.sqrt(np.pi))
+    else:
+        return erf(r / R) / r
+
+def force(r, R=1):
+    
+    if np.isclose(r, 0):
+        return 0
+    else:
+
+        f = 2 * np.exp(-(r/R)**2)/(np.sqrt(np.pi) * R * r)  - erf(r/R)/r**2
+        return f
+    
+soft_coulomb = np.vectorize(soft_coulomb)
+force = np.vectorize(force)
+
 
 class ShinMetiu:
-    def __init__(self, method = 'scipy', nstates=3, dvr_type='sinc', mass=1836):
+    def __init__(self, R, method = 'scipy', nstates=3, dvr_type='sinc', mass=1836):
         
         self.Rc = 1.5/au2angstrom  # Adjustable parameter in the pseudopotential
         # self.Rf = 1.5/au2angstrom  # Adjustable parameter in the pseudopotential
@@ -67,6 +87,8 @@ class ShinMetiu:
         self.mass = mass  # nuclear mass
         self.left = np.array([-self.L/2])
         self.right = np.array([self.L/2])
+
+        self.R = R # proton position
     
         # self.left = np.array([-self.L/2, 0])
         # self.right = np.array([self.L/2, 0])
@@ -79,12 +101,13 @@ class ShinMetiu:
         self.X = None
         self.Y = None
         
-        self.dvr_type = 'sinc'
+        self.dvr_type = dvr_type
         
         self.method = method
         self.v0 = None 
         # self.nv = 4 # davision’s default number of feature vectors is 4
         self.nstates = nstates
+        
         
     def create_grid(self, level, domain):
         
@@ -135,7 +158,7 @@ class ShinMetiu:
         if self.method == 'exact':
             w, u = eigh(H)
         elif self.method == 'davidson':
-            w, u = davidson_solver(H, neigen=self.nstates)
+            w, u = davidson(H, neigen=self.nstates)
         elif self.method == 'scipy':
             w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
             self.v0 = u[:,0] # store the eigenvectors for next calculation
@@ -165,7 +188,23 @@ class ShinMetiu:
         # ze2 = self.Z * self.e**2
         return -erf(np.linalg.norm(r - R) / self.Rc) / np.linalg.norm(r - R)
         # return -ze2 * erf(np.linalg.norm(r - R) / self.Rc) / np.linalg.norm(r - R)
-        
+    
+    def force(self, r, R):
+        """
+        Coulomb force due to nuclei
+
+        Parameters
+        ----------
+        r : TYPE
+            DESCRIPTION.
+        R : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
     # def V_en1(self, r, R):
     #      """
     #      Electron-nucleus interaction potential.
@@ -245,6 +284,8 @@ class ShinMetiu:
         return A
 
 
+
+    
 class ShinMetiu2:
     """
     2D Shin-Metiu model for PCET
@@ -277,6 +318,7 @@ class ShinMetiu2:
         self.right = np.array([self.L/2, 0])
         
         self.dvr_type = dvr_type
+        self.ndim = 2
     
         #######
         self.x = None
@@ -284,6 +326,7 @@ class ShinMetiu2:
         self.nx = None
         self.ny = None 
         self.domains = None 
+        self.size = None
         
         self.u = None
         self.X = None
@@ -306,13 +349,14 @@ class ShinMetiu2:
         self.y = y
         self.nx = len(x)
         self.ny = len(y)
+        self.size = self.nx * self.ny 
         self.lx = domain[0][1]-domain[0][0]
         self.ly = domain[1][1]-domain[1][0]
         self.dx = self.lx / (self.nx - 1)
         self.dy = self.ly / (self.ny - 1)
         self.domains = domain
         
-    def single_point(self, R):
+    def single_point(self, R, calc_nac=False):
         # if the matrix size 
         
         # H(r; R)
@@ -323,8 +367,6 @@ class ShinMetiu2:
         # tx = kinetic_energy(self.lx, self.nx)
         tx = kinetic(self.x, dvr=self.dvr_type)
         
-        print(tx)
-        
         idx = np.eye(self.nx)
         
         # ty = kinetic_energy(self.ly, self.ny)
@@ -332,8 +374,7 @@ class ShinMetiu2:
         idy = np.eye(self.ny)
         
         T = kron(tx, idy) + kron(idx, ty)
-        
-        print(T)
+
         
         # print(T.shape)
         
@@ -352,7 +393,9 @@ class ShinMetiu2:
         if self.method == 'exact':
             w, u = eigh(H)
         elif self.method == 'davidson':
-            w, u = davidson_solver(H, neigen=self.nstates)
+            
+            w, u = davidson(H, neigen=self.nstates)
+        
         elif self.method == 'scipy':
 
             w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
@@ -361,10 +404,116 @@ class ShinMetiu2:
         else:
             raise ValueError("Invalid method specified")
     
-
+        if not calc_nac:      
+            return w[:self.nstates], u[:, :self.nstates] 
         
-        return w[:self.nstates], u[:, :self.nstates] 
+        else:
+            
+            nac = self.nonadiabatic_coupling(w, u, R)
+            return w, u, nac
+        
+        #     dv = np.zeros((nx, ny, 2))
+        #     for i in range(nx):
+        #         for j in range(ny):
+        #             r = np.array([x[i], y[j]])
+        #             dv[i, j, :] = self.dH(r, R)
+                    
+        #     nac = contract('ij, ijn, ij -> n', u[:, 2].reshape(nx,ny).conj(),\
+        #                    dv, u[:,1].reshape(nx, ny))
+                
+        #     return w, u, nac/(w[1] - w[2])
+            
+    
+    def dH(self, r, R):
+        """
+        nuclear derivative of the electronic Hamiltonian :math:`\partial_\mu H(\mathbf{R})`
 
+        Parameters
+        ----------
+        r : TYPE
+            DESCRIPTION.
+        R : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        dh : TYPE
+            DESCRIPTION.
+
+        """
+        # NAC, derivative V_en
+        a = self.a
+        
+        # def each_nuclei(r, R):
+        # Ra = self.left
+        # Rb = self.right
+        
+        dh = (a + np.linalg.norm(r - R)**2)**(-3/2) * (R - r)
+        # dh += (a + np.linalg.norm(r - Ra)**2)**(-3/2) * (r - Ra)
+        # dh += (a + np.linalg.norm(r - Rb)**2)**(-3/2) * (r - Rb)
+        # dhdy = (a + np.linalg.norm(r - R)**2)**(-3/2) * (y + R[1])
+    
+        return dh
+        
+    def nonadiabatic_coupling(self, w, u, R):
+        """
+        Compute NACs  
+        .. math::
+            
+            F_\mu^{\beta \alpha} = \frac{\beta| \partial_\mu H|\alpha}{E_\alpha - E_\beta}
+
+        Parameters
+        ----------
+        w : TYPE
+            DESCRIPTION.
+        u : TYPE
+            DESCRIPTION.
+        R : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        
+        nx, ny = self.nx, self.ny
+        x, y = self.x, self.y 
+        
+        dv = np.zeros((nx, ny, 2))
+        for i in range(nx):
+            for j in range(ny):
+                r = np.array([x[i], y[j]])
+                dv[i, j, :] = self.dH(r, R)
+                
+        nac = contract('ij, ijn, ij -> n', u[:, 2].reshape(nx,ny).conj(),\
+                       dv, u[:,1].reshape(nx, ny))
+            
+        return nac/(w[1] - w[2])
+    
+    def berry_curvature(self, state_id=0):
+        """
+        For non-degenerate Abelian systems, 
+        
+        .. math::
+            
+            A_\mu = i \langle \psi | \partial_\mu \psi \rangle 
+            
+            B_{\mu \nu} = \partial_\mu A_\nu - \partial_\nu A_\mu 
+
+        Parameters
+        ----------
+        state_id : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+    
     def V_en(self, r, R):
         """
         Electron-nucleus interaction potential.
@@ -372,6 +521,8 @@ class ShinMetiu2:
         a = self.a
         
         return -1 / np.sqrt(a + np.linalg.norm(r - R)**2)
+    
+    
 
     def V_nn(self, R1, R2):
         """
@@ -399,7 +550,51 @@ class ShinMetiu2:
         
         return v
     
+    def parallel_transport(self, points):
+        """
+        Compute APES and NACs along a path
 
+        Parameters
+        ----------
+        points : TYPE
+            list of geometries defining a path.
+
+        Returns
+        -------
+        E : TYPE
+            DESCRIPTION.
+        U : TYPE
+            DESCRIPTION.
+
+        """
+        
+        wold, uold = self.single_point(points[0])
+        
+        E = [wold]
+        U = [uold]
+        
+        # print(nac)
+        
+        for point in points[1:]:
+            
+            w, u = self.single_point(point)
+            
+            # print(nac)
+            
+            for j in range(self.nstates):
+                if np.vdot(uold[:,j], u[:,j]) < 0:
+                    u[:,j] = -u[:,j]
+                    
+            wold = w
+            uold = u
+                    
+            E.append(w.copy())
+            U.append(u.copy())
+            
+        return E, U
+    
+    def single_valued(self):
+        pass
       
 
     def pes(self, domains=[[-2,2], [0,2]], levels=[4, 4]):
@@ -411,17 +606,19 @@ class ShinMetiu2:
         Y = discretize(*domains[1], l2, endpoints=False)
         E = np.zeros((len(X), len(Y), self.nstates))
         U = np.zeros((len(X), len(Y), self.nx, self.ny, self.nstates))
+        NAC = np.zeros((len(X), len(Y), self.ndim)) # nonadiabatic coupling
         
         print('Scanning the APES')
         for i in tqdm(range(len(X))):
             for j in range(len(Y)):
                 R = [X[i], Y[j]]
-                w, u = self.single_point(R)
+                w, u, nac = self.single_point(R, calc_nac=True)
                 # print(u.shape)
                 # w, u = sort(*self.single_point(R)) # The sort function sorts the eigenvalues from low to high
                 # print(u_temp.shape)
                 E[i, j, :] = w #[:nstates]
                 U[i, j] = u.reshape(self.nx, self.ny, self.nstates)
+                NAC[i, j] = nac
                 # print(U[i, j])
                 # U[i, j] = u.reshape(self.nx, self.ny, nstates)
                 # U[i, j] = u[:, :nstates].reshape(self.nx, self.ny, nstates)
@@ -429,12 +626,13 @@ class ShinMetiu2:
         self.u = U  
         self.X = X
         self.Y = Y
+        self.derivative_coupling = NAC
         # fig, ax = plt.subplots()
         
         # ax.plot(X, Y, E[:, 0], label='Ground state')
         # ax.plot(X, Y, E[:, 1], label='Excited state')
         # print(E)
-        return X, Y, E, U
+        return X, Y, E, U, NAC
         
     def electronic_overlap(self):#, l, r, nstates):
         # # TBW
@@ -819,24 +1017,61 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         return X, Y, E, U
 
 
-class ShinMetiu2e1D:
-    pass
 
+
+def circle(center=(0,0), radius=1, npts=10):
+    """
+    generate a discretized loop
+
+    Parameters
+    ----------
+    center : TYPE, optional
+        DESCRIPTION. The default is (0,0).
+    radius : TYPE, optional
+        DESCRIPTION. The default is 1.
+    npts : TYPE, optional
+        DESCRIPTION. The default is 10.
+
+    Returns
+    -------
+    points : TYPE
+        DESCRIPTION.
+
+    """
+    points = []
+    angles = np.linspace(0, 2*np.pi, npts, endpoint=False)
+    for i in range(npts):
+        point =  center + radius * np.array([np.cos(angles[i]), np.sin(angles[i])]) 
+        points.append(point.copy())
+    return points
+ 
 
 if __name__=='__main__':
     import time
     from pyqed.ldr.ldr import LDRN
     
-    # import proplot as plt
+    import proplot as plt
+    # import matplotlib.pyplot as plt
+    
+    
+    
+    r = np.linspace(0, 3)
+    # fig, ax = plt.subplots()
+    # ax.plot(r, soft_coulomb(r))
+    
+    fig, ax = plt.subplots()
+
+    ax.plot(r, [force(_r) for _r in r])
     
     
     # Example usage:
     mol = ShinMetiu2()
     mol.create_grid(5, domain=[[-6, 6], [-6,6]]) # check whether the domain enough big
-    w, u = mol.single_point([0,0])
-    print(w)
+    # w, u = mol.single_point([0,0])
+
     # X, E, U = mol.pes(domain=[-2,2], level = 5)
     # print(E)
+    
     
     # print(U.shape)
     
@@ -847,18 +1082,48 @@ if __name__=='__main__':
 
 
     # # Example usage:
-    mol = ShinMetiu2InMagneticField(B=0)
+    # mol = ShinMetiu2InMagneticField(B=0)
     
-    mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
-    mol.build()
-    
-    
-    levels = (2, 2)
-    domains = [[-2, 2], [-2, 2]]
+    # mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
+    # mol.build()
     
     
-    w, u = mol.single_point([0, 0])
-    print(w)
+    # levels = (2, 2)
+    # domains = [[-2, 2], [-2, 2]]
+    
+    # w, u, nac = mol.single_point(np.array([0, 1.2]), calc_nac=True)
+
+    
+    CI = (0, 1.21875)
+    points = circle(CI, radius=0.1, npts=10)
+    E, U = mol.parallel_transport(points)
+    
+    nac = []
+    for i in range(len(points)):
+        nac.append(mol.nonadiabatic_coupling(E[i], U[i], points[i]))
+    
+    # print([np.angle(f[0] + 1j * f[1]) for f in nac])
+    
+    
+    ### NAC
+    # from pyqed import scatter
+    # fig, ax = plt.subplots()
+    
+    # X,Y, E, U, NAC = mol.pes()
+    # q = ax.quiver(X, Y, NAC[:,:,0], NAC[:, :, 1])
+    # scatter(nac)
+    
+    
+    # fig, ax = plt.subplots()
+    # for j in range(1,3):
+    #     ax.plot([e[j] for e in E])
+    
+    # for _u in U:
+    #     fig, (ax1, ax2) = plt.subplots(ncols=2)
+    #     ax1.imshow(_u[:,1].reshape(mol.nx, mol.ny), cmap='viridis')
+    #     ax2.imshow(_u[:,2].reshape(mol.nx, mol.ny), cmap='viridis')
+
+        
 
     # X, Y, E, U = mol.pes(domains=domains, levels = levels)
     

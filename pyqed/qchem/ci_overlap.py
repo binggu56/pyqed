@@ -10,8 +10,58 @@ geometries).
 '''
 
 from functools import reduce
-import numpy
+import numpy as np
+
 from pyscf import gto, scf, ci
+
+
+
+# def wf_overlap(Xm, Xn, Cm, Cn, S):
+#     """
+#     CIS wavefunction overlap matrix
+
+#     Parameters
+#     ----------
+#     Xm : TYPE
+#         DESCRIPTION.
+#     Xn : TYPE
+#         DESCRIPTION.
+#     Cm : TYPE
+#         DESCRIPTION.
+#     Cn : TYPE
+#         DESCRIPTION.
+#     S : TYPE
+#         DESCRIPTION.
+
+#     Returns
+#     -------
+#     ovlp_00 : TYPE
+#         DESCRIPTION.
+
+#     """
+#     # restricted case has same orbitals for alpha and beta electrons
+#     has_m = True if isinstance(Xm, np.ndarray) else False
+#     has_n = True if isinstance(Xn, np.ndarray) else False
+#     has_y = True if (isinstance(Ym, np.ndarray) and isinstance(Yn, np.ndarray)) else False
+
+#     nroots, no, nv = Xm.shape
+
+#     smo = np.einsum('mp,mn,nq->pq', Cm, S, Cn)
+#     #print_matrix('smo:', smo, 5, 1)
+#     smo_oo = np.copy(smo[:no,:no])
+#     dot_0 = np.linalg.det(smo_oo)
+    
+#     ovlp = np.zeros((nroots, nroots))
+    
+#     ovlp[0, 0] = dot_0**2
+    
+    
+    # TODO
+    
+    # if not (has_m or has_n):
+
+`
+    
 
 def wavefunction_overlap(geometry1, geometry2):
     #

@@ -1,14 +1,19 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Created on Tue Aug  9 17:05:29 2022
 
-@author: Bing
+HF with matrix elements extracted from PySCF
+
+@author: Bing Gu (gubing@westlake.edu.cn)
 """
+
 
 import logging
 import numpy as np
 from scipy.linalg import eigh
 from pyscf.scf import _vhf
+from pyscf import ao2mo
 import sys
 
 from pyqed import dagger, dag
@@ -19,6 +24,9 @@ class RHF:
         self.max_cycle = 100
         self.init_guess = init_guess
 
+        self.nocc = self.mol.nelectron//2
+        self.nao = self.mol.nao
+
         self.mo_occ = None
         self.mo_coeff = None
         self.e_tot = None
@@ -27,20 +35,70 @@ class RHF:
         self.e_ne = None
         self.e_j = None
         self.e_k = None
+        
+        
+
+        
+        
+        self.hcore = None
+        self.vhf = None
+        self.dm = None
+        
+        self.eri = None
 
     def run(self, **kwargs):
-        self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ =\
-            hartree_fock(self.mol, **kwargs)
-        return
+        self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+            self.vhf, self.dm = hartree_fock(self.mol, **kwargs)
+        return self
+    
+    def get_eri(self):
+        """
+        electron repulsion integral in MO
 
-    def rdm1(self):
-        return make_rdm1(self.mo_coeff, mo_occ)
+        Returns
+        -------
+        eri : TYPE
+            DESCRIPTION.
+
+        """
+        
+        nmo = len(self.mo_energy)
+        C = self.mo_coeff
+        
+        eri = ao2mo.general(self.mol, (C,C,C,C),
+                      compact=False).reshape(nmo,nmo,nmo,nmo, order='C')
+        
+        
+        self.eri = eri 
+        return eri
+
+
+    def make_rdm1(self):
+        return make_rdm1(self.mo_coeff, self.mo_occ)
 
     def get_ovlp(self):
         pass
 
     def get_fock(self):
         pass
+    
+    def get_veff(self):
+        return get_veff(self.mol, self.dm)
+    
+    def get_j(self):
+        return get_jk(self.mol, self.dm, with_k=False)[0]
+    
+    def get_hcore(self):
+        return get_hcore(self.mol)
+    
+    def energy_elec(self,dm=None):
+        if dm is None:
+            dm = self.make_rdm1()
+            
+        return energy_elec(dm, self.hcore, self.vhf)
+    
+    def energy_nuc(self):
+        return self.e_nuc
 
 
 
@@ -79,7 +137,15 @@ def get_hcore(mol):
 
 
 def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
-    '''Hartree-Fock potential matrix for the given density matrix
+    '''Unrestricted Hartree-Fock potential matrix for the given density matrix
+    
+    .. math::
+
+        V_{ij}^\alpha &= \sum_{kl} (ij|kl)(\gamma_{lk}^\alpha+\gamma_{lk}^\beta)
+                       - \sum_{kl} (il|kj)\gamma_{lk}^\alpha \\
+        V_{ij}^\beta  &= \sum_{kl} (ij|kl)(\gamma_{lk}^\alpha+\gamma_{lk}^\beta)
+                       - \sum_{kl} (il|kj)\gamma_{lk}^\beta
+                       
     Args:
         mol : an instance of :class:`Mole`
         dm : ndarray or list of ndarrays
@@ -194,6 +260,7 @@ def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
             vk = vk.reshape(dm_shape)
     return vj, vk
 
+
 def energy_elec(dm, h1e=None, vhf=None):
     r'''Electronic part of Hartree-Fock energy, for given core hamiltonian and
     HF potential
@@ -235,6 +302,34 @@ def energy_elec(dm, h1e=None, vhf=None):
     return e1+e_coul #, e_coul
 
 
+# def energy_elec(mf, dm=None, h1e=None, vhf=None):
+#     '''Electronic energy of Unrestricted Hartree-Fock
+
+#     Note this function has side effects which cause mf.scf_summary updated.
+
+#     Returns:
+#         Hartree-Fock electronic energy and the 2-electron part contribution
+#     '''
+#     if dm is None: dm = mf.make_rdm1()
+#     if h1e is None:
+#         h1e = mf.get_hcore()
+#     if isinstance(dm, np.ndarray) and dm.ndim == 2:
+#         dm = np.array((dm*.5, dm*.5))
+#     if vhf is None:
+#         vhf = get_veff(mf.mol, dm)
+#     if h1e[0].ndim < dm[0].ndim:  # get [0] because h1e and dm may not be ndarrays
+#         h1e = (h1e, h1e)
+#     e1 = np.einsum('ij,ji->', h1e[0], dm[0])
+#     e1+= np.einsum('ij,ji->', h1e[1], dm[1])
+#     e_coul =(np.einsum('ij,ji->', vhf[0], dm[0]) +
+#              np.einsum('ij,ji->', vhf[1], dm[1])) * .5
+#     e_elec = (e1 + e_coul).real
+#     mf.scf_summary['e1'] = e1.real
+#     mf.scf_summary['e2'] = e_coul.real
+#     logger.debug(mf, 'E1 = %s  Ecoul = %s', e1, e_coul.real)
+#     return e_elec, e_coul
+
+
 def make_rdm1(mo_coeff, mo_occ, **kwargs):
     '''One-particle density matrix in AO representation
     Args:
@@ -255,7 +350,7 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 
 
 
-def hartree_fock(mol, max_cycle=50):
+def hartree_fock(mol, max_cycle=50, tol=1e-8):
 
     #print("constructing basis set")
 
@@ -376,7 +471,7 @@ def hartree_fock(mol, max_cycle=50):
 
     print("E_nclr = ", nuclear_energy)
 
-    print("\n {:4s} {:13s} de\n".format("iter", "total energy"))
+    logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
 
     conv = False
     for scf_iter in range(max_cycle):
@@ -393,10 +488,10 @@ def hartree_fock(mol, max_cycle=50):
 
         total_energy = electronic_energy + nuclear_energy
 
-        print("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
+        logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
                total_energy - old_energy))
 
-        if scf_iter > 2 and abs(old_energy - total_energy) < 1e-6:
+        if scf_iter > 2 and abs(old_energy - total_energy) < tol:
             conv = True
             break
 
@@ -427,7 +522,8 @@ def hartree_fock(mol, max_cycle=50):
     # check if this hartree-fock calculation is for configuration interaction
     # or not, if yes, output the essential information
     # if CI == False:
-    return total_energy, nuclear_energy, mo_energy, mo_coeff, mo_occ
+    return total_energy, nuclear_energy, mo_energy, mo_coeff, mo_occ, hcore, vhf,\
+        dm
     # else:
     # return C, Hcore, nuclear_energy, two_electron
 
@@ -443,3 +539,8 @@ if __name__ == '__main__':
     hf = RHF(mol)
     hf.run()
     print(hf.e_tot)
+
+
+
+                       
+                       

@@ -130,7 +130,11 @@ def get_m_rpa(gw, e_rpa, t_rpa):
 
 def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
     '''
-    self energy sigma_{pq} = i [GW]_{pq}
+    self energy 
+    
+    .. math::
+        
+        \Sigma_{pq} = i [GW]_{pq}
     '''
     if not isinstance(omegas, (list,tuple,np.ndarray)):
         single_point = True

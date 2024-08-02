@@ -500,6 +500,8 @@ class SparseGrid:
         # add positions of sparse grid points
         for i in range(len(self.indices)):
             self.gP[tuple(self.indices[i])] = gridPoint(self.indices[i],self.domain)
+        
+        return self.gP
 
     def generatePointsRec(self, dim, level, cur_level=None):
         """ 
@@ -609,6 +611,20 @@ class SparseGrid:
                     for k in range(len(indices)):
                 
                         self.nodal2Hier1D(indices[k], i, j, d)
+                        
+    def buildV(self):
+        """
+        compute the APESs at grid points
+
+        Returns
+        -------
+        None.
+
+        """
+        
+    def buildK(self):
+        # build KEO 
+        # how to do this?
         
     # def nodal2hierachiral(self):
     #     return self.nodal2Hier()
@@ -894,7 +910,7 @@ if __name__=="__main__":
         
         return v
 
-    level = 8
+    level = 5
     dim = 2
     
     # # reference calculation
@@ -967,7 +983,7 @@ if __name__=="__main__":
     print('number of regular grid points = ', 2**(2*level)) 
 
 
-    # # sg.plot_grid()
+    # sg.plot_grid()
     
     # #
     # #  Evaluate the initial wavepacket at each grid point.
@@ -986,18 +1002,19 @@ if __name__=="__main__":
     
     # # x = np.linspace(-6, 6, 2**5, endpoint=False)[1:]
 
-    index_set, c = sg.combination_technique() 
+
+    # index_set, c = sg.combination_technique() 
     
-    print(index_set)
-    print(len(c))
-    print(c)
+    # print(index_set)
+    # print(len(c))
+    # print(c)
     
     
-    index_set, c = sg.truncated_combination_technique(tau=5) 
-    print('truncated')
-    print(index_set)
-    print(len(c))
-    print(c)
+    # index_set, c = sg.truncated_combination_technique(tau=5) 
+    # print('truncated')
+    # print(index_set)
+    # print(len(c))
+    # print(c)
 
     # s = 0
     # for n, index in enumerate(index_set):

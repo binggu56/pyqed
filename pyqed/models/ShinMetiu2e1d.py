@@ -21,19 +21,19 @@ import warnings
 
 from pyqed import discretize, sort, dag
 from pyqed.davidson import davidson
-from pyqed.ldr.ldr import kinetic
-from pyqed import au2ev, au2angstrom
+
+from pyqed import au2ev, au2angstrom, fine_structure, pauli
 from pyqed.dvr import SineDVR
-from pyqed import scf
-from pyqed.scf import make_rdm1, energy_elec
+# from pyqed import scf
+# from pyqed.scf import make_rdm1, energy_elec
 # from pyqed.jordan_wigner import jordan_wigner_one_body, jordan_wigner_two_body
 
-from pyqed.ci.fci import SpinOuterProduct, givenΛgetB
+# from pyqed.ci.fci import SpinOuterProduct, givenΛgetB
 
-from numba import vectorize, float64, jit
-import sys
-from opt_einsum import contract
-from itertools import combinations
+# from numba import vectorize, float64, jit
+# import sys
+# from opt_einsum import contract
+# from itertools import combinations
 
 # @vectorize([float64(float64, float64)])
 # @vectorize
@@ -46,8 +46,18 @@ def soft_coulomb(r, R=1):
     else:
         return erf(r / R) / r
 
+def force(r, R=1):
+    
+    if np.isclose(r, 0):
+        return 0
+    else:
+        return ((2 * np.exp(-r**2/R**2))/(np.sqrt(np.pi) * R) - erf(r/R))/r**2
+
 soft_coulomb = np.vectorize(soft_coulomb)
 
+
+
+        
 def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
     '''Compute J, K matrices for all input density matrices
     Args:
@@ -208,12 +218,11 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
 
 
 
-class HydrogenChain:
-    pass
 
-class ShinMetiu1d2e:
+
+class ShinMetiu1d:
     """
-    Shin-Metiu model with 2 electrons in 1D
+    Shin-Metiu model with N electrons in 1D
     
     Refs 
         
@@ -239,7 +248,7 @@ class ShinMetiu1d2e:
         self.spin = spin
         self.nelec = self.nelectron = nelec
         self.Z = [1, 1, 1]     # Ion charge
-        # self.e = 1     # Electron charge, should be set to actual value in atomic units
+        self.e = -1     # Electron charge, should be set to actual value in atomic units
         
         self.L = 10/au2angstrom
         # print(self.L)
@@ -498,7 +507,7 @@ class ShinMetiu1d2e:
             self.V_en(r2, Ra) + self.V_en(r2, Rb) + self.V_en1(r2, R)
 
         # nuclei-nuclei interaction
-        v_nn = self.V_nn(R, Ra) + self.V_nn(R, Rb) 
+        v_nn = self.V_nn(R, Ra) + self.V_nn(R, Rb) + self.V_nn(Ra, Rb)
         v_ee = self.V_ee(r1, r2)
         
         v += v_nn + v_ee        
@@ -608,81 +617,22 @@ class ShinMetiu1d2e:
         plt.tight_layout()
         plt.show()
 
-class RHF1D:
-    # """
-    # restricited DVR-HF method in 1D 
-    # """
-    def __init__(self, mol, init_guess='hcore', dvr_type = 'sine'): # nelec, spin):
-        # self.spin = spin 
-        # self.nelec = nelec
-        self.mol = mol        
-    
-        self.T = None
-        self.hcore = None 
-        self.fock = None
-        
-        self.mol = mol
-        self.max_cycle = 100
-        self.tol = 1e-6
-        self.init_guess = init_guess
 
-        ###
-        self.nx = self.mol.nx 
-        self.x = self.mol.x
-        
-        self.mo_occ = None
-        self.mo_coeff = None
-        self.e_tot = None
-        self.e_nuc = None
-        self.e_kin = None
-        self.e_ne = None
-        self.e_j = None
-        self.e_k = None
-        
-        self.eri = None
-        
+class RHF_SOC(ShinMetiu1d):
+    """
+    3D spinful electron in a linear chain of three protons 
+    """
+    
+
     def create_grid(self, domain, level):
-            
-        x = discretize(domain, level, endpoints=False)
-        
-        self.x = x 
-        self.nx = len(x)
-
-        self.lx = domain[1]-domain[0]
-        # self.dx = self.lx / (self.nx - 1)
-
-        self.domain = domain
-    
-    def get_eri(self):
         """
-        electronc repulsion integral in DVR basis
-
-        Returns
-        -------
-        v : TYPE
-            DESCRIPTION.
-
-        """
-        nx = self.nx 
-        x = self.x
-        
-        v = soft_coulomb(0, self.mol.Re) * np.eye(nx)
-        for i in range(nx):
-            for j in range(i):
-                d = np.linalg.norm(x[i] - x[j])
-                v[i,j] = soft_coulomb(d, self.mol.Re)
-                v[j,i] = v[i,j]
-
-        self.eri = v
-        return v
-
-    def get_veff(self, dm):
-        """
-        compute Hartree and Fock potential
+        create real-space grids (DVR basis sets)
 
         Parameters
         ----------
-        dm : TYPE
+        domain : TYPE
+            DESCRIPTION.
+        level : TYPE
             DESCRIPTION.
 
         Returns
@@ -691,485 +641,248 @@ class RHF1D:
 
         """
         
-        # hartree potential        
-        J = contract('ij, jj -> i', self.eri, dm)
-        J = np.diag(J)
-        
-        # exchange 
-        K = self.eri * dm 
-        
-        vHF = J - 0.5 * K
-        
-        return vHF
-    
-    def get_hcore(self):
-        return self.mol.get_hcore()
-        
-    def run(self, R):
-        # scf cycle
-        max_cycle = self.max_cycle
-        tol = self.tol
-        
-        
-        # Hcore (kinetic + v_en)
-        hcore = self.mol.get_hcore(R)
-        self.hcore = hcore 
-        
-        # occ number
-        nocc = mol.nelectron // 2
-        mo_occ = np.zeros(self.nx)
-        mo_occ[:nocc] = 2
-        
-        self.mo_occ = np.stack([mo_occ, mo_occ])
-        print('mo_occ', self.mo_occ)
-        
-        self.get_eri()
-        
-        if self.init_guess == 'hcore':
-
-            mo_energy, mo_coeff = eigh(hcore)
-            dm = make_rdm1(mo_coeff, mo_occ)
-        
+        if isinstance(level, (int, float)):
+            level = [level, ] * 3
             
-            vhf = self.get_veff(dm)            
-            old_energy = energy_elec(dm, hcore, vhf)
-            
-        print("\n {:4s} {:13s} de\n".format("iter", "total energy"))
+        x = discretize(*domain[0], level[0], endpoints=False)
+        y = discretize(*domain[1], level[1], endpoints=False)
+        z = discretize(*domain[2], level[2], endpoints=False)
 
-        nuclear_energy = mol.energy_nuc(R)
-        
-        conv = False
-        for scf_iter in range(max_cycle):
-
-            # calculate the two electron part of the Fock matrix
-
-            vhf = self.get_veff(dm)
-            F = hcore + vhf
-
-
-            mo_energy, mo_coeff = eigh(F)
-            # print("epsilon: ", epsilon)
-            #print("C': ", Cprime)
-            # mo_coeff = C
-            # print("C: ", C)
-
-
-            # new density matrix in original basis
-            # P = np.zeros(Hcore.shape)
-            # for mu in range(len(phi)):
-            #     for v in range(len(phi)):
-            #         P[mu,v] = 2. * C[mu,0] * C[v,0]
-            dm = make_rdm1(mo_coeff, mo_occ)
-
-            electronic_energy = energy_elec(dm, hcore, vhf)
-
-            
-
-            print("E_elec = ", electronic_energy)
-
-            total_energy = electronic_energy + nuclear_energy
-
-            logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
-                   total_energy - old_energy))
-
-            if scf_iter > 2 and abs(old_energy - total_energy) < tol:
-                conv = True
-                print('SCF Converged.')
-                break
-            
-            old_energy = total_energy
-
-
-            #println("F: ", F)
-            #Fprime = X' * F * X
-            # Fprime = dagger(X).dot(F).dot(X)
-            #println("F': $Fprime")
-            
-        self.mo_coeff = mo_coeff
-        self.mo_energy = mo_energy
-
-
-        if not conv: sys.exit('SCF not converged.')
-
-        print('HF energy = ', total_energy)
-        
-        return total_energy
-    
-    # def energy_elec(dm, h1e=None, vhf=None):
-    #     r'''
-    #     Electronic part of Hartree-Fock energy, for given core hamiltonian and
-    #     HF potential
-        
-    #     ... math::
-    #         E = \sum_{ij}h_{ij} \gamma_{ji}
-    #           + \frac{1}{2}\sum_{ijkl} \gamma_{ji}\gamma_{lk} \langle ik||jl\rangle
-              
-    #     Note this function has side effects which cause mf.scf_summary updated.
-    #     Args:
-    #         mf : an instance of SCF class
-    #     Kwargs:
-    #         dm : 2D ndarray
-    #             one-partical density matrix
-    #         h1e : 2D ndarray
-    #             Core hamiltonian
-    #         vhf : 2D ndarray
-    #             HF potential
-    #     Returns:
-    #         Hartree-Fock electronic energy and the Coulomb energy
-    #     Examples:
-    #     >>> from pyscf import gto, scf
-    #     >>> mol = gto.M(atom='H 0 0 0; H 0 0 1.1')
-    #     >>> mf = scf.RHF(mol)
-    #     >>> mf.scf()
-    #     >>> dm = mf.make_rdm1()
-    #     >>> scf.hf.energy_elec(mf, dm)
-    #     (-1.5176090667746334, 0.60917167853723675)
-    #     >>> mf.energy_elec(dm)
-    #     (-1.5176090667746334, 0.60917167853723675)
-    #     '''
-    #     # if dm is None: dm = mf.make_rdm1()
-    #     # if h1e is None: h1e = mf.get_hcore()
-    #     # if vhf is None: vhf = mf.get_veff(mf.mol, dm)
-    #     e1 = np.einsum('ij,ji->', h1e, dm).real
-    #     e_coul = np.einsum('ij,ji->', vhf, dm).real * .5
-    #     # mf.scf_summary['e1'] = e1
-    #     # mf.scf_summary['e2'] = e_coul
-    #     # logger.debug(mf, 'E1 = %s  E_coul = %s', e1, e_coul)
-    #     return e1+e_coul #, e_coul
-
-
-    def make_rdm1(mo_coeff, mo_occ, **kwargs):
-        '''One-particle density matrix in AO representation
-        Args:
-            mo_coeff : 2D ndarray
-                Orbital coefficients. Each column is one orbital.
-            mo_occ : 1D ndarray
-                Occupancy
-        Returns:
-            One-particle density matrix, 2D ndarray
-        '''
-        mocc = mo_coeff[:,mo_occ>0]
-    # DO NOT make tag_array for dm1 here because this DM array may be modified and
-    # passed to functions like get_jk, get_vxc.  These functions may take the tags
-    # (mo_coeff, mo_occ) to compute the potential if tags were found in the DM
-    # array and modifications to DM array may be ignored.
-        return np.dot(mocc*mo_occ[mo_occ>0], mocc.conj().T)
-
-class RHF2D(scf.RHF):
-    """
-    restricited DVR-HF method in 2D 
-    """
-    def __init__(self, mol, init_guess='hcore', dvr_type = 'sine'): # nelec, spin):
-        # self.spin = spin 
-        # self.nelec = nelec
-        self.mol = mol        
-    
-        self.T = None
-        self.hcore = None 
-        self.fock = None
-        
-        self.mol = mol
-        self.max_cycle = 100
-        self.tol = 1e-6
-        self.init_guess = init_guess
-
-        self.mo_occ = None
-        self.mo_coeff = None
-        self.e_tot = None
-        self.e_nuc = None
-        self.e_kin = None
-        self.e_ne = None
-        self.e_j = None
-        self.e_k = None
-        
-    def create_grid(self, domains, levels):
-            
-        x = discretize(*domains[0], levels[0], endpoints=False)
-        y = discretize(*domains[0], levels[1], endpoints=False)
         
         self.x = x 
         self.y = y
+        self.z = z 
+        
         self.nx = len(x)
         self.ny = len(y)
-        self.lx = domains[0][1]-domains[0][0]
-        self.ly = domains[0][1]-domains[0][0]
+        self.nz = len(z)
+        
+        # self.lx = domain[0][1]-domain[0][0]
+        # self.ly = domain[0][1]-domain[0][0]
         # self.dx = self.lx / (self.nx - 1)
         # self.dy = self.ly / (self.ny - 1)
-        self.domains = domains
-            
-    def run(self, init_guess='hcore'):
-        # scf cycle
-        max_cycle = self.max_cycle
-        tol = self.tol
+        self.domain = domain 
+        self.level = level
         
-        conv = False
-        for scf_iter in range(max_cycle):
-
-            # calculate the two electron part of the Fock matrix
-
-            vhf = get_veff(mol, dm)
-            F = hcore + vhf
-
-            mo_energy, mo_coeff = eigh(F)
-
-            dm = make_rdm1(mo_coeff, mo_occ)
-
-            electronic_energy = energy_elec(dm, hcore, vhf)
-
-
-            #print("E_elec = ", electronic_energy)
-
-            total_energy = electronic_energy + nuclear_energy
-
-            logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
-                   total_energy - old_energy))
-
-            if scf_iter > 2 and abs(old_energy - total_energy) < tol:
-                conv = True
-                self.mo_coeff = mo_eff
-                self.mo_energy = mo_energy
-                break
-
-            #println("F: ", F)
-            #Fprime = X' * F * X
-            # Fprime = dagger(X).dot(F).dot(X)
-            #println("F': $Fprime")
-
-            # print("epsilon: ", epsilon)
-            #print("C': ", Cprime)
-            # mo_coeff = C
-            # print("C: ", C)
-
-
-            # new density matrix in original basis
-            # P = np.zeros(Hcore.shape)
-            # for mu in range(len(phi)):
-            #     for v in range(len(phi)):
-            #         P[mu,v] = 2. * C[mu,0] * C[v,0]
-
-            old_energy = total_energy
-
-        if not conv: sys.exit('SCF not converged.')
-
-        print('HF energy = ', total_energy)
-        
-        return 
-
-# class RHF:
-#     """
-#     HF in 3D space
-#     """
-#     pass
-
-
-class CASCI:
-    def __init__(self, mf, ncas, nelecas=None, nstates=3):
+    def run(self):
         """
-        Exact diagonalization (FCI) on the complete active space (CAS) by 
-        Jordan-Wigner transformation
-        
-        .. math::
-            H = h_{ij}c_i^\dagger c_j + v_{pqrs} c_p^\dagger c_q^\dagger c_s c_r
-
-        
-        From Pyscf: Hartree-Fock orbitals are often poor for systems with significant static correlation. 
-        In such cases, orbitals from density functional calculations often 
-        yield better starting points for CAS calculations.
+        build electronic Hamiltonian matrix H(r; R) in spin-orbitals and diagonalize
         
         Parameters
         ----------
-        scf : TYPE
-            A DFT/HF object.
-        nstates : TYPE, optional
-            number of excited states. The default is 3.
-        ncas : TYPE, optional
-            DESCRIPTION. The default is None.
-        nelecas : TYPE, optional
-            DESCRIPTION. The default is None.
+        R : TYPE
+            DESCRIPTION.
+
+        Raises
+        ------
+        ValueError
+            DESCRIPTION.
 
         Returns
         -------
-        None.
+        w : TYPE
+            DESCRIPTION.
+        u : TYPE
+            DESCRIPTION.
 
         """
-        self.ncas = ncas # number of MOs
-        if ncas > 10:
-            warnings.warn('Active space with {} orbitals is probably too big.'.format(ncas))
-        self.nstates = nstates
-        if nelecas is None:
-            nelecas = mf.mol.nelec
-        self.nelecas = nelecas
+
+        x, y, z = self.x, self.y, self.z
+        nx, ny, nz = self.nx, self.ny, self.nz
         
-        self.mf = mf
+        domain = self.domain
+        
+        # KEO
+        if self.dvr_type == 'sine':
+            
+            dvr_x = SineDVR(domain[0][0], domain[0][1], nx, mass=self.mass)
+            tx = dvr_x.t()
+            idx = dvr_x.idm 
+            
+            dvr_y = SineDVR(domain[1][0], domain[1][1], ny, mass=self.mass)
+            ty = dvr_y.t()
+            idy = dvr_y.idm 
+            
+            dvr_z = SineDVR(domain[2][0], domain[2][1], nz, mass=self.mass)
+            tz = dvr_z.t()
+            idz = dvr_z.idm 
+        
+        else:
+            raise NotImplementedError('DVR type {} has not been \
+                                      implemented.'.format(self.dvr_type))
+
+        
+        T = kron(tx, kron(idy, idz)) + kron(idx, kron(ty, idz)) + \
+            kron(idx, kron(idy, tz))
+
+        
+        # PEO
+        v = np.zeros((nx, ny, nz))
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    r = np.array([x[i], y[j], z[k]])
+                    v[i, j, k] = self.potential_energy(r)
+        
+        V = np.diag(v.ravel())
+        
+
+        nao = nx * ny * nz
+        nso = nao * 2 # number of spin-orbitals
+        
+        hcore = T + V # KEO + Coulomb potential
+        
+        # 1e SOC
+        s0, s1, s2, s3 = pauli() 
+        
+        hso1 = alpha**2/2 * py
+        
+        # H = np.block([ 
+        #       [hcore, hso], 
+        #       [hso.conj(), hcore]])
+
+        H = kron(hcore, s0)        
+        if np.any(np.isnan(H)) or np.any(np.isinf(H)):
+            raise ValueError("H matrix contains NaNs or infs.")
+        
+        if self.method == 'exact':
+            w, u = eigh(H)
+        
+        elif self.method == 'davidson':
+            w, u = davidson(H, neigen=self.nstates)
+            
+        elif self.method == 'scipy':
+            w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
+            
+            self.v0 = u[:,0] # store the eigenvectors for next calculation
+
+        else:
+            raise ValueError("Invalid method specified")
     
-    def get_SO_matrix(self, SF=False, H1=None, H2=None):
-        """ 
-        Given a PySCF uhf object get Spin-Orbit Matrices 
         
-        SF: bool
-            spin-flip
+        return w, u
+    
+class AtomicChain(ShinMetiu1d):
+    """
+    1D chain of atoms
+    """
+    def __init__(self, R, nstates=None, charge=0, dvr_type='sine', spin=0, Z=1, diag_method = 'scipy'):
+
+        self.geometry = self.atom_coords = self.R = R
+        self.nuc_charge = Z
+        self.natom = len(R)
+        
+        # self.charge = self.nuc_charge * self.natom - nelec
+        self.charge = charge 
+        self.nelec =  self.nuc_charge * self.natom - self.charge   
+        
+        super().__init__(method = diag_method, nstates=nstates, nelec=self.nelec, \
+                       dvr_type=dvr_type, spin=spin)
+        
+    
+    def v_en(self, r):
         """
-        from pyscf import ao2mo
+        Electron-nucleus interaction potential.
+        """
         
-        mf = self.mf
-        
-        # molecular orbitals
-        Ca, Cb = [mf.mo_coeff, ] * 2 
-        
-        # S = (uhf_pyscf.mol).intor("int1e_ovlp")
-        # eig, v = np.linalg.eigh(S)
-        # A = (v) @ np.diag(eig**(-0.5)) @ np.linalg.inv(v)
-        
-        # H1e in AO
-        H = mf.get_hcore()
-        # H = dag(Ca) @ H @ Ca 
-        
-        nmo = Ca.shape[1] # n
-        
-        eri = mf.eri  # (pq||rs) 1^*12^*2 
-        eri_aa = contract('ip, iq, ij, jr, js -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-        
-        # physicts notation <pq|rs>
-        # eri_aa = contract('ip, jq, ij, ir, js -> pqrs', Ca.conj(), Ca.conj(), eri, Ca, Ca)
-
-        eri_aa -= eri_aa.swapaxes(1,3)
-
-        eri_bb = eri_aa.copy()
-        
-        eri_ab = contract('ip, iq, ij, jr, js->pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-        eri_ba = contract('ip, iq, ij, jr, js->pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
-
-        
-        
-        
-        # eri_aa = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Ca, Ca, Ca), 
-        #                         compact=False)).reshape((n,n,n,n), order="C")
-        # eri_aa -= eri_aa.swapaxes(1,3)
-        
-        # eri_bb = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Cb, Cb, Cb),
-        # compact=False)).reshape((n,n,n,n), order="C")
-        # eri_bb -= eri_bb.swapaxes(1,3)
-        
-        # eri_ab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Ca, Cb, Cb),
-        # compact=False)).reshape((n,n,n,n), order="C")
-        # #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
-        
-        # eri_ba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Cb, Ca, Ca),
-        # compact=False)).reshape((n,n,n,n), order="C")
-        
-        H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-        H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
-        H, Cb, Cb)])
-        
-        # if SF:
-        #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_abba = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Cb, Ca),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_baab = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Ca, Cb),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_baba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Cb, Ca),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     H2_SF = np.stack(( np.stack((eri_abab, eri_abba)), np.stack((eri_baab, eri_baba)) ))
-        #     return H1, H2, H2_SF
-        # else:
-        #     return H1, H2
-        return H1, H2
-        
-    def qubitization(self):
-        pass
-
-        
+        v = 0 
+        for a in range(self.natom):
+            d = np.linalg.norm(r - self.R[a])
+            v += -soft_coulomb(d, self.Rf)
+        return v  * self.nuc_charge
     
-    # def jordan_wigner(self):
-    #     # an inefficient implementation without consdiering any syemmetry 
-        
-    #     # transform the Hamiltonian in DVR set to (truncated) MOs 
-    #     nmo = self.ncas
-    #     mf = self.mf 
-        
-    #     mo = mf.mo_coeff[:self.ncas]
-        
-    #     # single electron part
-    #     hcore_mo = contract('ia, ij, jb -> ab', mo.conj(), mf.hcore, mo)
-        
-    #     self.hcore_mo = hcore_mo
-        
-    #     eri = self.mf.eri
-    #     eri_mo = contract('ip, jq, ij, ir, js', mo.conj(), mo.conj(), eri, mo, mo)
+    def get_hcore(self):
+        """
+        single point calculations
 
-    #     H = 0        
-    #     for p in range(nmo):
-    #         for q in range(p+1):
-    #             H += jordan_wigner_one_body(p, q, hcore_mo[p, q], hc=True)
-                
-    #     for p in range(nmo):
-    #         for q in range(nmo):
-    #             for r in range(nmo):
-    #                 for s in range(nmo):
-    #                     H += jordan_wigner_two_body(p, q, s, r, 0.5*eri_mo[p, q, r, s])
-    
-    #     return H
-    
-    
-    def run(self, nstates=3):
-        from pyqed.ci.fci import SlaterCondon, CI_H
-        
-        mf = self.mf 
-        ncas = self.ncas 
-        
-        mo_occ = mf.mo_occ[:, :ncas]/2
-        
-        mf.mo_coeff = mf.mo_coeff[:, :ncas]
-        
-        Binary = get_fci_combos(mo_occ)
-        print('Binary shape', Binary.shape)
-        
-        H1, H2 = self.get_SO_matrix(mf)
-        SC1, SC2 = SlaterCondon(Binary)
-        H_CI = CI_H(Binary, H1, H2, SC1, SC2)
-        
-        print('HCI', H_CI)
-        
-        # E, X = np.linalg.eigh(H_CI)
-        E, X = eigsh(H_CI, k=nstates, which='SA')
-        return E, X
-        
-def get_fci_combos(mo_occ):
-    # print(mf.mo_occ.shape)
-    O_sp = np.asarray(mo_occ, dtype=np.int8)
-    
-    # number of electrons for each spin 
-    N_s = np.einsum("sp -> s", O_sp)
-    
-    N = O_sp.shape[1]
-    Λ_α = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[0] ) ) )
-    Λ_β = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[1] ) ) )
-    ΛA, ΛB = SpinOuterProduct(Λ_α, Λ_β)
-    Binary = givenΛgetB(ΛA, ΛB, N)
-    return Binary
+        Parameters
+        ----------
+        R : float
+            proton position.
 
+        Raises
+        ------
+        ValueError
+            DESCRIPTION.
 
-class RCISD:
-    def __init__(self, mf):
-        pass
-    
-    def buildH(self):
-        # build the CI H in determinants {0, ia, ijab}
-        pass
+        Returns
+        -------
+        w : TYPE
+            DESCRIPTION.
+        u : TYPE
+            DESCRIPTION.
+
+        """
         
-    def run(self):
-        pass
+        # H(r; R)
+        x = self.x
+        nx = self.nx
 
-class UCISD(self, mf):
-    def __init__(self):
-        pass
+        
+        # T 
+        # origin method of calculate kinetic term
+        # tx = kinetic(x, dvr=self.dvr_type)
+        # idx = np.eye(nx)  
+        
+        # ty = kinetic(y, dvr=self.dvr_type)
+        # idy = np.eye(ny)
+        
+        # T = kron(tx, idy) + kron(idx, ty)
+        
+        # # # new method of calculate kinetic term
+        dvr_x = SineDVR(*self.domain, nx)
+        
+        # tx = kinetic(self.x, dvr=self.dvr_type)
+        T = dvr_x.t()
+    
+        self.T = T
+        
+        
+        # V_en
+        # Ra = self.left
+        # Rb = self.right 
+        v = np.zeros((nx))
+        for i in range(nx):   
+            r1 = np.array(x[i])
+            # Potential from all ions
+            v[i] = self.v_en(r1)
+        
+        V = np.diag(v)
+        
+        # v_sym = self.enforce_spin_symmetry(v)
+        # # print(v_sym.shape)
+        # V = np.diag(v_sym.ravel())
+        
+        H = T + V 
+        # H = self.imaginary_time_propagation(H)
+        
+        if np.any(np.isnan(H)) or np.any(np.isinf(H)):
+            raise ValueError("H matrix contains NaNs or infs.")
+        
+        return H
+    
+    def energy_nuc(self):   
+        # Ra = self.left
+        # Rb = self.right 
+        v = 0        
+        for a in range(self.natom):
+            for b in range(a):
+                v += self.V_nn(self.R[a], self.R[b])
+        return v 
 
+def eri_svd(mf):
+    # ax.imshow(mf.eri)
+    u, a, vh = np.linalg.svd(mf.eri)
+    # ax.plot(a)  
+    return u, a, vh
 
 if __name__=='__main__':
     
-    import proplot as plt 
+    # import proplot as plt 
     # import matplotlib.pyplot as plt
+    from pyqed.qchem.dvr.rhf import RHF1D
+    from pyqed.qchem.casci import CASCI
+
     # r = np.linspace(0, 1)
     # # v = [soft_coulomb(_r, 1) for _r in r]
     # v = soft_coulomb(r)
@@ -1177,42 +890,103 @@ if __name__=='__main__':
     # fig, ax = plt.subplots()
     # ax.plot(r, v)
     
+    L = 10/au2angstrom
+        # print(self.L)
+        # self.mass = mass  # nuclear mass
+    # z = np.array([-L/2, -L/4, L/4, L/2])
+    z0 = np.linspace(-1, 1, 4) * L/2
     
+
+    mol = AtomicChain(z0, charge=0)
+    print('number of electrons = ', mol.nelec)
     ###############################################################################  
-    mol = ShinMetiu1d2e(method='scipy', nstates=6, nelec=4)
-    mol.spin = 0
-    mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=5)
+    # mol = ShinMetiu1d(nstates=3, nelec=2)
+    # # mol.spin = 0
+    mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=6)
     
-    R = 0.
-    
-    # exact 
+    # # exact 
+    # R = 0.
     # w, u = mol.single_point(R)
     # print(w)
-    
     
     # fig, ax = plt.subplots()
     # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
     
     # HF 
     mf = RHF1D(mol)    
-    mf.run(R)
-    
-    mo = mf.mo_coeff
+    mf.run()
 
+    E = mf.e_tot
     
+    cas = CASCI(mf, norb=6)
+    w, X = cas.run(3)
+    e_cas = w
+    print(w)
+    
+ 
+    ### scan PEC
+    
+    # ds = np.linspace(-1, 1, 4)
+    # E = np.zeros(len(ds))
+    
+    # nstates = 3
+    # e_cas = np.zeros((len(ds), nstates))
+
+    # for i in range(len(ds)):
+        
+    #     d = ds[i]
+    #     z = z0 + np.array([0, d, d, 0])
+    
+    #     mol = AtomicChain(z, charge=0)
+    #     print('number of electrons = ', mol.nelec)
+    #     ###############################################################################  
+    #     # mol = ShinMetiu1d(nstates=3, nelec=2)
+    #     # # mol.spin = 0
+    #     mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=6)
+        
+    #     # # exact 
+    #     # R = 0.
+    #     # w, u = mol.single_point(R)
+    #     # print(w)
+        
+    #     # fig, ax = plt.subplots()
+    #     # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
+        
+    #     # HF 
+    #     mf = RHF1D(mol)    
+    #     mf.run()
+    
+    #     E[i] = mf.e_tot
+        
+    #     cas = CASCI(mf, ncas=6)
+    #     w, X = cas.run(3)
+    #     e_cas[i, :] = w
+    #     # mo = mf.mo_coeff
+
+
     # fig, ax = plt.subplots()
-    # ax.imshow(mf.eri)
+    # ax.plot(ds, E, '-o', label='HF/DVR')
+    # ax.plot(ds, e_cas[:,0], '-o', label='CASCI S$_0$')
+    # ax.plot(ds, e_cas[:,1], '-', label='CASCI')
+    # ax.plot(ds, e_cas[:,2], '-s', label='CASCI S$_2$')
+
+    # ax.legend(frameon=False)
+
+    # ax.set_ylim(-3,0)
     
-    # fig, ax = plt.subplots()
-    # for j in range(4):
-    #     ax.plot(mol.x, mo[:, j])
+    def plot_mo(mo):
     
+        fig, ax = plt.subplots()
+
+        fig, ax = plt.subplots()
+        for j in range(4):
+            ax.plot(mol.x, mo[:, j], label= str(j))
+        ax.legend(frameon=False, title='MO')
+        fig.savefig('MO.pdf')
     
-    cas = CAS(mf, ncas=6)
-    E, X = cas.run(3)
+    ## CASCI
     
 
-    print(E+mol.energy_nuc(R))
     
     
     # mol.create_grid(5, [[-15/au2angstrom, 0], [0, 15/au2angstrom]])

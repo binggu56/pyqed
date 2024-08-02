@@ -17,13 +17,101 @@ from numpy import sin, cos, pi
 from numpy.linalg import norm
 import numpy as np
 
-from pyscf import dft, scf, gto
+from pyqed import dag
+
+from pyscf import dft, scf, gto, ao2mo
 
 # Suppress scientific notation printouts and change default precision
 np.set_printoptions(precision=4)
 np.set_printoptions(suppress=True)
 
 
+def get_hcore_mo(mf):
+    """
+    calc the core Hamiltonian in MOs
+
+    Parameters
+    ----------
+    mf : TYPE
+        DESCRIPTION.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    
+    if isinstance(mf, scf.rhf.RHF):
+        mo_coeff = mf.mo_coeff
+        return dag(mo_coeff) @ mf.get_hcore() @ mo_coeff
+    
+    elif isinstance(mf, scf.uhf.UHF):
+        
+        ha, hb = mf.get_hcore()
+        Ca, Cb = mf.mo_coeff  # MOs for alpha and beta electrons
+        
+        return [dag(Ca) @ ha @ Ca, dag(Cb) @ hb @ Cb]
+    
+    else:
+        raise ValueError('Input should be be mean-field object.')
+
+def get_eri_mo(mf):
+    """
+    get the two-electron integrals as a numpy array of shape (N,N,N, N)
+    where N is the number of orbitals
+    
+
+    Parameters
+    ----------
+    mol : TYPE
+        DESCRIPTION.
+    mo_coeff : TYPE
+        MOs. Not necesarrily the canonical orbitals. E.g. natural orbitals
+
+    Returns
+    -------
+    eri : TYPE
+        DESCRIPTION.
+
+    """
+    if isinstance(mf, scf.rhf.RHF):
+        Ca = mf.mo_coeff
+        n = Ca.shape[-1]
+        # eri = ao2mo.get_mo_eri(mol, mo_coeff)
+        eri_aa = (ao2mo.general(mf._eri , (Ca, Ca, Ca, Ca), 
+                                compact=False)).reshape((n,n,n,n), order="C")
+        return  eri_aa
+    
+    elif isinstance(mf, scf.uhf.UHF):
+        
+        Ca, Cb = mf.mo_coeff
+        
+        eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca), 
+                                compact=False)).reshape((n,n,n,n), order="C")
+        eri_aa -= eri_aa.swapaxes(1,3)
+        
+        eri_bb = (ao2mo.general( mf._eri , (Cb, Cb, Cb, Cb),
+        compact=False)).reshape((n,n,n,n), order="C")
+        eri_bb -= eri_bb.swapaxes(1,3)
+        
+        eri_ab = (ao2mo.general( mf._eri , (Ca, Ca, Cb, Cb),
+        compact=False)).reshape((n,n,n,n), order="C")
+        
+        # eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
+        
+        eri_ba = (ao2mo.general( mf._eri , (Cb, Cb, Ca, Ca),
+        compact=False)).reshape((n,n,n,n), order="C")
+        
+        H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
+        
+        return H2
+    
 def build_atom_from_coords(atom_symbol_list, coords):
     """
     construct the atom data format (i.e. xyz format) used in pyscf from coordinates and atom symbols
@@ -434,7 +522,6 @@ from functools import reduce
 
 
 # from pyqed import eig_asymm, is_positive_def, dag
-# from lime.optics import Pulse
 
 
 def intertia_moment(mass, coords):
@@ -459,15 +546,6 @@ def intertia_moment(mass, coords):
 #     def rhf(self):
 #         pass
 
-#     def rks(self):
-#         pass
-
-#     def tddft(self, nstates=1):
-#         pass
-
-#     def normal_modes(self):
-#         pass
-
 #     def absorption(self, ttype='electron'):
 #         # range, uv, ir, xray
 
@@ -482,7 +560,7 @@ def intertia_moment(mass, coords):
 
 # class Molecule(gto.M):
 class Molecule:
-    def __init__(self, **kwargs):
+    def __init__(self, geometry, charge=0, spin=0, **kwargs):
 
         # mol = super(Molecule, self).__init__(**kwargs)        
         
@@ -495,10 +573,20 @@ class Molecule:
         self.natom = mol.natm
         self.mass = mol.atom_mass_list()
         self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
+        
 
 
         self.distmat = None
+        # self.e_nuc = None
+        
 
+
+    
+    def atom_charge(self, atm_id):
+        pass
+    
+    def atom_charges(self):
+        pass
 
     def com(self):
         '''
@@ -728,6 +816,22 @@ class Molecule:
 
     def tofile(self,fname):
         pass
+    
+    def RHF(self):
+        pass
+    
+    def UHF(self):
+        pass
+    
+    def RKS(self):
+        pass
+    
+    def UKS(self):
+        pass
+    
+    # def energy_nuc(self):
+    #     pass
+        
 
 
 def readxyz():
