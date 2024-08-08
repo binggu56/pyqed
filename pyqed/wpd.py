@@ -189,12 +189,16 @@ class Solver():
 
 
 class SPO:
-    def __init__(self, x, mass=1, ns=2):
+    """
+    Time-dependent Schrodinger Equation for wavepackets on a single PES 
+    with 1D nuclear coordinate
+    """
+    def __init__(self, x, mass=1, nstates=1):
         self.x = x
         self.dx = interval(x)
         self.nx = len(x)
         self.k = 2. * pi * fftfreq(self.nx, self.dx)
-        self.ns = ns
+        self.nstates = nstates
 
         self.V = None
         self.mass = mass
@@ -218,7 +222,7 @@ class SPO:
         self._exp_K = np.exp(-0.5j / m * (k * k) * dt)
         return
 
-    def run(self, psi0, dt, Nt=1, t0=0, nout=1):
+    def run(self, psi0, dt, nt=1, t0=0, nout=1):
 
         """
         Time-dependent Schrodinger Equation for wavepackets on a single PES.
@@ -243,12 +247,12 @@ class SPO:
         t = t0
         psi_x = psi0.copy()
 
-        r = Result(psi0=psi0, dt=dt, Nt=Nt, t0=t0, nout=nout)
+        r = Result(psi0=psi0, dt=dt, Nt=nt, t0=t0, nout=nout)
 
         # SPO propagation
         psi_x = self.x_evolve_half(psi_x)
 
-        for i in range(1, Nt//nout):
+        for i in range(1, nt//nout):
             for k in range(nout):
                 t += dt
 
@@ -371,6 +375,7 @@ class SPO:
 
 #     return psi_x
 
+
 class SPO2:
     """
     second-order split-operator method for nonadiabatic wavepacket dynamics
@@ -411,6 +416,9 @@ class SPO2:
         
         self.d2a = None # diabatic to adiabatic transformation
         self.a2d = None # adiabatic to diabatic transformation
+        
+        # results
+        self.psilist = None
 
     def set_grid(self, x, y):
         self.x = x
@@ -472,12 +480,17 @@ class SPO2:
             for n in range(self.ns):
                 v[:, :, n, n] = -1j * eta * (self.X - 9.)**2
 
-        self.V = v
+        self.v = v
         return v
     
     def set_dpes(self, v):
         self.V = self.v = v
-        return 
+        return self
+    
+    # def set_DPEM(self, v):
+    #     self.V = self.v = v
+    #     return 
+        
 
 
     def build(self, dt, inertia=None):
@@ -692,7 +705,8 @@ class SPO2:
         
         r.x = self.x
         r.y = self.y
-        r.psilist = [psi0]
+        
+        psilist = [psi0]
 
         t = t0
         if self.coords == 'linear':
@@ -715,7 +729,7 @@ class SPO2:
                     psi = KEO(psi)
                     psi = _V_half(psi)
 
-                r.psilist.append(psi.copy())
+                psilist.append(psi.copy())
 
         else:
 
@@ -740,7 +754,7 @@ class SPO2:
             psi = KEO(psi)
             psi = np.einsum('ijab, ijb -> ija', self.exp_V_half, psi) # evolve V half step
 
-        r.psi = psi
+        r.psilist = psilist
         return r
     
     def rdm_el(self, psi):
@@ -901,7 +915,7 @@ class SPO2:
             fig.savefig('psi'+str(i)+'.pdf')
         return ax0, ax1
 
-
+    
 
 
 class SPO2NH(SPO2):
@@ -1970,10 +1984,10 @@ if __name__ == '__main__':
 
     # specify time steps and duration
     ndim = 2 # 2D problem, DO NOT CHANGE!
-    dt = 0.01
-    print('time step = {} fs'.format(dt * au2fs))
+    # dt = 0.01
+    # print('time step = {} fs'.format(dt * au2fs))
 
-    num_steps = 10
+    # num_steps = 10
 
 
     nx = 2 ** 5
@@ -1994,19 +2008,21 @@ if __name__ == '__main__':
     kx = 2. * np.pi * fftfreq(nx, dx)
     ky = 2. * np.pi * fftfreq(ny, dy)
 
-    X, Y = np.meshgrid(x, y)
+    def diabatic_potential_energy_matrix(x, y):
+        
+        X, Y = np.meshgrid(x, y)
+        
+        v = np.zeros((len(x), len(y), 2, 2))
+        
+        v[:, :, 0, 0] = 0.5 * ((X+1)**2 + Y**2)
+        v[:, :, 1, 1] = 0.5 * ((X-1)**2 + Y**2) + 1
+        v[:, :, 0, 1] = Y * 0.1
+        v[:, :, 1, 0] = Y * 0.1
+        
+        return v
 
-    fig, ax = plt.subplots()
-    v0 = 0.5 * ((X+1)**2 + Y**2)
-    v1 = 0.5 * ((X-1)**2 + Y**2) + 1.0
-    
-    
-    
-    # for i in range(nx):
-    #     for j in range(ny):
-    #         v[i,j] = diabatic(x[i], y[j])[0,0]
-
-    #ax.imshow(v)
+    v = diabatic_potential_energy_matrix(x, y)
+        
 
     # specify constants
     mass = [1.0, 1.0]  # particle mass
@@ -2027,9 +2043,9 @@ if __name__ == '__main__':
     psi0 = np.zeros((nx, ny, ns), dtype=complex)
     psi0[:, :, 1] = gauss_x_2d(sigma, x0, y0, kx0, ky0)
 
-    fig, ax = plt.subplots()
-    ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='viridis')
-    ax.set_title('Initial wavepacket')
+    # fig, ax = plt.subplots()
+    # ax.contour(x, y, np.abs(psi0[:, :, 1]).T, cmap='gnuplot')
+    # ax.set_title('Initial wavepacket')
 
     #psi = psi0
 
@@ -2046,16 +2062,16 @@ if __name__ == '__main__':
     # G[:,:,0, 0] = G[:,:,1, 1] = 1.
 
     
-    extent=[xmin, xmax, ymin, ymax]
+    # extent=[xmin, xmax, ymin, ymax]
 
     # psi1 = adiabatic_2d(x, y, psi0, v, dt=dt, Nt=num_steps, coords='curvilinear',G=G)
     sol = SPO2(nstates=2, mass=[1, 1], x=x, y=y)
 
-    sol.set_DPES(surfaces = [v0, v1], diabatic_couplings = [[[0, 1], X * 0.2]])
+    sol.v = v
 
-    r = sol.run(psi0=psi0, dt=0.5, Nt=2000)
+    r = sol.run(psi0=psi0, dt=0.5, nt=200)
     
-    rho = np.zeros((nstates, nstates, len(r.times)))
+    # rho = np.zeros((nstates, nstates, len(r.times)))
 
     # sol.current_density(r.psilist[-1])
     # r.plot_wavepacket(r.psilist[-1])
@@ -2064,7 +2080,7 @@ if __name__ == '__main__':
     #     rho[:, :, i] = sol.rdm_el(r.psilist[i])
     
     sol.rdm_el(r.psilist)
-    P = sol.population(r.psilist, representation='adiabatic')
+    P = sol.population(r.psilist, representation='diabatic')
 
     
     # p0, p1 = r.get_population()

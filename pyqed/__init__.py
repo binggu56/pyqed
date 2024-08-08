@@ -4,6 +4,7 @@ from .units import *
 from .mol import *
 from .style import *
 from .wpd import *
+# from spo.SPO_1D import SPO
 # from pyqed.qchem.mol import *
 from pyqed.qchem import mol
 from .optics import *

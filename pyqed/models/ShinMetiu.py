@@ -1050,18 +1050,18 @@ if __name__=='__main__':
     import time
     from pyqed.ldr.ldr import LDRN
     
-    import proplot as plt
-    # import matplotlib.pyplot as plt
+    # import proplot as plt
+    import matplotlib.pyplot as plt
     
     
     
-    r = np.linspace(0, 3)
+    # r = np.linspace(0, 3)
+    # # fig, ax = plt.subplots()
+    # # ax.plot(r, soft_coulomb(r))
+    
     # fig, ax = plt.subplots()
-    # ax.plot(r, soft_coulomb(r))
-    
-    fig, ax = plt.subplots()
 
-    ax.plot(r, [force(_r) for _r in r])
+    # ax.plot(r, [force(_r) for _r in r])
     
     
     # Example usage:
@@ -1088,19 +1088,19 @@ if __name__=='__main__':
     # mol.build()
     
     
-    # levels = (2, 2)
-    # domains = [[-2, 2], [-2, 2]]
+    levels = (5, 5)
+    domains = [[-2, 2], [0, 2]]
     
     # w, u, nac = mol.single_point(np.array([0, 1.2]), calc_nac=True)
 
     
-    CI = (0, 1.21875)
-    points = circle(CI, radius=0.1, npts=10)
-    E, U = mol.parallel_transport(points)
+    # CI = (0, 1.21875)
+    # points = circle(CI, radius=0.1, npts=10)
+    # E, U = mol.parallel_transport(points)
     
-    nac = []
-    for i in range(len(points)):
-        nac.append(mol.nonadiabatic_coupling(E[i], U[i], points[i]))
+    # nac = []
+    # for i in range(len(points)):
+    #     nac.append(mol.nonadiabatic_coupling(E[i], U[i], points[i]))
     
     # print([np.angle(f[0] + 1j * f[1]) for f in nac])
     
@@ -1125,26 +1125,26 @@ if __name__=='__main__':
 
         
 
-    # X, Y, E, U = mol.pes(domains=domains, levels = levels)
+    X, Y, E, U = mol.pes(domains=domains, levels = levels)
     
     
-    # start = time.time()
+    start = time.time()
 
-    # A = mol.electronic_overlap()
+    A = mol.electronic_overlap()
     
-    # print(A.shape)
-    # print(A[:, :, 0, :, :, 0])
+    print(A.shape)
+    print(A[:, :, 0, :, :, 0])
     
     
-    # ######################
-    # ## Quantum Dynamics ##
-    # ######################
+    ######################
+    ## Quantum Dynamics ##
+    ######################
     
-    # sol = LDRN(domains=domains, levels=levels)
-    # sol.A = A
-    # sol.apes = E
+    sol = LDRN(domains=domains, levels=levels)
+    sol.A = A
+    sol.apes = E
     
-    # sol.run(dt=0.01, mass=[1827,])
+    sol.run(dt=0.01, mass=[1827,])
     
     
     # e = np.allclose(u_exact[0], u_da[0])

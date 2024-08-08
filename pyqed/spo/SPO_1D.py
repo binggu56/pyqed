@@ -22,7 +22,7 @@ import scipy
 from numba import jit
 from numpy import pi 
 
-from lime.phys import dagger, interval
+from pyqed import dagger, interval
 
 
 def x_evolve(dt, x, v, psi):
@@ -150,15 +150,31 @@ def density_matrix(psi_x,dx):
     rho11 = 1. - rho00
     return rho00, rho01, rho01.conj(), rho11
 
+
+class SPO:
+    """
+    1D split-operator method for adiabatic wave packet dynamics 
+    """
+    def __init__(self, x, v, mass=1):
+        self.x = x 
+        self.v = v 
+        self.mass = mass
+    
+    def run(self, psi0, dt, nt):
+        x = self.x 
+        v = self.v 
+        psi_x = adiabatic_1d(dt=dt, x=x, v=v, psi0=psi0, Nt=nt)
+        return psi_x
+    
 ######################################################################
 if __name__ == '__main__':
     
-    from lime.units import au2fs, au2ev, au2wavenumber
+    from pyqed.units import au2fs, au2ev, au2wavenumber
     import matplotlib.pyplot as plt 
     
     # specify time steps and duration
-    dt = 0.1/au2fs
-    nt = 30
+    dt = 0.02/au2fs
+    nt = 400
     # frames = int(t_max / float(N_steps * dt))
     
     # specify constants
@@ -167,11 +183,11 @@ if __name__ == '__main__':
     
     # specify range in x coordinate
     N = 256
-    xmin = -128
+    xmin = -6
     xmax = -xmin
     #dx = 0.01
     #x = dx * (np.arange(N) - 0.5 * N)
-    x = np.linspace(xmin,xmax,N)
+    x = np.linspace(-8,8,128)
     
     print('x range = ',x[0], x[-1])
     # print('dx = {} \n'.format(dx))
@@ -184,9 +200,9 @@ if __name__ == '__main__':
     
     # diabatic surfaces with vibronic couplings
     # V_x = np.zeros((N,4))
-    omega = 2000/au2wavenumber
-    print('period = {} fs'.format(2*pi/omega * au2fs))
-    
+    # omega = 2000/au2wavenumber
+    # print('period = {} fs'.format(2*pi/omega * au2fs))
+    omega = 1
     v = x**2/2.0 * omega**2
     
     fig, ax = plt.subplots()
@@ -194,24 +210,24 @@ if __name__ == '__main__':
     
     # specify initial momentum and quantities derived from it
     #p0 = np.sqrt(2 * m * 0.2 * V0)
-    k0 = 0.0
-    x0 = -20
+
     #dp2 = p0 * p0 * 1./80
     #d = hbar / np.sqrt(2 * dp2)
     
     
-    psi_x0 =  gauss_x(x, a=4*(omega), x0=x0, k0=k0)
+    psi_x0 =  gauss_x(x, a=(omega), x0=-2, k0=0)
     # psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
     
     
     
     
     fig, ax = plt.subplots()
-    ax.plot(x, psi_x0)
+    ax.plot(x, np.abs(psi_x0))
     
     
     # propagate
-    psi_x = adiabatic_1d(dt=dt, x=x, v=v, psi0=psi_x0, Nt=nt)
+    psi_x = SPO(x, v).run(dt=dt, psi0=psi_x0, nt=nt)
+    
     ax.plot(x, np.abs(psi_x))
     
     # store the final wavefunction

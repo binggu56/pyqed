@@ -556,10 +556,12 @@ class SineDVR(DVR):
 
         """
         self.npts = npts
+        self.xmin = xmin 
+        self.xmax = xmax
         self.L = float(xmax - xmin)
-        self.a = self.L /(npts + 1)
+        self.dx = self.L /(npts + 1)
         self.n = np.arange(1, npts + 1)
-        self.x = float(xmin) + self.a * self.n
+        self.x = float(xmin) + self.dx * self.n
         self.k_max = None
         
 
@@ -668,7 +670,7 @@ class SineDVR(DVR):
             
             U_{j\alpha} = \sqrt{2/(n+1)} \sin(j \alpha \pi/(n+1))
         
-        for j, \alpha = 1, 2, ..., n. 
+        for j labels the FBR and :math:`\alpha = 1, 2, ..., n` labels the DVR set. 
         
         Returns
         -------
@@ -684,11 +686,36 @@ class SineDVR(DVR):
         return U
         
 
-    def dvr_set(self, n):
-        pass 
+    def basis(self, x, a=0):
+        """
+        Return the DVR basis vectors
+
+        Parameters
+        ----------
+        n : int
+            nth DVR basis set.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+        # a += 1
+        center = self.xmin + (a + 1) * self.dx
+        n = self.npts
+        L = self.L
+        _x = (x - center)/L
+        _y = (x + center)/L
+
+        
+        chi = 1/(2 * np.sqrt(L* (n+1))) * \
+            (np.sin((2*n+1) * np.pi/2 * _x)/np.sin(np.pi/2*_x) - \
+              np.sin((2*n+1) * np.pi/2 * _y)/np.sin(np.pi/2*_y))
+            
+        
+        return chi 
     
-#     def f(self, x=None):
-#         """Return the DVR basis vectors"""
 #         if x is None:
 #             x_m = self.x[:, np.newaxis]
 #         else:
@@ -1002,7 +1029,7 @@ class VFactory(object):
 
 if __name__ == '__main__':
     import time
-    x = np.linspace(-7, 7, 200)
+    # x = np.linspace(-7, 7, 200)
     def v(x):
         return x**2/2
         
@@ -1033,30 +1060,36 @@ if __name__ == '__main__':
     # test_sineDVR()
     
     
-    dvr = SineDVR(0, 1, npts=6)
+    dvr = SineDVR(-6, 6, npts=64)
     
+    E, U = dvr.run(v, 6)    
     
-    U = dvr.fbr2dvr()
+    x = np.linspace(-6,6,200)
 
-    # print((np.subtract.outer(dvr.n, dvr.n) % 2))
+    fig, ax = plt.subplots()
+    ax.plot(x, dvr.basis(x, 32))
+        
+    # U = dvr.fbr2dvr()
+
+    # # print((np.subtract.outer(dvr.n, dvr.n) % 2))
     
-    start = time.time()    
-    T = dvr.t()
-    print(T)
+    # start = time.time()    
+    # T = dvr.t()
+    # print(T)
     
-    print(U.conj().T @ np.diagflat(dvr.t_fbr()) @ U)
-    print(kinetic(dvr.x, dvr='sine'))
+    # print(U.conj().T @ np.diagflat(dvr.t_fbr()) @ U)
+    # print(kinetic(dvr.x, dvr='sine'))
     
-    # p = dvr.momentum()
-    # print(p)
-    # scipy.linalg.expm(-1j * T * 0.2)
+    # # p = dvr.momentum()
+    # # print(p)
+    # # scipy.linalg.expm(-1j * T * 0.2)
     
-    time1 = time.time()
-    # print('expm', time1 - start)
+    # time1 = time.time()
+    # # print('expm', time1 - start)
     
-    dvr.expT(0.2)
+    # dvr.expT(0.2)
     
-    time2 = time.time()
-    print(time2 - time1)
+    # time2 = time.time()
+    # print(time2 - time1)
     
     # print(np.sin(1 * 3 * np.pi/4) * np.sqrt(2/4 ))
