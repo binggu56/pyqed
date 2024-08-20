@@ -870,6 +870,17 @@ class AtomicChain(ShinMetiu1d):
                 v += self.V_nn(self.R[a], self.R[b])
         return v 
 
+def plot_mo(mo):
+
+
+
+    fig, ax = plt.subplots()
+    for j in range(4):
+        ax.plot(mol.x, mo[:, j], label= str(j))
+    ax.legend(frameon=False, title='MO')
+    fig.savefig('MO.pdf')
+        
+    
 def eri_svd(mf):
     # ax.imshow(mf.eri)
     u, a, vh = np.linalg.svd(mf.eri)
@@ -879,7 +890,7 @@ def eri_svd(mf):
 if __name__=='__main__':
     
     # import proplot as plt 
-    # import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt
     from pyqed.qchem.dvr.rhf import RHF1D
     from pyqed.qchem.casci import CASCI
 
@@ -895,6 +906,9 @@ if __name__=='__main__':
         # self.mass = mass  # nuclear mass
     # z = np.array([-L/2, -L/4, L/4, L/2])
     z0 = np.linspace(-1, 1, 4) * L/2
+    print(z0)
+    
+    print('distance = ', (z0[1] - z0[0])*au2angstrom)
     
 
     mol = AtomicChain(z0, charge=0)
@@ -913,20 +927,19 @@ if __name__=='__main__':
     # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
     
     # HF 
-    mf = RHF1D(mol)    
-    mf.run()
+    mf = RHF1D(mol).run()
 
-    E = mf.e_tot
+    # E = mf.e_tot
     
-    cas = CASCI(mf, norb=6)
-    w, X = cas.run(3)
-    e_cas = w
+    cas = CASCI(mf, ncas=6)
+    w, X = cas.run(1)
+    # e_cas = w
     print(w)
     
  
     ### scan PEC
     
-    # ds = np.linspace(-1, 1, 4)
+    # ds = np.linspace(-3, 2, 10)
     # E = np.zeros(len(ds))
     
     # nstates = 3
@@ -935,14 +948,14 @@ if __name__=='__main__':
     # for i in range(len(ds)):
         
     #     d = ds[i]
-    #     z = z0 + np.array([0, d, d, 0])
+    #     z = z0 + np.array([0, d, -d, 0])
     
     #     mol = AtomicChain(z, charge=0)
     #     print('number of electrons = ', mol.nelec)
     #     ###############################################################################  
     #     # mol = ShinMetiu1d(nstates=3, nelec=2)
     #     # # mol.spin = 0
-    #     mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=6)
+    #     mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=7)
         
     #     # # exact 
     #     # R = 0.
@@ -963,26 +976,13 @@ if __name__=='__main__':
     #     e_cas[i, :] = w
     #     # mo = mf.mo_coeff
 
+    # np.savez('e_cas_mode2_l7', ds, E, e_cas)
 
-    # fig, ax = plt.subplots()
-    # ax.plot(ds, E, '-o', label='HF/DVR')
-    # ax.plot(ds, e_cas[:,0], '-o', label='CASCI S$_0$')
-    # ax.plot(ds, e_cas[:,1], '-', label='CASCI')
-    # ax.plot(ds, e_cas[:,2], '-s', label='CASCI S$_2$')
 
-    # ax.legend(frameon=False)
 
     # ax.set_ylim(-3,0)
     
-    def plot_mo(mo):
-    
-        fig, ax = plt.subplots()
 
-        fig, ax = plt.subplots()
-        for j in range(4):
-            ax.plot(mol.x, mo[:, j], label= str(j))
-        ax.legend(frameon=False, title='MO')
-        fig.savefig('MO.pdf')
     
     ## CASCI
     

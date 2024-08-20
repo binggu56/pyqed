@@ -394,6 +394,16 @@ class SincDVR(DVR):
         iP[self.n, self.n] = 0.
         iP *= hbar
         return iP
+    
+    def momentum(self, hbar=1.):
+        """Return the momentum matrix times i (imaginary number)
+        i.e. ip = hbar frac{d}{dx}
+        Usage:
+            iP = self.p()
+
+        @returns iP momentum matrix times i (imaginary number)
+        """
+        return -1j * self.ip()
 
     def f(self, x=None):
         """Return the DVR basis vectors"""
@@ -618,6 +628,15 @@ class SineDVR(DVR):
         return T
 
     def momentum(self):
+        """
+        momentum operator matrix elements in DVR
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
         
         if self.U is None:
             self.fbr2dvr()

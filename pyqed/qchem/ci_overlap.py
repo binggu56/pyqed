@@ -60,34 +60,33 @@ from pyscf import gto, scf, ci
     
     # if not (has_m or has_n):
 
-`
     
 
-def wavefunction_overlap(geometry1, geometry2):
+def wavefunction_overlap():
     #
     # RCISD wavefunction overlap
     #
-    myhf1 = gto.M(atom='Na 0 0 0; F 0 0 10', basis='6-31g', verbose=0, unit='angstrom').apply(scf.RHF).run()
-    ci1 = ci.CISD(myhf1).run()
+    myhf1 = gto.M(atom='H 0 0 0; Li 0 0 1', basis='sto3g', verbose=0, unit='angstrom').apply(scf.RHF).run()
+    ci1 = ci.CISD(myhf1).run(nstates=3)
     print('CISD energy of mol1', ci1.e_tot) 
-    ci1.nstates = 3
-    ci1.run()
+    # ci1.nstates = 3
+    # ci1.run()
     
     
-    myhf2 = gto.M(atom='Na 0 0 0; F 0 0 10.05', basis='6-31g', verbose=0).apply(scf.RHF).run()
-    ci2 = ci.CISD(myhf2).run()
+    myhf2 = gto.M(atom='H 0 0 0; Li 0 0 1.1', basis='sto3g', verbose=0).apply(scf.RHF).run()
+    ci2 = ci.CISD(myhf2).run(nstates=3)
     print('CISD energy of mol2', ci2.e_tot)
     
     
     # overlap matrix between MOs at different geometries
     s12 = gto.intor_cross('cint1e_ovlp_sph', myhf1.mol, myhf2.mol)
-    s12 = reduce(numpy.dot, (myhf1.mo_coeff.T, s12, myhf2.mo_coeff))
+    s12 = reduce(np.dot, (myhf1.mo_coeff.T, s12, myhf2.mo_coeff))
     
     
     
     nmo = myhf2.mo_energy.size
     nocc = myhf2.mol.nelectron // 2
-    print('<CISD-mol1|CISD-mol2> = ', ci.cisd.overlap(ci1.ci[1], ci2.ci, nmo, nocc, s12))
+    print('<CISD-mol1|CISD-mol2> = ', ci.cisd.overlap(ci1.ci[2], ci2.ci[2], nmo, nocc, s12))
 
 
 def nonadiabatic_coupling(mol, mode_id):
@@ -106,3 +105,4 @@ def nonadiabatic_coupling(mol, mode_id):
     """
 # print('<CISD-mol1|CISD-mol2> = ', ci.cisd.overlap(ci1.ci[1], ci1.ci[0], nmo, nocc, s12))
 
+wavefunction_overlap()

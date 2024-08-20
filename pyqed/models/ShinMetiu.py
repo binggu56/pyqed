@@ -899,11 +899,20 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         """
         super().__init__(method, nstates, dvr_type)
         
-        self.E = E/au2volt_per_angstrom # electric field in au
+        # self._E = E/au2volt_per_angstrom # electric field in au
+        self.E = E 
         self.gauge = gauge 
         
         
         self.hcore = None
+        
+    @property
+    def E(self):
+        return self._E
+    
+    @E.setter
+    def E(self, value):
+        self._E = value 
         
         
     def build(self):
@@ -919,6 +928,7 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         
         # tx = kinetic(self.x, dvr=self.dvr_type)
         tx = dvr_x.t()
+        Px = dvr_x.momentum()
         
         idx = identity(self.nx)
         
@@ -933,14 +943,15 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         X = np.diag(dvr_x.x)
         Y = np.diag(dvr_y.x)
 
-        # Py = dvr_y.momentum()
+        Py = dvr_y.momentum()
         
         Ex, Ey = self.E 
         
         # dipole self-energy
         DSE = 0
         
-        self.hcore = T + kron(X, idy) * Ex + kron(idx, Y) * Ey + DSE
+        self.hcore = T + kron(X, idy) * Ex + kron(idx, Y) * Ey + DSE 
+        # self.hcore = T + kron(Px, idy) * Ex + kron(idx, Py) * Ey
         return 
         
     def single_point(self, R):
@@ -949,26 +960,30 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         x, y = self.x, self.y 
         nx, ny = self.nx, self.ny 
         
-        B = self.B
+        # B = self.B
         
         # V
         v = np.zeros((nx, ny))
         for i in range(nx):
             for j in range(ny):
                 r = np.array([x[i], y[j]])
-                v[i,j] = self.potential_energy(r, R) + 0.5 * B**2 * x[i]**2
+                v[i,j] = self.potential_energy(r, R)
         
         V = np.diag(v.ravel())
         # print(V.shape)
 
-        
+        Ex, Ey = self.E
         
         H = self.hcore +  V 
         
         if self.method == 'exact':
+        
             w, u = eigh(H)
+        
         elif self.method == 'davidson':
-            w, u = davidson_solver(H, neigen=self.nstates)
+            
+            w, u = davidson(H, neigen=self.nstates)
+            
         elif self.method == 'scipy':
         
             w, u = scipy.sparse.linalg.eigsh(csr_matrix(H), k=self.nstates, which='SA', v0=self.v0)
@@ -979,7 +994,7 @@ class ShinMetiu2InElectricField(ShinMetiu2):
         
         
         
-        return w[:self.nstates], u[:, :self.nstates] 
+        return w[:self.nstates] + (Ex**2 + Ey**2)/2, u[:, :self.nstates] 
 
     def pes(self, domains=[[-2,2], [0,2]], levels=[4, 4]):
         
@@ -1084,14 +1099,30 @@ if __name__=='__main__':
     # # Example usage:
     # mol = ShinMetiu2InMagneticField(B=0)
     
-    # mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
-    # mol.build()
+    mol = ShinMetiu2InElectricField()
+
     
     
-    levels = (5, 5)
-    domains = [[-2, 2], [0, 2]]
+    mol.create_grid(5, domain=[[-6, 6], [-6, 6]])
+
+    F = np.linspace(0, 1, 10)
+    energy = np.zeros((10, 3))
     
-    # w, u, nac = mol.single_point(np.array([0, 1.2]), calc_nac=True)
+    for i in range(10):    
+        mol.E = np.array([F[i], ] * 2)
+        mol.build()
+        
+        
+        levels = (5, 5)
+        domains = [[-2, 2], [0, 2]]
+        
+        w, u = mol.single_point(np.array([0, 1.2]))
+        
+        energy[i] = w
+
+    fig, ax = plt.subplots()
+    for i in range(3):
+        ax.plot(F, energy[:,i])
 
     
     # CI = (0, 1.21875)
@@ -1125,26 +1156,26 @@ if __name__=='__main__':
 
         
 
-    X, Y, E, U = mol.pes(domains=domains, levels = levels)
+    # X, Y, E, U = mol.pes(domains=domains, levels = levels)
     
     
-    start = time.time()
+    # start = time.time()
 
-    A = mol.electronic_overlap()
+    # A = mol.electronic_overlap()
     
-    print(A.shape)
-    print(A[:, :, 0, :, :, 0])
+    # print(A.shape)
+    # print(A[:, :, 0, :, :, 0])
     
     
-    ######################
-    ## Quantum Dynamics ##
-    ######################
+    # ######################
+    # ## Quantum Dynamics ##
+    # ######################
     
-    sol = LDRN(domains=domains, levels=levels)
-    sol.A = A
-    sol.apes = E
+    # sol = LDRN(domains=domains, levels=levels)
+    # sol.A = A
+    # sol.apes = E
     
-    sol.run(dt=0.01, mass=[1827,])
+    # sol.run(dt=0.01, mass=[1827,])
     
     
     # e = np.allclose(u_exact[0], u_da[0])

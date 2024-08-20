@@ -25,7 +25,7 @@ from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct
 
 
 class CASCI:
-    def __init__(self, mf, norb, nelecas=None, mu=None):
+    def __init__(self, mf, ncas, nelecas=None, mu=None):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or 
         Jordan-Wigner transformation
@@ -58,9 +58,9 @@ class CASCI:
         None.
 
         """
-        self.ncas = norb # number of MOs
+        self.ncas = ncas # number of MOs
         if self.ncas > 10:
-            warnings.warn('Active space with {} orbitals is probably too big.'.format(norb))
+            warnings.warn('Active space with {} orbitals is probably too big.'.format(self.ncas))
 
         self.nstates = None
         if nelecas is None:
@@ -73,6 +73,7 @@ class CASCI:
         
         
         self.mf = mf
+        self.mol = mf.mol
         self.chemical_potential = mu 
     
     def get_SO_matrix(self, SF=False, H1=None, H2=None):
@@ -254,7 +255,6 @@ class CASCI:
         
         Binary = get_fci_combos(mo_occ)
         print('Binary shape', Binary.shape)
-        print(Binary)
         
         # build the 1e and 2e Hamiltonian in MOs
         
@@ -264,11 +264,14 @@ class CASCI:
         SC1, SC2 = SlaterCondon(Binary)
         H_CI = CI_H(Binary, H1, H2, SC1, SC2)
         
-        print('HCI', H_CI)
+        # print('HCI', H_CI)
         
         # E, X = np.linalg.eigh(H_CI)
         E, X = eigsh(H_CI, k=nstates, which='SA')
-        return E, X
+        
+        e_nuc = self.mol.energy_nuc()
+
+        return E + e_nuc, X
     
 # class CAS_JWT(CASCI):
     

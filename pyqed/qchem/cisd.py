@@ -688,29 +688,26 @@ if __name__=='__main__':
 
     # cisd = ci.cisd.CISD(mf).run()   
     mf = RHF(mol).run()
-    # myci = UCISD(mf).run(nstates=4)
-    myfci = FCI(mf).run(4)
-    
-
-    
+    myci = UCISD(mf).run(nstates=4)
+    # myfci = FCI(mf).run(4)
 
     
     
-    # mol2 = gto.Mole(atom=[
-    #     ['H' , (0. , 0. , 0)],
-    #     ['H' , (0. , 0. , 1.1)]])
-    # mol2.basis = 'sto3g'
-    # mol2.charge = 0
-    # # mol.unit = 'b'
-    # mol2.build()
+    mol2 = gto.Mole(atom=[
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1.1)]])
+    mol2.basis = 'sto3g'
+    mol2.charge = 0
+    # mol.unit = 'b'
+    mol2.build()
     
-    # mf2 = RHF(mol2).run()
-    # ci2 = UCISD(mf2).run(nstates=4)
-    # # for I in range(93):
-    # #     print(myci.binary[I])
+    mf2 = RHF(mol2).run()
+    ci2 = UCISD(mf2).run(nstates=4)
+    # for I in range(93):
+    #     print(myci.binary[I])
     
-    # A = overlap(myci, ci2)
-    # print(A)
+    A = overlap(myci, ci2)
+    print(A)
     
     
     
