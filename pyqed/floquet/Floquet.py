@@ -11,18 +11,22 @@ import sys
 from scipy import linalg
 from pyqed.mol import Mol, dag
 
-class Floquet(Mol):
+class Floquet:
     """
     peridically driven multi-level system with a single frequency
 
     TODO: add more harmonics so it can treat a second harmonic driving
     """
-    # def __init__(self, H, edip):
+    def __init__(self, H, edip, omegad, E0, nt):
 
-    #     super().__init__(H, edip)
-
-    #     self.omegad = omegad # driving freqency
-    #     self.FBZ = [-omegad/2., omegad/2] # first Floquet-BZ
+        # super().__init__(H, edip)
+        self.H = H
+        self.edip = edip
+        self.nt = nt
+        self.E0 = E0
+        
+        self.omegad = omegad # driving freqency
+        self.FBZ = [-omegad/2., omegad/2] # first Floquet-BZ
 
     def momentum_matrix_elements(self):
         """
@@ -40,7 +44,7 @@ class Floquet(Mol):
         p = 1j * np.subtract.outer(E, E) * self.edip
         return p
 
-    def spectrum(self, E0, nt, omegad, gauge='length'):
+    def run(self, gauge='length'):
         """
         .. math::
             E(t) = E_0 * \cos(\Omega t)
@@ -62,6 +66,9 @@ class Floquet(Mol):
 
         """
         H0 = self.H
+        E0 = self.E0
+        nt = self.nt 
+        omegad = self.omegad
 
         if gauge == 'length': # electric dipole
 
@@ -71,9 +78,11 @@ class Floquet(Mol):
 
             H1 = 0.5j * self.momentum() * E0/omegad
 
-        return quasiE(H0, H1, nt, omegad)
+        quasienergies, floquet_modes, G = quasiE(H0, H1, nt, omegad)
 
-        # return quasienergies, floquet_modes
+        print('Quasienergies in the first FBZ = ', quasienergies)
+        
+        return quasienergies, floquet_modes, G
 
     def velocity_to_length(self):
         # transform the truncated velocity gauge Hamiltonian to length gauge
@@ -84,6 +93,9 @@ class Floquet(Mol):
 
 
 class FloquetGF(Floquet):
+    """
+    Floquet Green's function formalism
+    """
     def __init__(self, mol, amplitude, omegad, nt):
         # super.__init__(self, t, obj)
         self._mol = mol
@@ -335,9 +347,9 @@ def quasiE(H0, H1, Nt, omega):
 
 
     # to plot G on site basis, transform it to site-basis representation
-    #Gsite = U.dot(G)
+    Gsite = eigvecs_subset.dot(G)
 
-    return eigvals_subset, eigvecs_subset
+    return eigvals_subset, eigvecs_subset, Gsite
 
 def HamiltonFT(H0, H1, n):
     """

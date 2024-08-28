@@ -15,7 +15,7 @@ from pyqed import dagger, dag
 import scipy
 from scipy.sparse import csr_matrix
 
-from pyqed.Floquet import Floquet
+from pyqed.floquet.Floquet import Floquet
 from pyqed import Mol
 
 class Chain(Mol):
@@ -77,6 +77,8 @@ class Chain(Mol):
             for n in range(self.nsite):
                 for i in range(self.norb):
                     r[n * norb + i, n * norb + i] = n+1
+        
+        return r
 
     def buildH(self):
         """
@@ -119,10 +121,10 @@ class Chain(Mol):
         self.H = H
         return H
 
-    def Floquet(self):
+    def Floquet(self, **args):
         # drive_with_efield
 
-        return Floquet(self.H, -self.position())
+        return Floquet(self.H, -self.position(), **args)
 
     def zeeman(self):
         # drive with magnetic field
@@ -283,10 +285,10 @@ class Lattice:
         return
 
 
-class RiceMele:
-    def __init__(self, v, w, nsite=None):
+class RiceMele(Chain):
+    def __init__(self, v, w, nsites=None, boundary_condition='open'):
         """
-        Rice-Mele model with open boundary condition
+        Rice-Mele model with open boundary conditions
 
         Parameters
         ----------
@@ -304,8 +306,12 @@ class RiceMele:
         """
         self.intra = v
         self.inter = w
+        
+        self.norb = 2
+        self.size = 2 * nsites
+        
         self.H = None
-        self.nsite = nsite
+        self.nsites = self.nsite = nsites
         self.evecs = None
         self.evals = None
 
@@ -324,7 +330,11 @@ class RiceMele:
         self.H = H
         return H
 
-    def solve(self):
+    def run(self):
+        
+        if self.H is None:
+            self.buildH()
+            
         self.evals, self.evecs = scipy.linalg.eigh(self.H)
         return self.evals, self.evecs
 
@@ -341,6 +351,31 @@ class RiceMele:
         return
 
     def ldos(self, omega, eta=1e-4):
+        """
+        local density of states
+        
+        .. math::
+            
+            Im G^R(\omega) = Im (\omega + i \eta - H)^{-1}
+
+        Parameters
+        ----------
+        omega : TYPE
+            DESCRIPTION.
+        eta : TYPE, optional
+            DESCRIPTION. The default is 1e-4.
+
+        Raises
+        ------
+        ValueError
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
 
         if self.H is None:
             # raise ValueError('H is none. Call chain() to build the H first.')
@@ -401,11 +436,22 @@ class RiceMele:
                 g = U @ np.diag(1./(omega - 1j*eta - self.evals)) @ dag(U)
 
             return g
+        
+    def Floquet(self, **kwargs):
+        
+        if self.H is None:
+            self.buildH()
+        
+        dip = self.position()
+        return Floquet(self.H, -dip, **kwargs)
+    
 
 def green_renormalization(intra,inter,energy=0.0,nite=None,
                             info=False,delta=0.001,**kwargs):
-    """ Calculates bulk and surface Green function by a renormalization
-    algorithm, as described in I. Phys. F: Met. Phys. 15 (1985) 851-858 """
+    """ 
+    Calculates bulk and surface Green function by a renormalization
+    algorithm, as described in I. Phys. F: Met. Phys. 15 (1985) 851-858 
+    """
     # intra = algebra.todense(intra)
     # inter = algebra.todense(inter)
     error = np.abs(delta)*1e-6 # overwrite error

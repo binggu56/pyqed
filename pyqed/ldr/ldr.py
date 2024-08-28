@@ -334,7 +334,9 @@ class LDRN:
         
         self.L = [domain[1] - domain[0] for domain in domains]
 
-        
+        if (ndim > 12):
+            raise ValueError('Dimension D = {} cannot be larger than 10.'.format(ndim))
+            
         x = []
         w = [] 
         dvr = []
@@ -499,8 +501,7 @@ class LDRN:
 
         """
         alphabet = list(string.ascii_lowercase)
-        if (D > 10):
-            raise ValueError('Dimension D = {} cannot be larger than 10.'.format(D))
+
         
         s1 = "".join(alphabet[:D]) + 'x' 
         # s2 = "".join(alphabet[:D]) + 'x' + "".join(alphabet[D:2*D])+'y'
@@ -635,6 +636,31 @@ class LDRN:
         einsum_string = "".join(alphabet[:D]) + 'x, ' + "".join(alphabet[:D])+'y ->  xy'
         
         rho = np.einsum(einsum_string, psi.conj(), psi) * vol
+        return rho
+    
+    def rdm_nuc(self, psi):
+        """
+        compute the reduced nuclear density matrices 
+
+        Parameters
+        ----------
+        psi : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        rho : TYPE
+            DESCRIPTION.
+
+        """        
+        D = self.ndim 
+        
+        alphabet = list(string.ascii_lowercase)
+        
+        einsum_string = "".join(alphabet[:D]) + 'x, ' + "".join(alphabet[D:2*D])+'x ->' \
+            "".join(alphabet[:2*D])
+        
+        rho = np.einsum(einsum_string, psi.conj(), psi)
         return rho
 
 
@@ -1197,11 +1223,13 @@ class LDR2(WPD2):
         #         Tx[n, m] = 1/(2 * mx * dx**2) * (-1)**(n-m) * 2/(n-m)**2
         #         Tx[m, n] = Tx[n, m]
         
-
+        x = self.x
+        y = self.y 
+        nx = self.nx 
+        ny = self.ny
         
-        Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
-        
-        expKx = scipy.linalg.expm(-1j * Tx * dt)
+        # Tx = kinetic(self.x, mass=mx, dvr=self.dvr)
+        # expKx = scipy.linalg.expm(-1j * Tx * dt)
         
         dvr_x = SineDVR(x[0], x[-1], nx, mass=mx)
         Tx = dvr_x.t()
@@ -1209,7 +1237,7 @@ class LDR2(WPD2):
 
         dvr_y = SineDVR(y[0], y[-1], ny, mass=my)
         Ty = dvr_y.t()
-        expTx = dvr_y.expT(dt)
+        expTy = dvr_y.expT(dt)
 
 
         # x, y = self.x, self.y 
@@ -1223,7 +1251,7 @@ class LDR2(WPD2):
 
         # return -0.5/self.mass[0] * p2 - 0.5/self.mass[1] * p2_y
 
-        self.exp_K = [expKx, expKy]
+        self.exp_K = [expTx, expTy]
         self.K = [Tx, Ty]
         
         return 

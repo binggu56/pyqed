@@ -21,6 +21,7 @@ from itertools import combinations
 import warnings
 
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct
+from pyqed.qchem.dvr import RHF, RHF1D, RHF2D
 
 
 
@@ -75,6 +76,8 @@ class CASCI:
         self.mf = mf
         self.mol = mf.mol
         self.chemical_potential = mu 
+        
+        self.mo_coeff = mf.mo_coeff
     
     def get_SO_matrix(self, SF=False, H1=None, H2=None):
         """ 
@@ -88,7 +91,9 @@ class CASCI:
         mf = self.mf
         
         # molecular orbitals
-        Ca, Cb = [mf.mo_coeff, ] * 2 
+
+        if isinstance(mf, (RHF1D, RHF2D, RHF)):
+            Ca, Cb = [mf.mo_coeff, ] * 2 
         
         # S = (uhf_pyscf.mol).intor("int1e_ovlp")
         # eig, v = np.linalg.eigh(S)
@@ -273,8 +278,43 @@ class CASCI:
 
         return E + e_nuc, X
     
-# class CAS_JWT(CASCI):
+    def make_rdm1(self, civec):
+        """
+        spin-traced 1RDM 
+        
+        .. math::
+            
+            D_{pq} = \sum_{s = \alpha, \beta} \lange \Psi| q^\dag_s p_s | \Psi \rangle 
+
+        Returns
+        -------
+        None.
+
+        """
+        mo_coeff = self.mo_coeff
+        
+        pass
     
+    def make_rdm2(self):
+        pass
+    
+# class CAS_JWT(CASCI):
+
+class CASSCF(CASCI):
+    """
+    
+    Using the OptOrbFCI algorithm to optimize orbitals (better than conventional 
+                                                        CASSCF algorithm)
+    
+    Refs:
+        Q. Sun et al. / Chemical Physics Letters 683 (2017) 291–299
+    
+    
+        
+    """
+    def run(self):
+        pass
+        
         
 def get_fci_combos(mo_occ):
     # print(mf.mo_occ.shape)

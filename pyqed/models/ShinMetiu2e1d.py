@@ -916,7 +916,7 @@ if __name__=='__main__':
     ###############################################################################  
     # mol = ShinMetiu1d(nstates=3, nelec=2)
     # # mol.spin = 0
-    mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=6)
+    mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=4)
     
     # # exact 
     # R = 0.
@@ -927,14 +927,15 @@ if __name__=='__main__':
     # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
     
     # HF 
-    mf = RHF1D(mol).run()
+    mf = RHF1D(mol)
+    mf.run()
 
     # E = mf.e_tot
     
-    cas = CASCI(mf, ncas=6)
+    cas = CASCI(mf, ncas=6, nelecas=4)
     w, X = cas.run(1)
     # e_cas = w
-    print(w)
+    print("{:.15f}".format(w[0]))
     
  
     ### scan PEC

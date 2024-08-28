@@ -18,8 +18,8 @@ from decompose import decompose, compress
 
 from pyqed import gwp, discretize, pauli, sigmaz, interval
 
-from pyqed.tensor.mps import MPS, MPO, apply_mpo
-from pyqed.tensor.decompose import compress, tt_to_tensor
+from pyqed.mps.mps import MPS, MPO, apply_mpo
+from pyqed.mps.decompose import compress, tt_to_tensor
 
 
 
@@ -391,8 +391,8 @@ class TT_LDR:
         factors = decompose(A, rank=rank_ovlp, verbose=True)
         
         A_app = tt_to_tensor(factors)
-        print(A - A_app)
-        print(np.allclose(A, A_app))
+        # print(A - A_app)
+        # print(np.allclose(A, A_app))
         
         # muliply by the free-particle propagator
         self.buildK(dt)
@@ -447,6 +447,12 @@ if __name__=="__main__":
     
     from pyqed.ldr.ldr import LDR2
     
+    from pyqed.models.pyrazine import Pyrazine
+    from pyqed import au2fs, surf
+    from pyqed.mps.mps import is_left_canonical
+    
+    import matplotlib.pyplot as plt
+    
     def vibronic_state(x, nstates=2, ndim=2, dtype=complex):
         """
         Create an initial product vibronic state.
@@ -492,7 +498,7 @@ if __name__=="__main__":
 
     
     # Define Pararemeter here
-    delta = dt = 0.02
+    delta = dt = 0.5/au2fs
     L = 2
     chi_max = 10
     N_steps = 10
@@ -549,9 +555,7 @@ if __name__=="__main__":
     levels = [4] * 2
     
     
-    from pyqed.models.pyrazine import Pyrazine
-    from pyqed import au2fs, surf
-    from pyqed.tensor.mps import is_left_canonical
+
     
     sol = TT_LDR(domains=domains, levels=levels, nstates=3)
 
@@ -575,16 +579,24 @@ if __name__=="__main__":
     
     dt = 0.5/au2fs
     nt = 60
+    
+    
     r = ldr2.run(psi0, dt, nt)
-    # r.get_population(plot=True)
+    r.get_population(plot=True)
     
     
+    print(A.shape)
     
     # # TT_LDR solver
     
     sol.apes = apes
     sol.A = A
+    
     sol.mass = mol.mass
+
+
+    fig, ax = plt.subplots()
+    ax.imshow(A[:, 7, 1, :, 7, 1], cmap='viridis')
 
     mps = vibronic_state(x, nstates=3)
     
@@ -623,16 +635,17 @@ if __name__=="__main__":
         
     #     print(A - A_app)
         # print(np.allclose(A, A_app))
-    
+
+    # TODO: Smooth the overlap matrix may reduce the rank 
     mps_list = sol.run(mps, dt, nt, rank_state=40, rank_pes=10, rank_ovlp=200)
     
     rho_list = [sol.rdm_el(mps) for mps in mps_list]
     
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots()
-    ax.plot([rho[2, 2] for rho in rho_list])
-    ax.plot([rho[1, 1] for rho in rho_list])
     ax.plot([rho[0, 0] for rho in rho_list])
+    ax.plot([rho[1, 1] for rho in rho_list])
+    ax.plot([rho[2, 2] for rho in rho_list])
 
     
     
