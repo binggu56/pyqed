@@ -41,38 +41,100 @@ def initial_F(W):
     F[-1] = 1
     return F
 
-## tensor contraction from the right hand side
-##  -+     -A--+
-##   |      |  |
-##  -F' =  -W--F
-##   |      |  |
-##  -+     -B--+
+
 def contract_from_right(W, A, F, B):
+    """
+    ## tensor contraction from the right hand side
+    ##  -+     -A--+
+    ##   |      |  |
+    ##  -F' =  -W--F
+    ##   |      |  |
+    ##  -+     -B--+
+    
     # the einsum function doesn't appear to optimize the contractions properly,
     # so we split it into individual summations in the optimal order
     #return np.einsum("abst,sij,bjl,tkl->aik",W,A,F,B, optimize=True)
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    A : TYPE
+        DESCRIPTION.
+    F : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
     Temp = np.einsum("sij,bjl->sbil", A, F)
     Temp = np.einsum("sbil,abst->tail", Temp, W)
     return np.einsum("tail,tkl->aik", Temp, B)
 
-## tensor contraction from the left hand side
-## +-    +--A-
-## |     |  |
-## E' =  E--F-
-## |     |  |
-## +-    +--B-
+
 def contract_from_left(W, A, E, B):
+    """
+    ## tensor contraction from the left hand side
+    ## +-    +--A-
+    ## |     |  |
+    ## E' =  E--F-
+    ## |     |  |
+    ## +-    +--B-
+    
     # the einsum function doesn't appear to optimize the contractions properly,
     # so we split it into individual summations in the optimal order
     # return np.einsum("abst,sij,aik,tkl->bjl",W,A,E,B, optimize=True)
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    A : TYPE
+        DESCRIPTION.
+    E : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
     Temp = np.einsum("sij,aik->sajk", A, E)
     Temp = np.einsum("sajk,abst->tbjk", Temp, W)
     return np.einsum("tbjk,tkl->bjl", Temp, B)
 
-# construct the initial E and F matrices.
-# we choose to start from the left hand side, so the initial E matrix
-# is zero, the initial F matrices cover the complete chain
+
 def construct_F(Alist, MPO, Blist):
+    """
+    # construct the initial E and F matrices.
+    # we choose to start from the left hand side, so the initial E matrix
+    # is zero, the initial F matrices cover the complete chain
+
+    Parameters
+    ----------
+    Alist : TYPE
+        DESCRIPTION.
+    MPO : TYPE
+        DESCRIPTION.
+    Blist : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    F : TYPE
+        DESCRIPTION.
+
+    """
     F = [initial_F(MPO[-1])]
 
     for i in range(len(MPO)-1, 0, -1):
@@ -82,23 +144,55 @@ def construct_F(Alist, MPO, Blist):
 def construct_E(Alist, MPO, Blist):
     return [initial_E(MPO[0])]
 
-# 2-1 coarse-graining of two site MPO into one site
-#  |     |  |
-# -R- = -W--X-
-#  |     |  |
+
 def coarse_grain_MPO(W, X):
+    """
+    # 2-1 coarse-graining of two site MPO into one site
+    #  |     |  |
+    # -R- = -W--X-
+    #  |     |  |
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    X : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
     return np.reshape(np.einsum("abst,bcuv->acsutv",W,X),
                       [W.shape[0], X.shape[1],
                        W.shape[2]*X.shape[2],
                        W.shape[3]*X.shape[3]])
 
-# 'vertical' product of MPO W-matrices
-#        |
-#  |    -W-
-# -R- =  |
-#  |    -X-
-#        |
+
 def product_W(W, X):
+    """
+    # 'vertical' product of MPO W-matrices
+    #        |
+    #  |    -W-
+    # -R- =  |
+    #  |    -X-
+    #        |
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    X : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
     return np.reshape(np.einsum("abst,cdtu->acbdsu", W, X), [W.shape[0]*X.shape[0],
                                                              W.shape[1]*X.shape[1],
                                                              W.shape[2],X.shape[3]])
@@ -112,10 +206,26 @@ def product_MPO(M1, M2):
     return Result
 
 
-# 2-1 coarse-graining of two-site MPS into one site
-#   |     |  |
-#  -R- = -A--B-
+
 def coarse_grain_MPS(A,B):
+    """
+    # 2-1 coarse-graining of two-site MPS into one site
+    #   |     |  |
+    #  -R- = -A--B-
+
+    Parameters
+    ----------
+    A : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
     return np.reshape(np.einsum("sij,tjk->stik",A,B),
                       [A.shape[0]*B.shape[0], A.shape[1], B.shape[2]])
 
@@ -132,8 +242,35 @@ def fine_grain_MPS(A, dims):
     #print(np.dot(V[0],np.transpose(V[0])) + np.dot(V[1],np.transpose(V[1])))
     return U, S, V
 
-# truncate the matrices from an SVD to at most m states
 def truncate_SVD(U, S, V, m):
+    """
+    # truncate the matrices from an SVD to at most m states
+
+    Parameters
+    ----------
+    U : TYPE
+        DESCRIPTION.
+    S : TYPE
+        DESCRIPTION.
+    V : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    U : TYPE
+        DESCRIPTION.
+    S : TYPE
+        DESCRIPTION.
+    V : TYPE
+        DESCRIPTION.
+    trunc : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
+
+    """
     m = min(len(S), m)
     trunc = np.sum(S[m:])
     S = S[0:m]

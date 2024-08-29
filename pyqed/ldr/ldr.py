@@ -29,6 +29,8 @@ from scipy.sparse import kron, eye
 from scipy.linalg import eigh
 import logging
 
+from copy import copy
+
 try:
     import proplot as plt
 except:
@@ -331,6 +333,9 @@ class LDRN:
         assert(len(domains) == len(levels) == ndim)
         
         self.domains = domains
+        if mass is None:
+            mass = [1, ] * ndim
+        self.mass = mass
         
         self.L = [domain[1] - domain[0] for domain in domains]
 
@@ -344,9 +349,14 @@ class LDRN:
             # uniform grid 
             for d in range(ndim):
                 l = levels[d]
-                x.append(discretize(*domains[d], levels[d], endpoints=False))
-                _w = [1/(2**l-1), ] * (2**l-1)
-                w.append(_w)
+                # x.append(discretize(*domains[d], levels[d], endpoints=False))
+                # _w = [1/(2**l-1), ] * (2**l-1)
+                # w.append(_w)
+                
+                _dvr = SineDVR(*domains[d], 2**l-1, self.mass[d])
+                x.append(_dvr.x)
+                # w.append(_dvr.w)
+                dvr.append(copy(_dvr))
                 
         elif dvr_type == 'gauss_hermite':
             
@@ -370,9 +380,7 @@ class LDRN:
         
         self.dvr_type = [dvr_type, ] * ndim
         
-        if mass is None:
-            mass = [1, ] * ndim
-        self.mass = mass
+
         
         self.nstates = nstates
         self.ndim = ndim
