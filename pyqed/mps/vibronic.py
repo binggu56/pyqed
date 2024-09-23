@@ -18,8 +18,7 @@ import warnings
 from pyqed import raising, lowering, dag, destroy
 from pyqed.units import au2fs, au2ev, au2wavenumber
 
-from tensorly import tt_to_tensor
-# , tensor_to_vec
+# from tensorly import tt_to_tensor, tensor_to_vec
 from scipy.linalg import block_diag
 
 
@@ -814,19 +813,7 @@ def split_truncate_theta(theta, chi_max, eps):
     B = np.reshape(Z, [chivC, dR, chivR])
     return A, S, B
 
-def TDSE_MPO(B_list, s_list, chi_max):
-    for k in range(Nt):
-        # evolve dt
-        B_list, s_list = apply_mpo_svd(B_list,s_list,w_list,chi_max)
-    
-        psi = tensor_to_vec(mps_to_tensor(B_list))
-        print(np.linalg.norm(psi))
-    
-        # e[k] = dag(psi) @ e_op @ psi
-        # e[k] = obs(psi, e_op)
-        # compute vN entropy
-        s2 = np.array(s_list[L//2])**2
-        S.append(-np.sum(s2*np.log(s2)))
+
         
 
 if __name__=='__main__':
@@ -865,23 +852,37 @@ if __name__=='__main__':
     
     # print(e_op.shape)
     
-    # def mps_to_tensor(mps):
-    #     B0, B1, B2 = mps
+    def mps_to_tensor(mps):
+        B0, B1, B2 = mps
     
-    #     # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
-    #     psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
-    #     return psi
+        # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
+        psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
+        return psi
     
-    # def tensor_to_vec(psi):
-    #     return psi.flatten()
+    def tensor_to_vec(psi):
+        return psi.flatten()
     
 
+    def TDSE_MPO(B_list, s_list, chi_max):
+        for k in range(Nt):
+            # evolve dt
+            B_list, s_list = apply_mpo_svd(B_list,s_list,w_list,chi_max)
+        
+            psi = tensor_to_vec(mps_to_tensor(B_list))
+            print(np.linalg.norm(psi))
+        
+            # e[k] = dag(psi) @ e_op @ psi
+            # e[k] = obs(psi, e_op)
+            # compute vN entropy
+            s2 = np.array(s_list[L//2])**2
+            S.append(-np.sum(s2*np.log(s2)))
     
     # import proplot as plt
     import matplotlib.pyplot as plt
     
     fig, ax = plt.subplots()
     ax.plot(dt*np.arange(Nt), e.real)
+    
 # psi0 = [tensor(shap1), tensor(shape2)]
 
 # def spo_single_step(psi):

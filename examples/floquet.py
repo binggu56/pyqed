@@ -8,7 +8,7 @@ Created on Tue Aug 27 15:57:46 2024
 
 
 from pyqed.lattice.chain import RiceMele
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 
 from pyqed import level_scheme
 
@@ -27,10 +27,6 @@ E, U, G = floquet.run()
 print(G.shape)
 # level_scheme(E)
 
-for j in range(36):
-    fig, ax = plt.subplots()
-    ax.plot(G[j,:])
-
-
-
-
+# for j in range(36):
+#     fig, ax = plt.subplots()
+#     ax.plot(G[j,:])

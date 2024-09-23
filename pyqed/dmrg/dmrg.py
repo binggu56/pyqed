@@ -355,16 +355,35 @@ def two_site_dmrg(MPS, MPO, m, sweeps):
             E.pop();
     return MPS
 
-## Function the evaluate the expectation value of an MPO on a given MPS
-## <A|MPO|B>
+
 def Expectation(AList, MPO, BList):
+    """
+    ## Function the evaluate the expectation value of an MPO on a given MPS
+    ## <A|MPO|B>
+
+    Parameters
+    ----------
+    AList : TYPE
+        DESCRIPTION.
+    MPO : TYPE
+        DESCRIPTION.
+    BList : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
     E = [[[1]]]
     for i in range(0,len(MPO)):
         E = contract_from_left(MPO[i], AList[i], E, BList[i])
     return E[0][0][0]
 
 
-from pyqed.tensor.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
+from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 
 '''
     Function that implements finite-system DMRG (one-site update version) to obtain the ground state of an input 
@@ -492,40 +511,46 @@ def fDMRG_1site_GS_OBC(H,D,Nsweeps):
             Hzip[l+1] = ZipperRight(Hzip[l+2],M[l].conj().T,H[l],M[l])
         
     return E_list,M
-##
-## Parameters for the DMRG simulation
-##
 
-d=2   # local bond dimension, 0=up, 1=down
-N=100 # number of sites
 
-## initial state |+-+-+-+-+->
 
-InitialA1 = np.zeros((d,1,1))
-InitialA1[0,0,0] = 1
-InitialA2 = np.zeros((d,1,1))
-InitialA2[1,0,0] = 1
-
-MPS = [InitialA1, InitialA2] * int(N/2)
-
-## Local operators
-I = np.identity(2)
-Z = np.zeros((2,2))
-Sz = np.array([[0.5,  0  ],
-             [0  , -0.5]])
-Sp = np.array([[0, 0],
-             [1, 0]])
-Sm = np.array([[0, 1],
-             [0, 0]])
-
-## Hamiltonian MPO
-W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z],
-              [Z,  Z,      Z,      Z,  Sz], 
-              [Z,  Z,      Z,      Z,  Sm],
-              [Z,  Z,      Z,      Z,  Sp],
-              [Z,  Z,      Z,      Z,   I]])
-
-print(W.shape)
+        
+if __name__ == '__main__':
+    
+    ##
+    ## Parameters for the DMRG simulation
+    ##
+    
+    d=2   # local bond dimension, 0=up, 1=down
+    N=100 # number of sites
+    
+    ## initial state |+-+-+-+-+->
+    
+    InitialA1 = np.zeros((d,1,1))
+    InitialA1[0,0,0] = 1
+    InitialA2 = np.zeros((d,1,1))
+    InitialA2[1,0,0] = 1
+    
+    MPS = [InitialA1, InitialA2] * int(N/2)
+    
+    ## Local operators
+    I = np.identity(2)
+    Z = np.zeros((2,2))
+    Sz = np.array([[0.5,  0  ],
+                 [0  , -0.5]])
+    Sp = np.array([[0, 0],
+                 [1, 0]])
+    Sm = np.array([[0, 1],
+                 [0, 0]])
+    
+    ## Hamiltonian MPO
+    W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z],
+                  [Z,  Z,      Z,      Z,  Sz], 
+                  [Z,  Z,      Z,      Z,  Sm],
+                  [Z,  Z,      Z,      Z,  Sp],
+                  [Z,  Z,      Z,      Z,   I]])
+    
+    print(W.shape)
 # # left-hand edge is 1x5 matrix
 # Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z]])
 

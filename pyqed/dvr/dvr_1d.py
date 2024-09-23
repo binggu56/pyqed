@@ -21,7 +21,7 @@ from pyqed import interval
 def kinetic(x, mass=1, dvr='sinc'):
     """
     kinetic enegy operator for the DVR set
-    
+
     Parameters
     ----------
     x : TYPE
@@ -30,118 +30,118 @@ def kinetic(x, mass=1, dvr='sinc'):
         DESCRIPTION. The default is 1.
     dvr : TYPE, optional
         DESCRIPTION. The default is 'sinc'.
-    
+
     Returns
     -------
     Tx : TYPE
         DESCRIPTION.
-        
-        
+
+
     Refs:
-        
+
         M.H. Beck et al. Physics Reports 324 (2000) 1-105
-    
-    
+
+
     """
-    
-    # L = xmax - xmin 
+
+    # L = xmax - xmin
     # a = L / npts
     nx = len(x)
         # self.n = np.arange(npts)
         # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
         # self.w = np.ones(npts, dtype=np.float64) * self.a
         # self.k_max = np.pi/self.a
-    
+
     L = x[-1] - x[0]
     dx = interval(x)
     n = np.arange(nx)
     nx = npts = len(x)
-    
-    
+
+
     if dvr == 'sinc':
-        
+
         # Colbert-Miller DVR 1992
-        
+
         _m = n[:, np.newaxis]
         _n = n[np.newaxis, :]
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             T = 2. * (-1.)**(_m-_n) / (_m-_n)**2. / dx**2
-            
+
         T[n, n] = np.pi**2. / 3. / dx**2
         T *= 0.5/mass   # (pc)^2 / (2 mc^2)
-        
+
     elif dvr == 'sine':
 
         # Sine DVR (particle in-a-box)
         # n = np.arange(1, npts + 1)
         # dx = (xmax - xmin)/(npts + 1)
         # x = float(xmin) + self.a * self.n
-        
+
         npts = N = len(x)
         n = np.arange(1, npts + 1)
-        
-        
+
+
         _i = n[:, np.newaxis]
         _j = n[np.newaxis, :]
-        
+
         L = dx * (npts + 1)
-        
+
         m = npts + 1
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             T = ((-1.)**(_i-_j)
                 * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
                 - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
-        
+
         T[n - 1, n - 1] = 0.
         T += np.diag((2. * m**2. + 1.) / 3.
                       - 1./np.square(np.sin(np.pi * n / m)))
         T *= np.pi**2. / 2. / L**2. #prefactor common to all of T
         T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
-        
+
         # with warnings.catch_warnings():
         #     warnings.simplefilter("ignore")
-            
+
         #     T = 2 * (-1.)**(_i-_j)/(N+1)**2 * \
         #         np.sin(np.pi * _i/(N+1)) * np.sin(np.pi * _j/(N+1))\
         #         /(np.cos(np.pi * _i /(N+1)) - np.cos(_j * np.pi/(N+1)))**2
-        
+
         # T[n - 1, n - 1] = 0.
-        # T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2)) 
-                                               
+        # T += np.diag(-1/3 + 1/(6 * (N+1)**2) - 1/(2 * (N+1)**2 * np.sin(n * np.pi/(N+1))**2))
+
         # T *= np.pi**2. / (2. * mass * dx**2) #prefactor common to all of T
-    
+
     elif dvr == 'SincPeriodic':
-        
+
         _m = n[:, np.newaxis]
         _n = n[np.newaxis, :]
-        
+
         _arg = np.pi*(_m-_n)/nx
-        
+
         if (0 == nx % 2):
-            
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
-                
+
             T[n, n] = (nx**2. + 2.)/3.
         else:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
             T[n, n] = (nx**2. - 1.)/3.
-            
+
         T *= (np.pi/L)**2.
         T *= 0.5 / mass   # (pc)^2 / (2 mc^2)
-    
+
     return T
 
 class DVR(object):
-    
-        
+
+
     def v(self, V):
         """
         Return the potential matrix with the given potential.
@@ -209,18 +209,18 @@ class DVR(object):
         else:
             E, U = sla.eigsh(h, k=num_eigs, which='LM',
                              sigma=V(self.x).min())
-  
+
         self.eigvals = E
         self.eigvecs = U
-        self.potential = V 
+        self.potential = V
         return E, U
-    
+
     def draw_states(self, **kwargs):
         E, U = self.eigvals, self.eigvecs
         V = self.potential
-        
+
         num_eigs = len(E)
-        
+
         xmin = kwargs.get('xmin', self.x.min())
         xmax = kwargs.get('xmax', self.x.max())
         ymin = kwargs.get('ymin', np.ceil(V(self.x).min() - 1.))
@@ -322,7 +322,7 @@ class DVR(object):
         self.morse_test(precision=precision)
         self.sombrero_test(precision=precision)
         self.woods_saxon_test(precision=precision)
-    
+
 
 
 class SincDVR(DVR):
@@ -352,13 +352,13 @@ class SincDVR(DVR):
         # self.a = interval(x)
         self.n = np.arange(self.npts)
         # self.x = self.x0 + self.n * self.a - self.L / 2. + self.a / 2.
-        self.x = self.x0 + self.n * self.a - self.L / 2. 
+        self.x = self.x0 + self.n * self.a - self.L / 2.
 
-        # self.x = x 
+        # self.x = x
         self.w = np.ones(self.npts, dtype=np.float64) * self.a
         self.k_max = np.pi/self.a
-        
-        self.potential = None 
+
+        self.potential = None
         self.eigvals = None
         self.eigvecs = None
 
@@ -394,7 +394,7 @@ class SincDVR(DVR):
         iP[self.n, self.n] = 0.
         iP *= hbar
         return iP
-    
+
     def momentum(self, hbar=1.):
         """Return the momentum matrix times i (imaginary number)
         i.e. ip = hbar frac{d}{dx}
@@ -419,10 +419,10 @@ class ExponentialDVR(SincDVR):
     r"""
     Sinc function basis for periodic functions over an interval
     `x0 +- L/2` with `N = 2n + 1` points.
-    
+
     Refs
         M.H. Beck et al. Physics Reports 324 (2000) 1-105, P94
-        
+
     """
     def __init__(self, n, L=1 ,x0=0, *v, **kw):
         # Small shift here for consistent abscissa
@@ -433,7 +433,7 @@ class ExponentialDVR(SincDVR):
         self.n = np.arange(self.npts)
         self.x0 = x0
         self.a = self.L/self.npts
-        self.x = self.x0 + self.n * self.a - self.L / 2. 
+        self.x = self.x0 + self.n * self.a - self.L / 2.
 
         self.kx = (self.n - n) * 2 * np.pi/self.L
         # scipy.fftpack.fftfreq
@@ -452,17 +452,17 @@ class ExponentialDVR(SincDVR):
             T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
             T[self.n, self.n] = (self.npts**2. + 2.)/3.
         else:
-            
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
 
             T[self.n, self.n] = (self.npts**2. - 1.)/3.
-        
+
         T *= (np.pi/self.L)**2.
         T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
         return T
-    
+
     def derivative(self):
         """
         DVR expression for derivative operator d/dx
@@ -475,14 +475,14 @@ class ExponentialDVR(SincDVR):
         """
         _m = self.n[:, np.newaxis]
         _n = self.n[np.newaxis, :]
-        
-        
+
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             D = np.pi/self.L * (-1.)**(_m-_n)/np.sin(np.pi * (_m - _n)/self.npts)
-        
-        return D        
-        
+
+        return D
+
 
     def f(self, x=None):
         """Return the DVR basis vectors"""
@@ -492,19 +492,19 @@ class ExponentialDVR(SincDVR):
             x_m = np.asarray(x)[:, np.newaxis]
         x_n = self.x[np.newaxis, :]
         f = np.sinc((x_m-x_n)/self.a)/np.sinc((x_m-x_n)/self.L)/np.sqrt(self.a)
-        
+
         if (0 == self.npts % 2):
             f *= np.exp(-1j*np.pi*(x_m-x_n)/self.L)
         return f
-    
+
     def run(self, v, k=6):
         if callable(v):
-            V = np.diag(v(self.x)) 
+            V = np.diag(v(self.x))
         else:
             V = np.diag(v)
-        
+
         h = V + self.t()
-                
+
 
         # Get the eigenpairs
         # There are multiple options here.
@@ -520,10 +520,10 @@ class ExponentialDVR(SincDVR):
         else:
             E, U = sla.eigsh(h, k=k, which='LM',
                              sigma=V.min())
-  
+
         self.eigvals = E
         self.eigvecs = U
-        # self.potential = V 
+        # self.potential = V
         return E, U
 
 
@@ -544,12 +544,12 @@ class SineDVR(DVR):
         @attribute L size of x-domain
         @method h return hamiltonian matrix
         @method f return DVR basis vectors
-        
-        
+
+
     """
     def __init__(self, xmin, xmax, npts, mass=1):
         """
-        
+
 
         Parameters
         ----------
@@ -566,39 +566,39 @@ class SineDVR(DVR):
 
         """
         self.npts = npts
-        self.xmin = xmin 
+        self.xmin = xmin
         self.xmax = xmax
         self.L = float(xmax - xmin)
         self.dx = self.L /(npts + 1)
         self.n = np.arange(1, npts + 1)
         self.x = float(xmin) + self.dx * self.n
         self.k_max = None
-        
 
-        
-        
+
+
+
         ###
         self.T = None
         self.U = None
-        
+
         self._mass = mass
-        
+
     @property
     def mass(self):
         return self._mass
-        
+
     @mass.setter
     def mass(self, value):
         self._mass = value
-        
-        
-        
+
+
+
     def t_fbr(self):
-        m = self.mass 
+        m = self.mass
         l = self.L
-        
+
         return (0.5 / m) * (np.pi / l)**2 * np.arange(1, self.npts + 1)**2
-    
+
     def t(self, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
         Usage:
@@ -609,22 +609,22 @@ class SineDVR(DVR):
         _i = self.n[:, np.newaxis]
         _j = self.n[np.newaxis, :]
         m = self.npts + 1
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            
+
             T = ((-1.)**(_i-_j)
                 * (1./np.square(np.sin(np.pi / (2. * m) * (_i-_j)))
                 - 1./np.square(np.sin(np.pi / (2. * m) * (_i+_j)))))
-        
+
         T[self.n - 1, self.n - 1] = 0.
         T += np.diag((2. * m**2. + 1.) / 3.
                      - 1./np.square(np.sin(np.pi * self.n / m)))
-        
+
         T *= np.pi**2. / 2. / self.L**2 #prefactor common to all of T
         T *= 0.5 * hc**2. / self.mass   # (pc)^2 / (2 mc^2)
-        
-        self.T = T 
+
+        self.T = T
         return T
 
     def momentum(self):
@@ -637,30 +637,31 @@ class SineDVR(DVR):
             DESCRIPTION.
 
         """
-        
+
         if self.U is None:
             self.fbr2dvr()
-            
+
         U = self.U
         p = np.zeros((self.npts, self.npts))
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            
+
             p = (np.subtract.outer(self.n, self.n) % 2) * np.outer(self.n, self.n)/np.subtract.outer(self.n**2, self.n**2)
-        
+
         p[np.isnan(p)] = 0
         p = p * (-4j)/self.L
-        
+
         return contract('ia, ij, jb -> ab', U.conj(), p, U)
-    
+
     def expT(self, dt=1):
         """
         kinetic energy propagator
 
         .. math::
+
             e^{-i T t}
-            
+
         Parameters
         ----------
         dt : TYPE, optional
@@ -672,38 +673,38 @@ class SineDVR(DVR):
             DESCRIPTION.
 
         """
-        
+
         U = self.fbr2dvr()
-        
+
         _t = np.exp(-1j * dt/(2 * self.mass) * self.n**2 * np.pi**2/self.L**2)
-        
+
         return contract('ia, i, ib -> ab', U.conj(), _t, U)
-        # return U.conj().T @ np.diag(_t) @ U        
-        
+        # return U.conj().T @ np.diag(_t) @ U
+
 
     def fbr2dvr(self):
         """
-        transformation matrix from FBR to DVR 
-        
+        transformation matrix from FBR to DVR
+
         .. math::
-            
+
             U_{j\alpha} = \sqrt{2/(n+1)} \sin(j \alpha \pi/(n+1))
-        
-        for j labels the FBR and :math:`\alpha = 1, 2, ..., n` labels the DVR set. 
-        
+
+        for j labels the FBR and :math:`\alpha = 1, 2, ..., n` labels the DVR set.
+
         Returns
         -------
         U : TYPE
             DESCRIPTION.
 
         """
-        n = self.npts 
-        
+        n = self.npts
+
         U = np.sin(np.outer(self.n, self.n) * np.pi/(n+1)) * np.sqrt(2./(n+1))
-        
-        self.U = U 
+
+        self.U = U
         return U
-        
+
 
     def basis(self, x, a=0):
         """
@@ -711,15 +712,15 @@ class SineDVR(DVR):
 
         Parameters
         ----------
-        n : int
-            nth DVR basis set.
+        a : int
+            a-th DVR basis set.
 
         Returns
         -------
         None.
 
         """
-        
+
         # a += 1
         center = self.xmin + (a + 1) * self.dx
         n = self.npts
@@ -727,14 +728,14 @@ class SineDVR(DVR):
         _x = (x - center)/L
         _y = (x + center)/L
 
-        
+
         chi = 1/(2 * np.sqrt(L* (n+1))) * \
             (np.sin((2*n+1) * np.pi/2 * _x)/np.sin(np.pi/2*_x) - \
               np.sin((2*n+1) * np.pi/2 * _y)/np.sin(np.pi/2*_y))
-            
-        
-        return chi 
-    
+
+
+        return chi
+
 #         if x is None:
 #             x_m = self.x[:, np.newaxis]
 #         else:
@@ -1051,64 +1052,64 @@ if __name__ == '__main__':
     # x = np.linspace(-7, 7, 200)
     def v(x):
         return x**2/2
-        
+
     def test_sincdvr():
         # dvr = SincDVR(npts=20, L=10)
-    
+
         dvr = HermiteDVR(npts=10)
-        x = dvr.x 
-        
+        x = dvr.x
+
 
         w, u = dvr.run(v, num_eigs=10)
         dvr.draw_states()
-    
+
     def test_expdvr():
-        
+
         dvr = ExponentialDVR(n=6, L=10)
         E, U = dvr.run(v, k=5)
-    
+
         print(E)
-        
+
     def test_sineDVR():
         dvr = SineDVR(-5, 5, 20)
         E, U = dvr.run(v, k=5)
-    
+
         print(E)
-        
-    
+
+
     # test_sineDVR()
-    
-    
+
+
     dvr = SineDVR(-6, 6, npts=64)
-    
-    E, U = dvr.run(v, 6)    
-    
+
+    E, U = dvr.run(v, 6)
+
     x = np.linspace(-6,6,200)
 
     fig, ax = plt.subplots()
     ax.plot(x, dvr.basis(x, 32))
-        
+
     # U = dvr.fbr2dvr()
 
     # # print((np.subtract.outer(dvr.n, dvr.n) % 2))
-    
-    # start = time.time()    
+
+    # start = time.time()
     # T = dvr.t()
     # print(T)
-    
+
     # print(U.conj().T @ np.diagflat(dvr.t_fbr()) @ U)
     # print(kinetic(dvr.x, dvr='sine'))
-    
+
     # # p = dvr.momentum()
     # # print(p)
     # # scipy.linalg.expm(-1j * T * 0.2)
-    
+
     # time1 = time.time()
     # # print('expm', time1 - start)
-    
+
     # dvr.expT(0.2)
-    
+
     # time2 = time.time()
     # print(time2 - time1)
-    
+
     # print(np.sin(1 * 3 * np.pi/4) * np.sqrt(2/4 ))
