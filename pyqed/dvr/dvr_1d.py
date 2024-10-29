@@ -819,7 +819,7 @@ class BesselDVR(DVR):
     `0 ... R` with `npts` points, `dim` dimensions, `lam` angular
     momentum number.
     Usage:
-        d = sincDVR1D(npts, R, dim, lam)
+        d = BesselDVR(npts, R, dim, lam)
 
     @param[in] npts number of points
     @param[in] R max radius
@@ -833,23 +833,59 @@ class BesselDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, npts, R, dim, lam):
+    def __init__(self, npts, R, l=0, dim=2):
         assert type(dim) == int, "dim must be an integer."
         assert dim > 1, "dim must be 2 or more."
-        self.npts = npts
+        self.N = self.npts = npts
         self.n = np.arange(npts)
         self.R = R
         self.dim = dim
-        self.lam = lam
+        self.lam = self.l = l 
         self.__init_private()
+        
 
     def __init_private(self):
-        self.nu = self.lam + self.dim/2. - 1.
-        self.z = bessel.j_root(nu=self.nu, N=self.npts)
+        
+        nu = self.lam + self.dim/2. - 1.
+        # self.z = bessel.j_root(nu=self.nu, N=self.npts)
+        self.z = scipy.special.jn_zeros(nu, self.npts)
+        
         self.K = self.z[-1] / self.R
-        self.x = self.z / self. K
+        self.x = self.z / self.K
+        
+    def nu(self, l):
+        return l + self.dim/2.0 - 1
+    
+    def get_J(self, nu, d=0):
+        r"""Return the `d`'th derivative of the bessel functions J_{\nu}(z)."""
+        nu2 = 2*nu
+        if 0 == d:
+            def j(z):
+                return scipy.special.jn(nu, z)
+        else:
+            # Compute derivatives using recurrence relations.  Not
+            # efficient for high orders!
+            def j(z):
+                return (self.get_J(nu - 1, d - 1)(z) - self.get_J(nu + 1, d - 1)(z))/2.0
+        return j
+    
+    def get_abscissa(self, l=0):
+        nu = self.nu(l)
+        zn = scipy.special.jn_zeros(nu,self.N) # Only works for even dim
+        return zn/self.K
 
-    def t(self, hc=1., mc2=1.):
+    def get_weights(self, l):
+        """Return the integration weights"""
+        nu = self.nu(l=l)
+        rn = self.get_abscissa(l=l)
+        n = np.arange(len(rn))
+        zn = rn * self.K
+        
+        dJ = self.get_J(nu, d=1)
+        
+        return np.divide(2.0, self.K * zn * dJ(zn)**2)
+
+    def t(self, l, hc=1., mc2=1.):
         """Return the kinetic energy matrix.
         Usage:
             T = self.t(V)
@@ -857,7 +893,7 @@ class BesselDVR(DVR):
         @returns T kinetic energy matrix
         """
         n = self.npts
-        nu = self.nu
+        nu = self.nu(l)
         K = self.K
 
         _i = self.n[:, np.newaxis]
@@ -871,9 +907,72 @@ class BesselDVR(DVR):
         T += np.diag(K**2. / 3. * (1. + 2. * (nu**2. - 1.) / self.z**2.))
         T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
         return T
+    
+    def run(self, v, k=6):
+        if callable(v):
+            V = np.diag(v(self.x))
+        else:
+            V = np.diag(v)
 
-class GaussianDVR(DVR):
-    pass
+        h = V + self.t(self.l)
+
+
+        # Get the eigenpairs
+        # There are multiple options here.
+        # If the user is asking for all of the eigenvalues,
+        # then we need to use np.linalg.eigh()
+        if k == h.shape[0]:
+            E, U = np.linalg.eigh(h)
+        # But if we don't need all eigenvalues, only the smallest ones,
+        # then when the size of the H matrix becomes large enough, it is
+        # better to use sla.eigsh() with a shift-invert method. Here we
+        # have to have a good guess for the smallest eigenvalue so we
+        # ask for eigenvalues closest to the minimum of the potential.
+        else:
+            E, U = sla.eigsh(h, k=k, which='LM',
+                             sigma=V.min())
+
+        self.eigvals = E
+        self.eigvecs = U
+        # self.potential = V
+        return E, U
+
+    def get_F(self, n, l, normalize=False):
+        """Return the DVR basis functions."""
+        nu = self.nu(l=l)
+        rn = self.get_abscissa(l=l)[n]
+        zn = rn * self.k
+        F_n = 1./np.sqrt(self.get_weights(l)[n]) if normalize else 1.0
+        def F(r):
+            z = self.k*r
+            J = self.get_J(nu)
+            return np.divide((-1)**(n+1)*self.k*zn*np.sqrt(2*r)*J(z),
+                              (z**2 - zn**2)) / F_n
+        return F
+
+class LaguerreDVR(DVR):
+    def __init__(self, N, alpha=0):
+        """
+        for radial coordinate x \in [0, \infty]
+        
+        .. math::
+            
+            w(x) = x^\alpha e^{-x}, x \ge 0 
+
+        Parameters
+        ----------
+        N : TYPE
+            DESCRIPTION.
+        alpha : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        None.
+
+        """
+        
+        pass
 
 class ChebDVR(DVR):
     pass
@@ -1080,14 +1179,36 @@ if __name__ == '__main__':
     # test_sineDVR()
 
 
-    dvr = SineDVR(-6, 6, npts=64)
+    dvr_z = SineDVR(-4, 4, npts=16)
 
-    E, U = dvr.run(v, 6)
+    z = dvr_z.x
+    print(z)
+    
+    E, U = dvr_z.run(v, 6)
+    print(E)
+    # x = np.linspace(-6,6,200)
 
-    x = np.linspace(-6,6,200)
+    # fig, ax = plt.subplots()
+    # ax.plot(x, dvr.basis(x, 32))
 
+    
+    for N in [128, 256]:
+        dvr = BesselDVR(npts=N, R=8, l=0)
+        r = dvr.x
+        # print(dvr.get_weights(l=0))
+        # def v(x):
+        #     return -1/np.sqrt(x**2 + 0.00001) 
+        # for n in range(dvr_z.npts):
+        a = 0.05
+        # _v = -1/np.sqrt(r**2 + a**2)
+        _v = r**2/2
+        E, U = dvr.run(_v, k=1)
+    
+        print(E)
+    
     fig, ax = plt.subplots()
-    ax.plot(x, dvr.basis(x, 32))
+    ax.plot(r, -U[:,0], '-o')
+    ax.plot(r, np.sqrt(r)*np.exp(-r))
 
     # U = dvr.fbr2dvr()
 

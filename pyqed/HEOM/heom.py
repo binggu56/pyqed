@@ -160,9 +160,9 @@ def _calc_matsubara_params(N_exp, coup_strength, cut_freq, temperature):
 
 class HEOMSolver():
     """
-    HEOM solver with a single exponential function for the correlation functon. 
+    HEOM solver with a single exponential function for the correlation functon.
     Valid for Lorentz-Drude spectral density at high-T
-    
+
     """
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
@@ -193,17 +193,17 @@ class HEOMSolver():
         return
 
     def run(self, rho0, dt, nt, temperature, cutoff, reorganization, nado):
-        
+
         return _heom(self.H, rho0, self.c_ops, e_ops=self.e_ops, \
                   nt=nt, dt=dt, temperature=temperature, cutoff=cutoff, \
                   reorganization=reorganization, nado=nado)
-    
+
     def propagator(self, dt, nt, temperature, cutoff, \
                             reorganization, nado):
-        
+
         return _heom_propagator(self.H, self.c_ops, self.e_ops, temperature, cutoff, \
                                 reorganization, nado, dt, nt)
-        
+
 
     def correlation_2op_1t(self, rho0, a_op, b_op, dt, Nt, output='cor.dat'):
         '''
@@ -270,7 +270,7 @@ class HEOMSolver():
         #         e_ops=[b_op], return_result=True).observables[:,0]
 
         # return corr_mat
-    
+
 
 def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
              nado, dt, nt, fname=None, return_result=True):
@@ -281,7 +281,7 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     INPUT:
         T: in units of energy, kB * T, temperature of the bath
         reorg: reorganization energy
-        nado : auxiliary density operators, truncation of the hierachy
+        nado : maximum depth of auxiliary density operators, truncation of the hierachy
         fname: file name for output
 
     '''
@@ -306,11 +306,11 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     # D(t) = (a + ib) * exp(- gamma * t)
     # a = np.pi * reorg * T  # initial value of the correlation function D(0) = pi * lambda * kB * T
     # b = 0.0
-    
+
     # leading term of the Matsubara expansion
     # D0 = reorg * gamma * (coth(gamma/(2. * T)) - 1j)
     D0 = reorg * (2. * T - 1j * gamma)
-    
+
     print('Amplitude of the fluctuations = {}'.format(D0))
 
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
@@ -318,7 +318,7 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
 
     def L(ado):
         rhs = np.zeros_like(ado)
-        
+
         rhs[:,:,0] = - 1j * comm(H, ado[:,:,0]) - \
                 comm(sz, ado[:,:,1])
 
@@ -326,8 +326,8 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
             rhs[:,:,n] += -1j * comm(H, ado[:,:,n]) + \
                             (- comm(sz, ado[:,:,n+1]) - n * gamma * ado[:,:,n] + n * \
                             (D0.real * commutator(sz, ado[:,:,n-1]) + \
-                             1j * D0.imag * anticommutator(sz, ado[:,:,n-1])))  
-        return rhs 
+                             1j * D0.imag * anticommutator(sz, ado[:,:,n-1])))
+        return rhs
 
     # propagation time loop - HEOM
     observables = np.zeros((len(e_ops), nt), dtype=complex)
@@ -383,7 +383,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
     sz = c_ops[0] # collapse opeartor
 
-    
+
     # f = open(fname,'w')
     # fmt = '{} '* 5 + '\n'
 
@@ -391,7 +391,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
     L0 = operator_to_superoperator(H)
     Sm = operator_to_superoperator(sz)
     Sp = operator_to_superoperator(sz, kind='anticommutator')
-    
+
     t = 0.0
     for k in range(nt):
 
@@ -399,7 +399,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
 
         u[0] += -1j * L0 @ u[0] * dt - Sm @ u[1] * dt
 
-        for n in range(nado-1):
+        for n in range(1, nado-1):
             u[n] += -1j * L0 @ u[n] * dt + \
                         ((- Sm @ u[n+1]) - n * gamma * u[n] + n * \
                         (a *  Sm  + 1j * b * Sp) @ u[n-1] )*dt
@@ -415,7 +415,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
 
 def heom_multiexp():
     # TODO
-    
+
     N_c = 4
     N_m = 2
     N_he, he2idx, idx2he = enr_state_dictionaries([N_c + 1]*3 , N_c)
@@ -495,4 +495,3 @@ def heom_multiexp():
 
 if __name__ == '__main__':
     pass
-    

@@ -1,1231 +1,668 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jun 10 13:59:10 2024
+Created on Sun Oct  6 16:41:46 2024
 
-@author: Bing Gu (gubing@westlake.edu.cn)
+#####################################################
+#  DMRG quantum chemistry using MPS/MPO representations    #
+# Ian McCulloch August 2017                         #
+#####################################################
 
-
-DMRG/DVR calculation for 1D systems.
-
-
-This code is based on the simple-dmrg code by James R. Garrison and Ryan V. Mishmash.
- <https://github.com/simple-dmrg/simple-dmrg/>
-
-
+@author: Bing Gu
 """
+
+
+
 import numpy as np
-import scipy.constants as const
-# import scipy.linalg as la
-# import scipy
-from scipy.sparse.linalg import eigsh
-
-from scipy.special import erf
-import logging
-import warnings
-
-from pyqed import discretize, sort, dag, tensor
-from pyqed.davidson import davidson
-
-from pyqed import au2ev, au2angstrom
-from pyqed.dvr import SineDVR
-# from pyqed import scf
-# from pyqed.jordan_wigner import jordan_wigner_one_body, jordan_wigner_two_body
-
-from pyqed.qchem.ci.fci import SpinOuterProduct, givenΛgetB
-from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
-
-# from numba import vectorize, float64, jit
-# import sys
-from opt_einsum import contract
-
-from collections import namedtuple
+import scipy
+import scipy.sparse.linalg
+import scipy.sparse as sparse
+import math
+from copy import deepcopy
+from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian matrices
 
 
-from scipy.sparse import identity, kron, csr_matrix, diags
+# MPS A-matrix is a 3-index tensor, A[s,i,j]
+#    s
+#    |
+# i -A- j
+#
+# [s] acts on the local Hilbert space
+# [i,j] act on the virtual vonds
 
-ops = SpinHalfFermionOperators()
-Ntot = csr_matrix(ops["Ntot"])
-Cdu = ops["Cdu"]
-Cdd = ops["Cdd"]
-Cu = ops["Cu"]
-Cd = ops["Cd"]
-JW = ops["JW"]
-Na = ops["Nu"]
-Nb = ops["Nd"]
+# MPO W-matrix is a 4-index tensor, W[s,t,i,j]
+#     s
+#     |
+#  i -W- j
+#     |
+#     t
+#
+# [s,t] act on the local Hilbert space,
+# [i,j] act on the virtual bonds
+
+## initial E and F matrices for the left and right vacuum states
+def initial_E(W):
+    E = np.zeros((W.shape[0],1,1))
+    E[0] = 1
+    return E
+
+def initial_F(W):
+    F = np.zeros((W.shape[1],1,1))
+    F[-1] = 1
+    return F
 
 
-model_d = 4  # single-site basis size
-
-class SpinHalfFermionChain:
-
+def contract_from_right(W, A, F, B):
     """
-    exact diagonalization of spin-half open fermion chain with long-range interactions
+    ## tensor contraction from the right hand side
+    ##  -+     -A--+
+    ##   |      |  |
+    ##  -F' =  -W--F
+    ##   |      |  |
+    ##  -+     -B--+
 
-    by Jordan-Wigner transformation
-
-    .. math::
-
-        H = \sum_{<rs>} (c_r^\dagger c_s + c†scr−γ(c†rc†s+cscr))−2λ \sum_r c^\dagger_r c_r,
-
-    where r and s indicate neighbors on the chain.
-
-    Electron interactions can be included in the Hamiltonian easily.
-
-    """
-    def __init__(self, h1e, eri, nelec):
-        # if L is None:
-        L = h1e.shape[-1]
-        self.L = self.nsites = L
-
-        self.h1e = h1e
-        self.eri = eri
-        self.d = 4 # local dimension of each site
-        # self.filling = filling
-        self.nelec = nelec
-
-        self.H = None
-
-    def run(self, nstates=1):
-
-        # # single electron part
-        # Ca = mf.mo_coeff[:, :self.ncas]
-        # hcore_mo = contract('ia, ij, jb -> ab', Ca.conj(), mf.hcore, Ca)
-
-
-        # eri = self.mf.eri
-        # eri_mo = contract('ip, iq, ij, jr, js -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-
-        # # eri_mo = contract('ip, jq, ij, ir, js', mo.conj(), mo.conj(), eri, mo, mo)
-
-        # self.hcore_mo = hcore_mo
-
-        H = self.jordan_wigner()
-
-        E, X = eigsh(H, k=nstates, which='SA')
-
-        return E, X
-
-
-
-    def jordan_wigner(self):
-        """
-        MOs based on Restricted HF calculations
-
-        Returns
-        -------
-        H : TYPE
-            DESCRIPTION.
-
-        """
-        # an inefficient implementation without consdiering any syemmetry
-
-        from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
-            create, Is #, jordan_wigner_two_body
-
-        nelec = self.nelec
-        h1e = self.h1e
-        v = self.eri
-
-
-        norb = h1e.shape[-1]
-        nmo = L = norb # does not necesarrily have to MOs
-
-
-        Cu = annihilate(norb, spin='up')
-        Cd = annihilate(norb, spin='down')
-        Cdu = create(norb, spin='up')
-        Cdd = create(norb, spin='down')
-
-        H = 0
-        # for p in range(nmo):
-        #     for q in range(p+1):
-                # H += jordan_wigner_one_body(q, p, hcore_mo[q, p], hc=True)
-        for p in range(nmo):
-            for q in range(nmo):
-                H += h1e[p, q] * (Cdu[p] @ Cu[q] + Cdd[p] @ Cd[q])
-
-        # build total number operator
-        # number_operator = 0
-        Na = 0
-        Nb = 0
-        for p in range(L):
-            Na += Cdu[p] @ Cu[p]
-            Nb += Cdd[p] @ Cd[p]
-
-
-        # poor man's implementation of JWT for 2e operators wihtout exploiting any symmetry
-        for p in range(nmo):
-            for q in range(nmo):
-                for r in range(nmo):
-                    for s in range(nmo):
-                        H += 0.5 * v[p, q, r, s] * (\
-                            Cdu[p] @ Cdu[r] @ Cu[s] @ Cu[q] +\
-                            Cdu[p] @ Cdd[r] @ Cd[s] @ Cu[q] +\
-                            Cdd[p] @ Cdu[r] @ Cu[s] @ Cd[q] +
-                            Cdd[p] @ Cdd[r] @ Cd[s] @ Cd[q])
-                        # H += jordan_wigner_two_body(p, q, s, r, )
-
-        # digonal elements for p = q, r = s
-        I = tensor(Is(L))
-        # H += 0.2* ((Na - nelec/2 * I) @ (Na - self.nelec/2 * I) + \
-        #     (Nb - self.nelec/2 * I) @ (Nb - self.nelec/2 * I))
-        self.H = H
-        return H
-
-
-
-    def DMRG(self):
-        pass
-
-    def gen_mps(self):
-        pass
-
-
-# We will use python's "namedtuple" to represent the Block and EnlargedBlock objects
-
-Block = namedtuple("Block", ["length", "basis_size", "operator_dict"])
-EnlargedBlock = namedtuple("EnlargedBlock", ["length", "basis_size", "operator_dict"])
-
-def is_valid_block(block):
-    """
-    check the operators are of the right size
+    # the einsum function doesn't appear to optimize the contractions properly,
+    # so we split it into individual summations in the optimal order
+    #return np.einsum("abst,sij,bjl,tkl->aik",W,A,F,B, optimize=True)
 
     Parameters
     ----------
-    block : TYPE
+    W : TYPE
+        DESCRIPTION.
+    A : TYPE
+        DESCRIPTION.
+    F : TYPE
+        DESCRIPTION.
+    B : TYPE
         DESCRIPTION.
 
     Returns
     -------
-    bool
+    TYPE
         DESCRIPTION.
 
     """
-    for op in block.operator_dict.values():
-        if op.shape[0] != block.basis_size or op.shape[1] != block.basis_size:
-            return False
-    return True
 
-# This function should test the same exact things, so there is no need to
-# repeat its definition.
-is_valid_enlarged_block = is_valid_block
+    Temp = np.einsum("sij,bjl->sbil", A, F)
+    Temp = np.einsum("sbil,abst->tail", Temp, W)
+    return np.einsum("tail,tkl->aik", Temp, B)
 
-def H2(Sz1, Sp1, Sz2, Sp2):  # two-site part of H
+
+def contract_from_left(W, A, E, B):
     """
-    Given the operators S^z and S^+ on two sites in different Hilbert spaces
-    (e.g. two blocks), returns a Kronecker product representing the
-    corresponding two-site term in the Hamiltonian that joins the two sites.
-    """
-    J = Jz = 1.
-    return (
-        (J / 2) * (kron(Sp1, Sp2.conjugate().transpose()) +\
-                   kron(Sp1.conjugate().transpose(), Sp2)) +
-        Jz * kron(Sz1, Sz2)
-    )
-
-
-import scipy
-# scipy.linalg.kron(a, b)
-def enlarge_block(block, h1e, eri, forward=True):
-    """
-    This function enlarges the provided Block by a single site, returning an
-    EnlargedBlock.
-
-    The connection operators need to be updated.
-    """
-    mblock = block.basis_size
-    o = block.operator_dict
-
-    # Create the new operators for the enlarged block.  Our basis becomes a
-    # Kronecker product of the Block basis and the single-site basis.  NOTE:
-    # `kron` uses the tensor product convention making blocks of the second
-    # array scaled by the first.  As such, we adopt this convention for
-    # Kronecker products throughout the code.
-    l = block.length
-    L = h1e.shape[-1]
-
-    # if block.length == 1:
-    #     enlarged_operator_dict = {
-    #         "H": kron(o["H"], identity(4)) + kron(identity(mblock), H1[l+1]) \
-    #             + H2(o["conn_Sz"], o["conn_Sp"], Sz1, Sp1),
-    #         "conn_Sz": kron(identity(mblock), Sz1),
-    #         "conn_Sp": kron(identity(mblock), Sp1),
-    #     }
-    # else:
-    H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Na @ Nb + Nb @ Na))\
-          for j in range(L)]
-            
-    if forward:
-        site_id = l
-
-
-        H = kron(o["H"], identity(4)) + kron(identity(mblock), H1[site_id])
-
-        for j in range(l):
-
-            H += eri[j, site_id] * kron(o["Ntot"][j], Ntot)
-            H += h1e[j, site_id] * (kron(o["Cdu"][j], Cu) + kron(o["Cdd"][j], Cd) - \
-                                    kron(o["Cu"][j], Cdu) - kron(o["Cd"][j], Cdd))
-
-        Ntot_update = [kron(op, identity(4)) for op in o["Ntot"]] + [kron(identity(mblock), Ntot)]
-        Cdu_update = [kron(op, JW) for op in o["Cdu"]] + [kron(identity(mblock), Cdu @ JW)]
-        Cdd_update = [kron(op, JW) for op in o["Cdd"]] + [kron(identity(mblock), Cdd @ JW)]
-        Cu_update = [kron(op, JW) for op in o["Cu"]] + [kron(identity(mblock), Cu @ JW)]
-        Cd_update = [kron(op, JW) for op in o["Cd"]] + [kron(identity(mblock), Cd @ JW)]
-
-    else:
-        # env
-        site_id = L - l - 1
-
-
-        H = kron(o["H"], identity(4)) + kron(identity(mblock), H1[site_id])
-
-        for j in range(l):
-
-            H += eri[site_id, L - 1 - j] * kron(o["Ntot"][j], Ntot)
-            H += h1e[site_id, L - 1 - j] * (kron(o["Cdu"][j], JW @ Cu) + kron(o["Cdd"][j], JW @ Cd) - \
-                                            kron(o["Cu"][j], JW @ Cdu) - kron(o["Cd"][j], JW @ Cdd))
-
-    # H += H2(o["conn_Sz"], o["conn_Sp"], Sz1, Sp1)
-
-        Ntot_update = [kron(op, identity(4)) for op in o["Ntot"]] + [kron(identity(mblock), Ntot)]
-        Cdu_update = [kron(op, JW) for op in o["Cdu"]] + [kron(identity(mblock), Cdu)]
-        Cdd_update = [kron(op, JW) for op in o["Cdd"]] + [kron(identity(mblock), Cdd)]
-        Cu_update = [kron(op, JW) for op in o["Cu"]] + [kron(identity(mblock), Cu)]
-        Cd_update = [kron(op, JW) for op in o["Cd"]] + [kron(identity(mblock), Cd)]
-
-
-
-    enlarged_operator_dict = {
-        "H": H,
-        "Ntot": Ntot_update,
-        "Cdu": Cdu_update,
-        "Cdd": Cdd_update,
-        "Cu": Cu_update,
-        "Cd": Cd_update
-
-    }
-
-
-    return EnlargedBlock(length=(block.length + 1),
-                         basis_size=(block.basis_size * model_d),
-                         operator_dict=enlarged_operator_dict)
-
-def rotate_and_truncate(operator, transformation_matrix):
-    """Transforms the operator to the new (possibly truncated) basis given by
-    `transformation_matrix`.
-    """
-    if isinstance(operator, list):
-        return [transformation_matrix.conjugate().transpose() @ op @ transformation_matrix for op in operator]
-    else:
-        return transformation_matrix.conjugate().transpose().dot(operator.dot(transformation_matrix))
-
-def single_dmrg_step(sys, env, m, h1e, eri, forward=True):
-    """
-    Performs a single DMRG step using `sys` as the system and `env` as the
-    environment, keeping a maximum of `m` states in the new basis.
-    """
-    # assert is_valid_block(sys)
-    # assert is_valid_block(env)
-    
-    L = h1e.shape[0]
-
-    # Enlarge each block by a single site.
-    sys_enl = enlarge_block(sys, h1e, eri, forward)
-
-    if sys is env:  # no need to recalculate a second time
-        env_enl = sys_enl
-    else:
-        env_enl = enlarge_block(env, h1e, eri, forward=not forward)
-
-    # assert is_valid_enlarged_block(sys_enl)
-    # assert is_valid_enlarged_block(env_enl)
-
-    # Construct the full superblock Hamiltonian.
-    m_sys_enl = sys_enl.basis_size
-    m_env_enl = env_enl.basis_size
-    sys_enl_op = sys_enl.operator_dict
-    env_enl_op = env_enl.operator_dict
-
-    # print('HHH', sys_enl.operator_dict["H"])
-
-
-    superblock_hamiltonian = kron(sys_enl_op["H"], identity(m_env_enl)) + \
-                             kron(identity(m_sys_enl), env_enl_op["H"])
-
-    if forward:
-        for j in range(sys_enl.length):
-            for k in range(env_enl.length):
-                # print(j, L-k-1, eri[j, L-k-1], h1e[j, L-k-1])
-                superblock_hamiltonian += eri[j, L-k-1] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
-                superblock_hamiltonian += h1e[j, L-k-1] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
-                                                kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) -\
-                                                kron(sys_enl_op["Cu"][j], env_enl_op["Cdu"][k]) -\
-                                                kron(sys_enl_op["Cd"][j], env_enl_op["Cdd"][k])
-                                                )
-    else:
-        for j in range(sys_enl.length):
-            for k in range(env_enl.length):
-                superblock_hamiltonian += eri[k, L-j-1] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
-                superblock_hamiltonian += h1e[k, L-j-1] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
-                                                kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) -\
-                                                kron(sys_enl_op["Cu"][j], env_enl_op["Cdu"][k]) -\
-                                                kron(sys_enl_op["Cd"][j], env_enl_op["Cdd"][k])
-                                                )
-
-
-    # Call ARPACK to find the superblock ground state.  ("SA" means find the
-    # "smallest in amplitude" eigenvalue.)
-    (energy,), psi0 = eigsh(superblock_hamiltonian, k=1, which="SA")
-
-    # w, u = sort(*np.linalg.eigh(superblock_hamiltonian.toarray()))
-    # print('energy', energy, w)
-
-    # Construct the reduced density matrix of the system by tracing out the
-    # environment
-    #
-    # We want to make the (sys, env) indices correspond to (row, column) of a
-    # matrix, respectively.  Since the environment (column) index updates most
-    # quickly in our Kronecker product structure, psi0 is thus row-major ("C
-    # style").
-
-
-    psi0 = psi0.reshape([sys_enl.basis_size, -1], order="C")
-
-
-    rho = np.dot(psi0, psi0.conjugate().transpose())
-    rho_env = np.dot(psi0.transpose(), psi0.conj())
-
-
-    # Diagonalize the reduced density matrix and sort the eigenvectors by
-    # eigenvalue.
-    evals, evecs = np.linalg.eigh(rho)
-    possible_eigenstates = []
-    for eval, evec in zip(evals, evecs.transpose()):
-        possible_eigenstates.append((eval, evec))
-    possible_eigenstates.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-    evals_env, evecs_env = np.linalg.eigh(rho_env)
-    possible_eigenstates_env = []
-    for eval, evec in zip(evals_env, evecs_env.transpose()):
-        possible_eigenstates_env.append((eval, evec))
-    possible_eigenstates_env.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-
-    # Build the transformation matrix from the `m` overall most significant
-    # eigenvectors.
-    my_m = min(len(possible_eigenstates), m)
-    transformation_matrix = np.zeros((sys_enl.basis_size, my_m), dtype='d', order='F')
-    for i, (eval, evec) in enumerate(possible_eigenstates[:my_m]):
-        transformation_matrix[:, i] = evec
-
-    transformation_matrix_env = np.zeros((env_enl.basis_size, my_m), dtype='d', order='F')
-    for i, (eval, evec) in enumerate(possible_eigenstates_env[:my_m]):
-        transformation_matrix_env[:, i] = evec
-
-    truncation_error = 1 - sum([x[0] for x in possible_eigenstates[:my_m]])
-    print("truncation error:", truncation_error)
-
-    # Rotate and truncate each operator.
-    new_operator_dict = {}
-    for name, op in sys_enl.operator_dict.items():
-        new_operator_dict[name] = rotate_and_truncate(op, transformation_matrix)
-
-    new_env_operator_dict = {}
-    for name, op in env_enl.operator_dict.items():
-        new_env_operator_dict[name] = rotate_and_truncate(op, transformation_matrix_env)
-
-    # for name in ["H", "Ntot"]:
-    #     new_operator_dict[name] = rotate_and_truncate(sys_enl.operator_dict[name], transformation_matrix)
-
-    # for name in ["Cu", "Cd", "Cdu", "Cdd"]:
-    #     new_operator_dict[name] = [rotate_and_truncate(op, transformation_matrix)\
-    #                                for op in sys_enl.operator_dict[name]]
-
-    newblock = Block(length=sys_enl.length,
-                     basis_size=my_m,
-                     operator_dict=new_operator_dict)
-
-    newblock_env = Block(length=env_enl.length,
-                     basis_size=my_m,
-                     operator_dict=new_env_operator_dict)
-
-
-    return newblock, newblock_env, energy
-
-# def single_dmrg_step(sys, env, m):
-#     """
-#     Performs a single DMRG step using `sys` as the system and `env` as the
-#     environment, keeping a maximum of `m` states in the new basis.
-#     """
-#     # assert is_valid_block(sys)
-#     # assert is_valid_block(env)
-
-#     # Enlarge each block by a single site.
-#     sys_enl = enlarge_block(sys)
-
-#     if sys is env:  # no need to recalculate a second time
-#         env_enl = sys_enl
-#     else:
-#         env_enl = enlarge_block(env, direction='backward')
-
-#     # assert is_valid_enlarged_block(sys_enl)
-#     # assert is_valid_enlarged_block(env_enl)
-
-#     # Construct the full superblock Hamiltonian.
-#     m_sys_enl = sys_enl.basis_size
-#     m_env_enl = env_enl.basis_size
-#     sys_enl_op = sys_enl.operator_dict
-#     env_enl_op = env_enl.operator_dict
-
-
-#     superblock_hamiltonian = kron(sys_enl_op["H"], identity(m_env_enl)) + \
-#                              kron(identity(m_sys_enl), env_enl_op["H"])
-
-#     for j in range(sys.length):
-#         for k in range(env.length):
-#             superblock_hamiltonian += eri[j, k] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
-#             superblock_hamiltonian += h1e[j, k] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
-#                                             kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) +\
-#                                             kron(sys_enl_op["Cu"][j], env_enl_op["Cdu"][k]) +\
-#                                             kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k])
-#                                             )
-
-#     # Call ARPACK to find the superblock ground state.  ("SA" means find the
-#     # "smallest in amplitude" eigenvalue.)
-#     (energy,), psi0 = eigsh(superblock_hamiltonian, k=1, which="SA")
-
-#     # Construct the reduced density matrix of the system by tracing out the
-#     # environment
-#     #
-#     # We want to make the (sys, env) indices correspond to (row, column) of a
-#     # matrix, respectively.  Since the environment (column) index updates most
-#     # quickly in our Kronecker product structure, psi0 is thus row-major ("C
-#     # style").
-
-
-#     psi0 = psi0.reshape([sys_enl.basis_size, -1], order="C")
-#     rho = np.dot(psi0, psi0.conjugate().transpose())
-#     rho_env = np.dot(psi0.conjugate().transpose(), psi0)
-
-#     # Diagonalize the reduced density matrix and sort the eigenvectors by
-#     # eigenvalue.
-#     evals, evecs = np.linalg.eigh(rho)
-#     possible_eigenstates = []
-#     for eval, evec in zip(evals, evecs.transpose()):
-#         possible_eigenstates.append((eval, evec))
-#     possible_eigenstates.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-#     evals_env, evecs_env = np.linalg.eigh(rho_env)
-#     possible_eigenstates_env = []
-#     for eval, evec in zip(evals_env, evecs_env.transpose()):
-#         possible_eigenstates_env.append((eval, evec))
-#     possible_eigenstates_env.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-
-#     # Build the transformation matrix from the `m` overall most significant
-#     # eigenvectors.
-#     my_m = min(len(possible_eigenstates), m)
-#     transformation_matrix = np.zeros((sys_enl.basis_size, my_m), dtype='d', order='F')
-#     for i, (eval, evec) in enumerate(possible_eigenstates[:my_m]):
-#         transformation_matrix[:, i] = evec
-
-#     transformation_matrix_env = np.zeros((sys_enl.basis_size, my_m), dtype='d', order='F')
-#     for i, (eval, evec) in enumerate(possible_eigenstates_env[:my_m]):
-#         transformation_matrix_env[:, i] = evec
-
-#     truncation_error = 1 - sum([x[0] for x in possible_eigenstates[:my_m]])
-#     print("truncation error:", truncation_error)
-
-#     # Rotate and truncate each operator.
-#     new_operator_dict = {}
-#     for name, op in sys_enl.operator_dict.items():
-#         new_operator_dict[name] = rotate_and_truncate(op, transformation_matrix)
-
-#     new_env_operator_dict = {}
-#     for name, op in sys_enl.operator_dict.items():
-#         new_env_operator_dict[name] = rotate_and_truncate(op, transformation_matrix_env)
-
-#     # for name in ["H", "Ntot"]:
-#     #     new_operator_dict[name] = rotate_and_truncate(sys_enl.operator_dict[name], transformation_matrix)
-
-#     # for name in ["Cu", "Cd", "Cdu", "Cdd"]:
-#     #     new_operator_dict[name] = [rotate_and_truncate(op, transformation_matrix)\
-#     #                                for op in sys_enl.operator_dict[name]]
-
-#     newblock = Block(length=sys_enl.length,
-#                      basis_size=my_m,
-#                      operator_dict=new_operator_dict)
-
-#     newblock_env = Block(length=env_enl.length,
-#                      basis_size=my_m,
-#                      operator_dict=new_env_operator_dict)
-
-
-#     return newblock, newblock_env, energy
-
-def sweep(sys, env, m, h1e, eri, forward=True):
-    """
-
-    Performs a single DMRG sweep from left to right using `sys` as the system and `env` as the
-    environment, keeping a maximum of `m` states in the new basis.
-    """
-    # assert is_valid_block(sys)
-    # assert is_valid_block(env)
-
-    # Enlarge each block by a single site.
-    sys_enl = enlarge_block(sys, h1e, eri, forward=forward)
-    L = h1e.shape[-1]
-    
-    if sys is env:  # no need to recalculate a second time
-        env_enl = sys_enl
-    else:
-        env_enl = enlarge_block(env, h1e, eri, forward=not forward)
-
-    # assert is_valid_enlarged_block(sys_enl)
-    # assert is_valid_enlarged_block(env_enl)
-
-    # Construct the full superblock Hamiltonian.
-    m_sys_enl = sys_enl.basis_size
-    m_env_enl = env_enl.basis_size
-    sys_enl_op = sys_enl.operator_dict
-    env_enl_op = env_enl.operator_dict
-
-    superblock_hamiltonian = kron(sys_enl_op["H"], identity(m_env_enl)) + \
-                             kron(identity(m_sys_enl), env_enl_op["H"])
-
-    if forward:
-        for j in range(sys_enl.length):
-            for k in range(env_enl.length):
-                superblock_hamiltonian += eri[j, (L-1-k)] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
-                superblock_hamiltonian += h1e[j, (L-1-k)] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
-                                                kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) -\
-                                                kron(sys_enl_op["Cu"][j], env_enl_op["Cdu"][k]) -\
-                                                kron(sys_enl_op["Cd"][j], env_enl_op["Cdd"][k])
-                                                )
-    else:
-        for j in range(sys_enl.length):
-            for k in range(env_enl.length):
-                superblock_hamiltonian += eri[k, int(L-j-1)] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
-                superblock_hamiltonian += h1e[k, int(L-j-1)] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
-                                                kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) -\
-                                                kron(sys_enl_op["Cu"][j], env_enl_op["Cdu"][k]) -\
-                                                kron(sys_enl_op["Cd"][j], env_enl_op["Cdd"][k])
-                                                )
-
-    # Call ARPACK to find the superblock ground state.  ("SA" means find the
-    # "smallest in amplitude" eigenvalue.)
-    (energy,), psi0 = eigsh(superblock_hamiltonian, k=1, which="SA")
-
-    # Construct the reduced density matrix of the system by tracing out the
-    # environment
-    #
-    # We want to make the (sys, env) indices correspond to (row, column) of a
-    # matrix, respectively.  Since the environment (column) index updates most
-    # quickly in our Kronecker product structure, psi0 is thus row-major ("C
-    # style").
-    psi0 = psi0.reshape([sys_enl.basis_size, -1], order="C")
-    rho = np.dot(psi0, psi0.conjugate().transpose())
-
-    # Diagonalize the reduced density matrix and sort the eigenvectors by
-    # eigenvalue.
-    evals, evecs = np.linalg.eigh(rho)
-    possible_eigenstates = []
-    for eval, evec in zip(evals, evecs.transpose()):
-        possible_eigenstates.append((eval, evec))
-    possible_eigenstates.sort(reverse=True, key=lambda x: x[0])  # largest eigenvalue first
-
-    # Build the transformation matrix from the `m` overall most significant
-    # eigenvectors.
-    my_m = min(len(possible_eigenstates), m)
-    transformation_matrix = np.zeros((sys_enl.basis_size, my_m), dtype='d', order='F')
-    for i, (eval, evec) in enumerate(possible_eigenstates[:my_m]):
-        transformation_matrix[:, i] = evec
-
-    truncation_error = 1 - sum([x[0] for x in possible_eigenstates[:my_m]])
-    print("truncation error:", truncation_error)
-
-    # Rotate and truncate each operator.
-    new_operator_dict = {}
-    for name, op in sys_enl.operator_dict.items():
-        new_operator_dict[name] = rotate_and_truncate(op, transformation_matrix)
-
-    newblock = Block(length=sys_enl.length,
-                     basis_size=my_m,
-                     operator_dict=new_operator_dict)
-
-    return newblock, energy
-
-
-def graphic(sys_block, env_block, sys_label="l"):
-    """Returns a graphical representation of the DMRG step we are about to
-    perform, using '=' to represent the system sites, '-' to represent the
-    environment sites, and '**' to represent the two intermediate sites.
-    """
-    assert sys_label in ("l", "r")
-    graphic = ("=" * sys_block.length) + "**" + ("-" * env_block.length)
-    if sys_label == "r":
-        # The system should be on the right and the environment should be on
-        # the left, so reverse the graphic.
-        graphic = graphic[::-1]
-    return graphic
-
-def infinite_system_algorithm(L, m):
-    block = initial_block
-    # Repeatedly enlarge the system by performing a single DMRG step, using a
-    # reflection of the current block as the environment.
-    while 2 * block.length < L:
-        print("L =", block.length * 2 + 2)
-        block, energy = single_dmrg_step(block, block, m=m)
-        print("E/L =", energy / (block.length * 2))
-
-
-
-def finite_system_algorithm(L, m_warmup, m):
-    """
-    Finite system DMRG
+    ## tensor contraction from the left hand side
+    ## +-    +--A-
+    ## |     |  |
+    ## E' =  E--F-
+    ## |     |  |
+    ## +-    +--B-
+
+    # the einsum function doesn't appear to optimize the contractions properly,
+    # so we split it into individual summations in the optimal order
+    # return np.einsum("abst,sij,aik,tkl->bjl",W,A,E,B, optimize=True)
 
     Parameters
     ----------
-    L : TYPE
+    W : TYPE
         DESCRIPTION.
-    m_warmup : TYPE
+    A : TYPE
+        DESCRIPTION.
+    E : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    Temp = np.einsum("sij,aik->sajk", A, E)
+    Temp = np.einsum("sajk,abst->tbjk", Temp, W)
+    return np.einsum("tbjk,tkl->bjl", Temp, B)
+
+
+def construct_F(Alist, MPO, Blist):
+    """
+    # construct the initial E and F matrices.
+    # we choose to start from the left hand side, so the initial E matrix
+    # is zero, the initial F matrices cover the complete chain
+
+    Parameters
+    ----------
+    Alist : TYPE
+        DESCRIPTION.
+    MPO : TYPE
+        DESCRIPTION.
+    Blist : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    F : TYPE
+        DESCRIPTION.
+
+    """
+    F = [initial_F(MPO[-1])]
+
+    for i in range(len(MPO)-1, 0, -1):
+        F.append(contract_from_right(MPO[i], Alist[i], F[-1], Blist[i]))
+    return F
+
+def construct_E(Alist, MPO, Blist):
+    return [initial_E(MPO[0])]
+
+
+def coarse_grain_MPO(W, X):
+    """
+    # 2-1 coarse-graining of two site MPO into one site
+    #  |     |  |
+    # -R- = -W--X-
+    #  |     |  |
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    X : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return np.reshape(np.einsum("abst,bcuv->acsutv",W,X),
+                      [W.shape[0], X.shape[1],
+                       W.shape[2]*X.shape[2],
+                       W.shape[3]*X.shape[3]])
+
+
+def product_W(W, X):
+    """
+    # 'vertical' product of MPO W-matrices
+    #        |
+    #  |    -W-
+    # -R- =  |
+    #  |    -X-
+    #        |
+
+    Parameters
+    ----------
+    W : TYPE
+        DESCRIPTION.
+    X : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return np.reshape(np.einsum("abst,cdtu->acbdsu", W, X), [W.shape[0]*X.shape[0],
+                                                             W.shape[1]*X.shape[1],
+                                                             W.shape[2],X.shape[3]])
+
+
+def product_MPO(M1, M2):
+    assert len(M1) == len(M2)
+    Result = []
+    for i in range(0, len(M1)):
+        Result.append(product_W(M1[i], M2[i]))
+    return Result
+
+
+
+def coarse_grain_MPS(A,B):
+    """
+    # 2-1 coarse-graining of two-site MPS into one site
+    #   |     |  |
+    #  -R- = -A--B-
+
+    Parameters
+    ----------
+    A : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return np.reshape(np.einsum("sij,tjk->stik",A,B),
+                      [A.shape[0]*B.shape[0], A.shape[1], B.shape[2]])
+
+def fine_grain_MPS(A, dims):
+    assert A.shape[0] == dims[0] * dims[1]
+    Theta = np.transpose(np.reshape(A, dims + [A.shape[1], A.shape[2]]),
+                         (0,2,1,3))
+    M = np.reshape(Theta, (dims[0]*A.shape[1], dims[1]*A.shape[2]))
+    U, S, V = np.linalg.svd(M, full_matrices=0)
+    U = np.reshape(U, (dims[0], A.shape[1], -1))
+    V = np.transpose(np.reshape(V, (-1, dims[1], A.shape[2])), (1,0,2))
+    # assert U is left-orthogonal
+    # assert V is right-orthogonal
+    #print(np.dot(V[0],np.transpose(V[0])) + np.dot(V[1],np.transpose(V[1])))
+    return U, S, V
+
+def truncate_SVD(U, S, V, m):
+    """
+    # truncate the matrices from an SVD to at most m states
+
+    Parameters
+    ----------
+    U : TYPE
+        DESCRIPTION.
+    S : TYPE
+        DESCRIPTION.
+    V : TYPE
         DESCRIPTION.
     m : TYPE
         DESCRIPTION.
 
     Returns
     -------
-    None.
+    U : TYPE
+        DESCRIPTION.
+    S : TYPE
+        DESCRIPTION.
+    V : TYPE
+        DESCRIPTION.
+    trunc : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
 
     """
-    assert L % 2 == 0  # require that L is an even number
+    m = min(len(S), m)
+    trunc = np.sum(S[m:])
+    S = S[0:m]
+    U = U[:,:,0:m]
+    V = V[:,0:m,:]
+    return U,S,V,trunc,m
 
-    # To keep things simple, this dictionary is not actually saved to disk, but
-    # we use it to represent persistent storage.
-    block_disk = {}  # "disk" storage for Block objects
+# Functor to evaluate the Hamiltonian matrix-vector multiply
+#        +--A--+
+#        |  |  |
+# -R- =  E--W--F
+#  |     |  |  |
+#        +-   -+
+class HamiltonianMultiply(sparse.linalg.LinearOperator):
+    def __init__(self, E, W, F):
+        self.E = E
+        self.W = W
+        self.F = F
+        self.dtype = np.dtype('d')
+        self.req_shape = [W.shape[2], E.shape[1], F.shape[2]]
+        self.size = self.req_shape[0]*self.req_shape[1]*self.req_shape[2]
+        self.shape = [self.size, self.size]
 
-    # Use the infinite system algorithm to build up to desired size.  Each time
-    # we construct a block, we save it for future reference as both a left
-    # ("l") and right ("r") block, as the infinite system algorithm assumes the
-    # environment is a mirror image of the system.
-    block = initial_block
-    block_disk["l", block.length] = block
-    block_disk["r", block.length] = block
+    def _matvec(self, A):
+        # the einsum function doesn't appear to optimize the contractions properly,
+        # so we split it into individual summations in the optimal order
+        #R = np.einsum("aij,sik,abst,bkl->tjl",self.E,np.reshape(A, self.req_shape),
+        #              self.W,self.F, optimize=True)
+        R = np.einsum("aij,sik->ajsk", self.E, np.reshape(A, self.req_shape))
+        R = np.einsum("ajsk,abst->bjtk", R, self.W)
+        R = np.einsum("bjtk,bkl->tjl", R, self.F)
+        return np.reshape(R, -1)
 
-    while 2 * block.length < L:
-        # Perform a single DMRG step and save the new Block to "disk"
-        print(graphic(block, block))
-        block, energy = single_dmrg_step(block, block, m=m_warmup)
-        print("E/L =", energy / (block.length * 2))
-        block_disk["l", block.length] = block
-        block_disk["r", block.length] = block
+## optimize a single site given the MPO matrix W, and tensors E,F
+def optimize_site(A, W, E, F, tol=1E-8):
+    H = HamiltonianMultiply(E,W,F)
+    # we choose tol=1E-8 here, which is OK for small calculations.
+    # to bemore robust, we should take the tol -> 0 towards the end
+    # of the calculation.
+    E, V = sparse.linalg.eigsh(H,1,v0=A,which='SA', tol=tol)
+    return (E[0],np.reshape(V[:,0], H.req_shape))
 
-    # Now that the system is built up to its full size, we perform sweeps using
-    # the finite system algorithm.  At first the left block will act as the
-    # system, growing at the expense of the right block (the environment), but
-    # once we come to the end of the chain these roles will be reversed.
-    sys_label, env_label = "l", "r"
-    sys_block = block; del block  # rename the variable
+## two-site optimization of MPS A,B with respect to MPO W1,W2 and
+## environment tensors E,F
+## dir = 'left' or 'right' for a left-moving or right-moving sweep
+def optimize_two_sites(A, B, W1, W2, E, F, m, dir):
+    W = coarse_grain_MPO(W1,W2)
+    AA = coarse_grain_MPS(A,B)
+    H = HamiltonianMultiply(E,W,F)
+    E,V = sparse.linalg.eigsh(H,1,v0=AA,which='SA')
+    AA = np.reshape(V[:,0], H.req_shape)
+    A,S,B = fine_grain_MPS(AA, [A.shape[0], B.shape[0]])
+    A,S,B,trunc,m = truncate_SVD(A,S,B,m)
+    if (dir == 'right'):
+        B = np.einsum("ij,sjk->sik", np.diag(S), B)
+    else:
+        assert dir == 'left'
+        A = np.einsum("sij,jk->sik", A, np.diag(S))
+    return E[0], A, B, trunc, m
+
+def two_site_dmrg(MPS, MPO, m, sweeps):
+    ## Driver function to perform sweeps of 2-site DMRG
+
+    E = construct_E(MPS, MPO, MPS)
+    F = construct_F(MPS, MPO, MPS)
+    F.pop()
+    for sweep in range(0,int(sweeps/2)):
+        for i in range(0, len(MPS)-2):
+            Energy,MPS[i],MPS[i+1],trunc,states = optimize_two_sites(MPS[i],MPS[i+1],
+                                                                     MPO[i],MPO[i+1],
+                                                                     E[-1], F[-1], m, 'right')
+            print("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
+                     .format(sweep*2,i,i+1, Energy, states, trunc))
+
+            E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
+            F.pop();
+
+        for i in range(len(MPS)-2, 0, -1):
+            Energy,MPS[i],MPS[i+1],trunc,states = optimize_two_sites(MPS[i],MPS[i+1],
+                                                                     MPO[i],MPO[i+1],
+                                                                     E[-1], F[-1], m, 'left')
+            print("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
+                     .format(sweep*2+1,i,i+1, Energy, states, trunc))
+            F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
+            E.pop();
+
+    return MPS
+
+
+def Expectation(AList, MPO, BList):
+    """
+    Evaluate the expectation value of an MPO on a given MPS
+    <A|MPO|B>
+
+    Parameters
+    ----------
+    AList : TYPE
+        DESCRIPTION.
+    MPO : TYPE
+        DESCRIPTION.
+    BList : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    E = [[[1]]]
+    for i in range(0,len(MPO)):
+        E = contract_from_left(MPO[i], AList[i], E, BList[i])
+    return E[0][0][0]
+
+
+from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 
 
 
-    # for m in m_sweep_list:
-    while True:
-        # Load the appropriate environment block from "disk"
-        env_block = block_disk[env_label, L - sys_block.length - 2]
-
-        print(sys_block.length, env_block.length)
-
-
-        if env_block.length == 1:
-            # We've come to the end of the chain, so we reverse course.
-            sys_block, env_block = env_block, sys_block
-            sys_label, env_label = env_label, sys_label
-
-        # Perform a single DMRG step.
-        print(graphic(sys_block, env_block, sys_label))
-        sys_block, energy = single_dmrg_step(sys_block, env_block, m=m)
-
-        print("E/L =", energy / L)
-
-        # Save the block from this step to disk.
-        block_disk[sys_label, sys_block.length] = sys_block
-
-        # Check whether we just completed a full sweep.
-        if sys_label == "l" and 2 * sys_block.length == L:
-            break  # escape from the "while True" loop
 
 class DMRG:
     """
-    ab initio DRMG/DVR quantum chemistry calculation for 1D system
+    ground state DMRG in MPO/MPS framework
     """
-    def __init__(self, mf, L, D, tol=1e-6):
-        """
-        DMRG sweeping algorithm directly using DVR set (without SCF calculations)
+    def __init__(self, H, D, nsweeps=None, init_guess=None):
 
-        Parameters
-        ----------
-        d : TYPE
-            DESCRIPTION.
-        L : TYPE
-            DESCRIPTION.
-        D : TYPE, optional
-            maximum bond dimension. The default is None.
-        tol: float
-            tolerance for energy convergence
+        self.H = H
+        self.D = D
+        self.nsweeps = nsweeps
 
-        Returns
-        -------
-        None.
+        self.init_guess = init_guess
+        self.ground_state = None
 
-        """
-        assert(isinstance(mf, RHF1D))
+    def run(self):
 
-        self.mf = mf
+        if self.init_guess is None:
+            raise ValueError('Invalid initial guess.')
 
-        self.dim = 4
-        self.nelec = self.mf.mol.nelec
+        # fDMRG_1site_GS_OBC(self.H, self.D, self.nsweeps)
+        self.ground_state = two_site_dmrg(self.init_guess, self.H, self.D, self.nsweeps)
 
-        self.h1e = mf.hcore
-        self.eri = mf.eri
+        return self
 
-        self.nsites = self.L = mf.nx
-        self.D = self.m = D
+    # def expect(self, e_ops):
 
-        self.tol = tol # tolerance for energy convergence
-        self.rigid_shift = 0
-
-    # def run(self, initial_block, m_warmup=10):
-    #     L = self.L
-    #     m = self.m
-
-    #     assert L % 2 == 0  # require that L is an even number
-
-    #     # To keep things simple, this dictionary is not actually saved to disk, but
-    #     # we use it to represent persistent storage.
-    #     block_disk = {}  # "disk" storage for Block objects
-
-    #     # Use the infinite system algorithm to build up to desired size.  Each time
-    #     # we construct a block, we save it for future reference as both a left
-    #     # ("l") and right ("r") block, as the infinite system algorithm assumes the
-    #     # environment is a mirror image of the system.
-    #     block = initial_block
-    #     block_disk["l", block.length] = block
-    #     block_disk["r", block.length] = block
-
-    #     while 2 * block.length < L:
-    #         # Perform a single DMRG step and save the new Block to "disk"
-    #         print(graphic(block, block))
-    #         block, energy = single_dmrg_step(block, block, m=m_warmup)
-    #         print("E/L =", energy / (block.length * 2))
-    #         block_disk["l", block.length] = block
-    #         block_disk["r", block.length] = block
-
-    #     # Now that the system is built up to its full size, we perform sweeps using
-    #     # the finite system algorithm.  At first the left block will act as the
-    #     # system, growing at the expense of the right block (the environment), but
-    #     # once we come to the end of the chain these roles will be reversed.
-    #     sys_label, env_label = "l", "r"
-    #     sys_block = block; del block  # rename the variable
-
-    #     # Now that the system is built up to its full size, we perform sweeps using
-    #     # the finite system algorithm.  At first the left block will act as the
-    #     # system, growing at the expense of the right block (the environment), but
-    #     # once we come to the end of the chain these roles will be reversed.
-    #     sys_label, env_label = "l", "r"
-    #     sys_block = block; del block  # rename the variable
-
-    #     # for m in m_sweep_list:
-    #     while True:
-    #         # Load the appropriate environment block from "disk"
-    #         env_block = block_disk[env_label, L - sys_block.length - 2]
-
-    #         if env_block.length == 1:
-    #             # We've come to the end of the chain, so we reverse course.
-    #             sys_block, env_block = env_block, sys_block
-    #             sys_label, env_label = env_label, sys_label
-
-    #         # Perform a single DMRG step.
-    #         print(graphic(sys_block, env_block, sys_label))
-
-    #         sys_block, energy = single_dmrg_step(sys_block, env_block, m=m)
-
-    #         print("E =", energy)
-
-    #         # Save the block from this step to disk.
-    #         block_disk[sys_label, sys_block.length] = sys_block
-
-    #         # Check whether we just completed a full sweep.
-    #         if sys_label == "l" and 2 * sys_block.length == L:
-    #             break  # escape from the "while True" loop
-
-    #         # finite_system_algorithm(L, m_warmup, m)
-
-    def fix_nelec(self, shift=1, N=None):
-        """
-        fix the number of electrons by energy penalty
-
-        .. math::
-
-            \mathcal{H} = H + \lambda (\hat{N} - N)^2
-
-        Parameters
-        ----------
-        shift : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        None.
-
-        """
-        print('Fixing the number of electrons by penalty')
-        L = self.L
-        if N is None:
-            N = self.nelec
-        
-        self.h1e = self.h1e - shift * (2 * N - 1) * np.eye(self.L)
-        self.eri = self.eri +  2 * shift 
-        self.rigid_shift = shift * N**2
-        
-        return
-
-    def fix_spin(self, shift, spin=0):
-        """
-        fix the number of electrons by energy penalty
-
-        .. math::
-
-            \mathcal{H} = H + \lambda (\hat{S}^2 - S(S+1))^2
-
-        Parameters
-        ----------
-        shift : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        None.
-
-        """
-        # self.h1e += ...
-        # self.eri += ...
-        return
+    #     return Expectation(Alist, MPO, BList)
 
 
-    def run(self, m_warmup=None):
-        
-        # rank used during the iDMRG stage, if not specified, set it to D
-        if m_warmup is None: m_warmup = self.D
-        
-        block_disk = {}  # "disk" storage for Block objects
-
-        L = self.L
-        h1e = self.h1e
-        eri = self.eri
-
-        # onsite Hamiltonian
-        H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Na @ Nb + Nb @ Na))\
-              for j in range(L)]
-
-        assert L % 2 == 0  # require that L is an even number
-
-
-        # initial system band environment block
-        sys = Block(length=1, basis_size=4, operator_dict={
-                "H": H1[0],
-                "Ntot": [Ntot],
-                "Cu": [Cu @ JW],
-                "Cd": [Cd @ JW],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu @ JW],
-                "Cdd": [Cdd @ JW]
-            })
-
-        env =  Block(length=1, basis_size=4, operator_dict={
-                "H": H1[-1],
-                "Ntot": [Ntot],
-                "Cu": [Cu],
-                "Cd": [Cd],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu],
-                "Cdd": [Cdd]
-            })
-
-        block_disk["l", sys.length] = sys
-        block_disk["r", env.length] = env
-
-        while 2 * sys.length < L:
-
-            # Perform a single DMRG step and save the new Block to "disk"
-            print(graphic(sys, env))
-
-            sys, env, energy = single_dmrg_step(sys, env, m_warmup, h1e, eri)
-
-            print("E =", energy + self.rigid_shift)
-
-            block_disk["l", sys.length] = sys
-            block_disk["r", env.length] = env
-
-        ### Sweep
-        old_energy = energy
-
-        # Now that the system is built up to its full size, we perform sweeps using
-        # the finite system algorithm.  At first the left block will act as the
-        # system, growing at the expense of the right block (the environment), but
-        # once we come to the end of the chain these roles will be reversed.
-        sys_label, env_label = "l", "r"
-        sys_block = sys; del sys  # rename the variable
-
-        # for m in m_sweep_list:
-        forward = True
-        while True:
-            # Load the appropriate environment block from "disk"
-            env_block = block_disk[env_label, L - sys_block.length - 2]
-
-            if env_block.length == 1:
-                
-                forward = not forward
-                # We've come to the end of the chain, so we reverse course.
-                sys_block, env_block = env_block, sys_block
-                sys_label, env_label = env_label, sys_label
-
-            # Perform a single DMRG step.
-            print(graphic(sys_block, env_block, sys_label))
-
-            sys_block, energy = sweep(sys_block, env_block, self.m, h1e, eri, forward=forward)
-
-            print("E =", energy)
-
-
-            # Save the block from this step to disk.
-            block_disk[sys_label, sys_block.length] = sys_block
-
-            # Check whether we just completed a full sweep.
-            if sys_label == "l" and 2 * sys_block.length == L:
-                # break  # escape from the "while True" loop
-                if np.abs(energy - old_energy) < self.tol:
-                    print('Energy Converged. Total Energy = {}'.format(energy + self.rigid_shift + self.mf.e_nuc))
-                    break
-                else:
-                    old_energy = energy
-
-
-    def dump(self):
-        pass
-
-class DMRGSCF(DMRG):
+def to_mpo(h1e, eri):
     """
-    optimize the orbitals
+    express the Hamiltonian into MPO
+
+    .. math::
+
+        H = h_{ij} c_{i\sigma}^\dagger c_{j\sigma} + v_{ij} n_i n_j
+
+    Parameters
+    ----------
+    h1e : TYPE
+        one-electron core Hamiltonian.
+    eri : TYPE
+        electron-repulsion integral
+
+    Returns
+    -------
+    None.
+
     """
-    pass
 
 
-if __name__=='__main__':
-    from pyscf import gto, scf, dft, tddft, ao2mo
+def fDMRG_1site_GS_OBC(H,D,Nsweeps):
+    '''
+    Function that implements finite-system DMRG (one-site update version) to obtain the ground state of an input
+            Hamiltonian MPO (order of legs: left-bottom-right-top), 'H', that represents a system with open boundary
+            conditions.
 
-    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
-    from pyqed.qchem.gto.rhf import RHF
-    from pyqed.qchem.dvr.rhf import RHF1D
-    from pyqed.models.ShinMetiu2e1d import AtomicChain
+    Notes:
+            - the outputs are the ground state energy at every step of the algorithm, 'E_list', and the ground state
+                MPS (order of legs: left-bottom-right) at the final step, 'M'.
+            - the maximum bond dimension allowed for the ground state MPS is an input, 'D'.
+            - the number of sweeps is an input, 'Nsweeps'.
+    '''
+    N = len(H) #nr of sites
 
-    np.set_printoptions(precision=10, suppress=True, threshold=10000, linewidth=300)
+    # random MPS (left-bottom-right)
+    M = []
+    M.append(np.random.rand(1, np.shape(H[0])[3],D))
 
+    for l in range(1,N-1):
+        M.append(np.random.rand(D,np.shape(H[l])[3],D))
+    M.append(np.random.rand(D,np.shape(H[N-1])[3],1))
 
-    # mol = gto.Mole()
-    # mol.atom = [
-    #     ['H' , (0. , 0. , .917)],
-    #     ['Li' , (0. , 0. , 0.)], ]
-    # mol.basis = 'sto3g'
-    # mol.build()
+    ## normalized MPS in right canonical form
+    # M = LeftCanonical(M)
+    M = RightCanonical(M)
 
+    # Hzip
+    '''
+        Every step of the finite-system DMRG consists in optimizing a local tensor M[l] of an MPS in site
+            canonical form. The value of l is sweeped back and forth between 0 and N-1.
 
+        For a given l, we define Hzip as a list with N+2 elements where:
 
-    # mf = scf.RHF(mol).run()
+            - Hzip[0] = Hzip[N+1] = np.ones((1,1,1))
 
-    # e, fcivec = pyscf.fci.FCI(mf).kernel(verbose=4)
-    # print(e)
-    # Ca = mf.mo_coeff[0ArithmeticError
-    # n = Ca.shape[-1]
+            - Hzip[it] =
 
-    # mo_coeff = mf.mo_coeff
-    # get the two-electron integrals as a numpy array
-    # eri = get_eri_mo(mol, mo_coeff)
+                /--------------M[it-1]--3--
+                |             \|
+                |              |
+                |              |
+                Hzip[it-1]-----H[it-1]--2--          for it = 1, 2, ..., l
+                |              |
+                |              |
+                |             /|
+                \--------------M[it-1]^†--1--
 
-    # n = mol.nao
-    # Ca = mo_coeff
+            - Hzip[it] =
 
+                --1--M[it-1]-----\
+                     |/          |
+                     |           |
+                     |           |
+                --2--H[it-1]-----Hzip[it+1]          for it = l+1, l+2, ..., N
+                     |           |
+                     |           |
+                     |\          |
+                --3--M[it-1]^†---/
 
-    l = 10/au2angstrom
-        # print(self.L)
-        # self.mass = mass  # nuclear mass
-    # z = np.array([-L/2, -L/4, L/4, L/2])
-    z0 = np.linspace(-1, 1, 4) * l/2
-    print(z0)
+        Here, we initialize Hzip considering l=0 (note that this is consistent with starting with a random MPS in
+            right canonical form). Consistently, we will start the DMRG routine with a right sweep.
+    '''
+    Hzip = [np.ones((1,1,1)) for it in range(N+2)]
+    for l in range(N-1,-1,-1):
+        Hzip[l+1] = ZipperRight(Hzip[l+2],M[l].conj().T,H[l],M[l])
 
-    print('interatomic distance = ', (z0[1] - z0[0])*au2angstrom)
+    # DMRG routine
+    E_list = []
+    for itsweeps in range(Nsweeps):
+        ## right sweep
+        for l in range(N):
+            ### H matrix
+            Taux = np.einsum('ijk,jlmn',Hzip[l],H[l])
+            Taux = np.einsum('ijklm,nlo',Taux,Hzip[l+2])
+            Taux = np.transpose(Taux,(0,2,5,1,3,4))
+            Hmat = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1]*np.shape(Taux)[2],
+                                    np.shape(Taux)[3]*np.shape(Taux)[4]*np.shape(Taux)[5]))
 
+            ### Lanczos diagonalization of H matrix (lowest energy eigenvalue)
+            '''
+                Note: for performance purposes, we initialize Lanczos with the previous version of the local
+                    tensor M[l].
+            '''
+            val,vec = eigsh(Hmat, k=1, which='SA', v0=M[l])
+            E_list.append(val[0])
 
-    mol = AtomicChain(z0, charge=0)
-    print('number of electrons = ', mol.nelec)
-    ###############################################################################
-    # mol = ShinMetiu1d(nstates=3, nelec=2)
-    # # mol.spin = 0
-    # mol.create_grid([-15/au2angstrom, 15/au2angstrom], level=4)
+            ### update M[l]
+            '''
+                Note: in the right sweep, the local tensor M[l] obtained from Lanczos has to be left normalized.
+                    This is achieved by SVD. The remaining S*Vdag is contracted with M[l+1].
+            '''
+            Taux2 = np.reshape(vec,(np.shape(Taux)[0]*np.shape(Taux)[1],np.shape(Taux)[2]))
+            U,S,Vdag = np.linalg.svd(Taux2,full_matrices=False)
+            M[l] = np.reshape(U,(np.shape(Taux)[0],np.shape(Taux)[1],np.shape(U)[1]))
+            if l < N-1:
+                M[l+1] = np.einsum('ij,jkl',np.matmul(np.diag(S),Vdag),M[l+1])
 
-    # # exact
-    # R = 0.
-    # w, u = mol.single_point(R)
-    # print(w)
+            ### update Hzip
+            Hzip[l+1] = ZipperLeft(Hzip[l],M[l].conj().T,H[l],M[l])
 
-    # fig, ax = plt.subplots()
-    # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
+        ## left sweep
+        for l in range(N-1,-1,-1):
+            ### H matrix
+            Taux = np.einsum('ijk,jlmn',Hzip[l],H[l])
+            Taux = np.einsum('ijklm,nlo',Taux,Hzip[l+2])
+            Taux = np.transpose(Taux,(0,2,5,1,3,4))
+            Hmat = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1]*np.shape(Taux)[2],
+                                   np.shape(Taux)[3]*np.shape(Taux)[4]*np.shape(Taux)[5]))
 
-    # HF
-    mf = RHF1D(mol, dvr_type='sine')
-    mf.domain = [-15/au2angstrom, 15/au2angstrom]
-    mf.nx = 32
+            ### Lanczos diagonalization of H matrix (lowest energy eigenvalue)
+            val,vec = eigsh(Hmat, k=1, which='SA', v0=M[l])
+            E_list.append(val[0])
 
-    mf.run()
-    # exact
-    # w, u = mol.single_point(R)
-    # print(w)
+            ### update M[l]
+            '''
+                Note: in the left sweep, the local tensor M[l] obtained from Lanczos has to be right normalized.
+                    This is achieved by SVD. The remaining U*S is contracted with M[l-1].
+            '''
+            Taux2 = np.reshape(vec,(np.shape(Taux)[0],np.shape(Taux)[1]*np.shape(Taux)[2]))
+            U,S,Vdag = np.linalg.svd(Taux2,full_matrices=False)
+            M[l] = np.reshape(Vdag,(np.shape(Vdag)[0],np.shape(Taux)[1],np.shape(Taux)[2]))
+            if l > 0:
+                M[l-1] = np.einsum('ijk,kl',M[l-1],np.matmul(U,np.diag(S)))
 
+            ### update Hzip
+            Hzip[l+1] = ZipperRight(Hzip[l+2],M[l].conj().T,H[l],M[l])
 
-    # fig, ax = plt.subplots()
-    # ax.imshow(u[:, 1].reshape(mol.nx, mol.nx), origin='lower')
-
-    # mo = mf.mo_coeff
-    # print('orb energies', mf.mo_energy)
-
-    # h1e = mf.hcore
-    # eri = mf.eri
-
-    # # print(h1e)
-    # # print(eri)
-
-    # L = nsites = mf.nx
-
-
-    # # onsite Hamiltonian
-    # H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Na @ Nb + Nb @ Na)) for j in range(nsites)]
-
-
-    ### DMRG
-
-    # def debug():
-    #     sys = Block(length=1, basis_size=4, operator_dict={
-    #             "H": H1[0],
-    #             "Ntot": [Ntot],
-    #             "Cu": [Cu @ JW],
-    #             "Cd": [Cd @ JW],
-    #             # "Nu": [ops['Nu']],
-    #             # "Nd": [ops['Nd']],
-    #             "Cdu": [Cdu @ JW],
-    #             "Cdd": [Cdd @ JW]
-    #         })
-
-    #     env =  Block(length=1, basis_size=4, operator_dict={
-    #             "H": H1[-1],
-    #             "Ntot": [Ntot],
-    #             "Cu": [Cu],
-    #             "Cd": [Cd],
-    #             # "Nu": [ops['Nu']],
-    #             # "Nd": [ops['Nd']],
-    #             "Cdu": [Cdu],
-    #             "Cdd": [Cdd]
-    #         })
-
-    #     sys_enl = enlarge_block(enlarge_block(sys))
-    #     H = sys_enl.operator_dict["H"]
-
-    #     print(H.shape)
-    #     print(eigsh(H,6)[0])
-
-    #     env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
-    #     H = env_enl.operator_dict["H"]
-    #     # mblock = 4
-    #     # site_id = 1
-    #     # o = sys.operator_dict
-    #     # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
-
-    #     # print(Ntot)
-
-    #     # # for j in range(1):
-    #     # H += eri[0, 1] * kron(Ntot, Ntot)
-    #     # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
-    #     #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
-    #     # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
-    #     print(H.shape)
-    #     print(eigsh(H,6)[0])
+    return E_list,M
 
 
-    #     nx = mf.nx
-    #     I = np.eye(nx)
-    #     eri_full = np.zeros((nx, nx, nx, nx))
-    #     for i in range(nx):
-    #         for j in range(nx):
-    #             for k in range(nx):
-    #                 for l in range(nx):
-    #                     eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
-
-    #     for n in range(3, 4):
-    #     # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
-    #         model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
-
-    #         H  = model.jordan_wigner()
-    #         print(H.shape)
-    #         print(eigsh(H,k=6)[0])
 
 
-    dmrg = DMRG(mf, L=mf.nx, D=10)
+if __name__ == '__main__':
 
-    dmrg.fix_nelec(shift=0.5)
+    ##
+    ## Parameters for the DMRG simulation
+    ##
+
+    d=2   # local bond dimension, 0=up, 1=down
+    N=10 # number of sites
+
+    ## initial state |+-+-+-+-+->
+
+    InitialA1 = np.zeros((d,1,1))
+    InitialA1[0,0,0] = 1
+    InitialA2 = np.zeros((d,1,1))
+    InitialA2[1,0,0] = 1
+
+    MPS = [InitialA1, InitialA2] * int(N/2)
+
+    ## Local operators
+    I = np.identity(2)
+    Z = np.zeros((2,2))
+    Sz = np.array([[0.5,  0  ],
+                 [0  , -0.5]])
+    Sp = np.array([[0, 0],
+                 [1, 0]])
+    Sm = np.array([[0, 1],
+                 [0, 0]])
+
+    ## Hamiltonian MPO
+    W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z],
+                  [Z,  Z,      Z,      Z,  Sz],
+                  [Z,  Z,      Z,      Z,  Sm],
+                  [Z,  Z,      Z,      Z,  Sp],
+                  [Z,  Z,      Z,      Z,   I]])
+
+    print(W.shape)
+
+    # left-hand edge is 1x5 matrix
+    Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z]])
+
+    # right-hand edge is 5x1 matrix
+    Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])
+
+    # the complete MPO
+    H = MPO = [Wfirst] + ([W] * (N-2)) + [Wlast]
+
+    dmrg = DMRG(H, D=10, nsweeps=8)
+    dmrg.init_guess = MPS
     dmrg.run()
 
- # -2.3048356518
+    # # MPO for H^2, to calculate the variance
+    # HamSquared = product_MPO(MPO, MPO)
 
+    # 8 sweeps with m=10 states
+    # two_site_dmrg(MPS, MPO, 10, 8)
 
-    ### exact diagonalization
-    # nx = mf.nx
-    # I = np.eye(nx)
-    # eri_full = np.zeros((nx, nx, nx, nx))
-    # for i in range(nx):
-    #     for j in range(nx):
-    #         for k in range(nx):
-    #             for l in range(nx):
-    #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
-    # E, _ = SpinHalfFermionChain(h1e, eri_full, nelec=4).run(6)
-    # print(E)
+# # energy and energy squared
+# E_10 = Expectation(MPS, MPO, MPS);
+# Esq_10 = Expectation(MPS, HamSquared, MPS);
 
-    # Model-specific code for the Heisenberg XXZ chain
+# # 2 sweeps with m=20 states
+# two_site_dmrg(MPS, MPO, 20, 2)
 
-    # Sz1 = np.array([[0.5, 0], [0, -0.5]], dtype='d')  # single-site S^z
-    # Sp1 = np.array([[0, 1], [0, 0]], dtype='d')  # single-site S^+
+# # energy and energy squared
+# E_20 = Expectation(MPS, MPO, MPS);
+# Esq_20 = Expectation(MPS, HamSquared, MPS);
 
-    # H1 = np.array([[0, 0], [0, 0]], dtype='d')  # single-site portion of H is zero
+# # 2 sweeps with m=30 states
+# two_site_dmrg(MPS, MPO, 30, 2)
 
+# # energy and energy squared
+# E_30 = Expectation(MPS, MPO, MPS);
+# Esq_30 = Expectation(MPS, HamSquared, MPS);
 
+# Energy = Expectation(MPS, MPO, MPS)
+# print("Final energy expectation value {}".format(Energy))
 
+# # calculate the variance <(H-E)^2> = <H^2> - E^2
 
-
-
-
-
-    # conn refers to the connection operator, that is, the operator on the edge of
-    # the block, on the interior of the chain.  We need to be able to represent S^z
-    # and S^+ on that site in the current basis in order to grow the chain.
-    # initial_block = Block(length=1, basis_size=model_d, operator_dict={
-    #     "H": H1,
-    #     "Cu": ops['Cu'],
-    #     "Cd": ops['Cd'],
-    #     "Nu": ops['Nu'],
-    #     "Nd": ops['Nd']
-    # })
-
-    #infinite_system_algorithm(L=100, m=20)
-    # finite_system_algorithm(L=nsites, m_warmup=10, m=10)
+# print("m=10 variance = {:16.12f}".format(Esq_10 - E_10*E_10))
+# print("m=20 variance = {:16.12f}".format(Esq_20 - E_20*E_20))
+# print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))

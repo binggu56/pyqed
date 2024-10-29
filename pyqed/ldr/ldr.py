@@ -672,7 +672,7 @@ class LDRN:
         return rho
 
 
-class LDRN_LvN(LDRN):
+class LDR2_LvN(LDRN):
     """
     Liouville von Newmann equation in the LDR
     """
@@ -783,6 +783,8 @@ class LDRN_LvN(LDRN):
         rho_el = contract(einsum_string, rho)
         
         return rho_el
+    
+
         
         
 
@@ -1744,6 +1746,14 @@ class LDR2(WPD2):
     
     def k_evolve(self, psi):
         return self.expK @ psi
+    
+    def HEOM(self):
+        from pyqed.heom.deom import HEOMSolver
+        
+        if self.H is None: 
+            self.buildH(dt)
+        
+        return HEOMSolver(self.H)
     
     
 class LDR2_Jacobi(LDR2):

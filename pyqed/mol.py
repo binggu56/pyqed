@@ -778,7 +778,7 @@ class Mol:
         """
         hierarchical equations of motion
         """
-        from pyqed.deom import DEOMSolver
+        from pyqed.heom.deom import DEOMSolver
         
         solver = DEOMSolver(self.H, self.edip, bath,
                             coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)
