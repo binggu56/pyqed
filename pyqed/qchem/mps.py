@@ -404,9 +404,28 @@ from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 
 class DMRG:
     """
-    ground state DMRG in MPO/MPS framework
+    ground state finite DMRG in MPO/MPS framework
     """
     def __init__(self, H, D, nsweeps=None, init_guess=None):
+        """
+        
+
+        Parameters
+        ----------
+        H : TYPE
+            MPO of H.
+        D : TYPE
+            maximum bond dimension.
+        nsweeps : TYPE, optional
+            DESCRIPTION. The default is None.
+        init_guess : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        None.
+
+        """
 
         self.H = H
         self.D = D
@@ -450,6 +469,9 @@ def to_mpo(h1e, eri):
     None.
 
     """
+
+
+
 
 
 def fDMRG_1site_GS_OBC(H,D,Nsweeps):
@@ -583,11 +605,15 @@ def fDMRG_1site_GS_OBC(H,D,Nsweeps):
 
 
 
+#class QCDMRG(DMRG):
+    
+
 
 if __name__ == '__main__':
 
     ##
-    ## Parameters for the DMRG simulation
+    ## Parameters for the DMRG simulation for spin-1/2 chain
+    ## To apply to fermions, we only need to change the MPO if H 
     ##
 
     d=2   # local bond dimension, 0=up, 1=down
@@ -633,6 +659,9 @@ if __name__ == '__main__':
     dmrg = DMRG(H, D=10, nsweeps=8)
     dmrg.init_guess = MPS
     dmrg.run()
+    
+    
+
 
     # # MPO for H^2, to calculate the variance
     # HamSquared = product_MPO(MPO, MPO)

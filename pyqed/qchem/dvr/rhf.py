@@ -29,7 +29,7 @@ from pyqed.qchem.gto.rhf import make_rdm1, energy_elec
 
 # from pyqed.qchem.gto.ci.fci import SpinOuterProduct, givenΛgetB
 
-from numba import vectorize, float64, jit
+# from numba import vectorize, float64, jit
 import sys
 from opt_einsum import contract
 from itertools import combinations

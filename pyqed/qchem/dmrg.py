@@ -1039,12 +1039,12 @@ if __name__=='__main__':
     # n = mol.nao
     # Ca = mo_coeff
 
-
+    natom = 4
     l = 10/au2angstrom
         # print(self.L)
         # self.mass = mass  # nuclear mass
     # z = np.array([-L/2, -L/4, L/4, L/2])
-    z0 = np.linspace(-1, 1, 4) * l/2
+    z0 = np.linspace(-1, 1, natom) * l/2
     print(z0)
 
     print('interatomic distance = ', (z0[1] - z0[0])*au2angstrom)

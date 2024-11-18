@@ -59,12 +59,27 @@ from jax import grad
 
 import proplot as plt
 
-x = np.linspace(-10, 10)
+# x = np.linspace(-10, 10)
 
-def coordinate_map(x):
-    b = 0.1
-    return x - jnp.arctan(b*x)/b
 
+
+
+
+
+from pyqed import SineDVR
+from scipy.sparse.linalg import eigsh
+
+class MappedSineDVR(SineDVR):
+    def __init__(self):
+        pass
+
+def v(rho):
+    return -1/rho 
+    
+
+    
+    
+    
 
 
 
@@ -73,12 +88,10 @@ def coordinate_map(x):
 
 #print(df(2.0)) #(for _x in x)
 # ax.plot(x, [df2(_x) for _x in x])
-jacobian = jax.grad(coordinate_map)
-J = np.array([jacobian(_x) for _x in x])
 
-rho = coordinate_map(x)
+
 # J = jax.jacrev(jnp.arctan)
 
-fig, ax = plt.subplots()
-# ax.plot(x, coordinate_map(x))
-ax.plot(x, 1/J , '-o')
+# fig, ax = plt.subplots()
+# # ax.plot(x, coordinate_map(x))
+# ax.plot(x, 1/jnp.sqrt(J), '-o')

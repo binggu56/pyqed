@@ -8,10 +8,10 @@ Created on Tue Mar 26 17:26:02 2019
 
 import numpy as np
 import scipy
-from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
+from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg, issparse
 
 from pyqed.units import au2fs, au2k, au2ev
-from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol
+from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol, basis_transform
 
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
@@ -75,7 +75,7 @@ class Composite(Mol):
 
         H = kron(self.A.H, self.idb) + kron(self.ida, self.B.H)
 
-        if a_ops == None:
+        if a_ops is None:
 
             print('Warning: there is no coupling between the two subsystems.')
 
@@ -239,7 +239,10 @@ class Composite(Mol):
         if self.eigvecs is None:
             self.eigenstates()
 
-        return basis_transform(a, self.eigvecs)
+        # return basis_transform(a, self.eigvecs)
+        U = self.eigvecs 
+        
+        return dag(U) @ a @ U
 
             # raise ValueError('Call eigenstates() to compute eigvecs first.')
 
@@ -417,7 +420,7 @@ class Cavity():
         None.
 
         """
-        self.freq = self.omega = freq
+        self.freq = self.omega = self.omegac = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav
         self.n = self.dim = n_cav
@@ -520,6 +523,9 @@ class Cavity():
         a = lil_matrix((ncav, ncav))
         a.setdiag(range(ncav), 0)
         return a.tocsr()
+    
+    def num(self):
+        return self.get_number_operator()
 
     def quadrature(self):
         """
@@ -564,6 +570,8 @@ class Cavity():
     def get_nonhermH(self):
         return self.get_nonhermitianH()
 
+
+
 class Polariton(Composite):
     
     def __init__(self, mol, cav, g=None, gauge='length'):
@@ -595,7 +603,7 @@ class Polariton(Composite):
         self._g = value
         
     
-    def getH(self, g, RWA=False):
+    def getH(self, RWA=False):
         """
         The coupling strength is defined as 
         
@@ -639,6 +647,8 @@ class Polariton(Composite):
         a = cav.annihilate()
         ad = dag(a)
         qc = a + ad
+        
+        g = self._g
         
         if self.gauge in ['length', 'dipole', 'dip']:
             
@@ -757,7 +767,12 @@ class Polariton(Composite):
             evals, evecs = scipy.linalg.eigh(h)
             # number of photons in polariton states
             num_op = self.cav.num()
+            
+            print(num_op.shape)
+            
             num_op = kron(self.mol.idm, num_op)
+            
+            print(num_op.shape)
 
             n_ph = np.zeros(self.dim)
             for j in range(self.dim):
