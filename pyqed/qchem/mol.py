@@ -632,12 +632,12 @@ class Molecule:
 
         # mol = super(Molecule, self).__init__(atom=atom, **kwargs)
 
-        # mol = gto.M(atom=geometry, **kwargs)
+        mol = gto.M(atom, **kwargs)
 
-        # self.mol = mol
+        self.mol = mol
         # self.atom_coord = mol.atom_coord
         self._atom = atom
-        self.atom_coords = (mol.atom_coords()) # shape natoms, 3
+        # self.atom_coords = (mol.atom_coords()) # shape natoms, 3
 
         # print(self.atom_coords.shape)
         self.natom = mol.natm
@@ -656,6 +656,9 @@ class Molecule:
         self.overlap = None
         self.hcore = None
         self.eri = None
+
+    def atom_coords(self):
+        return self.mol.atom_coords()
 
     @property
     def nelec(self):

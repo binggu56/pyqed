@@ -149,7 +149,7 @@ def get_veff(eri, dm):
 
 class RHF1D:
     """
-    restricited DVR-HF method in 1D
+    restricited DVR-HF method in 1D for soft Columb potential
     """
     def __init__(self, mol, init_guess='hcore', dvr_type = 'sine', domain=None, nx=None): # nelec, spin):
         # self.spin = spin
@@ -173,9 +173,9 @@ class RHF1D:
         self.mo_occ = None
         self.mo_coeff = None
         self.e_tot = None
-        
+
         self.e_nuc = mol.energy_nuc()
-        
+
         self.e_kin = None
         self.e_ne = None
         self.e_j = None
@@ -304,7 +304,7 @@ class RHF1D:
 
     def energy_nuc(self):
         return self.mol.energy_nuc()
-    
+
     def run(self):
         # scf cycle
         max_cycle = self.max_cycle
