@@ -13,6 +13,9 @@ from __future__ import print_function
 from __future__ import division
 
 # import math
+import os 
+import sys 
+import numpy
 from numpy import sin, cos, pi
 from numpy.linalg import norm
 import numpy as np
@@ -30,10 +33,9 @@ from pyqed.qchem.hf import RHF, UHF
 
 from pyscf import dft, scf, gto, ao2mo
 
-# Suppress scientific notation printouts and change default precision
-np.set_printoptions(precision=4)
-np.set_printoptions(suppress=True)
 
+
+# DISABLE_EVAL = getattr(__config__, 'DISABLE_EVAL', False)
 
 def get_hcore_mo(mf):
     """
@@ -144,6 +146,165 @@ def build_atom_from_coords(atom_symbol_list, coords):
         atom.append([atom_symbol_list[n],  coords[n, :].tolist()])
 
     return atom
+
+
+
+def format_atom(atoms):
+    # '''Convert the input :attr:`Mole.atom` to the internal data format.
+    # Including, changing the nuclear charge to atom symbol, converting the
+    # coordinates to AU, rotate and shift the molecule.
+    # If the :attr:`~Mole.atom` is a string, it takes ";" and "\\n"
+    # for the mark to separate atoms;  "," and arbitrary length of blank space
+    # to separate the individual terms for an atom.  Blank line will be ignored.
+
+    # Args:
+    #     atoms : list or str
+    #         the same to :attr:`Mole.atom`
+
+    # Kwargs:
+    #     origin : ndarray
+    #         new axis origin.
+    #     axes : ndarray
+    #         (new_x, new_y, new_z), new coordinates
+    #     unit : str or number
+    #         If unit is one of strings (B, b, Bohr, bohr, AU, au), the coordinates
+    #         of the input atoms are the atomic unit;  If unit is one of strings
+    #         (A, a, Angstrom, angstrom, Ang, ang), the coordinates are in the
+    #         unit of angstrom;  If a number is given, the number are considered
+    #         as the Bohr value (in angstrom), which should be around 0.53.
+    #         Set unit=1 if wishing to preserve the unit of the coordinates.
+
+    # Returns:
+    #     "atoms" in the internal format. The internal format is
+    #         | atom = [[atom1, (x, y, z)],
+    #         |         [atom2, (x, y, z)],
+    #         |         ...
+    #         |         [atomN, (x, y, z)]]
+
+    # Examples:
+
+    # >>> gto.format_atom('9,0,0,0; h@1 0 0 1', origin=(1,1,1))
+    # [['F', [-1.0, -1.0, -1.0]], ['H@1', [-1.0, -1.0, 0.0]]]
+    # >>> gto.format_atom(['9,0,0,0', (1, (0, 0, 1))], origin=(1,1,1))
+    # [['F', [-1.0, -1.0, -1.0]], ['H', [-1, -1, 0]]]
+    # '''
+    def str2atm(line):
+        dat = line.split()
+        try:
+            coords = [float(x) for x in dat[1:4]]
+        except:
+            raise ValueError('Failed to parse geometry %s' % line)
+            
+            # else:
+            #     coords = list(eval(','.join(dat[1:4])))
+        if len(coords) != 3:
+            raise ValueError('Coordinates error in %s' % line)
+            
+        return [dat[0], coords]
+
+    if isinstance(atoms, str):
+        # The input atoms points to a geometry file
+        if os.path.isfile(atoms):
+            try:
+                atoms = readxyz(atoms)
+            except ValueError:
+                sys.stderr.write('\nFailed to parse geometry file  %s\n\n' % atoms)
+                raise
+    
+        atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')
+        fmt_atoms = []
+        for dat in atoms.split('\n'):
+            dat = dat.strip()
+            if dat and dat[0] != '#':
+                fmt_atoms.append(dat)
+        
+        
+        # if len(fmt_atoms[0].split()) < 4:
+        #     fmt_atoms = from_zmatrix('\n'.join(fmt_atoms))
+        # else:
+        fmt_atoms = [str2atm(line) for line in fmt_atoms]
+            
+    else:
+        fmt_atoms = []
+        for atom in atoms:
+            if isinstance(atom, str):
+                if atom.lstrip()[0] != '#':
+                    fmt_atoms.append(str2atm(atom.replace(',',' ')))
+            else:
+                if isinstance(atom[1], (int, float)):
+                    fmt_atoms.append([(atom[0]), atom[1:4]])
+                else:
+                    fmt_atoms.append([(atom[0]), atom[1]])
+    
+    c = numpy.array([a[1] for a in fmt_atoms], dtype=numpy.double)
+    # c = numpy.einsum('ix,kx->ki', axes * unit, c - origin)
+    z = [a[0] for a in fmt_atoms]
+    
+    return list(zip(z, c.tolist()))
+
+
+# def fromfile(filename, format=None):
+#     '''Read molecular geometry from a file
+#     (in testing)
+
+#     Supported formats:
+#         | raw: Each line is  <symbol> <x> <y> <z>
+#         | xyz: XYZ cartesian coordinates format
+#         | zmat: Z-matrix format
+#     '''
+#     if format is None:  # Guess format based on filename
+#         format = os.path.splitext(filename)[1][1:].lower()
+#         if format not in ('xyz', 'zmat', 'sdf'):
+#             format = 'raw'
+#     with open(filename, 'r') as f:
+#         return fromstring(f.read(), format)
+
+
+
+
+    #     atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')
+    #     fmt_atoms = []
+    #     for dat in atoms.split('\n'):
+    #         dat = dat.strip()
+    #         if dat and dat[0] != '#':
+    #             fmt_atoms.append(dat)
+
+    #     if len(fmt_atoms[0].split()) < 4:
+    #         fmt_atoms = from_zmatrix('\n'.join(fmt_atoms))
+    #     else:
+    #         fmt_atoms = [str2atm(line) for line in fmt_atoms]
+    # else:
+    #     fmt_atoms = []
+    #     for atom in atoms:
+    #         if isinstance(atom, str):
+    #             if atom.lstrip()[0] != '#':
+    #                 fmt_atoms.append(str2atm(atom.replace(',',' ')))
+    #         else:
+    #             if isinstance(atom[1], (int, float)):
+    #                 fmt_atoms.append([_atom_symbol(atom[0]), atom[1:4]])
+    #             else:
+    #                 fmt_atoms.append([_atom_symbol(atom[0]), atom[1]])
+
+    # if len(fmt_atoms) == 0:
+    #     return []
+
+    # if axes is None:
+    #     axes = numpy.eye(3)
+
+    # if isinstance(unit, str):
+    #     if is_au(unit):
+    #         unit = 1.
+    #     else:
+    #         unit = 1./param.BOHR
+    # else:
+    #     unit = 1./unit
+
+    # c = numpy.array([a[1] for a in fmt_atoms], dtype=numpy.double)
+    # c = numpy.einsum('ix,kx->ki', axes * unit, c - origin)
+    # z = [a[0] for a in fmt_atoms]
+    # return list(zip(z, c.tolist()))
+    
+    return atom_symbols, 
 
 # try:
 #     from cclib.parser.data import ccData
@@ -632,17 +793,18 @@ class Molecule:
 
         # mol = super(Molecule, self).__init__(atom=atom, **kwargs)
 
-        mol = gto.M(atom, **kwargs)
+        # mol = gto.M(atom, **kwargs)
+        
+        self._atom = self.format_atom(atom)
 
-        self.mol = mol
+        # self.mol = mol
         # self.atom_coord = mol.atom_coord
-        self._atom = atom
+
         # self.atom_coords = (mol.atom_coords()) # shape natoms, 3
 
         # print(self.atom_coords.shape)
-        self.natom = mol.natm
-        self.mass = mol.atom_mass_list()
-        self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
+        self.natom = len(self._atom)
+        # self.mass = mol.atom_mass_list()
 
         self.spin = spin
         self.charge = charge
@@ -651,14 +813,24 @@ class Molecule:
         self.basis = basis
         self._nelec = None
 
-        ########
+        ######## DO NOT CHANGE ####
         self.e_nuc = None
         self.overlap = None
         self.hcore = None
         self.eri = None
 
+    def atom_coord(self, a):
+        return self._atom[a][1]
+    
     def atom_coords(self):
-        return self.mol.atom_coords()
+        return np.array([self._atom[i][1] for i in range(self.natom)])
+    
+    def atom_symbol(self, i):
+        return self._atom[i][0]
+    
+    def atom_symbols(self):
+        return [mol.atom_symbol(i) for i in range(self.natom)]
+
 
     @property
     def nelec(self):
@@ -680,7 +852,7 @@ class Molecule:
     def atom_charges(self):
         pass
 
-    def com(self):
+    def center_of_mass(self):
         '''
         return center of mass
 
@@ -695,7 +867,7 @@ class Molecule:
 
     def inertia_moment(self):
         mass = self.mass
-        coords = self.atom_coords
+        coords = self.atom_coords()
         return inertia_moment(mass, coords)
 
     def molecular_frame(self):
@@ -943,8 +1115,16 @@ def grad_nuc(mol, atmlst=None):
     return gs
 
 
-def readxyz():
-    return
+def readxyz(fname):
+    with open(fname, 'r') as xyz_file:
+        lines = xyz_file.readlines()[2:] # Skipping the first two lines
+  
+    atomic_symbols = []
+    for line in lines:
+        atomic_symbols.append(line.split()[0])
+      
+    atomic_coordinates = np.array([line.split()[1:4] for line in lines], dtype=np.float64)
+    return atomic_symbols, atomic_coordinates
 
 def project_nac():
     pass
@@ -1328,12 +1508,16 @@ def view_mo():
 if __name__ == '__main__':
     # from pyscf import gto, tdscf, tools
     # from lime.units import au2fs, au2ev
+    # Suppress scientific notation printouts and change default precision
+    # np.set_printoptions(precision=4)
+    # np.set_printoptions(suppress=True)
+    
     import proplot as plt
 
 
     mol = gto.Mole()
     mol.verbose = 3
-    #mol.atom = [['Ne' , (0., 0., 0.)]]
+    atom = 'Ne, 0., 0., 0.'
     #mol.basis = {'Ne': '6-31G'}
     # This is from G2/97 i.e. MP2/6-31G*
     mol.atom = [['H' , (0,      0., 0.)],
@@ -1345,16 +1529,19 @@ if __name__ == '__main__':
 
     mol.basis = 'STO-3G'
     # mol.build()
-    mf = scf.RHF(mol).run()
+    
+    print(format_atom(atom))
+    
+    # mf = scf.RHF(mol).run()
 
-    # plot_mo_energy(mf)
+    # # plot_mo_energy(mf)
 
-    orbitals = intrinsic_orbitals(mf)
+    # orbitals = intrinsic_orbitals(mf)
 
 
-    _, homo_idx, _, lumo_idx = find_homo_lumo(mf)
-    print(f"HOMO (index): {homo_idx}")
-    print(f"LUMO (index): {lumo_idx}")
+    # _, homo_idx, _, lumo_idx = find_homo_lumo(mf)
+    # print(f"HOMO (index): {homo_idx}")
+    # print(f"LUMO (index): {lumo_idx}")
 
     # tools.cubegen.orbital(
     # mol, "cmo_homo.cube", orbitals["canonical"][:, homo_idx], margin=5
