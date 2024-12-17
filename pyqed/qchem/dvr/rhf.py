@@ -7,7 +7,6 @@ Created on Sat Jun  8 23:04:50 2024
 """
 import numpy as np
 import scipy.constants as const
-import scipy.linalg as la
 import scipy
 from scipy.sparse import identity, kron, csr_matrix, diags
 from scipy.sparse.linalg import eigsh
@@ -24,7 +23,7 @@ from pyqed.ldr.ldr import kinetic
 from pyqed import au2ev, au2angstrom
 from pyqed.dvr import SineDVR
 # from pyqed import scf
-from pyqed.qchem.gto.rhf import make_rdm1, energy_elec
+from pyqed.qchem.hf.rhf import make_rdm1, energy_elec
 # from pyqed.jordan_wigner import jordan_wigner_one_body, jordan_wigner_two_body
 
 # from pyqed.qchem.gto.ci.fci import SpinOuterProduct, givenΛgetB

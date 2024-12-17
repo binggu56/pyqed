@@ -67,9 +67,9 @@ bath = Bath([spe_sp], w_sp, [beta], [2], [0, 0, 0], [pade])
 deom_solver = mol.deom(bath, [sx])
 
 deom_solver.set_hierarchy(10)
-# deom_solver.set_pulse_system_func(lambda t: 0)
-# deom_solver.set_coupling_dipole(sdip)
-# deom_solver.set_pulse_coupling_func(lambda t: 0)
+deom_solver.set_pulse_system_func(lambda t: 0)
+deom_solver.set_coupling_dipole(sdip)
+deom_solver.set_pulse_coupling_func(lambda t: 0)
 
 t_save, ddos_save = deom_solver.run(rho0=rho, dt=0.01, nt=200, p1=[[1, 0], [0, 0]])
 

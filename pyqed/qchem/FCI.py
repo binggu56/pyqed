@@ -19,7 +19,7 @@ from functools import reduce
 from pyscf.ao2mo.outcore import general_iofree as ao2mofn
 from opt_einsum import contract
 
-from pyqed.qchem.hf import RHF
+from pyqed.qchem.hf.rhf import RHF
 from pyqed.qchem.cisd import get_SO_matrix, get_excitation_op,\
     SlaterCondon, CI_H
 

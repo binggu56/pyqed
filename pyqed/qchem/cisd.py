@@ -18,7 +18,7 @@ from opt_einsum import contract
 
 from pyscf.ao2mo.outcore import general_iofree as ao2mofn
 
-from pyqed.qchem.hf import RHF
+from pyqed.qchem.hf.rhf import RHF
 
 def givenΛgetB(ΛA, ΛB, N_mo):
     "Given Λ(i occupied orbitals for each determinant) get B (binary rep.)"

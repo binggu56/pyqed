@@ -21,6 +21,7 @@ from pyscf import dft, scf, gto
 
 from pyqed import discretize
 from pyqed.dvr import SineDVR
+from pyqed.qchem.mol import Molecule
 
 # Suppress scientific notation printouts and change default precision
 np.set_printoptions(precision=4)
@@ -49,7 +50,7 @@ def build_atom_from_coords(atom_symbol_list, coords):
     for n in range(natm):
         atom.append([atom_symbol_list[n],  coords[n, :].tolist()])
 
-    return atom 
+    return atom
 
 # try:
 #     from cclib.parser.data import ccData
@@ -474,69 +475,62 @@ def intertia_moment(mass, coords):
 
 
 # class Molecule(gto.M):
-class Mol:
+class Mol(Molecule):
     """
-    
+
     """
-    def __init__(self, geometry=None, dvr_type='sine', spin=0, charge=0):
-        
-        
-        self.geometry = geometry # proton position
-        
+    def __init__(self, atom=None, dvr_type='sine', spin=0, charge=0):
+
+
+        self.geometry = self.atom = atom # proton position
+
         self.domain = None
-        
+
         self.spin = spin
-        self.charge = charge 
+        self.charge = charge
         # self.atomic_charge = [1, 1, 1]     # Ion charge
         # self.e = 1     # Electron charge, should be set to actual value in atomic units
-        
+
         # self.L = 10/au2angstrom
         # print(self.L)
         # self.mass = mass  # nuclear mass
         # self.left = np.array([-self.L/2])
         # self.right = np.array([self.L/2])
-    
+
         # self.left = np.array([-self.L/2, 0])
         # self.right = np.array([self.L/2, 0])
-    
+
         self.x = None
         self.y = None
         self.z = None
-        
+
         self.nx = None
         self.ny = None
         self.nz = None
-        
+
         self.X = None
         self.Y = None
         self.Z = None
-        
-        self.dvr_type = dvr_type
-        
 
-        
+        self.dvr_type = dvr_type
+
+
+
         # self.atom_coord = mol.atom_coord
 
         # print(self.atom_coords.shape)
         self.natom = mol.natm
         self.mass = None # mol.atom_mass_list()
-        self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
+        self.atom_symbols = [self.atom_symbol(i) for i in range(self.natom)]
 
         self.distmat = None
         # self.e_nuc = None
-        
+
         # DVR basis set
         self.domain = None
         self.level = None
-   
-    def atom_masses(self):
-        pass
-    
-    def atom_coords(self):
-        # shape 3, natoms
-        self.atom_coords = None
-        pass
-        
+
+
     def create_grid(self, domain, level):
         """
         create DVR basis set
@@ -554,9 +548,9 @@ class Mol:
 
         """
         x = discretize(*domain, level, endpoints=False)
-        y = x.copy() 
-        
-        self.x = x 
+        y = x.copy()
+
+        self.x = x
         self.y = y
         self.nx = len(x)
         self.ny = len(y)
@@ -564,9 +558,9 @@ class Mol:
         # self.ly = domain[0][1]-domain[0][0]
         # self.dx = self.lx / (self.nx - 1)
         # self.dy = self.ly / (self.ny - 1)
-        self.domain = domain 
+        self.domain = domain
         self.level = level
-    
+
     def get_hcore(self, R=0):
         """
         single point calculations
@@ -589,309 +583,74 @@ class Mol:
             DESCRIPTION.
 
         """
-        
+
         # H(r; R)
         x = self.x
         nx = self.nx
 
-        
-        # T 
+
+        # T
         # origin method of calculate kinetic term
         # tx = kinetic(x, dvr=self.dvr_type)
-        # idx = np.eye(nx)  
-        
+        # idx = np.eye(nx)
+
         # ty = kinetic(y, dvr=self.dvr_type)
         # idy = np.eye(ny)
-        
+
         # T = kron(tx, idy) + kron(idx, ty)
-        
+
         # # # new method of calculate kinetic term
         dvr_x = SineDVR(*self.domain, nx)
-        
+
         # tx = kinetic(self.x, dvr=self.dvr_type)
         T = dvr_x.t()
-    
+
         self.T = T
-        
-        
+
+
         # V
         Ra = self.left
-        Rb = self.right 
+        Rb = self.right
         v = np.zeros((nx))
-        for i in range(nx):   
+        for i in range(nx):
             r1 = np.array(x[i])
             # Potential from all ions
             v[i] = self.V_en(r1, Ra) + self.V_en(r1, Rb) + self.V_en1(r1, R)
-        
+
         V = np.diag(v)
         # print(V.shape)
-        
+
         # v_sym = self.enforce_spin_symmetry(v)
         # # print(v_sym.shape)
         # V = np.diag(v_sym.ravel())
-        
-        H = T + V 
+
+        H = T + V
         # H = self.imaginary_time_propagation(H)
-        
+
         # if np.any(np.isnan(H)) or np.any(np.isinf(H)):
         #     raise ValueError("H matrix contains NaNs or infs.")
-        
+
         return H
 
-        
-
-
-    
-    def atom_charge(self, atm_id):
-        pass
-    
-    def atom_charges(self):
-        pass
-
-    def com(self):
-        '''
-        return center of mass
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        '''
-        mass = self.mass
-        return np.einsum('i,ij->j', mass, self.atom_coords)/mass.sum()
-
-    def inertia_moment(self):
-        mass = self.mass
-        coords = self.atom_coords
-        return intertia_moment(mass, coords)
-
-    def molecular_frame(self):
-        # transfrom to molecular frame
-        self.atom_coords -= self.com()
-        return self.atom_coords
-
-    def eckart_frame(self, ref):
-        """
-        transform to the Eckart frame relative to a reference geometry
-
-        Parameters
-        ----------
-        ref : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        None.
-
-        """
-        self.atom_coords = eckart(ref.T, self.atom_coords.T, self.mass)
-        return self.atom_coords
-
-    def principle_axes(self):
-        pass
-
-    def _build_distance_matrix(self):
-        """Build distance matrix between all atoms
-           TODO: calculate distances only as needed for efficiency"""
-        coords = self.atom_coords()
-        natom = self.natm
-
-        distancematrix = np.zeros((natom, natom))
-
-        for i in range(natom):
-            for j in range(i+1, natom):
-                distancematrix[i, j] = np.linalg.norm(coords[:, i]-coords[:, j])
-                distancematrix[j, i] = distancematrix[i, j]
-
-        self.distmat =  distancematrix
-        return distancematrix
-
-    def _calc_angle(self, atom1, atom2, atom3):
-        """
-        Calculate angle in radians between 3 atoms
-
-        Parameters
-        ----------
-        atom1 : TYPE
-            DESCRIPTION.
-        atom2 : TYPE
-            DESCRIPTION.
-        atom3 : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
-        vec1 = self.atom_coord(atom2) - self.atom_coord(atom1)
-        uvec1 = vec1 / norm(vec1)
-        vec2 = self.atom_coord(atom2) - self.atom_coord(atom3)
-        uvec2 = vec2 / norm(vec2)
-        return np.arccos(np.dot(uvec1, uvec2))*(180.0/pi)
-
-    def _calc_dihedral(self, atom1, atom2, atom3, atom4):
-        """
-
-           Calculate dihedral angle (in radians) between 4 atoms
-           For more information, see:
-               http://math.stackexchange.com/a/47084
-
-        Parameters
-        ----------
-        atom1 : TYPE
-            DESCRIPTION.
-        atom2 : TYPE
-            DESCRIPTION.
-        atom3 : TYPE
-            DESCRIPTION.
-        atom4 : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        dihedral : TYPE
-            DESCRIPTION.
-
-        """
-        r1 = self.atom_coord(atom1)
-        r2 = self.atom_coord(atom2)
-        r3 = self.atom_coord(atom3)
-        r4 = self.atom_coord(atom4)
-
-        # Vectors between 4 atoms
-        b1 = r2 - r1
-        b2 = r2 - r3
-        b3 = r4 - r3
-
-        # Normal vector of plane containing b1,b2
-        n1 = np.cross(b1, b2)
-        un1 = n1 / norm(n1)
-
-        # Normal vector of plane containing b1,b2
-        n2 = np.cross(b2, b3)
-        un2 = n2 / norm(n2)
-
-        # un1, ub2, and m1 form orthonormal frame
-        ub2 = b2 / norm(b2)
-        um1 = np.cross(un1, ub2)
-
-        # dot(ub2, n2) is always zero
-        x = np.dot(un1, un2)
-        y = np.dot(um1, un2)
-
-        dihedral = np.arctan2(y, x)*(180.0/pi)
-        if dihedral < 0:
-            dihedral = 360.0 + dihedral
-        return dihedral
-
-    def zmat(self, rvar=False, avar=False, dvar=False):
-        npart = self.natm
-
-        if self.distmat is None:
-            self._build_distance_matrix()
-
-        distmat = self.distmat
-
-        atomnames = self.atom_symbols()
-
-        rlist = []
-        alist = []
-        dlist = []
-        if npart > 0:
-            # Write the first atom
-            print(atomnames[0])
-
-            if npart > 1:
-                # and the second, with distance from first
-                n = atomnames[1]
-                rlist.append(distmat[0][1])
-                if (rvar):
-                    r = 'R1'
-                else:
-                    r = '{:>11.5f}'.format(rlist[0])
-                print('{:<3s} {:>4d}  {:11s}'.format(n, 1, r))
-
-                if npart > 2:
-                    n = atomnames[2]
-
-                    rlist.append(distmat[0][2])
-                    if (rvar):
-                        r = 'R2'
-                    else:
-                        r = '{:>11.5f}'.format(rlist[1])
-
-                    alist.append(self._calc_angle(2, 0, 1))
-                    if (avar):
-                        t = 'A1'
-                    else:
-                        t = '{:>11.5f}'.format(alist[0])
-
-                    print('{:<3s} {:>4d}  {:11s} {:>4d}  {:11s}'.format(n, 1, r, 2, t))
-
-                    if npart > 3:
-                        for i in range(3, npart):
-                            n = atomnames[i]
-
-                            rlist.append(distmat[i-3][i])
-                            if (rvar):
-                                r = 'R{:<4d}'.format(i)
-                            else:
-                                r = '{:>11.5f}'.format(rlist[i-1])
-
-                            alist.append(self._calc_angle(i, i-3, i-2))
-                            if (avar):
-                                t = 'A{:<4d}'.format(i-1)
-                            else:
-                                t = '{:>11.5f}'.format(alist[i-2])
-
-                            dlist.append(self._calc_dihedral(i, i-3, i-2, i-1))
-                            if (dvar):
-                                d = 'D{:<4d}'.format(i-2)
-                            else:
-                                d = '{:>11.5f}'.format(dlist[i-3])
-                            print('{:3s} {:>4d}  {:11s} {:>4d}  {:11s} {:>4d}  {:11s}'.format(n, i-2, r, i-1, t, i, d))
-        if (rvar):
-            print(" ")
-            for i in range(npart-1):
-                print('R{:<4d} = {:>11.5f}'.format(i+1, rlist[i]))
-        if (avar):
-            print(" ")
-            for i in range(npart-2):
-                print('A{:<4d} = {:>11.5f}'.format(i+1, alist[i]))
-        if (dvar):
-            print(" ")
-            for i in range(npart-3):
-                print('D{:<4d} = {:>11.5f}'.format(i+1, dlist[i]))
-
-        return
-
-    def jacobian(self, q):
-        return
-
-    def metric(self):
-        pass
 
     def tofile(self,fname):
         pass
-    
+
     def RHF(self):
         pass
-    
+
     def UHF(self):
         pass
-    
+
     def RKS(self):
         pass
-    
+
     def UKS(self):
         pass
-    
+
     # def energy_nuc(self):
     #     pass
-        
+
 
 
 def readxyz():
@@ -1071,7 +830,7 @@ def eckart(reference, changed, mass, option=None):
 
 def scan_pes(method='dft'):
     x = np.arange(0.7, 4.01, .1)
-    
+
     mol = gto.Mole()
     if method == 'hf':
         mf_scanner = scf.RHF(mol).as_scanner()
@@ -1086,9 +845,9 @@ def scan_pes(method='dft'):
                             ["H", (0., 0., b)],],
                     basis = 'cc-pvdz')
         ehf1.append(mf_scanner(mol))
-        
+
     import matplotlib.pyplot as plt
-    plt.plot(x, ehf1, '-o', label='HF,0.7->4.0')    
+    plt.plot(x, ehf1, '-o', label='HF,0.7->4.0')
 
 
 if __name__ == '__main__':
@@ -1114,7 +873,7 @@ if __name__ == '__main__':
 
     geometry2 = [['H' , (0.1,      0., 0.)],
                 ['H', (1.3, 0., 0.)]]
-    
+
     mol2 = Molecule(atom=geometry2)
 
     print(mol2.atom_coords)
@@ -1123,7 +882,7 @@ if __name__ == '__main__':
     print(mol2.eckart_frame(mol.atom_coords()))
 
     # print(mol.natm)
-    
+
     scan_pes()
     # mole = Molecule(mol)
     # mol.zmat(rvar=True)
@@ -1131,7 +890,3 @@ if __name__ == '__main__':
 
     # td = tdscf.TDRHF(mf)
     # td.kernel()
-
-
-
-

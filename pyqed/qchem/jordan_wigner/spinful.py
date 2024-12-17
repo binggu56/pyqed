@@ -128,6 +128,27 @@ def Is(l):
 
 
 def annihilate(L, spin='up'):
+    """
+    electron annihilation operators under JW transformation for a fermion chain
+
+    Parameters
+    ----------
+    L : TYPE
+        DESCRIPTION.
+    spin : TYPE, optional
+        DESCRIPTION. The default is 'up'.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    a : list
+        list of {c_i, i=1, 2, ..., L} operators.
+
+    """
     a = []
 
     if spin == 'up':
