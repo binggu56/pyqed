@@ -911,7 +911,7 @@ class Molecule:
     def molecular_frame(self):
         # transfrom to molecular frame
         self.atom_coords -= self.com()
-        return self.atom_coords
+        return self
 
     def eckart_frame(self, ref):
         """

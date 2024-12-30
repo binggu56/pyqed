@@ -3,7 +3,7 @@
 """
 Created on Thu Nov  7 11:00:37 2024
 
-NRG bosonic
+NRG bosonic for chain model
 
 @author: Bing Gu (gubing@westlake.edu.cn)
 """
@@ -12,7 +12,7 @@ from scipy import integrate
 from scipy.sparse import lil_matrix, csr_matrix, eye, kron
 from scipy.sparse.linalg import eigsh
 
-from pyqed import Cavity, Mol, Composite, dag, SineDVR
+from pyqed import Cavity, Mol, Composite, dag, SineDVR, pauli
 
 
 class Boson(Cavity):
@@ -20,7 +20,7 @@ class Boson(Cavity):
         self.dim = n
         self.ZPE = ZPE
         self.omega = omega
-        self.idm = eye(n)
+        self.identity = eye(n)
 
         ###
         self.H = None
@@ -45,33 +45,52 @@ class Boson(Cavity):
 
         return a.tocsr()
 
-def pauli():
-    # spin-half matrices
-    sz = np.array([[1.0,0.0],[0.0,-1.0]])
+# def pauli():
+#     # spin-half matrices
+#     sz = np.array([[1.0,0.0],[0.0,-1.0]])
 
-    sx = np.array([[0.0,1.0],[1.0,0.0]])
+#     sx = np.array([[0.0,1.0],[1.0,0.0]])
 
-    sy = np.array([[0.0,-1j],[1j,0.0]])
+#     sy = np.array([[0.0,-1j],[1j,0.0]])
 
-    s0 = np.identity(2)
+#     s0 = np.identity(2)
 
-    for _ in [s0, sx, sy, sz]:
-        _ = csr_matrix(_)
+#     for _ in [s0, sx, sy, sz]:
+#         _ = csr_matrix(_)
 
-    return s0, sx, sy, sz
+#     return s0, sx, sy, sz
 
 
 class SBM:
     """
     spin-boson model
     """
-    def __init__(self, epsilon, Delta):
+    def __init__(self, epsilon, Delta, omegac=1):
+        """
+
+
+        Parameters
+        ----------
+        epsilon : TYPE
+            DESCRIPTION.
+        Delta : TYPE
+            DESCRIPTION.
+        omegac : TYPE, optional
+            cutoff frequency. The default is 1.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        self.omegac = omegac
 
         I, X, Y, Z = pauli()
 
         self.H = 0.5 * (- epsilon * Z + X * Delta)
 
-    def spectral_density(self, J):
+    def spectral_density(self):
         pass
 
     def discretize(self):
@@ -87,38 +106,6 @@ class SBM:
         pass
 
 
-I, X, Y, Z = pauli()
-epsilon = 1
-Delta = 0.1
-H = 0.5 * (- epsilon * Z + X * Delta)
-
-omega = 1
-mol = Mol(H, X)
-site = Boson(omega, n=10)
-site.buildH()
-a = site.annihilate()
-
-mol = Composite(mol, site)
-H0  = mol.getH([X],  [a + dag(a)], g=[0.1])
-# E, U = mol.eigenstates(k=6)
-# a = mol.promote(a, subspace='B')
-# a = mol.transform_basis(a)
-
-print(a.shape)
-
-t = 0.5
-# add a boson site
-nz = 16
-dvr = SineDVR(-6, 6, nz)
-z = dvr.x
-for n in range(nz):
-    H = H0 + t * kron(I, a + dag(a)) * z[n]
-    E, U = eigsh(H, k=6)
-
-
-# build the overlap matrix
-
-# S = ...
 
 
 
@@ -195,3 +182,39 @@ class NRG:
 
     def add_coupling(self):
         pass
+
+
+if __name__=='__main__':
+    
+    I, X, Y, Z = pauli()
+    epsilon = 1
+    Delta = 0.1
+    H = 0.5 * (- epsilon * Z + X * Delta)
+    
+    omega = 1
+    mol = Mol(H, X)
+    site = Boson(omega, n=10)
+    site.buildH()
+    a = site.annihilate()
+    
+    mol = Composite(mol, site)
+    H0  = mol.getH([X],  [a + dag(a)], g=[0.1])
+    # E, U = mol.eigenstates(k=6)
+    # a = mol.promote(a, subspace='B')
+    # a = mol.transform_basis(a)
+    
+    print(a.shape)
+    
+    t = 0.5
+    # add a boson site
+    nz = 16
+    dvr = SineDVR(-6, 6, nz)
+    z = dvr.x
+    for n in range(nz):
+        H = H0 + t * kron(I, a + dag(a)) * z[n]
+        E, U = eigsh(H, k=6)
+    
+    
+    # build the overlap matrix
+    
+    # S = ...

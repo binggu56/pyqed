@@ -323,10 +323,46 @@ def optimize_site(A, W, E, F, tol=1E-8):
     E, V = sparse.linalg.eigsh(H,1,v0=A,which='SA', tol=tol)
     return (E[0],np.reshape(V[:,0], H.req_shape))
 
-## two-site optimization of MPS A,B with respect to MPO W1,W2 and
-## environment tensors E,F
-## dir = 'left' or 'right' for a left-moving or right-moving sweep
+
 def optimize_two_sites(A, B, W1, W2, E, F, m, dir):
+    """
+    two-site optimization of MPS A,B with respect to MPO W1,W2 and
+    environment tensors E,F
+    dir = 'left' or 'right' for a left-moving or right-moving sweep
+
+    Parameters
+    ----------
+    A : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+    W1 : TYPE
+        DESCRIPTION.
+    W2 : TYPE
+        DESCRIPTION.
+    E : TYPE
+        DESCRIPTION.
+    F : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
+    dir : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+    A : TYPE
+        DESCRIPTION.
+    B : TYPE
+        DESCRIPTION.
+    trunc : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
+
+    """
     W = coarse_grain_MPO(W1,W2)
     AA = coarse_grain_MPS(A,B)
     H = HamiltonianMultiply(E,W,F)
@@ -341,14 +377,40 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir):
         A = np.einsum("sij,jk->sik", A, np.diag(S))
     return E[0], A, B, trunc, m
 
-def two_site_dmrg(MPS, MPO, m, sweeps):
-    ## Driver function to perform sweeps of 2-site DMRG
+def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6):
+    """
+    Driver function to perform sweeps of 2-site DMRG
+
+
+    Parameters
+    ----------
+    MPS : TYPE
+        DESCRIPTION.
+    MPO : TYPE
+        DESCRIPTION.
+    m : TYPE
+        DESCRIPTION.
+    sweeps : TYPE, optional
+        DESCRIPTION. The default is 50.
+
+    Returns
+    -------
+    MPS : TYPE
+        DESCRIPTION.
+
+    """
 
     E = construct_E(MPS, MPO, MPS)
     F = construct_F(MPS, MPO, MPS)
     F.pop()
-    for sweep in range(0,int(sweeps/2)):
-        for i in range(0, len(MPS)-2):
+
+    Eold = expectation(MPS, MPO, MPS)
+
+    converged = False
+
+    for sweep in range(0, int(sweeps/2)):
+
+        for i in range(0, len(MPS)-2): # forward
             Energy,MPS[i],MPS[i+1],trunc,states = optimize_two_sites(MPS[i],MPS[i+1],
                                                                      MPO[i],MPO[i+1],
                                                                      E[-1], F[-1], m, 'right')
@@ -358,19 +420,39 @@ def two_site_dmrg(MPS, MPO, m, sweeps):
             E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
             F.pop();
 
-        for i in range(len(MPS)-2, 0, -1):
+        if abs(Energy - Eold) < conv:
+            print("DMRG Converged at sweep {}. \n Total energy = {}".format(sweep, Energy))
+            converged = True
+            break
+        else:
+            Eold = Energy
+
+        for i in range(len(MPS)-2, 0, -1): # backward
+
             Energy,MPS[i],MPS[i+1],trunc,states = optimize_two_sites(MPS[i],MPS[i+1],
                                                                      MPO[i],MPO[i+1],
                                                                      E[-1], F[-1], m, 'left')
+
             print("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2+1,i,i+1, Energy, states, trunc))
+
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
             E.pop();
 
-    return MPS
+        if abs(Energy - Eold) < conv:
+            print("DMRG Converged at sweep {}. \n Total energy = {}".format(sweep, Energy))
+            converged = True
+            break
+        else:
+            Eold = Energy
+
+    if not converged:
+        print("DMRG not converged. Try increasing nsweep or a better initial guess.")
+
+    return Energy, MPS
 
 
-def Expectation(AList, MPO, BList):
+def expectation(AList, MPO, BList=None):
     """
     Evaluate the expectation value of an MPO on a given MPS
     <A|MPO|B>
@@ -390,6 +472,8 @@ def Expectation(AList, MPO, BList):
         DESCRIPTION.
 
     """
+    if BList is None:
+        BList = AList
 
     E = [[[1]]]
     for i in range(0,len(MPO)):
@@ -406,9 +490,9 @@ class DMRG:
     """
     ground state finite DMRG in MPO/MPS framework
     """
-    def __init__(self, H, D, nsweeps=None, init_guess=None):
+    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site'):
         """
-        
+
 
         Parameters
         ----------
@@ -430,17 +514,23 @@ class DMRG:
         self.H = H
         self.D = D
         self.nsweeps = nsweeps
+        self.opt = opt
 
         self.init_guess = init_guess
-        self.ground_state = None
+        self.mps = None
+        self.e_tot = None
 
     def run(self):
 
         if self.init_guess is None:
             raise ValueError('Invalid initial guess.')
 
-        # fDMRG_1site_GS_OBC(self.H, self.D, self.nsweeps)
-        self.ground_state = two_site_dmrg(self.init_guess, self.H, self.D, self.nsweeps)
+        if self.opt == '1site':
+
+            fDMRG_1site_GS_OBC(self.H, self.D, self.nsweeps)
+
+        else:
+            self.e_tot, self.mps = two_site_dmrg(self.init_guess, self.H, self.D, self.nsweeps)
 
         return self
 
@@ -448,14 +538,18 @@ class DMRG:
 
     #     return Expectation(Alist, MPO, BList)
 
+    def make_rdm(self):
+        pass
 
-def to_mpo(h1e, eri):
+
+def autoMPO(h1e, eri):
     """
     express the Hamiltonian into MPO
 
     .. math::
 
-        H = h_{ij} c_{i\sigma}^\dagger c_{j\sigma} + v_{ij} n_i n_j
+        H = \sum_{i,j} h_{ij} E_{ij} + v_{ij} n_i n_j
+        E_{ij} = \sum_\sigma c_{i\sigma}^\dagger c_{j\sigma}
 
     Parameters
     ----------
@@ -469,6 +563,7 @@ def to_mpo(h1e, eri):
     None.
 
     """
+    pass
 
 
 
@@ -606,14 +701,14 @@ def fDMRG_1site_GS_OBC(H,D,Nsweeps):
 
 
 #class QCDMRG(DMRG):
-    
+
 
 
 if __name__ == '__main__':
 
     ##
     ## Parameters for the DMRG simulation for spin-1/2 chain
-    ## To apply to fermions, we only need to change the MPO if H 
+    ## To apply to fermions, we only need to change the MPO if H
     ##
 
     d=2   # local bond dimension, 0=up, 1=down
@@ -659,8 +754,8 @@ if __name__ == '__main__':
     dmrg = DMRG(H, D=10, nsweeps=8)
     dmrg.init_guess = MPS
     dmrg.run()
-    
-    
+
+
 
 
     # # MPO for H^2, to calculate the variance

@@ -5,7 +5,7 @@ Created on Wed Jun  5 14:29:59 2024
 
 @author: Bing Gu (gubing@westlake.edu.cn)
 
-From 
+From
 https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/651592aca69febde9ed8d6a6/original/notes-on-generalized-configuration-interaction-in-python.pdf
 
 """
@@ -30,7 +30,7 @@ def givenΛgetB(ΛA, ΛB, N_mo):
     for I in range(len(Binary)):
         Binary[I, 0, ΛA[I,:]] = 1
         Binary[I, 1, ΛB[I,:]] = 1
-        
+
     return Binary
 
 def SpinOuterProduct(A, B, stack=False):
@@ -46,18 +46,22 @@ def SpinOuterProduct(A, B, stack=False):
 
 def get_fci_combos(mf):
     # print(mf.mo_occ.shape)
-    if isinstance(mf, (scf.rhf.RHF, RHF)):
-        mo_occ = [mf.mo_occ//2, ] * 2
-    else:
-        mo_occ = mf.mo_occ 
-        
+    # if isinstance(mf, (scf.rhf.RHF, RHF)):
+
+    mo_occ = [mf.mo_occ//2, ] * 2
+    # else:
+    #     mo_occ = mf.mo_occ
+
+    print(mo_occ)
+
     O_sp = np.asarray(mo_occ, dtype=np.int8)
-    
-    # number of electrons for each spin 
+
+
+    # number of electrons for each spin
     N_s = np.einsum("sp -> s", O_sp)
-    
+
     N = O_sp.shape[1]
-    
+
     Λ_α = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[0] ) ) )
     Λ_β = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[1] ) ) )
     ΛA, ΛB = SpinOuterProduct(Λ_α, Λ_β)
@@ -66,7 +70,7 @@ def get_fci_combos(mf):
 
 
 def determinantsign(Binary):
-    
+
     sign = np.cumsum( Binary, axis=2)
     for I in range(len(Binary)):
         iia = np.where( Binary[I,0] == 1)[0]
@@ -76,14 +80,14 @@ def determinantsign(Binary):
     return ( (-1.)**(sign) ).astype(np.int8)
 
 # def get_excitation_op(i, j, binary, sign, spin=0):
-    
-    
+
+
 #     Difference = binary[i,spin] - binary[j, spin]
-    
-    
+
+
 #     a_t = (Difference + 0.5).astype(np.int8)
 #     a = -1*(Difference - 0.5).astype(np.int8)
-    
+
 #     # print('a', a.shape)
 #     if a is not None:
 #         if np.sum(a[0]) > 1: ### this is a double excitation
@@ -95,37 +99,37 @@ def determinantsign(Binary):
 #             å[ np.arange(len(å)),(å!=0).argmax(axis=1) ] = 0 ## zero first 1
 #             a = np.abs(å - a) ## absolute difference from orginal
 #             a = np.asarray([sign[i, spin]*å,sign[i, spin]*a]) ## stack
-        
+
 #         # print(a.shape, a_t.shape)
-        
+
 #         # return a_t, a
-    
+
 #     return sign[j, spin]*a_t, sign[i, spin]*a
 
 
 # def SlaterCondon(Binary):
 #     sign = determinantsign(Binary)
 #     SpinDifference = np.sum( np.abs(Binary[:, None, :, :] - Binary[None, :, :, :]), axis=3)//2
-    
+
 #     ## indices for 1-difference
 #     I_A, J_A = np.where( np.all(SpinDifference==np.array([1,0], dtype=np.int8), axis=2) )
 #     I_B, J_B = np.where( np.all(SpinDifference==np.array([0,1], dtype=np.int8), axis=2) )
-    
+
 #     ## indices for 2-differences
 #     I_AA, J_AA = np.where( np.all(SpinDifference==np.array([2,0], dtype=np.int8), axis=2) )
 #     I_BB, J_BB = np.where( np.all(SpinDifference==np.array([0,2], dtype=np.int8), axis=2) )
 #     I_AB, J_AB = np.where( np.all(SpinDifference==np.array([1,1], dtype=np.int8), axis=2) )
-    
-    
+
+
 #     ### get excitation operators
-    
+
 #     a_t , a = get_excitation_op(I_A , J_A , Binary, sign, spin=0)
 #     b_t , b = get_excitation_op(I_B , J_B , Binary, sign, spin=1)
-    
-    
+
+
 #     ca = ((Binary[I_A,0,:] + Binary[J_A,0,:])/2).astype(np.int8)
 #     cb = ((Binary[I_B,1,:] + Binary[J_B,1,:])/2).astype(np.int8)
-    
+
 
 #     aa_t, aa = get_excitation_op(I_AA, J_AA, Binary, sign, spin=0)
 
@@ -134,21 +138,21 @@ def determinantsign(Binary):
 
 #     ab_t, ab = get_excitation_op(I_AB, J_AB, Binary, sign, spin=0)
 #     ba_t, ba = get_excitation_op(I_AB, J_AB, Binary, sign, spin=1)
-    
+
 #     SC1 = [I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb]
 #     SC2 = [I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba]
-    
+
 #     return SC1, SC2
 
 # def get_SO_matrix(mf, SF=False, H1=None, H2=None):
-#     """ 
-#     Given a PySCF uhf object get Spin-Orbit Matrices 
-    
+#     """
+#     Given a PySCF uhf object get Spin-Orbit Matrices
+
 #     Parameters
 #     ==========
-    
-#     mf: uhf_pyscf object 
-    
+
+#     mf: uhf_pyscf object
+
 #     SF: bool
 #         spin-flip
 #     """
@@ -158,39 +162,39 @@ def determinantsign(Binary):
 #     else:
 #         Ca, Cb = mf.mo_coeff
 
-        
-    
+
+
 #     # S = (uhf_pyscf.mol).intor("int1e_ovlp")
 #     # eig, v = np.linalg.eigh(S)
 #     # A = (v) @ np.diag(eig**(-0.5)) @ np.linalg.inv(v)
-    
+
 #     # H1e in AO
 #     H = mf.get_hcore()
 #     n = Ca.shape[1]
-    
+
 #     # print('eri', uhf_pyscf._eri.shape, Ca.shape)
-    
-#     eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca), 
+
+#     eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca),
 #                             compact=False)).reshape((n,n,n,n), order="C")
 #     eri_aa -= eri_aa.swapaxes(1,3)
-    
+
 #     eri_bb = (ao2mo.general(mf._eri , (Cb, Cb, Cb, Cb), \
 #                             compact=False)).reshape((n,n,n,n), order="C")
 #     eri_bb -= eri_bb.swapaxes(1,3)
-    
+
 #     eri_ab = (ao2mo.general(mf._eri , (Ca, Ca, Cb, Cb), \
 #                             compact=False)).reshape((n,n,n,n), order="C")
-    
+
 #     # eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
-    
+
 #     eri_ba = (ao2mo.general(mf._eri , (Cb, Cb, Ca, Ca), \
 #                             compact=False)).reshape((n,n,n,n), order="C")
-    
+
 #     H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-    
+
 #     H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca.conj(), Ca),\
 #                      np.einsum("AB, Ap, Bq -> pq", H, Cb.conj(), Cb)])
-    
+
 #     if SF:
 #         eri_abab = (ao2mo.general( mf._eri , (Ca, Cb, Ca, Cb),
 #         compact=False)).reshape((n,n,n,n), order="C")
@@ -206,62 +210,62 @@ def determinantsign(Binary):
 #         return H1, H2
 
 # def get_SO_matrix(mf, SF=False, H1=None, H2=None):
-#     """ 
-#     Given a PySCF rhf/uhf object get Spin-Orbit one-electron and two-electron H Matrices 
-    
+#     """
+#     Given a PySCF rhf/uhf object get Spin-Orbit one-electron and two-electron H Matrices
+
 #     SF: bool
 #         spin-flip
 #     """
 #     from pyscf import ao2mo
-    
+
 #     # molecular orbitals
-#     Ca, Cb = [mf.mo_coeff, ] * 2 
-    
+#     Ca, Cb = [mf.mo_coeff, ] * 2
+
 #     # S = (uhf_pyscf.mol).intor("int1e_ovlp")
 #     # eig, v = np.linalg.eigh(S)
 #     # A = (v) @ np.diag(eig**(-0.5)) @ np.linalg.inv(v)
-    
+
 #     # H1e in AO
 #     H = mf.get_hcore()
-#     # H = dag(Ca) @ H @ Ca 
-    
+#     # H = dag(Ca) @ H @ Ca
+
 #     nmo = Ca.shape[1] # n
-    
-#     eri = mf.eri  # (pq||rs) 1^*12^*2 
+
+#     eri = mf.eri  # (pq||rs) 1^*12^*2
 #     eri_aa = contract('ip, iq, ij, jr, js -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-    
+
 #     # physicts notation <pq|rs>
 #     # eri_aa = contract('ip, jq, ij, ir, js -> pqrs', Ca.conj(), Ca.conj(), eri, Ca, Ca)
 
 #     eri_aa -= eri_aa.swapaxes(1,3)
 
 #     eri_bb = eri_aa.copy()
-    
+
 #     eri_ab = contract('ip, iq, ij, jr, js->pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
 #     eri_ba = contract('ip, iq, ij, jr, js->pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
 
-    
-    
-    
-#     # eri_aa = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Ca, Ca, Ca), 
+
+
+
+#     # eri_aa = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Ca, Ca, Ca),
 #     #                         compact=False)).reshape((n,n,n,n), order="C")
 #     # eri_aa -= eri_aa.swapaxes(1,3)
-    
+
 #     # eri_bb = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Cb, Cb, Cb),
 #     # compact=False)).reshape((n,n,n,n), order="C")
 #     # eri_bb -= eri_bb.swapaxes(1,3)
-    
+
 #     # eri_ab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Ca, Cb, Cb),
 #     # compact=False)).reshape((n,n,n,n), order="C")
 #     # #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
-    
+
 #     # eri_ba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Cb, Ca, Ca),
 #     # compact=False)).reshape((n,n,n,n), order="C")
-    
+
 #     H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
 #     H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
 #     H, Cb, Cb)])
-    
+
 #     # if SF:
 #     #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
 #     #     compact=False)).reshape((n,n,n,n), order="C")
@@ -288,14 +292,14 @@ def determinantsign(Binary):
 #     """
 #     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
 #     I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
-    
+
 #     # sum of MO energies
 #     H_CI = np.einsum("Spp, ISp -> I", H1, Binary, optimize=True)
-    
-#     # ERI     
+
+#     # ERI
 #     H_CI += np.einsum("STppqq, ISp, ITq -> I", H2, Binary, Binary, optimize=True)/2
 #     H_CI = np.diag(H_CI)
-    
+
 #     ## Rule 1
 #     H_CI[I_A , J_A ] -= np.einsum("pq, Kp, Kq -> K", H1[0], a_t, a, optimize=True)
 #     H_CI[I_A , J_A ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[0,0], a_t, a, ca, optimize=True)
@@ -305,7 +309,7 @@ def determinantsign(Binary):
 #     H_CI[I_B , J_B ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[1,1], b_t, b, cb, optimize=True)
 #     H_CI[I_B , J_B ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[1,0], b_t, b, Binary[I_B,0],
 #     optimize=True)
-    
+
 #     ## Rule 2
 #     H_CI[I_AA, J_AA] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[0,0], aa_t[0], aa[0],
 #     aa_t[1], aa[1], optimize=True)
@@ -313,67 +317,67 @@ def determinantsign(Binary):
 #     bb_t[1], bb[1], optimize=True)
 #     H_CI[I_AB, J_AB] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[0,1], ab_t, ab, ba_t, ba,
 #     optimize=True)
-    
+
 #     return H_CI
 
 def fcisolver(mf, nstates=1):
-    """ 
+    """
     Calculate the FCI of a PySCF Mean Field Object
-    
+
     Parameters
     ==========
-    
+
     mf: (PySCF Mean Field Object)
-    
+
     nstates: int
-        number of desired states. Default 1. 
-        
+        number of desired states. Default 1.
+
     Returns
     =======
     E (Eigenvlues)
-    X (Eigenstates) 
+    X (Eigenstates)
     """
-    
+
     # create all determinants labeled by a 3D array (I, \sigma, p)
     Binary = get_fci_combos(mf)
-    
-    print('Number of determinants', Binary.shape[0])
-    
-    H1, H2 = get_SO_matrix(mf)
-    
 
-    
+    print('Number of determinants', Binary.shape[0])
+
+    H1, H2 = get_SO_matrix(mf)
+
+
+
     SC1, SC2 = SlaterCondon(Binary)
     H_CI = CI_H(Binary, H1, H2, SC1, SC2)
-    
 
-    
+
+
 
     # E, X = np.linalg.eigh(H_CI)
     E, X = eigsh(H_CI, k=nstates, which='SA')
-    
+
     return E, X
 
 
-    
 
-        
+
+
 
 class FCI:
     def __init__(self, mf):
-        self.mf = mf 
+        self.mf = mf
 
     def run(self, nstates=1):
-        
+
         E, X = fcisolver(self.mf, nstates)
-        
+
 
         self.ci = X
         self.e_tot = E + self.mf.energy_nuc()
-        
+
         for n in range(nstates):
-            print('UCISD root {} E = {} '.format(n, self.e_tot[n]))
-        
+            print('FCI root {} E = {} '.format(n, self.e_tot[n]))
+
         return self
 
 
@@ -383,8 +387,8 @@ if __name__=='__main__':
 
     from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
     from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionChain
-    from pyqed.qchem.hf import RHF
-    
+    # from pyqed.qchem.hf import RHF
+
     mol = gto.Mole()
     mol.atom = [
         ['H' , (0. , 0. , 0)],
@@ -393,47 +397,45 @@ if __name__=='__main__':
     mol.charge = 0
     # mol.unit = 'b'
     mol.build()
-    
 
-    # # cisd = ci.cisd.CISD(mf).run()   
-    mf = RHF(mol).run()
-    
-    
-    fci = FCI(mf).run()
-    print(fci.e_tot)
-    
 
-    
+    # # cisd = ci.cisd.CISD(mf).run()
+    mf = RHF(mol)
+    mf.run()
+
+
+    # fci = FCI(mf).run()
+    # print(fci.e_tot)
+
+
+
     # print(mf.e_tot - mf.energy_nuc())
-    
+
     # h1e = get_hcore_mo(mf)
     # h2e = get_eri_mo(mf)
-    
+
     # print(fci.direct_spin0.pspace(h1e, h2e, norb=6, nelec=4))
-    
+
     # print(myfci.)
     # Ca = mf.mo_coeff[0ArithmeticError
     # n = Ca.shape[-1]
-    
+
     # mo_coeff = mf.mo_coeff
     # get the two-electron integrals as a numpy array
     # eri = get_eri_mo(mol, mo_coeff)
-    
+
     # n = mol.nao
     # Ca = mo_coeff
-        
+
     # h1e = get_hcore_mo(mf)
     # eri = get_eri_mo(mf)
-    
+
     # E, X = SpinHalfFermionChain(h1e, eri, nelec=mol.nelectron).run(nstates=2)
     # print(E + mol.energy_nuc())
-    
-    # eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca), 
+
+    # eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca),
     #                         compact=False)).reshape((n,n,n,n), order="C")
     # print(eri_aa.shape)
-    
+
     # E, X = FCI(mf).run()
     # print(E + mol.energy_nuc())
-    
-
-    

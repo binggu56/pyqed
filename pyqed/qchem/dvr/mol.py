@@ -482,7 +482,7 @@ class Mol(Molecule):
     def __init__(self, atom=None, dvr_type='sine', spin=0, charge=0):
 
 
-        self.geometry = self.atom = atom # proton position
+        self.geometry = self.atom = self._atm = atom # proton position
 
         self.domain = None
 

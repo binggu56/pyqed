@@ -17,6 +17,7 @@ from pyscf import ao2mo
 import sys
 
 from pyqed import dagger, dag
+from opt_einsum import contract
 
 class RHF:
     def __init__(self, mol, init_guess='h1e'):
@@ -39,12 +40,14 @@ class RHF:
 
 
 
-
+        ####
         self.hcore = None
         self.vhf = None
         self.dm = None
 
         self.eri = None
+
+        self.mo_energy = None
 
     def run(self, **kwargs):
         self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
@@ -90,7 +93,7 @@ class RHF:
 
     def get_hcore(self):
         # return get_hcore(self.mol)
-        return mol.hcore
+        return self.mol.hcore
 
     def energy_elec(self,dm=None):
         if dm is None:
@@ -177,7 +180,7 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
     True
     '''
     if dm_last is None:
-        vj, vk = get_jk(mol, np.asarray(dm), hermi, vhfopt)
+        vj, vk = get_jk(mol, np.asarray(dm))
         return vj - vk * .5
     else:
         ddm = np.asarray(dm) - np.asarray(dm_last)
@@ -185,76 +188,87 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
         return vj - vk * .5 + np.asarray(vhf_last)
 
 
-def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
-    '''Compute J, K matrices for all input density matrices
-    Args:
-        mol : an instance of :class:`Mole`
-        dm : ndarray or list of ndarrays
-            A density matrix or a list of density matrices
-    Kwargs:
-        hermi : int
-            Whether J, K matrix is hermitian
-            | 0 : not hermitian and not symmetric
-            | 1 : hermitian or symmetric
-            | 2 : anti-hermitian
-        vhfopt :
-            A class which holds precomputed quantities to optimize the
-            computation of J, K matrices
-        with_j : boolean
-            Whether to compute J matrices
-        with_k : boolean
-            Whether to compute K matrices
-        omega : float
-            Parameter of range-seperated Coulomb operator: erf( omega * r12 ) / r12.
-            If specified, integration are evaluated based on the long-range
-            part of the range-seperated Coulomb operator.
-    Returns:
-        Depending on the given dm, the function returns one J and one K matrix,
-        or a list of J matrices and a list of K matrices, corresponding to the
-        input density matrices.
-    Examples:
-    >>> from pyscf import gto, scf
-    >>> from pyscf.scf import _vhf
-    >>> mol = gto.M(atom='H 0 0 0; H 0 0 1.1')
-    >>> dms = np.random.random((3,mol.nao_nr(),mol.nao_nr()))
-    >>> j, k = scf.hf.get_jk(mol, dms, hermi=0)
-    >>> print(j.shape)
-    (3, 2, 2)
-    '''
-    dm = np.asarray(dm, order='C')
-    dm_shape = dm.shape
-    dm_dtype = dm.dtype
-    nao = dm_shape[-1]
+# def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
+#     '''Compute J, K matrices for all input density matrices
+#     Args:
+#         mol : an instance of :class:`Mole`
+#         dm : ndarray or list of ndarrays
+#             A density matrix or a list of density matrices
+#     Kwargs:
+#         hermi : int
+#             Whether J, K matrix is hermitian
+#             | 0 : not hermitian and not symmetric
+#             | 1 : hermitian or symmetric
+#             | 2 : anti-hermitian
+#         vhfopt :
+#             A class which holds precomputed quantities to optimize the
+#             computation of J, K matrices
+#         with_j : boolean
+#             Whether to compute J matrices
+#         with_k : boolean
+#             Whether to compute K matrices
+#         omega : float
+#             Parameter of range-seperated Coulomb operator: erf( omega * r12 ) / r12.
+#             If specified, integration are evaluated based on the long-range
+#             part of the range-seperated Coulomb operator.
+#     Returns:
+#         Depending on the given dm, the function returns one J and one K matrix,
+#         or a list of J matrices and a list of K matrices, corresponding to the
+#         input density matrices.
+#     Examples:
+#     >>> from pyscf import gto, scf
+#     >>> from pyscf.scf import _vhf
+#     >>> mol = gto.M(atom='H 0 0 0; H 0 0 1.1')
+#     >>> dms = np.random.random((3,mol.nao_nr(),mol.nao_nr()))
+#     >>> j, k = scf.hf.get_jk(mol, dms, hermi=0)
+#     >>> print(j.shape)
+#     (3, 2, 2)
+#     '''
+#     dm = np.asarray(dm, order='C')
+#     dm_shape = dm.shape
+#     dm_dtype = dm.dtype
+#     nao = dm_shape[-1]
 
-    if dm_dtype == np.complex128:
-        dm = np.vstack((dm.real, dm.imag)).reshape(-1,nao,nao)
-        hermi = 0
+#     if dm_dtype == np.complex128:
+#         dm = np.vstack((dm.real, dm.imag)).reshape(-1,nao,nao)
+#         hermi = 0
 
-    if omega is None:
-        vj, vk = _vhf.direct(dm, mol._atm, mol._bas, mol._env,
-                             vhfopt, hermi, mol.cart, with_j, with_k)
-    else:
-        # The vhfopt of standard Coulomb operator can be used here as an approximate
-        # integral prescreening conditioner since long-range part Coulomb is always
-        # smaller than standard Coulomb.  It's safe to filter LR integrals with the
-        # integral estimation from standard Coulomb.
-        with mol.with_range_coulomb(omega):
-            vj, vk = _vhf.direct(dm, mol._atm, mol._bas, mol._env,
-                                 vhfopt, hermi, mol.cart, with_j, with_k)
+#     if omega is None:
+#         vj, vk = _vhf.direct(dm, mol._atom, mol._bas, mol._env,
+#                              vhfopt, hermi, mol.cart, with_j, with_k)
+#     else:
+#         # The vhfopt of standard Coulomb operator can be used here as an approximate
+#         # integral prescreening conditioner since long-range part Coulomb is always
+#         # smaller than standard Coulomb.  It's safe to filter LR integrals with the
+#         # integral estimation from standard Coulomb.
+#         with mol.with_range_coulomb(omega):
+#             vj, vk = _vhf.direct(dm, mol._atm, mol._bas, mol._env,
+#                                  vhfopt, hermi, mol.cart, with_j, with_k)
 
-    if dm_dtype == np.complex128:
-        if with_j:
-            vj = vj.reshape((2,) + dm_shape)
-            vj = vj[0] + vj[1] * 1j
-        if with_k:
-            vk = vk.reshape((2,) + dm_shape)
-            vk = vk[0] + vk[1] * 1j
-    else:
-        if with_j:
-            vj = vj.reshape(dm_shape)
-        if with_k:
-            vk = vk.reshape(dm_shape)
+#     if dm_dtype == np.complex128:
+#         if with_j:
+#             vj = vj.reshape((2,) + dm_shape)
+#             vj = vj[0] + vj[1] * 1j
+#         if with_k:
+#             vk = vk.reshape((2,) + dm_shape)
+#             vk = vk[0] + vk[1] * 1j
+#     else:
+#         if with_j:
+#             vj = vj.reshape(dm_shape)
+#         if with_k:
+#             vk = vk.reshape(dm_shape)
+#     return vj, vk
+
+
+def get_jk(mol, dm):
+    # G[i,j] += P[k,l] * (ee[i,j,k,l]  - 0.5 * ee[i,l,k,j])
+    eri = mol.eri
+
+    vj = contract('kl, ijkl -> ij', dm, eri)
+    vk = contract('kl, ilkj -> ij', dm, eri)
     return vj, vk
+
+
 
 
 def energy_elec(dm, h1e=None, vhf=None):
@@ -362,7 +376,7 @@ def hartree_fock(mol, max_cycle=50, tol=1e-8):
     # #print("V: ", V)
 
     #build core-Hamiltonian matrix
-    
+
     # #print("building core-Hamiltonian matrix")
     # Hcore = T + V
 
@@ -493,6 +507,6 @@ if __name__ == '__main__':
     # conv = True, E(HF) = -1.081170784378
 
     # hartree_fock(mol)
-    hf = RHF(mol)
-    hf.run()
-    print(hf.e_tot)
+    # hf = RHF(mol).run()
+    # hf.run()
+    # print(hf.e_tot)

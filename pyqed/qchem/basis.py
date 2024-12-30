@@ -15,7 +15,8 @@ nuclear_electron_attraction_integral
 from gbasis.integrals.electron_repulsion import electron_repulsion_integral
 
 
-
+import os
+import pyqed
 
 def E(i,j,t,Qx,a,b):
     '''
@@ -365,12 +366,14 @@ def build(mol):
     atcoords = mol.atom_coords()
     atnums = mol.atom_charges()
 
+    basis_dir = os.path.abspath(f'{pyqed.__file__}/../qchem/')
+
     if isinstance(mol.basis, str):
 
         if mol.basis.replace('-','').lower() == '631g':
 
             # Obtain basis functions from the basis set files
-            basis_dict = parse_gbs("6-31g.1.gbs")
+            basis_dict = parse_gbs(basis_dir + "/6-31g.1.gbs")
             basis = make_contractions(basis_dict, atoms, atcoords, coord_types="c")
     else:
 
