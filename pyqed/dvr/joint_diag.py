@@ -3,12 +3,10 @@
 """
 Created on Mon Sep  9 15:45:14 2024
 
-@author: Bing Gu (gubing@westlake.edu.cn)
-"""
+@author: Pierre Ablin <pierreablin@gmail.com>,  Bing Gu (gubing@westlake.edu.cn)
 
-# Authors: Pierre Ablin <pierreablin@gmail.com>
-#
-# License: MIT
+License: MIT
+"""
 
 from time import time
 

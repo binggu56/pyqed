@@ -560,8 +560,10 @@ class Mol:
 
         return
     
-    def Floquet(self):
-        pass 
+    def Floquet(self,  omegad, E0, nt):
+        from pyqed.floquet.floquet import Floquet
+        
+        return Floquet(self.H,  self.dip, omegad, E0, nt)
     
     def quantum_dynamics(self, psi0, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''

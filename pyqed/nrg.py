@@ -90,7 +90,7 @@ class SBM:
 
         self.H = 0.5 * (- epsilon * Z + X * Delta)
 
-    def spectral_density(self):
+    def spectral_density(self, s=1, alpha=1):
         pass
 
     def discretize(self):
@@ -141,7 +141,9 @@ def discretize(J, a, b, nmodes, mesh='log'):
     elif mesh == 'log':
 
         if a == 0: a += 1e-3
-        y = np.logspace(a, np.log10(b), nmodes+1)
+        y = np.logspace(a, 1, nmodes+1, base=2)
+    
+        print(y)
 
     x = np.zeros(nmodes)
     g = np.zeros(nmodes)
@@ -158,6 +160,34 @@ def discretize(J, a, b, nmodes, mesh='log'):
 
     return x, np.sqrt(g)
 
+def J(omega, s=1, alpha=1, omegac=1):
+    """
+    
+
+    Parameters
+    ----------
+    omega : TYPE
+        DESCRIPTION.
+    s : TYPE, optional
+        DESCRIPTION. The default is 1.
+        
+        1: ohmic
+        < 1: subohmic 
+        > 1: superohmic 
+        
+    alpha : TYPE, optional
+        DESCRIPTION. The default is 1.
+    omegac : TYPE, optional
+        DESCRIPTION. The default is 1.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    return 2 * np.pi * alpha * omegac**(1-s) * omega**s
+
 class NRG:
     """
     NRG bosonic for open quantum systems
@@ -170,49 +200,140 @@ class NRG:
 
     .. math::
 
-        H = -\Delta X + \epsilon Z + \sqrt{\eta_0/\pi} Z(b_0+b_0^\dagger) + \sum_{n=0}^\infty \epsilon_n b_n^\dagger b_n + t_n(b_n b_{n+1}^\dagger + H.c.)
+        H = -\Delta X + \epsilon Z + \sqrt{\eta_0/\pi} Z/2 (b_0+b_0^\dagger) + 
+        \sum_{n=0}^\infty \epsilon_n b_n^\dagger b_n + t_n(b_n b_{n+1}^\dagger + H.c.)
 
 
     """
 
-    def __init__(self, Himp, onsite, hopping):
-        self.nsites = len(onsite) + 1
+    def __init__(self, Himp, L=2.0):
+        # self.nsites = len(onsite) + 1
 
-        self.hopping = hopping
-
+        # self.hopping = hopping
+        self.L = L # Lambda for log-discretization
+        self.H = Himp
+        
+        self.nmodes = None 
+        
     def add_coupling(self):
         pass
+    
+    def discretize(self, N, s=1.0, omegac=1, alpha=1):
+        # H = -\Delta X + \epsilon Z + \sum_i \xi_i a_i^\dagger a_i + \frac{Z}{2\sqrt{\pi}} \sum_i  \gamma_i (a_i + a_i^\dagger)
+        """
+        
+        H = H_imp + \sqrt{\eta0/\pi} Z/2 (b_0 + b_0^\dagger)
 
+        Refs 
+        
+        PHYSICAL REVIEW B 71, 045122 s2005d
+        
+        Parameters
+        ----------
+        N : TYPE
+            DESCRIPTION.
+        s : TYPE, optional
+            DESCRIPTION. The default is 1.
+        omegac : TYPE, optional
+            DESCRIPTION. The default is 1.
+        alpha : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        xi : TYPE
+            DESCRIPTION.
+        g : TYPE
+            DESCRIPTION.
+
+        """
+        
+        n = np.arange(N)
+        self.nmodes = N 
+        
+        L = self.L 
+        
+        xi = (s+1)/(s+2) * (1. - L**(-s-2))/(1. - L**(-s-1)) * omegac * L**(-n)
+        
+        g2 = 2 * np.pi * alpha/(s+1) * omegac**2 * (1 - L**(-s-1))* L**(-n * (s+1)) 
+        
+        
+        # to chain 
+        eta0 = np.sum(g2) # \int_0^\infty J(omega) \dif omega 
+        
+        self.eta0 = eta0
+        
+        U = np.zeros((N, N))
+        
+        U[0, :] = np.sqrt(g2)/np.sqrt(eta0)
+        
+
+        t = np.zeros(N) # hopping 
+        epsilon = np.zeros(N) # onsite 
+
+        epsilon[0] = np.sum(U[0]**2 * xi)
+        
+        t[0] = np.sum( (xi - epsilon[0])**2 * g2 )/eta0 
+        t[0] = np.sqrt(t[0])
+        
+        U[1] = (xi - epsilon[0]) * U[0]/t[0]
+        
+        for m in range(1, N-1):
+            
+            epsilon[m] = np.sum(U[m]**2 * xi)
+    
+            t[m] = np.sqrt( np.sum( ((xi - epsilon[m])* U[m] -  t[m-1] * U[m-1] )**2) )
+            
+            U[m+1] = ((xi - epsilon[m]) * U[m] - t[m-1] * U[m-1])/t[m]
+        
+        return epsilon, t
+    
+    def run(self):
+        
+        eta0 = self.eta0 
+        I, X, Y, Z = pauli()
+        
+        # impurity + the first boson site
+        nz = 16
+        site = Boson(epsilon[0], nz) # the 0th site 
+        a = site.annihilate()
+        
+        # x = dvr.x
+        # dvr.v = x**2/ 
+
+        # for n in range(nz):
+        H = kron(self.H, eye(nz)) + kron(I, site.buildH())  +  np.sqrt(eta0/np.pi) * kron(Z/2, a + dag(a))
+        E, U = eigsh(H, k=6)
+    
 
 if __name__=='__main__':
     
     I, X, Y, Z = pauli()
     epsilon = 1
     Delta = 0.1
-    H = 0.5 * (- epsilon * Z + X * Delta)
+    H = 0.5 * (epsilon * Z + X * Delta)
     
-    omega = 1
-    mol = Mol(H, X)
-    site = Boson(omega, n=10)
-    site.buildH()
-    a = site.annihilate()
+    # omega = 1
+    # mol = Mol(H, X)
+    # site = Boson(omega, n=10)
+    # site.buildH()
+    # a = site.annihilate()
     
-    mol = Composite(mol, site)
-    H0  = mol.getH([X],  [a + dag(a)], g=[0.1])
+    # mol = Composite(mol, site)
+    # H0  = mol.getH([X],  [a + dag(a)], g=[0.1])
+    
     # E, U = mol.eigenstates(k=6)
     # a = mol.promote(a, subspace='B')
     # a = mol.transform_basis(a)
     
-    print(a.shape)
+    nrg = NRG(H)
     
-    t = 0.5
-    # add a boson site
-    nz = 16
-    dvr = SineDVR(-6, 6, nz)
-    z = dvr.x
-    for n in range(nz):
-        H = H0 + t * kron(I, a + dag(a)) * z[n]
-        E, U = eigsh(H, k=6)
+    x, g = nrg.discretize(10)
+
+    
+    print(x, g)
+    
+
     
     
     # build the overlap matrix
