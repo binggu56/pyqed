@@ -321,17 +321,17 @@ def quasiE(H0, H1, Nt, omega, method='Floquet'):
         eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
 
 
-        # check if the Floquet states is complete
-        j = 0
-        for i in range(NF):
-            if  eigvals[i] < omega/2.0 and eigvals[i] > -omega/2.0:
-                eigvals_subset[j] = eigvals[i]
-                eigvecs_subset[:,j] = eigvecs[:,i]
-                j += 1
-        if j != Norbs:
-            print("Error: Number of Floquet states {} is not equal to \
-                the number of orbitals {} in the first BZ. \n".format(j, Norbs))
-            sys.exit()
+    # check if the Floquet states is complete
+    j = 0
+    for i in range(NF):
+        if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+            eigvals_subset[j] = eigvals[i]
+            eigvecs_subset[:,j] = eigvecs[:,i]
+            j += 1
+    if j != Norbs:
+        print("Error: Number of Floquet states {} is not equal to \
+              the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+        sys.exit()
 
 
         # now we have a complete linear independent set of solutions for the time-dependent problem

@@ -24,3 +24,5 @@ pyqed/polariton/negf_leak.npz
 pyqed/FCIDUMP.UHF
 pyqed/FCIDUMP
 pyqed/qchem/dvr/rhf-Bing的Mac Studio.py
+venv/
+.eggs/
