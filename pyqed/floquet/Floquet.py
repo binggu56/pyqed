@@ -323,7 +323,7 @@ def quasiE(H0, H1, Nt, omega):
     # check if the Floquet states is complete
     j = 0
     for i in range(NF):
-        if  eigvals[i] < omega/2.0 and eigvals[i] > -omega/2.0:
+        if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
             eigvals_subset[j] = eigvals[i]
             eigvecs_subset[:,j] = eigvecs[:,i]
             j += 1

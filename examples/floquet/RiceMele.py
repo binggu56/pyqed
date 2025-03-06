@@ -23,7 +23,6 @@ floquet = model.Floquet(omegad=0.1, E0=0.3, nt=61)
 
 
 E, U, G = floquet.run()
-
 print(G.shape)
 # level_scheme(E)
 

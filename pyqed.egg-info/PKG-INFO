@@ -1,4 +1,4 @@
-Metadata-Version: 1.1
+Metadata-Version: 2.1
 Name: pyqed
 Version: 0.1.3
 Summary:  ultrafast spectroscopy, cavity quantum electrodynamics
@@ -6,59 +6,6 @@ Home-page: https://github.com/binggu56/pyqed
 Author: Bing Gu
 Author-email: binggu56@gmail.com
 License: MIT license
-Description: ==============
-        Molecular QED
-        ==============
-        
-        
-        .. image:: https://img.shields.io/pypi/v/scitools.svg
-                :target: https://pypi.python.org/pypi/mqed
-        
-        .. image:: https://img.shields.io/travis/audreyr/scitools.svg
-                :target: https://travis-ci.org/audreyr/scitools
-        
-        .. image:: https://readthedocs.org/projects/scitools/badge/?version=latest
-                :target: https://scitools.readthedocs.io/en/latest/?badge=latest
-                :alt: Documentation Status
-        
-        
-        
-        
-        
-        * Free software: MIT license
-        * Documentation: https://pyqed.readthedocs.io/en/latest/
-        
-        
-        Features
-        --------
-        
-        Computational techniques for molecular quantum electrodynamics (MQED) 
-        
-        nonlinear molecular spectroscopy
-        
-        polariton chemistry
-        
-        quantum light spectroscopy
-        
-        laser-driven matter, etc.
-        
-        Author
-        -------
-        Bing Gu 
-        
-        email: bingg at uci dot edu 
-        
-        
-        
-        =======
-        History
-        =======
-        
-        0.1.0 (2018-08-11)
-        ------------------
-        
-        * First release on PyPI.
-        
 Keywords: pyqed
 Platform: UNKNOWN
 Classifier: Development Status :: 2 - Pre-Alpha
@@ -72,3 +19,59 @@ Classifier: Programming Language :: Python :: 3.4
 Classifier: Programming Language :: Python :: 3.5
 Classifier: Programming Language :: Python :: 3.6
 Classifier: Programming Language :: Python :: 3.7
+License-File: LICENSE
+
+==============
+Molecular QED
+==============
+
+
+.. image:: https://img.shields.io/pypi/v/pyqed.svg
+        :target: https://pypi.python.org/pypi/mqed
+
+.. image:: https://img.shields.io/travis/audreyr/pyqed.svg
+        :target: https://travis-ci.org/audreyr/pyqed
+
+.. image:: https://readthedocs.org/projects/pyqed/badge/?version=latest
+        :target: https://pyqed.readthedocs.io/en/latest/?badge=latest
+        :alt: Documentation Status
+
+
+
+
+
+* Free software: MIT license
+* Documentation: https://pyqed.readthedocs.io/en/latest/
+
+
+Features
+--------
+
+Computational techniques for molecular quantum electrodynamics (MQED) 
+
+nonlinear molecular spectroscopy
+
+polariton chemistry
+
+quantum light spectroscopy
+
+laser-driven matter, etc.
+
+Author
+-------
+Bing Gu 
+
+email: bingg at uci dot edu 
+
+
+
+=======
+History
+=======
+
+0.1.0 (2018-08-11)
+------------------
+
+* First release on PyPI.
+
+
