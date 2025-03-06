@@ -349,7 +349,7 @@ def quasiE(H0, H1, Nt, omega, method=1):
         # to plot G on site basis, transform it to site-basis representation
         Gsite = eigvecs_subset.dot(G)
 
-        return eigvals_subset, eigvecs_subset, Gsite
+        return eigvals_subset, eigvecs_subset, G
     elif method == 2:
             # Use Diagonalization Propagator method
             time_step = 5000
