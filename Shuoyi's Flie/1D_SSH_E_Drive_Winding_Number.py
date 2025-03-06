@@ -164,8 +164,8 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(1.1, 2, 10)       # Field amplitudes E0
-omega_values = np.linspace(1, 2, 10)        # Driving frequencies ω
+E0_values = np.linspace(0, 1, 10)       # Field amplitudes E0
+omega_values = np.linspace(0.1, 2, 10)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -190,7 +190,10 @@ for i, E0 in enumerate(E0_values):
         # We can use either method; here we store the energy-based winding number.
         # winding_map_energy[i, j] = W_energy
         winding_map_berry_real[i, j] = W_berry_real
-        winding_map_berry_integer[i, j] = round(W_berry_real)
+        if not np.isnan(W_berry_real):  # Ensure W_berry_real is a valid number 
+            winding_map_berry_integer[i, j] = round(W_berry_real) 
+        else: # Handle the NaN case (e.g., assign a default value or skip assignment)
+            winding_map_berry_integer[i, j] = 0  # or some other appropriate value
     print(f"Progress: {i+1}/{len(E0_values)}, elapsed time: {time.time() - start_time:.2f} sec")
 
 # =============================
