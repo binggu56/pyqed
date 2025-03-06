@@ -30,9 +30,9 @@ def H0(k, v, w):
     return np.array([[0, v + w * np.exp(-1j * k)],
                      [v + w * np.exp(1j * k), 0]])
 
-def H1(k, E_0):
-    return np.array([[0, E_0 * (1+np.exp(-1j * k))],
-                     [E_0  * (1+np.exp(1j * k)), 0]])
+def H1(k):
+    return np.array([[0, (1+np.exp(-1j * k))],
+                     [(1+np.exp(1j * k)), 0]])
 
 
 # =============================
@@ -50,7 +50,7 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
 
     # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
     k0 = k_values[0]
-    mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0, E_0))
+    mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
     floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
     # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
     eigs, eigvecs, G = floquet.run()
@@ -70,7 +70,7 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
     prev_state = occ_state.copy()
 
     for i, k_0 in enumerate(k_values[1:], start=1):
-        mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0, E_0))
+        mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k_0))
         floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
         # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method=1)
         eigs, eigvecs, G = floquet.run()
