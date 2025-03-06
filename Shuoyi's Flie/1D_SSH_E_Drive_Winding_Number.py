@@ -31,8 +31,8 @@ def H0(k, v, w):
                      [v + w * np.exp(1j * k), 0]])
 
 def H1(k):
-    return np.array([[0, (1+np.exp(-1j * k))],
-                     [(1+np.exp(1j * k)), 0]])
+    return np.array([[0, (-1+np.exp(-1j * k))],
+                     [(-1+np.exp(1j * k)), 0]])
 
 
 # =============================
@@ -50,7 +50,9 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
 
     # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
     k0 = k_values[0]
-    mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
+    # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
+    mol = Mol(H0(k0, v, w), H1(k0))
+    # print(vars(mol))
     floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
     # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
     eigs, eigvecs, G = floquet.run()
@@ -70,7 +72,9 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
     prev_state = occ_state.copy()
 
     for i, k_0 in enumerate(k_values[1:], start=1):
-        mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k_0))
+        mol = Mol(H0(k0, v, w), H1(k_0))
+        # print(vars(mol))
+        # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k_0))
         floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
         # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method=1)
         eigs, eigvecs, G = floquet.run()
@@ -164,8 +168,8 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 1, 10)       # Field amplitudes E0
-omega_values = np.linspace(0.1, 2, 10)        # Driving frequencies ω
+E0_values = np.linspace(0.1, 2, 20)       # Field amplitudes E0
+omega_values = np.linspace(1, 5, 20)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -180,7 +184,7 @@ for i, E0 in enumerate(E0_values):
         k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
         
         # Track the valence Floquet band (quasienergies and eigenstates)
-        occ_eigs, occ_states = track_valence_band(k_values, T, E0, omega, n_time_slices)
+        occ_eigs, occ_states = track_valence_band(k_values, T, E0, omega)
         # # Unwrap the quasienergy to recover a continuous function
         # unwrapped_eigs = unwrap_quasienergy(occ_eigs, omega, T)
         # # Calculate the winding number (you can use the Berry phase method as a check)
