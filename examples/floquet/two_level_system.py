@@ -15,4 +15,3 @@ floquet = mol.Floquet(omegad=0.1, E0=0.3, nt=61)
 
 floquet.run(method='Floquet')
 floquet.run(method='Diagonalization_Propagator')
-

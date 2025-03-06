@@ -4,7 +4,8 @@ from scipy.linalg import expm
 from scipy import linalg
 import time
 import sys
-from pyqed import Mol, pauli 
+from pyqed import Mol, pauli
+
 
 
 time_start = time.time()
@@ -22,6 +23,9 @@ n_kpoints = 200        # Number of k-points along BZ
 # FLOQUET HAMILTONIAN MODULE
 # =============================
 
+def self_Hamiltonian():
+    return np.array([[0,0],[0,0]], dtype=complex)
+
 def H0(k, v, w):
     return np.array([[0, v + w * np.exp(-1j * k)],
                      [v + w * np.exp(1j * k), 0]])
@@ -34,7 +38,7 @@ def H1(k, E_0):
 # =============================
 # BAND TRACKING MODULE
 # =============================
-def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0):
+def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -42,13 +46,13 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0):
     """
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
-    occupied_states = np.zeros((len(k_values), 2), dtype=complex)
+    occupied_states = np.zeros((len(k_values), 2*nt), dtype=complex)
 
     # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
     k0 = k_values[0]
-    mol = Mol(H0(k0, v, w), H1(k0, E_0))
-    floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
-
+    mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0, E_0))
+    floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+    # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
     eigs, eigvecs, G = floquet.run()
     # For instance, choose the state with the smaller quasienergy as the valence band.
     occ_index = np.argmin(eigs)
@@ -66,13 +70,14 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0):
     prev_state = occ_state.copy()
 
     for i, k_0 in enumerate(k_values[1:], start=1):
-        mol = Mol(H0(k_0, v, w), H1(k_0, E_0))
+        mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0, E_0))
         floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
+        # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method=1)
         eigs, eigvecs, G = floquet.run()
         # Normalize eigenstates
         for j in range(eigvecs.shape[1]):
-            eigvecs[j,:] = np.exp(-1j * eigs[j]*T) * eigvecs[:, j]
-            eigvecs[j,:] /= np.linalg.norm(eigvecs[:, j])
+            eigvecs[j,:] = np.exp(-1j * eigs[j]*T) * eigvecs[j, :]
+            eigvecs[j,:] /= np.linalg.norm(eigvecs[j, :])
         # Calculate overlaps with previous valence state
         overlaps = np.array([np.abs(np.vdot(prev_state, eigvecs[:, j])) for j in range(eigvecs.shape[1])])
         new_index = np.argmax(overlaps)
@@ -135,7 +140,7 @@ def calculate_winding_number(unwrapped_eigs, T):
 #     # W_2 = np.round(total_phase / (2 * np.pi)).astype(int)
 #     return W_1
 
-def berry_phase_winding(k_values, occupied_states):
+def berry_phase_winding(k_values, occupied_states, nt=61):
     """
     Alternatively, compute the winding number via Berry phase accumulation.
     This multiplies overlaps between successive eigenstates.
@@ -143,7 +148,7 @@ def berry_phase_winding(k_values, occupied_states):
     total_phase = 0.0
     N = len(k_values)
     # create a N by N matrix projector (need to be able to multiply other N by N matrices)
-    Projector = np.eye(2, dtype=complex)
+    Projector = np.eye(2*nt, dtype=complex)
     for i in range(N):
         Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
         # print(Projector)

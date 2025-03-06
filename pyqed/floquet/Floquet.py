@@ -79,9 +79,8 @@ class Floquet:
 
             H1 = 0.5j * self.momentum() * E0/omegad
         
-        quasienergies, floquet_modes, G = quasiE(H0, H1, nt, omegad, method)
+        quasienergies, floquet_modes, G = quasiE(H0, H1, nt, omegad, method=1)
 
-        print('Quasienergies in the first FBZ = ', quasienergies)
         return quasienergies, floquet_modes, G
 
     def velocity_to_length(self):
@@ -256,7 +255,7 @@ def _quasiE(H0, H1, Nt, omega):
     return eigvals_subset, eigvecs_subset
 
 
-def quasiE(H0, H1, Nt, omega, method='Floquet'):
+def quasiE(H0, H1, Nt, omega, method=1):
     """
     Construct the Floquet hamiltonian of size Norbs * Nt
 
@@ -270,7 +269,7 @@ def quasiE(H0, H1, Nt, omega, method='Floquet'):
         Nt    : number of Fourier components
         E0    : electric field amplitude
     """
-    if method == 'Floquet':
+    if method == 1:
         Norbs = H0.shape[-1]
 
         #print('transition dipoles \n', M)
@@ -321,17 +320,17 @@ def quasiE(H0, H1, Nt, omega, method='Floquet'):
         eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
 
 
-    # check if the Floquet states is complete
-    j = 0
-    for i in range(NF):
-        if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
-            eigvals_subset[j] = eigvals[i]
-            eigvecs_subset[:,j] = eigvecs[:,i]
-            j += 1
-    if j != Norbs:
-        print("Error: Number of Floquet states {} is not equal to \
-              the number of orbitals {} in the first BZ. \n".format(j, Norbs))
-        sys.exit()
+        # check if the Floquet states is complete
+        j = 0
+        for i in range(NF):
+            if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+                eigvals_subset[j] = eigvals[i]
+                eigvecs_subset[:,j] = eigvecs[:,i]
+                j += 1
+        if j != Norbs:
+            print("Error: Number of Floquet states {} is not equal to \
+                the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+            sys.exit()
 
 
         # now we have a complete linear independent set of solutions for the time-dependent problem
@@ -351,7 +350,7 @@ def quasiE(H0, H1, Nt, omega, method='Floquet'):
         Gsite = eigvecs_subset.dot(G)
 
         return eigvals_subset, eigvecs_subset, Gsite
-    elif method == 'Diagonalization_Propagator':
+    elif method == 2:
             # Use Diagonalization Propagator method
             time_step = 5000
             dt = 2 * np.pi / (time_step * omega)  # Time step for propagator
@@ -376,7 +375,7 @@ def quasiE(H0, H1, Nt, omega, method='Floquet'):
             return quasi_energies, eigvecs, Gsite
 
     else:
-        raise ValueError(f"Method {method} not recognized. Use 'Floquet' or 'Diagonalization_Propagator'.")
+        raise ValueError(f"Method {method} not recognized. Use 1 for Floquet or 2 for Diagonalization_Propagator.")
 
 def HamiltonFT(H0, H1, n):
     """
