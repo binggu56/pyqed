@@ -330,7 +330,7 @@ def quasiE(H0, H1, Nt, omega, method=1):
         if j != Norbs:
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
-            sys.exit()
+            # sys.exit()
 
 
         # now we have a complete linear independent set of solutions for the time-dependent problem
