@@ -560,11 +560,11 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
             vecs_upper = band_vecs[0]
         if len(vals_lower) != Nt:
             print('warning: the winding number calculated below for this condition might be incorrect')
-        # print('vals lower are',vals_lower)
-        # print('vals upper are',vals_upper)
+            print('vals lower are',vals_lower)
+            print('vals upper are',vals_upper)
         
         # ----------------------------------------------------------
-        def build_time_dep_state(vec, t):
+        def build_time_dep_state(vec, vals, t):
             """
             Returns |Phi(t)> = sum_{m} e^{-i (m + N0) omega t} |varphi^{(m)}>
             where |varphi^{(m)}> is the block of 'vec' for Fourier index m.
@@ -575,15 +575,15 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
             #     phase = np.exp(-1j*(m + N0)*omega*t)
             #     psi_t += block * phase
             for m in range(Nt):
-                psi_t += vec[:, m] * np.exp(-1j * m * omega * t)
+                psi_t += vec[:, m] * np.exp(-1j * m * omega * t - 1j * vals[m])
             return psi_t
 
         # Example usage for the first Floquet eigenvector in the BZ subset:
-        psi_of_t = build_time_dep_state(vecs_lower, t=T)
-        # psi_of_t += build_time_dep_state(vecs_upper, t=T)
+        occ_psi_of_t = build_time_dep_state(vecs_lower, vals_lower, t=T)
+        unocc_psi_of_t = build_time_dep_state(vecs_upper, vals_upper, t=T)
         # (Then do whatever you need with psi_of_t.)
 
-        return psi_of_t
+        return occ_psi_of_t, unocc_psi_of_t
 
 
 if __name__ == '__main__':
