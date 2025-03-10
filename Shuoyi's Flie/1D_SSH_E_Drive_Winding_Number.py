@@ -241,9 +241,6 @@ import time
 import sys
 from pyqed import Mol, pauli
 
-
-
-time_start = time.time()
 # =============================
 # PARAMETERS AND CONSTANTS
 # =============================
@@ -252,7 +249,7 @@ epsilon_A = 0       # On-site energy for A (Hartrees)
 epsilon_B = 0       # On-site energy for B (Hartrees)
 h_bar = 1.0            # Planck constant (atomic units)
 n_time_slices = 500   # Number of time slices in one period
-n_kpoints = 200        # Number of k-points along BZ
+n_kpoints = 100        # Number of k-points along BZ
 
 # =============================
 # FLOQUET HAMILTONIAN MODULE
@@ -281,18 +278,8 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
     """
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
-    occupied_states = np.zeros((len(k_values), nt), dtype=complex)
+    occupied_states = np.zeros((len(k_values), 2*nt), dtype=complex)
 
-    # # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
-    # k0 = k_values[0]
-    # # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
-    # mol = Mol(H0(k0, v, w), H1(k0))
-    # # print(vars(mol))
-    # floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-    # # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
-    # occ_state = floquet.winding_number(T)
-    # print(occ_state)
-    # print(len(occ_state))
     for i in range (len(k_values)):
         k0 = k_values[i]
         mol = Mol(H0(k0, v, w), H1(k0))
@@ -321,22 +308,8 @@ def unwrap_quasienergy(occupied_eigs, omega, T):
 # =============================
 # WINDING NUMBER CALCULATION
 # =============================
-def calculate_winding_number(unwrapped_eigs, T):
-    """
-    Calculate winding number from the net change of the unwrapped quasienergy
-    across the Brillouin zone. 
-    Winding number = (Delta quasi-energy)/(2*pi/T).
-    """
-    delta_e = unwrapped_eigs[-1] - unwrapped_eigs[0]
-    dE = 2 * np.pi / T
-    W = np.round(delta_e / dE).astype(int)
-    return W
 
 # def berry_phase_winding(k_values, occupied_states):
-#     """
-#     Alternatively, compute the winding number via Berry phase accumulation.
-#     This multiplies overlaps between successive eigenstates.
-#     """
 #     total_phase = 0.0
 #     N = len(k_values)
 #     for i in range(N - 1):
@@ -358,12 +331,11 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     total_phase = 0.0
     N = len(k_values)
     # create a N by N matrix projector (need to be able to multiply other N by N matrices)
-    Projector = np.eye(nt, dtype=complex)
+    Projector = np.eye(2*nt, dtype=complex)
     for i in range(N):
         Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
         # print(Projector)
     # Projector @= np.outer(occupied_states[0], np.conj(occupied_states[0]))
-    print(Projector)
     winding = np.trace(Projector)
     winding = np.round(np.angle(winding), 5)
     # Module by pi to get the winding number
@@ -376,8 +348,8 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(1, 2, 2)       # Field amplitudes E0
-omega_values = np.linspace(1, 5, 2)        # Driving frequencies ω
+E0_values = np.linspace(0, 2, 4)       # Field amplitudes E0
+omega_values = np.linspace(2, 5, 4)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -395,8 +367,6 @@ for i, E0 in enumerate(E0_values):
         occ_states = track_valence_band(k_values, T, E0, omega)
         # # Unwrap the quasienergy to recover a continuous function
         # unwrapped_eigs = unwrap_quasienergy(occ_eigs, omega, T)
-        # # Calculate the winding number (you can use the Berry phase method as a check)
-        # W_energy = calculate_winding_number(unwrapped_eigs, T)
         W_berry_real = berry_phase_winding(k_values, occ_states)
              
         # We can use either method; here we store the energy-based winding number.

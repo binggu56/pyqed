@@ -98,6 +98,7 @@ class Floquet:
         elif gauge == 'velocity':
 
             H1 = 0.5j * self.momentum() * E0/omegad
+            
         occ_state = Floquet_Winding_number(H0, H1, nt, omegad, T, method=1)
         return occ_state
 
@@ -440,7 +441,7 @@ def HamiltonFT(H0, H1, delta):
 def group_floquet_quasienergies(eigvals, eigvecs, omega=1.0, n_bands=2):
     """
     Identify 'n_bands' Floquet bands by clustering eigenvalues based on
-    their fractional part mod 'omega'. Then sort each band and return
+    their fractional part mod '1'. Then sort each band and return
     the grouped eigenvalues/eigenvectors.
 
     Parameters
@@ -471,7 +472,7 @@ def group_floquet_quasienergies(eigvals, eigvecs, omega=1.0, n_bands=2):
     eigvecs_sorted = eigvecs[:, idx_sort]
 
     # Cluster the fractional parts mod 'omega' in 1D
-    frac = np.mod(eigvals_sorted, omega)
+    frac = np.mod(eigvals_sorted, 1)
     km = KMeans(n_clusters=n_bands, random_state=0).fit(frac.reshape(-1,1))
     labels = km.labels_
 
@@ -487,7 +488,6 @@ def group_floquet_quasienergies(eigvals, eigvecs, omega=1.0, n_bands=2):
         these_vecs = these_vecs[:, sub_idx]
         band_vals.append(these_vals)
         band_vecs.append(these_vecs)
-
     return band_vals, band_vecs
 
 
@@ -548,74 +548,40 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
         # 'band_vals' is a list [vals_band0, vals_band1]
         # 'band_vecs' is a list [vecs_band0, vecs_band1]
 
-        # For example, pick "band 0" as the "lower Floquet band"
-        vals_lower = band_vals[0]
-        vecs_lower = band_vecs[0]
-
-        # Or pick "band 1" as the "upper Floquet band"
-        vals_upper = band_vals[1]
-        vecs_upper = band_vecs[1]
-
-        # ----------------------------------------------------------
-        # (Optional) If you only want the Floquet states
-        # within the principal Brillouin zone [-omega/2, +omega/2],
-        # we can filter them:
-        # ----------------------------------------------------------
-        in_bz = (vals_lower >= -omega/2) & (vals_lower <= omega/2)
-        eigvals_subset = vals_lower[in_bz]
-        eigvecs_subset = vecs_lower[:, in_bz]
-
-
-            # or handle as needed
-
-        # # ----------------------------------------------------------
-        # # Build the overlap matrix G[j,i] = < j | FloquetState i >
-        # # for j in [0..Norbs-1], i in [0..Norbs-1].
-        # # This is the same logic as your original code snippet.
-        # # ----------------------------------------------------------
-        # G = np.zeros((Norbs, Norbs), dtype=complex)
-        # for i in range(Norbs):
-        #     for j in range(Norbs):
-        #         tmp = 0.0
-        #         for m in range(Nt):
-        #             tmp += eigvecs_subset[m * Norbs + j, i]
-        #         G[j, i] = tmp
-
-        # # If you need G in the site basis or some other basis transform:
-        # Gsite = eigvecs_subset.dot(G)
-
-        # ----------------------------------------------------------
-        # (Optional) Reconstruct the time-dependent Floquet state
-        # from an eigenvector in 'eigvecs_subset'.
-        # For example, the i-th Floquet eigenvector is:
-        #   eigvecs_subset[:, i], length = Norbs*Nt
-        # The sub-block for Fourier index m is
-        #   eigvecs_subset[m*Norbs:(m+1)*Norbs, i]
-        # So we define a small helper:
+        if band_vals[0][0] < band_vals[1][0]:
+            vals_lower = band_vals[0]
+            vecs_lower = band_vecs[0]
+            vals_upper = band_vals[1]
+            vecs_upper = band_vecs[1]
+        else:
+            vals_lower = band_vals[1]
+            vecs_lower = band_vecs[1]
+            vals_upper = band_vals[0]
+            vecs_upper = band_vecs[0]
+        # print('vals lower are',vals_lower)
+        # print('vals upper are',vals_upper)
+        
         # ----------------------------------------------------------
         def build_time_dep_state(vec, t):
             """
             Returns |Phi(t)> = sum_{m} e^{-i (m + N0) omega t} |varphi^{(m)}>
             where |varphi^{(m)}> is the block of 'vec' for Fourier index m.
             """
-            psi_t = np.zeros(Nt, dtype=complex)
+            psi_t = np.zeros(2*Nt, dtype=complex)
             # for m in range(Nt):
             #     block = vec[m*Norbs : (m+1)*Norbs]
             #     phase = np.exp(-1j*(m + N0)*omega*t)
             #     psi_t += block * phase
             for m in range(Nt):
-                psi_t += vec[m] * np.exp(-1j * np.arange(Nt) * m * omega * t)
+                psi_t += vec[:, m] * np.exp(-1j * m * omega * t)
             return psi_t
 
         # Example usage for the first Floquet eigenvector in the BZ subset:
         psi_of_t = build_time_dep_state(vecs_lower, t=T)
+        # psi_of_t += build_time_dep_state(vecs_upper, t=T)
         # (Then do whatever you need with psi_of_t.)
 
-        return (psi_of_t)
-    # --------------------------------------------------------------
-    # You can implement method=2, etc. if needed
-    # --------------------------------------------------------------
-
+        return psi_of_t
 
 
 if __name__ == '__main__':
