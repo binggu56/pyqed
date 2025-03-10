@@ -558,6 +558,8 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
             vecs_lower = band_vecs[1]
             vals_upper = band_vals[0]
             vecs_upper = band_vecs[0]
+        if len(vals_lower) != Nt:
+            print('warning: the winding number calculated below for this condition might be incorrect')
         # print('vals lower are',vals_lower)
         # print('vals upper are',vals_upper)
         
