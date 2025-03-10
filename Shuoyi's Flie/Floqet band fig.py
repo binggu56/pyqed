@@ -143,7 +143,7 @@ for E0 in E0:
 
     plt.xlabel('Crystal momentum k')
     plt.ylabel('Quasienergy')
-    plt.title(f'Floquet Bands for E₀ = {E0}, ω = {omega} (T = {T:.2f})')
+    plt.title(f'Floquet Bands for E₀ = {E0:.4f}, ω = {omega:.2f} (T = {T:.2f})')
     plt.legend(loc='best')
     plt.grid(True)
     # plt.show()
