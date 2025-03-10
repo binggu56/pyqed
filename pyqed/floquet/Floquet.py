@@ -83,8 +83,23 @@ class Floquet:
 
         return quasienergies, floquet_modes, G
     
-    def winding_number(self): # To be modified
-        pass
+    def winding_number(self, T, gauge='length'): # To be modified
+        H0 = self.H
+        E0 = self.E0
+        nt = self.nt 
+        omegad = self.omegad
+        nt = self.nt 
+        omegad = self.omegad
+
+        if gauge == 'length': # electric dipole
+
+            H1 = -0.5 * self.edip * E0
+
+        elif gauge == 'velocity':
+
+            H1 = 0.5j * self.momentum() * E0/omegad
+        occ_state = Floquet_Winding_number(H0, H1, nt, omegad, T, method=1)
+        return occ_state
 
     def velocity_to_length(self):
         # transform the truncated velocity gauge Hamiltonian to length gauge
@@ -404,65 +419,106 @@ def HamiltonFT(H0, H1, n):
         return np.zeros((Norbs,Norbs))
 
 
-def Floquet_Winding_number(H0, H1, Nt, omega, method=1):
+from sklearn.cluster import KMeans
+
+def HamiltonFT(H0, H1, delta):
     """
-    Unfold the Floquet band to aligned phase and calculate its winding number, used for 1D systems
+    Example placeholder for your actual HamiltonFT(...) function,
+    which returns H0 + H1*(delta==±1) or something similar.
+    Modify as needed.
+    """
+    # For demonstration: a 2x2 matrix that depends on delta
+    # You should replace with your actual HamiltonFT logic.
+    if delta == 0:
+        return H0
+    elif abs(delta) == 1:
+        return H1
+    else:
+        return np.zeros_like(H0)
 
-    The total Hamiltonian is
-    .. math::
-        H = H_0 + H_1 (\exp(i*\Omega * t)+\exp(-i*\Omega * t))
-        or H = H_0 + 2 * H_1 \cos(\Omega * t)
 
-    INPUT
-        Norbs : number of orbitals
-        Nt    : number of Fourier components
-        E0    : electric field amplitude
+def group_floquet_quasienergies(eigvals, eigvecs, omega=1.0, n_bands=2):
+    """
+    Identify 'n_bands' Floquet bands by clustering eigenvalues based on
+    their fractional part mod 'omega'. Then sort each band and return
+    the grouped eigenvalues/eigenvectors.
+
+    Parameters
+    ----------
+    eigvals : array_like
+        Floquet eigenvalues (length = n_bands * N_t for a 2-level system).
+    eigvecs : ndarray
+        Corresponding eigenvectors (shape = (N_F, N_F)), where columns
+        match the order of 'eigvals'.
+    omega : float
+        Driving frequency (if ~1.0, we do mod 1).
+    n_bands : int
+        Number of bands to split into (2 for a two-level system).
+
+    Returns
+    -------
+    band_vals : list of 1D arrays
+        A list of length 'n_bands'; each entry is a sorted array of
+        eigenvalues belonging to that band.
+    band_vecs : list of 2D arrays
+        A list of length 'n_bands'; each entry is a 2D array of the
+        corresponding eigenvectors (columns match the sorted eigenvalues).
+    """
+    eigvals = np.asarray(eigvals)
+    # Sort globally first
+    idx_sort = np.argsort(eigvals)
+    eigvals_sorted = eigvals[idx_sort]
+    eigvecs_sorted = eigvecs[:, idx_sort]
+
+    # Cluster the fractional parts mod 'omega' in 1D
+    frac = np.mod(eigvals_sorted, omega)
+    km = KMeans(n_clusters=n_bands, random_state=0).fit(frac.reshape(-1,1))
+    labels = km.labels_
+
+    band_vals = []
+    band_vecs = []
+    for band_idx in range(n_bands):
+        # Extract all eigenvalues/vectors belonging to cluster band_idx
+        these_vals = eigvals_sorted[labels == band_idx]
+        these_vecs = eigvecs_sorted[:, labels == band_idx]
+        # Sort them by ascending eigenvalue
+        sub_idx = np.argsort(these_vals)
+        these_vals = these_vals[sub_idx]
+        these_vecs = these_vecs[:, sub_idx]
+        band_vals.append(these_vals)
+        band_vecs.append(these_vecs)
+
+    return band_vals, band_vecs
+
+
+def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
+    """
+    Build and diagonalize the Floquet Hamiltonian for a 1D system,
+    then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
+    Finally, (optionally) select states in the principal Brillouin zone
+    and build overlap matrices or time-dependent states.
+
+    H(t) = H0 + 2*H1*cos(omega * t)
     """
     if method == 1:
-        Norbs = H0.shape[-1]
+        Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
+        NF = Norbs * Nt           # dimension of Floquet matrix
+        N0 = -(Nt-1)//2           # shift for Fourier indices
 
-        #print('transition dipoles \n', M)
-
-        # dimensionality of the Floquet matrix
-        NF = Norbs * Nt
-        F = np.zeros((NF,NF), dtype=complex)
-
-        N0 = -(Nt-1)/2 # starting point for Fourier components of time exp(-i n w t)
-
-        idt = np.identity(Nt)
-        idm = np.identity(Norbs)
-        # construc the Floquet H for a general tight-binding Hamiltonian
+        # Construct the Floquet matrix
+        F = np.zeros((NF, NF), dtype=complex)
         for n in range(Nt):
             for m in range(Nt):
-
-                # atomic basis index
                 for k in range(Norbs):
                     for l in range(Norbs):
+                        i = Norbs*n + k
+                        j = Norbs*m + l
+                        # Hamiltonian block + photon block
+                        F[i, j] = (HamiltonFT(H0, H1, n-m)[k, l]
+                                   - (n + N0)*omega*(n==m)*(k==l))
 
-                    # map the index i to double-index (n,k) n : time Fourier component
-                    # with relationship for this :  Norbs * n + k = i
-
-                        i = Norbs * n + k
-                        j = Norbs * m + l
-                        F[i,j] = HamiltonFT(H0, H1, n-m)[k,l] - (n + N0) \
-                                * omega * idt[n,m] * idm[k,l]
-
-
-        # for a two-state model
-
-    #    for n in range(Nt):
-    #        for m in range(Nt):
-    #            F[n * Norbs, m * Norbs] = (N0 + n) * omega * delta(n,m)
-    #            F[n * Norbs + 1, m * Norbs + 1] = (onsite1 + (N0+n) * omega) * delta(n,m)
-    #            F[n * Norbs, m * Norbs + 1] = t * delta(n,m+1)
-    #            F[n * Norbs + 1, m * Norbs] = t * delta(n,m-1)
-        #print('\n Floquet matrix \n', F)
-
-        # compute the eigenvalues of the Floquet Hamiltonian,
-        eigvals, eigvecs = linalg.eigh(F)
-
-        #print('Floquet quasienergies', eigvals)
-
+        # Diagonalize
+        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)
         # specify a range to choose the quasienergies, choose the first BZ
         # [-hbar omega/2, hbar * omega/2]
         eigvals_subset = np.zeros(Norbs, dtype=complex)
@@ -480,54 +536,85 @@ def Floquet_Winding_number(H0, H1, Nt, omega, method=1):
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
+        # ----------------------------------------------------------
+        # Group the Floquet eigenvalues/eigenvectors into two bands
+        # (since Norbs=2 for a 2-level system). If you have more orbitals,
+        # set n_bands=Norbs.
+        # ----------------------------------------------------------
+        band_vals, band_vecs = group_floquet_quasienergies(
+            eigvals, eigvecs, omega=omega, n_bands=2
+        )
+
+        # 'band_vals' is a list [vals_band0, vals_band1]
+        # 'band_vecs' is a list [vecs_band0, vecs_band1]
+
+        # For example, pick "band 0" as the "lower Floquet band"
+        vals_lower = band_vals[0]
+        vecs_lower = band_vecs[0]
+
+        # Or pick "band 1" as the "upper Floquet band"
+        vals_upper = band_vals[1]
+        vecs_upper = band_vecs[1]
+
+        # ----------------------------------------------------------
+        # (Optional) If you only want the Floquet states
+        # within the principal Brillouin zone [-omega/2, +omega/2],
+        # we can filter them:
+        # ----------------------------------------------------------
+        in_bz = (vals_lower >= -omega/2) & (vals_lower <= omega/2)
+        eigvals_subset = vals_lower[in_bz]
+        eigvecs_subset = vecs_lower[:, in_bz]
 
 
-        # now we have a complete linear independent set of solutions for the time-dependent problem
-        # to compute the coefficients before each Floquet state if we start with |alpha>
-        # At time t = 0, constuct the overlap matrix between Floquet modes and system eigenstates
-        # G[j,i] = < system eigenstate j | Floquet state i >
-        G = np.zeros((Norbs,Norbs), dtype=complex)
-        for i in range(Norbs):
-            for j in range(Norbs):
-                tmp = 0.0
-                for m in range(Nt):
-                    tmp += eigvecs_subset[m * Norbs + j, i]
-                G[j,i] = tmp
+            # or handle as needed
 
+        # # ----------------------------------------------------------
+        # # Build the overlap matrix G[j,i] = < j | FloquetState i >
+        # # for j in [0..Norbs-1], i in [0..Norbs-1].
+        # # This is the same logic as your original code snippet.
+        # # ----------------------------------------------------------
+        # G = np.zeros((Norbs, Norbs), dtype=complex)
+        # for i in range(Norbs):
+        #     for j in range(Norbs):
+        #         tmp = 0.0
+        #         for m in range(Nt):
+        #             tmp += eigvecs_subset[m * Norbs + j, i]
+        #         G[j, i] = tmp
 
-        # to plot G on site basis, transform it to site-basis representation
-        Gsite = eigvecs_subset.dot(G)
+        # # If you need G in the site basis or some other basis transform:
+        # Gsite = eigvecs_subset.dot(G)
 
-        return eigvals_subset, eigvecs_subset, G
-    
-    elif method == 2:
-           print('Winding number is not available for Diagonalization Propagator method yet, use method 1.') 
-           sys.exit()
-            # # Use Diagonalization Propagator method
-            # time_step = 5000
-            # dt = 2 * np.pi / (time_step * omega)  # Time step for propagator
-            # U = np.eye(H0.shape[0], dtype=complex)  # Initialize the propagator
-            # for t in range(time_step):
-            #     time = t * dt
-            #     H_t = H0 + H1 * (np.exp(1j*omega * time)+np.exp(-1j*omega * time))
-            #     U = linalg.expm(-1j * H_t * dt) @ U  # Update the propagator
+        # ----------------------------------------------------------
+        # (Optional) Reconstruct the time-dependent Floquet state
+        # from an eigenvector in 'eigvecs_subset'.
+        # For example, the i-th Floquet eigenvector is:
+        #   eigvecs_subset[:, i], length = Norbs*Nt
+        # The sub-block for Fourier index m is
+        #   eigvecs_subset[m*Norbs:(m+1)*Norbs, i]
+        # So we define a small helper:
+        # ----------------------------------------------------------
+        def build_time_dep_state(vec, t):
+            """
+            Returns |Phi(t)> = sum_{m} e^{-i (m + N0) omega t} |varphi^{(m)}>
+            where |varphi^{(m)}> is the block of 'vec' for Fourier index m.
+            """
+            psi_t = np.zeros(Nt, dtype=complex)
+            # for m in range(Nt):
+            #     block = vec[m*Norbs : (m+1)*Norbs]
+            #     phase = np.exp(-1j*(m + N0)*omega*t)
+            #     psi_t += block * phase
+            for m in range(Nt):
+                psi_t += vec[m] * np.exp(-1j * np.arange(Nt) * m * omega * t)
+            return psi_t
 
-            # # Diagonalize the propagator to get quasi-energies and modes
-            # eigvals, eigvecs = np.linalg.eig(U)
-            # quasi_energies = np.angle(eigvals) * omega / (2 * np.pi)
-            #         # Compute the overlap matrix G
-            # Norbs = H0.shape[0]
-            # G = np.zeros((Norbs, Norbs), dtype=complex)
-            # for i in range(Norbs):
-            #     for j in range(Norbs):
-            #         G[j, i] = np.sum(eigvecs[:, i].conjugate() * eigvecs[:, j])
+        # Example usage for the first Floquet eigenvector in the BZ subset:
+        psi_of_t = build_time_dep_state(vecs_lower, t=T)
+        # (Then do whatever you need with psi_of_t.)
 
-            # # Transform G to the site basis
-            # Gsite = eigvecs.dot(G)
-            # return quasi_energies, eigvecs, Gsite
-
-    else:
-        raise ValueError(f"Method {method} not recognized. Use 1 for Floquet or 2 for Diagonalization_Propagator.")
+        return (psi_of_t)
+    # --------------------------------------------------------------
+    # You can implement method=2, etc. if needed
+    # --------------------------------------------------------------
 
 
 

@@ -2,15 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.linalg import expm
 from pyqed import Mol
-import time
 
-start_time = time.time()
 # =============================
 # PARAMETERS AND CONSTANTS
 # =============================
 a = 1.0                # Lattice constant (Bohr radii)
 h_bar = 1.0            # Planck constant (atomic units)
-n_kpoints = 200        # Number of k-points along BZ
+n_kpoints = 100        # Number of k-points along BZ
 
 # =============================
 # FLOQUET HAMILTONIAN MODULE
@@ -68,7 +66,8 @@ def track_valence_band(k_values, T, E0, omega, v = 1, w = 1, nt=61):
     prev_state = eigvecs[:, occ_index].copy()
 
     for i, k_0 in enumerate(k_values[1:], start=1):
-        # print(i)
+        print(f'k = {k_0}')
+        print(i)
         mol = Mol(H0(k_0, v, w), H1(k_0))
         # print(vars(mol))
         floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
@@ -117,36 +116,29 @@ def unwrap_quasienergy(occupied_eigs, omega, T):
 # =============================
 # MAIN: PLOT FOLDED & UNFOLDED FLOQUET BANDS
 # =============================
-E0 = np.linspace(0, 2, 41)
+E0 = 0.5
 omega = 1
 T = 2 * np.pi / omega
-for E0 in E0:
-    k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
 
-    folded_eigs_val_valance, folded_eigvec_valance, folded_eigs_val_cond, folded_eigvec_valance = track_valence_band(k_values, T, E0, omega)
+k_values = np.linspace(-np.pi / a, 0, n_kpoints)
 
-
-    unwrapped_eigs_con = unwrap_quasienergy(folded_eigs_val_cond, omega, T)
-    unwrapped_eigs_val = unwrap_quasienergy(folded_eigs_val_valance, omega, T)
-
-    # Save the figure
-    output_folder = "/Users/shuoyihu/Documents/GitHub/pyqed/Shuoyi's Flie/figures"
-    output_file = f"{output_folder}/floquet_bands_E0_{E0}_omega_{omega}.png"
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(k_values, unwrapped_eigs_val, 'o', color='blue', label='Valence')
-    plt.plot(k_values, unwrapped_eigs_con, 'o', color='red', label='Conduction')
-    # draw the Brilloin Zone boundary plt.axvline(y=-omega, color='black', linestyle='--')
-    plt.axhline(y=omega/2, color='black', linestyle='--')
-    plt.axhline(y=-omega/2, color='black', linestyle='--')
+folded_eigs_val_valance, folded_eigvec_valance, folded_eigs_val_cond, folded_eigvec_valance = track_valence_band(k_values, T, E0, omega)
 
 
-    plt.xlabel('Crystal momentum k')
-    plt.ylabel('Quasienergy')
-    plt.title(f'Floquet Bands for E₀ = {E0:.4f}, ω = {omega:.2f} (T = {T:.2f})')
-    plt.legend(loc='best')
-    plt.grid(True)
-    # plt.show()
-    plt.savefig(output_file)
-    plt.close()
-    print(f"Saved to {output_file}, time elapsed: {time.time() - start_time:.2f} s")
+unwrapped_eigs_con = unwrap_quasienergy(folded_eigs_val_cond, omega, T)
+unwrapped_eigs_val = unwrap_quasienergy(folded_eigs_val_valance, omega, T)
+
+plt.figure(figsize=(10, 6))
+plt.plot(k_values, unwrapped_eigs_val, 'o', color='blue', label='Valence')
+plt.plot(k_values, unwrapped_eigs_con, 'o', color='red', label='Conduction')
+# draw the Brilloin Zone boundary plt.axvline(y=-omega, color='black', linestyle='--')
+plt.axhline(y=omega/2, color='black', linestyle='--')
+plt.axhline(y=-omega/2, color='black', linestyle='--')
+
+
+plt.xlabel('Crystal momentum k')
+plt.ylabel('Quasienergy')
+plt.title(f'Floquet Bands for E₀ = {E0}, ω = {omega} (T = {T:.2f})')
+plt.legend(loc='best')
+plt.grid(True)
+plt.show()

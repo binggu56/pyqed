@@ -281,58 +281,26 @@ def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
     """
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
-    occupied_states = np.zeros((len(k_values), 2), dtype=complex)
+    occupied_states = np.zeros((len(k_values), nt), dtype=complex)
 
-    # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
-    k0 = k_values[0]
-    # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
-    mol = Mol(H0(k0, v, w), H1(k0))
-    # print(vars(mol))
-    floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-    # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
-    eigs, eigvecs, G = floquet.run()
-    # For instance, choose the state with the smaller quasienergy as the valence band.
-    occ_index = np.argmin(eigs)
-    occupied_eigs[0] = eigs[occ_index]
-    # Normalize and fix phase:
-    occ_state = G[:, occ_index]
-    occ_state /= np.linalg.norm(occ_state)
-    # Choose a reference phase (make first element real)
-    # multiply the Floquet pahse 
-    theta = eigs[occ_index] * T
-    # occ_state = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]]) @ occ_state
-    # occ_state *= np.exp(-1j * np.angle(occ_state[0]))
-    occupied_states[0] = occ_state
-    # occupied_states[0] = occ_state * np.exp(-1j * eigs[occ_index] * T)
-    prev_state = eigvecs[:, occ_index].copy()
-
-    for i, k_0 in enumerate(k_values[1:], start=1):
-        mol = Mol(H0(k0, v, w), H1(k_0))
-        # print(vars(mol))
-        # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k_0))
-        floquet = mol.Floquet(omegad=omega, E0=E_0, nt=61)
-        # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method=1)
-        eigs, eigvecs, G = floquet.run()
-        # Normalize eigenstates
-        for j in range(eigvecs.shape[1]):
-            eigvecs[j,:] = np.exp(-1j * eigs[j]*T) * eigvecs[j, :]
-            eigvecs[j,:] /= np.linalg.norm(eigvecs[j, :])
-        for j in range(G.shape[1]):
-            G[j,:] = np.exp(-1j * eigs[j]*T) * G[j, :]
-            G[j,:] /= np.linalg.norm(G[j, :])
-        # Calculate overlaps with previous valence state
-        overlaps = np.array([np.abs(np.vdot(prev_state, eigvecs[:, j])) for j in range(eigvecs.shape[1])])
-        new_index = np.argmax(overlaps)
-        new_state = G[:, new_index].copy()
-        # Phase align with previous state
-        # phase = np.angle(np.vdot(prev_state, new_state))
-        # new_state *= np.exp(-1j * phase)
-        occupied_states[i] = new_state
-        # occupied_states[i] = np.array([[np.cos(eigs[new_index] * T), -np.sin(eigs[new_index] * T)],[np.sin(eigs[new_index] * T), np.cos(eigs[new_index] * T)]]) @ new_state
-        # occupied_states[i] = new_state * np.exp(-1j * eigs[new_index] * T)
-        occupied_eigs[i] = eigs[new_index]
-        prev_state = eigvecs[:, new_index].copy()
-    return occupied_eigs, occupied_states
+    # # At first k, choose the eigenstate with lowest quasienergy in the chosen branch.
+    # k0 = k_values[0]
+    # # mol = Mol(self_Hamiltonian(), H0(k0, v, w), H1(k0))
+    # mol = Mol(H0(k0, v, w), H1(k0))
+    # # print(vars(mol))
+    # floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+    # # eigs, eigvecs, G = Floquet.run(floquet, gauge='length', method='Floquet')
+    # occ_state = floquet.winding_number(T)
+    # print(occ_state)
+    # print(len(occ_state))
+    for i in range (len(k_values)):
+        k0 = k_values[i]
+        mol = Mol(H0(k0, v, w), H1(k0))
+        floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+        occ_state = floquet.winding_number(T)
+        occupied_states[i] = occ_state
+    
+    return occupied_states
 
 def unwrap_quasienergy(occupied_eigs, omega, T):
     """
@@ -390,7 +358,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     total_phase = 0.0
     N = len(k_values)
     # create a N by N matrix projector (need to be able to multiply other N by N matrices)
-    Projector = np.eye(2, dtype=complex)
+    Projector = np.eye(nt, dtype=complex)
     for i in range(N):
         Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
         # print(Projector)
@@ -408,7 +376,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0.1, 2, 2)       # Field amplitudes E0
+E0_values = np.linspace(1, 2, 2)       # Field amplitudes E0
 omega_values = np.linspace(1, 5, 2)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
@@ -424,7 +392,7 @@ for i, E0 in enumerate(E0_values):
         k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
         
         # Track the valence Floquet band (quasienergies and eigenstates)
-        occ_eigs, occ_states = track_valence_band(k_values, T, E0, omega)
+        occ_states = track_valence_band(k_values, T, E0, omega)
         # # Unwrap the quasienergy to recover a continuous function
         # unwrapped_eigs = unwrap_quasienergy(occ_eigs, omega, T)
         # # Calculate the winding number (you can use the Berry phase method as a check)
