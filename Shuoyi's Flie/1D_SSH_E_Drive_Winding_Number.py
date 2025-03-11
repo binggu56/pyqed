@@ -348,7 +348,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 2, 4)       # Field amplitudes E0
+E0_values = np.linspace(1, 2, 4)       # Field amplitudes E0
 omega_values = np.linspace(2, 5, 4)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))

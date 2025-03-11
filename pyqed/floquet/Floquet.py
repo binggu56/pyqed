@@ -83,7 +83,7 @@ class Floquet:
 
         return quasienergies, floquet_modes, G
     
-    def winding_number(self, T, gauge='length'): # To be modified
+    def winding_number(self, T, quasi_E = None, previous_state = None, gauge='length'): # To be modified
         H0 = self.H
         E0 = self.E0
         nt = self.nt 
@@ -99,7 +99,7 @@ class Floquet:
 
             H1 = 0.5j * self.momentum() * E0/omegad
             
-        occ_state = Floquet_Winding_number(H0, H1, nt, omegad, T, method=1)
+        occ_state = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
         return occ_state
 
     def velocity_to_length(self):
@@ -491,7 +491,7 @@ def group_floquet_quasienergies(eigvals, eigvecs, omega=1.0, n_bands=2):
     return band_vals, band_vecs
 
 
-def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
+def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_state = None):
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
@@ -500,7 +500,7 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
 
     H(t) = H0 + 2*H1*cos(omega * t)
     """
-    if method == 1:
+    if E == 0:
         Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
@@ -523,6 +523,47 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
         # [-hbar omega/2, hbar * omega/2]
         eigvals_subset = np.zeros(Norbs, dtype=complex)
         eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+        # check if the Floquet states is complete
+        j = 0
+        for i in range(NF):
+            if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+                eigvals_subset[j] = eigvals[i]
+                eigvecs_subset[:,j] = eigvecs[:,i]
+                j += 1
+        if j != Norbs:
+            print("Error: Number of Floquet states {} is not equal to \
+                the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+            sys.exit()
+        eigvals = [x - quasiE for x in eigvals]
+        eigvals = np.array(eigvals)
+        idx = np.argsort(eigvals.real)
+        occ_state = eigvecs[:, idx[0]]
+        occ_state_energy = eigvals[idx[0]]  # might needed for winding number calculation
+        return occ_state
+    else:
+        Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
+        NF = Norbs * Nt           # dimension of Floquet matrix
+        N0 = -(Nt-1)//2           # shift for Fourier indices
+
+        # Construct the Floquet matrix
+        F = np.zeros((NF, NF), dtype=complex)
+        for n in range(Nt):
+            for m in range(Nt):
+                for k in range(Norbs):
+                    for l in range(Norbs):
+                        i = Norbs*n + k
+                        j = Norbs*m + l
+                        # Hamiltonian block + photon block
+                        F[i, j] = (HamiltonFT(H0, H1, n-m)[k, l]
+                                   - (n + N0)*omega*(n==m)*(k==l))
+
+        # Diagonalize
+        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)
+        eigvals = np.array(eigvals)
+        # specify a range to choose the quasienergies, choose the first BZ
+        # [-hbar omega/2, hbar * omega/2]
+        eigvals_subset = np.zeros(Norbs, dtype=complex)
+        eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
 
 
         # check if the Floquet states is complete
@@ -536,54 +577,15 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, method=1):
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
-        # ----------------------------------------------------------
-        # Group the Floquet eigenvalues/eigenvectors into two bands
-        # (since Norbs=2 for a 2-level system). If you have more orbitals,
-        # set n_bands=Norbs.
-        # ----------------------------------------------------------
-        band_vals, band_vecs = group_floquet_quasienergies(
-            eigvals, eigvecs, omega=omega, n_bands=2
-        )
+        overlap = np.zeros(NF)
+        for i in range(NF):
+            for j in range(NF):
+                overlap[i] += np.conjugate(eigvecs[j,i]) * previous_state[j]
+        idx = np.argsort(overlap.real)
+        occ_state = eigvecs[:,idx[-1]]
+        occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
 
-        # 'band_vals' is a list [vals_band0, vals_band1]
-        # 'band_vecs' is a list [vecs_band0, vecs_band1]
-
-        if band_vals[0][0] < band_vals[1][0]:
-            vals_lower = band_vals[0]
-            vecs_lower = band_vecs[0]
-            vals_upper = band_vals[1]
-            vecs_upper = band_vecs[1]
-        else:
-            vals_lower = band_vals[1]
-            vecs_lower = band_vecs[1]
-            vals_upper = band_vals[0]
-            vecs_upper = band_vecs[0]
-        if len(vals_lower) != Nt:
-            print('warning: the winding number calculated below for this condition might be incorrect')
-            print('vals lower are',vals_lower)
-            print('vals upper are',vals_upper)
-        
-        # ----------------------------------------------------------
-        def build_time_dep_state(vec, vals, t):
-            """
-            Returns |Phi(t)> = sum_{m} e^{-i (m + N0) omega t} |varphi^{(m)}>
-            where |varphi^{(m)}> is the block of 'vec' for Fourier index m.
-            """
-            psi_t = np.zeros(2*Nt, dtype=complex)
-            # for m in range(Nt):
-            #     block = vec[m*Norbs : (m+1)*Norbs]
-            #     phase = np.exp(-1j*(m + N0)*omega*t)
-            #     psi_t += block * phase
-            for m in range(Nt):
-                psi_t += vec[:, m] * np.exp(-1j * m * omega * t - 1j * vals[m])
-            return psi_t
-
-        # Example usage for the first Floquet eigenvector in the BZ subset:
-        occ_psi_of_t = build_time_dep_state(vecs_lower, vals_lower, t=T)
-        unocc_psi_of_t = build_time_dep_state(vecs_upper, vals_upper, t=T)
-        # (Then do whatever you need with psi_of_t.)
-
-        return occ_psi_of_t, unocc_psi_of_t
+        return occ_state
 
 
 if __name__ == '__main__':

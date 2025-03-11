@@ -35,27 +35,46 @@ def H1(k):
 # =============================
 # BAND TRACKING MODULE
 # =============================
-def track_valence_band(k_values, T, E0, omega, v = 0.8, w = 1.0, nt=61):
+def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0, nt=61):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
     and eigenstates for the occupied band.
+    previous is len(k_values), 2*nt matrix
     """
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
     occupied_states = np.zeros((len(k_values), 2*nt), dtype=complex)
     unocc_before_unfold_states = np.zeros((len(k_values), 2*nt), dtype=complex)
-
-    for i in range (len(k_values)):
-        k0 = k_values[i]
-        mol = Mol(H0(k0, v, w), H1(k0))
-        floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-        occ_state, unocc_states = floquet.winding_number(T)
-        occupied_states[i] = occ_state
-        unocc_before_unfold_states [i] = unocc_states
-        
+    if E_0 == 0:
+        static_val_eigval = np.zeros(len(k_values))
+        static_con_eigval = np.zeros(len(k_values))
+        for i in range(len(k_values)):
+            k0 = k_values[i]
+            eigvals, eigvecs = np.linalg.eig(H0(k0,v,w))
+            if eigvals[0].real > eigvals[-1].real:
+                eigvals = eigvals[::-1]  # Reverse the order
+                eigvecs = eigvecs[:, ::-1]
+                static_val_eigval[i] = eigvals[0]
+                static_con_eigval[i] = eigvals[1]
+            quasiE = eigvals[0]
+        # print(static_val_eigval)
+        # print(static_con_eigval)
+            mol = Mol(H0(k0, v, w), H1(k0))
+            floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+            occ_state = floquet.winding_number(T,quasi_E = quasiE)
+            occupied_states[i] = occ_state
+            # unocc_before_unfold_states [i] = unocc_states
+    else:
+        for i in range(len(k_values)):
+            k0 = k_values[i]
+            mol = Mol(H0(k0, v, w), H1(k0))
+            floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+            occ_state = floquet.winding_number(T,quasi_E = None, previous_state = previous[i])
+            occupied_states[i] = occ_state
+            # unocc_before_unfold_states [i] = unocc_states
     
-    return occupied_states, unocc_before_unfold_states
+    return occupied_states
 
 def unwrap_quasienergy(occupied_eigs, omega, T):
     """
@@ -123,28 +142,45 @@ winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
-
+v= 0.8
+w= 1.0
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
 # Loop over driving parameters:
 for j, omega in enumerate(omega_values):
     T = 2 * np.pi / omega  # period of the drive
     E0 = E0_values[0]
-    occ_states, unocc_states = track_valence_band(k_values, T, E0, omega)
+    # static_val_eigval = np.zeros(len(k_values), dtype=complex)
+    # static_val_eigval = np.zeros(len(k_values))
+    # static_con_eigval = np.zeros(len(k_values))
+    # for i in range(len(k_values)):
+    #     k = k_values[i]
+    #     eigvals, eigvecs = np.linalg.eig(H0(k,v,w))
+    #     if eigvals[0].real > eigvals[-1].real:
+    #         eigvals = eigvals[::-1]  # Reverse the order
+    #         eigvecs = eigvecs[:, ::-1]
+    #         static_val_eigval[i] = eigvals[0]
+    #         static_con_eigval[i] = eigvals[1]
+    
+    # print(static_val_eigval)
+    # print(static_con_eigval)
+    # !!!!!!!!!!!!!!!    
+    occ_states = track_valence_band(k_values, T, E0, omega)
+    
     W_berry_real = berry_phase_winding(k_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         # Track the valence Floquet band (quasienergies and eigenstates)
-        occ_states, unocc_states = track_valence_band(k_values, T, E0, omega)
-        overlaps = np.array([np.abs(np.vdot(pre_occ, occ_states)), np.abs(np.vdot(pre_occ, unocc_states))])
-        new_index = np.argmax(overlaps)
-        if new_index == 0:
-            new_state = occ_states
-        else:
-            new_state = unocc_states
-        pre_occ = new_state.copy()
+        occ_states = track_valence_band(k_values, T, E0, omega, pre_occ)
+        # overlaps = np.array([np.abs(np.vdot(pre_occ, occ_states)), np.abs(np.vdot(pre_occ, unocc_states))])
+        # new_index = np.argmax(overlaps)
+        # if new_index == 0:
+        #     new_state = occ_states
+        # else:
+        #     new_state = unocc_states
+        # pre_occ = new_state.copy()
         W_berry_real = berry_phase_winding(k_values, occ_states)
 
         # We can use either method; here we store the energy-based winding number.
