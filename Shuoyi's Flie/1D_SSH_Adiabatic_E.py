@@ -148,7 +148,7 @@ def figure(occ_state_energy, k_values):
     plt.legend()
     plt.grid()
     # Save the figure
-    filename = f"{save_folder}/Floquet_Band_E0_{E0:.2f}_omega_{omega:.2f}.png"
+    filename = f"{save_folder}/Floquet_Band_omega_{omega:.2f}_E0_{E0:.2f}.png"
     plt.savefig(filename, dpi=300)
     plt.close()  # Close the figure to free memory
     
@@ -156,8 +156,8 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 0.2, 10)       # Field amplitudes E0
-omega_values = np.linspace(2, 2, 1)        # Driving frequencies ω
+E0_values = np.linspace(0, 2, 11)       # Field amplitudes E0
+omega_values = np.linspace(2, 3, 2)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))

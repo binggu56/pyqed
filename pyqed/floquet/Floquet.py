@@ -576,15 +576,15 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
-        overlap = np.zeros(NF, dtype =complex)
+        overlap = np.zeros(NF)
         for i in range(NF):
             for j in range(NF):
-                overlap[i] += np.conjugate(eigvecs[j,i]) * previous_state[j]
-        idx = np.argsort(overlap.real)
-        max_index = np.argmax(idx)
-        print(idx)
-        occ_state = eigvecs[:,max_index]
-        occ_state_energy = eigvals[max_index]  # might needed for winding number calculation
+                # overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
+                overlap[i] += np.conjugate(eigvecs[i,j]) *previous_state[j]
+        idx = np.argsort(abs(overlap))
+
+        occ_state = eigvecs[:,idx[-1]]
+        occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
         return occ_state, occ_state_energy
 
 
