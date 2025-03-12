@@ -495,8 +495,8 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
-    Finally, (optionally) select states in the principal Brillouin zone
-    and build overlap matrices or time-dependent states.
+    choose the correct Floquet branch if E = 0 (by comparing with the directly diagonalized energies)
+    if E != 0, choose the correct branch by doing overlap with the previous state.
 
     H(t) = H0 + 2*H1*cos(omega * t)
     """
@@ -534,7 +534,7 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
-        eigvals_copy = [x - quasiE for x in eigvals]
+        eigvals_copy = [np.abs(x - quasiE) for x in eigvals]
         eigvals_copy = np.array(eigvals_copy)
         idx = np.argsort(eigvals_copy.real)
         occ_state = eigvecs[:, idx[0]]
@@ -558,8 +558,7 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
                                    - (n + N0)*omega*(n==m)*(k==l))
 
         # Diagonalize
-        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)
-        eigvals = np.array(eigvals)
+        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)s
         # specify a range to choose the quasienergies, choose the first BZ
         # [-hbar omega/2, hbar * omega/2]
         eigvals_subset = np.zeros(Norbs, dtype=complex)
@@ -577,14 +576,15 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
-        overlap = np.zeros(NF)
+        overlap = np.zeros(NF, dtype =complex)
         for i in range(NF):
             for j in range(NF):
                 overlap[i] += np.conjugate(eigvecs[j,i]) * previous_state[j]
         idx = np.argsort(overlap.real)
-        occ_state = eigvecs[:,idx[-1]]
-        occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
-
+        max_index = np.argmax(idx)
+        print(idx)
+        occ_state = eigvecs[:,max_index]
+        occ_state_energy = eigvals[max_index]  # might needed for winding number calculation
         return occ_state, occ_state_energy
 
 

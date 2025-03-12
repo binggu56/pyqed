@@ -28,8 +28,11 @@ def H0(k, v, w):
                      [v + w * np.exp(1j * k), 0]])
 
 def H1(k):
-    return np.array([[0, (-1+np.exp(-1j * k))],
-                     [(-1+np.exp(1j * k)), 0]])
+    return np.array([[0, (np.exp(-1j * k))],
+                     [(np.exp(1j * k)), 0]])
+# def H1(k):
+#     return np.array([[0, (-1+np.exp(-1j * k))],
+#                      [(-1+np.exp(1j * k)), 0]])
 
 
 # =============================
@@ -154,8 +157,7 @@ def figure(occ_state_energy, k_values):
 # =============================
 # Define parameter grid for the external drive:
 E0_values = np.linspace(0, 0.2, 10)       # Field amplitudes E0
-omega_values = 2
-# omega_values = np.linspace(2, 2, 1)        # Driving frequencies ω
+omega_values = np.linspace(2, 2, 1)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -181,15 +183,7 @@ for j, omega in enumerate(omega_values):
         E0 = E0_values[i+1]
         # Track the valence Floquet band (quasienergies and eigenstates)
         occ_states, occ_state_energy = track_valence_band(k_values, T, E0, omega, pre_occ)
-        print(occ_states)
         figure(occ_state_energy,k_values)
-        # overlaps = np.array([np.abs(np.vdot(pre_occ, occ_states)), np.abs(np.vdot(pre_occ, unocc_states))])
-        # new_index = np.argmax(overlaps)
-        # if new_index == 0:
-        #     new_state = occ_states
-        # else:
-        #     new_state = unocc_states
-        # pre_occ = new_state.copy()
         W_berry_real = berry_phase_winding(k_values, occ_states)
 
         # We can use either method; here we store the energy-based winding number.
