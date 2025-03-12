@@ -10,6 +10,7 @@ import numpy as np
 import sys
 from scipy import linalg
 from pyqed.mol import Mol, dag
+from sklearn.cluster import KMeans
 
 class Floquet:
     """
@@ -420,7 +421,7 @@ def HamiltonFT(H0, H1, n):
         return np.zeros((Norbs,Norbs))
 
 
-from sklearn.cluster import KMeans
+
 
 def HamiltonFT(H0, H1, delta):
     """
@@ -579,12 +580,24 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
         overlap = np.zeros(NF)
         for i in range(NF):
             for j in range(NF):
-                # overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
-                overlap[i] += np.conjugate(eigvecs[i,j]) *previous_state[j]
+                overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
+                # overlap[i] += np.conjugate(eigvecs[i,j]) * previous_state[j]
+            if np.abs(overlap[i]) < 0.05:
+                overlap[i]=0
+            else:
+                print(overlap[i])
+        print(overlap) 
         idx = np.argsort(abs(overlap))
 
-        occ_state = eigvecs[:,idx[-1]]
-        occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
+        # occ_state = eigvecs[:,idx[-1]]
+        # occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
+        occ_state = np.zeros((1,len(eigvecs[0])))
+        occ_state_energy = 0
+        for i in range(len(overlap)):
+            # occ_state += eigvecs[:,i]*overlap[i]
+            occ_state_energy += eigvals[i] * overlap[i]**2
+        # occ_state /=np.linalg.norm(occ_state)
+        
         return occ_state, occ_state_energy
 
 

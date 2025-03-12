@@ -156,8 +156,8 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 2, 11)       # Field amplitudes E0
-omega_values = np.linspace(2, 3, 2)        # Driving frequencies ω
+E0_values = np.linspace(0, 0.1, 100)       # Field amplitudes E0
+omega_values = np.linspace(5, 6, 2)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -196,7 +196,7 @@ for j, omega in enumerate(omega_values):
             winding_map_berry_integer[i+1, j] = 0  # or some other appropriate value
             
     print(f"Progress: {j+1}/{len(omega_values)}, elapsed time: {time.time() - start_time:.2f} sec")
-
+    time.sleep(2) 
 # =============================
 # PLOT THE PHASE DIAGRAM
 # =============================
