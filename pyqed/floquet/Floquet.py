@@ -99,8 +99,8 @@ class Floquet:
 
             H1 = 0.5j * self.momentum() * E0/omegad
             
-        occ_state = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
-        return occ_state
+        occ_state, occ_state_energy = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
+        return occ_state, occ_state_energy
 
     def velocity_to_length(self):
         # transform the truncated velocity gauge Hamiltonian to length gauge
@@ -534,12 +534,12 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
             print("Error: Number of Floquet states {} is not equal to \
                 the number of orbitals {} in the first BZ. \n".format(j, Norbs))
             sys.exit()
-        eigvals = [x - quasiE for x in eigvals]
-        eigvals = np.array(eigvals)
-        idx = np.argsort(eigvals.real)
+        eigvals_copy = [x - quasiE for x in eigvals]
+        eigvals_copy = np.array(eigvals_copy)
+        idx = np.argsort(eigvals_copy.real)
         occ_state = eigvecs[:, idx[0]]
         occ_state_energy = eigvals[idx[0]]  # might needed for winding number calculation
-        return occ_state
+        return occ_state, occ_state_energy
     else:
         Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
         NF = Norbs * Nt           # dimension of Floquet matrix
@@ -585,7 +585,7 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
         occ_state = eigvecs[:,idx[-1]]
         occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
 
-        return occ_state
+        return occ_state, occ_state_energy
 
 
 if __name__ == '__main__':

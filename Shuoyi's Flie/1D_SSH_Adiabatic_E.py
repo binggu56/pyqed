@@ -5,7 +5,7 @@ from scipy import linalg
 import time
 import sys
 from pyqed import Mol, pauli
-
+import os
 # =============================
 # PARAMETERS AND CONSTANTS
 # =============================
@@ -45,7 +45,8 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
     occupied_states = np.zeros((len(k_values), 2*nt), dtype=complex)
-    unocc_before_unfold_states = np.zeros((len(k_values), 2*nt), dtype=complex)
+    occupied_states_energy = np.zeros(len(k_values))
+    
     if E_0 == 0:
         static_val_eigval = np.zeros(len(k_values))
         static_con_eigval = np.zeros(len(k_values))
@@ -62,19 +63,21 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
         # print(static_con_eigval)
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state = floquet.winding_number(T,quasi_E = quasiE)
+            occ_state, occ_state_energy= floquet.winding_number(T,quasi_E = quasiE)
             occupied_states[i] = occ_state
+            occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
     else:
         for i in range(len(k_values)):
             k0 = k_values[i]
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state = floquet.winding_number(T,quasi_E = None, previous_state = previous[i])
+            occ_state, occ_state_energy = floquet.winding_number(T,quasi_E = None, previous_state = previous[i])
             occupied_states[i] = occ_state
+            occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
     
-    return occupied_states
+    return occupied_states, occupied_states_energy
 
 def unwrap_quasienergy(occupied_eigs, omega, T):
     """
@@ -107,12 +110,12 @@ def unwrap_quasienergy(occupied_eigs, omega, T):
 #     total_phase += np.round(np.angle(overlap), 5)
 #     total_phase = np.round(total_phase, 5)
 #     W_1 = total_phase % (2 * np.pi)/np.pi
-#     # W_2 = np.round(total_phase / (2 * np.pi)).astype(int)
+#     print(W_1)
 #     return W_1
 
 def berry_phase_winding(k_values, occupied_states, nt=61):
     """
-    Alternatively, compute the winding number via Berry phase accumulation.
+    Compute the winding number via Berry phase accumulation.
     This multiplies overlaps between successive eigenstates.
     """
     total_phase = 0.0
@@ -131,12 +134,28 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     # W_2 = np.round(total_phase / (2 * np.pi)).astype(int)
     return winding
 
+def figure(occ_state_energy, k_values):
+    save_folder = "Shuoyi's Flie/Floquet_Band_Plots"
+    os.makedirs(save_folder, exist_ok=True)  # Create folder if it doesn't exist
+    plt.figure(figsize=(8, 6))
+    plt.plot(k_values, occ_state_energy, label=f'E0 = {E0}, omega = {omega}')
+    plt.xlabel(r'$k$ values')
+    plt.ylabel(r'Quasienergies')
+    plt.title(f'Floquet Band Structure for E0 = {E0}, omega = {omega}')
+    plt.legend()
+    plt.grid()
+    # Save the figure
+    filename = f"{save_folder}/Floquet_Band_E0_{E0:.2f}_omega_{omega:.2f}.png"
+    plt.savefig(filename, dpi=300)
+    plt.close()  # Close the figure to free memory
+    
 # =============================
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 0.2, 4)       # Field amplitudes E0
-omega_values = np.linspace(2, 5, 4)        # Driving frequencies ω
+E0_values = np.linspace(0, 0.2, 10)       # Field amplitudes E0
+omega_values = 2
+# omega_values = np.linspace(2, 2, 1)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -146,34 +165,24 @@ v= 0.8
 w= 1.0
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
+
 # Loop over driving parameters:
 for j, omega in enumerate(omega_values):
     T = 2 * np.pi / omega  # period of the drive
     E0 = E0_values[0]
-    # static_val_eigval = np.zeros(len(k_values), dtype=complex)
-    # static_val_eigval = np.zeros(len(k_values))
-    # static_con_eigval = np.zeros(len(k_values))
-    # for i in range(len(k_values)):
-    #     k = k_values[i]
-    #     eigvals, eigvecs = np.linalg.eig(H0(k,v,w))
-    #     if eigvals[0].real > eigvals[-1].real:
-    #         eigvals = eigvals[::-1]  # Reverse the order
-    #         eigvecs = eigvecs[:, ::-1]
-    #         static_val_eigval[i] = eigvals[0]
-    #         static_con_eigval[i] = eigvals[1]
-    
-    # print(static_val_eigval)
-    # print(static_con_eigval)
-    # !!!!!!!!!!!!!!!    
-    occ_states = track_valence_band(k_values, T, E0, omega)
-    
+
+    occ_states, occ_state_energy= track_valence_band(k_values, T, E0, omega)
+    figure(occ_state_energy,k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
+    
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         # Track the valence Floquet band (quasienergies and eigenstates)
-        occ_states = track_valence_band(k_values, T, E0, omega, pre_occ)
+        occ_states, occ_state_energy = track_valence_band(k_values, T, E0, omega, pre_occ)
+        print(occ_states)
+        figure(occ_state_energy,k_values)
         # overlaps = np.array([np.abs(np.vdot(pre_occ, occ_states)), np.abs(np.vdot(pre_occ, unocc_states))])
         # new_index = np.argmax(overlaps)
         # if new_index == 0:
@@ -192,7 +201,7 @@ for j, omega in enumerate(omega_values):
         else: # Handle the NaN case (e.g., assign a default value or skip assignment)
             winding_map_berry_integer[i+1, j] = 0  # or some other appropriate value
             
-    print(f"Progress: {j+1}/{len(E0_values)}, elapsed time: {time.time() - start_time:.2f} sec")
+    print(f"Progress: {j+1}/{len(omega_values)}, elapsed time: {time.time() - start_time:.2f} sec")
 
 # =============================
 # PLOT THE PHASE DIAGRAM
