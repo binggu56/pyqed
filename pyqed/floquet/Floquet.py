@@ -582,21 +582,18 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
             for j in range(NF):
                 overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
                 # overlap[i] += np.conjugate(eigvecs[i,j]) * previous_state[j]
-            if np.abs(overlap[i]) < 0.05:
-                overlap[i]=0
-            else:
-                print(overlap[i])
-        print(overlap) 
+            # if np.abs(overlap[i]) < 0.05:
+            #     overlap[i]=0
+            # else:
+            #     print(overlap[i])
         idx = np.argsort(abs(overlap))
 
-        # occ_state = eigvecs[:,idx[-1]]
-        # occ_state_energy = eigvals[idx[-1]]  # might needed for winding number calculation
-        occ_state = np.zeros((1,len(eigvecs[0])))
-        occ_state_energy = 0
-        for i in range(len(overlap)):
-            # occ_state += eigvecs[:,i]*overlap[i]
-            occ_state_energy += eigvals[i] * overlap[i]**2
-        # occ_state /=np.linalg.norm(occ_state)
+        occ_state = eigvecs[:,idx[-1]]
+        occ_state_energy = eigvals[idx[-1]]
+        # for i in range(len(overlap)):
+        #     # occ_state += eigvecs[:,i]*overlap[i]
+        #     occ_state_energy += eigvals[i] * overlap[i]**2
+        # # occ_state /=np.linalg.norm(occ_state)
         
         return occ_state, occ_state_energy
 

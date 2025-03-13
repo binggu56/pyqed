@@ -9,12 +9,12 @@ import os
 # =============================
 # PARAMETERS AND CONSTANTS
 # =============================
-a = 3.0                # Lattice constant (Bohr radii)
+a = 1                # Lattice constant (Bohr radii)
 epsilon_A = 0       # On-site energy for A (Hartrees)
 epsilon_B = 0       # On-site energy for B (Hartrees)
 h_bar = 1.0            # Planck constant (atomic units)
 n_time_slices = 500   # Number of time slices in one period
-n_kpoints = 100        # Number of k-points along BZ
+n_kpoints = 200        # Number of k-points along BZ
 
 # =============================
 # FLOQUET HAMILTONIAN MODULE
@@ -24,8 +24,11 @@ def self_Hamiltonian():
     return np.array([[0,0],[0,0]], dtype=complex)
 
 def H0(k, v, w):
-    return np.array([[0, v + w * np.exp(-1j * k)],
-                     [v + w * np.exp(1j * k), 0]])
+    # return np.array([[0, v + w * np.exp(-1j * k)],
+    #                  [v + w * np.exp(1j * k), 0]])
+    H = np.array([[0, v + w * np.exp(-1j * k)],
+                  [v + w * np.exp(1j * k), -0]])
+    return H
 
 def H1(k):
     return np.array([[0, (np.exp(-1j * k))],
@@ -47,7 +50,7 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
     """
     E_0 = E0
     occupied_eigs = np.zeros(len(k_values))
-    occupied_states = np.zeros((len(k_values), 2*nt), dtype=complex)
+    occupied_states = np.zeros((2*nt, len(k_values)), dtype=complex)
     occupied_states_energy = np.zeros(len(k_values))
     
     if E_0 == 0:
@@ -55,7 +58,7 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
         static_con_eigval = np.zeros(len(k_values))
         for i in range(len(k_values)):
             k0 = k_values[i]
-            eigvals, eigvecs = np.linalg.eig(H0(k0,v,w))
+            eigvals, eigvecs = linalg.eig(H0(k0,v,w))
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
                 eigvecs = eigvecs[:, ::-1]
@@ -67,7 +70,7 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
             occ_state, occ_state_energy= floquet.winding_number(T,quasi_E = quasiE)
-            occupied_states[i] = occ_state
+            occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
     else:
@@ -75,8 +78,8 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
             k0 = k_values[i]
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number(T,quasi_E = None, previous_state = previous[i])
-            occupied_states[i] = occ_state
+            occ_state, occ_state_energy = floquet.winding_number(T,quasi_E = None, previous_state = previous[:,i])
+            occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
     
@@ -101,39 +104,29 @@ def unwrap_quasienergy(occupied_eigs, omega, T):
 # =============================
 # WINDING NUMBER CALCULATION
 # =============================
-
-# def berry_phase_winding(k_values, occupied_states):
-#     total_phase = 0.0
-#     N = len(k_values)
-#     for i in range(N - 1):
-#         overlap = np.vdot(occupied_states[i], occupied_states[i+1])
-#         total_phase += np.round(np.angle(overlap), 5)
-#     # Also close the loop (k=-pi and k=pi are identified)
-#     overlap = np.vdot(occupied_states[-1], occupied_states[0])
-#     total_phase += np.round(np.angle(overlap), 5)
-#     total_phase = np.round(total_phase, 5)
-#     W_1 = total_phase % (2 * np.pi)/np.pi
-#     print(W_1)
-#     return W_1
-
 def berry_phase_winding(k_values, occupied_states, nt=61):
     """
     Compute the winding number via Berry phase accumulation.
     This multiplies overlaps between successive eigenstates.
     """
-    total_phase = 0.0
     N = len(k_values)
     # create a N by N matrix projector (need to be able to multiply other N by N matrices)
-    Projector = np.eye(2*nt, dtype=complex)
-    for i in range(N):
-        Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
+    # Projector = np.eye(2*nt, dtype=complex)
+    occupied_states[:,0]/=np.linalg.norm(occupied_states[:,0])
+    Projector = np.outer(occupied_states[:,0],np.conj(occupied_states[:,0]))
+    for i in range(N-1):
+        occ_i = occupied_states[:,i+1]
+        occ_i /= np.linalg.norm(occ_i)
+        Projector = np.dot(Projector, np.outer(occ_i, np.conj(occ_i)))
+        # Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
         # print(Projector)
     # Projector @= np.outer(occupied_states[0], np.conj(occupied_states[0]))
-    winding = np.trace(Projector)
-    winding = np.round(np.angle(winding), 5)
-    # Module by pi to get the winding number
+    print(np.trace(Projector))
+    winding = np.round(np.angle(np.trace(Projector)), 5)
+    
     winding = winding % (2*np.pi) / np.pi
     print(winding)
+    
     # W_2 = np.round(total_phase / (2 * np.pi)).astype(int)
     return winding
 
@@ -156,7 +149,7 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 0.1, 100)       # Field amplitudes E0
+E0_values = np.linspace(0, 1, 10)       # Field amplitudes E0
 omega_values = np.linspace(5, 6, 2)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
@@ -164,7 +157,7 @@ winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
 v= 0.8
-w= 1.0
+w= 1.2
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
 
@@ -179,6 +172,20 @@ for j, omega in enumerate(omega_values):
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
     
+    #alternative way to calculate the berry phase
+    eigvec = np.zeros((2,len(k_values)),dtype=complex)
+    # for m , k0 in enumerate(k_values):
+    for m in range(len(k_values)):
+        k = k_values[m]        
+        eigvals, eigvecs = linalg.eigh(H0(k,v,w))
+        # eigvecs=eigvecs.T
+        # print(eigvecs)
+        # idx = np.argsort(eigvals)
+        # eigvec[:,m] = eigvecs[:,idx[0]]
+        eigvec[:,m] = eigvecs[:, np.argmin(eigvals)]
+        print(eigvec[:,m])
+    W_berry_reference= berry_phase_winding(k_values,eigvec,1)
+    print('refernece value is', W_berry_real)    
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         # Track the valence Floquet band (quasienergies and eigenstates)
@@ -194,7 +201,7 @@ for j, omega in enumerate(omega_values):
             winding_map_berry_integer[i+1, j] = round(W_berry_real) 
         else: # Handle the NaN case (e.g., assign a default value or skip assignment)
             winding_map_berry_integer[i+1, j] = 0  # or some other appropriate value
-            
+        pre_occ = occ_states
     print(f"Progress: {j+1}/{len(omega_values)}, elapsed time: {time.time() - start_time:.2f} sec")
     time.sleep(2) 
 # =============================
