@@ -423,7 +423,7 @@ def HamiltonFT(H0, H1, n):
 
 
 
-def HamiltonFT(H0, H1, delta):
+def _HamiltonFT(H0, H1, delta):
     """
     Example placeholder for your actual HamiltonFT(...) function,
     which returns H0 + H1*(delta==±1) or something similar.

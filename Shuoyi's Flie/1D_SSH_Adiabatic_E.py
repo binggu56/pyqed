@@ -24,15 +24,13 @@ def self_Hamiltonian():
     return np.array([[0,0],[0,0]], dtype=complex)
 
 def H0(k, v, w):
-    # return np.array([[0, v + w * np.exp(-1j * k)],
-    #                  [v + w * np.exp(1j * k), 0]])
     H = np.array([[0, v + w * np.exp(-1j * k)],
-                  [v + w * np.exp(1j * k), -0]])
+                  [v + w * np.exp(1j * k), 0]], dtype=complex)
     return H
 
 def H1(k):
-    return np.array([[0, (np.exp(-1j * k))],
-                     [(np.exp(1j * k)), 0]])
+    return np.array([[-(np.exp(-1j * k)), 0],
+                     [0, (np.exp(1j * k))]], dtype=complex)
 # def H1(k):
 #     return np.array([[0, (-1+np.exp(-1j * k))],
 #                      [(-1+np.exp(1j * k)), 0]])
@@ -149,8 +147,8 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 1, 10)       # Field amplitudes E0
-omega_values = np.linspace(5, 6, 2)        # Driving frequencies ω
+E0_values = np.linspace(0, 3, 151)       # Field amplitudes E0
+omega_values = np.linspace(0.2,1, 9)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -183,7 +181,7 @@ for j, omega in enumerate(omega_values):
         # idx = np.argsort(eigvals)
         # eigvec[:,m] = eigvecs[:,idx[0]]
         eigvec[:,m] = eigvecs[:, np.argmin(eigvals)]
-        print(eigvec[:,m])
+        # print(eigvec[:,m])
     W_berry_reference= berry_phase_winding(k_values,eigvec,1)
     print('refernece value is', W_berry_real)    
     for i in range(len(E0_values)-1):
@@ -203,7 +201,7 @@ for j, omega in enumerate(omega_values):
             winding_map_berry_integer[i+1, j] = 0  # or some other appropriate value
         pre_occ = occ_states
     print(f"Progress: {j+1}/{len(omega_values)}, elapsed time: {time.time() - start_time:.2f} sec")
-    time.sleep(2) 
+    # time.sleep(2) 
 # =============================
 # PLOT THE PHASE DIAGRAM
 # =============================
