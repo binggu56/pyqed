@@ -630,11 +630,11 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
         Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
-        for i in range(Nt):
+        for i in range(Nt-1):
             if i % 2 == 0:
-                Hn[i] *= jv(i,A)*np.cos(B)
+                Hn[i+1] *= jv(i,A)*np.cos(B)
             if i % 2 == 1:
-                Hn[i] *= 1j * jv(i,A)*np.sin(B)
+                Hn[i+1] *= 1j * jv(i,A)*np.sin(B)
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)
@@ -676,11 +676,11 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
         Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
-        for i in range(Nt):
+        for i in range(Nt-1):
             if i % 2 == 0:
-                Hn[i] *= jv(i,A)*np.cos(B)
+                Hn[i+1] *= jv(i,A)*np.cos(B)
             if i % 2 == 1:
-                Hn[i] *= 1j * jv(i,A)*np.sin(B)
+                Hn[i+1] *= 1j * jv(i,A)*np.sin(B)
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)
