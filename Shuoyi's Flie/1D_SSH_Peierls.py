@@ -67,7 +67,7 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
         # print(static_con_eigval)
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy= floquet.winding_number(T,quasi_E = quasiE)
+            occ_state, occ_state_energy= floquet.winding_number_Peierls(T, k0, quasi_E = quasiE)
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
@@ -76,7 +76,7 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
             k0 = k_values[i]
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number(T,quasi_E = None, previous_state = previous[:,i])
+            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = None, previous_state = previous[:,i])
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
             # unocc_before_unfold_states [i] = unocc_states
@@ -132,8 +132,8 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 3, 151)       # Field amplitudes E0
-omega_values = np.linspace(0.2,1, 9)        # Driving frequencies ω
+E0_values = np.linspace(0, 3, 2)       # Field amplitudes E0
+omega_values = np.linspace(0.2,1, 2)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
