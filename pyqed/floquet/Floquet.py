@@ -630,6 +630,7 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
         Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
+        Hn[0] = H0
         for i in range(Nt-1):
             if i % 2 == 0:
                 Hn[i+1] *= jv(i,A)*np.cos(B)
@@ -676,6 +677,7 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
         Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
+        Hn[0] = H0
         for i in range(Nt-1):
             if i % 2 == 0:
                 Hn[i+1] *= jv(i,A)*np.cos(B)
