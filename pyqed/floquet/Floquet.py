@@ -104,13 +104,12 @@ class Floquet:
         occ_state, occ_state_energy = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
         return occ_state, occ_state_energy
     
-    def winding_number_Peierls(self, T, k, quasi_E = None, previous_state = None, gauge='length'): # To be modified
+    def winding_number_Peierls(self, T, k, quasi_E = None, previous_state = None, gauge='length',w=0.2): # To be modified
         H0 = self.H
         E0 = self.E0
         nt = self.nt 
         omegad = self.omegad
-            
-        occ_state, occ_state_energy = Floquet_Winding_number_Peierls(H0, k, nt, omegad, T, E0, quasi_E, previous_state)
+        occ_state, occ_state_energy = Floquet_Winding_number_Peierls(H0, k, nt, omegad, T, E0, quasi_E, previous_state, w=w)
         return occ_state, occ_state_energy
 
     def velocity_to_length(self):
@@ -610,7 +609,7 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
         return occ_state, occ_state_energy
 
 
-def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previous_state = None, w = 1.2):
+def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previous_state = None, w = 0.2):
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
