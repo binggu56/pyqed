@@ -20,26 +20,20 @@ n_kpoints = 200        # Number of k-points along BZ
 # FLOQUET HAMILTONIAN MODULE
 # =============================
 
-def self_Hamiltonian():
-    return np.array([[0,0],[0,0]], dtype=complex)
-
-def H0(k, v, w):
-    H = np.array([[0, v + w * np.exp(-1j * k)],
-                  [v + w * np.exp(1j * k), 0]], dtype=complex)
+def H0(k,v,w):
+    H = np.array([[0, v],
+                  [v, 0]], dtype=complex)
     return H
 
 def H1(k):
-    return np.array([[-(np.exp(-1j * k)), 0],
-                     [0, (np.exp(1j * k))]], dtype=complex)
-# def H1(k):
-#     return np.array([[0, (-1+np.exp(-1j * k))],
-#                      [(-1+np.exp(1j * k)), 0]])
+    return np.array([[0, (-1+np.exp(-1j * k))],
+                     [(-1+np.exp(1j * k)), 0]], dtype=complex)
 
 
 # =============================
 # BAND TRACKING MODULE
 # =============================
-def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0, nt=61):
+def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.2, nt=61):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -56,21 +50,19 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
         static_con_eigval = np.zeros(len(k_values))
         for i in range(len(k_values)):
             k0 = k_values[i]
-            eigvals, eigvecs = linalg.eig(H0(k0,v,w))
+            H_0 = H0(k0, v, w) + np.array([[0, w*np.exp(-1j*k0)], [w*np.exp(1j*k0), 0]], dtype=complex)
+            eigvals, eigvecs = linalg.eig(H_0)
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
                 eigvecs = eigvecs[:, ::-1]
                 static_val_eigval[i] = eigvals[0]
                 static_con_eigval[i] = eigvals[1]
             quasiE = eigvals[0]
-        # print(static_val_eigval)
-        # print(static_con_eigval)
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
             occ_state, occ_state_energy= floquet.winding_number_Peierls(T, k0, quasi_E = quasiE)
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
-            # unocc_before_unfold_states [i] = unocc_states
     else:
         for i in range(len(k_values)):
             k0 = k_values[i]
@@ -79,7 +71,6 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.8, w = 1.0
             occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = None, previous_state = previous[:,i])
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
-            # unocc_before_unfold_states [i] = unocc_states
     
     return occupied_states, occupied_states_energy
 
@@ -101,21 +92,15 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
         occ_i = occupied_states[:,i+1]
         occ_i /= np.linalg.norm(occ_i)
         Projector = np.dot(Projector, np.outer(occ_i, np.conj(occ_i)))
-        # Projector @= np.outer(occupied_states[i], np.conj(occupied_states[i]))
-        # print(Projector)
-    # Projector @= np.outer(occupied_states[0], np.conj(occupied_states[0]))
-    print(np.trace(Projector))
     winding = np.round(np.angle(np.trace(Projector)), 5)
     
     winding = winding % (2*np.pi) / np.pi
     print(winding)
-    
-    # W_2 = np.round(total_phase / (2 * np.pi)).astype(int)
     return winding
 
 def figure(occ_state_energy, k_values):
     save_folder = "Shuoyi's Flie/Floquet_Band_Plots"
-    os.makedirs(save_folder, exist_ok=True)  # Create folder if it doesn't exist
+    os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
     plt.plot(k_values, occ_state_energy, label=f'E0 = {E0}, omega = {omega}')
     plt.xlabel(r'$k$ values')
@@ -126,14 +111,14 @@ def figure(occ_state_energy, k_values):
     # Save the figure
     filename = f"{save_folder}/Floquet_Band_omega_{omega:.2f}_E0_{E0:.2f}.png"
     plt.savefig(filename, dpi=300)
-    plt.close()  # Close the figure to free memory
+    plt.close()  
     
 # =============================
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 3, 2)       # Field amplitudes E0
-omega_values = np.linspace(0.2,1, 2)        # Driving frequencies ω
+E0_values = np.linspace(0, 1, 101)       # Field amplitudes E0
+omega_values = np.linspace(1,3, 3)        # Driving frequencies ω
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -141,15 +126,17 @@ winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
 v= 0.8
 w= 1.2
+nt = 61
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
+# k_values = np.linspace(0, 2*np.pi / a, n_kpoints)
 k_values = np.linspace(-np.pi / a, np.pi / a, n_kpoints)
 
 # Loop over driving parameters:
 for j, omega in enumerate(omega_values):
-    T = 2 * np.pi / omega  # period of the drive
+    T = 2 * np.pi / omega  
     E0 = E0_values[0]
 
-    occ_states, occ_state_energy= track_valence_band(k_values, T, E0, omega)
+    occ_states, occ_state_energy= track_valence_band(k_values, T, E0, omega, v = v, w = w, nt = nt)
     figure(occ_state_energy,k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
@@ -159,25 +146,21 @@ for j, omega in enumerate(omega_values):
     eigvec = np.zeros((2,len(k_values)),dtype=complex)
     # for m , k0 in enumerate(k_values):
     for m in range(len(k_values)):
-        k = k_values[m]        
-        eigvals, eigvecs = linalg.eigh(H0(k,v,w))
+        k = k_values[m]       
+        H_0 = H0(k,v,w) + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) 
+        eigvals, eigvecs = linalg.eigh(H_0)
         # eigvecs=eigvecs.T
-        # print(eigvecs)
         # idx = np.argsort(eigvals)
         # eigvec[:,m] = eigvecs[:,idx[0]]
         eigvec[:,m] = eigvecs[:, np.argmin(eigvals)]
-        # print(eigvec[:,m])
     W_berry_reference= berry_phase_winding(k_values,eigvec,1)
     print('refernece value is', W_berry_real)    
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         # Track the valence Floquet band (quasienergies and eigenstates)
-        occ_states, occ_state_energy = track_valence_band(k_values, T, E0, omega, pre_occ)
+        occ_states, occ_state_energy = track_valence_band(k_values, T, E0, omega, pre_occ, v = v, w = w, nt = nt)
         figure(occ_state_energy,k_values)
         W_berry_real = berry_phase_winding(k_values, occ_states)
-
-        # We can use either method; here we store the energy-based winding number.
-        # winding_map_energy[i, j] = W_energy
         winding_map_berry_real[i+1, j] = W_berry_real
         
         if not np.isnan(W_berry_real):  # Ensure W_berry_real is a valid number 
@@ -186,7 +169,6 @@ for j, omega in enumerate(omega_values):
             winding_map_berry_integer[i+1, j] = 0  # or some other appropriate value
         pre_occ = occ_states
     print(f"Progress: {j+1}/{len(omega_values)}, elapsed time: {time.time() - start_time:.2f} sec")
-    # time.sleep(2) 
 # =============================
 # PLOT THE PHASE DIAGRAM
 # =============================

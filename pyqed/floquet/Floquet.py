@@ -109,8 +109,6 @@ class Floquet:
         E0 = self.E0
         nt = self.nt 
         omegad = self.omegad
-        nt = self.nt 
-        omegad = self.omegad
             
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls(H0, k, nt, omegad, T, E0, quasi_E, previous_state)
         return occ_state, occ_state_energy
@@ -438,12 +436,11 @@ def HamiltonFT(H0, H1, n):
 
 def HamiltonFT_peierls(Hn, n):
     """
-    H(t) = H0 + [[0,1],[1,0]]* 2 * t_AB * cos (a/2 *(k-E_0/w * sin(w*t)))
+    H(t) is SSH model with k replaced by k - E_0/w * sin(wt) by Peierls substitution
     Use Jacobi-Anger expansion to construct the Hamiltonian in extended space
     """
-    # For demonstration: a 2x2 matrix that depends on delta
-    # You should replace with your actual HamiltonFT logic.
-    Norbs = Hn[1].shape[-1]
+
+    Norbs = Hn[0].shape[-1]
     if n >= 0:
         return Hn[n]
     
@@ -613,29 +610,32 @@ def Floquet_Winding_number(H0, H1, Nt, omega, T, E ,quasiE = None, previous_stat
         return occ_state, occ_state_energy
 
 
-def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previous_state = None):
+def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previous_state = None, w = 1.2):
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
     choose the correct Floquet branch if E = 0 (by comparing with the directly diagonalized energies)
     if E != 0, choose the correct branch by doing overlap with the previous state.
 
-    H(t) = H0 + [[0,1],[1,0]]* 2 * t_AB * cos (a/2 *(k-E_0/w * sin(w*t))) for 2 orbital system
+    H(t) is SSH model with k replaced by k - E_0/w * sin(wt) by Peierls substitution
     """
     a = 1 #lattice constant, need to be modifyed accordingly, later need to be included into the variables
-    A = E * a/2/omega
+    A = E /omega
     B = a* k /2
     if E == 0:
         Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
-        Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
-        Hn[0] = H0
-        for i in range(Nt-1):
-            if i % 2 == 0:
-                Hn[i+1] *= jv(i,A)*np.cos(B)
-            if i % 2 == 1:
-                Hn[i+1] *= 1j * jv(i,A)*np.sin(B)
+
+        # Hn = [np.array([[0, 0], [0, 0]], dtype=complex) for a in range(Nt)]
+        # Hn[0] = H0 + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex)
+
+        Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
+        for i in range(Nt):
+            Hn[i][0][1] *= jv(-i,A)
+            Hn[i][1][0] *= jv(i,A)
+        Hn[0] += H0
+
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)
@@ -676,13 +676,11 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
         NF = Norbs * Nt           # dimension of Floquet matrix
         N0 = -(Nt-1)//2           # shift for Fourier indices
-        Hn = [np.array([[0, 1], [1, 0]], dtype=complex) for a in range(Nt)]
-        Hn[0] = H0
-        for i in range(Nt-1):
-            if i % 2 == 0:
-                Hn[i+1] *= jv(i,A)*np.cos(B)
-            if i % 2 == 1:
-                Hn[i+1] *= 1j * jv(i,A)*np.sin(B)
+        Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
+        for i in range(Nt):
+            Hn[i][0][1] *= jv(-i,A)
+            Hn[i][1][0] *= jv(i,A)
+        Hn[0] += H0
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)
@@ -745,4 +743,4 @@ if __name__ == '__main__':
     qe, fmodes = mol.spectrum(0.4, omegad = 1, nt=10, gauge='length')
     print(qe)
     # qe, fmodes = dmol.spectrum(E0=0.4, Nt=10, gauge='velocity')
-    # print(qe)、、
+    # print(qe)
