@@ -35,7 +35,8 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_small"  # Replace with your desired path
+# custom_root_directory = "Shuoyi's Flie/data_small"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/data"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -144,12 +145,13 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-# E0_values = np.linspace(0, 0.2, 401)       # Field amplitudes E0 in 
+E0_values = np.linspace(0, 0.2, 401)       # Field amplitudes E0 in 
 # omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
-# omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 
-E0_values = np.linspace(0, 0.01, 1001)       # Field amplitudes E0 in 
-omega_values = np.linspace(0.018,0.020,3)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+omega_values = np.linspace(0.03,0.1,29)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+
+# E0_values = np.linspace(0, 0.01, 1001)       # Field amplitudes E0 in 
+# omega_values = np.linspace(0.018,0.020,3)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
@@ -221,3 +223,20 @@ plt.tight_layout()
 plt.show()
 
 
+plt.figure(figsize=(8, 6))
+
+# Loop over each omega column
+for j, omega in enumerate(omega_values):
+    # Remap each E₀ value to E₀/ω for the current column
+    y_coords = E0_values / omega  
+    # Create an array of the same size as E0_values filled with the current omega value (x-coordinate)
+    x_coords = np.full_like(E0_values, omega)
+    # Plot each point. Adjust marker size 's' as needed.
+    plt.scatter(x_coords, y_coords, c=winding_map_berry_real[:, j], cmap='viridis', marker='s', s=5)
+
+plt.xlabel('Driving Frequency ω')
+plt.ylabel('Field Amplitude / ω')
+plt.title('Winding Number (Real): E₀/ω vs ω')
+cbar = plt.colorbar()
+cbar.set_label('Winding Number')
+plt.show()

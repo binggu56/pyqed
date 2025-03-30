@@ -11,31 +11,28 @@ import h5py
 # PARAMETERS AND CONSTANTS
 # =============================
 a = 1                # Lattice constant (Bohr radii)
-# a = 8                # Lattice constant (Bohr radii)
-epsilon_A = 0       # On-site energy for A (Hartrees)
-epsilon_B = 0       # On-site energy for B (Hartrees)
 h_bar = 1.0            # Planck constant (atomic units)
 n_time_slices = 500   # Number of time slices in one period
 n_kpoints = 200        # Number of k-points along BZ
-
+start_time = time.time()
 # =============================
 # FLOQUET HAMILTONIAN MODULE
 # =============================
 
-def H0(k,v,w):
-    H = np.array([[0, v],
-                  [v, 0]], dtype=complex)
+def H0(k,r):
+    H = np.array([[0, -1.3 * r - 0.7 * np.exp(-1j * k)],
+                    [-1.3 * r - 0.7 * np.exp(1j * k), 0]], dtype=complex)
     return H
 
-def H1(k):
-    return np.array([[0, (np.exp(-1j * k))],
-                     [(np.exp(1j * k)), 0]], dtype=complex)
+def H1(k,r):
+    return np.array([[0, (np.exp(-1j * k))*r],
+                     [(np.exp(1j * k))*r, 0]], dtype=complex)
 
 # =============================
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_small"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/data_Dallago_2015"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -55,7 +52,7 @@ def load_data_from_hdf5(filename):
 # =============================
 # BAND TRACKING MODULE (Modified)
 # =============================
-def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.2, nt=61, filename=None):
+def track_valence_band(k_values, T, E0, omega, previous = None, r=1, nt=61, filename=None):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -75,23 +72,23 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.
     if E_0 == 0:
         for i in range(len(k_values)):
             k0 = k_values[i]
-            H_0 = H0(k0, v, w) + np.array([[0, w*np.exp(-1j*k0)], [w*np.exp(1j*k0), 0]], dtype=complex)
+            H_0 = H0(k0, r)
             eigvals, eigvecs = linalg.eig(H_0)
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
                 eigvecs = eigvecs[:, ::-1]
             quasiE = eigvals[0]
-            mol = Mol(H0(k0, v, w), H1(k0))
+            mol = Mol(H0(k0, r), H1(k0,r))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE, w=w)
+            occ_state, occ_state_energy = floquet.winding_number(T, quasi_E = quasiE)
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
     else:
         for i in range(len(k_values)):
             k0 = k_values[i]
-            mol = Mol(H0(k0, v, w), H1(k0))
+            mol = Mol(H0(k0, r), H1(k0,r))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous[:,i], w=w)
+            occ_state, occ_state_energy = floquet.winding_number(T, quasi_E = None, previous_state = previous[:,i])
             occupied_states[:,i] = occ_state
             occupied_states_energy[i] = occ_state_energy
     
@@ -126,7 +123,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     return winding
 
 def figure(occ_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/Floquet_Band_Plots"
+    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Dallago_2015"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
     plt.plot(k_values, occ_state_energy, label=f'E0 = {E0}, omega = {omega}')
@@ -148,16 +145,15 @@ def figure(occ_state_energy, k_values):
 # omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 # omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 
-E0_values = np.linspace(0, 0.01, 1001)       # Field amplitudes E0 in 
-omega_values = np.linspace(0.018,0.020,3)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+E0_values = np.linspace(0, 2, 201)       # Field amplitudes E0 in 
+omega_values = np.linspace(0.8,4.2,35)     
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
-v= 0.15
-w= 0.2
-nt = 61
+r = 1
+nt= 61
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(0, 2*np.pi / a, n_kpoints)
 k_values[0]=1e-4
@@ -169,7 +165,7 @@ for j, omega in enumerate(omega_values):
     # Construct the filename with the custom path and E0, omega values
     data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
 
-    occ_states, occ_state_energy, draw = track_valence_band(k_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
+    occ_states, occ_state_energy, draw = track_valence_band(k_values, T, E0, omega, r=1, nt=nt, filename=data_filename)
     if draw == True:
         figure(occ_state_energy, k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
@@ -179,7 +175,7 @@ for j, omega in enumerate(omega_values):
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
-        occ_states, occ_state_energy, draw = track_valence_band(k_values, T, E0, omega, pre_occ, v=v, w=w, nt=nt, filename=data_filename)
+        occ_states, occ_state_energy, draw = track_valence_band(k_values, T, E0, omega, previous=pre_occ, r=1, nt=nt, filename=data_filename)
         if draw == True:
             figure(occ_state_energy, k_values)
         W_berry_real = berry_phase_winding(k_values, occ_states)
@@ -190,6 +186,7 @@ for j, omega in enumerate(omega_values):
         else:
             winding_map_berry_integer[i+1, j] = 0
         pre_occ = occ_states
+    print(f"Completed {j+1}/{len(omega_values)} calculations, time elapsed: {time.time() - start_time:.2f} seconds")
 
 # =============================
 # PLOT THE PHASE DIAGRAM
