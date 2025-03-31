@@ -7,12 +7,10 @@ import sys
 from pyqed import Mol, pauli
 import os
 import h5py
-from scipy.special import jv
 # =============================
 # PARAMETERS AND CONSTANTS
 # =============================
 a = 1                # Lattice constant (Bohr radii)
-b = 0.5              # Distance between A and B sites on one side
 # a = 8                # Lattice constant (Bohr radii)
 epsilon_A = 0       # On-site energy for A (Hartrees)
 epsilon_B = 0       # On-site energy for B (Hartrees)
@@ -24,16 +22,20 @@ n_kpoints = 200        # Number of k-points along BZ
 # FLOQUET HAMILTONIAN MODULE
 # =============================
 
+def H0(k,v,w):
+    H = np.array([[0, v],
+                  [v, 0]], dtype=complex)
+    return H
 
 def H1(k):
-    return np.array([[0, 0],
-                     [0, 0]], dtype=complex)
+    return np.array([[0, (np.exp(-1j * k))],
+                     [(np.exp(1j * k)), 0]], dtype=complex)
 
 # =============================
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_Gomez_Leon_2013"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/data_small"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -53,7 +55,7 @@ def load_data_from_hdf5(filename):
 # =============================
 # BAND TRACKING MODULE (Modified)
 # =============================
-def track_valence_band(k_values, E0_over_omega, previous = None, v = 0.15, w = 0.2, nt=61, filename=None, b=0.5, t=1):
+def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.2, nt=61, filename=None):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -63,48 +65,47 @@ def track_valence_band(k_values, E0_over_omega, previous = None, v = 0.15, w = 0
     if filename and os.path.exists(filename):
         print(f"Loading data from {filename}...")
         occupied_states, occupied_states_energy = load_data_from_hdf5(filename)
-        return occupied_states, occupied_states_energy, False
+        return occupied_states, occupied_states_energy, True
         
-    omega = 100
-    E_0 = E0_over_omega * omega
+    
+    E_0 = E0
     occupied_states = np.zeros((2*nt, len(k_values)), dtype=complex)
     occupied_states_energy = np.zeros(len(k_values))
+    conduction_states = np.zeros((2*nt, len(k_values)), dtype=complex)
+    conduction_states_energy = np.zeros(len(k_values))
     
-    if E0_over_omega == 0:
+    if E_0 == 0:
         for i in range(len(k_values)):
             k0 = k_values[i]
-            # H_0 = np.array([[0, t*np.exp(-1j*k0*b)*jv(0, E0_over_omega*b)+ np.exp(1j*k0*(1-b))*jv(0, E0_over_omega*(1-b))],
-            #                 [t*np.exp(1j*k0*b)*jv(0, E0_over_omega*b)+ np.exp(-1j*k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
-            H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
-                            [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
+            H_0 = H0(k0, v, w) + np.array([[0, w*np.exp(-1j*k0)], [w*np.exp(1j*k0), 0]], dtype=complex)
             eigvals, eigvecs = linalg.eig(H_0)
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
                 eigvecs = eigvecs[:, ::-1]
             quasiE = eigvals[0]
-            mol = Mol(H_0, H1(k0))
+            mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E = quasiE, w=w, t=t, b=b, E_over_omega=E0_over_omega)
+            occ_state, occ_state_energy, con_state, con_state_energy = floquet.winding_number_Peierls_2(T, k0, quasi_E = quasiE, w=w)
             occupied_states[:,i] = occ_state
+            conduction_states[:,i] = con_state
             occupied_states_energy[i] = occ_state_energy
+            conduction_states_energy[i] = con_state_energy
     else:
         for i in range(len(k_values)):
             k0 = k_values[i]
-            # H_0 = np.array([[0, t*np.exp(-1j*k0*b)*jv(0, E0_over_omega*b)+ np.exp(1j*k0*(1-b))*jv(0, E0_over_omega*(1-b))], 
-            #                 [t*np.exp(1j*k0*b)*jv(0, E0_over_omega*b)+ np.exp(-1j*k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
-            H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
-                            [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
-            mol = Mol(H_0, H1(k0))
+            mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous[:,i], w=w, b=b, t=t, E_over_omega=E0_over_omega)
+            occ_state, occ_state_energy, con_state, con_state_energy = floquet.winding_number_Peierls_2(T, k0, quasi_E=None, previous_state=previous[:,i], w=w)
             occupied_states[:,i] = occ_state
+            conduction_states[:,i] = con_state
             occupied_states_energy[i] = occ_state_energy
+            conduction_states_energy[i] = con_state_energy
     
     # Save the computed data to a file for future use
     if filename:
-        save_data_to_hdf5(filename, occupied_states, occupied_states_energy)
+        save_data_to_hdf5(filename, occupied_states, occupied_states_energy, conduction_states, conduction_states_energy)
     
-    return occupied_states, occupied_states_energy, True
+    return occupied_states, occupied_states_energy, conduction_states, conduction_states_energy, True
 
 
 # =============================
@@ -130,18 +131,19 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     print(winding)
     return winding
 
-def figure(occ_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Gomez_Leon_2013"
+def figure(occ_state_energy, con_state_energy, k_values):
+    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Both_bands"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
-    plt.plot(k_values, occ_state_energy, label=f'E0_over_omega = {E0_over_omega:.6f}, b = {b:.2f},t = {t:.2f}')
+    plt.plot(k_values, occ_state_energy, label=f'E0 = {E0}, omega = {omega}')
+    plt.plot(k_values, con_state_energy, label=f'Conduction band', linestyle='--')
     plt.xlabel(r'$k$ values')
     plt.ylabel(r'Quasienergies')
-    plt.title(f'Floquet Band Structure for E0_over_omega = {E0_over_omega:.6f}_b = {b:.3f}')
+    plt.title(f'Floquet Band Structure for E0 = {E0} (Hartrees), omega = {omega} in atomic units')
     plt.legend()
     plt.grid()
     # Save the figure
-    filename = f"{save_folder}/Floquet_Band_omega_{E0_over_omega:.6f}_b_{b:.3f}_t_{t:.2f}.png"
+    filename = f"{save_folder}/Floquet_Band_omega_{omega:.5f}_E0_{E0:.5f}.png"
     plt.savefig(filename, dpi=300)
     plt.close()  
     
@@ -149,47 +151,46 @@ def figure(occ_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-# E0_values = np.linspace(0, 0.2, 401)       # Field amplitudes E0 in 
-# omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+E0_values = np.linspace(0, 0.2, 401)       # Field amplitudes E0 in 
+omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 # omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
 
-# E0_values = np.linspace(0, 0.2, 201)       # Field amplitudes E0 in 
+# E0_values = np.linspace(0, 0.01, 1001)       # Field amplitudes E0 in 
 # omega_values = np.linspace(0.018,0.020,3)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
-E0_over_omega_values = np.linspace(0, 8, 201)       
-b_values = np.linspace(0, 1, 11)
 
-winding_map_energy = np.zeros((len(E0_over_omega_values), len(b_values)))
-winding_map_berry_real = np.zeros((len(E0_over_omega_values), len(b_values)))
-winding_map_berry_integer = np.zeros((len(E0_over_omega_values), len(b_values)))
+winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
+winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
+winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
-v= 0.15
-w= 0.2
+v= 0.8
+w= 1.2
+# v= 0.15
+# w= 0.2
 nt = 61
-t = 1.5
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(0, 2*np.pi / a, n_kpoints)
 k_values[0]=1e-4
 k_values[-1]=2*np.pi/a-1e-4
-for j, b in enumerate(b_values):
-    E0_over_omega = E0_over_omega_values[0]
-    b_values[j] = b
+for j, omega in enumerate(omega_values):
+    T = 2 * np.pi / omega  
+    E0 = E0_values[0]
     
     # Construct the filename with the custom path and E0, omega values
-    data_filename = os.path.join(custom_root_directory, f"data_E0_over_omega_{E0_over_omega:.6f}_b_{b:.3f}_t_{t:.2f}.h5")
+    data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
 
-    occ_states, occ_state_energy, draw = track_valence_band(k_values, E0_over_omega, v=v, w=w, nt=nt, filename=data_filename, b=b)
+    occ_states, occ_state_energy, conduction_state_energy, draw = track_valence_band(k_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
     if draw == True:
-        figure(occ_state_energy, k_values)
+        figure(occ_state_energy,conduction_state_energy, k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
 
-    for i in range(len(E0_over_omega_values)-1):
-        E0_over_omega = E0_over_omega_values[i+1]
-        data_filename = os.path.join(custom_root_directory, f"data_E0_over_omega_{E0_over_omega:.6f}_b_{b:.3f}.h5")
-        occ_states, occ_state_energy, draw = track_valence_band(k_values, E0_over_omega, pre_occ, v=v, w=w, nt=nt, filename=data_filename, b=b)
+    for i in range(len(E0_values)-1):
+        E0 = E0_values[i+1]
+        data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
+        occ_states, occ_state_energy, conduction_state_energy, draw = track_valence_band(k_values, T, E0, omega, pre_occ, v=v, w=w, nt=nt, filename=data_filename)
         if draw == True:
-            figure(occ_state_energy, k_values)
+            figure(occ_state_energy, conduction_state_energy, k_values)
         W_berry_real = berry_phase_winding(k_values, occ_states)
         winding_map_berry_real[i+1, j] = W_berry_real
         
@@ -207,25 +208,23 @@ fig, axs = plt.subplots(1, 2, figsize=(16, 6))
 
 # First subplot: Real winding number
 im0 = axs[0].imshow(winding_map_berry_real, aspect='auto', cmap='viridis',
-                    extent=[E0_over_omega_values[0], E0_over_omega_values[-1], b_values[0], b_values[-1]],
+                    extent=[omega_values[0], omega_values[-1], E0_values[0], E0_values[-1]],
                     origin='lower')
 cbar0 = fig.colorbar(im0, ax=axs[0])
 cbar0.set_label('Winding Number')
-axs[0].set_xlabel('b')
-axs[0].set_ylabel('E₀_over_ω')
+axs[0].set_xlabel('Driving Frequency ω')
+axs[0].set_ylabel('Field Amplitude E₀')
 axs[0].set_title('Winding Number: Real')
 
 # Second subplot: Integer winding number
 im1 = axs[1].imshow(winding_map_berry_integer, aspect='auto', cmap='viridis',
-                    extent=[E0_over_omega_values[0], E0_over_omega_values[-1], b_values[0], b_values[-1]],
+                    extent=[omega_values[0], omega_values[-1], E0_values[0], E0_values[-1]],
                     origin='lower')
 cbar1 = fig.colorbar(im1, ax=axs[1])
 cbar1.set_label('Winding Number')
-axs[1].set_xlabel('b')
-axs[1].set_ylabel('E₀_over_ω')
+axs[1].set_xlabel('Driving Frequency ω')
+axs[1].set_ylabel('Field Amplitude E₀')
 axs[1].set_title('Winding Number: Integer')
 
 plt.tight_layout()
 plt.show()
-
-
