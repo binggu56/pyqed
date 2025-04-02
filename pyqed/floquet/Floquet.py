@@ -775,7 +775,7 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
         for i in range(Nt):
             Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
             Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))
-        # Hn[0] = H0
+        Hn[0] = H0
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)

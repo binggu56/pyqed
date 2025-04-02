@@ -35,27 +35,31 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_small"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/data_SSH_both_bands"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
 
-def save_data_to_hdf5(filename, occupied_states, occupied_states_energy):
+def save_data_to_hdf5(filename, occupied_states, occupied_states_energy, conduction_states, conduction_states_energy):
     with h5py.File(filename, 'w') as f:
         f.create_dataset('occupied_states', data=occupied_states)
         f.create_dataset('occupied_states_energy', data=occupied_states_energy)
+        f.create_dataset('conduction_states', data=conduction_states)
+        f.create_dataset('conduction_states_energy', data=conduction_states_energy)
 
 def load_data_from_hdf5(filename):
     with h5py.File(filename, 'r') as f:
         occupied_states = f['occupied_states'][:]
         occupied_states_energy = f['occupied_states_energy'][:]
-    return occupied_states, occupied_states_energy
+        conduction_states = f['conduction_states'][:]
+        conduction_states_energy = f['conduction_states_energy'][:]
+    return occupied_states, occupied_states_energy, conduction_states, conduction_states_energy
 
 
 # =============================
 # BAND TRACKING MODULE (Modified)
 # =============================
-def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.2, nt=61, filename=None):
+def track_valence_band(k_values, T, E0, omega, previous_val = None, previous_con = None, v = 0.15, w = 0.2, nt=61, filename=None):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -64,14 +68,14 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.
     """
     if filename and os.path.exists(filename):
         print(f"Loading data from {filename}...")
-        occupied_states, occupied_states_energy = load_data_from_hdf5(filename)
-        return occupied_states, occupied_states_energy, True
+        occupied_states, occupied_states_energy, conduction_states, conduction_states_energy = load_data_from_hdf5(filename)
+        return occupied_states, occupied_states_energy, conduction_states, conduction_states_energy, False
         
     
     E_0 = E0
     occupied_states = np.zeros((2*nt, len(k_values)), dtype=complex)
-    occupied_states_energy = np.zeros(len(k_values))
     conduction_states = np.zeros((2*nt, len(k_values)), dtype=complex)
+    occupied_states_energy = np.zeros(len(k_values))
     conduction_states_energy = np.zeros(len(k_values))
     
     if E_0 == 0:
@@ -82,10 +86,12 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
                 eigvecs = eigvecs[:, ::-1]
-            quasiE = eigvals[0]
+            quasiE_val = eigvals[0]
+            quasiE_con = eigvals[1]
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy, con_state, con_state_energy = floquet.winding_number_Peierls_2(T, k0, quasi_E = quasiE, w=w)
+            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_val, w=w)
+            con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_con, w=w)
             occupied_states[:,i] = occ_state
             conduction_states[:,i] = con_state
             occupied_states_energy[i] = occ_state_energy
@@ -95,11 +101,18 @@ def track_valence_band(k_values, T, E0, omega, previous = None, v = 0.15, w = 0.
             k0 = k_values[i]
             mol = Mol(H0(k0, v, w), H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy, con_state, con_state_energy = floquet.winding_number_Peierls_2(T, k0, quasi_E=None, previous_state=previous[:,i], w=w)
-            occupied_states[:,i] = occ_state
-            conduction_states[:,i] = con_state
-            occupied_states_energy[i] = occ_state_energy
-            conduction_states_energy[i] = con_state_energy
+            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_val[:,i], w=w)
+            con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_con[:,i], w=w)
+            if occ_state_energy < con_state_energy:
+                occupied_states[:,i] = occ_state
+                conduction_states[:,i] = con_state
+                occupied_states_energy[i] = occ_state_energy
+                conduction_states_energy[i] = con_state_energy
+            else:
+                occupied_states[:,i] = con_state
+                conduction_states[:,i] = occ_state
+                occupied_states_energy[i] = con_state_energy
+                conduction_states_energy[i] = occ_state_energy
     
     # Save the computed data to a file for future use
     if filename:
@@ -132,11 +145,11 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     return winding
 
 def figure(occ_state_energy, con_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Both_bands"
+    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_SSH_Both_bands"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
-    plt.plot(k_values, occ_state_energy, label=f'E0 = {E0}, omega = {omega}')
-    plt.plot(k_values, con_state_energy, label=f'Conduction band', linestyle='--')
+    plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, omega = {omega}')
+    plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, omega = {omega}')
     plt.xlabel(r'$k$ values')
     plt.ylabel(r'Quasienergies')
     plt.title(f'Floquet Band Structure for E0 = {E0} (Hartrees), omega = {omega} in atomic units')
@@ -151,21 +164,19 @@ def figure(occ_state_energy, con_state_energy, k_values):
 # MAIN PHASE DIAGRAM CALCULATION
 # =============================
 # Define parameter grid for the external drive:
-E0_values = np.linspace(0, 0.2, 401)       # Field amplitudes E0 in 
-omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
-# omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+# E0_values = np.linspace(0, 0.2, 201)       # Field amplitudes E0 in 
+# omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω 
+# omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω 
 
-# E0_values = np.linspace(0, 0.01, 1001)       # Field amplitudes E0 in 
-# omega_values = np.linspace(0.018,0.020,3)     # Driving frequencies ω (in atomic units, 0.04 corresponds to 300nm input light)
+E0_values = np.linspace(0, 0.01, 101)       # Field amplitudes E0 in 
+omega_values = np.linspace(0.005,0.005,1)     # Driving frequencies ω 
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_integer = np.zeros((len(E0_values), len(omega_values)))
 start_time = time.time()
-v= 0.8
-w= 1.2
-# v= 0.15
-# w= 0.2
+v= 0.2
+w= 0.15
 nt = 61
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
 k_values = np.linspace(0, 2*np.pi / a, n_kpoints)
@@ -178,19 +189,21 @@ for j, omega in enumerate(omega_values):
     # Construct the filename with the custom path and E0, omega values
     data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
 
-    occ_states, occ_state_energy, conduction_state_energy, draw = track_valence_band(k_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
+    occ_states, occ_state_energy, con_states, con_state_energy, draw = track_valence_band(k_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
     if draw == True:
-        figure(occ_state_energy,conduction_state_energy, k_values)
+        figure(occ_state_energy, con_state_energy, k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
+    pre_con = con_states
+    
 
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
-        occ_states, occ_state_energy, conduction_state_energy, draw = track_valence_band(k_values, T, E0, omega, pre_occ, v=v, w=w, nt=nt, filename=data_filename)
+        occ_states, occ_state_energy, con_states, con_state_energy,  draw = track_valence_band(k_values, T, E0, omega, previous_val= pre_occ, previous_con=con_states, v=v, w=w, nt=nt, filename=data_filename)
         if draw == True:
-            figure(occ_state_energy, conduction_state_energy, k_values)
+            figure(occ_state_energy, con_state_energy, k_values)
         W_berry_real = berry_phase_winding(k_values, occ_states)
         winding_map_berry_real[i+1, j] = W_berry_real
         
@@ -199,6 +212,7 @@ for j, omega in enumerate(omega_values):
         else:
             winding_map_berry_integer[i+1, j] = 0
         pre_occ = occ_states
+        pre_con = con_states
 
 # =============================
 # PLOT THE PHASE DIAGRAM
