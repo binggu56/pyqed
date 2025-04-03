@@ -109,84 +109,87 @@ class SBM:
 
 
 
-def discretize(J, a, b, nmodes, mesh='log'):
-    """
-    Discretize a harmonic bath in the range (a, b) by the mean method in Ref. 1.
+# def discretize(J, a, b, nmodes, mesh='log'):
+#     """
+#     Discretize a harmonic bath in the range (a, b) by the mean method in Ref. 1.
 
 
-    Ref:
-        [1] PRB 92, 155126 (2015)
+#     Ref:
+#         [1] PRB 92, 155126 (2015)
 
-    Parameters
-    ----------
-    J : TYPE
-        DESCRIPTION.
-    n : TYPE
-        DESCRIPTION.
-    domain : TYPE, optional
-        DESCRIPTION. The default is None.
+#     Parameters
+#     ----------
+#     J : TYPE
+#         DESCRIPTION.
+#     n : TYPE
+#         DESCRIPTION.
+#     domain : TYPE, optional
+#         DESCRIPTION. The default is None.
 
-    Returns
-    -------
-    x : array
-        mode frequecies
-    g : array
-        coupling strength
+#     Returns
+#     -------
+#     x : array
+#         mode frequecies
+#     g : array
+#         coupling strength
 
-    """
-    if mesh == 'linear':
+#     """
+#     if mesh == 'linear':
 
-        y = np.linspace(a, b, nmodes, endpoint=False)
+#         y = np.linspace(a, b, nmodes, endpoint=False)
 
-    elif mesh == 'log':
+#     elif mesh == 'log':
 
-        if a == 0: a += 1e-3
-        y = np.logspace(a, 1, nmodes+1, base=2)
-    
-        print(y)
-
-    x = np.zeros(nmodes)
-    g = np.zeros(nmodes)
-
-
-    for n in range(nmodes):
-         g[n] = integrate.quad(J, y[n], y[n+1])[0]
-         x[n] = integrate.quad(lambda x: x * J(x), y[n], y[n+1])[0]
-         x[n] /= g[n]
-
-    # last interval from y[-1] to b
-    # g[-1] = integrate.quad(J, y[-1], b)[0]
-    # x[-1] = integrate.quad(lambda x: x * J(x), y[-1], b)[0]/g[-1]
-
-    return x, np.sqrt(g)
-
-def J(omega, s=1, alpha=1, omegac=1):
-    """
+#         if a == 0: a += 1e-3
+#         y = np.logspace(a, 1, nmodes+1, base=2)
     
 
-    Parameters
-    ----------
-    omega : TYPE
-        DESCRIPTION.
-    s : TYPE, optional
-        DESCRIPTION. The default is 1.
-        
-        1: ohmic
-        < 1: subohmic 
-        > 1: superohmic 
-        
-    alpha : TYPE, optional
-        DESCRIPTION. The default is 1.
-    omegac : TYPE, optional
-        DESCRIPTION. The default is 1.
+#     x = np.zeros(nmodes)
+#     g = np.zeros(nmodes)
 
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
 
-    """
-    return 2 * np.pi * alpha * omegac**(1-s) * omega**s
+#     for n in range(nmodes):
+#          g[n] = integrate.quad(J, y[n], y[n+1])[0]
+#          x[n] = integrate.quad(lambda x: x * J(x), y[n], y[n+1])[0]
+#          x[n] /= g[n]
+
+#     # last interval from y[-1] to b
+#     # g[-1] = integrate.quad(J, y[-1], b)[0]
+#     # x[-1] = integrate.quad(lambda x: x * J(x), y[-1], b)[0]/g[-1]
+
+#     return x, np.sqrt(g)
+
+# def ohmic(omega, s=1, alpha=1, omegac=1):
+#     """
+#     ohmic spectral density
+
+#     .. math::
+
+#         J(\omega) = 2\pi \alpha \omega^s e^{-\omega/\omega_c}
+
+#     Parameters
+#     ----------
+#     omega : TYPE
+#         DESCRIPTION.
+#     s : TYPE, optional
+#         DESCRIPTION. The default is 1.
+        
+#         1: ohmic
+#         < 1: subohmic 
+#         > 1: superohmic 
+        
+#     alpha : TYPE, optional
+#         DESCRIPTION. The default is 1.
+#     omegac : TYPE, optional
+#         DESCRIPTION. The default is 1.
+
+#     Returns
+#     -------
+#     TYPE
+#         DESCRIPTION.
+
+#     """
+#     return 2 * np.pi * alpha * omegac**(1-s) * omega**s
 
 class NRG:
     """
@@ -221,12 +224,13 @@ class NRG:
     def discretize(self, N, s=1.0, omegac=1, alpha=1):
         # H = -\Delta X + \epsilon Z + \sum_i \xi_i a_i^\dagger a_i + \frac{Z}{2\sqrt{\pi}} \sum_i  \gamma_i (a_i + a_i^\dagger)
         """
-        
-        H = H_imp + \sqrt{\eta0/\pi} Z/2 (b_0 + b_0^\dagger)
+        logrithmic discretization
+        .. math::
 
-        Refs 
-        
-        PHYSICAL REVIEW B 71, 045122 s2005d
+            H = H_imp + \sqrt{\eta0/\pi} Z/2 (b_0 + b_0^\dagger)
+
+        Refs:
+            PHYSICAL REVIEW B 71, 045122 s2005d
         
         Parameters
         ----------
@@ -304,7 +308,7 @@ class NRG:
         # for n in range(nz):
         H = kron(self.H, eye(nz)) + kron(I, site.buildH())  +  np.sqrt(eta0/np.pi) * kron(Z/2, a + dag(a))
         E, U = eigsh(H, k=6)
-    
+        
 
 if __name__=='__main__':
     
@@ -328,9 +332,10 @@ if __name__=='__main__':
     
     nrg = NRG(H)
     
-    x, g = nrg.discretize(10)
+    # x, g = nrg.discretize(10)
 
-    
+    x, g = discretize(J, 0, 10, 10, mesh='log')
+
     print(x, g)
     
 

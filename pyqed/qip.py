@@ -262,9 +262,13 @@ def _compute_vn_entropy(density_matrix, base=None):
 
     evs = np.linalg.eigvalsh(density_matrix)
     evs = np.where(evs > 0, evs, 1.0)
-    entropy = entr(evs) / div_base
+    entropy = sum(entr(evs)) / div_base
 
     return entropy
 
 if __name__ == '__main__':
-    pass
+    x = [[1/2, 0], [0, 1/2]]
+    S = _compute_vn_entropy(x,base=2)
+    print(S)
+    
+    

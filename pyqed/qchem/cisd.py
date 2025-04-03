@@ -208,11 +208,22 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     from pyscf import ao2mo
 
     # molecular orbitals
-    if isinstance(mf, scf.uhf.UHF):
+    if isinstance(mf, RHF):
+        
+        Ca, Cb = [mf.mo_coeff, ] * 2
+        
+        eri = mf.mol.eri
+
+        
+    elif isinstance(mf, scf.uhf.UHF):
         Ca, Cb = mf.mo_coeff
+        
+        eri = mf.mol.intor('int2e', aosym='s8')
+
+    
     else:
-        Ca = mf.mo_coeff
-        Cb = mf.mo_coeff
+        raise TypeError('mf type not supported.')
+
 
 
     # S = (uhf_pyscf.mol).intor("int1e_ovlp")
@@ -221,9 +232,11 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
 
     # H1e in AO
     H = mf.get_hcore()
-    H = dag(Ca) @ H @ Ca
+    # H = dag(Ca) @ H @ Ca
 
     n = nmo = Ca.shape[1] # n
+    
+
 
     # eri = mf.get_eri()
 
@@ -237,49 +250,48 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     # eri_ab = eri.copy()
     # eri_ba = eri.copy()
 
-    if isinstance(mf, scf.uhf.UHF):
+    # if isinstance(mf, scf.uhf.UHF):
 
-        # eri = ao2mo.get_ao_eri(mf.mol, compact=False).reshape(nmo, nmo, nmo, nmo)
-        # print(eri.shape)
-        eri = mf.mol.intor('int2e', aosym='s8')
+    # eri = ao2mo.get_ao_eri(mf.mol, compact=False).reshape(nmo, nmo, nmo, nmo)
+    # print(eri.shape)
 
-        eri_aa = (ao2mo.general( eri , (Ca, Ca, Ca, Ca),
-                                compact=False)).reshape((n,n,n,n), order="C")
-        eri_aa -= eri_aa.swapaxes(1,3)
-
-
-        eri_bb = (ao2mo.general( eri , (Cb, Cb, Cb, Cb),
-        compact=False)).reshape((n,n,n,n), order="C")
-        eri_bb -= eri_bb.swapaxes(1,3)
-
-        # eri_bb = eri_aa.copy()
+    eri_aa = (ao2mo.general( eri , (Ca, Ca, Ca, Ca),
+                            compact=False)).reshape((n,n,n,n), order="C")
+    eri_aa -= eri_aa.swapaxes(1,3)
 
 
-        eri_ab = (ao2mo.general( eri , (Ca, Ca, Cb, Cb),
-        compact=False)).reshape((n,n,n,n), order="C")
-        #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
+    eri_bb = (ao2mo.general( eri , (Cb, Cb, Cb, Cb),
+    compact=False)).reshape((n,n,n,n), order="C")
+    eri_bb -= eri_bb.swapaxes(1,3)
 
-        eri_ba = (ao2mo.general( eri , (Cb, Cb, Ca, Ca),
-        compact=False)).reshape((n,n,n,n), order="C")
+    # eri_bb = eri_aa.copy()
 
-        H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-        H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
-        H, Cb, Cb)])
 
-        # if SF:
-        #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_abba = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Cb, Ca),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_baab = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Ca, Cb),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     eri_baba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Cb, Ca),
-        #     compact=False)).reshape((n,n,n,n), order="C")
-        #     H2_SF = np.stack(( np.stack((eri_abab, eri_abba)), np.stack((eri_baab, eri_baba)) ))
-        #     return H1, H2, H2_SF
-        # else:
-        #     return H1, H2
-        return H1, H2
+    eri_ab = (ao2mo.general( eri , (Ca, Ca, Cb, Cb),
+    compact=False)).reshape((n,n,n,n), order="C")
+    #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
+
+    eri_ba = (ao2mo.general( eri , (Cb, Cb, Ca, Ca),
+    compact=False)).reshape((n,n,n,n), order="C")
+
+    H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
+    H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
+    H, Cb, Cb)])
+
+    # if SF:
+    #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
+    #     compact=False)).reshape((n,n,n,n), order="C")
+    #     eri_abba = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Cb, Ca),
+    #     compact=False)).reshape((n,n,n,n), order="C")
+    #     eri_baab = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Ca, Cb),
+    #     compact=False)).reshape((n,n,n,n), order="C")
+    #     eri_baba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Cb, Ca),
+    #     compact=False)).reshape((n,n,n,n), order="C")
+    #     H2_SF = np.stack(( np.stack((eri_abab, eri_abba)), np.stack((eri_baab, eri_baba)) ))
+    #     return H1, H2, H2_SF
+    # else:
+    #     return H1, H2
+    return H1, H2
 
 def CI_H(Binary, H1, H2, SC1, SC2):
     """

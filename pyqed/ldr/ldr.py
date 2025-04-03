@@ -3,6 +3,8 @@
 """
 Created on Wed Jan 17 12:44:37 2024
 
+Exact solver for conical intersection dynamics based on LDR.
+
 @author: Bing Gu (gubing@westlake.edu.cn)
 """
 
@@ -548,8 +550,9 @@ class LDRN:
     def buildH(self, dt):
         
         if self.apes is None:
-            print('building the adibatic potential energy surfaces ...')
-            self.build_apes()
+            raise ValueError('APES not provided. Set by self.apes = ...')
+            # print('building the adibatic potential energy surfaces ...')
+            # self.build_apes()
         
         print('building the potential energy propagator')
         self.buildV(dt)
@@ -783,7 +786,24 @@ class LDR2_LvN(LDRN):
         rho_el = contract(einsum_string, rho)
         
         return rho_el
-    
+
+    def HEOM(self):
+        """
+        couple the entire conical intersection model to a harmonic bath 
+        treated with HEOM
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        from pyqed.heom.deom import HEOMSolver
+        
+        if self.H is None: 
+            self.buildH(dt)
+        
+        return HEOMSolver(self.H)
 
         
         
@@ -2818,7 +2838,11 @@ if __name__ == '__main__':
     
     domains = [[-6,6], ]*2
     levels = [5, ] * 2 
-    solver = LDR2(x, y, nstates = nstates, \
+    
+    # solver = LDR2(x, y, nstates = nstates, \
+    #               mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
+
+    solver = LDRN(domains, levels, nstates = nstates, \
                   mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
     solver.v = v

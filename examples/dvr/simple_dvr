@@ -1,0 +1,26 @@
+### A simple example of using DVR to solve the harmonic oscillator
+
+from pyqed import SineDVR, SincDVR
+
+import numpy as np 
+
+
+dvr = SineDVR(-5, 5, 64)
+x = dvr.x
+dvr.v = x**2/2
+
+e, u = dvr.run()
+
+np.set_printoptions(precision=16)
+print(f'SineDVR: {e}')
+
+
+dvr = SincDVR(10, 64)
+x = dvr.x
+dvr.v = x**2/2
+
+e, u = dvr.run()
+
+print(e)
+# print(dvr.eigenvalues)
+

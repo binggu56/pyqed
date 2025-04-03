@@ -475,7 +475,7 @@ def intertia_moment(mass, coords):
 
 
 # class Molecule(gto.M):
-class Mol(Molecule):
+class Molecule(Molecule):
     """
 
     """
@@ -864,26 +864,28 @@ if __name__ == '__main__':
     mol.atom = [['H' , (0,      0., 0.)],
                 ['H', (1.1, 0., 0.)]]
                 # ['F' , (0.91, 0., 0.)]]
+                
+    print(mol.atom_charge(3))
 
 
 
 
-    mol.basis = 'STO-3G'
-    mol.build()
+    # mol.basis = 'STO-3G'
+    # mol.build()
 
-    geometry2 = [['H' , (0.1,      0., 0.)],
-                ['H', (1.3, 0., 0.)]]
+    # geometry2 = [['H' , (0.1,      0., 0.)],
+    #             ['H', (1.3, 0., 0.)]]
 
-    mol2 = Molecule(atom=geometry2)
+    # mol2 = Molecule(atom=geometry2)
 
-    print(mol2.atom_coords)
-    print(mol2.com())
-    mol2.molecular_frame()
-    print(mol2.eckart_frame(mol.atom_coords()))
+    # print(mol2.atom_coords)
+    # print(mol2.com())
+    # mol2.molecular_frame()
+    # print(mol2.eckart_frame(mol.atom_coords()))
 
-    # print(mol.natm)
+    # # print(mol.natm)
 
-    scan_pes()
+    # scan_pes()
     # mole = Molecule(mol)
     # mol.zmat(rvar=True)
     # mf = scf.RHF(mol).run()

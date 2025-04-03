@@ -52,8 +52,6 @@ def get_fci_combos(mf):
     # else:
     #     mo_occ = mf.mo_occ
 
-    print(mo_occ)
-
     O_sp = np.asarray(mo_occ, dtype=np.int8)
 
 
@@ -383,32 +381,53 @@ class FCI:
 
 
 if __name__=='__main__':
-    from pyscf import gto, scf, dft, tddft, ao2mo, ci
+    from pyscf import gto, scf, dft, tddft, ao2mo, ci, fci
+    # from pyscf.fci import FCI
 
-    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
+    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule
     from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionChain
     # from pyqed.qchem.hf import RHF
 
-    mol = gto.Mole()
-    mol.atom = [
+    # mol = gto.Mole()
+    mol = Molecule(atom = [
         ['H' , (0. , 0. , 0)],
-        ['Li' , (0. , 0. , 1)], ]
+        ['Li' , (0. , 0. , 1)]])
+    
     mol.basis = 'sto3g'
     mol.charge = 0
     # mol.unit = 'b'
     mol.build()
+    
+
 
 
     # # cisd = ci.cisd.CISD(mf).run()
     mf = RHF(mol)
     mf.run()
+    
+    print(mol.eri.shape)
 
 
-    # fci = FCI(mf).run()
-    # print(fci.e_tot)
+    fci = FCI(mf).run()
+    print(fci.e_tot)
 
 
-
+    mol = gto.Mole(atom = [
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1)]])
+    
+    mol.basis = 'sto3g'
+    mol.charge = 0
+    mol.unit = 'b'
+    
+    mf = scf.RHF(mol).run()
+    
+    # from pyscf.fci import FCI
+    # FCI(mf).run()
+    import pyscf 
+    cisolver = pyscf.fci.FCI(mf).run()
+    print(cisolver.e_tot)
+    
     # print(mf.e_tot - mf.energy_nuc())
 
     # h1e = get_hcore_mo(mf)

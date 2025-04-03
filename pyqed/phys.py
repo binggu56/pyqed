@@ -14,6 +14,29 @@ import heapq
 from functools import reduce
 
 
+def logarithmic_discretize(n, base=2):
+    """
+    log discretization of (0, 1) 
+    .. math::
+        
+        [\Lambda^{-(n+1)}, \Lambda^{-n}], n = 0, 1, ...
+
+    Parameters
+    ----------
+    n : TYPE
+        DESCRIPTION.
+    base : TYPE, optional
+        discretization parameter. The default is 2.
+
+    Returns
+    -------
+    TYPE
+        :math:`\Lambda^{-n}, n = 0, 1 ...` in descending order.
+
+    """
+    return list(reversed(np.logspace(-n, 0, n+1, base=2, endpoint=True)))
+
+
 def integrate(f, a, b, **args):
     """
     

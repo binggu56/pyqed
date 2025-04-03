@@ -324,6 +324,8 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
     Returns:
         One-particle density matrix, 2D ndarray
     '''
+
+    
     mocc = mo_coeff[:,mo_occ>0]
 # DO NOT make tag_array for dm1 here because this DM array may be modified and
 # passed to functions like get_jk, get_vxc.  These functions may take the tags

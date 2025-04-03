@@ -4,11 +4,14 @@ from pyqed import discretize
 from pyqed import au2angstrom
 from surfreact import utils as ut
 import csv
-from pyqed.ldr.ldr import kinetic
+
+
+from pyqed.ldr.ldr import 
 
 class Rate:
     """
-    thermal rate constant for a adiabatic reaction using Miller's flux-side correlation function 
+    thermal rate constant for a adiabatic reaction using Miller's flux-side 
+    correlation function 
     """
     def __init__(self, ldr):
         self.ldr = ldr
@@ -19,6 +22,8 @@ class Rate:
 class NonadiabaticRate:
     """
     thermal rate constant using Miller's flux-side correlation function 
+    .. math::
+        C_{FF}(t) = \text{Tr}[e^{-iHt}F(t)e^{iHt}h(x)]
     """
     def __init__(self, ldr):
         self.ldr = ldr 
@@ -27,7 +32,7 @@ class NonadiabaticRate:
 def hamiltonian(V, numpts):
 
     V = np.eye(numpts)*V
-    T = kinetic(x, mass= 1836, dvr= 'sinc') 
+    T = kinetic(x, mass= 1836, dvr= 'sine') 
 
     H = T+V
     
@@ -139,31 +144,34 @@ def CFFsingletime(t_now, evecs, evalsmatrix, flux_mat, bolt_flux):
   
     return Cff
 
-# Calculate the correlation function over a series of times
 
-T = 500 # temperature in K
-beta = 1./(ut.kbAU*T)
+if __name__ == '__main__':
 
-file_path = f'/home/lhy/E.npz'
-data = np.load(file_path)
-V = data['E']
-data.close()
-
-levels = 8
-domains = [-4/au2angstrom, 4/au2angstrom]
-x = discretize(*domains, levels)
-numpts = 2 ** levels + 1
-
-H, evecs, evalsmat = hamiltonian(V[:,0], numpts)
-fluxMatrix = flux(x, H)
-bmn = boltzmann(beta, evecs, evalsmat)
-boltFlux = boltflux(fluxMatrix, bmn)
-
-print(CFFsingletime(0, evecs, evalsmat, fluxMatrix, boltFlux))
-Cff_t = [CFFsingletime(41.341*i, evecs, evalsmat, fluxMatrix, boltFlux) for i in range(100)]
-
-with open('Cff_t.csv', 'w', newline='') as file:
-    writer = csv.writer(file)
-    for value in Cff_t:
-        writer.writerow([value])
+    # Calculate the correlation function 
+    
+    T = 500 # temperature in K
+    beta = 1./(ut.kbAU*T)
+    
+    file_path = f'E.npz'
+    data = np.load(file_path)
+    V = data['E']
+    data.close()
+    
+    levels = 8
+    domains = [-4/au2angstrom, 4/au2angstrom]
+    x = discretize(*domains, levels)
+    numpts = 2 ** levels + 1
+    
+    H, evecs, evalsmat = hamiltonian(V[:,0], numpts)
+    fluxMatrix = flux(x, H)
+    bmn = boltzmann(beta, evecs, evalsmat)
+    boltFlux = boltflux(fluxMatrix, bmn)
+    
+    print(CFFsingletime(0, evecs, evalsmat, fluxMatrix, boltFlux))
+    Cff_t = [CFFsingletime(41.341*i, evecs, evalsmat, fluxMatrix, boltFlux) for i in range(100)]
+    
+    with open('Cff_t.csv', 'w', newline='') as file:
+        writer = csv.writer(file)
+        for value in Cff_t:
+            writer.writerow([value])
 
