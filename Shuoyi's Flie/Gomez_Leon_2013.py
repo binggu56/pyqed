@@ -30,7 +30,7 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_Gomez_Leon_2013"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/data_Gomez_Leon_2013_finer"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -76,6 +76,8 @@ def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_co
     if E0_over_omega == 0:
         for i in range(len(k_values)):
             k0 = k_values[i]
+            # H_0 = np.array([[0, t*jv(0,E0_over_omega*b)+np.exp(-1j*k0*b)*jv(0,E0_over_omega*(1-b))],
+            #                 [t*jv(0,E0_over_omega*b)+np.exp(1j*k0*b)*jv(0,E0_over_omega*(1-b)), 0]], dtype=complex)
             H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
                             [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
             eigvals, eigvecs = linalg.eig(H_0)
@@ -142,7 +144,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     return winding
 
 def figure(occ_state_energy, cond_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Gomez_Leon_2013"
+    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Gomez_Leon_2013_finer"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
     plt.plot(k_values, occ_state_energy, label=f'Val_E0_over_omega = {E0_over_omega:.6f}, b = {b:.2f},t = {t:.2f}')
@@ -162,10 +164,13 @@ def figure(occ_state_energy, cond_state_energy, k_values):
 # =============================
 # Define parameter grid for the external drive:
 # E0_over_omega_values = np.linspace(0, 8, 201)       
-E0_over_omega_values = np.linspace(0, 20, 101)       
+E0_over_omega_values = np.linspace(0, 20, 501)       
 
 # b_values = np.linspace(0.5, 1.0, 5)
-b_values = np.linspace(0, 1, 21)
+# b_values = np.linspace(0, 1, 21)
+# b_values = np.linspace(0.45, 0.55, 9)
+b_values = [0.45,0.463,0.475,0.488,0.5,0.513,0.525]
+# b_values = np.linspace(0.55, 0.55, 1)
 # b_values = np.linspace(0, 0, 1)
 
 winding_map_energy = np.zeros((len(E0_over_omega_values), len(b_values)))
