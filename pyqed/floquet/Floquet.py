@@ -771,8 +771,10 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
         # Hn[0] = H0 + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex)
 
         # Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
-        Hn_b = [np.array([[0, t*np.exp(-1j*k*b)], [t*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
-        Hn_a_b = [np.array([[0, np.exp(1j*k*(1-b))], [np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_b = [np.array([[0, t*np.exp(-1j*k*b)], [t*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_a_b = [np.array([[0, np.exp(1j*k*(1-b))], [np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+        Hn_b = [np.array([[0, t], [t, 0]], dtype=complex) for a in range(Nt)]
+        Hn_a_b = [np.array([[0, np.exp(1j*k)], [np.exp(-1j*k), 0]], dtype=complex) for a in range(Nt)]
         for i in range(Nt):
             Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
             Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))
@@ -821,11 +823,14 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
         # Hn[0] = H0 + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex)
 
         # Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
-        Hn_b = [np.array([[0, t*w*np.exp(-1j*k*b)], [t*w*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
-        Hn_a_b = [np.array([[0, w*np.exp(1j*k*(1-b))], [w*np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_b = [np.array([[0, t*np.exp(-1j*k*b)], [t*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_a_b = [np.array([[0, np.exp(1j*k*(1-b))], [np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+        Hn_b = [np.array([[0, t], [t, 0]], dtype=complex) for a in range(Nt)]
+        Hn_a_b = [np.array([[0, np.exp(1j*k)], [np.exp(-1j*k), 0]], dtype=complex) for a in range(Nt)]
         for i in range(Nt):
             Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
             Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))
+        Hn[0] = H0
         # Construct the Floquet matrix
         # need to be modified.
         F = np.zeros((NF, NF), dtype=complex)
@@ -904,6 +909,7 @@ def Floquet_Winding_number_Peierls_GL2013_2(H0, k, Nt, E_over_omega ,quasiE = No
         Hn_a_b = [np.array([[0, np.exp(1j*k)], [np.exp(-1j*k), 0]], dtype=complex) for a in range(Nt)]
         # Hn_b = [np.array([[0, t*np.exp(-1j*k*b)], [t*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
         # Hn_a_b = [np.array([[0, np.exp(1j*k*(1-b))], [np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+
         for i in range(Nt):
             Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
             Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))

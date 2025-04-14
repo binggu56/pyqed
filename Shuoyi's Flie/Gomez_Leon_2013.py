@@ -78,8 +78,10 @@ def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_co
             k0 = k_values[i]
             # H_0 = np.array([[0, t*jv(0,E0_over_omega*b)+np.exp(-1j*k0*b)*jv(0,E0_over_omega*(1-b))],
             #                 [t*jv(0,E0_over_omega*b)+np.exp(1j*k0*b)*jv(0,E0_over_omega*(1-b)), 0]], dtype=complex)
-            H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
-                            [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
+            H_0 = np.array([[0, t*jv(0, E0_over_omega*b)+ np.cos(k0)*jv(0, E0_over_omega*(1-b))],
+                            [t*jv(0, E0_over_omega*b)+ np.cos(k0)*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
+            # H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
+            #                 [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
             eigvals, eigvecs = linalg.eig(H_0)
             if eigvals[0].real > eigvals[-1].real:
                 eigvals = eigvals[::-1]  # Reverse the order
@@ -97,8 +99,10 @@ def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_co
     else:
         for i in range(len(k_values)):
             k0 = k_values[i]
-            H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
-                            [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
+            H_0 = np.array([[0, t*jv(0, E0_over_omega*b)+ np.cos(k0)*jv(0, E0_over_omega*(1-b))],
+                            [t*jv(0, E0_over_omega*b)+ np.cos(k0)*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
+            # H_0 = np.array([[0, t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))-t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)+1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b))],
+            #                 [t*np.cos(k0*b)*jv(0, E0_over_omega*b)+ np.cos(k0*(1-b))*jv(0, E0_over_omega*(1-b))+t*1j*np.sin(k0*b)*jv(0, E0_over_omega*b)-1j*np.sin(k0*(1-b))*jv(0, E0_over_omega*(1-b)), 0]], dtype=complex)
             mol = Mol(H_0, H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
             occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous_val[:,i], w=w, b=b, t=t, E_over_omega=E0_over_omega)
@@ -164,13 +168,13 @@ def figure(occ_state_energy, cond_state_energy, k_values):
 # =============================
 # Define parameter grid for the external drive:
 # E0_over_omega_values = np.linspace(0, 8, 201)       
-E0_over_omega_values = np.linspace(0, 20, 501)       
+E0_over_omega_values = np.linspace(0, 20, 201)       
 
 # b_values = np.linspace(0.5, 1.0, 5)
 # b_values = np.linspace(0, 1, 21)
 # b_values = np.linspace(0.45, 0.55, 9)
-b_values = [0.45,0.463,0.475,0.488,0.5,0.513,0.525]
-# b_values = np.linspace(0.55, 0.55, 1)
+# b_values = [0.45,0.463,0.475,0.488,0.5,0.513,0.525]
+b_values = np.linspace(0.55, 0.55, 1)
 # b_values = np.linspace(0, 0, 1)
 
 winding_map_energy = np.zeros((len(E0_over_omega_values), len(b_values)))
