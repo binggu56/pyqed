@@ -148,8 +148,10 @@ def figure(occ_state_energy, con_state_energy, k_values):
     save_folder = "Shuoyi's Flie/Floquet_Band_Plots_SSH_Both_bands"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
-    plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, omega = {omega}')
-    plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, omega = {omega}')
+    plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
+    plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
+    # plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, omega = {omega}')
+    # plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, omega = {omega}')
     plt.xlabel(r'$k$ values')
     plt.ylabel(r'Quasienergies')
     plt.title(f'Floquet Band Structure for E0 = {E0} (Hartrees), omega = {omega} in atomic units')
@@ -168,8 +170,20 @@ def figure(occ_state_energy, con_state_energy, k_values):
 # omega_values = np.linspace(0.03,0.06,7)     # Driving frequencies ω 
 # omega_values = np.linspace(0.03,0.01,15)     # Driving frequencies ω 
 
-E0_values = np.linspace(0, 0.01, 101)       # Field amplitudes E0 in 
-omega_values = np.linspace(0.005,0.005,1)     # Driving frequencies ω 
+# E0_values = np.linspace(0, 0.25, 251)       # Field amplitudes E0 in 
+
+E0_values_1 = np.linspace(0, 0.00008, 9)       # Field amplitudes E0 in 
+E0_values_2 = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
+E0_values = np.concatenate((E0_values_1, E0_values_2[2:])) # Field amplitudes E0 in
+# E0_values = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
+
+
+wavelength_values = np.linspace(350,700,7) # Wavelengths in nm
+# wavelength_values = [408.33,350,300]
+# wavelength_values = np.linspace(300,700,8) # Wavelengths in nm
+# wavelength_values = np.linspace(300,400,2) # Wavelengths in nm
+omega_values = [30/4.13/wavelength for wavelength in wavelength_values] # Driving frequencies ω
+# omega_values = np.linspace(0.13,0.17,5)     # Driving frequencies ω 
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
