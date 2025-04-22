@@ -30,7 +30,7 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_Gomez_Leon_2013_test"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/Gomez_Leon_2013/data_Gomez_Leon_2013_test"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -142,7 +142,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     return winding
 
 def figure(occ_state_energy, cond_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/Floquet_Band_Plots_Gomez_Leon_2013_test"
+    save_folder = "Floquet_Band_Plots_Gomez_Leon_2013_test"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
     plt.plot(k_values, occ_state_energy, label=f'Val_E0_over_omega = {E0_over_omega:.6f}, b = {b:.2f},t = {t:.2f}')
@@ -162,16 +162,9 @@ def figure(occ_state_energy, cond_state_energy, k_values):
 # =============================
 # Define parameter grid for the external drive:
 # E0_over_omega_values = np.linspace(0, 8, 201)       
-E0_over_omega_values = np.linspace(0, 20, 201)  
-# E0_over_omega_values = np.linspace(0, 20, 101)    # This is for drawing the result
-# E0_over_omega_values = [0, 17.9, 17.91, 17.92, 17.93, 17.94, 17.95, 18]
-# E0_over_omega_values = [0, 4.9, 4.91, 4.92, 4.93, 4.94, 4.95]
-# E0_over_omega_values = [0, 13.55,13.56,13.57,13.58,13.59,13.6]
-b_values = np.linspace(0, 1, 21)
-# b_values = np.linspace(0.15, 0.15, 1)
-# b_values = np.linspace(0.45, 0.45, 1)
-
-# b_values = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1]
+# E0_over_omega_values = np.linspace(0, 20, 1601)  
+E0_over_omega_values = np.linspace(0, 1, 101) 
+b_values = [0.41, 0.42]
 
 winding_map_energy = np.zeros((len(E0_over_omega_values), len(b_values)))
 winding_map_berry_real = np.zeros((len(E0_over_omega_values), len(b_values)))

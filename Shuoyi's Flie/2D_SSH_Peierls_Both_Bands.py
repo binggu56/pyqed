@@ -11,7 +11,6 @@ import h5py
 # PARAMETERS AND CONSTANTS
 # =============================
 a = 1                # Lattice constant (Bohr radii)
-# a = 8                # Lattice constant (Bohr radii)
 epsilon_A = 0       # On-site energy for A (Hartrees)
 epsilon_B = 0       # On-site energy for B (Hartrees)
 h_bar = 1.0            # Planck constant (atomic units)
@@ -22,7 +21,7 @@ n_kpoints = 200        # Number of k-points along BZ
 # FLOQUET HAMILTONIAN MODULE
 # =============================
 
-def H0(k,v,w):
+def H0(kx,ky,v,w):
     H = np.array([[0, v],
                   [v, 0]], dtype=complex)
     return H
@@ -59,12 +58,12 @@ def load_data_from_hdf5(filename):
 # =============================
 # BAND TRACKING MODULE (Modified)
 # =============================
-def track_valence_band(k_values, T, E0, omega, previous_val = None, previous_con = None, v = 0.15, w = 0.2, nt=61, filename=None):
+def track_valence_band(kx_values,ky_values, T, E0, omega, previous_val = None, previous_con = None, v = 0.15, w = 0.2, nt=61, filename=None):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
     and eigenstates for the occupied band.
-    previous is len(k_values), 2*nt matrix
+    previous is len(kx_values), 2*nt matrix
     """
     if filename and os.path.exists(filename):
         print(f"Loading data from {filename}...")
@@ -73,46 +72,50 @@ def track_valence_band(k_values, T, E0, omega, previous_val = None, previous_con
         
     
     E_0 = E0
-    occupied_states = np.zeros((2*nt, len(k_values)), dtype=complex)
-    conduction_states = np.zeros((2*nt, len(k_values)), dtype=complex)
-    occupied_states_energy = np.zeros(len(k_values))
-    conduction_states_energy = np.zeros(len(k_values))
+    occupied_states = np.zeros((2*nt, len(kx_values)), dtype=complex)
+    conduction_states = np.zeros((2*nt, len(kx_values)), dtype=complex)
+    occupied_states_energy = np.zeros(len(kx_values))
+    conduction_states_energy = np.zeros(len(kx_values))
     
     if E_0 == 0:
-        for i in range(len(k_values)):
-            k0 = k_values[i]
-            H_0 = H0(k0, v, w) + np.array([[0, w*np.exp(-1j*k0)], [w*np.exp(1j*k0), 0]], dtype=complex)
-            eigvals, eigvecs = linalg.eig(H_0)
-            if eigvals[0].real > eigvals[-1].real:
-                eigvals = eigvals[::-1]  # Reverse the order
-                eigvecs = eigvecs[:, ::-1]
-            quasiE_val = eigvals[0]
-            quasiE_con = eigvals[1]
-            mol = Mol(H0(k0, v, w), H1(k0))
-            floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_val, w=w)
-            con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_con, w=w)
-            occupied_states[:,i] = occ_state
-            conduction_states[:,i] = con_state
-            occupied_states_energy[i] = occ_state_energy
-            conduction_states_energy[i] = con_state_energy
-    else:
-        for i in range(len(k_values)):
-            k0 = k_values[i]
-            mol = Mol(H0(k0, v, w), H1(k0))
-            floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_val[:,i], w=w)
-            con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_con[:,i], w=w)
-            if occ_state_energy <= con_state_energy:
+        for i in range(len(kx_values)):
+            for j in range(len(ky_values)):
+                k0x = kx_values[i]
+                k0y = ky_values[j]
+                H_0 = H0(k0x, k0y, v, w) + np.array([[0, w*np.exp(-1j*k0)], [w*np.exp(1j*k0), 0]], dtype=complex)
+                eigvals, eigvecs = linalg.eig(H_0)
+                if eigvals[0].real > eigvals[-1].real:
+                    eigvals = eigvals[::-1]  # Reverse the order
+                    eigvecs = eigvecs[:, ::-1]
+                quasiE_val = eigvals[0]
+                quasiE_con = eigvals[1]
+                mol = Mol(H0(k0, v, w), H1(k0))
+                floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+                occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_val, w=w)
+                con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E = quasiE_con, w=w)
                 occupied_states[:,i] = occ_state
                 conduction_states[:,i] = con_state
                 occupied_states_energy[i] = occ_state_energy
                 conduction_states_energy[i] = con_state_energy
-            else:
-                occupied_states[:,i] = con_state
-                conduction_states[:,i] = occ_state
-                occupied_states_energy[i] = con_state_energy
-                conduction_states_energy[i] = occ_state_energy
+    else:
+        for i in range(len(kx_values)):
+            for j in range(len(ky_values)):
+                k0x = kx_values[i]
+                k0y = ky_values[i]
+                mol = Mol(H0(k0, v, w), H1(k0))
+                floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
+                occ_state, occ_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_val[:,i], w=w)
+                con_state, con_state_energy = floquet.winding_number_Peierls(T, k0, quasi_E=None, previous_state=previous_con[:,i], w=w)
+                if occ_state_energy <= con_state_energy:
+                    occupied_states[:,i] = occ_state
+                    conduction_states[:,i] = con_state
+                    occupied_states_energy[i] = occ_state_energy
+                    conduction_states_energy[i] = con_state_energy
+                else:
+                    occupied_states[:,i] = con_state
+                    conduction_states[:,i] = occ_state
+                    occupied_states_energy[i] = con_state_energy
+                    conduction_states_energy[i] = occ_state_energy
     
     # Save the computed data to a file for future use
     if filename:
@@ -124,12 +127,12 @@ def track_valence_band(k_values, T, E0, omega, previous_val = None, previous_con
 # =============================
 # WINDING NUMBER CALCULATION
 # =============================
-def berry_phase_winding(k_values, occupied_states, nt=61):
+def berry_phase_winding(kx_values, occupied_states, nt=61):
     """
     Compute the winding number via Berry phase accumulation.
     This multiplies overlaps between successive eigenstates.
     """
-    N = len(k_values)
+    N = len(kx_values)
     # create a N by N matrix projector (need to be able to multiply other N by N matrices)
     # Projector = np.eye(2*nt, dtype=complex)
     occupied_states[:,0]/=np.linalg.norm(occupied_states[:,0])
@@ -144,14 +147,14 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     print(winding)
     return winding
 
-def figure(occ_state_energy, con_state_energy, k_values):
+def figure(occ_state_energy, con_state_energy, kx_values):
     save_folder = "Shuoyi's Flie/Floquet_Band_Plots_SSH_Both_bands"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
-    plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
-    plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
-    # plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, omega = {omega}')
-    # plt.plot(k_values, con_state_energy, label=f'con_state_E0 = {E0}, omega = {omega}')
+    plt.plot(kx_values, occ_state_energy, label=f'occ_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
+    plt.plot(kx_values, con_state_energy, label=f'con_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
+    # plt.plot(kx_values, occ_state_energy, label=f'occ_state_E0 = {E0}, omega = {omega}')
+    # plt.plot(kx_values, con_state_energy, label=f'con_state_E0 = {E0}, omega = {omega}')
     plt.xlabel(r'$k$ values')
     plt.ylabel(r'Quasienergies')
     plt.title(f'Floquet Band Structure for E0 = {E0} (Hartrees), omega = {omega} in atomic units')
@@ -172,19 +175,14 @@ def figure(occ_state_energy, con_state_energy, k_values):
 
 # E0_values = np.linspace(0, 0.25, 251)       # Field amplitudes E0 in 
 
-
 E0_values_1 = np.linspace(0, 0.00008, 9)       # Field amplitudes E0 in 
 E0_values_2 = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
-E0_values_2 = np.linspace(0, 0.012, 151)       # Field amplitudes E0 in 
 E0_values = np.concatenate((E0_values_1, E0_values_2[2:])) # Field amplitudes E0 in
 # E0_values = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
 
 
-# wavelength_values = [350,360,370,380,390,408.33,420,440,450,466.67]
-# wavelength_values = [350,360,370,380,390,400,410,420,440,450,466.67]
-wavelength_values = [350,360,370,380,390,400,410,420,440]
-# wavelength_values = [400,410,420]
-# wavelength_values = [500, 550,600,650,700, 466.67,408.33,350,300]
+wavelength_values = np.linspace(350,700,7) # Wavelengths in nm
+# wavelength_values = [408.33,350,300]
 # wavelength_values = np.linspace(300,700,8) # Wavelengths in nm
 # wavelength_values = np.linspace(300,400,2) # Wavelengths in nm
 omega_values = [30/4.13/wavelength for wavelength in wavelength_values] # Driving frequencies ω
@@ -198,9 +196,12 @@ v= 0.2
 w= 0.15
 nt = 61
 # Define k-space over the Brillouin zone (-pi/a, pi/a)
-k_values = np.linspace(0, 2*np.pi / a, n_kpoints)
-k_values[0]=1e-4
-k_values[-1]=2*np.pi/a-1e-4
+kx_values = np.linspace(0, 2*np.pi / a, n_kpoints)
+kx_values[0]=1e-4
+kx_values[-1]=2*np.pi/a-1e-4
+ky_values = np.linspace(0, 2*np.pi / a, n_kpoints)
+ky_values[0]=1e-4
+ky_values[-1]=2*np.pi/a-1e-4
 for j, omega in enumerate(omega_values):
     T = 2 * np.pi / omega  
     E0 = E0_values[0]
@@ -208,10 +209,10 @@ for j, omega in enumerate(omega_values):
     # Construct the filename with the custom path and E0, omega values
     data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
 
-    occ_states, occ_state_energy, con_states, con_state_energy, draw = track_valence_band(k_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
+    occ_states, occ_state_energy, con_states, con_state_energy, draw = track_valence_band(kx_values,ky_values, T, E0, omega, v=v, w=w, nt=nt, filename=data_filename)
     if draw == True:
-        figure(occ_state_energy, con_state_energy, k_values)
-    W_berry_real = berry_phase_winding(k_values, occ_states)
+        figure(occ_state_energy, con_state_energy, kx_values)
+    W_berry_real = berry_phase_winding(kx_values, occ_states)
     winding_map_berry_real[0, j] = W_berry_real
     pre_occ = occ_states
     pre_con = con_states
@@ -220,10 +221,10 @@ for j, omega in enumerate(omega_values):
     for i in range(len(E0_values)-1):
         E0 = E0_values[i+1]
         data_filename = os.path.join(custom_root_directory, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
-        occ_states, occ_state_energy, con_states, con_state_energy,  draw = track_valence_band(k_values, T, E0, omega, previous_val= pre_occ, previous_con=con_states, v=v, w=w, nt=nt, filename=data_filename)
+        occ_states, occ_state_energy, con_states, con_state_energy,  draw = track_valence_band(kx_values, ky_values, T, E0, omega, previous_val= pre_occ, previous_con=con_states, v=v, w=w, nt=nt, filename=data_filename)
         if draw == True:
-            figure(occ_state_energy, con_state_energy, k_values)
-        W_berry_real = berry_phase_winding(k_values, occ_states)
+            figure(occ_state_energy, con_state_energy, kx_values)
+        W_berry_real = berry_phase_winding(kx_values, occ_states)
         winding_map_berry_real[i+1, j] = W_berry_real
         
         if not np.isnan(W_berry_real):

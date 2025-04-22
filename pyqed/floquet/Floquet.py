@@ -119,6 +119,14 @@ class Floquet:
         omegad = self.omegad
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls_GL2013(H0, k, nt, E_over_omega, quasi_E, previous_state, w=w, b=b, t=t)
         return occ_state, occ_state_energy
+    
+    def winding_number_Peierls_GL2013_2D(self, k, quasi_E = None, previous_state = None, gauge='length',w=0.2, b=0.5, t=1, E_over_omega = 1): # To be modified
+        H0 = self.H
+        E0 = self.E0
+        nt = self.nt 
+        omegad = self.omegad
+        occ_state, occ_state_energy = Floquet_Winding_number_Peierls_GL2013_2D(H0, k, nt, E_over_omega, quasi_E, previous_state, w=w, b=b, t=t)
+        return occ_state, occ_state_energy
 
 
     def velocity_to_length(self):
@@ -740,9 +748,178 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         # # occ_state /=np.linalg.norm(occ_state)
         
         return occ_state, occ_state_energy
+# ===============================================================
+#  B.  add to  pyqed/Floquet.py
+#      (just drop it below the existing Peierls helper)
+# ===============================================================
+from ssh_circular_floquet import build_floquet_matrix
+
+def Floquet_Winding_number_Peierls_circular(H0_placeholder, k,
+                                            Nt, omega, params,
+                                            quasiE=None, previous_state=None):
+    '''Return *valence* Floquet state for circular‑polarised SSH.
+
+    # Parameters
+    # ----------
+    # k : float
+    # Nt : int        ( = 2*m_max+1 )
+    # omega : float   (drive frequency Ω)
+    # params : dict   (must contain all **kwargs requested by build_floquet_matrix)
+    # quasiE / previous_state : same purpose & logic as in your linear routine'''
+    
+    HF = build_floquet_matrix(k, **params)
+    evals, evecs = linalg.eigh(HF)
+
+    # 1st Floquet zone  |ε| ≤ Ω/2
+    inside = np.logical_and(evals.real <=  0.5*omega,
+                            evals.real >= -0.5*omega)
+    evals_F  = evals[inside]
+    evecs_F  = evecs[:, inside]
+
+    # select by quasiE (initial sweep)  or  by overlap (continuation)
+    if quasiE is not None or previous_state is None:
+        # initial sweep: pick the closest eigen‑value to quasiE
+        idx = np.argmin(np.abs(evals_F.real - (quasiE if quasiE is not None else 0.0)))
+    else:
+        overlaps = evecs_F.conj().T @ previous_state
+        idx      = np.argmax(np.abs(overlaps))
+
+    return evecs_F[:, idx], evals_F[idx].real
 
 
 def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None, previous_state = None, w = 0.2, b=0.5, t=1):
+    """
+    Build and diagonalize the Floquet Hamiltonian for a 1D system,
+    then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
+    choose the correct Floquet branch if E = 0 (by comparing with the directly diagonalized energies)
+    if E != 0, choose the correct branch by doing overlap with the previous state.
+
+    H(t) is SSH model with k replaced by k - E_0/w * sin(wt) by Peierls substitution
+    """
+    a = 1 #lattice constant, need to be modifyed accordingly, later need to be included into the variables
+    A = E_over_omega
+    omega = 100
+    if E_over_omega == 0:
+        Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
+        NF = Norbs * Nt           # dimension of Floquet matrix
+        N0 = -(Nt-1)//2           # shift for Fourier indices
+
+        Hn = [np.array([[0, 0], [0, 0]], dtype=complex) for a in range(Nt)]
+        # Hn[0] = H0 + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex)
+
+        # Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
+        Hn_b = [np.array([[0, t], [t, 0]], dtype=complex) for a in range(Nt)]
+        Hn_a_b = [np.array([[0, np.exp(1j*k)], [np.exp(-1j*k), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_b = [np.array([[0, t*np.exp(-1j*k*b)], [t*np.exp(1j*k*b), 0]], dtype=complex) for a in range(Nt)]
+        # Hn_a_b = [np.array([[0, np.exp(1j*k*(1-b))], [np.exp(-1j*k*(1-b)), 0]], dtype=complex) for a in range(Nt)]
+
+        for i in range(Nt):
+            Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
+            Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))
+        Hn[0] = H0
+        # Construct the Floquet matrix
+        # need to be modified.
+        F = np.zeros((NF, NF), dtype=complex)
+        for n in range(Nt):
+            for m in range(Nt):
+                for k in range(Norbs):
+                    for l in range(Norbs):
+                        i = Norbs*n + k
+                        j = Norbs*m + l
+                        # Hamiltonian block + photon block
+                        F[i, j] = (HamiltonFT_peierls(Hn, n-m)[k, l]
+                                   - (n + N0)*omega*(n==m)*(k==l))
+
+        # Diagonalize
+        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)
+        # specify a range to choose the quasienergies, choose the first BZ
+        # [-hbar omega/2, hbar * omega/2]
+        eigvals_subset = np.zeros(Norbs, dtype=complex)
+        eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+        # check if the Floquet states is complete
+        j = 0
+        for i in range(NF):
+            if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+                eigvals_subset[j] = eigvals[i]
+                eigvecs_subset[:,j] = eigvecs[:,i]
+                j += 1
+        if j != Norbs:
+            print("Error: Number of Floquet states {} is not equal to \
+                the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+            sys.exit()
+        eigvals_copy = [np.abs(x - quasiE) for x in eigvals]
+        eigvals_copy = np.array(eigvals_copy)
+        idx = np.argsort(eigvals_copy.real)
+        occ_state = eigvecs[:, idx[0]]
+        occ_state_energy = eigvals[idx[0]]  # might needed for winding number calculation
+        return occ_state, occ_state_energy
+    else:
+        Norbs = H0.shape[-1]      # e.g., 2 for a two-level system
+        NF = Norbs * Nt           # dimension of Floquet matrix
+        N0 = -(Nt-1)//2           # shift for Fourier indices
+        Hn = [np.array([[0, 0], [0, 0]], dtype=complex) for a in range(Nt)]
+        # Hn[0] = H0 + np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex)
+
+        # Hn = [np.array([[0, w*np.exp(-1j*k)], [w*np.exp(1j*k), 0]], dtype=complex) for a in range(Nt)]
+        Hn_b = [np.array([[0, t], [t, 0]], dtype=complex) for a in range(Nt)]
+        Hn_a_b = [np.array([[0, np.exp(1j*k)], [np.exp(-1j*k), 0]], dtype=complex) for a in range(Nt)]
+        for i in range(Nt):
+            Hn[i][0][1] = Hn_b[i][0][1] * jv(-i,A*b) + Hn_a_b[i][0][1] * jv(i,A*(1-b)) 
+            Hn[i][1][0] = Hn_b[i][1][0] * jv(i,A*b) + Hn_a_b[i][1][0] * jv(-i,A*(1-b))
+        Hn[0] = H0
+        # Construct the Floquet matrix
+        # need to be modified.
+        F = np.zeros((NF, NF), dtype=complex)
+        for n in range(Nt):
+            for m in range(Nt):
+                for k in range(Norbs):
+                    for l in range(Norbs):
+                        i = Norbs*n + k
+                        j = Norbs*m + l
+                        # Hamiltonian block + photon block
+                        F[i, j] = (HamiltonFT_peierls(Hn, n-m)[k, l]
+                                   - (n + N0)*omega*(n==m)*(k==l))
+
+        # Diagonalize
+        eigvals, eigvecs = linalg.eigh(F)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)s
+        # specify a range to choose the quasienergies, choose the first BZ
+        # [-hbar omega/2, hbar * omega/2]
+        eigvals_subset = np.zeros(Norbs, dtype=complex)
+        eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+
+
+        # check if the Floquet states is complete
+        j = 0
+        for i in range(NF):
+            if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+                eigvals_subset[j] = eigvals[i]
+                eigvecs_subset[:,j] = eigvecs[:,i]
+                j += 1
+        if j != Norbs:
+            print("Error: Number of Floquet states {} is not equal to \
+                the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+            sys.exit()
+        overlap = np.zeros(NF)
+        for i in range(NF):
+            for j in range(NF):
+                overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
+                # overlap[i] += np.conjugate(eigvecs[i,j]) * previous_state[j]
+            # if np.abs(overlap[i]) < 0.05:
+            #     overlap[i]=0
+            # else:
+            #     print(overlap[i])
+        idx = np.argsort(abs(overlap))
+
+        occ_state = eigvecs[:,idx[-1]]
+        occ_state_energy = eigvals[idx[-1]]
+        # for i in range(len(overlap)):
+        #     # occ_state += eigvecs[:,i]*overlap[i]
+        #     occ_state_energy += eigvals[i] * overlap[i]**2
+        # # occ_state /=np.linalg.norm(occ_state)
+        
+        return occ_state, occ_state_energy
+
+def Floquet_Winding_number_Peierls_GL2013_2D(H0, k, Nt, E_over_omega ,quasiE = None, previous_state = None, w = 0.2, b=0.5, t=1):
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.
