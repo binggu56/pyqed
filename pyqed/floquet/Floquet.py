@@ -119,6 +119,22 @@ class Floquet:
         omegad = self.omegad
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls_GL2013(H0, k, nt, E_over_omega, quasi_E, previous_state, w=w, b=b, t=t)
         return occ_state, occ_state_energy
+
+    def winding_number_Peierls_circular(self,k0, nt, omega, T, E0,
+                                                    delta_x, delta_y,
+                                                    a, t0, xi,
+                                                    quasi_E,                 # or None
+                                                    previous_state):
+        H0 = self.H
+        E0 = self.E0
+        nt = self.nt 
+        omegad = self.omegad
+        occ_state, occ_state_energy = Floquet_Winding_number_Peierls_circular(k0,                     # Bloch momentum
+                                            nt, omega, T, E0,      # drive
+                                            delta_x, delta_y,      # geometry
+                                            a=1.0, t0=1.0, xi=1.0, # lattice & decay
+                                            quasiE=None, previous_state=None)
+        return occ_state, occ_state_energy
     
     def winding_number_Peierls_GL2013_2D(self, k, quasi_E = None, previous_state = None, gauge='length',w=0.2, b=0.5, t=1, E_over_omega = 1): # To be modified
         H0 = self.H
@@ -748,43 +764,121 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         # # occ_state /=np.linalg.norm(occ_state)
         
         return occ_state, occ_state_energy
-# ===============================================================
-#  B.  add to  pyqed/Floquet.py
-#      (just drop it below the existing Peierls helper)
-# ===============================================================
-from ssh_circular_floquet import build_floquet_matrix
-
-def Floquet_Winding_number_Peierls_circular(H0_placeholder, k,
-                                            Nt, omega, params,
-                                            quasiE=None, previous_state=None):
-    '''Return *valence* Floquet state for circular‑polarised SSH.
-
-    # Parameters
-    # ----------
-    # k : float
-    # Nt : int        ( = 2*m_max+1 )
-    # omega : float   (drive frequency Ω)
-    # params : dict   (must contain all **kwargs requested by build_floquet_matrix)
-    # quasiE / previous_state : same purpose & logic as in your linear routine'''
     
-    HF = build_floquet_matrix(k, **params)
-    evals, evecs = linalg.eigh(HF)
+# ==============================================================
+#  Circularly polarised Peierls helper  (δx,δy embedding)
+# ==============================================================
 
-    # 1st Floquet zone  |ε| ≤ Ω/2
-    inside = np.logical_and(evals.real <=  0.5*omega,
-                            evals.real >= -0.5*omega)
-    evals_F  = evals[inside]
-    evecs_F  = evecs[:, inside]
+import numpy as np
+from numpy import exp, eye, zeros, hypot, arctan2
+from scipy.linalg import eigh
+from scipy.special import jv
 
-    # select by quasiE (initial sweep)  or  by overlap (continuation)
-    if quasiE is not None or previous_state is None:
-        # initial sweep: pick the closest eigen‑value to quasiE
-        idx = np.argmin(np.abs(evals_F.real - (quasiE if quasiE is not None else 0.0)))
+
+def Floquet_Winding_number_Peierls_circular(
+        k, Nt, omega, T, E0,                        # drive & grid
+        delta_x, delta_y,                           # geometry
+        a=1.0, t0=1.0, xi=1.0,                      # lattice/decay
+        quasiE=None, previous_state=None):
+    """
+    Construct the extended Floquet matrix for a circularly polarised
+    vector potential  A(t)=A0[cosΩt, sinΩt]  and return the valence
+    Floquet state at momentum k.
+
+    All array sizes are identical to those used in the linear routine,
+    so the outer code stays unchanged.
+    """
+    Norbs = 2                   # SSH: 2 sites / unit cell
+    NF    = Norbs * Nt
+    N0    = -(Nt - 1) // 2      # Fourier index shift  (Nt must be odd)
+
+    # ---- static hopping magnitudes  v0, w0  --------------------
+    d_v   = (delta_x**2 + delta_y**2)**0.5
+    d_w   = ((a-delta_x)**2 + delta_y**2)**0.5
+    v0    = t0 * exp(-d_v / xi)
+    w0    = t0 * exp(-d_w / xi)
+
+    # ---- bond angles & drive amplitude -------------------------
+    theta_v = arctan2(delta_y,            delta_x)
+    theta_w = arctan2(-delta_y,  a - delta_x)
+    z_v     = (E0 / omega) * d_v          #  α|d|
+    z_w     = (E0 / omega) * d_w
+
+    # # Fourier coeffs  t^{(m)}  for m = N0 … N0+Nt-1
+    # m_list  = np.arange(Nt) + N0
+    # coeff_v = v0 * (-1j)**m_list * jv(m_list, z_v) * np.exp(-1j*m_list*theta_v)
+    # coeff_w = w0 * (-1j)**m_list * jv(m_list, z_w) * np.exp(-1j*m_list*theta_w)
+    # ---------- Fourier coefficients t^{(m)} ---------------------
+    # need m = -(Nt-1) … +(Nt-1)  →  2*Nt-1 values
+    m_all  = np.arange(-Nt+1, Nt)           # length 2*Nt-1
+    coeff_v = v0 * (-1j)**(-m_all) * jv(-m_all, z_v) * np.exp(1j*m_all*theta_v)
+    coeff_w = w0 * (-1j)**(-m_all) * jv(-m_all, z_w) * np.exp(1j*m_all*theta_w)
+
+
+    # ---- build Floquet matrix  F  --------------------------------
+    F = zeros((NF, NF), dtype=complex)
+    for n in range(Nt):
+        for m in range(Nt):
+            mm = n - m                          # harmonic index
+            # v_m = coeff_v[mm + (Nt-1)//2]
+            # w_m = coeff_w[mm + (Nt-1)//2] * exp(-1j * k)
+            v_m = coeff_v[mm + Nt - 1]
+            w_m = coeff_w[mm + Nt - 1] * exp(-1j * k)
+
+            block = zeros((2, 2), dtype=complex)
+            block[0, 1] = v_m + w_m
+            block[1, 0] = (v_m + w_m).conjugate()
+            if n == m:
+                block += eye(2) * (n + N0) * omega
+            F[2*n:2*n+2, 2*m:2*m+2] = block
+
+    # ---- diagonalise & pick valence branch -----------------------
+    eigvals, eigvecs = eigh(F)
+    # zone = np.logical_and(eigvals.real <=  0.5*omega,
+    #                       eigvals.real >= -0.5*omega)
+    # eps, vec = eigvals[zone], eigvecs[:, zone]
+    eigvals_subset = np.zeros(Norbs, dtype=complex)
+    eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+    j=0
+    for i in range(NF):
+        if  eigvals[i] <= omega/2.0 and eigvals[i] >= -omega/2.0:
+            eigvals_subset[j] = eigvals[i]
+            eigvecs_subset[:,j] = eigvecs[:,i]
+            j += 1
+    if j != Norbs:
+        print("Error: Number of Floquet states {} is not equal to \
+            the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+        sys.exit()
+    if E0 == 0:
+        eigvals_copy = [np.abs(x - quasiE) for x in eigvals]
+        eigvals_copy = np.array(eigvals_copy)
+        idx = np.argsort(eigvals_copy.real)
+        occ_state = eigvecs[:, idx[0]]
+        occ_state_energy = eigvals[idx[0]]  # might needed for winding number calculation
+        return occ_state, occ_state_energy
     else:
-        overlaps = evecs_F.conj().T @ previous_state
-        idx      = np.argmax(np.abs(overlaps))
+        overlap = np.zeros(NF)
+        for i in range(NF):
+            for j in range(NF):
+                overlap[i] += eigvecs[j,i] *np.conjugate(previous_state[j])
+                # overlap[i] += np.conjugate(eigvecs[i,j]) * previous_state[j]
+            # if np.abs(overlap[i]) < 0.05:
+            #     overlap[i]=0
+            # else:
+            #     print(overlap[i])
+        idx = np.argsort(abs(overlap))
 
-    return evecs_F[:, idx], evals_F[idx].real
+        occ_state = eigvecs[:,idx[-1]]
+        occ_state_energy = eigvals[idx[-1]]
+        return occ_state, occ_state_energy
+        
+    # if previous_state is None or quasiE is not None:
+    #     idx = np.argmin(np.abs(eps.real - (quasiE if quasiE is not None else 0.0)))
+    # else:
+    #     olap = eigvecs.conj().T @ previous_state
+    #     idx  = np.argmax(np.abs(olap))
+
+    # return eigvecs[:, idx], eigvecs[idx].real
 
 
 def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None, previous_state = None, w = 0.2, b=0.5, t=1):
