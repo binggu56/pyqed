@@ -128,7 +128,6 @@ class Floquet:
         H0 = self.H
         E0 = self.E0
         nt = self.nt 
-        omegad = self.omegad
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls_circular(k0,                     # Bloch momentum
                                             nt, omega, T, E0,      # drive
                                             delta_x, delta_y,      # geometry
@@ -782,8 +781,8 @@ def Floquet_Winding_number_Peierls_circular(
         quasiE=None, previous_state=None):
     """
     Construct the extended Floquet matrix for a circularly polarised
-    vector potential  A(t)=A0[cosΩt, sinΩt]  and return the valence
-    Floquet state at momentum k.
+    vector potential  A(t)=A0[cosΩt, sinΩt]  and return the valence
+    Floquet state at momentum k.
 
     All array sizes are identical to those used in the linear routine,
     so the outer code stays unchanged.
@@ -794,7 +793,7 @@ def Floquet_Winding_number_Peierls_circular(
 
     # ---- static hopping magnitudes  v0, w0  --------------------
     d_v   = (delta_x**2 + delta_y**2)**0.5
-    d_w   = ((a-delta_x)**2 + delta_y**2)**0.5
+    d_w   = np.sqrt((a-delta_x)**2 + delta_y**2)
     v0    = t0 * exp(-d_v / xi)
     w0    = t0 * exp(-d_w / xi)
 
@@ -810,6 +809,8 @@ def Floquet_Winding_number_Peierls_circular(
     # coeff_w = w0 * (-1j)**m_list * jv(m_list, z_w) * np.exp(-1j*m_list*theta_w)
     # ---------- Fourier coefficients t^{(m)} ---------------------
     # need m = -(Nt-1) … +(Nt-1)  →  2*Nt-1 values
+    
+    #check this part
     m_all  = np.arange(-Nt+1, Nt)           # length 2*Nt-1
     coeff_v = v0 * (-1j)**(-m_all) * jv(-m_all, z_v) * np.exp(1j*m_all*theta_v)
     coeff_w = w0 * (-1j)**(-m_all) * jv(-m_all, z_w) * np.exp(1j*m_all*theta_w)
@@ -823,7 +824,7 @@ def Floquet_Winding_number_Peierls_circular(
             # v_m = coeff_v[mm + (Nt-1)//2]
             # w_m = coeff_w[mm + (Nt-1)//2] * exp(-1j * k)
             v_m = coeff_v[mm + Nt - 1]
-            w_m = coeff_w[mm + Nt - 1] * exp(-1j * k)
+            w_m = coeff_w[mm + Nt - 1] * exp(-1j * k * a)
 
             block = zeros((2, 2), dtype=complex)
             block[0, 1] = v_m + w_m

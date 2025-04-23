@@ -61,7 +61,7 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/SSH_circular/data_SSH_circular"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/SSH_circular/Plot_SSH_circular_wavelength_410"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)
@@ -197,7 +197,7 @@ def berry_phase_winding(k_values, occupied_states, nt=61):
     return winding
 
 def figure(occ_state_energy, con_state_energy, k_values):
-    save_folder = "Shuoyi's Flie/SSH_circular/Plot_SSH_circular"
+    save_folder = "Shuoyi's Flie/SSH_circular/Plot_SSH_circular_wavelength_410"
     os.makedirs(save_folder, exist_ok=True)
     plt.figure(figsize=(8, 6))
     plt.plot(k_values, occ_state_energy, label=f'occ_state_E0 = {E0}, wavelength = {30/4.13/omega:.2f} nm')
@@ -227,20 +227,20 @@ def figure(occ_state_energy, con_state_energy, k_values):
 
 # E0_values_1 = np.linspace(0, 0.00008, 9)       # Field amplitudes E0 in 
 # E0_values_2 = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
-E0_values = np.linspace(0, 0.1, 401)       # Field amplitudes E0 in 
+t0, xi           = 1.0, 0.5
+E0_values = np.linspace(0, 0.02, 801)
+       # Field amplitudes E0 in 
 # E0_values = np.concatenate((E0_values_1, E0_values_2[2:])) # Field amplitudes E0 in
 # E0_values = np.linspace(0, 0.04, 501)       # Field amplitudes E0 in 
 
 
-# wavelength_values = [350,360,370,380,390,408.33,420,440,450,466.67]
-# wavelength_values = [350,360,370,380,390,400,410,420,440,450,466.67]
-wavelength_values = [350,360,370,380,390,400,410,420,440]
+wavelength_values = [410]
 # wavelength_values = [400,410,420]
 # wavelength_values = [500, 550,600,650,700, 466.67,408.33,350,300]
 # wavelength_values = np.linspace(300,700,8) # Wavelengths in nm
 # wavelength_values = np.linspace(300,400,2) # Wavelengths in nm
 omega_values = [30/4.13/wavelength for wavelength in wavelength_values] # Driving frequencies ω
-# omega_values = np.linspace(0.13,0.17,5)     # Driving frequencies ω 
+
 
 winding_map_energy = np.zeros((len(E0_values), len(omega_values)))
 winding_map_berry_real = np.zeros((len(E0_values), len(omega_values)))
