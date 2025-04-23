@@ -12,6 +12,12 @@ from scipy import linalg
 from scipy.special import jv
 from pyqed.mol import Mol, dag
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import time
+import os
+from pyqed.floquet.floquet_utils import track_valence_band, berry_phase_winding, figure, track_valence_band_GL2013
+
 
 class Floquet:
     """
@@ -85,6 +91,153 @@ class Floquet:
 
         return quasienergies, floquet_modes, G
     
+
+
+    def run_phase_diagram(self, k_values, E0_values, omega_values, save_dir,
+                        save_band_plot=True, nt=61, v=0.2, w=0.15):
+        """
+        Run Floquet winding number phase diagram over (E0, omega).
+
+        Parameters:
+        - k_values: np.array, k points along BZ
+        - E0_values: 1D array of E0 field amplitudes
+        - omega_values: 1D array of driving frequencies
+        - save_dir: str, root directory for data and plots
+        - save_band_plot: bool, whether to save band plots
+        - nt, v, w: model and time-discretization parameters
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        data_dir = os.path.join(save_dir, "h5")
+        band_dir = os.path.join(save_dir, "bands") if save_band_plot else None
+        if band_dir: os.makedirs(band_dir, exist_ok=True)
+
+        winding_real = np.zeros((len(E0_values), len(omega_values)))
+        winding_int = np.zeros_like(winding_real)
+
+        total = len(E0_values) * len(omega_values)
+        start = time.time()
+        idx = 0
+
+        for j, omega in enumerate(omega_values):
+            T = 2 * np.pi / omega
+            pre_occ = pre_con = None
+            for i, E0 in enumerate(E0_values):
+                self.E0 = E0
+                self.omegad = omega
+
+                fname = os.path.join(data_dir, f"data_E0_{E0:.5f}_omega_{omega:.4f}.h5")
+
+                occ, occ_e, con, con_e, draw = track_valence_band(
+                    k_values, T, E0, omega, previous_val=pre_occ, previous_con=pre_con,
+                    v=v, w=w, nt=nt, filename=fname
+                )
+                if draw and band_dir:
+                    # fig = plt.figure()
+                    # plt.plot(k_values, occ_e, label="Valence")
+                    # plt.plot(k_values, con_e, label="Conduction")
+                    # plt.title(f"E0={E0:.3f}, omega={omega:.3f}")
+                    # plt.xlabel("k")
+                    # plt.ylabel("Quasienergy")
+                    # plt.legend()
+                    # plt.grid()
+                    # fig.savefig(os.path.join(band_dir, f"band_E0_{E0:.4f}_omega_{omega:.4f}.png"))
+                    # plt.close(fig)
+                    figure(occ_e, con_e, k_values, E0, omega, save_folder=band_dir)
+
+
+                w_real = berry_phase_winding(k_values, occ)
+                winding_real[i, j] = w_real
+                winding_int[i, j] = round(w_real) if not np.isnan(w_real) else 0
+
+                pre_occ, pre_con = occ, con
+
+                idx += 1
+                elapsed = time.time() - start
+                remaining = elapsed / idx * (total - idx)
+                progress = f"[{idx}/{total}]---------- E0={E0:.4f}, omega={omega:.4f} | Remaining: {remaining/60:.1f} min"
+                print(progress, end="\r")
+
+        # Save final phase diagram
+        fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+        im0 = axs[0].imshow(winding_real, aspect='auto', origin='lower',
+                            extent=[omega_values[0], omega_values[-1], E0_values[0], E0_values[-1]])
+        axs[0].set_title("Winding (Real)"); axs[0].set_xlabel("omega"); axs[0].set_ylabel("E0")
+        fig.colorbar(im0, ax=axs[0])
+
+        im1 = axs[1].imshow(winding_int, aspect='auto', origin='lower',
+                            extent=[omega_values[0], omega_values[-1], E0_values[0], E0_values[-1]])
+        axs[1].set_title("Winding (Integer)")
+        fig.colorbar(im1, ax=axs[1])
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir, "winding_phase_diagram.png"))
+        plt.close(fig)
+
+    def run_phase_diagram_GL2013(self, k_vals, E0_over_omega_vals, b_vals, save_dir,
+                             nt=61, t=1.5, omega=100, save_band_plot=False):
+
+
+        os.makedirs(save_dir, exist_ok=True)
+        band_dir = os.path.join(save_dir, "bands") if save_band_plot else None
+        data_dir = os.path.join(save_dir, "h5")
+        os.makedirs(data_dir, exist_ok=True)
+        if save_band_plot:
+            os.makedirs(band_dir, exist_ok=True)
+
+        wind_real = np.zeros((len(E0_over_omega_vals), len(b_vals)))
+        wind_int = np.zeros_like(wind_real)
+        start = time.time()
+
+        for j, b in enumerate(b_vals):
+            pre_occ = pre_con = None
+            for i, E0o in enumerate(E0_over_omega_vals):
+                fname = os.path.join(data_dir, f"data_E0_over_omega_{E0o:.6f}_b_{b:.3f}_t_{t:.2f}.h5")
+                occ, occ_e, con, con_e, draw = track_valence_band_GL2013(k_vals, E0o,
+                                    previous_val=pre_occ, previous_con=pre_con,
+                                    nt=nt, filename=fname, b=b, t=t, omega=omega)
+
+                if draw and save_band_plot:
+                    plt.figure(figsize=(8, 6))
+                    plt.plot(k_vals, occ_e, label=f'Val_E0_over_omega = {E0o:.6f}, b = {b:.2f},t = {t:.2f}')
+                    plt.plot(k_vals, con_e, label=f'Val_E0_over_omega = {E0o:.6f}, b = {b:.2f},t = {t:.2f}')
+                    plt.title(f"$E_0/\omega$ = {E0o:.2f}, b = {b:.2f}")
+                    plt.xlabel("k")
+                    plt.ylabel("Quasienergy")
+                    plt.legend()
+                    plt.grid(True)
+                    plt.savefig(os.path.join(band_dir, f"band_E0o_{E0o:.4f}_b_{b:.2f}.png"))
+                    plt.close()
+
+                w_real = berry_phase_winding(k_vals, occ)
+                wind_real[i, j] = w_real
+                wind_int[i, j] = round(w_real) if not np.isnan(w_real) else 0
+                pre_occ, pre_con = occ, con
+
+                elapsed = time.time() - start
+                remaining = (len(E0_over_omega_vals) * len(b_vals) - (j * len(E0_over_omega_vals) + i)) * elapsed / (i + 1)
+                print(f"[{i+1}/{len(E0_over_omega_vals)}], ---------- b = {b:.3f} E0/omega = {E0o:.3f} | Remaining: {remaining/60:.1f} min", end="\r")
+
+        # Plot winding phase diagram
+        fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+        im0 = axs[0].imshow(wind_real, aspect='auto', origin='lower',
+                            extent=[b_vals[0], b_vals[-1], E0_over_omega_vals[0], E0_over_omega_vals[-1]])
+        axs[0].set_title("Winding (Real)")
+        axs[0].set_xlabel("b")
+        axs[0].set_ylabel("E0/ω")
+        fig.colorbar(im0, ax=axs[0])
+
+        im1 = axs[1].imshow(wind_int, aspect='auto', origin='lower',
+                            extent=[b_vals[0], b_vals[-1], E0_over_omega_vals[0], E0_over_omega_vals[-1]])
+        axs[1].set_title("Winding (Integer)")
+        axs[1].set_xlabel("b")
+        axs[1].set_ylabel("E0/ω")
+        fig.colorbar(im1, ax=axs[1])
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir, "winding_phase_diagram_GL2013.png"))
+        plt.close()
+
+
+
     def winding_number(self, T, quasi_E = None, previous_state = None, gauge='length'): # To be modified
         H0 = self.H
         E0 = self.E0
@@ -112,12 +265,12 @@ class Floquet:
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls(H0, k, nt, omegad, T, E0, quasi_E, previous_state, w=w)
         return occ_state, occ_state_energy
 
-    def winding_number_Peierls_GL2013(self, k, quasi_E = None, previous_state = None, gauge='length',w=0.2, b=0.5, t=1, E_over_omega = 1): # To be modified
+    def winding_number_Peierls_GL2013(self, k, quasi_E = None, previous_state = None, gauge='length', b=0.5, t=1, E_over_omega = 1): # To be modified
         H0 = self.H
         E0 = self.E0
         nt = self.nt 
         omegad = self.omegad
-        occ_state, occ_state_energy = Floquet_Winding_number_Peierls_GL2013(H0, k, nt, E_over_omega, quasi_E, previous_state, w=w, b=b, t=t)
+        occ_state, occ_state_energy = Floquet_Winding_number_Peierls_GL2013(H0, k, nt, E_over_omega, quasi_E, previous_state, b=b, t=t)
         return occ_state, occ_state_energy
 
     def winding_number_Peierls_circular(self,k0, nt, omega, T, E0,
@@ -882,7 +1035,7 @@ def Floquet_Winding_number_Peierls_circular(
     # return eigvecs[:, idx], eigvecs[idx].real
 
 
-def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None, previous_state = None, w = 0.2, b=0.5, t=1):
+def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None, previous_state = None, b=0.5, t=1):
     """
     Build and diagonalize the Floquet Hamiltonian for a 1D system,
     then group the 2*N_t eigenvalues/eigenstates into two Floquet bands.

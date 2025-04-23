@@ -11,9 +11,6 @@ import h5py
 # PARAMETERS AND CONSTANTS
 # =============================
 a = 1                # Lattice constant (Bohr radii)
-# a = 8                # Lattice constant (Bohr radii)
-epsilon_A = 0       # On-site energy for A (Hartrees)
-epsilon_B = 0       # On-site energy for B (Hartrees)
 h_bar = 1.0            # Planck constant (atomic units)
 n_time_slices = 500   # Number of time slices in one period
 n_kpoints = 200        # Number of k-points along BZ
@@ -35,7 +32,7 @@ def H1(k):
 # FILE SAVING AND LOADING FUNCTIONS
 # =============================
 # Define the custom root directory where the HDF5 files will be saved
-custom_root_directory = "Shuoyi's Flie/data_SSH_both_bands"  # Replace with your desired path
+custom_root_directory = "Shuoyi's Flie/SSH_linear/data_SSH_both_bands"  # Replace with your desired path
 
 # Create the directory if it doesn't exist
 os.makedirs(custom_root_directory, exist_ok=True)

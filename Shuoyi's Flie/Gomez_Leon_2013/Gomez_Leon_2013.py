@@ -54,7 +54,7 @@ def load_data_from_hdf5(filename):
 # =============================
 # BAND TRACKING MODULE (Modified)
 # =============================
-def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_con = None, v = 0.15, w = 0.2, nt=61, filename=None, b=0.5, t=1.5):
+def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_con = None, nt=61, filename=None, b=0.5, t=1.5):
     """
     For each k, compute the Floquet spectrum and track the valence (occupied) band
     using an overlap method. Returns the list of (possibly folded) quasienergies
@@ -86,8 +86,8 @@ def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_co
             quasiE_con = eigvals[1]
             mol = Mol(H_0, H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E = quasiE_val, w=w, t=t, b=b, E_over_omega=E0_over_omega)
-            con_state, con_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E = quasiE_con, w=w, t=t, b=b, E_over_omega=E0_over_omega)
+            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E = quasiE_val, t=t, b=b, E_over_omega=E0_over_omega)
+            con_state, con_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E = quasiE_con, t=t, b=b, E_over_omega=E0_over_omega)
             occupied_states[:,i] = occ_state
             conduction_states[:,i] = con_state
             occupied_states_energy[i] = occ_state_energy
@@ -99,8 +99,8 @@ def track_valence_band(k_values, E0_over_omega, previous_val = None, previous_co
                             [t*jv(0,E0_over_omega*b)+np.exp(1j*k0)*jv(0,E0_over_omega*(1-b)), 0]], dtype=complex)
             mol = Mol(H_0, H1(k0))
             floquet = mol.Floquet(omegad=omega, E0=E_0, nt=nt)
-            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous_val[:,i], w=w, b=b, t=t, E_over_omega=E0_over_omega)
-            con_state, con_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous_con[:,i], w=w, b=b, t=t, E_over_omega=E0_over_omega)
+            occ_state, occ_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous_val[:,i], b=b, t=t, E_over_omega=E0_over_omega)
+            con_state, con_state_energy = floquet.winding_number_Peierls_GL2013(k0, quasi_E=None, previous_state=previous_con[:,i], b=b, t=t, E_over_omega=E0_over_omega)
             if occ_state_energy < con_state_energy:
                 occupied_states[:,i] = occ_state
                 conduction_states[:,i] = con_state
@@ -162,16 +162,8 @@ def figure(occ_state_energy, cond_state_energy, k_values):
 # =============================
 # Define parameter grid for the external drive:
 # E0_over_omega_values = np.linspace(0, 8, 201)       
-E0_over_omega_values = np.linspace(0, 20, 1601)  
-# E0_over_omega_values = np.linspace(0, 20, 101)    # This is for drawing the result
-# E0_over_omega_values = [0, 17.9, 17.91, 17.92, 17.93, 17.94, 17.95, 18]
-# E0_over_omega_values = [0, 4.9, 4.91, 4.92, 4.93, 4.94, 4.95]
-# E0_over_omega_values = [0, 13.55,13.56,13.57,13.58,13.59,13.6]
+E0_over_omega_values = np.linspace(0, 20, 801)  
 b_values = np.linspace(0, 1, 21)
-# b_values = np.linspace(0.15, 0.15, 1)
-# b_values = np.linspace(0.45, 0.45, 1)
-
-# b_values = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1]
 
 winding_map_energy = np.zeros((len(E0_over_omega_values), len(b_values)))
 winding_map_berry_real = np.zeros((len(E0_over_omega_values), len(b_values)))
@@ -192,7 +184,7 @@ for j, b in enumerate(b_values):
     # Construct the filename with the custom path and E0, omega values
     data_filename = os.path.join(custom_root_directory, f"data_E0_over_omega_{E0_over_omega:.6f}_b_{b:.3f}_t_{t:.2f}.h5")
 
-    occ_states, occ_state_energy, con_states, con_state_energy, draw = track_valence_band(k_values, E0_over_omega, v=v, w=w, nt=nt, filename=data_filename, b=b, t=t)
+    occ_states, occ_state_energy, con_states, con_state_energy, draw = track_valence_band(k_values, E0_over_omega, nt=nt, filename=data_filename, b=b, t=t)
     if draw == True:
         figure(occ_state_energy, con_state_energy, k_values)
     W_berry_real = berry_phase_winding(k_values, occ_states)
