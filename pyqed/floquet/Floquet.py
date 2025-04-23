@@ -132,8 +132,8 @@ class Floquet:
         occ_state, occ_state_energy = Floquet_Winding_number_Peierls_circular(k0,                     # Bloch momentum
                                             nt, omega, T, E0,      # drive
                                             delta_x, delta_y,      # geometry
-                                            a=1.0, t0=1.0, xi=1.0, # lattice & decay
-                                            quasiE=None, previous_state=None)
+                                            a=a, t0=t0, xi=xi, # lattice & decay
+                                            quasiE=quasi_E, previous_state=previous_state)
         return occ_state, occ_state_energy
     
     def winding_number_Peierls_GL2013_2D(self, k, quasi_E = None, previous_state = None, gauge='length',w=0.2, b=0.5, t=1, E_over_omega = 1): # To be modified
