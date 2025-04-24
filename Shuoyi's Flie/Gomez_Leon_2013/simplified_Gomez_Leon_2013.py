@@ -17,7 +17,7 @@ import numpy as np
 #     ρ_F(k)   = t e^{-ikb₀} J_{n−m}(A₀b₀) + e^{ik(a₀−b₀)} J_{m−n}(A₀(a₀−b₀))
 #     ρ̃_F(k)  = t e^{+ikb₀} J_{m−n}(A₀b₀) + e^{−ik(a₀−b₀)} J_{n−m}(A₀(a₀−b₀))
 
-# === Numerical Parameter Grids ===
+# === Parameter Setup ===
 
 # Discretized crystal momentum k values in the Brillouin zone (0 to 2π)
 k_vals = np.linspace(1e-4, 2 * np.pi - 1e-4, 200)
