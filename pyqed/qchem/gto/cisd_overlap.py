@@ -11,7 +11,7 @@ geometries).
 
 from functools import reduce
 import numpy
-from pyscf import gto, scf, ci, lib
+from pyscf import gto, scf, ci, lib, ci
 import numpy as np
 
 
@@ -200,41 +200,25 @@ def overlap(cibra, ciket, nmo, nocc, s=None, DEBUG=False):
     return ovlp
 
 
-def wavefunction_overlap(geometry1=None, geometry2=None):
+def wavefunction_overlap(geometry1, geometry2, basis='6-31g', nstates=2):
     #
     # RCISD wavefunction overlap
     #
-    nstates = 3 
     
-    myhf1 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
-    C   -3.191128   -0.790170    0.027261
-    C   -4.458793   -1.235223   -0.013632
-    N   -5.447661   -0.444953   -0.040858
-    C   -5.169422    0.790163   -0.027260
-    C   -3.901761    1.235215    0.013633
-    H   -2.344820   -1.496317    0.050492
-    H   -4.678296   -2.315552   -0.024843
-    H   -6.015733    1.496310   -0.050491
-    H   -3.682256    2.315544    0.024844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
-    ci1 = ci.CISD(myhf1).run()
-    print('CISD energy of mol1', ci1.e_tot) 
+    myhf1 = gto.M(atom=geometry1, basis=basis, verbose=0, unit='au').apply(scf.RHF).run()
+    ci1 = ci.CISD(myhf1)
     ci1.nstates = 2
     ci1.run()
+
+    print('CISD energy of mol1', ci1.e_tot) 
+
     
     
-    myhf2 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
-    C   -3.191128   -0.790170    0.027261
-    C   -4.458793   -1.235223   -0.013632
-    N   -5.447661   -0.444953   -0.040858
-    C   -5.169422    0.790163   -0.027260
-    C   -3.901761    1.235215    0.013633
-    H   -2.344820   -1.496317    0.050492
-    H   -4.678296   -2.315552   -0.024843
-    H   -6.015733    1.496310   -0.050491
-    H   -3.682256    2.315544    0.026844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
+    myhf2 = gto.M(atom=geometry2, basis=basis, verbose=0, unit='au').apply(scf.RHF).run()
     ci2 = ci.CISD(myhf2)
     ci2.nstates = 2
     ci2.run()
+
     print('CISD energy of mol2', ci2.e_tot)
     
     
@@ -251,16 +235,21 @@ def wavefunction_overlap(geometry1=None, geometry2=None):
 
     print(ci1.ci[0].shape)
     
-    S = np.zeros((2,2))
+    # compute overlap matrix between different states
+    S = np.zeros((nstates, nstates))
     for i in range(1, nstates):
-        S[i-1, i-1] = overlap(ci1.ci[i-1], ci2.ci[i-1], nmo, nocc)
+        S[i-1, i-1] = overlap(ci1.ci[i-1], ci2.ci[i-1], nmo, nocc, s12)
         
     # print('<CISD-mol1|CISD-mol2> = ', 
     for i in range(1, nstates):
         for j in range(1, i):
-            S[i-1, j-1] = overlap(ci1.ci[i-1], ci2.ci[j-1], nmo, nocc)
+            S[i-1, j-1] = overlap(ci1.ci[i-1], ci2.ci[j-1], nmo, nocc, s12)
             S[j-1, i-1] = S[i-1, j-1]
     return S
 
-overlaps = wavefunction_overlap()
-print(overlaps)
+
+if __name__ == '__main__':
+    geometry1 = 'Na 0 0 0; F 0 0 10'
+    geometry2 = 'Na 0 0 0; F 0 0 10.05'
+    overlaps = wavefunction_overlap(geometry1, geometry2)
+    print(overlaps)

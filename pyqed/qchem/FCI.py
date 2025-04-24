@@ -381,7 +381,7 @@ class FCI:
 
 
 if __name__=='__main__':
-    from pyscf import gto, scf, dft, tddft, ao2mo, ci, fci
+    from pyscf import gto, scf, dft, tddft, ao2mo, ci
     # from pyscf.fci import FCI
 
     from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule

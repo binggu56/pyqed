@@ -352,7 +352,7 @@ class CI:
         self.nao = mf.mol.nao
         self.nmo = self.nao
 
-        self.nocc = mf.mol.nelectron//2
+        self.nocc = mf.mol.nelec//2
 
         self.max_cycle = max_cycle
 
@@ -621,6 +621,9 @@ class UCISD(CI):
 def overlap(cibra, ciket, s=None):
     """
     CISD electronic overlap matrix
+        
+    Compute the overlap between Slater determinants first 
+    and contract with CI coefficients
 
     Parameters
     ----------
@@ -644,7 +647,10 @@ def overlap(cibra, ciket, s=None):
 
     # overlap matrix between MOs at different geometries
     if s is None:
-        s = gto.intor_cross('cint1e_ovlp_sph', cibra.mol, ciket.mol)
+        
+        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+
+        s = overlap_integral_asymmetric(mol._bas, mol2._bas)
         s = reduce(np.dot, (cibra.mo_coeff.T, s, ciket.mo_coeff))
 
     nsd = cibra.binary.shape[0]
@@ -678,15 +684,15 @@ def overlap(cibra, ciket, s=None):
 if __name__=='__main__':
     from pyscf import gto, scf, dft, tddft, ao2mo, fci, ci
     import pyscf
-    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
+    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule
     from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionChain
-    from pyqed.qchem.hf import RHF
+    from pyqed.qchem.hf.rhf import RHF
     from pyqed.qchem.fci import FCI
 
-    mol = gto.Mole()
-    mol.atom = [
+    # mol = gto.Mole()
+    mol = Molecule(atom = [
         ['H' , (0. , 0. , 0)],
-        ['Li' , (0. , 0. , 1)], ]
+        ['Li' , (0. , 0. , 1)], ])
     mol.basis = 'sto3g'
     mol.charge = 0
     # mol.unit = 'b'
@@ -708,7 +714,7 @@ if __name__=='__main__':
 
 
 
-    mol2 = gto.Mole(atom=[
+    mol2 = Molecule(atom=[
         ['H' , (0. , 0. , 0)],
         ['Li' , (0. , 0. , 1.1)]])
     mol2.basis = 'sto3g'
@@ -721,6 +727,8 @@ if __name__=='__main__':
     # for I in range(93):
     #     print(myci.binary[I])
 
+
+    
     A = overlap(myci, ci2)
     print(A)
 

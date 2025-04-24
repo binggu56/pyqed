@@ -2,6 +2,8 @@
 """
 Created on Sat Sep 28 20:09:06 2019
 
+TEBD for quantum dynamics of vibronic model systems
+
 @author: Bing
 """
 
@@ -12,7 +14,8 @@ The TEBD algorithm is also used to recompress the MPS after the MPO time evoluti
 This is simpler to code but less efficient than a variational optimization.
 See arXiv:1407.1832 for details and how to extend to higher orders.
 
-Frank Pollmann, frankp@pks.mpg.de """
+Frank Pollmann, frankp@pks.mpg.de
+"""
 
 import numpy as np
 import pylab as pl
@@ -371,6 +374,314 @@ class MPO:
         factors = apply_mpo(self.factors, mps.factors, rank)
 
         return MPS(factors)
+
+
+
+
+class Site(object):
+    """A general single site
+
+    You use this class to create a single site. The site comes empty (i.e.
+    with no operators included), but for th identity operator. You should
+    add operators you need to make you site up.
+
+    Parameters
+    ----------
+    dim : an int
+	Size of the Hilbert space. The dimension must be at least 1. A site of
+        dim = 1  represents the vaccum (or something strange like that, it's
+        used for demo purposes mostly.)
+    operators : a dictionary of string and numpy array (with ndim = 2).
+	Operators for the site.
+
+    Examples
+    --------
+    >>> from dmrg101.core.sites import Site
+    >>> brand_new_site = Site(2)
+    >>> # the Hilbert space has dimension 2
+    >>> print brand_new_site.dim
+    2
+    >>> # the only operator is the identity
+    >>> print brand_new_site.operators
+    {'id': array([[ 1.,  0.],
+           [ 0.,  1.]])}
+    """
+    def __init__(self, dim):
+        """
+        Creates an empty site of dimension dim.
+
+        	Raises
+        	------
+        	DMRGException
+        	    if `dim` < 1.
+
+        	Notes
+        	-----
+        	Postcond : The identity operator (ones in the diagonal, zeros elsewhere)
+        	is added to the `self.operators` dictionary.
+        """
+        if dim < 1:
+            raise DMRGException("Site dim must be at least 1")
+        super(Site, self).__init__()
+        self.dim = dim
+        self.operators = { "id" : np.eye(self.dim, self.dim) }
+
+    def add_operator(self, operator_name):
+        #  """
+        # Adds an operator to the site.
+
+        #   Parameters
+       	# ----------
+        #    	operator_name : string
+       	#     The operator name.
+
+       	# Raises
+       	# ------
+       	# DMRGException
+       	#     if `operator_name` is already in the dict.
+
+       	# Notes
+       	# -----
+       	# Postcond:
+
+        #       - `self.operators` has one item more, and
+        #       - the newly created operator is a (`self.dim`, `self.dim`)
+        #         matrix of full of zeros.
+
+       	# Examples
+       	# --------
+       	# >>> from dmrg101.core.sites import Site
+       	# >>> new_site = Site(2)
+       	# >>> print new_site.operators.keys()
+       	# ['id']
+       	# >>> new_site.add_operator('s_z')
+       	# >>> print new_site.operators.keys()
+       	# ['s_z', 'id']
+       	# >>> # note that the newly created op has all zeros
+       	# >>> print new_site.operators['s_z']
+       	# [[ 0.  0.]
+        # 	 [ 0.  0.]]
+        # """
+        if str(operator_name) in self.operators.keys():
+
+        # if str(operator_name) in self.operators.keys():
+            raise DMRGException("Operator name exists already")
+        else:
+            self.operators[str(operator_name)] = np.zeros((self.dim, self.dim))
+
+
+class Block(Site):
+    """A block.
+
+    That is the representation of the Hilbert space and operators of a
+    direct product of single site's Hilbert space and operators, that have
+    been truncated.
+
+    You use this class to create the two blocks (one for the left, one for
+    the right) needed in the DMRG algorithm. The block comes empty.
+
+    Parameters
+    ----------
+    dim : an int.
+	Size of the Hilbert space. The dimension must be at least 1. A
+	block of dim = 1  represents the vaccum (or something strange like
+	that, it's used for demo purposes mostly.)
+    operators : a dictionary of string and numpy array (with ndim = 2).
+	Operators for the block.
+
+    Examples
+    --------
+    >>> from dmrg101.core.block import Block
+    >>> brand_new_block = Block(2)
+    >>> # the Hilbert space has dimension 2
+    >>> print brand_new_block.dim
+    2
+    >>> # the only operator is the identity
+    >>> print brand_new_block.operators
+    {'id': array([[ 1.,  0.],
+           [ 0.,  1.]])}
+    """
+    def __init__(self, dim):
+        	"""Creates an empty block of dimension dim.
+
+        	Raises
+        	------
+        	DMRGException
+        	     if `dim` < 1.
+
+        	Notes
+        	-----
+        	Postcond : The identity operator (ones in the diagonal, zeros elsewhere)
+        	is added to the `self.operators` dictionary. A full of zeros block
+        	Hamiltonian operator is added to the list.
+        	"""
+        	super(Block, self).__init__(dim)
+
+def make_block_from_site(site):
+    """Makes a brand new block using a single site.
+
+    You use this function at the beginning of the DMRG algorithm to
+    upgrade a single site to a block.
+
+    Parameters
+    ----------
+    site : a Site object.
+        The site you want to upgrade.
+
+    Returns
+    -------
+    result: a Block object.
+        A brand new block with the same contents that the single site.
+
+    Postcond
+    --------
+    The list for the operators in the site and the block are copied,
+    meaning that the list are different and modifying the block won't
+    modify the site.
+
+    Examples
+    --------
+    >>> from dmrg101.core.block import Block
+    >>> from dmrg101.core.block import make_block_from_site
+    >>> from dmrg101.core.sites import SpinOneHalfSite
+    >>> spin_one_half_site = SpinOneHalfSite()
+    >>> brand_new_block = make_block_from_site(spin_one_half_site)
+    >>> # check all it's what you expected
+    >>> print brand_new_block.dim
+    2
+    >>> print brand_new_block.operators.keys()
+    ['s_p', 's_z', 's_m', 'id']
+    >>> print brand_new_block.operators['s_z']
+    [[-0.5  0. ]
+     [ 0.   0.5]]
+    >>> print brand_new_block.operators['s_p']
+    [[ 0.  0.]
+     [ 1.  0.]]
+    >>> print brand_new_block.operators['s_m']
+    [[ 0.  1.]
+     [ 0.  0.]]
+    >>> # operators for site and block are different objects
+    >>> print ( id(spin_one_half_site.operators['s_z']) ==
+    ...		id(brand_new_block.operators['s_z']) )
+    False
+    """
+    result = Block(site.dim)
+    result.operators = copy.deepcopy(site.operators)
+    return result
+
+"""Exception class for the DMRG code
+"""
+class DMRGException(Exception):
+    """A base exception for the DMRG code
+
+    Parameters
+    ----------
+    msg : a string
+        A message explaining the error
+    """
+    def __init__(self, msg):
+        super(DMRGException, self).__init__()
+        self.msg = msg
+
+    def __srt__(self, msg):
+        	return repr(self.msg)
+
+# def make_updated_block_for_site(transformation_matrix,
+# 		                operators_to_add_to_block):
+#     """Make a new block for a list of operators.
+
+#     Takes a dictionary of operator names and matrices and makes a new
+#     block inserting in the `operators` block dictionary the result of
+#     transforming the matrices in the original dictionary accoring to the
+#     transformation matrix.
+
+#     You use this function everytime you want to create a new block by
+#     transforming the current operators to a truncated basis.
+
+#     Parameters
+#     ----------
+#     transformation_matrix : a numpy array of ndim = 2.
+#         The transformation matrix coming from a (truncated) unitary
+# 	transformation.
+#     operators_to_add_to_block : a dict of strings and numpy arrays of ndim = 2.
+#         The list of operators to transform.
+
+#     Returns
+#     -------
+#     result : a Block.
+#         A block with the new transformed operators.
+#     """
+#     cols_of_transformation_matrix = transformation_matrix.shape[1]
+#     result = Block(cols_of_transformation_matrix)
+#     for key in operators_to_add_to_block.keys():
+#         ult.add_operator(key)
+#         ult.operators[key] = transform_matrix(operators_to_add_to_block[key],
+# 			                         transformation_matrix)
+#     return result
+
+
+class PauliSite(Site):
+    """
+    A site for spin 1/2 models.
+
+    You use this site for models where the single sites are spin
+    one-half sites. The Hilbert space is ordered such as the first state
+    is the spin down, and the second state is the spin up. Therefore e.g.
+    you have the following relation between operator matrix elements:
+
+    .. math::
+
+        \langle \downarrow | A | uparrow \rangle = A_{0,1}
+
+    Notes
+    -----
+    Postcond: The site has already built-in the spin operators for s_z, s_p, s_m.
+
+    Examples
+    --------
+    >>> from dmrg101.core.sites import PauliSite
+    >>> pauli_site = PauliSite()
+    >>> # check all it's what you expected
+    >>> print pauli_site.dim
+    2
+    >>> print pauli_site.operators.keys()
+    ['s_p', 's_z', 's_m', 'id']
+    >>> print pauli_site.operators['s_z']
+    [[-1.  0.]
+      [ 0.  1.]]
+    >>> print pauli_site.operators['s_x']
+    [[ 0.  1.]
+      [ 1.  0.]]
+    """
+    def __init__(self):
+        """
+        Creates the spin one-half site with Pauli matrices.
+
+ 	  Notes
+ 	  -----
+ 	  Postcond : the dimension is set to 2, and the Pauli matrices
+ 	  are added as operators.
+
+        """
+        super(PauliSite, self).__init__(2)
+	# add the operators
+        self.add_operator("s_z")
+        self.add_operator("s_x")
+        self.add_operator("s_m")
+
+	# for clarity
+        s_z = self.operators["s_z"]
+        s_x = self.operators["s_x"]
+        s_m = self.operators["s_m"]
+
+	# set the matrix elements different from zero to the right values
+        s_z[0, 0] = -1.0
+        s_z[1, 1] = 1.0
+        s_x[0, 1] = 1.0
+        s_x[1, 0] = 1.0
+        s_m[0, 1] = 1.0
+
+
 
 
 
@@ -746,6 +1057,13 @@ def make_U_xx_mpo(L,dt,dtype=float):
     return w_list
 
 
+# class TimeEvolvingBlockDecimation:
+
+class TEBD:
+    def __init__(self, D):
+        self.D = D
+
+
 def tebd(B_list, s_list, U_list, chi_max):
     """
     Use TEBD to optmize the MPS and to rduce it back to the orginal size.
@@ -864,7 +1182,7 @@ def apes(x,y):
 
 def potential(B_list, s_list, V, chi_max):
     """
-    potential energy component of the one-step evolution operator e^{-i * dt * V) on the MPS
+    potential energy component of the evolution operator e^{-i * dt * V) on the MPS
     input:
         V: n-d array, PES
         L: int
@@ -1058,7 +1376,31 @@ def expect_one_site(mps, a, n=-1):
 
 
 def overlap(bra, ket):
-    # compute the overlap between two factors
+    """
+
+    Compute the overlap between two MPSs with the same sites
+
+    .. math::
+
+        S = \langle \phi | \chi \rangle
+
+    Note
+    ----
+    It does not work for two MPS with different basis sets.
+
+    Parameters
+    ----------
+    bra : TYPE
+        DESCRIPTION.
+    ket : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
     assert(ket.dims == bra.dims)
 
     C = np.einsum('aib, aic -> bc', bra.factors[0].conj(), ket.factors[0])

@@ -380,7 +380,7 @@ def build(mol):
             basis_dict = parse_gbs(basis_dir + "/sto-3g.1.gbs")
             
             
-        basis = make_contractions(basis_dict, atoms, atcoords, coord_types="c")
+        basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
     else:
 
         raise NotImplementedError('Customized basis not supported yet.')
@@ -415,6 +415,8 @@ def build(mol):
     #Compute e-e repulsion integral in MO basis, shape=(#MO, #MO, #MO, #MO)
     int2e_mo = electron_repulsion_integral(basis, notation='chemist')
     mol.eri = int2e_mo
+    
+    mol._bas = basis
     
     return 
 

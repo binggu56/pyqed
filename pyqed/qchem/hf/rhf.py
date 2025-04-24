@@ -26,6 +26,7 @@ class RHF:
         self.init_guess = init_guess
 
         self.nocc = self.mol.nelec//2
+        
         self.nao = self.mol.nao
 
         self.mo_occ = None
