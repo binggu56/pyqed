@@ -35,7 +35,7 @@ b_vals = np.linspace(0.55, 0.6, 2)  # Can be extended to more b values
 t = 1.5
 
 # omega: angular frequency of the driving field
-omega = 100  # corresponds to near-infrared wavelength if A0 is in atomic units
+omega = 100
 
 # === Model Initialization ===
 
@@ -44,6 +44,7 @@ omega = 100  # corresponds to near-infrared wavelength if A0 is in atomic units
 H0 = np.array([[0, t], [t, 0]], dtype=complex)
 
 # H1 is unused in the Peierls-Gomez-Leon setup since the field enters via modified hopping elements
+# /leave it be as ZERO/, effect of the field in enclosed in the run_phase_diagram_GL2013 function
 H1 = np.array([[0, 0], [0, 0]], dtype=complex)
 
 
@@ -65,7 +66,7 @@ floquet.run_phase_diagram_GL2013(
     k_vals,
     E0o_vals,
     b_vals,
-    save_dir="Shuoyi's Flie/Gomez_Leon_2013/data_Gomez_Leon_2013_test",
+    save_dir="Data_storage/Gomez_Leon_2013/data_Gomez_Leon_2013_test",
     save_band_plot=True,
     t=t,
     omega=omega
