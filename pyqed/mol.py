@@ -561,7 +561,7 @@ class Mol:
         return
     
     def Floquet(self,  omegad, E0, nt):
-        from pyqed.floquet.floquet import Floquet
+        from pyqed.floquet.Floquet import Floquet
         
         return Floquet(self.H,  self.dip, omegad, E0, nt)
     
@@ -780,7 +780,7 @@ class Mol:
         """
         hierarchical equations of motion
         """
-        from pyqed.heom.deom import DEOMSolver
+        from pyqed.HEOM.deom import DEOMSolver
         
         solver = DEOMSolver(self.H, self.edip, bath,
                             coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)

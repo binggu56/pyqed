@@ -1,4 +1,4 @@
 from .mol import * 
 # from .casci import * 
-from .fci import * 
+from .FCI import * 
 from .hf import *
