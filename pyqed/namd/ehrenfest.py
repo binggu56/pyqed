@@ -165,7 +165,7 @@ def Sym(V):
             V[i,j] = V[j,i] 
     return V 
 
-@numba.autojit
+# @numba.autojit
 def Vint(x,y):
     """
     interaction potential between x and y     
@@ -212,19 +212,19 @@ def Vint(x,y):
 
 
 def ground(x):
-    return 0.5 * x**2 
+    return 0.5 * np.sum(x**2), x
 
 def excited(x):
-    return 0.5 * (x-1.0)**2 + 1.0 
+    return 0.5 * np.sum((x-1.0)**2) + 1.0, x - 1.0
 
-@numba.autojit 
+# @numba.autojit 
 def MeanField(y,c):
     
     V0, dV0 = ground(y) 
     V1, dV1 = excited(y)
     
-    Vmf = abs(c(0))**2 * V0 + abs(c(1))**2 * V1
-    dVmf = abs(c(0))**2 * dV0 + abs(c(1))**2 * dV1
+    Vmf = abs(c[:,0])**2 * V0 + abs(c[:, 1])**2 * V1
+    dVmf = abs(c[:, 0])**2 * dV0 + abs(c[:, 1])**2 * dV1
     
     return Vmf, dVmf 
 
@@ -249,22 +249,22 @@ class Ehrenfest:
         else:
             raise ValueError(f"Invalid unit: {unit}")
         
-        self.x = np.random.randn(self.ntraj)
+        self.x = np.random.randn(self.ntraj, self.ndim)
         self.x = self.x / np.sqrt(2.0 * self.ax) + self.x0
 
-        self.p = np.zeros(self.ntraj)
+        self.p = np.zeros(self.ntraj, self.ndim)
 
         self.w = np.array([1./self.ntraj]*self.ntraj)
     
-    def run(self, dt=0.002, nsteps=200):
+    def run(self, dt=0.002, nt=200):
         pass        
         
 # initialization 
 # for nuclear DOF  : an ensemble of trajectories 
 # for electronic DOF  : for each trajectory associate a complex vector c of dimension M 
 
-Ntraj = 1
-M = 2 
+ntraj = Ntraj = 10
+M = nstates = 2 
 #nfit = 5
 #ax = 1.0 # width of the GH basis 
 ay0 = 16.0  
@@ -291,15 +291,13 @@ print('trace of density matrix',np.vdot(c[0,:], c[0,:]))
 # initial conditions for nuclear trajectory   
 
 # ensemble of trajectories    
-#y = np.random.randn(Ntraj)             
-#y = y / np.sqrt(2.0 * ay0) + y0
+y = np.random.randn(ntraj)             
+y = y / np.sqrt(2.0 * ay0) + y0
+print('trajectory range {}, {}'.format(min(y),max(y)))
 
-# single trajectory 
-y = y0 
-#print('trajectory range {}, {}'.format(min(y),max(y)))
 print('intial nuclear position',y)
 py = np.zeros(Ntraj)
-ry = - ay0 * (y-y0) 
+# ry = - ay0 * (y-y0) 
 
 w = np.array([1./Ntraj]*Ntraj)
 
@@ -337,7 +335,7 @@ print('timestep  = {}'.format(dt))
 
 #eps = 0.5 # nonlinear coupling Vint = eps*x**2*y**2
 
-@numba.autojit 
+# @numba.autojit 
 def den(c,w):
     """
         compute reduced density matrix elements 
@@ -356,7 +354,7 @@ def den(c,w):
         
     return rho[0,1], purity.real  
         
-@numba.autojit 
+# @numba.autojit 
 def norm(c,w):
     
     anm = 0.0 
@@ -365,7 +363,7 @@ def norm(c,w):
         anm += np.vdot(c[k,:], c[k,:]).real * w[k]
     return anm
 
-@numba.autojit
+# @numba.autojit
 def fit_c(c,y):
     """
     global approximation of c vs y to obtain the derivative c'',c'     
@@ -386,21 +384,21 @@ def fit_c(c,y):
             
     return dc, ddc
     
-@numba.autojit 
+# @numba.autojit 
 def prop_c(y):
     
-    dc, ddc = fit_c(c,y)
+    # dc, ddc = fit_c(c,y)
 
-    dcdt = np.zeros([Ntraj,M],dtype=np.complex128)
+    dcdt = np.zeros([ntraj,M],dtype=np.complex128)
     
     
     #X1 = M1mat(ax,M)
-    for k in range(Ntraj):
+    for k in range(ntraj):
         
-        H = np.zeros((2,2))
-        H[0,0] = ground(y[k])
+        H = np.zeros((nstates, nstates))
+        H[0,0] = ground(y[k])[0]
         H[0,1] = H[1,0] = 0.0 
-        H[1,1] = excited(y[k])
+        H[1,1] = excited(y[k])[0]
          
         # anharmonic term in the bath potential 
         #Va = y[k]**4 * 1.0
@@ -411,7 +409,7 @@ def prop_c(y):
        
     return dcdt
     
-@numba.autojit 
+# @numba.autojit 
 def xAve(c,y,w):
     """
     compute expectation value of x     
@@ -456,7 +454,7 @@ for k in range(Nt):
 
     # force field 
         
-    x_ave = xAve(c,y,w)
+    # x_ave = xAve(c,y,w)
     v0, dv = MeanField(y,c)
 
     py += - dv * dt2 - fric_cons * py * dt2 
@@ -481,7 +479,7 @@ for k in range(Nt):
 #            d[k,i] = np.exp(-1j*t*H[i,i])*c[k,i]
 
 
-    fx.write('{} {} \n'.format(t,x_ave))
+    # fx.write('{} {} \n'.format(t,x_ave))
            
     f.write(fmt.format(t,*y[0:nout]))
 
@@ -503,7 +501,7 @@ print('The total energy = {} Hartree. \n'.format(Etot))
 
 # print trajectory and coefficients 
 for k in range(Ntraj):
-    fc.write( '{} {} {} {} \n'.format(y[k], c[k,0],c[k,-1]))
+    fc.write( '{} {} {} \n'.format(y[k], c[k,0],c[k,-1]))
 
 fe.close()
 f.close() 

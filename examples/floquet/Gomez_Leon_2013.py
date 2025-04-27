@@ -1,4 +1,4 @@
-from pyqed.floquet import Floquet
+from pyqed.floquet.floquet import Floquet
 from pyqed import Mol
 import numpy as np
 
