@@ -13,19 +13,184 @@ from scipy.special import jv
 from pyqed.mol import Mol, dag
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+# from tqdm import tqdm
 import time
 import os
-from pyqed.floquet.floquet_utils import track_valence_band, berry_phase_winding, figure, track_valence_band_GL2013
+from pyqed.floquet.utils import track_valence_band, berry_phase_winding, figure, track_valence_band_GL2013
+
+from numpy import exp, eye, zeros, arctan2
+from scipy.linalg import eigh
 
 
-class Floquet:
+class TightBinding(Mol):
     """
-    peridically driven multi-level system with a single frequency
+    1D tight-binding chain with Bloch periodic boundary conditions.
+
+    Inherits from Mol so that FloquetBloch can be constructed.
+
+    Parameters
+    ----------
+    h0 : array_like, shape (norb, norb)
+        On-site Hamiltonian matrix for a single unit cell.
+    hopping : array_like or float
+        If float, uniform scalar hopping between cells. If array_like, matrix of shape (norb, norb)
+        representing inter-cell hopping.
+    a : float, optional
+        Lattice constant (default = 1).
+    nk : int, optional
+        Number of k-points in the Brillouin zone for band structure.
+    mu : float, optional
+        On site potential (added to diagonal).
+    """
+    def __init__(self, h0, hopping=0.0, a=1.0, nk=50, mu=0.0):
+        # Store parameters
+        self.h0 = np.array(h0, dtype=complex)
+        self.norb = self.h0.shape[0]
+        # hopping matrix between unit cells (norb x norb)
+        self.hop = (np.array(hopping, dtype=complex)
+                    if np.shape(hopping) != () else np.eye(self.norb) * hopping)
+        self.a = a
+        self.mu = mu
+        # precompute k-grid
+        self.k_vals = np.linspace(-np.pi/a, np.pi/a, nk)
+        # placeholders for results
+        self._bands = None  # shape (norb, nk)
+
+        # Initialize Mol parent with dummy edip (will override in Floquet)
+        super().__init__(H=self.h0, edip=np.zeros_like(self.h0))
+
+    def buildH(self, k):
+        """
+        Construct the Bloch Hamiltonian H(k) = h0 + hop*e^{i k a} + hop^dag e^{-i k a} + mu*I.
+
+        Parameters
+        ----------
+        k : float
+            Crystal momentum.
+
+        Returns
+        -------
+        Hk : ndarray, shape (norb, norb)
+        """
+        phase = np.exp(1j * k * self.a)
+        Hk = (self.h0
+              + self.hop * phase
+              + self.hop.conj().T * np.conj(phase)
+              + np.eye(self.norb) * self.mu)
+        return Hk
+
+    def run(self, k=None):
+        """
+        Compute band eigenvalues at one or many k-points.
+
+        Parameters
+        ----------
+        k : float or array_like, optional
+            If None, uses the full internal k-grid. Otherwise compute only at specified k.
+
+        Returns
+        -------
+        ks : ndarray
+            k-points used.
+        bands : ndarray, shape (norb, len(ks))
+            Eigenvalues sorted ascending along axis 0.
+        """
+        ks = np.atleast_1d(k) if k is not None else self.k_vals
+        bands = np.zeros((self.norb, len(ks)), dtype=float)
+        for idx, kpt in enumerate(ks):
+            eigs = np.linalg.eigvalsh(self.buildH(kpt))
+            bands[:, idx] = np.sort(eigs.real)
+        self._bands = bands
+        return ks, bands
+
+    def plot(self, k=None):
+        """
+        Plot the valence and conduction bands over k.
+        """
+        ks, bands = self.run(k)
+        plt.figure(figsize=(8, 4))
+        for b in range(self.norb):
+            plt.plot(ks, bands[b], label=f'Band {b}')
+        plt.xlabel('k')
+        plt.ylabel('Energy')
+        plt.title('Tight-Binding Band Structure')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+ 
+    def band_gap(self):
+        """
+        Compute the minimum gap between the lowest two bands over the k-grid.
+        """
+        if self._bands is None:
+            _, self._bands = self.run()
+        # gap = min_{k} [ band1(k) - band0(k) ]
+        return np.min(self._bands[1] - self._bands[0])
+
+    def Floquet(self, **kwargs):
+        """
+        Create a FloquetBloch solver for this TB model.
+
+        Keyword Args
+        ------------
+        omegad : float
+            Driving frequency.
+        E0 : float
+            Electric field amplitude.
+        polarization : array_like of length 3
+            Field polarization vector (unused for 1D).
+        nt : int
+            Number of Floquet harmonics.
+        gauge : {'length','velocity'}
+            Choice of gauge.
+
+        Returns
+        -------
+        floq : FloquetBloch
+        """
+        # Overwrite parent H to be the static H0(k) function
+        # We wrap buildH to supply H at each k inside FloquetBloch
+        def Hk_func(kpt):
+            return self.buildH(kpt)
+
+        # dipole operator in Bloch basis: position * charge
+        # for 1D, position operator acts as i d/dk in Bloch basis, but here use real-space site positions
+        # approximate by diagonal positions [0, a, 2a,...]
+        pos = np.diag(np.arange(self.norb) * self.a)
+
+        floq = FloquetBloch(Hk=Hk_func,
+                             Edip=pos,
+                             **kwargs)
+        return floq
+
+
+    def density_of_states(self):
+        pass
+
+    def zeeman(self):
+        # drive with magnetic field
+        pass
+
+    def gf(self):
+        # surface and bulk Green function
+        pass
+
+    def gf_surface(self):
+        pass
+
+
+    def LvN(self, *args, **kwargs):
+        # Liouville von Newnman equation solver
+        pass
+        # return LvN(*args, **kwargs)
+
+class FloquetBloch:
+    """
+    peridically driven tight-binding system with a single frequency
 
     TODO: add more harmonics so it can treat a second harmonic driving
     """
-    def __init__(self, H, edip, omegad, E0, nt):
+    def __init__(self, H , omegad, E0, nt, edip=None):
 
         # super().__init__(H, edip)
         self.H = H
@@ -52,48 +217,10 @@ class Floquet:
         p = 1j * np.subtract.outer(E, E) * self.edip
         return p
 
-    def run(self, gauge='length', method='Floquet'):
-        """
-        .. math::
-            E(t) = E_0 * \cos(\Omega t)
-            A(t) = -\frac{E_0}{\Omega} * \sin(\Omega  t)
-
-        Parameters
-        ----------
-        E0 : TYPE
-            electric field amplitude.
-        gauge : TYPE, optional
-            DESCRIPTION. The default is 'length'.
-
-        Returns
-        -------
-        quasienergies : TYPE
-            DESCRIPTION.
-        floquet_modes : TYPE
-            DESCRIPTION.
-
-        """
-        H0 = self.H
-        E0 = self.E0
-        nt = self.nt 
-        omegad = self.omegad
-        
-
-        if gauge == 'length': # electric dipole
-
-            H1 = -0.5 * self.edip * E0
-
-        elif gauge == 'velocity':
-
-            H1 = 0.5j * self.momentum() * E0/omegad
-        
-        quasienergies, floquet_modes, G = quasiE(H0, H1, nt, omegad, method=1)
-
-        return quasienergies, floquet_modes, G
     
 
 
-    def run_phase_diagram(self, k_values, E0_values, omega_values, save_dir,
+    def phase_diagram(self, k_values, E0_values, omega_values, save_dir,
                         save_band_plot=True, nt=61, v=0.2, w=0.15):
         """
         Run Floquet winding number phase diagram over (E0, omega).
@@ -162,6 +289,8 @@ class Floquet:
         fig.tight_layout()
         fig.savefig(os.path.join(save_dir, "winding_phase_diagram.png"))
         plt.close(fig)
+        
+        # return
 
     def run_phase_diagram_GL2013(self, k_vals, E0_over_omega_vals, b_vals, save_dir,
                              nt=61, t=1.5, omega=100, save_band_plot=False):
@@ -243,8 +372,11 @@ class Floquet:
         elif gauge == 'velocity':
 
             H1 = 0.5j * self.momentum() * E0/omegad
-            
-        occ_state, occ_state_energy = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
+        
+        elif gauge == 'peierls':
+        
+            occ_state, occ_state_energy = Floquet_Winding_number(H0, H1, nt, omegad, T, E0, quasi_E, previous_state)
+
         return occ_state, occ_state_energy
     
     def winding_number_Peierls(self, T, k, quasi_E = None, previous_state = None, gauge='length',w=0.2): # To be modified
@@ -287,7 +419,7 @@ class Floquet:
         pass
 
 
-class FloquetGF(Floquet):
+class FloquetGF(FloquetBloch):
     """
     Floquet Green's function formalism
     """
@@ -900,19 +1032,15 @@ def Floquet_Winding_number_Peierls(H0, k, Nt, omega, T, E ,quasiE = None, previo
         return occ_state, occ_state_energy
     
 # ==============================================================
-#  Circularly polarised Peierls helper  (δx,δy embedding)
+#  Circularly polarised Peierls helper  (δx,δy embedding)
 # ==============================================================
 
-import numpy as np
-from numpy import exp, eye, zeros, hypot, arctan2
-from scipy.linalg import eigh
-from scipy.special import jv
 
 
 def Floquet_Winding_number_Peierls_circular(
-        k, Nt, omega, T, E0,                        # drive & grid
-        delta_x, delta_y,                           # geometry
-        a=1.0, t0=1.0, xi=1.0,                      # lattice/decay
+        k, Nt, omega, T, E0,                        # drive & grid
+        delta_x, delta_y,                           # geometry
+        a=1.0, t0=1.0, xi=1.0,                      # lattice/decay
         quasiE=None, previous_state=None):
     """
     Construct the extended Floquet matrix for a circularly polarised
@@ -926,7 +1054,7 @@ def Floquet_Winding_number_Peierls_circular(
     NF    = Norbs * Nt
     N0    = -(Nt - 1) // 2      # Fourier index shift  (Nt must be odd)
 
-    # ---- static hopping magnitudes  v0, w0  --------------------
+    # ---- static hopping magnitudes  v0, w0  --------------------
     d_v   = (delta_x**2 + delta_y**2)**0.5
     d_w   = np.sqrt((a-delta_x)**2 + delta_y**2)
     v0    = t0 * exp(-d_v / xi)
@@ -1149,14 +1277,55 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
         
         return occ_state, occ_state_energy
 
+# def test():
+#     """
+#     Test of FB winding number solver aganist GL2024, PRL,
 
+#     Returns
+#     -------
+#     None.
+
+#     """
+    
 if __name__ == '__main__':
-    from pyqed import pauli
-    s0, sx, sy, sz = pauli()
+    # from pyqed import pauli
+    # s0, sx, sy, sz = pauli()
     
-    mol = Floquet(H=0.5*sz, edip=sx)
+    tb = TightBinding(norbs=2, coords=[[]])
     
-    qe, fmodes = mol.spectrum(0.4, omegad = 1, nt=10, gauge='length')
-    print(qe)
+    tb.band_gap()
+    tb.band_structure(ks)
+    
+    
+    floquet = tb.Floquet(omegad = 1, E = 1, polarization=[1, 0, 0])
+    
+    floquet.gauge = 'length'
+    floquet.nt = 61
+
+    
+    floquet.winding_number(n=0)
+    
+    floquet.quasienergy()
+    floquet.floquet_modes()
+    
+    
+    # phase diagram 
+    W = np.zeros((10, 10))
+    for i, E in enumerate(np.linspace(0, 0.1, 10)):
+        for j, omegad in enumerate(np.linspace(0, 1, 10)):
+            floquet.set_amplitude(E)
+            floquet.set_driving_frequency(omegad)
+            
+            W[i, j] = floquet.winding_number()
+    
+    # plot W
+    
+    # dynamics 
+    
+    
+    # mol = Floquet(H=0.5*sz, edip=sx)    
+    # qe, fmodes = mol.spectrum(0.4, omegad = 1, nt=10, gauge='length')
+
+
     # qe, fmodes = dmol.spectrum(E0=0.4, Nt=10, gauge='velocity')
     # print(qe)

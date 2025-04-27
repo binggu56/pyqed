@@ -28,17 +28,12 @@ def jordan_wigner_transform(j, lattice_length):
         operators.append(I)
     return -nested_kronecker_product(operators)
 
-lattice_length = 4
-a = []
-for i in range(lattice_length):
-    a.append(jordan_wigner_transform(i, lattice_length))
-
-"""
-spinless fermmions on an open chain
-    H=∑<rs>(c†rcs+c†scr−γ(c†rc†s+cscr))−2λ∑rc†rcr,
-"""
 
 def hamiltonian(gam, lam, a, lattice_length):
+    """
+    spinless fermmions on an open chain
+        H=∑<rs>(c†rcs+c†scr−γ(c†rc†s+cscr))−2λ∑rc†rcr,
+    """
     H = 0
     for i in range(lattice_length - 1):
         H += a[i].T.dot(a[i+1]) - a[i].dot(a[i+1].T)
@@ -47,7 +42,15 @@ def hamiltonian(gam, lam, a, lattice_length):
         H -= 2*lam*(a[i].dot(a[i].T))
     return H
 
-gam, lam =1, 1
-H = hamiltonian(gam, lam, a, lattice_length)
-eigenvalues = np.linalg.eig(H)[0]
-print(sorted(eigenvalues))
+if __name__=='__main__':
+    
+    lattice_length = 4
+    a = []
+    for i in range(lattice_length):
+        a.append(jordan_wigner_transform(i, lattice_length))
+
+
+    gam, lam =1, 1
+    H = hamiltonian(gam, lam, a, lattice_length)
+    eigenvalues = np.linalg.eig(H)[0]
+    print(sorted(eigenvalues))

@@ -58,6 +58,8 @@ class Chain(Mol):
         """
         position matrix elements in localized basis/Wannier basis
 
+        valid for open boundary condition
+
         .. math::
             x = \sum_{n=1}^N \sum_A n (\ket{m A}\bra{m A})
 
