@@ -28,6 +28,10 @@ class TightBinding(Mol):
     """
     def __init__(self, h, hopping=0, L=None, a=1, mu=0, nk=50, disorder=False):
         """
+        
+        .. math::
+            
+            H = 
 
         Parameters
         ----------
@@ -1190,18 +1194,37 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
     
     def set_
 
+# def test():
+#     """
+#     Test of FB winding number solver aganist GL2024, PRL,
+
+#     Returns
+#     -------
+#     None.
+
+#     """
+    
 if __name__ == '__main__':
-    from pyqed import pauli
-    s0, sx, sy, sz = pauli()
+    # from pyqed import pauli
+    # s0, sx, sy, sz = pauli()
     
     tb = TightBinding(norbs=2, coords=[[]])
-    floquet = tb.Floquet(omegad=, E=, gauge=)
     
-    floquet.gauge = 'p'
+    tb.band_gap()
+    tb.band_structure(ks)
+    
+    
+    floquet = tb.Floquet(omegad=, E=, polarization=[1, 0, 0])
+    
+    floquet.gauge = 'length'
     floquet.nt = 61
 
     
     floquet.winding_number(n=0)
+    
+    floquet.quasienergy()
+    flouqet.floquet_modes()
+    
     
     # phase diagram 
     
@@ -1213,6 +1236,9 @@ if __name__ == '__main__':
             W[i, j] = floqe.widn
     
     plot W
+    
+    # dynamics 
+    
     
     # mol = Floquet(H=0.5*sz, edip=sx)    
     # qe, fmodes = mol.spectrum(0.4, omegad = 1, nt=10, gauge='length')
