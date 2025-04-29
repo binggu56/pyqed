@@ -53,7 +53,8 @@ class TightBinding(Mol):
 
         # Build intracell and intercell hopping matrices
         self.intra = np.zeros((self.norb, self.norb), dtype=complex)
-        self.inter = np.zeros_like(self.intra)
+        self.inter_upper = np.zeros_like(self.intra)
+        self.inter_lower = np.zeros_like(self.intra)
         for i in range(self.norb):
             for j in range(self.norb):
                 # Intracell hopping
@@ -66,8 +67,8 @@ class TightBinding(Mol):
                 delta_p = (self.coords[j] + self.a_vec) - self.coords[i]
                 dist_p = np.linalg.norm(delta_p)
                 if i > j:
-                    self.inter[i, j] = np.exp(-dist_p / self.lambda_decay)
-                    self.inter[j, i] = np.conj(self.inter[i, j])
+                    self.inter_lower[i, j] = np.exp(dist_p / self.lambda_decay)
+                    self.inter_upper[j, i] = np.conj(self.inter_lower[i, j])
 
         # Build k-point grid for Brillouin zone
         if isinstance(nk, int):
@@ -89,7 +90,7 @@ class TightBinding(Mol):
 
     def buildH(self, k):
         """
-        Construct Bloch Hamiltonian H(k) = intra + inter*e^{i k·a} + mu*I.
+        Construct Bloch Hamiltonian H(k) = intra + inter_upper*e^{i k·a} + inter_lower*e^{-i k·a} + mu*I.
 
         Parameters
         ----------
@@ -104,10 +105,12 @@ class TightBinding(Mol):
             if isinstance(k, (list, np.ndarray)):
                 if len(k[0]) != self.dim:
                     raise ValueError(f"each k point must have length {self.dim}")
-        phase = np.exp(1j * np.dot(k_vec, self.a_vec))
+
         Hk = (self.intra
-              + self.inter * phase
+              + self.inter_upper * np.exp(1j * np.dot(k, self.a_vec))
+              + self.inter_lower * np.exp(-1j * np.dot(k, self.a_vec))
               + np.eye(self.norb) * self.mu)
+
         return Hk
 
     def run(self, k=None):
@@ -175,16 +178,15 @@ class TightBinding(Mol):
 
     def Floquet(self, **kwargs):
         """
-        Create a FloquetBloch solver using this TB model.
-
-        Keyword Args
-        ------------
-        omegad, E0, nt, gauge, polarization
+        Return a FloquetBloch instance with coordinate info.
         """
         Hk_func = lambda kpt: self.buildH(kpt)
-        # Position operator for 1D orbitals: diag(0, a, 2a, ...)
-        pos = np.diag(np.arange(self.norb) * self.a_vec[0])
-        return FloquetBloch(Hk=Hk_func, Edip=pos, **kwargs)
+        # pos = np.diag(np.arange(self.norb) * self.a_vec[0])
+        floq = FloquetBloch(Hk_func=Hk_func, **kwargs, coords=self.coords, a_vec=self.a_vec,
+                            norbs=self.norb)
+        # floq = FloquetBloch(Hk=Hk_func, Edip=pos, **kwargs)
+        # Attach coordinate info for extended H build
+        return floq
 
 
     def density_of_states(self):
@@ -223,9 +225,11 @@ if __name__ == '__main__':
     tb.plot()
 
     # Floquet example
-    floq = tb.Floquet(omegad=5.0, E0=0.2, nt=21, gauge='length')
-    print("Floquet winding #", floq.winding_number(n=0))
- 
+    floq = tb.Floquet(omegad=5.0, E0=0.2, nt=21, gauge='Peierls', polarization=[1])
+    print("Floquet hamiltonian", floq.build_extendedH(0))
+    floq.run(k=np.linspace(-np.pi, np.pi, 100))
+    floq.plot_band_structure(k=np.linspace(-np.pi, np.pi, 100))
+    print("Floquet winding #", floq.winding_number(band = 0))
 
 
 # To improve:
