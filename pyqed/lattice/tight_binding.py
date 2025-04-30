@@ -7,6 +7,7 @@ Tight-binding models
 @author: Bing Gu
 
 """
+import os
 import numpy as np
 from numpy.linalg import inv
 from pyqed import dagger, dag
@@ -176,14 +177,16 @@ class TightBinding(Mol):
         gap = self._bands[1] - self._bands[0]
         return np.min(gap)
 
-    def Floquet(self, **kwargs):
+    def Floquet(self, data_path, **kwargs):
         """
         Return a FloquetBloch instance with coordinate info.
         """
+        if not os.path.exists(data_path):
+            os.makedirs(data_path)
         Hk_func = lambda kpt: self.buildH(kpt)
         # pos = np.diag(np.arange(self.norb) * self.a_vec[0])
         floq = FloquetBloch(Hk_func=Hk_func, **kwargs, coords=self.coords, a_vec=self.a_vec,
-                            norbs=self.norb)
+                            norbs=self.norb, data_path=data_path)
         # floq = FloquetBloch(Hk=Hk_func, Edip=pos, **kwargs)
         # Attach coordinate info for extended H build
         return floq
@@ -225,7 +228,7 @@ if __name__ == '__main__':
     tb.plot()
 
     # Floquet example
-    floq = tb.Floquet(omegad=5.0, E0=0.2, nt=21, gauge='Peierls', polarization=[1])
+    floq = tb.Floquet(omegad=5.0, E0=[0,0.1], nt=21, gauge='Peierls', polarization=[1], data_path='MacBook_local_data/floquet_data')
     print("Floquet hamiltonian", floq.build_extendedH(0))
     floq.run(k=np.linspace(-np.pi, np.pi, 100))
     floq.plot_band_structure(k=np.linspace(-np.pi, np.pi, 100))

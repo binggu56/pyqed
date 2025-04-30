@@ -272,10 +272,13 @@ class FloquetBloch:
 
     def build_extendedH(self, kpt):
         """Build the Floquet extended Hamiltonian via Jacobi-Anger expansion."""
+        if isinstance(self.E0, (float, int)):
+            omegad, E0 = self.omegad, self.E0
+        if isinstance(self.E0, (list, np.ndarray)):
+            omegad, E0 = self.omegad, self.E0[-1]
+            print('Only the extendedH for largesr H built.')
         Norbs, nt = self.norbs, self.nt
-        omegad, E0 = self.omegad, self.E0
         coords, eps = self.coords, self.polarization
-
         H0 = self.Hk_func(kpt)
         dmat = np.dot(coords[:, None, :] - coords[None, :, :], eps)
         Hn = {}
