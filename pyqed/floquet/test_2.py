@@ -265,4 +265,5 @@
 #     print("3D direction vectors:\n", model3.direction_of_position_vector)
 import numpy as np
 band_energy = [np.zeros((5,2), dtype=complex) for i in range(3)]
+print(np.shape(band_energy))
 print(band_energy)
