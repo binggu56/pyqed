@@ -16,9 +16,11 @@ import matplotlib.pyplot as plt
 # from tqdm import tqdm
 import time
 import os
-from pyqed.floquet.utils import track_valence_band, berry_phase_winding, figure, track_valence_band_GL2013
+from pyqed.floquet.utils import track_valence_band, berry_phase_winding, figure, track_valence_band_GL2013, save_data_to_hdf5, load_data_from_hdf5
 from numpy import exp, eye, zeros, arctan2
 from scipy.linalg import eigh
+import os
+import h5py
 
 class TightBinding(Mol):
     """
@@ -37,41 +39,237 @@ class TightBinding(Mol):
     mu : float, optional
         On-site energy added to diagonal.
     """
-    def __init__(self, coords, lambda_decay=1.0, a=1.0, nk=50, mu=0.0):
+    def __init__(self, coords, relative_Hopping = None, lambda_decay=1.0, lattice_constant=[1.0], nk=50, mu=0.0):
         # Orbital positions and dimensionality
         self.coords = np.array(coords, dtype=float)
         self.norb = len(self.coords)
         self.dim = len(self.coords[0])
-        print("dim", self.dim)
-        # Lattice vectors
-        if np.shape(a) == ():
-            self.a_vec = np.ones(self.dim) * float(a)
-        else:
-            self.a_vec = np.array(a, dtype=float)
-            if self.a_vec.size != self.dim:
-                raise ValueError("Length of `a` must equal spatial dimension")
-
-        self.mu = mu
         self.lambda_decay = float(lambda_decay)
+        self.direction_of_position_vector = np.zeros(self.dim) #this is stored for calculating dot product with A (magnetic vector potential) later
+        # Lattice vectors
+        # check if lattice_constant is a set up correctly, if it is a scalar, then extend in one direction
+        if np.shape(lattice_constant) == ():
+            if self.dim == 1:
+                self.lattice_constant = np.ones(self.dim) * float(lattice_constant)
+            else:   
+                raise ValueError("dimension of lattice_constant and dimension of the system does not match, if you want to set up higher dimension system only extend in one direction, please provide a list of lattice_constant and set the non-extension direction to 0, put non-extension direction to end of the list")
+        else:
+            self.lattice_constant = np.array(lattice_constant, dtype=float)
+            if self.lattice_constant.size != self.dim:
+                raise ValueError("dimension of lattice_constant and dimension of the system does not match, if you want to set up higher dimension system only extend in one direction, please provide a list of lattice_constant and set the non-extension direction to 0, put non-extension direction to end of the list")
 
-        # Build intracell and intercell hopping matrices
-        self.intra = np.zeros((self.norb, self.norb), dtype=complex)
+
+        # count the non-zero elements in the lattice_constant as the extension direction
+        self.extension_direction_number = np.count_nonzero(self.lattice_constant)
+        # check if the zeros in lattice_constant is located at the end of the list
+        non_extension_direction_number = len(self.lattice_constant) - self.extension_direction_number
+        for i in range(non_extension_direction_number):
+            if self.lattice_constant[-i-1] != 0:
+                raise ValueError("the zeros in lattice_constant is not located at the end of the list, please set the non-extension direction to 0, put non-extension direction to end of the list")
+        
+        # Check if relative_Hopping is provided
+        if relative_Hopping is not None:
+            if len(relative_Hopping) != self.norb*(self.norb-1)*2**(self.extension_direction_number-1):
+                raise ValueError("Length of `relative_Hopping` must match the existing pairs of orbitals, for example, in two dimension, for 2 orbitals, the length of `relative_Hopping` must be 2 (tao_AB, tao_BA'), for 3 orbitals, the length of `relative_Hopping` must be 6 (tao_AB, tao_BA', tao_AC, tao_CA', tao_BC, tao_CB'), in three dimension, for 2 orbitals, the length of `relative_Hopping` must be 4 (tao_AB, tao_BAx, tao_BAy, tao_BAxy)")
+            self.relative_Hopping = np.array(relative_Hopping, dtype=float)
+            self.direction_of_position_vector = []
+            self.modified_position_vector = []
+            if self.extension_direction_number == 1:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.direction_of_position_vector.append(self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+            elif self.extension_direction_number == 2:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for a in range(self.dim):
+                    for i in range(self.norb):
+                        for j in range(self.norb):
+                            if j > i:
+                                modified_position_vector = np.zeros(self.dim)
+                                modified_position_vector[a] = self.lattice_constant[a]
+                                self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 2
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            modified_position_vector[1] = self.lattice_constant[1]
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+            elif self.extension_direction_number == 3:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.direction_of_position_vector.append(self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for a in range(self.dim):
+                    for i in range(self.norb):
+                        for j in range(self.norb):
+                            if j > i:
+                                modified_position_vector = np.zeros(self.dim)
+                                modified_position_vector[a] = self.lattice_constant[a]
+                                self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 2
+                for a in range(self.dim):
+                    for b in range(a+1, self.dim):
+                        for i in range(self.norb):
+                            for j in range(self.norb):
+                                if j > i:
+                                    modified_position_vector = np.zeros(self.dim)
+                                    modified_position_vector[a] = self.lattice_constant[a]
+                                    modified_position_vector[b] = self.lattice_constant[b]
+                                    self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                    self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 3
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            modified_position_vector[1] = self.lattice_constant[1]
+                            modified_position_vector[2] = self.lattice_constant[2]
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+        else:
+            self.relative_Hopping = []
+            self.direction_of_position_vector = []
+            self.modified_position_vector = []
+            if self.extension_direction_number == 1:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(self.coords[j] - self.coords[i]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(self.coords[j] - self.coords[i])
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+            elif self.extension_direction_number == 2:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(self.coords[j] - self.coords[i]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(self.coords[j] - self.coords[i])
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for a in range(self.dim):
+                    for i in range(self.norb):
+                        for j in range(self.norb):
+                            if j > i:
+                                modified_position_vector = np.zeros(self.dim)
+                                modified_position_vector[a] = self.lattice_constant[a]
+                                self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                                self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 2
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            modified_position_vector[1] = self.lattice_constant[1]
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+            elif self.extension_direction_number == 3:
+                # current_dim = 0
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(self.coords[j] - self.coords[i]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(self.coords[j] - self.coords[i])
+                            self.modified_position_vector.append(np.zeros(self.dim))
+                # current_dim = 1
+                for a in range(self.dim):
+                    for i in range(self.norb):
+                        for j in range(self.norb):
+                            if j > i:
+                                modified_position_vector = np.zeros(self.dim)
+                                modified_position_vector[a] = self.lattice_constant[a]
+                                self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                                self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 2
+                for a in range(self.dim):
+                    for b in range(a+1, self.dim):
+                        for i in range(self.norb):
+                            for j in range(self.norb):
+                                if j > i:
+                                    modified_position_vector = np.zeros(self.dim)
+                                    modified_position_vector[a] = self.lattice_constant[a]
+                                    modified_position_vector[b] = self.lattice_constant[b]
+                                    self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                                    self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                                    self.modified_position_vector.append(modified_position_vector)
+                # current_dim = 3
+                for i in range(self.norb):
+                    for j in range(self.norb):
+                        if j > i:
+                            modified_position_vector = np.zeros(self.dim)
+                            modified_position_vector[0] = self.lattice_constant[0]
+                            modified_position_vector[1] = self.lattice_constant[1]
+                            modified_position_vector[2] = self.lattice_constant[2]
+                            self.relative_Hopping.append(np.exp(-np.linalg.norm(modified_position_vector + self.coords[i] - self.coords[j]) / self.lambda_decay))
+                            self.direction_of_position_vector.append(modified_position_vector + self.coords[i] - self.coords[j])
+                            self.modified_position_vector.append(modified_position_vector)
+        self.mu = mu
+
+        # number of unique (i<j) pairs
+        pairs = [(i, j)
+                 for i in range(self.norb)
+                 for j in range(self.norb)
+                 if j > i]
+        Npairs = len(pairs)
+
+        # allocate matrices
+        self.intra       = np.zeros((self.norb, self.norb), dtype=complex)
         self.inter_upper = np.zeros_like(self.intra)
         self.inter_lower = np.zeros_like(self.intra)
-        for i in range(self.norb):
-            for j in range(self.norb):
-                # Intracell hopping
-                delta = self.coords[j] - self.coords[i]
-                dist = np.linalg.norm(delta)
-                if i > j:
-                    self.intra[i, j] = np.exp(-dist / self.lambda_decay)
-                    self.intra[j, i] = np.conj(self.intra[i, j])
-                # Intercell hopping (to next unit cell)
-                delta_p = (self.coords[j] + self.a_vec) - self.coords[i]
-                dist_p = np.linalg.norm(delta_p)
-                if i > j:
-                    self.inter_lower[i, j] = np.exp(dist_p / self.lambda_decay)
-                    self.inter_upper[j, i] = np.conj(self.inter_lower[i, j])
+
+        # 1) intracell hoppings (R = 0)
+        for idx, (i, j) in enumerate(pairs):
+            t = self.relative_Hopping[idx]
+            # fill both (i→j) and its Hermitian partner (j→i)
+            self.intra[i, j] = t
+            self.intra[j, i] = np.conj(t)
+
+        # 2) intercell hoppings to the “+a” neighbor (R = +a)
+        for idx, (i, j) in enumerate(pairs, start=Npairs):
+            t = self.relative_Hopping[idx]
+            # by convention we put the +a hop in (i←j), i.e. H_{i,j}(+a) = t
+            # and its Hermitian partner in (j←i) for R = -a
+            i0, j0 = pairs[idx - Npairs]
+            self.inter_upper[i0, j0] = t
+            self.inter_lower[j0, i0] = np.conj(t)
+
 
         # Build k-point grid for Brillouin zone
         if isinstance(nk, int):
@@ -81,7 +279,7 @@ class TightBinding(Mol):
             if len(nk_list) != self.dim:
                 raise ValueError("`nk` must be int or list of length dim")
 
-        axes = [np.linspace(-np.pi/self.a_vec[d], np.pi/self.a_vec[d], nk_list[d])
+        axes = [np.linspace(-np.pi/self.lattice_constant[d], np.pi/self.lattice_constant[d], nk_list[d])
                 for d in range(self.dim)]
         grids = np.meshgrid(*axes, indexing='ij')
         pts = np.stack([g.flatten() for g in grids], axis=-1)
@@ -92,29 +290,16 @@ class TightBinding(Mol):
 
 
     def buildH(self, k):
-        """
-        Construct Bloch Hamiltonian H(k) = intra + inter_upper*e^{i k·a} + inter_lower*e^{-i k·a} + mu*I.
-
-        Parameters
-        ----------
-        k : array_like, length = dim
-            Crystal momentum vector.
-        """
-        #check if k is a list of k points, if self.dim == 1, then k is a list of floats
+        # flatten k to a scalar phase if 1D
         if self.dim == 1:
-            if isinstance(k, (float, int)):
-                k_vec = np.array([k])
+            φ = float(k) * self.lattice_constant[0]
         else:
-            if isinstance(k, (list, np.ndarray)):
-                if len(k[0]) != self.dim:
-                    raise ValueError(f"each k point must have length {self.dim}")
+            φ = np.dot(k, self.lattice_constant)
 
-        Hk = (self.intra
-              + self.inter_upper * np.exp(1j * np.dot(k, self.a_vec))
-              + self.inter_lower * np.exp(-1j * np.dot(k, self.a_vec))
-              + np.eye(self.norb) * self.mu)
-
-        return Hk
+        return ( self.intra
+               + self.inter_upper * np.exp(+1j*φ)
+               + self.inter_lower * np.exp(-1j*φ)
+               + np.eye(self.norb) * self.mu )
 
     def run(self, k=None):
         """
@@ -179,452 +364,490 @@ class TightBinding(Mol):
         gap = self._bands[1] - self._bands[0]
         return np.min(gap)
 
-    def Floquet(self, **kwargs):
+    def Floquet(self, data_path, **kwargs):
         """
         Return a FloquetBloch instance with coordinate info.
         """
+        if not os.path.exists(data_path):
+            os.makedirs(data_path)
         Hk_func = lambda kpt: self.buildH(kpt)
         # pos = np.diag(np.arange(self.norb) * self.a_vec[0])
-        floq = FloquetBloch(Hk_func=Hk_func, **kwargs, coords=self.coords, a_vec=self.a_vec,
-                            norbs=self.norb)
+        floq = FloquetBloch(Hk_func=Hk_func, **kwargs, coords=self.coords, a_vec=self.lattice_constant,
+                            norbs=self.norb, data_path=data_path, relative_Hopping=self.relative_Hopping, direction_of_position_vector=self.direction_of_position_vector, translation_vectors=self.modified_position_vector)
         # floq = FloquetBloch(Hk=Hk_func, Edip=pos, **kwargs)
         # Attach coordinate info for extended H build
         return floq
+    
 
-
-    def density_of_states(self):
-        pass
-
-    def zeeman(self):
-        # drive with magnetic field
-        pass
-
-    def gf(self):
-        # surface and bulk Green function
-        pass
-
-    def gf_surface(self):
-        pass
-
-
-    def LvN(self, *args, **kwargs):
-        # Liouville von Newnman equation solver
-        pass
-        # return LvN(*args, **kwargs)
-
-
-# class FloquetBloch:
-#     """
-#     Periodically driven tight-binding system in Bloch basis.
-#     Performs Floquet analysis via Jacobi-Anger expansion and tracks specified bands.
-
-#     Parameters
-#     ----------
-#     Hk_func : callable
-#         Function Hk_func(k) returning the static Bloch Hamiltonian at momentum k.
-#     omegad : float
-#         Driving angular frequency.
-#     E0 : float
-#         Electric field amplitude.
-#     nt : int
-#         Number of Floquet harmonics (Fourier components).
-#     coords : array_like, shape (norbs, dim)
-#         Orbital coordinates within unit cell (for dipole projection).
-#     a_vec : array_like, shape (dim,)
-#         Lattice vector(s) for phase factors.
-#     norbs : int
-#         Number of orbitals per cell.
-#     gauge : {'Peierls', 'length', 'velocity'}
-#         Gauge choice.
-#     polarization : array_like, shape (dim,)
-#         Jones vector specifying field polarization.
-#     data_path : str or None
-#         Directory to cache computed band data (.npz). If None, no caching.
-#     initial_band : int
-#         Band index at E=0 to track if calculated_bands not given.
-#     """
-#     def __init__(self, Hk_func, omegad, E0, nt,
-#                  coords, a_vec, norbs,
-#                  gauge='Peierls', polarization=None,
-#                  data_path=None, initial_band=0):
-#         self.Hk_func = Hk_func
-#         self.omegad = omegad
-#         self.E0 = E0
-#         self.nt = nt
-#         self.coords = np.array(coords)
-#         self.a_vec = np.array(a_vec)
-#         self.norbs = norbs
-#         self.gauge = gauge
-#         if polarization is None:
-#             self.polarization = np.zeros(self.coords.shape[1])
-#         else:
-#             self.polarization = np.array(polarization)
-#         if self.polarization.size != self.coords.shape[1]:
-#             raise ValueError("polarization must match coordinate dimension")
-#         self.data_path = data_path
-#         self.initial_band = initial_band
-#         # storage for last results
-#         self.k_vals = None
-#         self._tracked_bands = None
-#         self._energies = None
-#         self._states = None
-#         self.dim = len(coords[0])
-
-#     def build_extendedH(self, kpt):
-#         """Build the Floquet extended Hamiltonian via Jacobi-Anger expansion."""
-#         if isinstance(self.E0, (float, int)):
-#             omegad, E0 = self.omegad, self.E0
-#         if isinstance(self.E0, (list, np.ndarray)):
-#             omegad, E0 = self.omegad, self.E0[-1]
-#             print('Note: Here in .build_extendedH, Only the extendedH for largesr H built and shown, but list input type is allowed in .run()')
-#         Norbs, nt = self.norbs, self.nt
-#         coords, eps = self.coords, self.polarization
-#         H0 = self.Hk_func(kpt)
-#         dmat = np.dot(coords[:, None, :] - coords[None, :, :], eps)
-#         Hn = {}
-#         for p in range(-nt//2, nt//2 + 1):
-#             Hn[p] = H0 * jv(p, E0/omegad * dmat)
-#         NF = Norbs * nt
-#         F = np.zeros((NF, NF), dtype=complex)
-#         N0 = -(nt - 1) // 2
-#         for n in range(nt):
-#             for m in range(nt):
-#                 p = n - m
-#                 block = Hn.get(p, np.zeros((Norbs, Norbs)))
-#                 if n == m:
-#                     block = block + np.eye(Norbs) * ((n + N0) * omegad)
-#                 i0, i1 = n*Norbs, (n+1)*Norbs
-#                 j0, j1 = m*Norbs, (m+1)*Norbs
-#                 F[i0:i1, j0:j1] = block
-#         return F
-
-#     def run(self, k, nE_steps=10, calculated_bands=None):
-#         """
-#         Diagonalize for each k, tracking specified Floquet bands.
-
-#         Parameters
-#         ----------
-#         k : array_like
-#             k-points of shape (M, dim).
-#         nE_steps : int
-#             Number of field ramp steps.
-#         calculated_bands : list of int, optional
-#             Bands to track; defaults to [initial_band].
-
-#         Returns
-#         -------
-#         ks : ndarray, shape (M, dim)
-#         energies : ndarray, shape (len(calculated_bands), M)
-#         states : ndarray, shape (len(calculated_bands), norbs*nt, M)
-#         """
-#         # reshape for 1D
-#         if self.dim == 1:
-#             if isinstance(k, (float, int)):
-#                 k = np.array([k])
-#             if isinstance(k[0], (float, int)):
-#                 k = np.array(k).reshape(-1, 1)
-#         ks = np.atleast_2d(k)
-#         M = ks.shape[0]
-#         Norbs, nt = self.norbs, self.nt
-#         NF = Norbs * nt
-
-#         # choose bands
-#         bands_to_track = list(calculated_bands) if calculated_bands is not None else [self.initial_band]
-#         self._tracked_bands = bands_to_track
-#         nb = len(bands_to_track)
-
-#         # caching
-#         cache_file = None
-#         if self.data_path:
-#             os.makedirs(self.data_path, exist_ok=True)
-#             pol = '_'.join(map(str, self.polarization))
-#             cache_file = os.path.join(self.data_path,
-#                 f"floquet_E{self.E0:.6f}_w{self.omegad:.6f}_nt{nt}_pol{pol}.npz")
-#             if os.path.exists(cache_file):
-#                 data = np.load(cache_file)
-#                 energies = data['energies']
-#                 states = data['states']
-#                 self.k_vals = ks
-#                 self._energies = energies
-#                 self._states = states
-#                 for j, b in enumerate(bands_to_track):
-#                     setattr(self, f"_bands_{b}", energies[j])
-#                     setattr(self, f"_states_{b}", states[j])
-#                 return ks, energies, states
-
-#         # outputs
-#         energies = np.zeros((nb, M), dtype=float)
-#         states = np.zeros((nb, NF, M), dtype=complex)
-#         prev = np.zeros((NF, M, nb), dtype=complex)
-#         E_list = np.linspace(0, self.E0, nE_steps) if self.E0 != 0 else [0.]
-
-#         for ie, Ecur in enumerate(E_list):
-#             self.E0 = Ecur
-#             for ik, kpt in enumerate(ks):
-#                 Fk = self.build_extendedH(kpt)
-#                 eigvals, eigvecs = np.linalg.eigh(Fk)
-#                 if ie == 0:
-#                     static = np.linalg.eigvalsh(self.Hk_func(kpt))
-#                     for j, b in enumerate(bands_to_track):
-#                         target = static[b]
-#                         idx = np.argmin(np.abs(eigvals - target))
-#                         prev[:, ik, j] = eigvecs[:, idx]
-#                         if len(E_list) == 1:
-#                             energies[j, ik] = eigvals[idx]
-#                             states[j, :, ik] = eigvecs[:, idx]
-#                 else:
-#                     for j in range(nb):
-#                         ov = np.abs(prev[:, ik, j].conj() @ eigvecs)
-#                         idx = np.argmax(ov)
-#                         prev[:, ik, j] = eigvecs[:, idx]
-#                         if ie == len(E_list) - 1:
-#                             energies[j, ik] = eigvals[idx]
-#                             states[j, :, ik] = eigvecs[:, idx]
-
-#         # store
-#         self.k_vals = ks
-#         self._energies = energies
-#         self._states = states
-#         for j, b in enumerate(bands_to_track):
-#             setattr(self, f"_bands_{b}", energies[j])
-#             setattr(self, f"_states_{b}", states[j])
-#         if cache_file:
-#             np.savez(cache_file, energies=energies, states=states)
-#         return ks, energies, states
-
-#     def plot_band_structure(self, k=None):
-#         """Plot tracked band energies vs k in 1D."""
-#         if self.dim != 1:
-#             raise NotImplementedError("Plotting only supported in 1D.")
-#         if self._energies is None:
-#             ks, energies, _ = self.run(k)
-#         else:
-#             ks = self.k_vals
-#             energies = self._energies
-#         import matplotlib.pyplot as plt
-#         plt.figure(figsize=(8, 4))
-#         for j, b in enumerate(self._tracked_bands):
-#             plt.plot(ks, energies[j], label=f'Band {b}')
-#         plt.xlabel('k')
-#         plt.ylabel('Energy')
-#         plt.title('Floquet-Bloch Band Structure')
-#         plt.legend()
-#         plt.grid(True)
-#         plt.show()
-
-#     def winding_number(self, band=None):
-#         """
-#         Compute winding number via Berry phase of a tracked Floquet state.
-
-#         Parameters
-#         ----------
-#         band : int, optional
-#             Band index to compute for; if None and only one tracked, uses that.
-#         """
-#         if self._states is None or self.k_vals is None:
-#             raise RuntimeError("Run first before computing winding.")
-#         if band is None:
-#             if len(self._tracked_bands) == 1:
-#                 band = self._tracked_bands[0]
-#             else:
-#                 raise ValueError("Must specify band if multiple tracked.")
-#         if band not in self._tracked_bands:
-#             raise ValueError(f"Band {band} not tracked (tracked: {self._tracked_bands})")
-#         j = self._tracked_bands.index(band)
-#         vecs = self._states[j]  # shape (NF, M)
-#         N = vecs.shape[1]
-#         P = np.outer(vecs[:, 0], vecs[:, 0].conj())
-#         for i in range(1, N):
-#             psi = vecs[:, i] / np.linalg.norm(vecs[:, i])
-#             P = P @ np.outer(psi, psi.conj())
-#         angle = np.angle(np.trace(P))
-#         return (angle % (2*np.pi)) / np.pi
-
-import numpy as np
-import os
-import h5py
-from scipy.special import jv
 
 class FloquetBloch:
     """
-    Periodically driven tight-binding system in Bloch basis with caching.
+    Periodically driven tight-binding system in Bloch basis.
 
     Parameters
     ----------
     Hk_func : callable
-        Returns static Bloch Hamiltonian H(k).
+        Function Hk_func(kpt) returning the static Bloch Hamiltonian H(k).
     omegad : float
-        Driving frequency.
-    E0 : float or list/ndarray
-        Field amplitudes; if list/array, must start at zero.
+        Driving frequency ωₙ.
+    E0 : float or array_like
+        Field amplitude(s). If list/array, builds one Floquet matrix per E₀.
     nt : int
-        Number of Floquet harmonics.
+        Number of Floquet harmonics (matrix size = norbs * nt).
     coords : array_like, shape (norbs, dim)
-        Orbital positions.
+        Orbital positions within the unit cell.
     a_vec : array_like, shape (dim,)
-        Lattice vectors.
+        Lattice vector(s).
     norbs : int
         Number of orbitals per cell.
-    data_path : str or None
-        Directory for HDF5 caching and plots.
-    initial_band : int
-        Default static band to track.
+    relative_Hopping : list of float
+        Exponential-decay hoppings t₍ᵢⱼ₎ in the same order as the pairs list.
+    direction_of_position_vector : list of array_like
+        Full displacement vectors d₍ᵢⱼ₎ = (rⱼ-rᵢ) + lattice shifts.
+    translation_vectors : list of array_like
+        Pure lattice-shift R for each hop (i.e. d₍ᵢⱼ₎ - (rⱼ-rᵢ)).
+    gauge : str, optional
+        Driving gauge (only "Peierls" supported here).
+    polarization : array_like, optional
+        Field polarization vector (dim-length).
+    data_path : str, optional
+        Path for caching or output.
+    initial_band : int, optional
+        Which static band to track by default.
     """
-    def __init__(self, Hk_func, omegad, E0, nt,
-                 coords, a_vec, norbs,
-                 gauge='Peierls', polarization=None,
-                 data_path=None, initial_band=0):
-        self.Hk_func = Hk_func
-        self.omegad = omegad
-        if isinstance(E0, (list, np.ndarray)):
-            self.E0 = E0[-1]
-            self._E_list = None             # array of E values
-        if isinstance(E0, (float, int)):
-            self.E0 = E0
-            self._E_list = None
-        self.nt = nt
-        self.coords = np.array(coords)
-        self.a_vec = np.array(a_vec)
-        self.norbs = norbs
-        self.gauge = gauge
-        self.polarization = (np.zeros(self.coords.shape[1]) if polarization is None
-                             else np.array(polarization))
+    def __init__(self,
+                 Hk_func,
+                 omegad,
+                 E0,
+                 nt,
+                 coords,
+                 a_vec,
+                 norbs,
+                 relative_Hopping,
+                 direction_of_position_vector,
+                 translation_vectors,
+                 gauge='Peierls',
+                 polarization=None,
+                 data_path='MacBook_local_data/floquet_data'):
+
+        # store core parameters
+        self.Hk_func  = Hk_func
+        self.omegad   = float(omegad)
+        self.nt       = int(nt)
+        self.coords   = np.array(coords, float)    # (norbs, dim)
+        self.a_vec    = np.array(a_vec, float)     # (dim,)
+        self.norbs    = int(norbs)
+        self.gauge    = gauge
+        self.dim      = len(self.a_vec)
+
+        # --- E0 handling: scalar or list ---
+        E_arr = np.atleast_1d(E0).astype(float)
+        if E_arr.ndim != 1:
+            raise ValueError("E0 must be a scalar or 1D array of floats")
+        if E_arr.size == 1:
+            self._E_list   = None
+            self.E0_scalar = float(E_arr[0])
+        else:
+            self._E_list   = list(E_arr)
+            self.E0_scalar = None
+
+        # hopping data (must match length = 2 × #unique pairs)
+        self.relative_Hopping            = list(relative_Hopping)
+        self.direction_of_position_vector = [np.array(d, float)
+                                            for d in direction_of_position_vector]
+        self.translation_vectors         = [np.array(R, float)
+                                            for R in translation_vectors]
+
+        # build list of unique orbital pairs i<j
+        self.pairs = [(i, j)
+                      for i in range(self.norbs)
+                      for j in range(self.norbs) if j > i]
+        expected_len = 2 * len(self.pairs)
+
+        if not (len(self.relative_Hopping) == len(self.direction_of_position_vector)
+                == len(self.translation_vectors)
+                == expected_len):
+            print('len of direction of position vector', len(self.direction_of_position_vector))
+            print('len of realtive hopping', len(self.relative_Hopping))
+            print('len of translation_vectors', len(self.translation_vectors))
+            raise ValueError(f"Expected 2*#pairs={expected_len} hops, "
+                             f"got {len(self.relative_Hopping)}")
+
+        # polarization vector
+        if polarization is None:
+            self.polarization = np.zeros(self.coords.shape[1], float)
+        else:
+            self.polarization = np.array(polarization, float)
         if self.polarization.size != self.coords.shape[1]:
             raise ValueError("polarization must match coordinate dimension")
-        self.data_path = data_path
-        self.initial_band = initial_band
 
-        # storage
-        self.k_vals = None
-        self._tracked_bands = None      # list of bands
-        self._energies_all = None       # shape (nb, nE, M)
-        self._states_all = None         # shape (nb, nE, NF, M)
-        self.dim = len(coords[0])
+        # Floquet block indices range
+        self.N0    = self.nt // 2
+        self.all_p = np.arange(-self.N0, self.N0 + 1, dtype=int)
 
+        # optional metadata
+        self.data_path    = data_path
+        self.k = None #placeholder
+
+    # def build_extendedH(self, kpt, Ecur=None):
+    #     """
+    #     Construct the Floquet Hamiltonian(s) F(k) for one or many E₀.
+
+    #     Parameters
+    #     ----------
+    #     kpt : float or array_like
+    #         Crystal momentum (1D scalar or dim-vector).
+    #     Ecur : float, optional
+    #         If provided, override the built-in amplitude(s).
+
+    #     Returns
+    #     -------
+    #     F : (norbs*nt, norbs*nt) complex ndarray, if single E₀  
+    #     [F₁, F₂, ...] : list of such arrays, if multiple E₀
+    #     """
+    #     kpt = np.atleast_1d(kpt).astype(float)
+    #     Norbs, nt, ω = self.norbs, self.nt, self.omegad
+
+    #     # decide which E₀'s to loop over
+    #     if Ecur is None:
+    #         raise ValueError("Please Provide E")
+    #     # 1) build each Fourier block H^(p)
+    #     Hn = {p: np.zeros((Norbs, Norbs), complex)
+    #             for p in self.all_p}
+
+    #     # loop all hops: first intracell, then intercell
+    #     for idx, ((i, j), t, dvec, R) in enumerate(zip(
+    #             self.pairs + self.pairs,
+    #             self.relative_Hopping,
+    #             self.direction_of_position_vector,
+    #             self.translation_vectors)):
+    #         base = self.coords[j] - self.coords[i]
+    #         dvec = base + R
+    #         # compute Bessel argument
+    #         arg = np.dot(self.polarization, dvec) * (Ecur / ω)
+    #         # momentum-space phase from the pure lattice shift R
+    #         phase = np.exp(1j * np.dot(kpt, R))
+
+    #         # fill each Fourier harmonic block
+    #         for p in self.all_p:
+    #             J = jv(p, arg)
+    #             Hn[p][i, j] += t * J * phase
+    #             Hn[p][j, i] += np.conj(t * J * phase)
+
+    #     # 2) assemble the full Floquet matrix F
+    #     NF = Norbs * nt
+    #     F  = np.zeros((NF, NF), complex)
+    #     for n in range(nt):
+    #         for m in range(nt):
+    #             p = n - m
+    #             block = Hn.get(p, np.zeros((Norbs, Norbs), complex))
+    #             if n == m:
+    #                 # add (n-N0)*ω identity on the diagonal block
+    #                 block = block + np.eye(Norbs) * ((n - self.N0) * ω)
+    #             i0, i1 = n*Norbs, (n+1)*Norbs
+    #             j0, j1 = m*Norbs, (m+1)*Norbs
+    #             F[i0:i1, j0:j1] = block
+
+    #     # results.append(F)
+
+    #     # return single array if only one E₀ requested
+    #     return F
+    #     # return results[0] if len(results) == 1 else results
     def build_extendedH(self, kpt, Ecur=None):
-        if Ecur is None:
-            Ecur = self.E0
-            print('Note: Here only the extendedH for largesr E built and shown if your input is a list')
-        Norbs, nt = self.norbs, self.nt
-        omegad = self.omegad
-        H0 = self.Hk_func(kpt)
-        dmat = np.dot(self.coords[:,None,:] - self.coords[None,:,:],
-                      self.polarization)
-        Hn = {p: H0 * jv(p, Ecur/omegad * dmat)
-              for p in range(-nt//2, nt//2+1)}
-        NF = Norbs*nt
+
+        kpt = np.atleast_1d(kpt).astype(float)
+        Norbs, nt, ω = self.norbs, self.nt, self.omegad
+
+        # decide which E0 list to use
+        if Ecur is not None:
+            E_list = [float(Ecur)]
+        elif self._E_list is None:
+            E_list = [self.E0_scalar]
+        else:
+            E_list = list(self._E_list)
+
+        # set up empty Fourier blocks
+        Hn = {p: np.zeros((Norbs, Norbs), dtype=complex)
+            for p in self.all_p}
+
+        # static orbital positions
+        R0 = np.array(self.coords)  # shape (norbs, dim)
+
+        # directional polarization vector
+        Avec = np.array(self.polarization)
+
+        # shorthand for second index of pairs
+        pairs = self.pairs
+
+        # 1D case: two shifts R=0 and R=+a
+        if self.dim == 1:
+            a = self.a_vec[0]
+            for (i, j), t0, dij in zip(pairs + pairs,
+                                    self.relative_Hopping,
+                                    self.direction_of_position_vector):
+                # note: pairs+pairs so we still consume two entries per pair
+                # but here dij was built = (r_j-r_i)+R already
+                # R = dij - (r_j-r_i):
+                base = R0[j,0] - R0[i,0]
+                Rshift = dij[0] - base
+
+                for E0 in E_list:
+                    arg0 = (E0/ω) * (Avec[0] * base)
+                    arg1 = (E0/ω) * (Avec[0] * (base + a))
+                    phase1 = np.exp(1j * kpt * a)
+
+                    for p in self.all_p:
+                        J0 = jv(p, arg0)
+                        J1 = jv(p, arg1)
+                        # intracell hop (R=0)
+                        Hn[p][i, j] += t0 * J0
+                        Hn[p][j, i] += np.conjugate(t0 * J0)
+                        # intercell hop (R=+a)
+                        Hn[p][i, j] += t0 * J1 * phase1
+                        Hn[p][j, i] += np.conjugate(t0 * J1 * phase1)
+
+        # 2D case: shifts R in { (0,0), (a,0), (0,b), (a,b) }
+        elif self.dim == 2:
+            a, b = self.a_vec
+            shifts = [
+                np.array([0.0, 0.0]),
+                np.array([a,   0.0]),
+                np.array([0.0, b  ]),
+                np.array([a,   b  ]),
+            ]
+            for (i, j), t in zip(pairs * len(shifts), self.relative_Hopping):
+                # figure out which shift this t corresponds to
+                idx = len(self.pairs)  # reused as counter
+                pidx = self.relative_Hopping.index(t) // len(self.pairs)
+                R = shifts[pidx]
+                base_vec = R0[j] - R0[i]
+
+                for E0 in E_list:
+                    # precompute phase and arg for this R
+                    arg = (E0/ω) * np.dot(Avec, base_vec + R)
+                    phase = np.exp(1j * (kpt[0]*R[0] + kpt[1]*R[1]))
+
+                    for p in self.all_p:
+                        J = jv(p, arg)
+                        Hn[p][i, j] += t * J * phase
+                        Hn[p][j, i] += np.conjugate(t * J * phase)
+
+        # 3D case: R ∈ { (0,0,0), (a,0,0), (0,b,0), (0,0,c),
+        #                 (a,b,0), (a,0,c), (0,b,c), (a,b,c) }
+        elif self.dim == 3:
+            a, b, c = self.a_vec
+            shifts = []
+            for da in (0.0, a):
+                for db in (0.0, b):
+                    for dc in (0.0, c):
+                        shifts.append(np.array([da, db, dc]))
+            for (i, j), t in zip(pairs * len(shifts), self.relative_Hopping):
+                pidx = self.relative_Hopping.index(t) // len(self.pairs)
+                R = shifts[pidx]
+                base_vec = R0[j] - R0[i]
+
+                for E0 in E_list:
+                    arg   = (E0/ω) * np.dot(Avec, base_vec + R)
+                    phase = np.exp(1j * (kpt[0]*R[0] + kpt[1]*R[1] + kpt[2]*R[2]))
+                    for p in self.all_p:
+                        J = jv(p, arg)
+                        Hn[p][i, j] += t * J * phase
+                        Hn[p][j, i] += np.conjugate(t * J * phase)
+
+        else:
+            raise NotImplementedError("Floquet build only for dim=1,2,3")
+
+        # Finally assemble the big (Norbs*nt)x(Norbs*nt) Floquet matrix F
+        NF = Norbs * nt
         F = np.zeros((NF, NF), dtype=complex)
-        N0 = -(nt-1)//2
-        for n in range(nt):
-            for m in range(nt):
-                p = n - m
-                block = Hn.get(p, np.zeros((Norbs, Norbs)))
-                if n == m:
-                    block += np.eye(Norbs) * ((n+N0)*omegad)
-                i0, i1 = n*Norbs, (n+1)*Norbs
-                j0, j1 = m*Norbs, (m+1)*Norbs
+        for m in range(nt):
+            for n in range(nt):
+                p = m - n
+                block = Hn.get(p, np.zeros((Norbs, Norbs), complex))
+                if m == n:
+                    block = block + np.eye(Norbs) * ((m - self.N0) * ω)
+                i0, i1 = m*Norbs, (m+1)*Norbs
+                j0, j1 = n*Norbs, (n+1)*Norbs
                 F[i0:i1, j0:j1] = block
+
         return F
 
-    def run(self, k, nE_steps=10, calculated_bands=None):
+
+
+    def track_band(self, k_values, E0=None, quasienergy = None, previous_state = None, filename=None, band_index=None):
+        '''
+        Compute the energy and corresponding eigenstate of the assigned band for the given k list, stored and saved in local file.
+        this is a helper function for .run, usually should not be directly called.
+        parameters
+        ----------
+        k : array_like, shape (M, dim)
+            k-point(s) to compute.
+        quasienergy: np.array, shape (len(k),)
+        previous_state: list of np.array, each np.array element in the list have shape (len(k), Norbs * nt)
+
+        Improve:
+        band_index has not been considered yet
+        '''
+        nt = self.nt
+        # if previous_state is None and quasienergy is None:
+        #     raise ValueError("One of the information (quasienergy, previous_state) is required to track the band.")
+        if E0 != 0 and previous_state is None:
+            raise ValueError("previous_state is required to track the band at when external field is applied.")
+            
+        if filename and os.path.exists(filename):
+            print(f"Loading data from {filename}...")   
+            return load_data_from_hdf5(filename)    
+
+        NF = self.norbs * nt
+        band_energy = np.zeros((len(k_values), self.norbs), dtype=complex)
+        band_eigenstates = [np.zeros((len(k_values), NF), dtype=complex) for a in range(self.norbs)]
+        Norbs = self.norbs
+        omega = self.omegad
+        for i, k0 in enumerate(k_values):
+            extended_Floquet_hamiltonian = self.build_extendedH(k0, E0)
+            if E0 == 0:
+                filename = os.path.join(self.data_path, f"band_E{E0:.6f}.h5")
+                Real_band_energy, _ = linalg.eigh(self.Hk_func(k0))
+                        # Diagonalize
+                eigvals, eigvecs = linalg.eigh(extended_Floquet_hamiltonian)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)
+                # specify a range to choose the quasienergies, choose the first BZ
+                # [-hbar omega/2, hbar * omega/2]
+                eigvals_subset = np.zeros(Norbs, dtype=complex)
+                eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+                # check if the Floquet states is complete
+                j = 0
+                for m in range(NF):
+                    if -omega/2 <= eigvals[m].real <= omega/2:
+                        eigvals_subset[j]   = eigvals[m]
+                        eigvecs_subset[:,j] = eigvecs[:,m]
+                        j += 1
+                if j != Norbs:
+                    print("Error: Number of Floquet states {} is not equal to \
+                        the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+                    sys.exit()
+                # now track one Floquet level per real band
+                for band_idx in range(self.norbs):
+                    # 1) pick out the ONE real-band energy
+                    target_energy = Real_band_energy[band_idx]           # a scalar
+
+                    # 2) form a 1-D distance array
+                    distances = np.abs(eigvals - target_energy)          # shape = (NF,)
+
+                    # 3) get the single best Floquet index
+                    floq_idx  = np.argmin(distances)                     # integer
+
+                    # 4) assign that ONE scalar into your storage
+                    band_energy[i, band_idx]            = eigvals[floq_idx]
+                    band_eigenstates[band_idx][i, :]    = eigvecs[:, floq_idx]
+                # return band_energy, band_eigenstates
+            else:
+                filename = os.path.join(self.data_path, f"band_E{E0:.6f}.h5")
+                # Diagonalize
+                eigvals, eigvecs = linalg.eigh(extended_Floquet_hamiltonian)  # shape(eigvals)=(NF,), shape(eigvecs)=(NF,NF)s
+                # specify a range to choose the quasienergies, choose the first BZ
+                # [-hbar omega/2, hbar * omega/2]
+                eigvals_subset = np.zeros(Norbs, dtype=complex)
+                eigvecs_subset = np.zeros((NF , Norbs), dtype=complex)
+                # check if the Floquet states is complete
+                j = 0
+                for m in range(NF):
+                    if -omega/2 <= eigvals[m].real <= omega/2:
+                        eigvals_subset[j]   = eigvals[m]
+                        eigvecs_subset[:,j] = eigvecs[:,m]
+                        j += 1
+                if j != Norbs:
+                    print("Error: Number of Floquet states {} is not equal to \
+                        the number of orbitals {} in the first BZ. \n".format(j, Norbs))
+                    sys.exit()
+                # overlap = np.zeros(NF)
+                # for i in range(NF):
+                #     overlap[i] = np.abs(np.dot(previous_state.conj(), eigvecs[:, i]))**2
+
+                # idx = np.argsort(overlap)[::-1]  # Sort indices by descending overlap
+
+                # for band_idx in range(self.norb):
+                #     band_eigenstates[band_idx][:, i] = eigvecs[:, idx[band_idx]]
+                #     band_energy[i][band_idx] = eigvals[idx[band_idx]]
+
+                # return band_energy, band_eigenstates
+                    # — build overlap matrix: shape (Norbs, NF) —
+                overlap = np.zeros((Norbs, NF), dtype=float)
+                for band_idx in range(Norbs):
+                    prev_vec = previous_state[band_idx][i, :]            # shape (NF,)
+                    # dot prev_vec* with every eigvecs[:,m] -> scalar, then abs²
+                    # np.vdot does conj(prev_vec)·eigvecs[:,m]
+                    for m in range(NF):
+                        overlap[band_idx, m] = np.abs(np.vdot(prev_vec, eigvecs[:, m]))**2
+
+                # — greedy assignment so each band picks its best *unused* Floquet level —
+                assigned = set()
+                assignment = {}  # band_idx -> chosen index m
+                for band_idx in range(Norbs):
+                    # look through this band’s overlaps in descending order
+                    for m in np.argsort(overlap[band_idx])[::-1]:
+                        if m not in assigned:
+                            assigned.add(m)
+                            assignment[band_idx] = m
+                            break
+
+                # — store each band’s matched eigenvalue & eigenvector —
+                for band_idx, m in assignment.items():
+                    band_energy[i, band_idx]         = eigvals[m]
+                    band_eigenstates[band_idx][i, :] = eigvecs[:, m]
+                # — ensure our N_orbs quasi‐energies are ascending; if not, reorder — 
+                # get the real parts for comparison
+                vals = band_energy[i].real    # shape (Norbs,)
+                # check monotonic non‐decreasing
+                if not np.all(np.diff(vals) >= 0):
+                    # compute the ascending sort‐order
+                    order = np.argsort(vals)
+                    # reorder the energies row
+                    band_energy[i, :] = band_energy[i, order]
+                    # reorder the eigenstates for this k‐point
+                    # stash the old row of each band
+                    old_states = [ band_eigenstates[b][i, :].copy()
+                                for b in range(Norbs) ]
+                    for new_b, old_b in enumerate(order):
+                        band_eigenstates[new_b][i, :] = old_states[old_b]
+
+                
+        save_data_to_hdf5(filename, band_energy, band_eigenstates)
+        return band_energy, band_eigenstates
+
+
+
+    def run(self, k, nE_steps = None, calculated_bands=None):
         """
-        Compute and cache Floquet bands per-field.
+        Compute and cache Floquet bands over k and E values.
 
         k : array_like, shape (M, dim)
         nE_steps : int, ignored if E0 is list/array
         calculated_bands : list[int] or None
         """
-        # reshape for 1D
-        if self.dim == 1:
-            arr = np.atleast_1d(k)
-            if np.isscalar(arr[0]):
-                k = arr.reshape(-1,1)
-        ks = np.atleast_2d(k)
-        M = ks.shape[0]
-        Norbs, nt = self.norbs, self.nt
-        NF = Norbs*nt
-
-        # choose bands
-        bands = list(calculated_bands) if calculated_bands is not None else [self.initial_band]
-        nb = len(bands)
-        self._tracked_bands = bands
-
-        # setup E_list
-        if isinstance(self.E0, (list, np.ndarray)):
-            E_list = np.array(self.E0, float)
-            E_list.sort()
+        self.k = k
+        time_start = time.time()
+        if self._E_list is None and nE_steps is None:
+            raise ValueError('please specify the steps you wish to take in reaching the final E field strength, or directly provide a list of E when setting up the FloquetBloch class')
+        if self._E_list is None:
+            E_list = np.linspace(0,self.E0_scalar,nE_steps)
+        if self.E0_scalar is None:
+            E_list = self._E_list
             if E_list[0] != 0:
-                raise ValueError("If E0 is list, must start at 0.")
-        else:
-            E_list = np.linspace(0, self.E0, nE_steps) if self.E0 != 0 else np.array([0.])
-        self._E_list = E_list
-
-        # prepare results
-        energies = np.zeros((nb, len(E_list), M), dtype=float)
-        states = np.zeros((nb, len(E_list), NF, M), dtype=complex)
-
-        # caching per E
-        if self.data_path:
-            os.makedirs(self.data_path, exist_ok=True)
-            pol = '_'.join(map(str, self.polarization))
-            bands_str = '_'.join(map(str, bands))
-        else:
-            pol = bands_str = None
-
-        for ie, Ecur in enumerate(E_list):
-            # per-field cache filename
-            if self.data_path:
-                fname = f"floquet_E{Ecur:.6f}_w{self.omegad:.6f}_nt{nt}_pol{pol}_bands{bands_str}.h5"
-                cache = os.path.join(self.data_path, fname)
+                E_list.insert(0, 0)
+        
+        for i, E_current in enumerate(E_list):
+            filename = os.path.join(self.data_path, f"band_E{E_current:.6f}.h5")
+            if i == 0:
+                # For the first E value, no previous state or quasienergy
+                quasienergy, previous_state = self.track_band(k, E_current, filename=filename, band_index=calculated_bands)
             else:
-                cache = None
-
-            if cache and os.path.isfile(cache):
-                with h5py.File(cache, 'r') as f:
-                    # load
-                    if self.k_vals is None:
-                        self.k_vals = f['k_vals'][:]
-                    energies[:, ie, :] = f['energies'][:]
-                    states[:, ie, :, :] = f['states'][:]
-                continue
-
-            # compute this Ecur
-            prev = np.zeros((NF, M, nb), dtype=complex)
-            for ik, kpt in enumerate(ks):
-                Fk = self.build_extendedH(kpt, Ecur)
-                eigvals, eigvecs = np.linalg.eigh(Fk)
-                if ie == 0:
-                    static = np.linalg.eigvalsh(self.Hk_func(kpt))
-                    for j,b in enumerate(bands):
-                        tgt = static[b]
-                        idx = np.argmin(np.abs(eigvals - tgt))
-                        prev[:,ik,j] = eigvecs[:,idx]
-                        energies[j,ie,ik] = eigvals[idx]
-                        states[j,ie,:,ik] = eigvecs[:,idx]
-                else:
-                    for j in range(nb):
-                        ov = np.abs(prev[:,ik,j].conj() @ eigvecs)
-                        idx = np.argmax(ov)
-                        prev[:,ik,j] = eigvecs[:,idx]
-                        energies[j,ie,ik] = eigvals[idx]
-                        states[j,ie,:,ik] = eigvecs[:,idx]
-
-            # save cache
-            if cache:
-                with h5py.File(cache, 'w') as f:
-                    f.create_dataset('k_vals', data=ks)
-                    f.create_dataset('energies', data=energies[:,ie,:])
-                    f.create_dataset('states', data=states[:,ie,:,:])
-
-        # store all
-        self.k_vals = ks
-        self._energies_all = energies
-        self._states_all = states
-
-        return ks, energies, states
+                # Use the previous state and quasienergy to track the band
+                quasienergy, previous_state = self.track_band(k, E_current, quasienergy=quasienergy, previous_state=previous_state, filename=filename, band_index=calculated_bands)
+            print("current E is ", E_current, " time_past ", time.time()-time_start)
+        return quasienergy, previous_state
 
     def plot_band_structure(self, k=None, E=None,
-                            save_band_structure=False, outdir=None):
+                            save_band_structure=True, outdir=None):
         """
         Plot (or save) Floquet bands at specified E or list of E.
 
@@ -635,90 +858,145 @@ class FloquetBloch:
         outdir : str or None
             Directory under data_path to save plots.
         """
-        import matplotlib.pyplot as plt
-        if self._energies_all is None:
+
+        # 1) Make sure we have self.k and data on disk
+        if self.k is None:
+            # first time: run to generate data for this k-grid
             self.run(k)
-        ks = self.k_vals
-        E_list = self._E_list
-        # handle E list
-        E_vals = E_list if E is None else np.atleast_1d(E)
-        if len(E_vals) > 1:
-            if not save_band_structure:
-                print("Warning: multiple E provided, forcing save_band_structure=True")
-                save_band_structure = True
-        # prepare save dir
-        if save_band_structure:
-            base = (outdir if outdir else self.data_path)
-            plotdir = os.path.join(base, 'Floquet_Band_Structure')
-            os.makedirs(plotdir, exist_ok=True)
-        # loop
-        for Ecur in E_vals:
-            # find index
-            idx = np.argmin(np.abs(E_list - Ecur))
-            data = self._energies_all[:, idx, :]
-            plt.figure(figsize=(8,4))
-            for j,b in enumerate(self._tracked_bands):
-                plt.plot(ks, data[j], label=f'Band {b}')
-            plt.xlabel('k'); plt.ylabel('Energy')
-            plt.title(f'Floquet Bands @ E={Ecur:.3f}, ω={self.omegad:.3f}')
-            plt.legend(); plt.grid(True)
+        else:
+            # if user passes k manually, it must match
+            if k is not None and list(k) != list(self.k):
+                raise ValueError(
+                    "Cannot plot on a different k-grid than was used in .run()."
+                )
+
+        # 2) Build list of E values to plot
+        if E is None:
+            # take last E from your run-list
+            if self._E_list is not None:
+                E_list = self._E_list
+            else:
+                E_list = [self.E0_scalar]
+        elif isinstance(E, (float, int)):
+            E_list = [float(E)]
+        else:
+            E_list = list(E)
+
+        # 3) Loop over each E, load & plot
+        for E_val in E_list:
+            fname = os.path.join(self.data_path, f"band_E{E_val:.6f}.h5")
+            print(f"Loading band data from {fname}…")
+            band_energy, _ = load_data_from_hdf5(fname)
+            # band_energy shape: (len(k), Norbs)
+
+            fig, ax = plt.subplots()
+            for band_idx in range(band_energy.shape[1]):
+                ax.plot(self.k, band_energy[:, band_idx].real,
+                        label=f"band {band_idx}")
+            ax.set_xlabel("k")
+            ax.set_ylabel("Energy")
+            ax.set_title(f"Floquet bands at E = {E_val:.6f}")
+            ax.legend()
+
+            # 4) either save to disk or show interactively
             if save_band_structure:
-                fname = f"band_E{Ecur:.6f}_w{self.omegad:.6f}.png"
-                plt.savefig(os.path.join(plotdir, fname))
-                plt.close()
+                # decide output folder
+                if outdir:
+                    target = os.path.join(self.data_path, outdir)
+                else:
+                    target = os.path.join(self.data_path, "Floquet_Band_Structure")
+                os.makedirs(target, exist_ok=True)
+                out_png = os.path.join(target, f"band_E{E_val:.6f}.png")
+                fig.savefig(out_png)
+                plt.close(fig)
+                print(f"Saved plot to {out_png}")
             else:
                 plt.show()
 
-    def winding_number(self, band=None, E=None):
-        """
-        Compute winding number for given band and field E or list of E.
 
-        Returns float or list of floats.
+    def winding_number(self, band, E=None):
         """
-        if self._states_all is None or self.k_vals is None:
-            raise RuntimeError("Call run() before winding_number().")
-        bands = self._tracked_bands
-        if band is None:
-            if len(bands)==1:
-                band = bands[0]
-            else:
-                raise ValueError("Specify band when tracking multiple.")
-        if band not in bands:
-            raise ValueError(f"Band {band} not tracked.")
-        j = bands.index(band)
-        E_list = self._E_list
-        E_vals = E_list if E is None else np.atleast_1d(E)
+        Compute the Floquet winding number for a single tracked band by
+        reading the cached eigenstates from HDF5 files.
+
+        Parameters
+        ----------
+        band : int
+            Index of the Floquet band to compute (0 ≤ band < self.norbs).
+        E : float or list of float, optional
+            Field amplitude(s) to evaluate.  If None, uses all E's from the last run.
+
+        Returns
+        -------
+        float or list of float
+            The winding number(s) for the requested band and field value(s).
+        """
+
+        # 1) must have run() first
+        if self.k is None:
+            raise RuntimeError("Call run() before computing winding number.")
+
+        Norbs = self.norbs
+        # 2) validate band index
+        if not isinstance(band, int) or not (0 <= band < Norbs):
+            raise ValueError(f"`band` must be an integer in [0, {Norbs-1}].")
+
+        # 3) build list of E values
+        if E is None:
+            E_list = self._E_list if self._E_list is not None else [self.E0_scalar]
+        elif isinstance(E, (float, int)):
+            E_list = [float(E)]
+        else:
+            E_list = list(E)
+
         results = []
-        for Ecur in E_vals:
-            ie = np.argmin(np.abs(E_list - Ecur))
-            vecs = self._states_all[j, ie]  # (NF, M)
-            M = vecs.shape[1]
-            P = np.outer(vecs[:,0], vecs[:,0].conj())
-            for i in range(1, M):
-                psi = vecs[:,i]/np.linalg.norm(vecs[:,i])
-                P = P @ np.outer(psi, psi.conj())
-            angle = np.angle(np.trace(P))
-            results.append((angle % (2*np.pi))/np.pi)
-        return results if len(results)>1 else results[0]
+        # 4) loop over each field amplitude
+        for E_val in E_list:
+            fname = os.path.join(self.data_path, f"band_E{E_val:.6f}.h5")
+            print(f"Loading Floquet data from {fname}…")
+            _, all_states = load_data_from_hdf5(fname)
+            # all_states is a list of length Norbs, each shape (Nk, NF)
+            psi_k_NF = all_states[band]      # shape = (Nk, NF)
+            # Transpose to get shape (NF, Nk)
+            vecs = psi_k_NF.T
+            Nk = vecs.shape[1]
 
-def test_Gomez_Leon_2013():
+            # 5) build the projector chain P = |ψ₀⟩⟨ψ₀|⋯|ψ_{Nk-1}⟩⟨ψ_{Nk-1}|
+            #    then extract the total phase from Tr P
+            P = np.outer(vecs[:, 0], np.conjugate(vecs[:, 0]))
+            for j in range(1, Nk):
+                v = vecs[:, j]
+                v = v / np.linalg.norm(v)
+                P = P @ np.outer(v, np.conjugate(v))
+
+            angle = np.angle(np.round(np.trace(P)),5)
+            # original normalization was (angle mod 2π) / π
+            winding = (angle % (2 * np.pi)) / np.pi
+            results.append(winding)
+
+        # 6) return scalar if one E, else list
+        return results[0] if len(results) == 1 else results
+
+
+def test_Gomez_Leon_2013(E0 = 20, number_of_step_in_b = 10, nt = 21):
     """
     Test the Gomez-Leon 2013 model but using TightBinding and FloquetBloch classes, calculate the winding number and finally plot the heatmap
     """
     # Parameters
 
-    omega = 1.0
-    nt = 61
+    omega = 100
+    E_over_omega = np.linspace(0, E0/omega, 200)
+    E = [e * omega for e in E_over_omega]
     k_vals = np.linspace(-np.pi, np.pi, 100)
-    b_grid = np.linspace(0.1, 1.0, 10)
+    b_grid = np.linspace(0, 1.0, number_of_step_in_b)
     for b in b_grid:
         # Create tight-binding model
         coords = [[0], [b]]
-        tb_model = TightBinding(coords, lambda_decay=1.0, a=1.0, nk=50, mu=0.0)
+        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=50, mu=0.0, relative_Hopping=[1,1.5])
         
         # Run Floquet analysis
-        floquet_model = tb_model.Floquet(omegad=omega, E0=E0, nt=nt)
-        ks, energies, states = floquet_model.run(k_vals)
+        floquet_model = tb_model.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_Gomez_Leon_test_b={b:.2f}')
+        energies, states = floquet_model.run(k_vals)
         
         # Plot band structure
         floquet_model.plot_band_structure(k_vals)
@@ -1997,3 +2275,36 @@ def Floquet_Winding_number_Peierls_GL2013(H0, k, Nt, E_over_omega ,quasiE = None
 
 #     # qe, fmodes = dmol.spectrum(E0=0.4, Nt=10, gauge='velocity')
 #     # print(qe)
+
+if __name__ == "__main__":
+    test_Gomez_Leon_2013()
+#     # 1D two-orbital example: orbitals at x=0 and x=0.5
+#     coords        = [[0.0], [0.4]]
+#     lambda_decay = 0.5
+#     a             = 1.0
+#     mu            = 0
+
+#     # instantiate and build hopping matrices
+#     tb = TightBinding(
+#         coords,
+#         lambda_decay=lambda_decay,
+#         lattice_constant=a,
+#         nk=10,
+#         mu=mu
+#     )
+
+#     # sample H(k) at k=0 and k=π
+#     for k in [0.0, np.pi]:
+#         Hk = tb.buildH(k)
+#         print(f"H(k = {k:.3f}):\n{Hk}\n")
+#         eigs = np.linalg.eigvalsh(Hk)
+#         print(f"eigenvalues at k={k:.3f}: {eigs}\n{'-'*40}\n")
+#     tb.run(k=np.linspace(-np.pi, np.pi, 100))
+#     tb.plot(k=np.linspace(-np.pi, np.pi, 100))
+#     print("Band gap =", tb.band_gap())
+
+#     floquet = tb.Floquet(omegad=5.0, E0=np.linspace(0, 1,101), nt=21, gauge='Peierls', polarization=[1], data_path='MacBook_local_data/floquet_data')
+#     floquet.run(k=np.linspace(-np.pi, np.pi, 100))
+#     floquet.plot_band_structure(k=np.linspace(-np.pi, np.pi, 100),save_band_structure=True)
+#     a = floquet.winding_number(band=0)
+#     print(a)

@@ -7,20 +7,16 @@ from scipy import linalg
 import matplotlib.pyplot as plt
 from scipy.special import jv
 
-def save_data_to_hdf5(filename, occ, occ_e, con, con_e):
+def save_data_to_hdf5(filename, band_energy, band_eigenstates):
     os.makedirs(os.path.dirname(filename), exist_ok=True)  # Add this line
     with h5py.File(filename, 'w') as f:
-        f.create_dataset('occupied_states', data=occ)
-        f.create_dataset('occupied_states_energy', data=occ_e)
-        f.create_dataset('conduction_states', data=con)
-        f.create_dataset('conduction_states_energy', data=con_e)
+        f.create_dataset('band_energy', data= band_energy)
+        f.create_dataset('band_eigenstates', data = band_eigenstates)
 
 def load_data_from_hdf5(filename):
     with h5py.File(filename, 'r') as f:
-        return (f['occupied_states'][:],
-                f['occupied_states_energy'][:],
-                f['conduction_states'][:],
-                f['conduction_states_energy'][:])
+        return (f['band_energy'][:],
+                f['band_eigenstates'][:])
 
 def track_valence_band(k_values, T, E0, omega,
                        previous_val=None, previous_con=None,

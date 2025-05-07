@@ -233,7 +233,7 @@ if __name__ == '__main__':
     floq.run(k=np.linspace(-np.pi, np.pi, 100))
     floq.plot_band_structure(k=np.linspace(-np.pi, np.pi, 100))
     print("Floquet winding #", floq.winding_number(band = 0))
-
+ 
 
 # To improve:
 # 1. mu now only take in float, but can be a matrix
