@@ -480,7 +480,7 @@ class FloquetBloch:
         if polarization is None:
             self.polarization = np.zeros(self.coords.shape[1], float)
         else:
-            self.polarization = np.array(polarization, float)
+            self.polarization = np.array(polarization, complex)
         if self.polarization.size != self.coords.shape[1]:
             raise ValueError("polarization must match coordinate dimension")
 
@@ -544,7 +544,7 @@ class FloquetBloch:
                 if x == 1:
                     for m in range (math.comb(self.extension_dim, x)):
                         offset_1 = sum(math.comb(self.extension_dim, y) for y in range(x))+m
-                        t = self.relative_Hopping[ block_start + offset_1 + m ]
+                        t = self.relative_Hopping[block_start + offset_1 + m ]
                         if base[m]>=0:
                             shifted_base = base[m] - self.a_vec[m]
                             phase = np.exp(1j * np.dot(kpt,-self.a_vec[m])) # this is in closed lift basis
@@ -930,33 +930,102 @@ class FloquetBloch:
         # 6) return scalar if one E, else list
         return results[0] if len(results) == 1 else results
 
-def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 101, nt = 17):
+    def subspace_winding(self, bands, E=None):
+        """
+        1D Wilson-loop for an occupied subspace of multiple bands (e.g. [0,1]).
+
+        Returns the single integer winding of that subspace.
+        """
+        import os
+        import numpy as np
+        from pyqed.floquet.utils import load_data_from_hdf5
+
+        # Preconditions
+        if self.k is None:
+            raise RuntimeError("Call run() before computing subspace winding.")
+        for b in bands:
+            if not (0 <= b < self.norbs):
+                raise ValueError(f"Band index {b} out of range [0, {self.norbs-1}].")
+
+        # Build E list
+        if E is None:
+            E_list = self._E_list or [self.E0_scalar]
+        elif isinstance(E, (float, int)):
+            E_list = [float(E)]
+        else:
+            E_list = list(E)
+
+        results = []
+        Nk = len(self.k)
+        n_sub = len(bands)
+
+        for E_val in E_list:
+            # 1) load all_states[b] of shape (Nk, NF)
+            fname = os.path.join(self.data_path, f"band_E{E_val:.6f}.h5")
+            _, all_states = load_data_from_hdf5(fname)
+
+            # 2) determine NF
+            Nk_check, NF = all_states[bands[0]].shape
+            assert Nk_check == Nk, "k-grid length mismatch"
+
+            # 3) build psi_sub[k] of shape (NF, n_sub)
+            psi_sub = np.zeros((Nk, NF, n_sub), dtype=complex)
+            for j, b in enumerate(bands):
+                psi_sub[:, :, j] = all_states[b]   # fill k×NF slice
+
+            # 4) gauge-fix each subspace basis via a thin QR
+            Q = np.zeros_like(psi_sub, dtype=complex)  # (Nk, NF, n_sub)
+            for k in range(Nk):
+                # psi_sub[k] is NF×n_sub
+                q, _ = np.linalg.qr(psi_sub[k], mode='reduced')
+                Q[k] = q
+
+            # 5) build overlap matrices U_k = Q_k^† · Q_{k+1}
+            U = np.zeros((Nk, n_sub, n_sub), dtype=complex)
+            for k in range(Nk):
+                kp = (k+1) % Nk
+                U[k] = Q[k].conj().T @ Q[kp]
+
+            # 6) multiply them to get the Wilson loop W (n_sub×n_sub)
+            W = np.eye(n_sub, dtype=complex)
+            for k in range(Nk):
+                W = W @ U[k]
+
+            # 7) total subspace winding = arg det(W) / (2π)
+            detW = np.linalg.det(W)
+            phase = np.mod(np.angle(detW), 2*np.pi)
+            w = int(np.round(phase/(2*np.pi)))
+
+            results.append(w)
+
+        return results[0] if len(results)==1 else results
+
+
+def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21):
     """
     Test the Gomez-Leon 2013 model but using TightBinding and FloquetBloch classes, calculate the winding number and finally plot the heatmap
     """
     # Parameters
     # time_start = time.time()
     omega = 10
-    E_over_omega = np.linspace(0, E0/omega, 201)
+    E_over_omega = np.linspace(0, E0/omega, 101)
     E = [e * omega for e in E_over_omega]
     k_vals = np.linspace(-np.pi, np.pi, 100)
     b_grid = np.linspace(0,1,number_of_step_in_b)
     winding_number_grid = np.zeros((len(b_grid), len(E)), dtype=complex)
+    winding_number_band = 0
     for b_idx, b in enumerate(b_grid):
         # Create tight-binding model
-        coords = [[0], [b]]
-        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1])
-        
+        coords = [[0], [b]]   
+        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1])      
         # Run Floquet analysis
         floquet_model = tb_model.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_Gomez_Leon_test_b={b:.2f}/')
         energies, states = floquet_model.run(k_vals)
-        
-        # Plot band structure
         winding_number_grid[b_idx]=floquet_model.winding_number(band=0)
+        print(f"Winding number for b={b:.2f}: {winding_number_grid[b_idx]}")
         # floquet_model.plot_band_structure(k_vals,save_band_structure=True)
 
         print('')
-        winding_number_grid[b_idx][0]=0.0
     # Convert b_grid and E to 2D meshgrid for plotting
     B, E_mesh = np.meshgrid(b_grid, E_over_omega)
 
@@ -966,7 +1035,7 @@ def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 101, nt = 17):
     plt.colorbar(label='Winding Number')
     plt.xlabel('Bond Length b')
     plt.ylabel(r'$E_0 / \omega$')
-    plt.title('Floquet Winding Number Map (Band 0)')
+    plt.title(f'Floquet Winding Number Map (Band {winding_number_band}/)')
     plt.tight_layout()
     plt.show()
 
@@ -1610,46 +1679,60 @@ def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 101, nt = 17):
 
 #     # qe, fmodes = dmol.spectrum(E0=0.4, Nt=10, gauge='velocity')
 #     # print(qe)
-def test_3norbs_1D(E0 = 20, number_of_step_in_b = 1, nt = 17):
+
+
+
+def test_1D_2norbs(E0 = 1, number_of_step_in_omega = 11, nt = 21):
     """
     Test the Gomez-Leon 2013 model but using TightBinding and FloquetBloch classes, calculate the winding number and finally plot the heatmap
     """
     # Parameters
     # time_start = time.time()
-    omega = 10
-    E_over_omega = np.linspace(0, E0/omega, 21)
-    E = [e * omega for e in E_over_omega]
-    k_vals = np.linspace(-np.pi, np.pi, 100)
-    b_grid = np.linspace(0.2,0.2,1)
-    winding_number_grid = np.zeros((len(b_grid), len(E)), dtype=complex)
-    for b_idx, b in enumerate(b_grid):
+    # omega = np.linspace(0.3, 0.4, number_of_step_in_omega)
+    omega = [0.8,0.7,0.6,0.5,0.4,0.3]
+    omega = [4.95]
+    # omega = [5]
+    # E = np.linspace(0, 0.001, 11)
+    # E_2 = np.linspace(0.001, 0.01, 10)
+    # E_3 = np.linspace(0.01, 0.1, 10)
+    # E_4 = np.linspace(0.1, 1, 10)
+    # E = np.concatenate((E,E_2,E_3,E_4))
+    E = np.linspace(0, E0, 101)
+    k_vals = np.linspace(-np.pi, np.pi, 300)
+    winding_number_grid = np.zeros((len(omega), len(E)), dtype=complex)
+    winding_number_band = 0
+    for omg_idx, omg in enumerate(omega):
         # Create tight-binding model
-        coords = [[0], [b], [0.7]]
-        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1,1, 1, 1,1])
-        
+
+        # tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1,1,1,1,1])
+        # coords = [[0], [b],[0.6],[0.8]]
+        # tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1,1,1,1,1,1,1,1,1,1,1])   
+        coords = [[0], [0.6]]   
+        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1])      
         # Run Floquet analysis
-        floquet_model = tb_model.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_test_3norbs_1D_b={b:.2f}/')
+        floquet_model = tb_model.Floquet(omegad=omg, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_1D_2norbs_test_omega={omg:.5f}/')
         energies, states = floquet_model.run(k_vals)
+
+        winding_number_grid[omg_idx]=floquet_model.winding_number(band=0)
+        print(f"Winding number for omega={omg:.2f}: {winding_number_grid[omg_idx]}")
         
-        # Plot band structure
-        winding_number_grid[b_idx]=floquet_model.winding_number(band=0)
+        
         floquet_model.plot_band_structure(k_vals,save_band_structure=True)
 
         print('')
-        winding_number_grid[b_idx][0]=0.0
     # Convert b_grid and E to 2D meshgrid for plotting
-    B, E_mesh = np.meshgrid(b_grid, E_over_omega)
+    B, E_mesh = np.meshgrid(omega, E)
 
     # Plot the winding number map (real part only if complex)
     plt.figure(figsize=(6, 5))
     plt.pcolormesh(B, E_mesh, winding_number_grid.T.real, shading='auto', cmap='viridis')
     plt.colorbar(label='Winding Number')
-    plt.xlabel('Bond Length b')
+    plt.xlabel('Driving Frequency omega')
     plt.ylabel(r'$E_0 / \omega$')
-    plt.title('Floquet Winding Number Map (Band 0)')
+    plt.title(f'Floquet Winding Number Map (Band {winding_number_band}/)')
     plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
     # test_Gomez_Leon_2013()
-    test_3norbs_1D()
+    test_1D_2norbs()
