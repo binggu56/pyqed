@@ -731,7 +731,7 @@ class FloquetBloch:
                     for m in range(NF):
                         overlap[band_idx, m] = np.abs(np.vdot(prev_vec, eigvecs[:, m]))**2
 
-                # — greedy assignment so each band picks its best *unused* Floquet level —
+                # — assignment so each band picks its best *unused* Floquet level —
                 assigned = set()
                 assignment = {}  # band_idx -> chosen index m
                 for band_idx in range(Norbs):
