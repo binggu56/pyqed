@@ -33,7 +33,7 @@ from scipy.special import erf
 import logging
 # import warnings
 
-from pyqed import discretize, sort, dag, tensor
+from pyqed import discretize, sort, dag, tensor, SpinHalfFermionOperators
 from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom
 from pyqed.dvr import SineDVR
@@ -47,47 +47,7 @@ from opt_einsum import contract
 
 
 
-def SpinHalfFermionOperators(filling=1.):
-    d = 4
-    states = ['empty', 'up', 'down', 'full']
-    # 0) Build the operators.
-    Nu_diag = np.array([0., 1., 0., 1.], dtype=np.float64)
-    Nd_diag = np.array([0., 0., 1., 1.], dtype=np.float64)
 
-    Nu = np.diag(Nu_diag)
-    Nd = np.diag(Nd_diag)
-    Ntot = np.diag(Nu_diag + Nd_diag)
-    dN = np.diag(Nu_diag + Nd_diag - filling)
-    NuNd = np.diag(Nu_diag * Nd_diag)
-    JWu = np.diag(1. - 2 * Nu_diag)  # (-1)^Nu
-    JWd = np.diag(1. - 2 * Nd_diag)  # (-1)^Nd
-    JW = JWu * JWd  # (-1)^{Nu+Nd}
-
-
-    Cu = np.zeros((d, d))
-    Cu[0, 1] = Cu[2, 3] = 1
-    Cdu = np.transpose(Cu)
-    # For spin-down annihilation operator: include a Jordan-Wigner string JWu
-    # this ensures that Cdu.Cd = - Cd.Cdu
-    # c.f. the chapter on the Jordan-Wigner trafo in the userguide
-    Cd_noJW = np.zeros((d, d))
-    Cd_noJW[0, 2] = Cd_noJW[1, 3] = 1
-    Cd = np.dot(JWu, Cd_noJW)  # (don't do this for spin-up...)
-    Cdd = np.transpose(Cd)
-
-    # spin operators are defined as  (Cdu, Cdd) S^gamma (Cu, Cd)^T,
-    # where S^gamma is the 2x2 matrix for spin-half
-    Sz = np.diag(0.5 * (Nu_diag - Nd_diag))
-    Sp = np.dot(Cdu, Cd)
-    Sm = np.dot(Cdd, Cu)
-    Sx = 0.5 * (Sp + Sm)
-    Sy = -0.5j * (Sp - Sm)
-
-    ops = dict(JW=JW, JWu=JWu, JWd=JWd,
-               Cu=Cu, Cdu=Cdu, Cd=Cd, Cdd=Cdd,
-               Nu=Nu, Nd=Nd, Ntot=Ntot, NuNd=NuNd, dN=dN,
-               Sx=Sx, Sy=Sy, Sz=Sz, Sp=Sp, Sm=Sm)  # yapf: disable
-    return ops
 
 ops = SpinHalfFermionOperators()
 Cd = ops['Cd']
@@ -196,14 +156,14 @@ def number_operator(L, spin='up'):
     if spin == 'up':
 
         for i in range(L):
-            ai = [JW, ] * i +  [Nu] + Is(L - i -1)
+            ai = [Is, ] * i +  [Nu] + Is(L - i -1)
             a.append(tensor(ai))
         return a
 
     elif spin == 'down':
 
         for i in range(L):
-            ai = [JW, ] * i +  [Nd] + Is(L - i -1)
+            ai = [Is, ] * i +  [Nd] + Is(L - i -1)
             a.append(tensor(ai))
         return a
 
@@ -430,6 +390,8 @@ class SpinHalfFermionChain:
 
     def spin_tot(self, psi):
         pass
+
+
 
 if __name__=='__main__':
     from pyscf import gto, scf, dft, tddft, ao2mo

@@ -268,6 +268,18 @@ def format_atom(atoms):
 #         return fromstring(f.read(), format)
 
 
+def fromfile(filename, format=None):
+        if format is None:  # Guess format based on filename
+            format = os.path.splitext(filename)[1][1:].lower()
+            if format in ('xyz'):
+                return readxyz(filename)
+        else:
+            raise ValueError('Format {} not supported. Use XYZ'.format(format))
+            
+            
+        # with open(filename, 'r') as f:
+        #     return fromstring(f.read(), format)
+    
 
 
     #     atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')
@@ -859,7 +871,7 @@ class Molecule:
     @property
     def nelec(self):
         if self._nelec is None:
-            self._nelec = sum(self.atom_charges()) + self.charge
+            self._nelec = sum(self.atom_charges()) - self.charge
 
         return self._nelec
 
@@ -1160,6 +1172,22 @@ def grad_nuc(mol, atmlst=None):
 
 
 def readxyz(fname):
+    """
+    read XYZ file and parse it to `atom` format
+
+    Parameters
+    ----------
+    fname : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atomic_symbols : TYPE
+        DESCRIPTION.
+    atomic_coordinates : TYPE
+        DESCRIPTION.
+
+    """
     with open(fname, 'r') as xyz_file:
         lines = xyz_file.readlines()[2:] # Skipping the first two lines
 
@@ -1168,7 +1196,9 @@ def readxyz(fname):
         atomic_symbols.append(line.split()[0])
 
     atomic_coordinates = np.array([line.split()[1:4] for line in lines], dtype=np.float64)
-    return atomic_symbols, atomic_coordinates
+    return build_atom_from_coords(atomic_symbols, atomic_coordinates)
+
+
 
 def project_nac():
     pass
@@ -1572,7 +1602,7 @@ if __name__ == '__main__':
 
 
 
-    mol.basis = '6-31G'
+    mol.basis = 'sto3G'
     mol.build()
     mol.RHF().run()
 

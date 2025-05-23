@@ -544,7 +544,7 @@ class DMRG:
 
 def autoMPO(h1e, eri):
     """
-    express the Hamiltonian into MPO
+    write the Hamiltonian into the MPO form
 
     .. math::
 

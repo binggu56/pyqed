@@ -413,6 +413,31 @@ class SincDVR(DVR):
             x_m = np.asarray(x)[:, np.newaxis]
         x_n = self.x[np.newaxis, :]
         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
+    
+    def run(self, num_eigs = 5, **kwargs):
+        
+        assert self.v is not None
+        
+        h = self.t() + np.diag(self.v)
+        # Get the eigenpairs
+        # There are multiple options here.
+        # If the user is asking for all of the eigenvalues,
+        # then we need to use np.linalg.eigh()
+        if num_eigs == h.shape[0]:
+            E, U = np.linalg.eigh(h)
+        # But if we don't need all eigenvalues, only the smallest ones,
+        # then when the size of the H matrix becomes large enough, it is
+        # better to use sla.eigsh() with a shift-invert method. Here we
+        # have to have a good guess for the smallest eigenvalue so we
+        # ask for eigenvalues closest to the minimum of the potential.
+        else:
+            E, U = sla.eigsh(h, k=num_eigs, which='LM',
+                             sigma=self.v.min())
+
+        self.eigvals = E
+        self.eigvecs = U
+        # self.potential = V
+        return E, U
 
 # class SincDVRPeriodic(SincDVR):
 class ExponentialDVR(SincDVR):

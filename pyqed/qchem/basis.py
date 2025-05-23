@@ -350,7 +350,7 @@ def ERI(a,b,c,d):
 
 def build(mol):
     """
-    build electronic integrals in AO using GBasis lib
+    build electronic integrals in AO using GBasis package
 
     Parameters
     ----------
@@ -374,15 +374,28 @@ def build(mol):
 
             # Obtain basis functions from the basis set files
             basis_dict = parse_gbs(basis_dir + "/6-31g.1.gbs")
-            basis = make_contractions(basis_dict, atoms, atcoords, coord_types="c")
+        
+        elif mol.basis.replace('-','').lower() == 'sto3g':
+            
+            basis_dict = parse_gbs(basis_dir + "/sto-3g.1.gbs")
+            
+            
+        basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
     else:
 
         raise NotImplementedError('Customized basis not supported yet.')
 
-
+    total_ao = 0
+    for shell in basis:
+        total_ao += shell.angmom_components_cart.shape[0]
+    mol.nao = total_ao
+        
+    print("Number of generalized shells:", len(basis)) 
+    
     # compute overlap integrals in AO and MO basis
     mol.overlap = overlap_integral(basis)
-    mol.nao = len(basis)
+
+    
 
     # olp_mo = overlap_integral(basis, transform=mo_coeffs.T)
 
@@ -402,6 +415,10 @@ def build(mol):
     #Compute e-e repulsion integral in MO basis, shape=(#MO, #MO, #MO, #MO)
     int2e_mo = electron_repulsion_integral(basis, notation='chemist')
     mol.eri = int2e_mo
+    
+    mol._bas = basis
+    
+    return 
 
 
 

@@ -164,10 +164,11 @@ class RHF1D:
         self.tol = 1e-6
         self.init_guess = init_guess
 
-        ###
+        ### dvr setup
         self.x = None
         self.nx = nx
         self.domain = domain
+        self.dvr_type = dvr_type
 
         self.mo_occ = None
         self.mo_coeff = None
@@ -182,6 +183,8 @@ class RHF1D:
         self.hcore = None
 
         self.eri = None
+        
+        self.dvr = None
 
     # def create_grid(self, domain, level, endpoints=False):
 
@@ -265,7 +268,11 @@ class RHF1D:
         # T
         # origin method of calculate kinetic term
 
-        dvr = SineDVR(*self.domain, nx)
+        if self.dvr_type == 'sine':
+            dvr = SineDVR(*self.domain, nx)
+        else: 
+            raise ValueError('DVR {} is not supported yet, use sine.'.format(self.dvr_type))
+        
 
         x = dvr.x
         self.x = x

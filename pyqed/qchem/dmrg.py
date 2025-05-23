@@ -57,8 +57,6 @@ Nd = ops["Nd"]
 
 model_d = 4  # single-site basis size
 
-# class MultiFermionSite(SpinHalfFermionChain):
-    
 
 class SpinHalfFermionChain:
 
@@ -88,7 +86,7 @@ class SpinHalfFermionChain:
         self.nelec = nelec
 
         self.H = None
-        self.ops = None # basic operators for a chain 
+        self.ops = None # basic operators for a chain
 
     def run(self, nstates=1):
 
@@ -174,21 +172,21 @@ class SpinHalfFermionChain:
         # digonal elements for p = q, r = s
         if self.nelec is not None:
             I = tensor(Is(L))
-            
+
             H += 0.2* ((Na - nelec/2 * I) @ (Na - self.nelec/2 * I) + \
                 (Nb - self.nelec/2 * I) @ (Nb - self.nelec/2 * I))
         self.H = H
-        
-        self.ops = {"H": H, 
+
+        self.ops = {"H": H,
                "Cd": Cd,
                "Cu": Cu,
-               "Cdd": Cdd, 
+               "Cdd": Cdd,
                "Cdu": Cdu,
-               "Nu" : Na, 
+               "Nu" : Na,
                "Nd" : Nb,
                "Ntot": Ntot
                }
-        
+
         return H
 
 
@@ -252,9 +250,9 @@ def enlarge_block(block, h1e, eri, forward=True):
 
     The connection operators need to be updated.
     """
-    
-    L = nsites = h1e.shape[-1] 
-    
+
+    L = nsites = h1e.shape[-1]
+
     mblock = block.basis_size
     o = block.operator_dict
 
@@ -273,7 +271,7 @@ def enlarge_block(block, h1e, eri, forward=True):
     #         "conn_Sp": kron(identity(mblock), Sp1),
     #     }
     # else:
-        
+
     if forward:
         site_id = l
 
@@ -592,7 +590,7 @@ def sweep(sys, env, h1e, eri, m, forward=True):
     """
     # assert is_valid_block(sys)
     # assert is_valid_block(env)
-    
+
     L = h1e.shape[-1]
 
     # Enlarge each block by a single site.
@@ -616,25 +614,25 @@ def sweep(sys, env, h1e, eri, m, forward=True):
                              kron(identity(m_sys_enl), env_enl_op["H"])
 
     if forward:
-        
+
         def complementary(j):
 
             nj =  sum([eri[j, (L-1-k)] * env_enl_op["Ntot"][k] for k in range(env_enl.length)])
-            
+
             Cu_j = sum([h1e[j, (L-1-k)] *  env_enl_op["Cu"][k] for k in range(env_enl.length)])
-            
+
             Cd_j = sum([h1e[j, (L-1-k)] *  env_enl_op["Cd"][k] for k in range(env_enl.length)])
-            
-            Cdu_j = sum([h1e[j, (L-1-k)] *  env_enl_op["Cdu"][k] for k in range(env_enl.length)])          
+
+            Cdu_j = sum([h1e[j, (L-1-k)] *  env_enl_op["Cdu"][k] for k in range(env_enl.length)])
             Cdd_j = sum([h1e[j, (L-1-k)] *  env_enl_op["Cdd"][k] for k in range(env_enl.length)])
 
             return nj, Cu_j, Cd_j, Cdu_j, Cdd_j
-        
+
         for j in range(sys_enl.length):
-            
-            
+
+
             ntot_j, Cu_j, Cd_j, Cdu_j, Cdd_j = complementary(j)
-            
+
             superblock_hamiltonian += kron(sys_enl_op["Ntot"][j], ntot_j) + \
                 kron(sys_enl_op["Cdu"][j], Cu_j) +\
                 kron(sys_enl_op["Cdd"][j], Cd_j) -\
@@ -649,31 +647,31 @@ def sweep(sys, env, h1e, eri, m, forward=True):
             #                                     kron(sys_enl_op["Cd"][j], env_enl_op["Cdd"][k])
             #                                     )
     else:
-        
+
         def complementary(k):
 
             nj =  sum([eri[k, (L-1-j)] * sys_enl_op["Ntot"][j] for j in range(sys_enl.length)])
-            
+
             Cu_j = sum([h1e[k, (L-1-j)] *  sys_enl_op["Cu"][j] for j in range(sys_enl.length)])
             Cd_j = sum([h1e[k, (L-1-j)] *  sys_enl_op["Cd"][j] for j in range(sys_enl.length)])
             Cdu_j = sum([h1e[k, (L-1-j)] *  sys_enl_op["Cdu"][j] for j in range(sys_enl.length)])
             Cdd_j = sum([h1e[k, (L-1-j)] *  sys_enl_op["Cdd"][j] for j in range(sys_enl.length)])
-    
+
             return nj, Cu_j, Cd_j, Cdu_j, Cdd_j
-        
+
         for k in range(env_enl.length):
-            
+
             ntot_k, Cu_k, Cd_k, Cdu_k, Cdd_k = complementary(k)
-            
+
             superblock_hamiltonian +=  kron(ntot_k, env_enl_op["Ntot"][k]) +\
                                      kron(Cdu_k, env_enl_op["Cu"][k]) +\
                                     kron(Cdd_k, env_enl_op["Cd"][k]) -\
                                                 kron(Cu_k, env_enl_op["Cdu"][k]) -\
                                                 kron(Cd_k, env_enl_op["Cdd"][k])
-                
+
         # for j in range(sys_enl.length):
         #     for k in range(env_enl.length):
-                
+
         #         superblock_hamiltonian += eri[k, int(L-j-1)] * kron(sys_enl_op["Ntot"][j], env_enl_op["Ntot"][k])
         #         superblock_hamiltonian += h1e[k, int(L-j-1)] * (kron(sys_enl_op["Cdu"][j], env_enl_op["Cu"][k]) +\
         #                                         kron(sys_enl_op["Cdd"][j], env_enl_op["Cd"][k]) -\
@@ -739,7 +737,7 @@ def graphic(sys_block, env_block, sys_label="l"):
     return graphic
 
 # def infinite_system_algorithm(L, m):
-    
+
 #     initial_block = Block(length=1, basis_size=4, operator_dict={
 #         "H": H1,
 #         "Cu": ops['Cu'],
@@ -747,7 +745,7 @@ def graphic(sys_block, env_block, sys_label="l"):
 #         "Nu": ops['Nu'],
 #         "Nd": ops['Nd']
 #     })
-    
+
 #     block = initial_block
 #     # Repeatedly enlarge the system by performing a single DMRG step, using a
 #     # reflection of the current block as the environment.
@@ -864,23 +862,23 @@ class DMRG:
         self.d = 4
 
         self.h1e = mf.hcore
-        
-        
+
+
         self.eri = mf.eri
 
         try:
             self.nsites = self.L = mf.nx
         except:
             self.nsites = self.L = mf.nz
-            
+
         # assert(mf.eri.shape == (self.L, self.L))
 
-        
+
         self.D = self.m = D
 
         self.tol = tol # tolerance for energy convergence
         self.rigid_shift = 0
-        
+
         if m_warmup is None:
             m_warmup = D
         self.m_warmup = m_warmup
@@ -999,8 +997,8 @@ class DMRG:
     def run(self):
 
         # L = self.L
-        m_warmup = self.m_warmup 
-        
+        m_warmup = self.m_warmup
+
         return kernel(self.h1e, self.eri, m_warmup=m_warmup, m=self.D, \
                       shift=self.rigid_shift, tol=self.tol)
 
@@ -1010,12 +1008,12 @@ class DMRG:
 
 
 def kernel(h1e, eri, m, m_warmup=None, shift=0, tol=1e-6):
-    
+
     block_disk = {}  # "disk" storage for Block objects
 
 
     L = h1e.shape[-1]
-    
+
     # onsite Hamiltonian
     H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Nu @ Nd + Nd @ Nu))\
           for j in range(L)]
@@ -1109,6 +1107,72 @@ class DMRGSCF(DMRG):
     """
     pass
 
+    def debug():
+        sys = Block(length=1, basis_size=4, operator_dict={
+                "H": H1[0],
+                "Ntot": [Ntot],
+                "Cu": [Cu @ JW],
+                "Cd": [Cd @ JW],
+                # "Nu": [ops['Nu']],
+                # "Nd": [ops['Nd']],
+                "Cdu": [Cdu @ JW],
+                "Cdd": [Cdd @ JW]
+            })
+
+        env =  Block(length=1, basis_size=4, operator_dict={
+                "H": H1[-1],
+                "Ntot": [Ntot],
+                "Cu": [Cu],
+                "Cd": [Cd],
+                # "Nu": [ops['Nu']],
+                # "Nd": [ops['Nd']],
+                "Cdu": [Cdu],
+                "Cdd": [Cdd]
+            })
+
+        sys_enl = enlarge_block(enlarge_block(sys))
+        H = sys_enl.operator_dict["H"]
+
+        print(H.shape)
+        print(eigsh(H,6)[0])
+
+        env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
+        H = env_enl.operator_dict["H"]
+        # mblock = 4
+        # site_id = 1
+        # o = sys.operator_dict
+        # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
+
+        # print(Ntot)
+
+        # # for j in range(1):
+        # H += eri[0, 1] * kron(Ntot, Ntot)
+        # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
+        #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
+        # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
+        print(H.shape)
+        print(eigsh(H,6)[0])
+
+
+        nx = mf.nx
+        I = np.eye(nx)
+        eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
+        # eri_full = np.zeros((nx, nx, nx, nx))
+        # for i in range(nx):
+        #     for j in range(nx):
+        #         for k in range(nx):
+        #             for l in range(nx):
+        #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
+
+        for n in range(3, 4):
+        # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
+            model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
+
+            H  = model.jordan_wigner()
+            print(H.shape)
+            print(eigsh(H,k=6)[0])
+
+
 
 if __name__=='__main__':
     from pyscf import gto, scf, dft, tddft, ao2mo
@@ -1127,8 +1191,6 @@ if __name__=='__main__':
     #     ['Li' , (0. , 0. , 0.)], ]
     # mol.basis = 'sto3g'
     # mol.build()
-
-
 
     # mf = scf.RHF(mol).run()
 
@@ -1203,77 +1265,12 @@ if __name__=='__main__':
 
     ### DMRG
 
-    def debug():
-        sys = Block(length=1, basis_size=4, operator_dict={
-                "H": H1[0],
-                "Ntot": [Ntot],
-                "Cu": [Cu @ JW],
-                "Cd": [Cd @ JW],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu @ JW],
-                "Cdd": [Cdd @ JW]
-            })
-
-        env =  Block(length=1, basis_size=4, operator_dict={
-                "H": H1[-1],
-                "Ntot": [Ntot],
-                "Cu": [Cu],
-                "Cd": [Cd],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu],
-                "Cdd": [Cdd]
-            })
-
-        sys_enl = enlarge_block(enlarge_block(sys))
-        H = sys_enl.operator_dict["H"]
-
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-        env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
-        H = env_enl.operator_dict["H"]
-        # mblock = 4
-        # site_id = 1
-        # o = sys.operator_dict
-        # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
-
-        # print(Ntot)
-
-        # # for j in range(1):
-        # H += eri[0, 1] * kron(Ntot, Ntot)
-        # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
-        #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
-        # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-
-        nx = mf.nx
-        I = np.eye(nx)
-        eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
-        # eri_full = np.zeros((nx, nx, nx, nx))
-        # for i in range(nx):
-        #     for j in range(nx):
-        #         for k in range(nx):
-        #             for l in range(nx):
-        #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
-
-        for n in range(3, 4):
-        # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
-            model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
-
-            H  = model.jordan_wigner()
-            print(H.shape)
-            print(eigsh(H,k=6)[0])
-
 
     dmrg = DMRG(mf, L=nsites, D=10)
     dmrg.run(10)
 
  # -2.3048356518
- 
+
  # -2.2845645731603184
 
 
