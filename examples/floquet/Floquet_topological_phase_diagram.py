@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pyqed.floquet.Floquet import TightBinding
 
-def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21, omega = 10, relative_Hopping = [1.5,1]):
+def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013'):
     """
     Test the Gomez-Leon 2013 model but using TightBinding and FloquetBloch classes, calculate the winding number and finally plot the heatmap
     """
@@ -22,13 +22,14 @@ def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21, omega = 10
         coords = [[0], [b]]   
         tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=relative_Hopping)     
         # Run Floquet analysis
-        floquet_model = tb_model.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_Gomez_Leon_test_b={b:.2f}/')
+        floquet_model = tb_model.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], data_path=f'{data_saving_root}/floquet_data_Gomez_Leon_test_b={b:.2f}/')
         energies, states = floquet_model.run(k_vals)
         winding_number_grid[b_idx]=floquet_model.winding_number(band=0)
         print(f"Winding number for b={b:.2f}: {winding_number_grid[b_idx]}")
 
-        # run the following line to save the plots of band structure or when you feel not sure about the results, then checking the band closing behaviour could help verify
-        # floquet_model.plot_band_structure(k_vals,save_band_structure=True)
+        if save_band_structure:
+            # run the following line to save the plots of band structure or when you feel not sure about the results, then checking the band closing behaviour could help verify
+            floquet_model.plot_band_structure(k_vals,save_band_structure=True)
 
         print('')
     # Convert b_grid and E to 2D meshgrid for plotting
@@ -46,7 +47,7 @@ def test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21, omega = 10
 
 
 
-def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), nt = 21, b = 0.5):
+def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), nt = 21, b = 0.4, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data'):
     """
     Test the Gomez-Leon 2013 model but using TightBinding and FloquetBloch classes, calculate the winding number and finally plot the heatmap
     """
@@ -60,16 +61,18 @@ def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), n
     for omg_idx, omg in enumerate(omega):
         # Create tight-binding model
         coords = [[0], [b]]   
-        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5,1])      
+        tb_model = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=relative_Hopping)      
         # Run Floquet analysis
-        floquet_model = tb_model.Floquet(omegad=omg, E0=E, nt=nt, polarization=[1], data_path=f'MacBook_local_data/floquet_data_1D_2norbs_test_omega={omg:.5f}/')
+        floquet_model = tb_model.Floquet(omegad=omg, E0=E, nt=nt, polarization=[1], data_path=f'{data_saving_root}/floquet_data_1D_2norbs_test_omega={omg:.5f}/')
         energies, states = floquet_model.run(k_vals)
 
         winding_number_grid[omg_idx]=floquet_model.winding_number(band=0)
         print(f"Winding number for omega={omg:.2f}: {winding_number_grid[omg_idx]}")
         
+        if save_band_structure:
+            # run the following line to save the plots of band structure or when you feel not sure about the results, then checking the band closing behaviour could help verify
+            floquet_model.plot_band_structure(k_vals,save_band_structure=True)
         
-        floquet_model.plot_band_structure(k_vals,save_band_structure=True)
 
         print('')
     # Convert b_grid and E to 2D meshgrid for plotting
@@ -80,14 +83,14 @@ def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), n
     plt.pcolormesh(B, E_mesh, winding_number_grid.T.real, shading='auto', cmap='viridis')
     plt.colorbar(label='Winding Number')
     plt.xlabel('Driving Frequency omega')
-    plt.ylabel(r'$E_0 / \omega$')
+    plt.ylabel(r'$E_0')
     plt.title(f'Floquet Winding Number Map (Band {winding_number_band}/)')
     plt.tight_layout()
     plt.show()
 
 
 if __name__ == "__main__":
-    # test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 11, nt = 21, omega = 10, relative_Hopping = [1.5,1])
-    test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), nt = 21, b = 0.5)
+    # test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 21, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013')
+    test_1D_2norbs(E0 = np.linspace(0, 200, 101), omega = np.linspace(10,11, 2), relative_Hopping = [1.5,1], nt = 21, b = 0.6, save_band_structure=False, data_saving_root = 'local_data')
     
     
