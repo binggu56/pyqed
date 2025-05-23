@@ -90,7 +90,8 @@ def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), n
 
 
 if __name__ == "__main__":
-    # test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 21, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013')
-    test_1D_2norbs(E0 = np.linspace(0, 200, 101), omega = np.linspace(10,11, 2), relative_Hopping = [1.5,1], nt = 21, b = 0.6, save_band_structure=False, data_saving_root = 'local_data')
+    test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 21, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013')
+    test_1D_2norbs(E0 = np.linspace(0, 50, 101), omega = np.linspace(3,7, 17), relative_Hopping = [1.5,1], nt = 21, b = 0.6, save_band_structure=False, data_saving_root = 'local_data')
+
     
     
