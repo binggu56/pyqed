@@ -1107,72 +1107,6 @@ class DMRGSCF(DMRG):
     """
     pass
 
-    def debug():
-        sys = Block(length=1, basis_size=4, operator_dict={
-                "H": H1[0],
-                "Ntot": [Ntot],
-                "Cu": [Cu @ JW],
-                "Cd": [Cd @ JW],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu @ JW],
-                "Cdd": [Cdd @ JW]
-            })
-
-        env =  Block(length=1, basis_size=4, operator_dict={
-                "H": H1[-1],
-                "Ntot": [Ntot],
-                "Cu": [Cu],
-                "Cd": [Cd],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu],
-                "Cdd": [Cdd]
-            })
-
-        sys_enl = enlarge_block(enlarge_block(sys))
-        H = sys_enl.operator_dict["H"]
-
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-        env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
-        H = env_enl.operator_dict["H"]
-        # mblock = 4
-        # site_id = 1
-        # o = sys.operator_dict
-        # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
-
-        # print(Ntot)
-
-        # # for j in range(1):
-        # H += eri[0, 1] * kron(Ntot, Ntot)
-        # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
-        #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
-        # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-
-        nx = mf.nx
-        I = np.eye(nx)
-        eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
-        # eri_full = np.zeros((nx, nx, nx, nx))
-        # for i in range(nx):
-        #     for j in range(nx):
-        #         for k in range(nx):
-        #             for l in range(nx):
-        #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
-
-        for n in range(3, 4):
-        # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
-            model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
-
-            H  = model.jordan_wigner()
-            print(H.shape)
-            print(eigsh(H,k=6)[0])
-
-
 
 if __name__=='__main__':
     from pyscf import gto, scf, dft, tddft, ao2mo
@@ -1191,6 +1125,8 @@ if __name__=='__main__':
     #     ['Li' , (0. , 0. , 0.)], ]
     # mol.basis = 'sto3g'
     # mol.build()
+
+
 
     # mf = scf.RHF(mol).run()
 
@@ -1264,6 +1200,71 @@ if __name__=='__main__':
 
 
     ### DMRG
+
+    def debug():
+        sys = Block(length=1, basis_size=4, operator_dict={
+                "H": H1[0],
+                "Ntot": [Ntot],
+                "Cu": [Cu @ JW],
+                "Cd": [Cd @ JW],
+                # "Nu": [ops['Nu']],
+                # "Nd": [ops['Nd']],
+                "Cdu": [Cdu @ JW],
+                "Cdd": [Cdd @ JW]
+            })
+
+        env =  Block(length=1, basis_size=4, operator_dict={
+                "H": H1[-1],
+                "Ntot": [Ntot],
+                "Cu": [Cu],
+                "Cd": [Cd],
+                # "Nu": [ops['Nu']],
+                # "Nd": [ops['Nd']],
+                "Cdu": [Cdu],
+                "Cdd": [Cdd]
+            })
+
+        sys_enl = enlarge_block(enlarge_block(sys))
+        H = sys_enl.operator_dict["H"]
+
+        print(H.shape)
+        print(eigsh(H,6)[0])
+
+        env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
+        H = env_enl.operator_dict["H"]
+        # mblock = 4
+        # site_id = 1
+        # o = sys.operator_dict
+        # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
+
+        # print(Ntot)
+
+        # # for j in range(1):
+        # H += eri[0, 1] * kron(Ntot, Ntot)
+        # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
+        #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
+        # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
+        print(H.shape)
+        print(eigsh(H,6)[0])
+
+
+        nx = mf.nx
+        I = np.eye(nx)
+        eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
+        # eri_full = np.zeros((nx, nx, nx, nx))
+        # for i in range(nx):
+        #     for j in range(nx):
+        #         for k in range(nx):
+        #             for l in range(nx):
+        #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
+
+        for n in range(3, 4):
+        # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
+            model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
+
+            H  = model.jordan_wigner()
+            print(H.shape)
+            print(eigsh(H,k=6)[0])
 
 
     dmrg = DMRG(mf, L=nsites, D=10)

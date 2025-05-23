@@ -6,7 +6,10 @@ Created on Mon Jun 10 13:59:10 2024
 @author: Bing Gu (gubing@westlake.edu.cn)
 
 
-DMRG/DVR calculation for 1D systems.
+DMRG/DVR calculation for 1D fermion and bosonic quantum field theory using a conventional DMRG algorithm
+
+particularly for quantum chemistry problems using hybrid Gaussian/DVR basis functions 
+(but only one transversal orbital is allowed)
 
 
 This code is based on the simple-dmrg code by James R. Garrison and Ryan V. Mishmash.
@@ -1101,84 +1104,92 @@ def kernel(h1e, eri, m, m_warmup=None, shift=0, tol=1e-6):
             else:
                 old_energy = energy
 
+
+### DMRG
+
+def debug(mf):
+    
+    L = nsites = mf.nx
+    # onsite Hamiltonian
+    H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Nu @ Nd + Nd @ Nu)) for j in range(nsites)]
+
+    sys = Block(length=1, basis_size=4, operator_dict={
+            "H": H1[0],
+            "Ntot": [Ntot],
+            "Cu": [Cu @ JW],
+            "Cd": [Cd @ JW],
+            # "Nu": [ops['Nu']],
+            # "Nd": [ops['Nd']],
+            "Cdu": [Cdu @ JW],
+            "Cdd": [Cdd @ JW]
+        })
+
+    env =  Block(length=1, basis_size=4, operator_dict={
+            "H": H1[-1],
+            "Ntot": [Ntot],
+            "Cu": [Cu],
+            "Cd": [Cd],
+            # "Nu": [ops['Nu']],
+            # "Nd": [ops['Nd']],
+            "Cdu": [Cdu],
+            "Cdd": [Cdd]
+        })
+
+    sys_enl = enlarge_block(enlarge_block(sys))
+    H = sys_enl.operator_dict["H"]
+
+    print(H.shape)
+    print(eigsh(H,6)[0])
+
+    env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
+    H = env_enl.operator_dict["H"]
+    # mblock = 4
+    # site_id = 1
+    # o = sys.operator_dict
+    # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
+
+    # print(Ntot)
+
+    # # for j in range(1):
+    # H += eri[0, 1] * kron(Ntot, Ntot)
+    # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
+    #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
+    # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
+    print(H.shape)
+    print(eigsh(H,6)[0])
+
+
+    nx = mf.nx
+    I = np.eye(nx)
+    eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
+    # eri_full = np.zeros((nx, nx, nx, nx))
+    # for i in range(nx):
+    #     for j in range(nx):
+    #         for k in range(nx):
+    #             for l in range(nx):
+    #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
+
+    for n in range(3, 4):
+    # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
+        model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
+
+        H  = model.jordan_wigner()
+        print(H.shape)
+        print(eigsh(H,k=6)[0])
+            
 class DMRGSCF(DMRG):
     """
     optimize the orbitals
     """
     pass
 
-    def debug():
-        sys = Block(length=1, basis_size=4, operator_dict={
-                "H": H1[0],
-                "Ntot": [Ntot],
-                "Cu": [Cu @ JW],
-                "Cd": [Cd @ JW],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu @ JW],
-                "Cdd": [Cdd @ JW]
-            })
-
-        env =  Block(length=1, basis_size=4, operator_dict={
-                "H": H1[-1],
-                "Ntot": [Ntot],
-                "Cu": [Cu],
-                "Cd": [Cd],
-                # "Nu": [ops['Nu']],
-                # "Nd": [ops['Nd']],
-                "Cdu": [Cdu],
-                "Cdd": [Cdd]
-            })
-
-        sys_enl = enlarge_block(enlarge_block(sys))
-        H = sys_enl.operator_dict["H"]
-
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-        env_enl = enlarge_block(enlarge_block(env, forward=False), forward=False)
-        H = env_enl.operator_dict["H"]
-        # mblock = 4
-        # site_id = 1
-        # o = sys.operator_dict
-        # H = kron(H1[0], identity(4)) + kron(identity(mblock), H1[1])
-
-        # print(Ntot)
-
-        # # for j in range(1):
-        # H += eri[0, 1] * kron(Ntot, Ntot)
-        # H += h1e[0, 1] * (kron(Cdu @ JW, Cu) + kron(Cdd @ JW, Cd) - \
-        #                             kron(Cu @ JW, Cdu) - kron(Cd @ JW, Cdd))
-        # # H += h1e[1, 0] * (kron(JW @ Cu, Cdu) + kron(JW @ Cd, Cdd))
-        print(H.shape)
-        print(eigsh(H,6)[0])
-
-
-        nx = mf.nx
-        I = np.eye(nx)
-        eri_full = contract('ij, jk, kl -> ijkl', I, eri, I)
-        # eri_full = np.zeros((nx, nx, nx, nx))
-        # for i in range(nx):
-        #     for j in range(nx):
-        #         for k in range(nx):
-        #             for l in range(nx):
-        #                 eri_full[i,j,k,l] = eri[j,k] * I[i, j] * I[k, l]
-
-        for n in range(3, 4):
-        # E, X = SpinHalfFermionChain(h1e, eri_full, nelec=6).run()
-            model = SpinHalfFermionChain(h1e[n:,n:], eri_full[n:,n:,n:,n:], nelec=4)
-
-            H  = model.jordan_wigner()
-            print(H.shape)
-            print(eigsh(H,k=6)[0])
-
 
 
 if __name__=='__main__':
-    from pyscf import gto, scf, dft, tddft, ao2mo
+    # from pyscf import gto, scf, dft, tddft, ao2mo
 
-    from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
-    from pyqed.qchem.gto.rhf import RHF
+    # from pyqed.qchem.mol import get_hcore_mo, get_eri_mo
+    # from pyqed.qchem.gto.rhf import RHF
     from pyqed.qchem.dvr.rhf import RHF1D
     from pyqed.models.ShinMetiu2e1d import AtomicChain
 
@@ -1191,6 +1202,8 @@ if __name__=='__main__':
     #     ['Li' , (0. , 0. , 0.)], ]
     # mol.basis = 'sto3g'
     # mol.build()
+
+
 
     # mf = scf.RHF(mol).run()
 
@@ -1206,7 +1219,7 @@ if __name__=='__main__':
     # n = mol.nao
     # Ca = mo_coeff
 
-    natom = 10
+    natom = 4
     l = 10/au2angstrom
         # print(self.L)
         # self.mass = mass  # nuclear mass
@@ -1235,10 +1248,14 @@ if __name__=='__main__':
     # HF
     mf = RHF1D(mol, dvr_type='sine')
     mf.domain = [-15/au2angstrom, 15/au2angstrom]
-    mf.nx = 20
+    mf.nx = 32
 
+
+    
     mf.run()
+    
     print(mf.e_nuc)
+    
     # exact
     # w, u = mol.single_point(R)
     # print(w)
@@ -1253,21 +1270,30 @@ if __name__=='__main__':
     h1e = mf.hcore
     eri = mf.eri
 
-    # print(h1e)
+    print(h1e)
     # print(eri)
+    
+    from scipy.linalg import svd
+    import matplotlib.pyplot as plt
+    
+    u, s, vh = svd(mf.T - np.diag(np.diag(mf.T, k=0)))
+    
+    # print(np.diag(np.diag(h1e,k=0)))
+          
+    
+    
+    fig, ax = plt.subplots()
+    ax.plot(s, 'o')
+    
+    # u, s, vh = svd(eri)
+    
+    # print(s)
+    
+    # fig, ax = plt.subplots()
+    # ax.plot(s, 'o')
 
-    L = nsites = mf.nx
-
-
-    # onsite Hamiltonian
-    H1 = [ (h1e[j, j] * Ntot + 0.5 * eri[j, j] * (Nu @ Nd + Nd @ Nu)) for j in range(nsites)]
-
-
-    ### DMRG
-
-
-    dmrg = DMRG(mf, L=nsites, D=10)
-    dmrg.run(10)
+    dmrg = DMRG(mf, D=10)
+    # dmrg.run()
 
  # -2.3048356518
 

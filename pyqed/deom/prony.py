@@ -136,8 +136,21 @@ def prony_decomposition(x, fft_ct, nexp):
 
 if __name__=='__main__':
     
-    n = 4000 # 2N + 1 points 
+    
+    from pyqed.dvr import SineDVR
+    
+
+    n = 100 # 2N + 1 points 
+    
     scale = 20 # range [0, 80]
+    
+    
+    dvr = SineDVR(-6, 6, 2*n+1)
+    t = dvr.t()
+    
+    fft_ct = t[0, :]
+    
+    print(fft_ct)
     
     # scale_fft = 1000
     # n_fft = 10000000
@@ -159,8 +172,10 @@ if __name__=='__main__':
     
     
     x = np.linspace(0, scale, 2*n+1)
-    fft_ct = 1/x
-    fft_ct[0] = fft_ct[1]
+    # x = dvr.x
+    
+    # fft_ct = 1/x
+    # fft_ct[0] = fft_ct[1]
     
     etal1, expn1, err = prony_decomposition(x, fft_ct, 15)
     

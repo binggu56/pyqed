@@ -12,3 +12,5 @@ from pyqed.polariton.cavity import *
 from pyqed.qchem import *
 from pyqed.dvr.dvr_1d import *
 # from pyqed.qchem.jordan_wigner.spinful import *
+from pyqed.mps.mps import *
+from pyqed.qip import *

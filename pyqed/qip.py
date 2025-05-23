@@ -8,6 +8,10 @@ Created on Tue Oct  8 23:19:15 2024
 import numpy as np
 from scipy.special import entr
 
+
+def hadamard():
+    return np.array([[1, 1], [1, -1]]) / np.sqrt(2)
+
 def reduce_dm(density_matrix, indices, check_state=False, c_dtype="complex128"):
     """Compute the density matrix from a state represented with a density matrix.
 
@@ -270,5 +274,3 @@ if __name__ == '__main__':
     x = [[1/2, 0], [0, 1/2]]
     S = _compute_vn_entropy(x,base=2)
     print(S)
-    
-    

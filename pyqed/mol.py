@@ -178,31 +178,7 @@ def load_result(fname):
         result = pickle.load(f)
     return result
 
-def eigh(a, k=None):
-    """
-    find the eigenvalues and eigenstates of matrix a
 
-    Parameters
-    ----------
-    a : TYPE
-        DESCRIPTION.
-    k : TYPE, optional
-        DESCRIPTION. The default is None.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    """        
-    if k is None:
-        if issparse(a):
-            return np.linalg.eigh(a.toarray())
-        else:
-            return np.linalg.eigh(a)
-    
-    else: 
-        return scipy.sparse.linalg.eigsh(a, k=k)
         
 
 class Mol:
