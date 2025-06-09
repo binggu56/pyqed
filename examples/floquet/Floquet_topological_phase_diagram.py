@@ -94,8 +94,8 @@ def test_1D_2norbs(E0 = np.linspace(0, 1, 101), omega = np.linspace(5,10, 10), n
 
 if __name__ == "__main__":
     
-    test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 21, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013')
-    test_1D_2norbs(E0 = np.linspace(0, 50, 20), omega = np.linspace(3,7, 10), relative_Hopping = [1.5,1], nt = 21, b = 0.6, save_band_structure=False, data_saving_root = 'local_data')
+    # test_Gomez_Leon_2013(E0 = 200, number_of_step_in_b = 21, nt = 21, omega = 10, relative_Hopping = [1.5,1], save_band_structure=False, data_saving_root = 'local_data_GL2013')
+    # test_1D_2norbs(E0 = np.linspace(0, 50, 20), omega = np.linspace(3,7, 10), relative_Hopping = [1.5,1], nt = 21, b = 0.6, save_band_structure=False, data_saving_root = 'local_data')
 
     omega = 6
     # E_over_omega = np.linspace(0, E0/omega, 101)
@@ -110,25 +110,33 @@ if __name__ == "__main__":
     
     coords = [[0], [b]]   
     
-    tb = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=relative_Hopping)     
+    tb = TightBinding(coords, lambda_decay=1.0, lattice_constant=[1.0], nk=100, mu=0.0, relative_Hopping=[1.5, 1])     
     
-    tb.discretize_b___zone(nk)
+    # tb.discretize_b___zone(nk)
     
     # Run Floquet analysis
-    floquet_model = tb.Floquet(omegad=omega, E0=E, nt=nt, polarization=[1], 
-                                     data_path=f'{data_saving_root}/floquet_data_Gomez_Leon_test_b={b:.2f}/')
+    floquet_model = tb.Floquet(omegad=omega, E0=E, nt=21, data_path='./')
+    
+    tb.E = E
 
     # compute Floquet-Bloch quasienergy band structure
     k_vals = np.linspace(-np.pi, np.pi, 100)
-    energies, states = floquet_model.run(k_vals)
+    energies, states = floquet_model.run(k_vals, fold=True)
+    w = floquet_model.winding_number(band_id)
+    
+    floquet.run_along_path(path)
+    
+    np.savez(energies)
+    
+    print(energies)
     
     
-    winding_number_grid[b_idx]=floquet_model.winding_number(band=0)
-    print(f"Winding number for b={b:.2f}: {winding_number_grid[b_idx]}")
+    # winding_number = floquet_model.winding_number(band=0)
+    # print(f"Winding number for b={b:.2f}: {winding_number}")
 
-    if save_band_structure:
-        # run the following line to save the plots of band structure or when you feel not sure about the results, then checking the band closing behaviour could help verify
-        floquet_model.plot_band_structure(k_vals,save_band_structure=True)
+    # if save_band_structure:
+    #     # run the following line to save the plots of band structure or when you feel not sure about the results, then checking the band closing behaviour could help verify
+    #     floquet_model.plot_band_structure(k_vals,save_band_structure=True)
 
     
     

@@ -26,7 +26,7 @@ import numpy as np
 
 from scipy.sparse import identity, kron, csr_matrix, diags, eye
 from scipy.sparse.linalg import eigsh
-from scipy.linalg import norm, eigh
+from scipy.linalg import norm
 
 from scipy.special import erf
 # from scipy.constants import e, epsilon_0, hbar
@@ -34,14 +34,15 @@ import logging
 # import warnings
 
 from pyqed import discretize, sort, dag, tensor, SpinHalfFermionOperators
+from pyqed.phys import eigh
 from pyqed.davidson import davidson
-from pyqed import au2ev, au2angstrom
+from pyqed import au2ev, au2angstrom, obs
 from pyqed.dvr import SineDVR
 # from pyqed import scf
 
 from pyqed.qchem.gto.rhf import make_rdm1, energy_elec
 
-from numba import vectorize, float64, jit
+# from numba import vectorize, float64, jit
 import sys
 from opt_einsum import contract
 
@@ -179,7 +180,7 @@ def number_operator(L, spin='up'):
 
 
 
-def jordan_wigner_transform(j, L):
+def jordan_wigner_transform(j, L, coeff=1, hc=False):
     """
     ["JW", ..., "JW", "Cu",  "Id", ..., "Id"]    # for the annihilation operator spin-up
     ["JW", ..., "JW", "Cd",  "Id", ..., "Id"]    # for the annihilation operator spin-down
@@ -290,6 +291,12 @@ class SpinHalfFermionChain:
         self.nelec = nelec
 
         self.H = None
+        self.Cu = None
+        self.Cd = None
+        self.Cdd = None
+        self.Cdu = None # C^\dag_\uparrow
+        self.Nu_tot = None
+        self.Nd_tot = None
 
     def run(self, nstates=1):
 
@@ -305,13 +312,22 @@ class SpinHalfFermionChain:
 
         # self.hcore_mo = hcore_mo
 
-        H = self.jordan_wigner(self.h1e, self.eri)
-        self.H = H
-        E, X = eigsh(H, k=nstates, which='SA')
+        # H = self.jordan_wigner()
+        # self.H = H
+        E, X = eigh(self.H, k=nstates, which='SA')
+        
+        # Nu = np.diag(dag(X) @ self.Nu_tot @ X)
+        # Nd = np.diag(dag(X) @ self.Nd_tot @ X)
+
+        # print('Energy  Nu     Nd')
+        # for i in range(nstates):
+        #     print(E[i], Nu[i], Nd[i])
 
         return E, X
 
 
+    def build(self):
+        self.jordan_wigner()
 
     def jordan_wigner(self, aosym='8'):
         """
@@ -342,6 +358,11 @@ class SpinHalfFermionChain:
         Cdu = create(norb, spin='up')
         Cdd = create(norb, spin='down')
 
+        self.Cu = Cu
+        self.Cd = Cd
+        self.Cdu = Cdu
+        self.Cdd = Cdd
+
         H = 0
         # for p in range(nmo):
         #     for q in range(p+1):
@@ -357,6 +378,9 @@ class SpinHalfFermionChain:
         for p in range(L):
             Na += Cdu[p] @ Cu[p]
             Nb += Cdd[p] @ Cd[p]
+        
+        self.Nu_tot = Na
+        self.Nd_tot = Nb
 
 
         # poor man's implementation of JWT for 2e operators wihtout exploiting any symmetry
@@ -372,13 +396,26 @@ class SpinHalfFermionChain:
                         # H += jordan_wigner_two_body(p, q, s, r, )
 
         # digonal elements for p = q, r = s
-        I = tensor(Is(L))
+        self.H = H
 
         return H
 
-        # return H + (Na - nelec/2 * I) @ (Na - self.nelec/2 * I) + \
-        #     (Nb - self.nelec/2 * I) @ (Nb - self.nelec/2 * I)
-
+    def fix_nelec(self, nelec=None, s=1):
+        
+        if self.H is None:
+            self.build()
+        
+        I = tensor(Is(self.L))
+        
+        Na = self.Nu_tot
+        Nb = self.Nd_tot 
+        
+        if nelec is None:
+            nelec = self.nelec 
+        
+        self.H += s * (Na - nelec/2 * I) @ (Na - nelec/2 * I) + \
+                s * (Nb - self.nelec/2 * I) @ (Nb - self.nelec/2 * I)
+        return 
 
     def DMRG(self):
         pass

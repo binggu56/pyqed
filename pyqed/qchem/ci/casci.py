@@ -21,7 +21,9 @@ from itertools import combinations
 import warnings
 
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct
-
+from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
+            create, Is #, jordan_wigner_two_body
+        
 
 
 class CASCI:
@@ -31,7 +33,7 @@ class CASCI:
         Jordan-Wigner transformation
         
         .. math::
-            H = h_{ij}c_i^\dagger c_j + v_{pqrs} c_p^\dagger c_q^\dagger c_s c_r\
+            H = h_{ij}c_i^\dagger c_j + \frac{1}{2} v_{pqrs} c_p^\dagger c_q^\dagger c_s c_r\
                 -\mu \sum_\sigma c_{i\sigma}^\dag c_{i\sigma}
 
         
@@ -76,6 +78,12 @@ class CASCI:
         self.chemical_potential = mu 
         
         self.mol = mf.mol
+        
+        ###
+        self.e_tot = None
+        self.H = None 
+        self.Nu = None
+        self.Nd = None
     
     def get_SO_matrix(self, SF=False, H1=None, H2=None):
         """ 
@@ -84,7 +92,7 @@ class CASCI:
         SF: bool
             spin-flip
         """
-        from pyscf import ao2mo
+        # from pyscf import ao2mo
         
         mf = self.mf
         
@@ -183,7 +191,16 @@ class CASCI:
             raise NotImplementedError('Nartural orbitals qubitization not implemented.')
 
         
-    
+    def fix_nelec_by_energy_penalty(self, shift=0.1):
+        
+        Na = self.Nu 
+        Nb = self.Nd 
+        
+        I = tensor(Is(self.ncas))
+        
+        self.H += shift * ((Na - self.nelecas/2 * I) @ (Na - self.nelecas/2 * I) + \
+            (Nb - self.nelecas/2 * I) @ (Nb - self.nelecas/2 * I))
+        
     def jordan_wigner(self, h1e, v):
         """
         MOs based on Restricted HF calculations 
@@ -196,9 +213,7 @@ class CASCI:
         """
         # an inefficient implementation without consdiering any syemmetry 
         
-        from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
-            create, Is #, jordan_wigner_two_body
-        
+
         norb = h1e.shape[-1]
         nmo = L = norb # does not necesarrily have to MOs
 
@@ -223,6 +238,9 @@ class CASCI:
         for p in range(L):
             Na += Cdu[p] @ Cu[p] 
             Nb += Cdd[p] @ Cd[p]
+            
+        self.Nu = Na
+        self.Nd = Nb
 
         
         # poor man's implementation of JWT for 2e operators wihtout exploiting any symmetry 
@@ -238,10 +256,10 @@ class CASCI:
                         # H += jordan_wigner_two_body(p, q, s, r, )
     
         # digonal elements for p = q, r = s
-        I = tensor(Is(L))
+
         
-        return H + (Na - self.nelecas/2 * I) @ (Na - self.nelecas/2 * I) + \
-            (Nb - self.nelecas/2 * I) @ (Nb - self.nelecas/2 * I)
+        self.H = H
+        return H
     
     
     def run(self, nstates=3):

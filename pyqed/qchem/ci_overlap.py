@@ -50,17 +50,17 @@ from pyscf import gto, scf, ci
 #     #print_matrix('smo:', smo, 5, 1)
 #     smo_oo = np.copy(smo[:no,:no])
 #     dot_0 = np.linalg.det(smo_oo)
-    
+
 #     ovlp = np.zeros((nroots, nroots))
-    
+
 #     ovlp[0, 0] = dot_0**2
-    
-    
+
+
     # TODO
-    
+
     # if not (has_m or has_n):
 
-    
+
 
 def wavefunction_overlap():
     #
@@ -68,22 +68,22 @@ def wavefunction_overlap():
     #
     myhf1 = gto.M(atom='H 0 0 0; Li 0 0 1', basis='sto3g', verbose=0, unit='au').apply(scf.RHF).run()
     ci1 = ci.CISD(myhf1).run(nstates=3)
-    print('CISD energy of mol1', ci1.e_tot) 
+    print('CISD energy of mol1', ci1.e_tot)
     # ci1.nstates = 3
     # ci1.run()
-    
-    
+
+
     myhf2 = gto.M(atom='H 0 0 0; Li 0 0 1.1', basis='sto3g', verbose=0, unit='au').apply(scf.RHF).run()
     ci2 = ci.CISD(myhf2).run(nstates=3)
     print('CISD energy of mol2', ci2.e_tot)
-    
-    
+
+
     # overlap matrix between MOs at different geometries
     s12 = gto.intor_cross('cint1e_ovlp_sph', myhf1.mol, myhf2.mol)
     s12 = reduce(np.dot, (myhf1.mo_coeff.T, s12, myhf2.mo_coeff))
-    
-    
-    
+
+
+
     nmo = myhf2.mo_energy.size
     nocc = myhf2.mol.nelectron // 2
     print('<CISD-mol1|CISD-mol2> = ', ci.cisd.overlap(ci1.ci[0], ci2.ci[0], nmo, nocc, s12))
@@ -106,77 +106,79 @@ def nonadiabatic_coupling(mol, mode_id):
 # print('<CISD-mol1|CISD-mol2> = ', ci.cisd.overlap(ci1.ci[1], ci1.ci[0], nmo, nocc, s12))
 
 
-from gbasis.parsers import parse_gbs, make_contractions
-from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+if __name__=='__main__':
 
-from pyqed import Molecule
+    from gbasis.parsers import parse_gbs, make_contractions
+    from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
 
-
-print(wavefunction_overlap())
-
-mol = gto.M(atom = [
-    ['H' , (0. , 0. , 0)],
-    ['Li' , (0. , 0. , 1)], ])
-mol.basis = 'sto3g'
-mol.charge = 0
-mol.unit = 'b'
-mol.build()
-hf = mol.HF().run()
-
-mol2 = gto.M(atom = [
-    ['H' , (0. , 0. , 0)],
-    ['Li' , (0. , 0. , 1.1)], ])
-mol2.basis = 'sto3g'
-mol2.charge = 0
-mol2.unit = 'b'
-mol2.build()
-hf2 = mol2.HF().run()
-
-### PySCF AO overlap 
-s = gto.intor_cross('cint1e_ovlp_sph', mol, mol2)
-# s = reduce(np.dot, (hf.mo_coeff.T, s, hf2.mo_coeff))
-
-print(s)
+    from pyqed import Molecule
 
 
+    print(wavefunction_overlap())
 
-mol = Molecule(atom = [
-    ['H' , (0. , 0. , 0)],
-    ['Li' , (0. , 0. , 1)], ])
-mol.basis = 'sto3g'
-mol.charge = 0
-mol.unit = 'b'
-mol.build()
-hf = mol.RHF().run()
+    mol = gto.M(atom = [
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1)], ])
+    mol.basis = 'sto3g'
+    mol.charge = 0
+    mol.unit = 'b'
+    mol.build()
+    hf = mol.HF().run()
 
-mol2 = Molecule(atom = [
-    ['H' , (0. , 0. , 0)],
-    ['Li' , (0. , 0. , 1.1)], ])
-mol2.basis = 'sto3g'
-mol2.charge = 0
-mol2.unit = 'b'
-mol2.build()
+    mol2 = gto.M(atom = [
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1.1)], ])
+    mol2.basis = 'sto3g'
+    mol2.charge = 0
+    mol2.unit = 'b'
+    mol2.build()
+    hf2 = mol2.HF().run()
 
-hf2 = mol2.RHF().run()
+    ### PySCF AO overlap
+    s = gto.intor_cross('cint1e_ovlp_sph', mol, mol2)
+    # s = reduce(np.dot, (hf.mo_coeff.T, s, hf2.mo_coeff))
+
+    print(s)
 
 
 
+    mol = Molecule(atom = [
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1)], ])
+    mol.basis = 'sto3g'
+    mol.charge = 0
+    mol.unit = 'b'
+    mol.build()
+    hf = mol.RHF().run()
 
-# basis_dict = parse_gbs("6-311g.0.gbs")
-# ao_basis_new = make_contractions(basis_dict, ["H", "He"], mol.atom_coords(), "p")
+    mol2 = Molecule(atom = [
+        ['H' , (0. , 0. , 0)],
+        ['Li' , (0. , 0. , 1.1)], ])
+    mol2.basis = 'sto3g'
+    mol2.charge = 0
+    mol2.unit = 'b'
+    mol2.build()
+
+    hf2 = mol2.RHF().run()
 
 
-# # create an 6-311G basis set for the helium hydride ion in spherical coordinates
-# basis_dict = parse_gbs("6-311g.0.gbs")
-# ao_basis_new = make_contractions(basis_dict, ["H", "He"], mol.atom_coords(), "p")
 
-# print(f"Number of shells in 6-311G basis: {len(ao_basis_new)}")
-# print(f"Number of shells in 6-31G basis: {len(ao_basis)}", end="\n\n")
 
-# compute overlap of two different basis sets
-int1e_overlap_basis = overlap_integral_asymmetric(mol._bas, mol2._bas)
-# s = reduce(np.dot, (hf.mo_coeff.T, int1e_overlap_basis, hf2.mo_coeff))
+    # basis_dict = parse_gbs("6-311g.0.gbs")
+    # ao_basis_new = make_contractions(basis_dict, ["H", "He"], mol.atom_coords(), "p")
 
-print(f"Shape of overlap matrix: {int1e_overlap_basis.shape}")
-print("Overlap matrix (S) of atomic orbitals between old and new basis:")
-print(int1e_overlap_basis)
+
+    # # create an 6-311G basis set for the helium hydride ion in spherical coordinates
+    # basis_dict = parse_gbs("6-311g.0.gbs")
+    # ao_basis_new = make_contractions(basis_dict, ["H", "He"], mol.atom_coords(), "p")
+
+    # print(f"Number of shells in 6-311G basis: {len(ao_basis_new)}")
+    # print(f"Number of shells in 6-31G basis: {len(ao_basis)}", end="\n\n")
+
+    # compute overlap of two different basis sets
+    int1e_overlap_basis = overlap_integral_asymmetric(mol._bas, mol2._bas)
+    # s = reduce(np.dot, (hf.mo_coeff.T, int1e_overlap_basis, hf2.mo_coeff))
+
+    print(f"Shape of overlap matrix: {int1e_overlap_basis.shape}")
+    print("Overlap matrix (S) of atomic orbitals between old and new basis:")
+    print(int1e_overlap_basis)

@@ -683,7 +683,7 @@ def overlap(cibra, ciket, s=None):
 
 if __name__=='__main__':
     from pyscf import gto, scf, dft, tddft, ao2mo, fci, ci
-    import pyscf
+
     from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule
     from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionChain
     from pyqed.qchem.hf.rhf import RHF

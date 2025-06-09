@@ -26,8 +26,10 @@ class RHF:
         self.init_guess = init_guess
 
         self.nocc = self.mol.nelec//2
-        
+
         self.nao = self.mol.nao
+
+        self.nso = None
 
         self.mo_occ = None
         self.mo_coeff = None
@@ -47,6 +49,7 @@ class RHF:
         self.dm = None
 
         self.eri = None
+        # self.eri_so = None
 
         self.mo_energy = None
 
@@ -76,6 +79,41 @@ class RHF:
         self.eri = eri
         return eri
 
+    def get_eri_so(self):
+        """
+        get electron repulsion integral in spin orbitals
+
+        # Integrals are in "chemist's notation"
+        # eri[i,j,k,l] = (ij|kl) = \int i(1) j(1) 1/r12 k(r2) l(r2)
+
+        Returns
+        -------
+        eri : TYPE
+            DESCRIPTION.
+
+        """
+        # RHF, convert to spin-orbitals
+        nso = 2 * len(self.mo_energy)
+        self.nso = nso
+        # self.e_mf = np.zeros(nso)
+        # self.e_mf[0::2] = self.e_mf[1::2] = self.mo_energy
+
+        # b = np.zeros((nso//2,nso))
+        # b[:,0::2] = b[:,1::2] = self.mo_coeff
+
+        # self.v_mf = 0.5 * reduce(np.dot, (b.T, v_mf, b))
+        # self.v_mf[::2,1::2] = self.v_mf[1::2,::2] = 0
+
+        # # electron repulsion integral
+        # eri = ao2mofn(mf.mol, (b,b,b,b),
+        #               compact=False).reshape(nso,nso,nso,nso)
+        I = np.eye(2)
+        eri = contract('ijkl, ab, cd -> iajbkcld', self.eri, I, I).reshape(nso, nso, nso, nso)
+
+        # eri[::2,1::2] = eri[1::2,::2] = eri[:,:,::2,1::2] = eri[:,:,1::2,::2] = 0
+
+        # print("Imag part of ERIs =", np.linalg.norm(eri.imag))
+        return eri
 
     def make_rdm1(self):
         return make_rdm1(self.mo_coeff, self.mo_occ)
@@ -93,8 +131,37 @@ class RHF:
         return get_jk(self.mol, self.dm, with_k=False)[0]
 
     def get_hcore(self):
+        """
+        get core Hamiltonian in AO
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
         # return get_hcore(self.mol)
         return self.mol.hcore
+
+    def get_hcore_mo(self):
+        """
+        get core Hamiltonian in canonical molecular orbitals
+
+        Returns
+        -------
+        ndarray.
+
+        """
+        C = self.mo_coeff
+        return C.conj() @ self.mol.hcore @ C
+
+    def get_eri_mo(self):
+        pass
+
+    def to_uhf(self):
+        # transform a RHF to UHF format with spin orbitals
+        pass
+
 
     def energy_elec(self,dm=None):
         if dm is None:
@@ -104,10 +171,6 @@ class RHF:
 
     def energy_nuc(self):
         return self.e_nuc
-
-
-
-
 
 
 # def get_hcore(mol):
@@ -262,7 +325,28 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
 
 
 def get_jk(mol, dm):
-    # G[i,j] += P[k,l] * (ee[i,j,k,l]  - 0.5 * ee[i,l,k,j])
+    """
+    get the Colomb and exchange terms in the Fock matrix
+
+    .. math::
+
+        G[i,j] = P[k,l] * (v[i,j,k,l]  - 0.5 * v[i,l,k,j])
+
+    Parameters
+    ----------
+    mol : TYPE
+        DESCRIPTION.
+    dm : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    vj : TYPE
+        DESCRIPTION.
+    vk : TYPE
+        DESCRIPTION.
+
+    """
     eri = mol.eri
 
     vj = contract('kl, ijkl -> ij', dm, eri)
@@ -326,7 +410,7 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
         One-particle density matrix, 2D ndarray
     '''
 
-    
+
     mocc = mo_coeff[:,mo_occ>0]
 # DO NOT make tag_array for dm1 here because this DM array may be modified and
 # passed to functions like get_jk, get_vxc.  These functions may take the tags

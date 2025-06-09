@@ -29,7 +29,7 @@ from gbasis.integrals.electron_repulsion import electron_repulsion_integral
 
 
 from pyqed import dag
-from pyqed.qchem.hf.rhf import RHF#, UHF
+from pyqed.qchem.hf import RHF, UHF
 
 from periodictable import elements
 # from pyscf import dft, scf, gto, ao2mo
@@ -275,11 +275,11 @@ def fromfile(filename, format=None):
                 return readxyz(filename)
         else:
             raise ValueError('Format {} not supported. Use XYZ'.format(format))
-            
-            
+
+
         # with open(filename, 'r') as f:
         #     return fromstring(f.read(), format)
-    
+
 
 
     #     atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')

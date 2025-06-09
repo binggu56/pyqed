@@ -98,7 +98,7 @@ def logarithmic_discretize(n, base=2):
         :math:`\Lambda^{-n}, n = 0, 1 ...` in descending order.
 
     """
-    return list(reversed(np.logspace(-n, 0, n+1, base=2, endpoint=True)))
+    return list(reversed(np.logspace(-n, 0, n+1, base=base, endpoint=True)))
 
 
 def integrate(f, a, b, **args):
@@ -1123,11 +1123,16 @@ def transform(A, v):
     transformation rule: A_{ab} = <a|i><i|A|j><j|b> = Anew = v^\dag A v
     input:
         A: matrix of operator A in old basis
-        v: basis transformation matrix
+        v: basis transformation matrix v[old_index, new_index]
     output:
         Anew: matrix A in the new basis
     """
-    Anew = dag(v).dot(A.dot(v))
+    if isinstance(A, np.ndarray):
+        Anew = dag(v).dot(A.dot(v))
+        
+    elif isinstance(A, list):
+        Anew = [dag(v) @ a @ v for a in A]
+    
     #Anew = csr_matrix(A)
 
     return Anew
@@ -1493,7 +1498,7 @@ def driven_dissipative_dynamics(ham, dip, rho0, pulse, dt=0.001, Nt=1, \
 ####################
 # class SpinChain:
 #     def __init__()
-    
+
 class TFIM:
     def __init__(self, J, g, nsites):
         """
@@ -1619,7 +1624,7 @@ class TFIM:
 
     def renormalize(op):
         pass
-        
+
 
 class HeisenbergModel:
     def __init__(self, Jx, Jy, Jz, h, nsites):

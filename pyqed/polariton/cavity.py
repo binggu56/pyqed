@@ -16,6 +16,8 @@ from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol, basis_tr
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
 
+# from pyqed import obs_dm as obs
+
 import sys
 if sys.version_info[1] < 10:
     import proplot as plt
@@ -343,11 +345,11 @@ def fft(t, x, freq=np.linspace(0,0.1)):
     return sp
 
 
-def obs(A, rho):
-    """
-    compute observables
-    """
-    return A.dot( rho).diagonal().sum()
+# def obs(A, rho):
+#     """
+#     compute observables
+#     """
+#     return A.dot( rho).diagonal().sum()
 
 # def rk4_step(a, fun, dt, *args):
 

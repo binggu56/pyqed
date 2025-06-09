@@ -86,7 +86,7 @@ class CASCI:
         SF: bool
             spin-flip
         """
-        from pyscf import ao2mo
+        # from pyscf import ao2mo
 
         mf = self.mf
 

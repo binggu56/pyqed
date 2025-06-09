@@ -1272,7 +1272,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6):
     return Energy, MPS
 
 
-def expect(bra, MPO, ket=None):
+def expect_mps(bra, MPO, ket=None):
     """
     Evaluate the expectation value of an MPO on a given MPS
     .. math::

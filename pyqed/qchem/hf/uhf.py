@@ -7,7 +7,7 @@ Created on Sun Dec  1 09:40:40 2024
 """
 
 import numpy as np
-from pyqed.qchem.rhf import RHF, get_veff
+from pyqed.qchem.hf import RHF, get_veff
 
 class UHF:
     def __init__(self, mol):

@@ -246,7 +246,6 @@ def H2(Sz1, Sp1, Sz2, Sp2):  # two-site part of H
     )
 
 
-import scipy
 # scipy.linalg.kron(a, b)
 def enlarge_block(block, h1e, eri, forward=True):
     """
@@ -286,7 +285,10 @@ def enlarge_block(block, h1e, eri, forward=True):
 
         for j in range(l):
 
-            H += eri[j, site_id] * kron(o["Ntot"][j], Ntot)
+            H += eri[j, site_id] * kron(o["Ntot"][j], Ntot) # n_j n_l
+
+            # t_jl c^\dag_{j \uparrow} c_{l \uparrow}
+
             H += h1e[j, site_id] * (kron(o["Cdu"][j], Cu) + kron(o["Cdd"][j], Cd) - \
                                     kron(o["Cu"][j], Cdu) - kron(o["Cd"][j], Cdd))
 
@@ -836,9 +838,11 @@ def finite_system_algorithm(L, m_warmup, m):
         if sys_label == "l" and 2 * sys_block.length == L:
             break  # escape from the "while True" loop
 
-class DMRG:
+class DMRGDVR:
     """
     ab initio DRMG/DVR quantum chemistry calculation for 1D fermion chain
+
+    we need a better name for this!
     """
     def __init__(self, mf, D, m_warmup=None, tol=1e-6):
         """

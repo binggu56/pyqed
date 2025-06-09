@@ -200,67 +200,69 @@ def overlap(cibra, ciket, nmo, nocc, s=None, DEBUG=False):
     return ovlp
 
 
-def wavefunction_overlap(geometry1=None, geometry2=None):
-    #
-    # RCISD wavefunction overlap
-    #
-    nstates = 3 
+if __name__=='__main__':
     
-    myhf1 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
-    C   -3.191128   -0.790170    0.027261
-    C   -4.458793   -1.235223   -0.013632
-    N   -5.447661   -0.444953   -0.040858
-    C   -5.169422    0.790163   -0.027260
-    C   -3.901761    1.235215    0.013633
-    H   -2.344820   -1.496317    0.050492
-    H   -4.678296   -2.315552   -0.024843
-    H   -6.015733    1.496310   -0.050491
-    H   -3.682256    2.315544    0.024844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
-    ci1 = ci.CISD(myhf1).run()
-    print('CISD energy of mol1', ci1.e_tot) 
-    ci1.nstates = 2
-    ci1.run()
-    
-    
-    myhf2 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
-    C   -3.191128   -0.790170    0.027261
-    C   -4.458793   -1.235223   -0.013632
-    N   -5.447661   -0.444953   -0.040858
-    C   -5.169422    0.790163   -0.027260
-    C   -3.901761    1.235215    0.013633
-    H   -2.344820   -1.496317    0.050492
-    H   -4.678296   -2.315552   -0.024843
-    H   -6.015733    1.496310   -0.050491
-    H   -3.682256    2.315544    0.026844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
-    ci2 = ci.CISD(myhf2)
-    ci2.nstates = 2
-    ci2.run()
-    print('CISD energy of mol2', ci2.e_tot)
-    
-    
-    # overlap matrix between MOs at different geometries
-    s12 = gto.intor_cross('cint1e_ovlp_sph', myhf1.mol, myhf2.mol)
-    s12 = reduce(numpy.dot, (myhf1.mo_coeff.T, s12, myhf2.mo_coeff))
-    
-    print(s12.shape)
-    
-    
-    nmo = myhf2.mo_energy.size
-    nocc = myhf2.mol.nelectron // 2
-    
-
-    print(ci1.ci[0].shape)
-    
-    S = np.zeros((2,2))
-    for i in range(1, nstates):
-        S[i-1, i-1] = overlap(ci1.ci[i-1], ci2.ci[i-1], nmo, nocc)
+    def wavefunction_overlap(geometry1=None, geometry2=None):
+        #
+        # RCISD wavefunction overlap
+        #
+        nstates = 3 
         
-    # print('<CISD-mol1|CISD-mol2> = ', 
-    for i in range(1, nstates):
-        for j in range(1, i):
-            S[i-1, j-1] = overlap(ci1.ci[i-1], ci2.ci[j-1], nmo, nocc)
-            S[j-1, i-1] = S[i-1, j-1]
-    return S
-
-overlaps = wavefunction_overlap()
-print(overlaps)
+        myhf1 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
+        C   -3.191128   -0.790170    0.027261
+        C   -4.458793   -1.235223   -0.013632
+        N   -5.447661   -0.444953   -0.040858
+        C   -5.169422    0.790163   -0.027260
+        C   -3.901761    1.235215    0.013633
+        H   -2.344820   -1.496317    0.050492
+        H   -4.678296   -2.315552   -0.024843
+        H   -6.015733    1.496310   -0.050491
+        H   -3.682256    2.315544    0.024844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
+        ci1 = ci.CISD(myhf1).run()
+        print('CISD energy of mol1', ci1.e_tot) 
+        ci1.nstates = 2
+        ci1.run()
+        
+        
+        myhf2 = gto.M(atom='''N   -2.912892    0.444945    0.040859;
+        C   -3.191128   -0.790170    0.027261
+        C   -4.458793   -1.235223   -0.013632
+        N   -5.447661   -0.444953   -0.040858
+        C   -5.169422    0.790163   -0.027260
+        C   -3.901761    1.235215    0.013633
+        H   -2.344820   -1.496317    0.050492
+        H   -4.678296   -2.315552   -0.024843
+        H   -6.015733    1.496310   -0.050491
+        H   -3.682256    2.315544    0.026844''', basis='321g', verbose=0, unit='angstrom').apply(scf.RHF).run()
+        ci2 = ci.CISD(myhf2)
+        ci2.nstates = 2
+        ci2.run()
+        print('CISD energy of mol2', ci2.e_tot)
+        
+        
+        # overlap matrix between MOs at different geometries
+        s12 = gto.intor_cross('cint1e_ovlp_sph', myhf1.mol, myhf2.mol)
+        s12 = reduce(numpy.dot, (myhf1.mo_coeff.T, s12, myhf2.mo_coeff))
+        
+        print(s12.shape)
+        
+        
+        nmo = myhf2.mo_energy.size
+        nocc = myhf2.mol.nelectron // 2
+        
+    
+        print(ci1.ci[0].shape)
+        
+        S = np.zeros((2,2))
+        for i in range(1, nstates):
+            S[i-1, i-1] = overlap(ci1.ci[i-1], ci2.ci[i-1], nmo, nocc)
+            
+        # print('<CISD-mol1|CISD-mol2> = ', 
+        for i in range(1, nstates):
+            for j in range(1, i):
+                S[i-1, j-1] = overlap(ci1.ci[i-1], ci2.ci[j-1], nmo, nocc)
+                S[j-1, i-1] = S[i-1, j-1]
+        return S
+    
+    overlaps = wavefunction_overlap()
+    print(overlaps)
