@@ -16,7 +16,7 @@ from scipy.sparse import identity
 from functools import reduce
 import warnings
 
-from pyqed import meshgrid, interval, cartesian_product
+from pyqed import meshgrid, interval, cartesian_product, SineDVR
 from pyqed.phys import discretize
 from scipy.io import savemat
 
@@ -31,8 +31,13 @@ def export_to_matlab(fname, psi, fmt='matlab'):
     
 class DVRN(object):
     
-    def __init__(self, domains, levels, ndim=3, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
-        # self.dvr1d = dvr1d00000
+    def __init__(self, domains, levels, ndim=2, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
+        
+        self.dvr = []
+        for d in range(ndim):
+            dvr = SineDVR(domains[d], levels[d])
+            self.dvr.append(dvr.copy())
+        
 
         # self.nx = nx
         # self.xmin, self.xmax = xlim
@@ -355,35 +360,44 @@ class DVR2(object):
         return out.reshape(cols, rows).T
 
 
-    def __init__(self, x, y, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
+    def __init__(self, xlim, ylim, nx, ny, dvr_type='sine', mass=None):
         # self.dvr1d = dvr1d
 
-        # self.nx = nx
-        # self.xmin, self.xmax = xlim
-        # self.ymin, self.ymax = ylim
-        # self.Lx = self.xmax - self.xmin
-        # self.ny = ny
-        # self.Ly = self.ymax - self.ymin
-        # self.dx = self.Lx/nx
-        # self.dy = self.Ly/ny
-        # self.x0 = (self.xmin + self.xmax)/2
-        # self.y0 = (self.ymin + self.ymax)/2
+        self.nx = nx
+        self.xmin, self.xmax = xlim
+        self.ymin, self.ymax = ylim
+        self.Lx = self.xmax - self.xmin
+        self.ny = ny
+        self.Ly = self.ymax - self.ymin
+        self.dx = self.Lx/nx
+        self.dy = self.Ly/ny
+        self.x0 = (self.xmin + self.xmax)/2
+        self.y0 = (self.ymin + self.ymax)/2
 
         # self.x = self.x0 + np.arange(nx) * self.dx - self.Lx/2. + self.dx/2.
         # self.y = self.y0 + np.arange(ny) * self.dy - self.Ly/2. + self.dy/2.
 
-        self.x = x
-        self.y = y
-        self.nx = len(x)
-        self.ny = len(y)
-        self.xmax = max(x)
-        self.xmin = min(x)
-        self.ymax = max(y)
-        self.ymin = min(y)
-        self.Lx = self.xmax - self.xmin
-        self.Ly = self.ymax - self.ymin
-        self.dx = x[1] - x[0]
-        self.dy = y[1] - y[0]
+        
+        if dvr_type == 'sine':
+            dvr_x = SineDVR(*xlim, nx)
+            dvr_y = SineDVR(*ylim, ny)
+            self.x = dvr_x.x
+            self.y = dvr_y.x
+            
+            self.dvr = [dvr_x, dvr_y]
+            
+        # self.x = x
+        # self.y = y
+        # self.nx = len(x)
+        # self.ny = len(y)
+        # self.xmax = max(x)
+        # self.xmin = min(x)
+        # self.ymax = max(y)
+        # self.ymin = min(y)
+        # self.Lx = self.xmax - self.xmin
+        # self.Ly = self.ymax - self.ymin
+        # self.dx = x[1] - x[0]
+        # self.dy = y[1] - y[0]
 
         if mass is None:
             mass = [1, 1]
@@ -397,19 +411,25 @@ class DVR2(object):
         self._V = None
         self.size = self.nx * self.ny
 
-    def v(self, V):
+    def v(self, V, *args):
         """Return the potential matrix with the given potential.
         Usage:
             v_matrix = self.v(V)
 
-        @param[in] V potential function
+        @param[in] 
+            V : callable
+                potential function
         @returns v_matrix potential matrix
         """
 
+        if callable(V):
 
-        self._V = V(self.X, self.Y)
+            self._V = V(self.X, self.Y, *args)
 
-        return sp.diags(self._V.flatten())
+            return self._V
+        
+        else:
+            self._V = V
 
     def t(self, boundary_conditions=['vanishing', 'vanishing'], coords='linear',\
           inertia=None):
@@ -429,17 +449,20 @@ class DVR2(object):
 
         if coords == 'linear':
 
-            tx = _kmat(self.nx, self.Lx, self.mx, boundary_condition=bc_x)
-            ty = _kmat(self.ny, self.Ly, self.my, boundary_condition=bc_y)
-
+            tx = self.dvr[0].t()
+            ty = self.dvr[1].t()
+            
             idx = sp.identity(self.nx)
             idy = sp.identity(self.ny)
             return sp.kron(idx, ty) + sp.kron(tx, idy)
 
         elif coords == 'jacobi':
 
-            tx = _kmat(self.nx, self.Lx, self.mx, boundary_condition=bc_x)
-            ty = _kmat(self.ny, self.Ly, self.my, boundary_condition=bc_y)
+            # tx = _kmat(self.nx, self.Lx, self.mx, boundary_condition=bc_x)
+            # ty = _kmat(self.ny, self.Ly, self.my, boundary_condition=bc_y)
+            
+            tx = self.dvr[0].t()
+            ty = self.dvr[1].t()
 
             idy = sp.identity(self.ny)
             # moment of inertia I(r_i)\delta_{ij}
@@ -449,7 +472,7 @@ class DVR2(object):
 
             return self._K
 
-    def buildH(self, V, coords='linear', **kwargs):
+    def buildH(self, coords='linear', **kwargs):
         """Return the hamiltonian matrix with the given potential.
         Usage:
             H = self.h(V)
@@ -460,10 +483,10 @@ class DVR2(object):
             kwargs for computing kinetic energy matrix
         """
 
-        if hasattr(V, '__call__'):
-            u = self.v(V)
-        else:
-            u = sp.diags(V.flatten())
+        # if hasattr(V, '__call__'):
+        #     u = self.v(V)
+        # else:
+        u = sp.diags(self._V.flatten())
 
 
         self.H = self.t(coords=coords, **kwargs)  + u
@@ -510,10 +533,10 @@ class DVR2(object):
     #     if doshow: plt.show()
     #     return
 
-    def run(self, V, k=6, **kwargs):
+    def run(self, k=6, **kwargs):
 
         if self.H is None:
-            self.buildH(V, **kwargs)
+            self.buildH(**kwargs)
 
         # If all eigenvalues are required, then we use np.linalg.eigh()
         if k == self.size:
@@ -524,7 +547,7 @@ class DVR2(object):
         # have to have a good guess for the smallest eigenvalue so we
         # ask for eigenvalues closest to the minimum of the potential.
         else:
-            E, U = sp.linalg.eigsh(self.H, k=k, which='SM')
+            E, U = sp.linalg.eigsh(self.H, k=k, which='SA')
 
 
         # doshow = kwargs.get('doshow', False)
@@ -544,6 +567,8 @@ class DVR2(object):
         #               ymin=ymin, ymax=ymax,
         #               zmin=zmin, zmax=zmax,
         #               uscale=uscale, doshow=doshow)
+        # print('eigenvalues = ', E)
+        
         return E, U
 
     def plot(self, U, **kwargs):
@@ -876,16 +901,46 @@ class VFactory(object):
 
 
 if __name__ == '__main__':
+    def sho(x, y, k = 1., x0 = 0., y0 = 0.):
+        """Usage:
+                V = harmosc_factory(**kwargs)
 
-    # dvr = DVR2(nx=64, Lx=8, ny=64, Ly=8)
-    # dvr.sho_test()
-    x = discretize(l=4)
-    print(x)
-    nx = len(x)
-    xy = np.fliplr(__cartesian_product([x, x]))
-    print(len(xy))
-    xy = np.reshape(xy, (nx, nx, 2))
-    X, Y = xy[:, :, 0], xy[:, :, 1]
+        Return a two-dimensional harmonic oscillator potential V(x, y)
+        with wavenumber k.
+        i.e. V(x, y) = 1/2 * k * ((x - x0)^2 + (y - y0)^2)
+
+        Keyword arguments
+        @param[in] k    wavenumber of the SHO potential (default=1)
+        @param[in] x0   x-displacement from origin (default=0)
+        @param[in] y0   y-displacement from origin (default=0)
+        @returns   V    2-D SHO potential V(x)
+        """
+        return 0.5 * (x - x0)**2 + 0.5 * (y - y0)**2 + 2*x*y + x**2 * y + x * y**2 + x**2*y**2
+        
+    nx, ny = 15, 15
+    dvr = DVR2((-6,6), nx, (-6,6), ny)
     
-    X1, Y1 = np.meshgrid(x,x)
-    print(X - X1)    
+    
+    dvr.v(sho)
+    E, U = dvr.run(k=3)
+    
+    
+    for j in range(3):
+        u, s, vh = np.linalg.svd(U[:, j].reshape(nx, ny))
+        
+        print(s)
+        
+        fig, ax = plt.subplots()
+        ax.plot(s, 'o')
+    
+    
+    # x = discretize(l=4)
+    # print(x)
+    # nx = len(x)
+    # xy = np.fliplr(__cartesian_product([x, x]))
+    # print(len(xy))
+    # xy = np.reshape(xy, (nx, nx, 2))
+    # X, Y = xy[:, :, 0], xy[:, :, 1]
+    
+    # X1, Y1 = np.meshgrid(x,x)
+    # print(X - X1)    

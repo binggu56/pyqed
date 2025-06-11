@@ -5,6 +5,7 @@ from numpy import exp, pi, sqrt
 from scipy.sparse import csr_matrix, lil_matrix, identity, kron, linalg,\
                         spdiags, issparse
 from scipy.special import hermite, jv
+from scipy.sparse.linalg import eigsh
 from math import factorial
 import scipy as sp
 # import numba
@@ -14,9 +15,95 @@ import heapq
 from functools import reduce
 
 
+def eigh(a, k=None, **args):
+    """
+    find the eigenvalues and eigenstates of matrix a
+
+    Parameters
+    ----------
+    a : TYPE
+        DESCRIPTION.
+    k : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    if k is None or k >= a.shape[-1]:
+        if issparse(a):
+            return np.linalg.eigh(a.toarray())
+        else:
+            return np.linalg.eigh(a)
+
+    else:
+
+        assert(isinstance(k, int))
+
+        if not issparse(a):
+            a = csr_matrix(a)
+
+        return sort(*eigsh(a, k=k, **args))
+
+
+def expect(psi, op, variance=False):
+    """
+    compute the expectation value and its variances
+
+    .. math::
+        \langle \psi | O | \psi \rangle
+
+    Parameters
+    ----------
+    psi : TYPE
+        DESCRIPTION.
+    op : TYPE
+        DESCRIPTION.
+    variance : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    ave = psi.conj() @ op @ psi
+    if variance:
+        var = psi.conj() @ op @ op @ psi
+        return ave, (var - ave**2)
+    else:
+        return ave
+
+
+def logarithmic_discretize(n, base=2):
+    """
+    log discretization of (0, 1)
+    .. math::
+
+        [\Lambda^{-(n+1)}, \Lambda^{-n}], n = 0, 1, ...
+
+    Parameters
+    ----------
+    n : TYPE
+        DESCRIPTION.
+    base : TYPE, optional
+        discretization parameter. The default is 2.
+
+    Returns
+    -------
+    TYPE
+        :math:`\Lambda^{-n}, n = 0, 1 ...` in descending order.
+
+    """
+    return list(reversed(np.logspace(-n, 0, n+1, base=base, endpoint=True)))
+
+
 def integrate(f, a, b, **args):
     """
-    
+
     Compute a definite integral.
 
     Parameters
@@ -65,13 +152,13 @@ def cartesian(*args):
     ans = [[]]
     for arg in args:
         ans = [x+[y] for x in ans for y in arg]
-      
+
     return ans
 
 def discretize(a=0, b=1, l=4, endpoints=True):
     """
     Create a uniform math with size with level l in the range [a, b]
-    
+
     mesh size is :math:`(b-a)/2^l`
 
     Parameters
@@ -95,17 +182,17 @@ def discretize(a=0, b=1, l=4, endpoints=True):
         return np.linspace(a, b, 2**l+1, endpoint=True)
     else:
         return np.linspace(a, b, 2**l, endpoint=False)[1:]
-    
+
     # if startpoint is False and endpoint is False:
     #     return x[1:-1]
 
     # elif startpoint and endpoint is False:
     #     return x
-    
+
     # elif startpoint and endpoint:
-        
+
     #     return np.linspace(a, b, 2**l+1, endpoint=True)
-    
+
 
 def polar2cartesian(r, theta):
     """
@@ -555,7 +642,7 @@ def tensor(*args, **kwargs):
 
 
     """
-    
+
     # if kwargs['sparse']:
     #     kron = sp.kron
     # else:
@@ -790,16 +877,16 @@ def rgwp(x, x0=0., sigma=1.):
 def gwp(x, a=None, x0=0., p0=0., ndim=1):
     '''
     complex Gaussian wavepacket
-    
+
     .. math::
-        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-(x-x_0) A (x-x_0) + i p_0(x-x_0)} 
+        g(x; x_0, p_0) = Det(A)^{1/4}/\pi^{n/4} e^{-1/2 (x-x_0) A (x-x_0) + i p_0(x-x_0)}
 
     Parameters
     ----------
     x : TYPE
         DESCRIPTION.
     sigma : TYPE, optional
-        (co)variance matrix. 
+        (co)variance matrix.
     x0 : TYPE, optional
         DESCRIPTION. The default is 0..
     p0 : TYPE, optional
@@ -815,48 +902,48 @@ def gwp(x, a=None, x0=0., p0=0., ndim=1):
     #     ndim = 1
     # else:
     #     ndim = len(x)
-    
+
     x = np.array(x)
-    
+
     if a is None:
         a = np.eye(ndim)
-        
+
     if ndim == 1:
-        
+
         return (a/np.pi)**(1/4) * np.exp(-a * (x-x0)**2/2.)\
             * exp(1j * p0 * (x-x0))
-    
+
     elif ndim == 2:
-        
+
         if isinstance(x0, float):
             x0 = np.array([x0, ] * ndim)
         if isinstance(p0, float):
             p0 = np.array([p0, ] * ndim)
-        
+
         u = np.array(x-x0)
-        
-        delta = u.dot(a @ u) 
-        
+
+        delta = u.dot(a @ u)
+
         gauss_2d = np.linalg.det(a)**(1/4)/np.pi**(ndim/4) \
                           * np.exp(-0.5 * delta + 1j * p0.dot(x-x0))
-    
+
         return gauss_2d
 
     elif ndim > 2:
-        
+
         # A = np.linalg.inv(sigma)
-        
+
         # if isinstance(x, list):
         #     x = np.array(x)
         if isinstance(x0, float):
             x0 = np.array([x0, ] * ndim)
         if isinstance(p0, float):
             p0 = np.array([p0, ] * ndim)
-            
+
 
         u = x - x0
         delta = u.dot(a @ u)
-        
+
         g =  np.linalg.det(a)**(1/4)/(np.pi)**(ndim/4) * exp(-0.5 * delta + \
                                                              1j * p0.dot(x-x0))
 
@@ -1036,11 +1123,16 @@ def transform(A, v):
     transformation rule: A_{ab} = <a|i><i|A|j><j|b> = Anew = v^\dag A v
     input:
         A: matrix of operator A in old basis
-        v: basis transformation matrix
+        v: basis transformation matrix v[old_index, new_index]
     output:
         Anew: matrix A in the new basis
     """
-    Anew = dag(v).dot(A.dot(v))
+    if isinstance(A, np.ndarray):
+        Anew = dag(v).dot(A.dot(v))
+        
+    elif isinstance(A, list):
+        Anew = [dag(v) @ a @ v for a in A]
+    
     #Anew = csr_matrix(A)
 
     return Anew
@@ -1404,6 +1496,188 @@ def driven_dissipative_dynamics(ham, dip, rho0, pulse, dt=0.001, Nt=1, \
 ####################
 # spin chains
 ####################
+# class SpinChain:
+#     def __init__()
+
+class TFIM:
+    def __init__(self, J, g, nsites):
+        """
+        transversal field Ising model
+
+        .. math::
+
+            H = - J (\sum_{\langle i,j \rangle} Z_i Z_j + g \sum_j X_j)
+
+        Parameters
+        ----------
+        onsite : TYPE
+            DESCRIPTION.
+        hopping : TYPE
+            DESCRIPTION.
+        nsites : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
+        self.g = g
+        self.hopping = self.J = J
+        self.nsites = nsites
+
+        ###
+        self.H = None
+        self.lowering = None
+        self.e_tot = None
+
+    def build(self):
+
+    # if not isinstance(hopping, float):
+    #     raise ValueError('Hopping must be float.')
+
+    # if isinstance(onsite, (float, int)):
+    #     onsite = [onsite, ] * nsites
+
+
+        s0, X, sy, Z = pauli()
+        sm, sp = lowering(), raising()
+        J = self.hopping
+
+        g = self.g
+
+        h0 = g * X
+
+        idm = s0
+        nsites = self.nsites
+
+        if nsites == 1:
+            self.H = - J * h0
+            self.lowering = sm
+            return self.H
+
+        elif nsites == 2:
+
+            h0 = g * X
+            hf = g * X
+            ham = kron(idm, hf) + kron(h0, idm) + kron(Z, Z)
+
+            xs = [kron(sm, idm), kron(idm, sm)]
+
+            self.H = - J * ham
+            self.lowering = xs
+
+            return self.H
+
+        elif nsites > 2:
+
+            h0 = g * X
+            hf = g * X
+
+            head = kron(h0, tensor_power(idm, nsites-1))
+            tail = kron(tensor_power(idm, nsites-1), hf)
+            ham = head + tail
+
+            for i in range(1, nsites-1):
+                h = g * X
+                ham += kron(tensor_power(idm, i), \
+                                          kron(h, tensor_power(idm, nsites-i-1)))
+
+            hop_head = kron(kron(Z, Z), tensor_power(idm, nsites-2))
+            hop_tail = kron(tensor_power(idm, nsites-2), kron(Z, Z))
+
+            ham += hop_head + hop_tail
+
+            for i in range(1, nsites-2):
+                ham += kron(tensor_power(idm, i), \
+                                    kron(kron(Z, Z), tensor_power(idm, nsites-i-2)))
+
+            # connect the last mode to the first mode
+
+            lower_head = kron(sm, tensor_power(idm, nsites-1))
+            xs = []
+            xs.append(lower_head)
+
+            for i in range(1, nsites-1):
+                # x = quadrature(dims[i])
+                lower = kron(tensor_power(idm, i), kron(sm, tensor_power(idm, nsites-i-1)))
+                xs.append(lower.copy())
+
+            lower_tail = kron(tensor_power(idm, nsites-1), sm)
+            xs.append(lower_tail)
+
+            self.H = - J * ham
+            self.lowering = xs
+
+
+        # self.H, self.lowering = multispin(self.onsite, self.hopping, self.nsites)
+            return self.H
+
+    def run(self, nroots=1):
+
+        if self.H is None:
+            self.build()
+
+        E, U = eigsh(self.H, k=nroots)
+        self.e_tot = E
+        return E
+
+    def renormalize(op):
+        pass
+
+
+class HeisenbergModel:
+    def __init__(self, Jx, Jy, Jz, h, nsites):
+        """
+
+        Heisenberg model
+
+        .. math::
+
+            H = - \frac{1}{2} (\sum_{j=1}^{N} (J_{x}\sigma_{j}^{x} \sigma_{j+1}^{x}
+                + J_y \sigma _{j}^{y}\sigma_{j+1}^{y} + J_z \sigma_{j}^{z}\sigma_{j+1}^{z})
+                + h \sigma_{j}^z)
+
+
+        Parameters
+        ----------
+        Jx : TYPE
+            DESCRIPTION.
+        Jy : TYPE
+            DESCRIPTION.
+        Jz : TYPE
+            DESCRIPTION.
+        h : TYPE
+            external field
+        nsites : int
+            number of sites
+
+        Returns
+        -------
+        None.
+
+        """
+        self.Jx = Jx
+        self.Jy = Jy
+        self.Jz = Jz
+        self.h = h
+
+        ###
+        self.H = None
+
+    def build(self):
+        pass
+
+    def run(self):
+        pass
+
+    def DMRG(self):
+        pass
+
+    def NARG(self):
+        pass
+
+
 def multispin(onsite, hopping, nsites):
 
     # if not isinstance(hopping, float):
@@ -1419,10 +1693,10 @@ def multispin(onsite, hopping, nsites):
     J = hopping
 
     sz = 0.5 * (s0 - sz)
-    
+
     if isinstance(onsite, float):
         onsite = [onsite, ] * nsites
-        
+
     h0 = 0.5 * onsite[0] * sz
     x = sx
     idm = s0
@@ -1530,7 +1804,7 @@ def multi_spin(onsite, nsites):
 
 def multiboson(omega, nmodes, J=0, truncate=2):
     """
-    construct the hamiltonian for a multi-spin system
+    construct the hamiltonian for a multi-boson system
 
     Parameters
     ----------
@@ -1971,7 +2245,7 @@ def pdf_normal(x, mu=0, sigma=1.):
 if __name__ == '__main__':
     H = sigmaz() -  sigmax()
     s0, sx, sy, sz = pauli()
-    
+
     print(kron(sz, s0) != tensor(csr_matrix(sz), csr_matrix(s0)))
     # print(isherm(H))
 
@@ -1986,7 +2260,3 @@ if __name__ == '__main__':
     # U2 = propagator(H, dt, nt, method='eom')
     # print(U1[-1])
     # print(U2[-1])
-
-
-
-

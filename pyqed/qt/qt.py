@@ -13,6 +13,7 @@ import numba
 import sys
 import math
 
+from opt_einsum import contract
 
 from pyqed import au2angstrom, au2wavenumber
 
@@ -724,6 +725,9 @@ def fit_c(c, x, deg=1):
     x: array (ntraj, ndim)
         trajectories.
         
+    deg: int 
+        Default = 1 (linear fit). 
+        
     """
     ntraj, ndim = x.shape
     nstates = c.shape[-1]
@@ -751,35 +755,82 @@ def fit_c(c, x, deg=1):
         ddc = np.zeros((ntraj, nstates, ndim), dtype=np.complex128)
         
         if deg == 1:
-            nbasis = ndim + 1
+            nb = ndim + 1
 
             S = np.zeros((ndim + 1, ndim+1))
             b = np.zeros((ndim+1, nstates), dtype=complex)
             
-            for i in range(ntraj):
+            f = np.zeros((ntraj, nb))
+            f[:,:-1] = x
+            f[:, -1] = 1.0
+
+            b = contract('i, ia, im->ma', w, c, f)
+            S = contract('im, in, i -> mn', f, f, w)
+
+            # for i in range(ntraj):
          
-                f = np.array([*x[i,:],1.0]) # fitting basis
+            #     f = np.array([*x[i,:],1.0]) # fitting basis
          
-                for m in range(ndim+1):
+            #     for m in range(ndim+1):
                     
-                    for a in range(nstates):
-                        b[m, a] += w[i] * c[i, a] * f[m]
+            #         for a in range(nstates):
+            #             b[m, a] += w[i] * c[i, a] * f[m]
                     
-                    for n in range(m+1):
+            #         for n in range(m+1):
          
-                        S[m,n] += w[i] * f[m] * f[n]
-            S = Sym(S)
+            #             S[m,n] += w[i] * f[m] * f[n]
+            # S = Sym(S)
+            
+            coeff = np.linalg.solve(S, b)
+            
+        
+            
+            for a in range(nstates):
+                for m in range(ndim):
+                    dc[:, a, m] = coeff[m, a]
+            
+                return dc, ddc
+
+
+        elif deg == 2:
+            
+            # number of basis sets 
+            nb = 1 + ndim + ndim*(ndim +1)//2
+            
+
+            S = np.zeros((nb, nb))
+            b = np.zeros((nb, nstates), dtype=complex)
+            
+            f = np.zeros((ntraj, nb))
+            f[:,1:] = x
+            f[:, 0] = 1.0
+            
+            n = ndim + 1
+            for j in range(ndim):
+                for k in range(j, ndim):
+                    f[:, n] = x[:, j] * x[:, k]
+                    n += 1
+                    
+            # f[:, ndim + 1:] = np.reshape(contract('ni, nj -> nij', x, x), ntraj, ndim**2)
+            
+
+            b = contract('i, ia, im -> ma', w, c, f)
+            S = contract('im, in, i -> mn', f, f, w)
             
             coeff = np.linalg.solve(S, b)
             
             
             for a in range(nstates):
-                for m in range(ndim):
-                    dc[:, a, m] = coeff[m, a]
-
-        elif deg == 2:
-            nbasis = 1 + ndim + ndim**2
-            pass 
+                a = coeff[0, a]
+                b = coeff[1:ndim+1, a]
+                c = np.reshape(coeff[ndim+1:, a], (ndim, ndim))
+                
+                for d in range(ndim):
+                    dc[:, a, d] = b[d, a] + x[:, d]
+                    ddc[:, a, d] = 2 * c[d, d]
+            
+                return dc, ddc
+            raise NotImplementedError('Only linear basis has been implemented. Set deg=1.') 
 
         elif deg > 2:
             raise NotImplementedError('Only linear basis has been implemented. Set deg=1.')
@@ -787,25 +838,48 @@ def fit_c(c, x, deg=1):
     # error analysis
     # err = np.sum(c - x )
     
-    return dc, ddc
 
-@numba.jit
-def prop_c(H,c,y,ry,py,x_ave):
+
+def prop_c(H,c,y,ry,py):
+    """Propagate the coefficients
+
+    Parameters
+    ----------
+    H : 2d array (nstates, nstates)
+        Hamiltonian matrix
+    c : 2d array (ntraj, nstates)
+        coefficients
+    y : 2d array (ntraj, ndim)
+        coordinates
+    ry : 2d array (ntraj, ndim)
+        quantum force
+    py : 2d array (ntraj, ndim)
+        momentum
+    x_ave : float
+        average position
+
+    Returns
+    -------
+    dcdt : 2d array (ntraj, nstates)
+        time derivative of coefficients
+    """
 
     dc, ddc = fit_c(c,y)
 
     dcdt = np.zeros([Ntraj,M],dtype=np.complex128)
 
-    eps = 0.20 # linear coupling Vint = eps*sigma_z*y
+    SzAve = AveSigma_z(c, w)
+    Sz = sigma_z()
 
-    Ave_sigma_z = AveSigma_z()
-    for k in range(Ntraj):
+    for k in range(ntraj):
 
-        Vp = eps * y[k] * Ave_sigma_z
+        Vp = sum(g * y[k]) * (Sz - SzAve * np.eye(nstates))
 
-        # anharmonic term in the bath potential
+        # anharmonicity in the bath potential
         #Va = y[k]**4*0.1
-        tmp = (H + Vp).dot(c[k,:]) - ddc[k,:]/2.0/amy - dc[k,:] * ry[k]/amy #+ Va * c[k,:]
+       
+        tmp = (H + Vp).dot(c[k,:]) - c[k] -  contract('aj,j->a', ddc[k,:,:], 0.5/mass) - contract('aj, j -> a', dc[k], ry[k]/mass) #+ Va * c[k,:]
+
 
         dcdt[k,:] = -1j * tmp
 
@@ -819,7 +893,7 @@ def AveSigma_z(c,w):
 
     return tmp
 
-@numba.jit
+# @numba.jit
 def xAve(c,y,w):
     """
     compute expectation value of x
@@ -834,58 +908,67 @@ def xAve(c,y,w):
 
     return x_ave.real
 
-def Vy(y):
-    v0 = y**2/2.0
-    dv = y
-    return v0,dv
+def Vy(y, SzAve):
+    ntraj, ndim = y.shape
+    v0 = np.zeros(ntraj)
+    dv = np.zeros((ntraj, ndim))
 
-def potential(y):
-    v0 = y**2/2.0
-    f = -y
-    return v0, f
+    for n in range(ntraj):
+        v0[n] = np.sum(y[n]**2 * omegas/2.0)
+        dv[n] = omegas * y[n] + g * SzAve
+
+    return v0, dv
+
 
 # initialization
 # for DOF y : an ensemble of trajectories
 # for DOF x : for each trajectory associate a complex vector c of dimension M
 
-Ntraj = ntraj = 128
-M = 2
-nfit = 4
-ax = 1.0 # width of the GH basis
+Ntraj = ntraj = 512
+nstates = M = 2 # number of states
+nfit = 3 # degree of the polynomial for fitting the coefficients
 
+ax = 1.0 # width of the Gaussian basis
+x0 = 0.5 # initial position of the Gaussian basis   
 
-x0 = 0.5
 # initial conditions for c
 c = np.zeros((Ntraj, M), dtype=np.complex128)
 
 # mixture of ground and first excited state
 
 #c[:,0] = 1.0/np.sqrt(2.0)+0j
-#c[:,1] = 1.0/np.sqrt(2.0)+0j
+# c[:,1] = 1.0/np.sqrt(2.0)+0j
 #for i in range(2,M):
 #    c[:,i] = 0.0+0.0j
 
+c[:,1] = 1.0 # initial state is the excited state
+
 # coherent state
-z = 1.0/np.sqrt(2.0) * x0
-for i in range(M):
-    c[:,i] = np.exp(-0.5 * np.abs(z)**2) * z**i / np.sqrt(math.factorial(i))
+# z = 1.0/np.sqrt(2.0) * x0
+# for i in range(M):
+#     c[:,i] = np.exp(-0.5 * np.abs(z)**2) * z**i / np.sqrt(math.factorial(i))
 
 print('initial occupation \n',c[0,:])
 print('trace of density matrix',np.vdot(c[0,:], c[0,:]))
 # ---------------------------------
 # initial conditions for QTs
-ndim = Ndim = 2 
+ndim = Ndim = 8
 print('dimensionality of nuclei = {} \n'.format(ndim))
-y0 = np.zeros(ndim)
-ay0 = np.array([4.0, ] * ndim)
 
-mass = amy = np.array([10.0, 10.0])
+omegas = np.linspace(0.5, 2, ndim)
+
+print('vibrational frequency', omegas)
+
+y0 = np.array([0., ] * ndim)
+ay0 = np.array([1.0, ] * ndim)
+
+mass = amy = 1/omegas
+
 assert(len(amy) == ndim)
 
-print(ndim, ntraj)
-y = np.random.randn(Ntraj, ndim)
 
-for j in range(Ndim):
+y = np.random.randn(Ntraj, ndim)
+for j in range(ndim):
     y[:,j] = y[:,j] / np.sqrt(2.0 * ay0[j]) + y0[j]
 
 print('trajectory range {}, {}'.format(min(y[:, 0]),max(y[:, 0])))
@@ -911,11 +994,11 @@ fmt =  ' {}' * (nout+1)  + '\n'
 Eu = 0.
 
 
-fric_cons = 1.0      # friction constant
+fric_cons = 0.2      # friction constant
 
 
-Nt = 20
-dt = 0.001
+Nt = 400
+dt = 0.004
 dt2 = dt/2.0
 t = 0.0
 
@@ -923,16 +1006,16 @@ print('time range for propagation is [0,{}]'.format(Nt*dt))
 print('timestep  = {}'.format(dt))
 
 # construct the Hamiltonian matrix for anharmonic oscilator
-g = np.array([0.1,0.1])
-if len(g) != Ndim:
-    print('Error: coupling constants has wrong dimensionality.')
+g = np.array([0.05, ] * ndim)
+
+if len(g) != ndim:
+    raise ValueError('Error: coupling constants has wrong dimensionality.')
 #V = 0.5 * M2mat(ax,M) + g/4.0 * M4mat(ax,M)
 #K = Kmat(ax,0.0,M)
-Delta = 0.2
+Delta = 1
 H = Delta * sigma_x() / 2.0
+
 # propagate the QTs for y
-
-
 # update the coeffcients for each trajectory
 fmt_c = ' {} '* (M+1)
 
@@ -943,12 +1026,17 @@ fx = open('xAve.dat','w')
 fnorm = open('norm.dat', 'w')
 fden = open('den.dat','w')
 
-v0, dv = Vy(y)
+
+v0, dv = Vy(y, -1)
 ry, du, Eu = LQF(y,w)
 
+print('classical and quantum potential energy', sum(v0 * w), sum(Eu * w))
+
 cold = c
-dcdt = prop_c(H,c,y,ry,py,x0)
+dcdt = prop_c(H,c,y,ry,py)
 c = c + dcdt * dt
+
+population = np.zeros(Nt)
 
 for k in range(Nt):
 
@@ -962,8 +1050,9 @@ for k in range(Nt):
     # force field
     ry, du, Eu = LQF(y,w)
 
-    x_ave = xAve(c,y,w)
-    v0, dv = Vy(y,x_ave)
+    SzAve = AveSigma_z(c, w)
+    v0, dv = Vy(y, SzAve)
+
 
     py += (- dv - du) * dt2 - fric_cons * py * dt2
 
@@ -974,11 +1063,12 @@ for k in range(Nt):
 
     # update c
 
-    dcdt = prop_c(H,c,y,ry,py,x_ave)
+    dcdt = prop_c(H,c,y,ry,py)
     cnew = cold + dcdt * dt * 2.0
     cold = c
     c = cnew
-
+    
+    population[k] = np.sum(np.abs(c[:,1])**2 * w)
 
     #  output data for each timestep
 #    d = c
@@ -987,17 +1077,17 @@ for k in range(Nt):
 #            d[k,i] = np.exp(-1j*t*H[i,i])*c[k,i]
 
 
-    fx.write('{} {} \n'.format(t,x_ave))
+    fx.write('{} {} \n'.format(t,SzAve))
 
     f.write(fmt.format(t,*y[0:nout]))
 
-    fnorm.write(' {} {} \n'.format(t,anm))
+    # fnorm.write(' {} {} \n'.format(t,anm))
 
     # output density matrix elements
     rho = den(c,w)
     fden.write(' {} {} \n'.format(t,rho))
 
-    Ek = np.dot(py*py,w)/2./amy
+    Ek = contract('ij,ij,i, j->', py, py, w, 1/mass)/2.
     Ev = np.dot(v0,w)
     Eu = Eu
     Etot = Ek + Ev + Eu
@@ -1015,6 +1105,11 @@ fe.close()
 f.close()
 fc.close()
 fx.close()
+
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots()
+ax.plot(population)
+plt.show()
 
 
 #a, x0, De = 1.02, 1.4, 0.176/100

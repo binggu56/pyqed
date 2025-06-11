@@ -178,31 +178,7 @@ def load_result(fname):
         result = pickle.load(f)
     return result
 
-def eigh(a, k=None):
-    """
-    find the eigenvalues and eigenstates of matrix a
 
-    Parameters
-    ----------
-    a : TYPE
-        DESCRIPTION.
-    k : TYPE, optional
-        DESCRIPTION. The default is None.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    """        
-    if k is None:
-        if issparse(a):
-            return np.linalg.eigh(a.toarray())
-        else:
-            return np.linalg.eigh(a)
-    
-    else: 
-        return scipy.sparse.linalg.eigsh(a, k=k)
         
 
 class Mol:
@@ -231,7 +207,13 @@ class Mol:
         None.
 
         """
+        
         self.H = H
+        if isdiag(H):
+            self.E = np.diag(H) # eigenvalues
+        else:
+            self.E = None
+            
         self.nonhermH = None
         self.h = H
         #        self.initial_state = psi0
@@ -273,7 +255,7 @@ class Mol:
         # if isdiag(H):
         #     self.E = np.diag(H)
         # else:
-        self.E = self.eigenenergies()
+        # self.E = self.eigenenergies()
 
     # def raising(self):
     #     return self.raising
@@ -313,7 +295,23 @@ class Mol:
     def edip_rms(self, edip):
         self._edip_rms = edip
 
+    def get_p_from_r(self):
+        """
+        .. math::
+            p_{ji} = -i m (\omega_i - \omega_j) x_{ji} = i \omega_{ij} \mu_ji
 
+        Returns
+        -------
+        None.
+
+        """
+        if self.E is None:
+            self.E = self.eigenenergies()
+            
+        return -1j * np.substract.outer(self.E, self.E) * self.edip
+            
+        
+    
     # @property
     # def H(self):
     #     return self.H
@@ -479,7 +477,9 @@ class Mol:
         """
         if self.H is None:
             raise ValueError('Call getH/calcH to compute H first.')
-
+        
+        H = self.H
+        
         if k is None or k >= self.dim: # full spectrum
             
             if issparse(H):
@@ -535,7 +535,12 @@ class Mol:
                         e_ops=obs_ops, nout=nout, t0=t0)
 
         return
-
+    
+    def Floquet(self,  omegad, E0, nt):
+        from pyqed.floquet.Floquet import Floquet
+        
+        return Floquet(self.H,  self.dip, omegad, E0, nt)
+    
     def quantum_dynamics(self, psi0, dt=0.001, Nt=1, obs_ops=None, nout=1, t0=0.0):
         '''
         quantum dynamics under time-independent hamiltonian
@@ -751,7 +756,7 @@ class Mol:
         """
         hierarchical equations of motion
         """
-        from pyqed.deom import DEOMSolver
+        from pyqed.HEOM.deom import DEOMSolver
         
         solver = DEOMSolver(self.H, self.edip, bath,
                             coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)

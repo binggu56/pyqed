@@ -308,6 +308,8 @@ def level_scheme(E, ylim=None, fname=None):
     return ax
 
 
+
+
 def two_scales(x, yl, yr, xlabel=None, ylabels=None, xlim=None, yllim=None, yrlim=None,\
                yticks=None, fname='output.pdf'):
     fig, ax = subplots()
@@ -343,7 +345,7 @@ def surf(x, y, f, fname='output.png', xlabel='X', \
          ylabel='Y', zlabel='Z', cmap=None, title=None, method='matplotlib'):
 
     if method == 'matplotlib':
-        
+
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
 
@@ -358,7 +360,7 @@ def surf(x, y, f, fname='output.png', xlabel='X', \
         else:
             ax.plot_surface(X, Y, f, rstride=1, cstride=1, linewidth=0,
                         cmap='viridis', edgecolor='none')
-            
+
 
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -583,7 +585,3 @@ if __name__ == '__main__':
     # ax = surf(f, x, y)
 
     export(X, Y, f)
-
-
-
-

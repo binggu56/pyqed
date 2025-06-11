@@ -12,14 +12,27 @@ Based on QCL https://github.com/ben-albrecht/qcl/blob/master/qcl/
 from __future__ import print_function
 from __future__ import division
 
-import math
+# import math
+import os
+import sys
+import numpy
 from numpy import sin, cos, pi
 from numpy.linalg import norm
 import numpy as np
 
-# Suppress scientific notation printouts and change default precision
-np.set_printoptions(precision=4)
-np.set_printoptions(suppress=True)
+from gbasis.parsers import parse_gbs, make_contractions
+from gbasis.integrals.overlap import overlap_integral
+from gbasis.integrals.kinetic_energy import kinetic_energy_integral
+from gbasis.integrals.nuclear_electron_attraction import \
+nuclear_electron_attraction_integral
+from gbasis.integrals.electron_repulsion import electron_repulsion_integral
+
+
+from pyqed import dag
+from pyqed.qchem.hf import RHF, UHF
+
+from periodictable import elements
+# from pyscf import dft, scf, gto, ao2mo
 
 # try:
 #     from cclib.parser.data import ccData
@@ -27,6 +40,293 @@ np.set_printoptions(suppress=True)
 # except ImportError:
 #     print("Failed to load cclib!")
 #     raise
+
+
+
+# DISABLE_EVAL = getattr(__config__, 'DISABLE_EVAL', False)
+
+def get_hcore_mo(mf):
+    """
+    calc the core Hamiltonian in MOs
+
+    Parameters
+    ----------
+    mf : TYPE
+        DESCRIPTION.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+
+    if isinstance(mf, scf.rhf.RHF):
+        mo_coeff = mf.mo_coeff
+        return dag(mo_coeff) @ mf.get_hcore() @ mo_coeff
+
+    elif isinstance(mf, scf.uhf.UHF):
+
+        ha, hb = mf.get_hcore()
+        Ca, Cb = mf.mo_coeff  # MOs for alpha and beta electrons
+
+        return [dag(Ca) @ ha @ Ca, dag(Cb) @ hb @ Cb]
+
+    else:
+        raise ValueError('Input should be be mean-field object.')
+
+def get_eri_mo(mf):
+    """
+    get the two-electron integrals as a numpy array of shape (N,N,N, N)
+    where N is the number of orbitals
+
+
+    Parameters
+    ----------
+    mol : TYPE
+        DESCRIPTION.
+    mo_coeff : TYPE
+        MOs. Not necesarrily the canonical orbitals. E.g. natural orbitals
+
+    Returns
+    -------
+    eri : TYPE
+        DESCRIPTION.
+
+    """
+    if isinstance(mf, scf.rhf.RHF):
+        Ca = mf.mo_coeff
+        n = Ca.shape[-1]
+        # eri = ao2mo.get_mo_eri(mol, mo_coeff)
+        eri_aa = (ao2mo.general(mf._eri , (Ca, Ca, Ca, Ca),
+                                compact=False)).reshape((n,n,n,n), order="C")
+        return  eri_aa
+
+    elif isinstance(mf, scf.uhf.UHF):
+
+        Ca, Cb = mf.mo_coeff
+
+        eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca),
+                                compact=False)).reshape((n,n,n,n), order="C")
+        eri_aa -= eri_aa.swapaxes(1,3)
+
+        eri_bb = (ao2mo.general( mf._eri , (Cb, Cb, Cb, Cb),
+        compact=False)).reshape((n,n,n,n), order="C")
+        eri_bb -= eri_bb.swapaxes(1,3)
+
+        eri_ab = (ao2mo.general( mf._eri , (Ca, Ca, Cb, Cb),
+        compact=False)).reshape((n,n,n,n), order="C")
+
+        # eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
+
+        eri_ba = (ao2mo.general( mf._eri , (Cb, Cb, Ca, Ca),
+        compact=False)).reshape((n,n,n,n), order="C")
+
+        H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
+
+        return H2
+
+def build_atom_from_coords(atom_symbol_list, coords):
+    """
+    construct the atom data format (i.e. xyz format) used in pyscf from coordinates and atom symbols
+
+    Parameters
+    ----------
+    atom_symbol_list : TYPE
+        DESCRIPTION.
+    coords : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atom : TYPE
+        DESCRIPTION.
+
+    """
+    natm = len(atom_symbol_list)
+    atom = []
+    for n in range(natm):
+        atom.append([atom_symbol_list[n],  coords[n, :].tolist()])
+
+    return atom
+
+
+
+def format_atom(atoms):
+    # '''Convert the input :attr:`Mole.atom` to the internal data format.
+    # Including, changing the nuclear charge to atom symbol, converting the
+    # coordinates to AU, rotate and shift the molecule.
+    # If the :attr:`~Mole.atom` is a string, it takes ";" and "\\n"
+    # for the mark to separate atoms;  "," and arbitrary length of blank space
+    # to separate the individual terms for an atom.  Blank line will be ignored.
+
+    # Args:
+    #     atoms : list or str
+    #         the same to :attr:`Mole.atom`
+
+    # Kwargs:
+    #     origin : ndarray
+    #         new axis origin.
+    #     axes : ndarray
+    #         (new_x, new_y, new_z), new coordinates
+    #     unit : str or number
+    #         If unit is one of strings (B, b, Bohr, bohr, AU, au), the coordinates
+    #         of the input atoms are the atomic unit;  If unit is one of strings
+    #         (A, a, Angstrom, angstrom, Ang, ang), the coordinates are in the
+    #         unit of angstrom;  If a number is given, the number are considered
+    #         as the Bohr value (in angstrom), which should be around 0.53.
+    #         Set unit=1 if wishing to preserve the unit of the coordinates.
+
+    # Returns:
+    #     "atoms" in the internal format. The internal format is
+    #         | atom = [[atom1, (x, y, z)],
+    #         |         [atom2, (x, y, z)],
+    #         |         ...
+    #         |         [atomN, (x, y, z)]]
+
+    # Examples:
+
+    # >>> gto.format_atom('9,0,0,0; h@1 0 0 1', origin=(1,1,1))
+    # [['F', [-1.0, -1.0, -1.0]], ['H@1', [-1.0, -1.0, 0.0]]]
+    # >>> gto.format_atom(['9,0,0,0', (1, (0, 0, 1))], origin=(1,1,1))
+    # [['F', [-1.0, -1.0, -1.0]], ['H', [-1, -1, 0]]]
+    # '''
+    def str2atm(line):
+        dat = line.split()
+        try:
+            coords = [float(x) for x in dat[1:4]]
+        except:
+            raise ValueError('Failed to parse geometry %s' % line)
+
+            # else:
+            #     coords = list(eval(','.join(dat[1:4])))
+        if len(coords) != 3:
+            raise ValueError('Coordinates error in %s' % line)
+
+        return [dat[0], coords]
+
+    if isinstance(atoms, str):
+        # The input atoms points to a geometry file
+        if os.path.isfile(atoms):
+            try:
+                atoms = readxyz(atoms)
+            except ValueError:
+                sys.stderr.write('\nFailed to parse geometry file  %s\n\n' % atoms)
+                raise
+
+        atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')
+        fmt_atoms = []
+        for dat in atoms.split('\n'):
+            dat = dat.strip()
+            if dat and dat[0] != '#':
+                fmt_atoms.append(dat)
+
+
+        # if len(fmt_atoms[0].split()) < 4:
+        #     fmt_atoms = from_zmatrix('\n'.join(fmt_atoms))
+        # else:
+        fmt_atoms = [str2atm(line) for line in fmt_atoms]
+
+    else:
+        fmt_atoms = []
+        for atom in atoms:
+            if isinstance(atom, str):
+                if atom.lstrip()[0] != '#':
+                    fmt_atoms.append(str2atm(atom.replace(',',' ')))
+            else:
+                if isinstance(atom[1], (int, float)):
+                    fmt_atoms.append([(atom[0]), atom[1:4]])
+                else:
+                    fmt_atoms.append([(atom[0]), atom[1]])
+
+    c = numpy.array([a[1] for a in fmt_atoms], dtype=numpy.double)
+    # c = numpy.einsum('ix,kx->ki', axes * unit, c - origin)
+    z = [a[0] for a in fmt_atoms]
+
+    return list(zip(z, c.tolist()))
+
+
+# def fromfile(filename, format=None):
+#     '''Read molecular geometry from a file
+#     (in testing)
+
+#     Supported formats:
+#         | raw: Each line is  <symbol> <x> <y> <z>
+#         | xyz: XYZ cartesian coordinates format
+#         | zmat: Z-matrix format
+#     '''
+#     if format is None:  # Guess format based on filename
+#         format = os.path.splitext(filename)[1][1:].lower()
+#         if format not in ('xyz', 'zmat', 'sdf'):
+#             format = 'raw'
+#     with open(filename, 'r') as f:
+#         return fromstring(f.read(), format)
+
+
+def fromfile(filename, format=None):
+        if format is None:  # Guess format based on filename
+            format = os.path.splitext(filename)[1][1:].lower()
+            if format in ('xyz'):
+                return readxyz(filename)
+        else:
+            raise ValueError('Format {} not supported. Use XYZ'.format(format))
+
+
+        # with open(filename, 'r') as f:
+        #     return fromstring(f.read(), format)
+
+
+
+    #     atoms = atoms.replace(';','\n').replace(',',' ').replace('\t',' ')
+    #     fmt_atoms = []
+    #     for dat in atoms.split('\n'):
+    #         dat = dat.strip()
+    #         if dat and dat[0] != '#':
+    #             fmt_atoms.append(dat)
+
+    #     if len(fmt_atoms[0].split()) < 4:
+    #         fmt_atoms = from_zmatrix('\n'.join(fmt_atoms))
+    #     else:
+    #         fmt_atoms = [str2atm(line) for line in fmt_atoms]
+    # else:
+    #     fmt_atoms = []
+    #     for atom in atoms:
+    #         if isinstance(atom, str):
+    #             if atom.lstrip()[0] != '#':
+    #                 fmt_atoms.append(str2atm(atom.replace(',',' ')))
+    #         else:
+    #             if isinstance(atom[1], (int, float)):
+    #                 fmt_atoms.append([_atom_symbol(atom[0]), atom[1:4]])
+    #             else:
+    #                 fmt_atoms.append([_atom_symbol(atom[0]), atom[1]])
+
+    # if len(fmt_atoms) == 0:
+    #     return []
+
+    # if axes is None:
+    #     axes = numpy.eye(3)
+
+    # if isinstance(unit, str):
+    #     if is_au(unit):
+    #         unit = 1.
+    #     else:
+    #         unit = 1./param.BOHR
+    # else:
+    #     unit = 1./unit
+
+    # c = numpy.array([a[1] for a in fmt_atoms], dtype=numpy.double)
+    # c = numpy.einsum('ix,kx->ki', axes * unit, c - origin)
+    # z = [a[0] for a in fmt_atoms]
+    # return list(zip(z, c.tolist()))
+
+    # return atom_symbols,
+
+
 
 
 # class ccData_xyz(ccData):
@@ -396,7 +696,7 @@ np.set_printoptions(suppress=True)
 #         H 2 1.0 1 120.0 3 180.0
 #         """
 
-import numpy as np
+
 import scipy.linalg as linalg
 from scipy.optimize import newton
 
@@ -404,13 +704,29 @@ from scipy.optimize import newton
 import pyscf.ao2mo
 import pyscf
 from functools import reduce
+from pyqed.qchem.basis import build
 
 
 # from pyqed import eig_asymm, is_positive_def, dag
-# from lime.optics import Pulse
 
 
-def intertia_moment(mass, coords):
+def inertia_moment(mass, coords):
+    """
+    compute the inertia moment of a rigid body
+
+    Parameters
+    ----------
+    mass : TYPE
+        DESCRIPTION.
+    coords : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    im : TYPE
+        DESCRIPTION.
+
+    """
     mass_center = np.einsum('i,ij->j', mass, coords)/mass.sum()
     coords = coords - mass_center
     im = np.einsum('i,ij,ik->jk', mass, coords, coords)
@@ -432,15 +748,6 @@ def intertia_moment(mass, coords):
 #     def rhf(self):
 #         pass
 
-#     def rks(self):
-#         pass
-
-#     def tddft(self, nstates=1):
-#         pass
-
-#     def normal_modes(self):
-#         pass
-
 #     def absorption(self, ttype='electron'):
 #         # range, uv, ir, xray
 
@@ -452,26 +759,150 @@ def intertia_moment(mass, coords):
 #     def emission(self):
 #         pass
 
+# def build_molecular_integrals(mol):
+#     """
+#     electronic integrals in AO
 
-# class Molecule(pyscf.gto.Mole):
+#     Parameters
+#     ----------
+#     mol : TYPE
+#         DESCRIPTION.
+
+#     Returns
+#     -------
+#     None.
+
+#     """
+#     atoms = mol.atom_symbols()
+#     atcoords = mol.atom_coords()
+
+#     if mol.basis in ['631g', '6-31g', '631G', '6-31G']:
+#         # Obtain basis functions from the basis set files
+#         basis_dict = parse_gbs("6-31g.1.gbs")
+#         basis = make_contractions(basis_dict, atoms, atcoords, coord_types="c")
+
+
+#     # compute overlap integrals in AO and MO basis
+#     mol.overlap = overlap_integral(basis)
+
+
+#     # olp_mo = overlap_integral(basis, transform=mo_coeffs.T)
+
+#     # compute kinetic energy integrals in AO basis
+#     k_int1e = kinetic_energy_integral(basis)
+#     print("Shape kinetic energy integral: ", k_int1e.shape, "(#AO, #AO)")
+
+
+#     # compute nuclear-electron attraction integrals in AO basis
+#     atnums = np.array([1,1])
+#     nuc_int1e = nuclear_electron_attraction_integral(
+#             basis, atcoords, atnums)
+#     print("Shape Nuclear-electron integral: ", nuc_int1e.shape, "(#AO, #AO)")
+
+#     mol.hcore = k_int1e + nuc_int1e
+
+#     #Compute e-e repulsion integral in MO basis, shape=(#MO, #MO, #MO, #MO)
+#     int2e_mo = electron_repulsion_integral(basis, notation='chemist')
+#     mol.eri = int2e_mo
+
+def atom_mass_list(mol):
+    '''
+    A list of mass for all atoms in the molecule
+    '''
+    return np.array([elements.isotope(mol.atom_symbol(i)).mass \
+                     for i in range(mol.natom)])
+
+
+
 class Molecule:
-    def __init__(self, **kwargs):
+    def __init__(self, atom, charge=0, spin=0, basis=None, **kwargs):
 
-        mol = gto.M(**kwargs)
+        # mol = super(Molecule, self).__init__(atom=atom, **kwargs)
 
-        self.mol = mol
+        # mol = gto.M(atom, **kwargs)
+
+        self._atom = format_atom(atom)
+
+        # self.mol = mol
         # self.atom_coord = mol.atom_coord
-        self.atom_coords = (mol.atom_coords()) # shape 3, natoms
-        # print(self.atom_coords.shape)
-        self.natom = mol.natm
-        self.mass = mol.atom_mass_list()
-        self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
 
+        # print(self.atom_coords.shape)
+        self.natom = len(self._atom)
+        # self.mass = mol.atom_mass_list()
+
+        self.spin = spin
+        self.charge = charge
 
         self.distmat = None
+        self.basis = basis
+        self._nelec = None
+
+        ######## DO NOT CHANGE ####
+        self.e_nuc = None
+        self.overlap = None
+        self.hcore = None
+        self.eri = None
+
+        self.nao = None
 
 
-    def com(self):
+    @property
+    def atom(self):
+        return self._atom
+
+    @atom.setter
+    def atom(self, atm):
+        self._atom = atm
+
+
+    def atom_coord(self, a):
+        return self._atom[a][1]
+
+    def atom_coords(self):
+        return np.array([self._atom[i][1] for i in range(self.natom)])
+
+    def atom_symbol(self, i):
+        return self._atom[i][0]
+
+    def atom_symbols(self):
+        return [self.atom_symbol(i) for i in range(self.natom)]
+
+
+    @property
+    def nelec(self):
+        if self._nelec is None:
+            self._nelec = sum(self.atom_charges()) - self.charge
+
+        return self._nelec
+
+
+    def build(self):
+        """
+        build molecular integrals
+
+        Returns
+        -------
+        None.
+
+        """
+
+        build(self)
+
+
+    def atom_mass_list(self):
+        '''
+        A list of mass for all atoms in the molecule
+        '''
+
+        return atom_mass_list(self)
+
+    def atom_charge(self, atm_id):
+        return elements.isotope(self.atom_symbol(atm_id)).number
+
+    def atom_charges(self):
+        return np.array([self.atom_charge(i) for i in range(self.natom)])
+
+    def center_of_mass(self):
         '''
         return center of mass
 
@@ -481,18 +912,18 @@ class Molecule:
             DESCRIPTION.
 
         '''
-        mass = self.mass
-        return np.einsum('i,ij->j', mass, self.atom_coords)/mass.sum()
+        mass = self.atom_mass_list()
+        return np.einsum('i,ij->j', mass, self.atom_coords())/mass.sum()
 
     def inertia_moment(self):
         mass = self.mass
-        coords = self.atom_coords
-        return intertia_moment(mass, coords)
+        coords = self.atom_coords()
+        return inertia_moment(mass, coords)
 
     def molecular_frame(self):
         # transfrom to molecular frame
         self.atom_coords -= self.com()
-        return self.atom_coords
+        return self
 
     def eckart_frame(self, ref):
         """
@@ -700,9 +1131,74 @@ class Molecule:
     def tofile(self,fname):
         pass
 
+    def RHF(self):
+        return RHF(self)
 
-def readxyz():
-    return
+    def UHF(self):
+        return UHF(self)
+
+    def RKS(self):
+        pass
+
+    def UKS(self):
+        pass
+
+    def energy_nuc(self):
+        return energy_nuc(self.atom_coords(), self.atom_charges())
+
+def energy_nuc(atcoords, atnums):
+    # Compute Nucleus-Nucleus repulsion
+    rab = np.triu(np.linalg.norm(atcoords[:, None]- atcoords, axis=-1))
+    at_charges = np.triu(atnums[:, None] * atnums)[np.where(rab > 0)]
+    nn_e = np.sum(at_charges / rab[rab > 0])
+    return nn_e
+
+def grad_nuc(mol, atmlst=None):
+    '''
+    Derivatives of nuclear repulsion energy wrt nuclear coordinates
+    '''
+    z = mol.atom_charges()
+    r = mol.atom_coords()
+    dr = r[:,None,:] - r
+    dist = np.linalg.norm(dr, axis=2)
+    diag_idx = np.diag_indices(z.size)
+    dist[diag_idx] = 1e100
+    rinv = 1./dist
+    rinv[diag_idx] = 0.
+    gs = np.einsum('i,j,ijx,ij->ix', -z, z, dr, rinv**3)
+    if atmlst is not None:
+        gs = gs[atmlst]
+    return gs
+
+
+def readxyz(fname):
+    """
+    read XYZ file and parse it to `atom` format
+
+    Parameters
+    ----------
+    fname : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    atomic_symbols : TYPE
+        DESCRIPTION.
+    atomic_coordinates : TYPE
+        DESCRIPTION.
+
+    """
+    with open(fname, 'r') as xyz_file:
+        lines = xyz_file.readlines()[2:] # Skipping the first two lines
+
+    atomic_symbols = []
+    for line in lines:
+        atomic_symbols.append(line.split()[0])
+
+    atomic_coordinates = np.array([line.split()[1:4] for line in lines], dtype=np.float64)
+    return build_atom_from_coords(atomic_symbols, atomic_coordinates)
+
+
 
 def project_nac():
     pass
@@ -774,9 +1270,8 @@ def eckart(reference, changed, mass, option=None):
         changed[:, i] -= com_changed
 
 
-# % if (abs(max(max(comref))) > 1e-4)
-# %     disp('Warning! Translational Eckart Condition for reference not satisfied!');
-# % end
+    if (abs(max(max(com_ref))) > 1e-4):
+         raise Warning('Warning! Translational Eckart Condition for reference not satisfied!')
 
 
 
@@ -876,46 +1371,291 @@ def eckart(reference, changed, mass, option=None):
     return xyz_rot
 
 
-if __name__ == '__main__':
-    from pyscf import scf, gto, tdscf
-    # from lime.units import au2fs, au2ev
-    import proplot as plt
+def scan_pes(method='dft'):
+    x = np.arange(0.7, 4.01, .1)
 
-    # mol = Molecule()
     mol = gto.Mole()
-    mol.verbose = 3
-    #mol.atom = [['Ne' , (0., 0., 0.)]]
+    if method == 'hf':
+        mf_scanner = scf.RHF(mol).as_scanner()
+    elif method == 'dft':
+        mf_scanner = dft.RKS(mol).set(xc='b3lyp').as_scanner()
+
+    ehf1 = []
+    for b in np.arange(0.7, 4.01, 0.1):
+        mol = gto.M(verbose = 5,
+                    output = 'out_hf-%2.1f' % b,
+                    atom = [["F", (0., 0., 0.)],
+                            ["H", (0., 0., b)],],
+                    basis = 'cc-pvdz')
+        ehf1.append(mf_scanner(mol))
+
+    import matplotlib.pyplot as plt
+    plt.plot(x, ehf1, '-o', label='HF,0.7->4.0')
+
+def plot_mo_energy(mf):
+    """
+    plot the energy levels and occupations for a HF calculation
+
+    Parameters
+    ----------
+    mf : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    Refs
+    https://www.andersle.no/posts/2022/mo/mo.html
+
+    """
+    import matplotlib
+    from matplotlib import pyplot as plt
+    import seaborn as sns
+
+    fig, ax = plt.subplots(constrained_layout=True, figsize=(9, 6))
+    colors = matplotlib.cm.get_cmap("tab20")(np.linspace(0, 1, len(mf.mo_energy)))
+
+    pos = []
+    for i, (energy, occ) in enumerate(zip(mf.mo_energy, mf.mo_occ)):
+        left = 3 * i
+        right = 3 * i + 2.5
+        length = right - left
+
+        (line,) = ax.plot([left, right], [energy, energy], color=colors[i], lw=3)
+
+        electron_x, electron_y = None, None
+        if occ == 2:
+            electron_x = [left + 0.25 * length, left + 0.75 * length]
+            electron_y = [energy, energy]
+        elif occ == 1:
+            electron_x, electron_y = [left + 0.5], [energy]
+        if electron_x and electron_y:
+            ax.scatter(electron_x, electron_y, color=line.get_color())
+
+        pos.append(left + 0.5 * length)
+
+    ax.axhline(y=0, ls=":", color="k")
+    ax.set_xticks(pos)
+    ax.set_xticklabels([f"#{i}" for i, _ in enumerate(pos)])
+    ax.set(xlabel="MO number", ylabel="Energy / a.u.")
+    sns.despine(fig=fig)
+
+
+def intrinsic_orbitals(mf):
+    """
+
+    Get intrinsic bonding orbitals and localized intrinsic valence virtual orbitals (livvo):
+
+    J. Chem. Theory Comput. 2013, 9, 11, 4834–4843
+
+    Parameters
+    ----------
+    mf : TYPE
+        DESCRIPTION.
+    mol : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    orbitals : TYPE
+        DESCRIPTION.
+
+    Useage:
+
+        To write all the canonical MOs
+
+        ``write_all_coeffs(mol,
+    orbitals["canonical"],
+    prefix=f"{molecule_name}_cmo",
+    dirname="cmo",
+    margin=5)''
+
+    """
+    """Get molecular orbitals"""
+
+    from pyscf import lo
+    mol = mf.mol
+    orbitals = {"canonical": mf.mo_coeff}
+
+    orbocc = mf.mo_coeff[:, 0 : mol.nelec[0]]
+    orbvirt = mf.mo_coeff[:, mol.nelec[0] :]
+
+    ovlpS = mol.intor_symmetric("int1e_ovlp")
+
+    iaos = lo.iao.iao(mol, orbocc)
+    iaos = lo.orth.vec_lowdin(iaos, ovlpS)
+    ibos = lo.ibo.ibo(mol, orbocc, locmethod="IBO")
+    orbitals["ibo"] = ibos
+
+    livvo = lo.vvo.livvo(mol, orbocc, orbvirt)
+    orbitals["livvo"] = livvo
+    return orbitals
+
+# def intrinsic_orbitals(mf):
+#     """
+
+#     Get intrinsic atomic and bonding orbitals
+
+#     J. Chem. Theory Comput. 2013, 9, 11, 4834–4843
+
+#     Parameters
+#     ----------
+#     mf : TYPE
+#         DESCRIPTION.
+
+#     Returns
+#     -------
+#     iaos: IAO
+#     ibos: IBO
+
+
+#     """
+#     from pyscf import lo
+
+#     # Get intrinsic bonding orbitals and localized intrinsic valence virtual orbitals (livvo):
+#     orbocc = mf.mo_coeff[:, 0 : mol.nelec[0]]
+
+#     ovlpS = mol.intor_symmetric("int1e_ovlp")
+
+#     iaos = lo.iao.iao(mol, orbocc)
+#     iaos = lo.orth.vec_lowdin(iaos, ovlpS)
+#     ibos = lo.ibo.ibo(mol, orbocc, locmethod="IBO")
+
+#     return iaos, ibos
+
+
+def find_homo_lumo(mf):
+    lumo = float("inf")
+    lumo_idx = None
+    homo = -float("inf")
+    homo_idx = None
+    for i, (energy, occ) in enumerate(zip(mf.mo_energy, mf.mo_occ)):
+        if occ > 0 and energy > homo:
+            homo = energy
+            homo_idx = i
+        if occ == 0 and energy < lumo:
+            lumo = energy
+            lumo_idx = i
+
+    return homo, homo_idx, lumo, lumo_idx
+
+
+def view_mo():
+
+    import py3Dmol
+
+    data = None
+    with open("ibo_homo.cube", "r") as infile:
+        data = infile.read()
+
+    view = py3Dmol.view()
+    view.addVolumetricData(
+        data,
+        "cube",
+        {
+            "isoval": 0.05,
+            "smoothness": 5,
+            "opacity": 0.8,
+            "volformat": "cube",
+            "color": "blue",
+        },
+    )
+    view.addVolumetricData(
+        data,
+        "cube",
+        {
+            "isoval": -0.05,
+            "smoothness": 5,
+            "opacity": 0.8,
+            "volformat": "cube",
+            "color": "orange",
+        },
+    )
+    view.addModel(data, "cube")
+    view.setStyle({"stick": {}})
+    view.zoomTo()
+    view.show()
+
+
+if __name__ == '__main__':
+    # from pyscf import gto, tdscf, tools
+    # from lime.units import au2fs, au2ev
+    # Suppress scientific notation printouts and change default precision
+    # np.set_printoptions(precision=4)
+    # np.set_printoptions(suppress=True)
+
+    # import proplot as plt
+
+
+    # mol = gto.Mole()
+    # mol.verbose = 3
+    atom = [['H' , (0,      0., 0.)],
+            ['H', (1.1, 0., 0.)]]
     #mol.basis = {'Ne': '6-31G'}
+    mol = Molecule(atom)
     # This is from G2/97 i.e. MP2/6-31G*
-    mol.atom = [['H' , (0,      0., 0.)],
-                ['H', (1.1, 0., 0.)]]
+    # mol.atom = [['H' , (0,      0., 0.)],
+    #             ['H', (1.1, 0., 0.)]]
                 # ['F' , (0.91, 0., 0.)]]
 
 
 
 
-    mol.basis = 'STO-3G'
+    mol.basis = 'sto3G'
     mol.build()
+    mol.RHF().run()
 
-    geometry2 = [['H' , (0.1,      0., 0.)],
-                ['H', (1.3, 0., 0.)]]
-    
-    mol2 = Molecule(atom=geometry2)
+    # print(mol.atom_symbols())
+    # print(mol.atom_mass_list())
+    # print(mol.atom_charges())
+    # print(mol.energy_nuc())
 
-    print(mol2.atom_coords)
-    print(mol2.com())
-    mol2.molecular_frame()
-    print(mol2.eckart_frame(mol.atom_coords()))
+    # print(mol.eri.shape)
+
+    # mf = scf.RHF(mol).run()
+
+    # # plot_mo_energy(mf)
+
+    # orbitals = intrinsic_orbitals(mf)
+
+
+    # _, homo_idx, _, lumo_idx = find_homo_lumo(mf)
+    # print(f"HOMO (index): {homo_idx}")
+    # print(f"LUMO (index): {lumo_idx}")
+
+    # tools.cubegen.orbital(
+    # mol, "cmo_homo.cube", orbitals["canonical"][:, homo_idx], margin=5
+    # )
+    # tools.cubegen.orbital(
+    #     mol, "cmo_lumo.cube", orbitals["canonical"][:, lumo_idx], margin=5
+    # )
+    # tools.cubegen.orbital(mol, "ibo_homo.cube", orbitals["ibo"][:, -1], margin=5)
+
+    # tools.cubegen.orbital(
+    #     mol, "livvo_lumo.cube", orbitals["livvo"][:, 0], margin=5
+    # );
+
+
+
+    # geometry2 = [['H' , (0.1,      0., 0.)],
+    #             ['H', (1.3, 0., 0.)]]
+
+    # mol2 = Molecule(atom=geometry2)
+
+
+
+    # print(mol2.atom_coords)
+    # print(mol2.com())
+    # mol2.molecular_frame()
+    # print(mol2.eckart_frame(mol.atom_coords()))
 
     # print(mol.natm)
 
+    # scan_pes()
     # mole = Molecule(mol)
     # mol.zmat(rvar=True)
     # mf = scf.RHF(mol).run()
 
     # td = tdscf.TDRHF(mf)
     # td.kernel()
-
-
-
-

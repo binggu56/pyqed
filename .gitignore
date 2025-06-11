@@ -21,4 +21,13 @@ pyqed/polariton/negf_leak.npz
 *.dat
 *.dat
 *.pyc
-*.h5
+pyqed/FCIDUMP.UHF
+pyqed/FCIDUMP
+pyqed/qchem/dvr/rhf-Bing的Mac Studio.py
+venv/
+.eggs/
+
+MacBook_local_data
+local_data
+dataset
+local_data_GL2013

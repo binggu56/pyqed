@@ -8,13 +8,15 @@ Created on Tue Mar 26 17:26:02 2019
 
 import numpy as np
 import scipy
-from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
+from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg, issparse
 
 from pyqed.units import au2fs, au2k, au2ev
-from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol
+from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol, basis_transform
 
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2
+
+# from pyqed import obs_dm as obs
 
 import sys
 if sys.version_info[1] < 10:
@@ -75,7 +77,7 @@ class Composite(Mol):
 
         H = kron(self.A.H, self.idb) + kron(self.ida, self.B.H)
 
-        if a_ops == None:
+        if a_ops is None:
 
             print('Warning: there is no coupling between the two subsystems.')
 
@@ -239,7 +241,10 @@ class Composite(Mol):
         if self.eigvecs is None:
             self.eigenstates()
 
-        return basis_transform(a, self.eigvecs)
+        # return basis_transform(a, self.eigvecs)
+        U = self.eigvecs 
+        
+        return dag(U) @ a @ U
 
             # raise ValueError('Call eigenstates() to compute eigvecs first.')
 
@@ -340,11 +345,11 @@ def fft(t, x, freq=np.linspace(0,0.1)):
     return sp
 
 
-def obs(A, rho):
-    """
-    compute observables
-    """
-    return A.dot( rho).diagonal().sum()
+# def obs(A, rho):
+#     """
+#     compute observables
+#     """
+#     return A.dot( rho).diagonal().sum()
 
 # def rk4_step(a, fun, dt, *args):
 
@@ -417,7 +422,7 @@ class Cavity():
         None.
 
         """
-        self.freq = self.omega = freq
+        self.freq = self.omega = self.omegac = freq
         self.resonance = freq
         self.ncav = self.n_cav = n_cav
         self.n = self.dim = n_cav
@@ -520,6 +525,9 @@ class Cavity():
         a = lil_matrix((ncav, ncav))
         a.setdiag(range(ncav), 0)
         return a.tocsr()
+    
+    def num(self):
+        return self.get_number_operator()
 
     def quadrature(self):
         """
@@ -564,29 +572,57 @@ class Cavity():
     def get_nonhermH(self):
         return self.get_nonhermitianH()
 
+
+
 class Polariton(Composite):
-    def __init__(self, mol, cav):
+    
+    def __init__(self, mol, cav, g=None, gauge='length'):
 
         super(Polariton, self).__init__(mol, cav)
+        
+        assert isinstance(mol, Mol)
 
         self.mol = mol
         self.cav = cav
         self._ham = self.H = None
         self.dip = None
         self.cav_leak = None
-        self.H = None
+
         self.dims = [mol.dim, cav.n_cav]
         self.dim = mol.dim * cav.n_cav
+        self.gauge = gauge
         #self.dm = kron(mol.dm, cav.get_dm())
 
-    def getH(self, g, RWA=False):
+        self._g = g
+        self.H = None
+        
+    @property
+    def g(self):
+        return self._g 
+    
+    @g.setter
+    def g(self, value):
+        self._g = value
+        
+    
+    def getH(self, RWA=False):
         """
+        The coupling strength is defined as 
+        
+        .. math:: 
+            g \equiv \sqrt( \omega_c / 2 episilon_0 V) = \sqrt{2\pi\omega_c/V}
+            
+        The dipole self-energy 
+        .. math::
+            DSE = \frac{1}{2\epsilon_0 V} (\bm \mu \cdot \bm \varepsilon)^2
 
 
         Parameters
         ----------
         g : float
-            single photon electric field strength sqrt(hbar * omegac / 2 episilon_0 V)
+            single photon electric field strength 
+
+                
         RWA : TYPE, optional
             DESCRIPTION. The default is False.
 
@@ -599,22 +635,44 @@ class Polariton(Composite):
 
         mol = self.mol
         cav = self.cav
+        
+        omegac = cav.omegac
 
         hmol = mol.getH()
         hcav = cav.getH()
 
+        edip = mol.edip
+        
         Icav = cav.idm
         Imol = mol.idm
-
-        if RWA:
-
-            hint = g * (kron(mol.raising, cav.annihilate()) +
-                        kron(mol.lowering, cav.create()))
-
-        else:
-
-            hint = g * kron(mol.edip, cav.create() + cav.annihilate())
-
+        
+        a = cav.annihilate()
+        ad = dag(a)
+        qc = a + ad
+        
+        g = self._g
+        
+        if self.gauge in ['length', 'dipole', 'dip']:
+            
+            if RWA:
+    
+                hint = g * (kron(mol.raising, a) +
+                            kron(mol.lowering, ad))
+    
+            else:
+                
+                DSE = g**2/omegac * kron(edip @ edip, Icav)
+                
+                hint = 1j * g * kron(edip,  a - ad) + DSE
+        
+        elif self.gauge in ['velocity']:
+            
+            p = self.mol.get_p_from_r()
+            
+            A = g/omegac * qc
+            
+            hint =  np.kron(p, A) + 0.5 * kron(Imol, A @ A)
+            
         self.H = kron(hmol, Icav) + kron(Imol, hcav) + hint
 
         return self.H
@@ -697,7 +755,7 @@ class Polariton(Composite):
         """
 
         if self.H == None:
-            sys.exit('Please call getH to compute the Hamiltonian first.')
+            sys.exit('Please call getH() to compute the Hamiltonian first.')
 
 
         if k is None:
@@ -711,7 +769,12 @@ class Polariton(Composite):
             evals, evecs = scipy.linalg.eigh(h)
             # number of photons in polariton states
             num_op = self.cav.num()
+            
+            print(num_op.shape)
+            
             num_op = kron(self.mol.idm, num_op)
+            
+            print(num_op.shape)
 
             n_ph = np.zeros(self.dim)
             for j in range(self.dim):

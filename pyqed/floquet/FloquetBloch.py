@@ -21,9 +21,9 @@ def delta(i,j):
         return 0 
 
 
-class FloquetBloch:
-    def __init__(self, norbs, intracell, intercell):
-        pass
+# class FloquetBloch:
+#     def __init__(self, norbs, intracell, intercell):
+#         pass
 
         
 def Hamilton(Norbs):
@@ -222,25 +222,25 @@ def spectrum():
                     fInter.write('{} {} \n'.format(quasiE[ii] - quasiE[jj] + l * omega, tmp))
     
     
-   
-Nt = 9 # has to be odd integer 
-Norbs = 2 
+if __name__ == '__main__':
+    Nt = 9 # has to be odd integer 
+    Norbs = 2 
 
-omega = 1.0
- 
-onsite0 = 0.0
-onsite1 = 2.0
+    omega = 1.0
+    
+    onsite0 = 0.0
+    onsite1 = 2.0
 
-E0 = 0.5 
-a = 2. 
-t = 1.0
+    E0 = 0.5 
+    a = 2. 
+    t = 1.0
 
 
-quasiE0 = (1.0-np.sqrt(5.0))/2.0 + 1.0
-quasiE1 = (1.0+np.sqrt(5.0))/2.0 - 2.0
+    quasiE0 = (1.0-np.sqrt(5.0))/2.0 + 1.0
+    quasiE1 = (1.0+np.sqrt(5.0))/2.0 - 2.0
 
-print('Quasienergies')
-print(quasiE0, quasiE1)
+    print('Quasienergies')
+    print(quasiE0, quasiE1)
 
 
 
