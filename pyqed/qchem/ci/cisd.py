@@ -209,20 +209,20 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
 
     # molecular orbitals
     if isinstance(mf, RHF):
-        
+
         Ca, Cb = [mf.mo_coeff, ] * 2
-        
+
         eri = mf.mol.eri
 
-        
+
     elif isinstance(mf, scf.uhf.UHF):
         Ca, Cb = mf.mo_coeff
-        
+
         eri = mf.mol.intor('int2e', aosym='s8')
 
-    
+
     else:
-        raise TypeError('mf type not supported.')
+        raise TypeError('mf type not supported.', type(mf))
 
 
 
@@ -235,7 +235,7 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     # H = dag(Ca) @ H @ Ca
 
     n = nmo = Ca.shape[1] # n
-    
+
 
 
     # eri = mf.get_eri()
@@ -621,8 +621,8 @@ class UCISD(CI):
 def overlap(cibra, ciket, s=None):
     """
     CISD electronic overlap matrix
-        
-    Compute the overlap between Slater determinants first 
+
+    Compute the overlap between Slater determinants first
     and contract with CI coefficients
 
     Parameters
@@ -647,7 +647,7 @@ def overlap(cibra, ciket, s=None):
 
     # overlap matrix between MOs at different geometries
     if s is None:
-        
+
         from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
 
         s = overlap_integral_asymmetric(mol._bas, mol2._bas)
@@ -728,7 +728,7 @@ if __name__=='__main__':
     #     print(myci.binary[I])
 
 
-    
+
     A = overlap(myci, ci2)
     print(A)
 

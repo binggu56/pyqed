@@ -88,7 +88,7 @@ def Is(l):
 #     return tensor(Is(i) + [sigmaz()] + Is(N - i - 1))
 
 
-def annihilate(L, spin='up'):
+def annihilate(L, spin='up', forward=True):
     """
     electron annihilation operators under JW transformation for a fermion chain
 
@@ -98,6 +98,8 @@ def annihilate(L, spin='up'):
         DESCRIPTION.
     spin : TYPE, optional
         DESCRIPTION. The default is 'up'.
+    forward: bool
+        control JW string starts from the first or the last site. Default: True.
 
     Raises
     ------
@@ -110,45 +112,91 @@ def annihilate(L, spin='up'):
         list of {c_i, i=1, 2, ..., L} operators.
 
     """
-    a = []
 
-    if spin == 'up':
+    assert(spin in ['up', 'down'])
 
-        for i in range(L):
-            ai = [JW, ] * i +  [Cu] + Is(L - i -1)
-            a.append(tensor(ai))
-        return a
+    if forward:
 
-    elif spin == 'down':
+        a = []
 
-        for i in range(L):
-            ai = [JW, ] * i +  [Cd] + Is(L - i -1)
-            a.append(tensor(ai))
-        return a
+        if spin == 'up':
 
-    else:
-        raise ValueError('Spin {} can only be up or down.')
+            for i in range(L):
+                ai = [JW, ] * i +  [Cu] + Is(L - i -1)
+                a.append(tensor(ai))
+            return a
 
+        elif spin == 'down':
 
-def create(L, spin='up'):
-    a = []
+            for i in range(L):
+                ai = [JW, ] * i +  [Cd] + Is(L - i -1)
+                a.append(tensor(ai))
+            return a
 
-    if spin == 'up':
-
-        for i in range(L):
-            ai = [JW, ] * i +  [Cdu] + Is(L - i -1)
-            a.append(tensor(ai))
-        return a
-
-    elif spin == 'down':
-
-        for i in range(L):
-            ai = [JW, ] * i +  [Cdd] + Is(L - i -1)
-            a.append(tensor(ai))
-        return a
+        else:
+            raise ValueError('Spin {} can only be up or down.')
 
     else:
-        raise ValueError('Spin {} can only be up or down.')
+
+        a = []
+
+        if spin == 'up':
+
+            for i in range(L):
+                ai = Is(i) +  [Cu] + [JW, ] * (L - i -1)
+                a.append(tensor(ai))
+            return a
+
+        elif spin == 'down':
+
+            for i in range(L):
+                ai = Is(i) +  [Cd] + [JW, ] * (L - i -1)
+                a.append(tensor(ai))
+            return a
+
+
+
+def create(L, spin='up', forward=True):
+
+    assert(spin in ['up', 'down'])
+
+    if forward:
+
+        a = []
+
+        if spin == 'up':
+
+            for i in range(L):
+                ai = [JW, ] * i +  [Cdu] + Is(L - i -1)
+                a.append(tensor(ai))
+            return a
+
+        elif spin == 'down':
+
+            for i in range(L):
+                ai = [JW, ] * i +  [Cdd] + Is(L - i -1)
+                a.append(tensor(ai))
+            return a
+
+    else:
+
+        a = []
+
+        if spin == 'up':
+
+            for i in range(L):
+                ai = Is(i) +  [Cdu] + [JW, ] * (L - i -1)
+                a.append(tensor(ai))
+            return a
+
+        elif spin == 'down':
+
+            for i in range(L):
+                ai = Is(i) +  [Cdd] + [JW, ] * (L - i -1)
+                a.append(tensor(ai))
+            return a
+
+
 
 
 def number_operator(L, spin='up'):
@@ -315,7 +363,7 @@ class SpinHalfFermionChain:
         # H = self.jordan_wigner()
         # self.H = H
         E, X = eigh(self.H, k=nstates, which='SA')
-        
+
         # Nu = np.diag(dag(X) @ self.Nu_tot @ X)
         # Nd = np.diag(dag(X) @ self.Nd_tot @ X)
 
@@ -329,7 +377,7 @@ class SpinHalfFermionChain:
     def build(self):
         self.jordan_wigner()
 
-    def jordan_wigner(self, aosym='8'):
+    def jordan_wigner(self, forward=True, aosym='8'):
         """
         MOs based on Restricted HF calculations
 
@@ -352,11 +400,11 @@ class SpinHalfFermionChain:
         norb = h1e.shape[-1]
         nmo = L = norb # does not necesarrily have to MOs
 
+        Cu = annihilate(norb, spin='up', forward=forward)
+        Cd = annihilate(norb, spin='down', forward=forward)
+        Cdu = create(norb, spin='up', forward=forward)
+        Cdd = create(norb, spin='down', forward=forward)
 
-        Cu = annihilate(norb, spin='up')
-        Cd = annihilate(norb, spin='down')
-        Cdu = create(norb, spin='up')
-        Cdd = create(norb, spin='down')
 
         self.Cu = Cu
         self.Cd = Cd
@@ -378,7 +426,7 @@ class SpinHalfFermionChain:
         for p in range(L):
             Na += Cdu[p] @ Cu[p]
             Nb += Cdd[p] @ Cd[p]
-        
+
         self.Nu_tot = Na
         self.Nd_tot = Nb
 
@@ -401,21 +449,21 @@ class SpinHalfFermionChain:
         return H
 
     def fix_nelec(self, nelec=None, s=1):
-        
+
         if self.H is None:
             self.build()
-        
+
         I = tensor(Is(self.L))
-        
+
         Na = self.Nu_tot
-        Nb = self.Nd_tot 
-        
+        Nb = self.Nd_tot
+
         if nelec is None:
-            nelec = self.nelec 
-        
+            nelec = self.nelec
+
         self.H += s * (Na - nelec/2 * I) @ (Na - nelec/2 * I) + \
                 s * (Nb - self.nelec/2 * I) @ (Nb - self.nelec/2 * I)
-        return 
+        return
 
     def DMRG(self):
         pass

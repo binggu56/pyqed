@@ -246,7 +246,7 @@ def H2(Sz1, Sp1, Sz2, Sp2):  # two-site part of H
     )
 
 
-# scipy.linalg.kron(a, b)
+
 def enlarge_block(block, h1e, eri, forward=True):
     """
     This function enlarges the provided Block by a single site, returning an
@@ -291,7 +291,7 @@ def enlarge_block(block, h1e, eri, forward=True):
 
             H += h1e[j, site_id] * (kron(o["Cdu"][j], Cu) + kron(o["Cdd"][j], Cd) - \
                                     kron(o["Cu"][j], Cdu) - kron(o["Cd"][j], Cdd))
-
+        # update the JW string
         Ntot_update = [kron(op, identity(4)) for op in o["Ntot"]] + [kron(identity(mblock), Ntot)]
         Cdu_update = [kron(op, JW) for op in o["Cdu"]] + [kron(identity(mblock), Cdu @ JW)]
         Cdd_update = [kron(op, JW) for op in o["Cdd"]] + [kron(identity(mblock), Cdd @ JW)]

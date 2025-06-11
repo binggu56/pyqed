@@ -344,7 +344,6 @@ def fcisolver(mf, nstates=1):
     H1, H2 = get_SO_matrix(mf)
 
 
-
     SC1, SC2 = SlaterCondon(Binary)
     H_CI = CI_H(Binary, H1, H2, SC1, SC2)
 
@@ -381,7 +380,7 @@ class FCI:
 
 
 if __name__=='__main__':
-    from pyscf import gto, scf, dft, tddft, ao2mo, ci
+    # from pyscf import gto, scf, dft, tddft, ao2mo, ci
     # from pyscf.fci import FCI
 
     from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule
