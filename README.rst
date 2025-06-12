@@ -38,5 +38,5 @@ Author
 -------
 Bing Gu 
 
-email: bingg at uci dot edu 
+Email: gubing@westlake.edu.cn
 
