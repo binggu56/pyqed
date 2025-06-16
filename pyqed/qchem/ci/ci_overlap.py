@@ -12,7 +12,8 @@ geometries).
 from functools import reduce
 import numpy as np
 
-from pyscf import gto, scf, ci
+
+from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
 
 
 
@@ -59,6 +60,51 @@ from pyscf import gto, scf, ci
     # TODO
 
     # if not (has_m or has_n):
+
+def overlap_ao(mol, mol2):
+    """
+    compute overlap of two different basis sets
+
+
+    Parameters
+    ----------
+    mol : TYPE
+        DESCRIPTION.
+    mol2 : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    s : TYPE
+        DESCRIPTION.
+
+    """
+    s = overlap_integral_asymmetric(mol._bas, mol2._bas)
+    return s
+
+def overlap_mo(mf, mf2, s=None):
+    """
+    compute the overlap between MOs of two different configurations
+
+    Parameters
+    ----------
+    mf : RHF or RKS object
+        DESCRIPTION.
+    mf2 : TYPE
+        DESCRIPTION.
+    s : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    2darray
+        DESCRIPTION.
+
+    """
+    if s is None:
+        s = overlap_ao(mf.mol, mf2.mol)
+
+    return mf.mo_coeff.conj().T @ s @ mf2.mo_coeff
 
 
 
@@ -112,7 +158,7 @@ if __name__=='__main__':
     from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
 
     from pyqed import Molecule
-
+    from pyscf import gto, scf, ci
 
     print(wavefunction_overlap())
 

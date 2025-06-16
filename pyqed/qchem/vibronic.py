@@ -13,13 +13,13 @@ from numpy import einsum
 from pyqed import norm
 
 from pyscf import gto, scf, dft, tddft
-from pyqed.coordinates import Molecule
+from pyqed import Molecule
 
 np.set_printoptions(precision=8)
 np.set_printoptions(suppress=True)
 
 
-class LVC_DFT:
+class ConstructLVC:
     """
     Construct lnear vibronic coupling model by ab initio methods.
 

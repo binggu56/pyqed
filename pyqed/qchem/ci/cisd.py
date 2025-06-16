@@ -205,24 +205,25 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     SF: bool
         spin-flip
     """
-    from pyscf import ao2mo
+    # from pyscf import ao2mo
+
 
     # molecular orbitals
-    if isinstance(mf, RHF):
+    # if isinstance(mf, RHF):
 
-        Ca, Cb = [mf.mo_coeff, ] * 2
+    Ca, Cb = [mf.mo_coeff, ] * 2
 
-        eri = mf.mol.eri
-
-
-    elif isinstance(mf, scf.uhf.UHF):
-        Ca, Cb = mf.mo_coeff
-
-        eri = mf.mol.intor('int2e', aosym='s8')
+    eri = mf.mol.eri
 
 
-    else:
-        raise TypeError('mf type not supported.', type(mf))
+    # elif isinstance(mf, scf.uhf.UHF):
+    #     Ca, Cb = mf.mo_coeff
+
+    #     eri = mf.mol.intor('int2e', aosym='s8')
+
+
+    # else:
+    #     raise TypeError('mf type not supported.', type(mf))
 
 
 
@@ -620,7 +621,7 @@ class UCISD(CI):
 
 def overlap(cibra, ciket, s=None):
     """
-    CISD electronic overlap matrix
+    CI electronic overlap matrix (CISD, CASCI)
 
     Compute the overlap between Slater determinants first
     and contract with CI coefficients
@@ -650,8 +651,8 @@ def overlap(cibra, ciket, s=None):
 
         from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
 
-        s = overlap_integral_asymmetric(mol._bas, mol2._bas)
-        s = reduce(np.dot, (cibra.mo_coeff.T, s, ciket.mo_coeff))
+        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
 
     nsd = cibra.binary.shape[0]
     S = np.zeros((nsd, nsd))
@@ -687,7 +688,7 @@ if __name__=='__main__':
     from pyqed.qchem.mol import get_hcore_mo, get_eri_mo, Molecule
     from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionChain
     from pyqed.qchem.hf.rhf import RHF
-    from pyqed.qchem.fci import FCI
+    from pyqed.qchem import FCI
 
     # mol = gto.Mole()
     mol = Molecule(atom = [

@@ -27,9 +27,10 @@ class RHF:
 
         self.nocc = self.mol.nelec//2
 
-        self.nao = self.mol.nao
+        self.nao = self.nmo = self.mol.nao # number of MOs
 
         self.nso = None
+        self.nelec = mol.nelec
 
         self.mo_occ = None
         self.mo_coeff = None
@@ -48,7 +49,7 @@ class RHF:
         self.vhf = None
         self.dm = None
 
-        self.eri = None
+        self.eri = mol.eri
         # self.eri_so = None
 
         self.mo_energy = None

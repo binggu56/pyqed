@@ -654,14 +654,14 @@ class MPO:
         None.
 
         """
-        self.factors = self.data = factors
+        self.factors = self.data = self.cores = factors
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
         # self.chi_max = chi_max
 
 
         if homogenous:
-            self.dims = [mps[0].shape[1], ] * self.nsites
+            self.dims = [factors[0].shape[1], ] * self.nsites
         else:
             self.dims = [t.shape[1] for t in factors] # physical dims of each site
 
@@ -677,7 +677,7 @@ class MPO:
 
         return MPS(factors)
 
-    def __matmul__(self, other):
+    def __matmul__(self, other, compress=False, D=None):
         """
         define product of two MPOs
 
@@ -697,7 +697,14 @@ class MPO:
 
         elif isinstance(other, MPS):
             return apply_mpo(self.factors, other.factors)
+    
+    def __add__(self, other, compress=False, D=None):
+        # return ...
+        # if compress
+        pass
 
+
+# A @ B 
 
 def apply_mpo(w_list, B_list, chi_max):
     """

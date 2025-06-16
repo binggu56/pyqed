@@ -388,11 +388,12 @@ def build(mol):
     total_ao = 0
     for shell in basis:
         total_ao += shell.angmom_components_cart.shape[0]
+    
     mol.nao = total_ao
         
     print("Number of generalized shells:", len(basis)) 
     
-    # compute overlap integrals in AO and MO basis
+    # compute overlap integrals in AO basis
     mol.overlap = overlap_integral(basis)
 
     

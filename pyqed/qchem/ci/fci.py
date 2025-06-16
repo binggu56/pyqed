@@ -5,7 +5,9 @@ Created on Wed Jun  5 14:29:59 2024
 
 @author: Bing Gu (gubing@westlake.edu.cn)
 
-From
+FCI solver
+
+Ref:
 https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/651592aca69febde9ed8d6a6/original/notes-on-generalized-configuration-interaction-in-python.pdf
 
 """
@@ -20,8 +22,7 @@ from pyscf.ao2mo.outcore import general_iofree as ao2mofn
 from opt_einsum import contract
 
 from pyqed.qchem.hf.rhf import RHF
-from pyqed.qchem import get_SO_matrix, get_excitation_op,\
-    SlaterCondon, CI_H
+from pyqed.qchem.ci.cisd import get_SO_matrix, SlaterCondon, CI_H
 
 
 def givenΛgetB(ΛA, ΛB, N_mo):
@@ -44,11 +45,11 @@ def SpinOuterProduct(A, B, stack=False):
         return ΛA, ΛB
 
 
-def get_fci_combos(mf):
+def get_fci_combos(mf=None, mo_occ=None):
     # print(mf.mo_occ.shape)
     # if isinstance(mf, (scf.rhf.RHF, RHF)):
-
-    mo_occ = [mf.mo_occ//2, ] * 2
+    if mo_occ is None:
+        mo_occ = [mf.mo_occ//2, ] * 2
     # else:
     #     mo_occ = mf.mo_occ
 
@@ -320,12 +321,12 @@ def determinantsign(Binary):
 
 def fcisolver(mf, nstates=1):
     """
-    Calculate the FCI of a PySCF Mean Field Object
+    Calculate the FCI of a Mean Field Object
 
     Parameters
     ==========
 
-    mf: (PySCF Mean Field Object)
+    mf: Mean Field Object
 
     nstates: int
         number of desired states. Default 1.
@@ -396,9 +397,6 @@ if __name__=='__main__':
     mol.charge = 0
     # mol.unit = 'b'
     mol.build()
-
-
-
 
     # # cisd = ci.cisd.CISD(mf).run()
     mf = RHF(mol)

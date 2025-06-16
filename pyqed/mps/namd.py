@@ -144,13 +144,16 @@ def kinetic(x, mass=1, dvr='sinc'):
 
     return T
 
-class TT_LDR:
+class LDRTT:
     def __init__(self, domains, levels, nstates=2, rank=None, mass=None, dvr_type='sine'):
         """
          MPS/TT representation for LDR dynamics using the SPO integrator
          
+         This is not practical as it requires the full tensor of the V and A. 
+         
          The first N sites are nuclear while last site is the electronic.
          modes. :math:`| \alpha n_1 n_2 \cdots n_d\rangle`
+         
          
 
         Parameters

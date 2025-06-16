@@ -32,7 +32,7 @@ from pyqed import dag
 from pyqed.qchem.hf import RHF, UHF
 
 from periodictable import elements
-# from pyscf import dft, scf, gto, ao2mo
+from pyscf import dft, scf, gto, ao2mo
 
 # try:
 #     from cclib.parser.data import ccData
@@ -844,6 +844,7 @@ class Molecule:
         self.eri = None
 
         self.nao = None
+        self.nmo = None
 
 
     @property
