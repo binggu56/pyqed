@@ -374,6 +374,43 @@ class CASCI:
             print("Root {} {}".format(i, self.e_tot[i]))
 
         return self
+    
+    def make_rdm1(self):
+        """
+        spin-traced 1e reduced density matrix
+        .. math::
+            
+            \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>
+
+
+        Returns
+        -------
+        None.
+
+        """
+
+        pass
+    
+    def make_rdm2(self):
+        """
+        2-e reduced density matrix
+        
+        The definition follows the PySCF convention.
+        .. math::
+            
+            \Gamma[p,q,r,s] = \sum_{sigma,tau} <p_sigma^\dagger r_tau^\dagger s_tau q_sigma>
+        
+        with this convention, the energy is computed as 
+        
+        E = einsum('pqrs,pqrs', eri, rdm2)
+        
+        Returns
+        -------
+        None.
+
+        """
+        pass
+    
 
 
 

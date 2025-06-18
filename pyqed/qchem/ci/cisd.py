@@ -301,7 +301,10 @@ def CI_H(Binary, H1, H2, SC1, SC2):
     H2 (2-body Hamtilonian)
     SC1 (1-body Slater-Condon Rules)
     SC2 (2-body Slater-Condon Rules)
-    GET: CI Hamiltonian
+
+    Return
+    ======
+    HCI: CI Hamiltonian
     """
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
     I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
@@ -366,6 +369,7 @@ class CI:
 
         self.binary = None
         self.H = None
+
 
 
 class CISD(CI):
@@ -497,7 +501,6 @@ class UCISD(CI):
             Binary[:] = mf.mo_occ
 
 
-        print(nocc, nmo)
         # singles
         I = 1
         for i in range(nocc):
@@ -579,10 +582,8 @@ class UCISD(CI):
 
         H_CI = self.buildH()
 
-        print(H_CI)
-
         E, X = eigsh(H_CI, k=nstates, maxiter=self.max_cycle, \
-                      which='SA', tol=tol)
+                      which='SA', tol=tol, v0=ci0)
 
         self.e_tot = E + self.mf.energy_nuc()
 
@@ -616,6 +617,9 @@ class UCISD(CI):
         pass
 
     def make_rdm2(self):
+        pass
+
+    def make_natural_orbitals(self):
         pass
 
 
