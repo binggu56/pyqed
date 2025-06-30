@@ -323,8 +323,8 @@ class CASCI:
         nstates : TYPE, optional
             DESCRIPTION. The default is 3.
         method : TYPE, optional
-            choose which solver to use. 
-            'ci' is the standard CI solver. 
+            choose which solver to use.
+            'ci' is the standard CI solver.
             'jw' is the exact diagonalizaion by Jordan-Wigner transformation.
             The default is 'ci'.
 
@@ -346,23 +346,33 @@ class CASCI:
 
             self.binary = binary
 
-            print('CASCI number of determinants', binary.shape[0])
+            print('------------------------------')
+            print("             CASCI              ")
+            print('------------------------------\n')
+            print('Number of determinants', binary.shape[0])
 
             H1, H2 = self.get_SO_matrix()
 
             SC1, SC2 = SlaterCondon(binary)
+
+            I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
+
+            print(I_A, J_A)
+            print(a_t, a)
+
+
             H_CI = CI_H(binary, H1, H2, SC1, SC2)
 
 
             E, X = eigsh(H_CI, k=nstates, which='SA')
 
         elif method == 'jw':
-            
+
             # exact diagonalization by JW transform
 
             H = self.qubitization()
             E, X = eigsh(H, k=nstates, which='SA')
-        
+
         else:
             raise ValueError("There is no {} solver for CASCI. Use 'ci' or 'jw'".format(method))
 
@@ -374,12 +384,12 @@ class CASCI:
             print("Root {} {}".format(i, self.e_tot[i]))
 
         return self
-    
+
     def make_rdm1(self):
         """
         spin-traced 1e reduced density matrix
         .. math::
-            
+
             \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>
 
 
@@ -390,27 +400,27 @@ class CASCI:
         """
 
         pass
-    
+
     def make_rdm2(self):
         """
         2-e reduced density matrix
-        
+
         The definition follows the PySCF convention.
         .. math::
-            
+
             \Gamma[p,q,r,s] = \sum_{sigma,tau} <p_sigma^\dagger r_tau^\dagger s_tau q_sigma>
-        
-        with this convention, the energy is computed as 
-        
+
+        with this convention, the energy is computed as
+
         E = einsum('pqrs,pqrs', eri, rdm2)
-        
+
         Returns
         -------
         None.
 
         """
         pass
-    
+
 
 
 

@@ -834,7 +834,7 @@ def finite_system_algorithm(L, m_warmup, m):
         if sys_label == "l" and 2 * sys_block.length == L:
             break  # escape from the "while True" loop
 
-class DMRG:
+class QCDMRG:
     """
     ab initio DRMG/DVR quantum chemistry calculation for 1D fermion chain
     """

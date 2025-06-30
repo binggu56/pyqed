@@ -13,6 +13,7 @@ from pyqed import dag, tensor, transform
 
 
 from pyqed import SpinHalfFermionOperators, eigh
+from pyqed.mps.mps import MPO, DMRG
 
 
 from scipy.sparse.linalg import eigsh
@@ -182,8 +183,83 @@ class FermiHubbard(SpinHalfFermionChain):
 
         return self.H        
 
-    def DMRG(self):
-        pass
+    def build_h_mpo(self):
+        """
+        
+        the complete MPO of the Hamiltonian
+
+        Returns
+        -------
+        None.
+
+        """
+
+        ops = SpinHalfFermionOperators()
+        # JWu = ops['JWu']
+        # JWd = ops['JWd']
+        JW = ops['JW']
+        Cu = ops['Cu']
+        Cdu = ops['Cdu']
+        Cd = ops['Cd']
+        Cdd = ops['Cdd']
+        Sz = ops['Sz']
+        Nu = ops['Nu']
+        Nd = ops['Nd']
+        Ntot = ops['Ntot']
+
+        L = self.L 
+        t = - self.t 
+        
+        U = self.U
+        mu = self.mu
+        
+        self.I = I = np.eye(4)
+        self.Z = Z =np.zeros((4,4))
+
+        W_first = np.array([[U * Nu @ Nd - mu * (Nu + Nd), -t * Cdu @ JW, -t * Cdd @ JW, t * Cu @ JW, t * Cd @ JW, I]])
+     
+        # print('w1',W_first)
+
+
+        W = np.array([[I, Z, Z, Z, Z, Z],
+         [Cu, Z, Z, Z, Z, Z],
+         [Cd, Z, Z, Z, Z, Z],
+         [Cdu, Z, Z, Z, Z, Z],
+         [Cdd, Z, Z, Z, Z, Z],
+         [U * Nu @ Nd - mu * (Nu + Nd), -t * Cdu @ JW, -t * Cdd @ JW, t * Cu @ JW, t * Cd @ JW, I]])
+        W_last = np.array([[I], [Cu], [Cd], [Cdu], [Cdd], [U * Nu @ Nd - mu * (Nu + Nd)]])
+
+        
+        self.W_first = W_first
+
+        self.W = W
+        self.W_last = W_last
+        # print('w_first',np.shape(W_first))
+        # print('w',np.shape(W))
+        
+        if self.L >= 3:
+            mpo = [self.W_first] + ([self.W] * (self.L-2)) + [self.W_last]
+            # result = mpo[0]
+            # for i in range(1,self.L):
+            #     result = coarse_gain_MPO(result,mpo[i])   # translate MPO form into exact form
+
+        elif self.L == 2:
+            mpo = [self.W_first] + [self.W_last]
+            # result = coarse_gain_MPO(mpo[0],mpo[1])
+
+        else:
+            print("L should be more than 2")
+            # result = -1
+            mpo = -1
+        
+        self.h_mpo = MPO(mpo)
+        return 
+    
+    def DMRG(self, D=10):
+        
+        self.buildHMPO()
+        
+        return DMRG(self.h_mpo.cores, D)
 
     def number_operator(self, site_id, spin='up'):
         """

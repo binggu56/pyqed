@@ -33,7 +33,8 @@ from scipy.special import erf
 import logging
 # import warnings
 
-from pyqed import discretize, sort, dag, tensor, SpinHalfFermionOperators
+from pyqed import discretize, sort, dag, tensor
+from pyqed import SpinHalfFermionOperators
 from pyqed.phys import eigh
 from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom, obs

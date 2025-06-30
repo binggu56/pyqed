@@ -20,6 +20,7 @@ from pyscf.ao2mo.outcore import general_iofree as ao2mofn
 
 from pyqed.qchem.hf.rhf import RHF
 from pyqed import dag
+from pyqed.qchem.ci.fci import SlaterCondon, CI_H, get_SO_matrix
 
 
 def givenΛgetB(ΛA, ΛB, N_mo):
@@ -68,70 +69,8 @@ def determinantsign(Binary):
         sign[I, 1, iib] = np.arange(0, len(iib), 1)
     return ( (-1.)**(sign) ).astype(np.int8)
 
-def get_excitation_op(i, j, binary, sign, spin=0):
 
 
-    Difference = binary[i,spin] - binary[j, spin]
-
-
-    a_t = (Difference + 0.5).astype(np.int8)
-    a = -1*(Difference - 0.5).astype(np.int8)
-
-    # print('a', a.shape)
-    if len(a) > 0:
-        if np.sum(a[0]) > 1: ### this is a double excitation
-            å_t = 1*a_t ## make copy
-            å_t[ np.arange(len(å_t)),(å_t!=0).argmax(axis=1) ] = 0 ## zero first 1
-            a_t = np.abs(å_t - a_t) ## absolute difference from orginal
-            a_t = np.asarray([sign[j, spin]*å_t,sign[j, spin]*a_t]) ## stack
-            å = 1*a ## make copy
-            å[ np.arange(len(å)),(å!=0).argmax(axis=1) ] = 0 ## zero first 1
-            a = np.abs(å - a) ## absolute difference from orginal
-            a = np.asarray([sign[i, spin]*å,sign[i, spin]*a]) ## stack
-
-    # print(a.shape, a_t.shape)
-
-        # return a_t, a
-
-    return sign[j, spin]*a_t, sign[i, spin]*a
-
-
-def SlaterCondon(Binary):
-    sign = determinantsign(Binary)
-    SpinDifference = np.sum( np.abs(Binary[:, None, :, :] - Binary[None, :, :, :]), axis=3)//2
-
-    ## indices for 1-difference
-    I_A, J_A = np.where( np.all(SpinDifference==np.array([1,0], dtype=np.int8), axis=2) )
-    I_B, J_B = np.where( np.all(SpinDifference==np.array([0,1], dtype=np.int8), axis=2) )
-
-    ## indices for 2-differences
-    I_AA, J_AA = np.where( np.all(SpinDifference==np.array([2,0], dtype=np.int8), axis=2) )
-    I_BB, J_BB = np.where( np.all(SpinDifference==np.array([0,2], dtype=np.int8), axis=2) )
-    I_AB, J_AB = np.where( np.all(SpinDifference==np.array([1,1], dtype=np.int8), axis=2) )
-
-
-    ### get excitation operators
-
-    a_t , a = get_excitation_op(I_A , J_A , Binary, sign, spin=0)
-    b_t , b = get_excitation_op(I_B , J_B , Binary, sign, spin=1)
-
-
-    ca = ((Binary[I_A,0,:] + Binary[J_A,0,:])/2).astype(np.int8)
-    cb = ((Binary[I_B,1,:] + Binary[J_B,1,:])/2).astype(np.int8)
-
-    # if len(I_AA) >0:
-    aa_t, aa = get_excitation_op(I_AA, J_AA, Binary, sign, spin=0)
-
-    # if len(I_BB) > 0:
-    bb_t, bb = get_excitation_op(I_BB, J_BB, Binary, sign, spin=1)
-
-    ab_t, ab = get_excitation_op(I_AB, J_AB, Binary, sign, spin=0)
-    ba_t, ba = get_excitation_op(I_AB, J_AB, Binary, sign, spin=1)
-
-    SC1 = [I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb]
-    SC2 = [I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba]
-
-    return SC1, SC2
 
 # def get_SO_matrix(mf, SF=False, H1=None, H2=None):
 #     """
@@ -198,147 +137,8 @@ def SlaterCondon(Binary):
 #     else:
 #         return H1, H2
 
-def get_SO_matrix(mf, SF=False, H1=None, H2=None):
-    """
-    Given a PySCF rhf/uhf object get Spin-Orbit one-electron and two-electron H Matrices
-
-    SF: bool
-        spin-flip
-    """
-    # from pyscf import ao2mo
 
 
-    # molecular orbitals
-    # if isinstance(mf, RHF):
-
-    Ca, Cb = [mf.mo_coeff, ] * 2
-
-    eri = mf.mol.eri
-
-
-    # elif isinstance(mf, scf.uhf.UHF):
-    #     Ca, Cb = mf.mo_coeff
-
-    #     eri = mf.mol.intor('int2e', aosym='s8')
-
-
-    # else:
-    #     raise TypeError('mf type not supported.', type(mf))
-
-
-
-    # S = (uhf_pyscf.mol).intor("int1e_ovlp")
-    # eig, v = np.linalg.eigh(S)
-    # A = (v) @ np.diag(eig**(-0.5)) @ np.linalg.inv(v)
-
-    # H1e in AO
-    H = mf.get_hcore()
-    # H = dag(Ca) @ H @ Ca
-
-    n = nmo = Ca.shape[1] # n
-
-
-
-    # eri = mf.get_eri()
-
-    # eri_aa = eri  # (pq||rs) 1^*12^*2
-    # eri_aa -= eri_aa.swapaxes(1,3) # change to physicts notation 1* 2* 2 1
-
-
-
-    # # eri_ab = contract('ip, iq, ij, jr, js->pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-    # # eri_ba = contract('ip, iq, ij, jr, js->pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
-    # eri_ab = eri.copy()
-    # eri_ba = eri.copy()
-
-    # if isinstance(mf, scf.uhf.UHF):
-
-    # eri = ao2mo.get_ao_eri(mf.mol, compact=False).reshape(nmo, nmo, nmo, nmo)
-    # print(eri.shape)
-
-    eri_aa = (ao2mo.general( eri , (Ca, Ca, Ca, Ca),
-                            compact=False)).reshape((n,n,n,n), order="C")
-    eri_aa -= eri_aa.swapaxes(1,3)
-
-
-    eri_bb = (ao2mo.general( eri , (Cb, Cb, Cb, Cb),
-    compact=False)).reshape((n,n,n,n), order="C")
-    eri_bb -= eri_bb.swapaxes(1,3)
-
-    # eri_bb = eri_aa.copy()
-
-
-    eri_ab = (ao2mo.general( eri , (Ca, Ca, Cb, Cb),
-    compact=False)).reshape((n,n,n,n), order="C")
-    #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
-
-    eri_ba = (ao2mo.general( eri , (Cb, Cb, Ca, Ca),
-    compact=False)).reshape((n,n,n,n), order="C")
-
-    H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-    H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
-    H, Cb, Cb)])
-
-    # if SF:
-    #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
-    #     compact=False)).reshape((n,n,n,n), order="C")
-    #     eri_abba = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Cb, Ca),
-    #     compact=False)).reshape((n,n,n,n), order="C")
-    #     eri_baab = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Ca, Cb),
-    #     compact=False)).reshape((n,n,n,n), order="C")
-    #     eri_baba = (ao2mo.general( (uhf_pyscf)._eri , (Cb, Ca, Cb, Ca),
-    #     compact=False)).reshape((n,n,n,n), order="C")
-    #     H2_SF = np.stack(( np.stack((eri_abab, eri_abba)), np.stack((eri_baab, eri_baba)) ))
-    #     return H1, H2, H2_SF
-    # else:
-    #     return H1, H2
-    return H1, H2
-
-def CI_H(Binary, H1, H2, SC1, SC2):
-    """
-    Explicitly construct the CI Hamiltonian Matrix
-    GIVEN: H1 (1-body Hamtilonian)
-    H2 (2-body Hamtilonian)
-    SC1 (1-body Slater-Condon Rules)
-    SC2 (2-body Slater-Condon Rules)
-
-    Return
-    ======
-    HCI: CI Hamiltonian
-    """
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
-
-    # sum of MO energies
-    H_CI = np.einsum("Spp, ISp -> I", H1, Binary, optimize=True)
-
-    # ERI
-    H_CI += np.einsum("STppqq, ISp, ITq -> I", H2, Binary, Binary, optimize=True)/2
-    H_CI = np.diag(H_CI)
-
-    ## Rule 1
-    H_CI[I_A , J_A ] -= np.einsum("pq, Kp, Kq -> K", H1[0], a_t, a, optimize=True)
-    H_CI[I_A , J_A ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[0,0], a_t, a, ca, optimize=True)
-    H_CI[I_A , J_A ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[0,1], a_t, a, Binary[I_A,1],
-    optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("pq, Kp, Kq -> K", H1[1], b_t, b, optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[1,1], b_t, b, cb, optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("pqrr, Kp, Kq, Kr -> K", H2[1,0], b_t, b, Binary[I_B,0],
-    optimize=True)
-
-    if len(I_AA) > 0:
-    ## Rule 2
-        H_CI[I_AA, J_AA] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[0,0], aa_t[0], aa[0],
-        aa_t[1], aa[1], optimize=True)
-
-    if len(I_BB) > 0:
-        H_CI[I_BB, J_BB] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[1,1], bb_t[0], bb[0],
-        bb_t[1], bb[1], optimize=True)
-
-    H_CI[I_AB, J_AB] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[0,1], ab_t, ab, ba_t, ba,
-        optimize=True)
-
-    return H_CI
 
 
 class CI:
@@ -457,8 +257,6 @@ class UCISD(CI):
 
         # number of Slater determinants (without spin symmetry)
         nsd = 1 + 2*nocc * nvir + nocc*(nocc-1)*nvir*(nvir-1)//2 + nocc**2*nvir**2
-        HCI = np.zeros((nsd, nsd))
-
 
         # nsd = 1 + 4*nocc * nvir + nocc*(2*nocc-1)*nvir*(2*nvir-1)
 
