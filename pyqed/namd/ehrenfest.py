@@ -219,7 +219,7 @@ def excited(x):
     return 0.5 * np.sum((x-1.0)**2) + 1.0, x - 1.0
 
 # @numba.autojit
-def MeanField(y,c):
+def mean_field_force(y,c):
 
     V0, dV0 = ground(y)
     V1, dV1 = excited(y)
@@ -364,26 +364,26 @@ def norm(c,w):
         anm += np.vdot(c[k,:], c[k,:]).real * w[k]
     return anm
 
-# @numba.autojit
-def fit_c(c,y):
-    """
-    global approximation of c vs y to obtain the derivative c'',c'
-    """
-    dc = np.zeros((Ntraj,M),dtype=np.complex128)
-    ddc = np.zeros((Ntraj,M),dtype=np.complex128)
+# # @numba.autojit
+# def fit_c(c,y):
+#     """
+#     global approximation of c vs y to obtain the derivative c'',c'
+#     """
+#     dc = np.zeros((Ntraj,M),dtype=np.complex128)
+#     ddc = np.zeros((Ntraj,M),dtype=np.complex128)
 
-    for j in range(M):
+#     for j in range(M):
 
-        z = c[:,j]
-        pars = np.polyfit(y,z,nfit)
-        p0 = np.poly1d(pars)
-        p1 = np.polyder(p0)
-        p2 = np.polyder(p1)
-#for k in range(Ntraj):
-        dc[:,j] = p1(y)
-        ddc[:,j] = p2(y)
+#         z = c[:,j]
+#         pars = np.polyfit(y,z,nfit)
+#         p0 = np.poly1d(pars)
+#         p1 = np.polyder(p0)
+#         p2 = np.polyder(p1)
+# #for k in range(Ntraj):
+#         dc[:,j] = p1(y)
+#         ddc[:,j] = p2(y)
 
-    return dc, ddc
+#     return dc, ddc
 
 # @numba.autojit
 def prop_c(y):
@@ -439,7 +439,7 @@ fnorm = open('norm.dat', 'w')
 fden = open('den.dat','w')
 
 
-v0, dv = MeanField(y,c)
+v0, dv = mean_field_force(y,c)
 
 cold = c
 dcdt = prop_c(y)
@@ -449,17 +449,17 @@ for k in range(Nt):
 
     t = t + dt
 
-    py += - dv * dt2 - fric_cons * py * dt2
+    py += - dv * dt2 
 
     y +=  py*dt/amy
 
     # force field
 
     # x_ave = xAve(c,y,w)
-    v0, dv = MeanField(y,c)
+    v0, dv = mean_field_force(y,c)
 
-    py += - dv * dt2 - fric_cons * py * dt2
-
+    py += - dv * dt2 
+    
     # renormalization
 
     #anm = norm(c,w)
@@ -487,12 +487,12 @@ for k in range(Nt):
     #fnorm.write(' {} {} \n'.format(t,anm))
 
     # output density matrix elements
-    rho, purity = den(c,w)
-    fden.write(' {} {} {} \n'.format(t,rho, purity))
+    # rho, purity = den(c,w)
+    # fden.write(' {} {} {} \n'.format(t,rho, purity))
 
     Ek = np.dot(py*py,w)/2./amy
     Ev = np.dot(v0,w)
-    #Eu = Eu
+
     Etot = Ek + Ev
 
     fe.write('{} {} {} {} \n'.format(t,Ek,Ev,Etot))

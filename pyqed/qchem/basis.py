@@ -374,12 +374,21 @@ def build(mol):
 
             # Obtain basis functions from the basis set files
             basis_dict = parse_gbs(basis_dir + "/6-31g.1.gbs")
-        
+
         elif mol.basis.replace('-','').lower() == 'sto3g':
-            
+
             basis_dict = parse_gbs(basis_dir + "/sto-3g.1.gbs")
-            
-            
+
+        elif mol.basis.replace('-','').lower() == 'sto6g':
+
+            basis_dict = parse_gbs(basis_dir + "/sto-6g.1.gbs")
+
+        elif mol.basis.replace('-','').lower() == '6311g':
+
+            basis_dict = parse_gbs(basis_dir + "/6-311g.0.gbs")
+
+
+
         basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
     else:
 
@@ -388,15 +397,15 @@ def build(mol):
     total_ao = 0
     for shell in basis:
         total_ao += shell.angmom_components_cart.shape[0]
-    
+
     mol.nao = total_ao
-        
-    print("Number of generalized shells:", len(basis)) 
-    
+
+    print("Number of generalized shells:", len(basis))
+
     # compute overlap integrals in AO basis
     mol.overlap = overlap_integral(basis)
 
-    
+
 
     # olp_mo = overlap_integral(basis, transform=mo_coeffs.T)
 
@@ -416,10 +425,10 @@ def build(mol):
     #Compute e-e repulsion integral in MO basis, shape=(#MO, #MO, #MO, #MO)
     int2e_mo = electron_repulsion_integral(basis, notation='chemist')
     mol.eri = int2e_mo
-    
+
     mol._bas = basis
-    
-    return 
+
+    return
 
 
 

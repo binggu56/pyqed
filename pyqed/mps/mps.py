@@ -349,46 +349,46 @@ class Site(object):
         """
         if dim < 1:
             raise DMRGException("Site dim must be at least 1")
-        super(Site, self).__init__()
+        # super(Site, self).__init__()
         self.dim = dim
-        self.operators = { "id" : np.eye(self.dim, self.dim) }
+        self.operators = { "id" : scipy.sparse.eye(self.dim, self.dim) }
 
     def add_operator(self, operator_name):
-        #  """
-        # Adds an operator to the site.
+        """
+        Adds an operator to the site.
 
-        #   Parameters
-       	# ----------
-        #    	operator_name : string
-       	#     The operator name.
+          Parameters
+       	----------
+           	operator_name : string
+       	    The operator name.
 
-       	# Raises
-       	# ------
-       	# DMRGException
-       	#     if `operator_name` is already in the dict.
+       	Raises
+       	------
+       	DMRGException
+       	    if `operator_name` is already in the dict.
 
-       	# Notes
-       	# -----
-       	# Postcond:
+       	Notes
+       	-----
+       	Postcond:
 
-        #       - `self.operators` has one item more, and
-        #       - the newly created operator is a (`self.dim`, `self.dim`)
-        #         matrix of full of zeros.
+              - `self.operators` has one item more, and
+              - the newly created operator is a (`self.dim`, `self.dim`)
+                matrix of full of zeros.
 
-       	# Examples
-       	# --------
-       	# >>> from dmrg101.core.sites import Site
-       	# >>> new_site = Site(2)
-       	# >>> print new_site.operators.keys()
-       	# ['id']
-       	# >>> new_site.add_operator('s_z')
-       	# >>> print new_site.operators.keys()
-       	# ['s_z', 'id']
-       	# >>> # note that the newly created op has all zeros
-       	# >>> print new_site.operators['s_z']
-       	# [[ 0.  0.]
-        # 	 [ 0.  0.]]
-        # """
+       	Examples
+       	--------
+       	>>> new_site = Site(2)
+       	>>> print new_site.operators.keys()
+       	['id']
+       	>>> new_site.add_operator('s_z')
+       	>>> print new_site.operators.keys()
+       	['s_z', 'id']
+       	>>> # note that the newly created op has all zeros
+       	>>> print new_site.operators['s_z']
+       	[[ 0.  0.]
+        	 [ 0.  0.]]
+        """
+
         if str(operator_name) in self.operators.keys():
             raise DMRGException("Operator name exists already")
         else:
@@ -740,14 +740,14 @@ class MPO:
 
         elif isinstance(other, MPS):
             return apply_mpo(self.factors, other.factors)
-    
+
     def __add__(self, other, compress=False, D=None):
         # return ...
         # if compress
         pass
 
 
-# A @ B 
+# A @ B
 
 def apply_mpo(w_list, B_list, chi_max):
     """

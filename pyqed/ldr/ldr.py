@@ -34,7 +34,7 @@ import logging
 from copy import copy
 
 try:
-    import proplot as plt
+    import ultraplot as plt
 except:
     import matplotlib.pyplot as plt
 
@@ -329,7 +329,7 @@ class LDRN:
     This is extremely expansive, the maximum dimension should be < 4.
 
     """
-    def __init__(self, domains, levels, ndim=3, nstates=2, x0=None, mass=None, \
+    def __init__(self, domains, levels, ndim=2, nstates=2, x0=None, mass=None, \
                  dvr_type='sine'):
 
         assert(len(domains) == len(levels) == ndim)
@@ -396,12 +396,14 @@ class LDRN:
         self.K = None
         # self._V = None
 
-        self._v = None
+        self._v = None # DPEM
+
         self.exp_K = None
         self.exp_V = None
         self.exp_T = None # KEO in LDR
         self.wf_overlap = self.A = None
         self.apes = None
+        self.dpem = None # diabatic potential energy matrix
 
 
     @property
@@ -2772,8 +2774,11 @@ class SincDVR_PBC(SincDVR2):
 
 
 if __name__ == '__main__':
-
-
+    
+    ##################
+    # nonabelian model 
+    ##################
+    
     # from pyqed.models.pyrazine import DHO
     from pyqed import sigmaz, interval, sigmax, norm, gwp
     from pyqed.models.pyrazine import Pyrazine
@@ -2839,14 +2844,14 @@ if __name__ == '__main__':
     domains = [[-6,6], ]*2
     levels = [5, ] * 2
 
-    # solver = LDR2(x, y, nstates = nstates, \
-    #               mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
-
-    solver = LDRN(domains, levels, nstates = nstates, \
+    solver = LDR2(x, y, nstates = nstates, \
                   mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
 
+    # solver = LDRN(domains, levels, nstates = nstates, \
+    #               mass = [1/omega, ] * 2, ndim=2) # mol.mass = [230.5405791702069, 367.62919827476884]
+
     solver.v = v
-    # solver.build_apes()
+    solver.build_apes()
 
     psi0 = np.zeros((nx, ny, nstates), dtype=complex)
     for i in range(nx):
@@ -2856,7 +2861,7 @@ if __name__ == '__main__':
     # psi0 = np.reshape(psi0, (nx*ny*nstates,1))
 
     # transfrom the initial state to the adiabatic representation
-    # psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
+    psi0 = np.einsum('ija, ijab -> ijb', psi0, solver.adiabatic_states)
 
     dt = 0.2/au2fs
     nt = 100

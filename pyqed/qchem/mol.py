@@ -41,7 +41,25 @@ from pyscf import dft, scf, gto, ao2mo
 #     print("Failed to load cclib!")
 #     raise
 
+def atomic_chain(natom, z, element='H', basis='631g', spin=0):
 
+    # ds = np.linspace(-4, 4, natom)
+
+    elements = [element, ] * natom
+
+    R = np.zeros((natom, 3))
+    R[:, 2] = z
+
+    atom = build_atom_from_coords(elements, R)
+
+    mol = Molecule(
+        atom = atom,
+        basis = basis,
+        unit = 'b',
+        spin = spin,
+        )
+
+    return mol
 
 # DISABLE_EVAL = getattr(__config__, 'DISABLE_EVAL', False)
 
@@ -950,7 +968,7 @@ class Molecule:
         """Build distance matrix between all atoms
            TODO: calculate distances only as needed for efficiency"""
         coords = self.atom_coords()
-        natom = self.natm
+        natom = self.natom
 
         distancematrix = np.zeros((natom, natom))
 
@@ -1588,13 +1606,20 @@ if __name__ == '__main__':
 
     # import proplot as plt
 
-
+    from pyqed import Molecule
+    
     # mol = gto.Mole()
     # mol.verbose = 3
     atom = [['H' , (0,      0., 0.)],
-            ['H', (1.1, 0., 0.)]]
+            ['H', (1.1, 0., 0.)],
+            ['H', (1.5, 0, 0)]]
     #mol.basis = {'Ne': '6-31G'}
     mol = Molecule(atom)
+    
+    d = mol._build_distance_matrix()
+    
+    print(d)
+    
     # This is from G2/97 i.e. MP2/6-31G*
     # mol.atom = [['H' , (0,      0., 0.)],
     #             ['H', (1.1, 0., 0.)]]

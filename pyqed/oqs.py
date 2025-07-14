@@ -27,7 +27,7 @@ import pyqed.superoperator as superop
 
 
 
-class RedfieldSolver:
+class Redfield:
 # class Redfield_solver:
     def __init__(self, H, c_ops=None, spectra=None, e_ops=None):
         self.H = H
@@ -824,14 +824,14 @@ class Env:
         spectral density
         """
         # if model == 'ohmic':
-            
+
         #     return np.exp(-x/cutoff)
 
 
 
 
-    
-    
+
+
 
 # @jit
 def func(rho, h0, c_ops, l_ops):
@@ -850,12 +850,16 @@ def func(rho, h0, c_ops, l_ops):
 
 
 
-def coherent(N, alpha):
+def coherent_state(N, alpha, method='operator'):
     """Generates a coherent state with eigenvalue alpha.
 
     Constructed using displacement operator on vacuum state.
 
     Modified from Qutip.
+
+    .. math::
+
+        |\alpha \rangle = e^{\alpha a^\dagger - \alpha^* a} |0\rangle
 
     Parameters
     ----------
@@ -903,23 +907,27 @@ def coherent(N, alpha):
 
     """
 
-    x = basis(N, 0)
-    a = destroy(N)
-    D = la.expm(alpha * dag(a) - np.conj(alpha) * a)
+    if method == 'operator':
 
-    return D @ x
+        x = basis(N, 0)
+        a = destroy(N)
+        D = la.expm(alpha * dag(a) - np.conj(alpha) * a)
+
+        return D @ x
 
     # elif method == "analytic" or offset > 0:
+    elif method == "analytic":
 
-    #     data = np.zeros([N, 1], dtype=complex)
-    #     n = arange(N) + offset
-    #     data[:, 0] = np.exp(-(abs(alpha) ** 2) / 2.0) * (alpha ** (n)) / \
-    #         _sqrt_factorial(n)
-    #     return Qobj(data)
+        data = np.zeros(N, dtype=complex)
+        n = np.arange(N) #+ offset
+        data = np.exp(-(abs(alpha) ** 2) / 2.0) * (alpha ** (n)) / \
+            np.sqrt(np.factorial(n))
+        # return Qobj(data)
+        return data
 
-    # else:
-    #     raise TypeError(
-    #         "The method option can only take values 'operator' or 'analytic'")
+    else:
+        raise TypeError(
+            "The method option can only take values 'operator' or 'analytic'")
 
 
 
@@ -973,7 +981,7 @@ shape = [3, 3], type = oper, isHerm = True
 
     """
     #if method == "operator":
-    psi = coherent(N, alpha)
+    psi = coherent_state(N, alpha)
 
     return ket2dm(psi)
 
@@ -1111,7 +1119,7 @@ def observe(A, rho):
     """
     return A.dot(rho).diagonal().sum()
 
-class LindbladSolver():
+class Lindblad():
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
         self.e_ops = e_ops
@@ -1329,6 +1337,8 @@ class LindbladSolver():
 
 
 
+
+
 class HEOMSolver():
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
@@ -1359,17 +1369,17 @@ class HEOMSolver():
         return
 
     def run(self, rho0, dt, nt, temperature, cutoff, reorganization, nado):
-        
+
         return _heom(self.H, rho0, self.c_ops, e_ops=self.e_ops, \
                   nt=nt, dt=dt, temperature=temperature, cutoff=cutoff, \
                   reorganization=reorganization, nado=nado)
-    
+
     def propagator(self, dt, nt, temperature, cutoff, \
                             reorganization, nado):
-        
+
         return _heom_propagator(self.H, self.c_ops, self.e_ops, temperature, cutoff, \
                                 reorganization, nado, dt, nt)
-        
+
 
     def correlation_2op_1t(self, rho0, a_op, b_op, dt, Nt, output='cor.dat'):
         '''
@@ -1435,6 +1445,7 @@ class HEOMSolver():
                 e_ops=[b_op], return_result=True).observables[:,0]
 
         return corr_mat
+
 # exponential series solvers
 
 # def _correlation_es_2t(H, state0, tlist, taulist, c_ops, a_op, b_op, c_op):
@@ -1620,7 +1631,7 @@ def _lindblad(H, rho0, c_ops, e_ops=None, Nt=1, t0=0, dt=0.005, return_result=Tr
     rho = rho0.copy()
     rho = rho.astype(complex)
     rho = csr_matrix(rho)
-    
+
     if e_ops is None:
         e_ops = []
 
@@ -1792,7 +1803,7 @@ def _lindblad_driven(H, rho0, c_ops=None, e_ops=None, Nt=1, dt=0.005, t0=0.,
             t += dt
 
             Ht = calculateH(t)
-            
+
             rho = rk4(rho, liouvillian, dt, Ht, c_ops)
 
             rholist.append(rho.copy())
@@ -1839,11 +1850,11 @@ def _heom(H, rho0, c_ops, e_ops, temperature, cutoff, reorganization,\
     # D(t) = (a + ib) * exp(- gamma * t)
     # a = np.pi * reorg * T  # initial value of the correlation function D(0) = pi * lambda * kB * T
     # b = 0.0
-    
+
     # leading term of the Matsubara expansion
     D0 = reorg * gamma * (coth(gamma/(2. * T)) - 1j)
     # D0 = reorg * (2. * T - 1j * gamma)
-    
+
     print('Amplitude of the fluctuations = {}'.format(D0))
 
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
@@ -1911,7 +1922,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
     #sz = np.zeros((nstate, nstate), dtype=np.complex128)
     sz = c_ops[0] # collapse opeartor
 
-    
+
     # f = open(fname,'w')
     # fmt = '{} '* 5 + '\n'
 
@@ -1919,7 +1930,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
     L0 = operator_to_superoperator(H)
     Sm = operator_to_superoperator(sz)
     Sp = operator_to_superoperator(sz, kind='anticommutator')
-    
+
     t = 0.0
     for k in range(nt):
 
@@ -1941,7 +1952,7 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
     return u
 
 def test_lindblad():
-    mesolver = Lindblad_solver(H, c_ops=[sz.astype(complex)])
+    mesolver = Lindblad(H, c_ops=[sz.astype(complex)])
     Nt = 800
     dt = 0.5
 
@@ -1966,6 +1977,8 @@ def test_lindblad():
     ax.set_ylabel('E(t)')
     return
 
+
+HEOM = HEOMSolver
 
 if __name__ == '__main__':
 
@@ -1993,7 +2006,7 @@ if __name__ == '__main__':
     psi0 = basis(2, 0)
     rho0 = ket2dm(psi0).astype(complex)
 
-    mesolver = Redfield_solver(H, c_ops=[sz.astype(complex)])
+    mesolver = Redfield(H, c_ops=[sz.astype(complex)])
     Nt = 800
     dt = 0.5
 

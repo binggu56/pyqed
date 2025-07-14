@@ -1140,7 +1140,7 @@ if __name__ == '__main__':
     psi0[:,0] =  gwp(x, a, x0, k0) * np.exp(1j*angle)
     # psi_x0[:,1] = 1./np.sqrt(2.) * gauss_x(x, a, x0, k0)
 
-    sol = NAMD(x, 2, psi0, mass=1, V_x =V_x)
+    sol = SPO(x, 2, psi0, mass=1, V_x =V_x)
     sol.propagate(dt, psi0, nt=1000)
 
     rho = np.genfromtxt('density_matrix.dat')

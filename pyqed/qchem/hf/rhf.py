@@ -12,8 +12,8 @@ HF with matrix elements extracted from PySCF
 import logging
 import numpy as np
 from scipy.linalg import eigh
-from pyscf.scf import _vhf
-from pyscf import ao2mo
+# from pyscf.scf import _vhf
+# from pyscf import ao2mo
 import sys
 
 from pyqed import dagger, dag
@@ -154,10 +154,21 @@ class RHF:
 
         """
         C = self.mo_coeff
-        return C.conj() @ self.mol.hcore @ C
+        return dag(C) @ self.mol.hcore @ C
 
     def get_eri_mo(self):
-        pass
+        """
+        get electron repulsion integrals in CMOs
+
+        Returns
+        -------
+        eri_mo : TYPE
+            DESCRIPTION.
+
+        """
+        C = self.mo_coeff
+        eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', self.eri, C.conj(), C, C.conj(), C)
+        return eri_mo
 
     def to_uhf(self):
         # transform a RHF to UHF format with spin orbitals
