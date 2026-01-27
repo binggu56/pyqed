@@ -354,7 +354,7 @@ class SBM:
             init_mps.append(A_boson)
 
         # 6. Return DMRG Object
-        dmrg_obj = DMRG_Solver(H=mpo_fixed, D=D, nsweeps=nsweeps, init_guess=init_mps, U1= False)
+        dmrg_obj = DMRG_Solver(H=mpo_fixed, D=D, nsweeps=nsweeps, init_guess=init_mps)
         
         return dmrg_obj
 
