@@ -37,3 +37,8 @@ local_data_GL2013
 *.bat
 *.nbc
 *.nbi
+
+sh_file_for_HPC
+Checkpoints
+examples/optimization/newton
+Miniforge3-MacOSX-arm64.sh
