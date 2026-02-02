@@ -21,8 +21,8 @@ import re
 
 from numba import njit, vectorize, jit, int64, float64
 
-@njit(float64(int64, int64, int64, float64, float64, float64), parallel=True)
-def E(i,j,t,Qx,a,b):
+# @njit(float64(int64, int64, int64, float64, float64, float64), parallel=True)
+def E(i: int, j:int, t:int, Qx:float, a:float, b:float):
     '''
     Recursive definition of Hermite Gaussian coefficients.
 
@@ -389,7 +389,7 @@ ALIAS = {
     'ccpv5zdkh'  : 'cc-pv5z-dk.dat' ,
 }
 
-def build(mol):
+def build(mol, pyscf=False):
     """
     build electronic integrals in AO using GBasis package
 
@@ -403,21 +403,29 @@ def build(mol):
     None.
 
     """
-    from gbasis.parsers import parse_gbs, make_contractions
-
     atoms = mol.atom_symbols()
     atcoords = mol.atom_coords()
     atnums = mol.atom_charges()
 
-    basis_dir = os.path.abspath(f'{pyqed.__file__}/../qchem/basis_set/')
+    if not pyscf:
 
-    if isinstance(mol.basis, str):
+        from gbasis.parsers import parse_gbs, make_contractions
 
-        basis_dict = parse_gbs(basis_dir + '/' + ALIAS[mol.basis.replace('-','').lower()])
-        basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
+        basis_dir = os.path.abspath(f'{pyqed.__file__}/../qchem/basis_set/')
+
+        if isinstance(mol.basis, str):
+
+            basis_dict = parse_gbs(basis_dir + '/' + ALIAS[mol.basis.replace('-','').lower()])
+            basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
+        else:
+
+            raise NotImplementedError('Customized basis not supported yet.')
     else:
 
-        raise NotImplementedError('Customized basis not supported yet.')
+        from gbasis.wrappers import from_pyscf
+
+        basis = from_pyscf(mol.topyscf())
+
 
     ####
     ###  The count of total_ao from https://gbasis.qcdevs.org/tutorial/JCP_paper.html# does not seem to work with ccpvdz.
@@ -437,7 +445,7 @@ def build(mol):
     mol.overlap = overlap_integral(basis)
 
     mol.nao = mol.overlap.shape[0]
-    
+
     print("Number of AOs = ", mol.nao)
 
     # olp_mo = overlap_integral(basis, transform=mo_coeffs.T)
