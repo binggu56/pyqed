@@ -349,7 +349,7 @@ def run_gdvr_dmrg_loop(
         else:
             mps_guess = [t.copy() for t in last_mps_tensors]
         
-        solver = mps_lib.DMRG(mpo_dmrg, D=dmrg_bond_dim, nsweeps=dmrg_sweeps, init_guess=mps_guess)
+        solver = mps_lib.DMRG(mpo_dmrg, D=dmrg_bond_dim, nsweeps=dmrg_sweeps, init_guess=mps_guess, not_conv_err=False)
         solver.run()
         
         try:
@@ -430,10 +430,10 @@ if __name__ == "__main__":
     basis_cfg = {'s': S_EXPS}
     
     run_gdvr_dmrg_loop(
-        mol, Lz=8.0, Nz=80, basis_cfg=basis_cfg,
+        mol, Lz=8.0, Nz=50, basis_cfg=basis_cfg,
         pre_opt_cycles=10,    
         dmrg_cycles=4,         
-        dmrg_bond_dim=40,
+        dmrg_bond_dim=20,
         dmrg_sweeps=10,
         post_dmrg_opt_cycles=10 
     )

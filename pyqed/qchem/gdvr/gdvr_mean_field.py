@@ -653,35 +653,55 @@ class SweepNewtonHelper(NewtonHelper):
         
         return H_nn
 
-    def kkt_step_slice(self, n, d_stack, P_slice, S_prim, ridge=0.0):
-        # 1. Exact Gradient (O(Nz))
+    def kkt_step_slice(self, n, d_stack, P_slice, S_prim, ridge_base=1e-4):
+        """
+        Solves the local KKT problem with automatic ridge selection for stability.
+        """
+        # 1. Compute Exact Gradient (O(Nz))
+        # This ensures the direction is consistent with the latest orbital stack
         g_n_vec = self.get_gradient_slice_onthefly(n, d_stack, P_slice)
         g_n = g_n_vec.reshape(-1, 1)
         
-        # 2. Exact Diagonal Hessian (O(Nz)) - THIS WAS MISSING IN YOUR CODE
+        # 2. Compute Exact Diagonal Hessian (O(Nz))
         H_nn = self.get_diagonal_hessian_block_sparse(n, d_stack, P_slice)
         
-        if ridge > 0.0:
-            H_nn += ridge * np.eye(H_nn.shape[0])
+        # 3. Automated Ridge Selection
+        # Calculate eigenvalues to check for negative curvature or ill-conditioning
+        try:
+            w = np.linalg.eigvalsh(H_nn)
+            min_eig = w[0]
+            # The ridge shift makes the minimum eigenvalue at least ridge_base
+            auto_ridge = max(0.0, ridge_base - min_eig)
+        except np.linalg.LinAlgError:
+            # Fallback for extreme numerical cases
+            auto_ridge = ridge_base
             
+        H_nn_shifted = H_nn + auto_ridge * np.eye(H_nn.shape[0])
+            
+        # 4. Build the KKT System
+        # The KKT system ensures the update delta_d remains orthogonal to the constraint
         dn = d_stack[n].reshape(-1, 1)
         s_vec = S_prim @ dn
         
-        N = H_nn.shape[0]
+        N = H_nn_shifted.shape[0]
         KKT = np.zeros((N + 1, N + 1), dtype=float)
-        KKT[:N, :N] = H_nn
+        KKT[:N, :N] = H_nn_shifted
         KKT[:N, N]  = s_vec.flatten()
         KKT[N, :N]  = s_vec.flatten()
         
+        # Right-hand side is the negative gradient for descent
         rhs = np.zeros((N + 1, 1), dtype=float)
         rhs[:N] = -g_n
         
+        # 5. Solve the Linear System
         try:
-            sol = la.solve(KKT, rhs)
+            sol = np.linalg.solve(KKT, rhs)
             delta_d = sol[:N].flatten()
             lam = sol[N]
-        except la.LinAlgError:
-            delta_d = -0.1 * g_n.flatten()
+        except np.linalg.LinAlgError:
+            # Emergency descent: steep-descent fallback if KKT is singular
+            print(f"  [Warning] KKT singular at site {n}, using scaled gradient.")
+            delta_d = -0.01 * g_n.flatten()
             lam = 0.0
             
         return delta_d, lam, g_n_vec
@@ -692,7 +712,7 @@ def sweep_optimize_driver(
     P_slice,
     S_prim,
     n_cycles=1,
-    ridge=1e-4,         # Lowered default ridge
+    ridge=1,          # large default ridge for stability
     trust_step=1.0,     # Full Newton step
     trust_radius=2.0,   # decides how large a step could be, decides convergence speed vs. monotonic decrement stability
     verbose=True

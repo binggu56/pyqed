@@ -332,7 +332,7 @@ def extract_rdms_for_helper(solver, n_spatial, verbose=False):
 def dmrg_ao_optimization_step(
     mol, d_stack, dummy, S_prim, ERIop, h1_nm_func, 
     z, Kz, T_prim, alphas, centers, labels, K_h, Kx_h,
-    solver, Enuc=0.0, n_cycles=5, ridge=1e-3, verbose=True
+    solver, Enuc=0.0, n_cycles=5, ridge=1, verbose=True
 ):
     # 1. Extract RDMs
     P_spatial, D_spatial = extract_rdms_for_helper(solver, d_stack.shape[0], verbose=verbose)
@@ -349,8 +349,8 @@ def dmrg_ao_optimization_step(
         S_prim,
         n_cycles=n_cycles,
         ridge=ridge,
-        trust_step=1.0,
-        trust_radius=1.0, 
+        trust_step=0.1,
+        trust_radius=0.1, 
         verbose=verbose
     )
     
