@@ -108,6 +108,9 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     sv_list = []   # (s, q_mid, local_index)
     U_store = {}
     V_store = {}
+    
+    # Store S blocks temporarily
+    S_store = {} 
 
     for q_mid, entries in blocks_by_q_mid.items():
         rows = sorted(row_map[q_mid])
@@ -142,6 +145,8 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
               )
 
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
+        
+        S_store[q_mid] = S 
 
         for i, s in enumerate(S):
             sv_list.append((s, q_mid, i))
@@ -151,8 +156,16 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     # GLOBAL truncation with bookkeeping
     sv_list.sort(reverse=True, key=lambda x: x[0])
+    
+    # Calculate truncation error
+    full_sq_norm = sum(s**2 for s, _, _ in sv_list)
+    
     if m_max is not None:
         sv_list = sv_list[:m_max]
+        
+    trunc_err = 0.0
+    if full_sq_norm > 1e-12:
+        trunc_err = 1.0 - sum(s**2 for s, _, _ in sv_list) / full_sq_norm
 
     kept = {}
     for s, q_mid, i in sv_list:
@@ -160,10 +173,15 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     final_U = {}
     final_V = {}
+    final_S = {} # Dictionary to store S diagonal matrices
 
     for q_mid, idxs in kept.items():
+        idxs = sorted(idxs) # Ensure indices are sorted
         U, rows, r_starts, entries = U_store[q_mid]
         Vt, cols, c_starts, entries = V_store[q_mid]
+        
+        S_block = S_store[q_mid][idxs]
+        final_S[q_mid] = np.diag(S_block)
 
         for r in rows:
             for qn, blk in entries:
@@ -207,8 +225,9 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
         qns=[bond_qns, qns_R, qns_pR],
         dirs=[-1, AA_perm.dirs[2], AA_perm.dirs[3]]
     )
-
-    return U, V, 0.0, sum(len(v) for v in kept.values())
+    
+    # Return S as a dictionary of arrays {q_mid: diagonal_matrix}
+    return U, V, final_S, trunc_err, sum(len(v) for v in kept.values())
 
 
 
@@ -298,20 +317,14 @@ class MPS:
             try:
                 self.dim = Bs[0].shape[1]
             except TypeError:
-                # Fallback for BlockTensor if .shape property fails due to QN format mismatch
-                # Assumes Bs[0] is (Left, Phys, Right) or (Left, Right, Phys)?
-                # Standard MPS in this code seems to be (ChiL, d, ChiR) -> Axis 1 is Physical.
-                # We iterate data to sum up dimensions of unique physical QNs.
                 if hasattr(Bs[0], 'data'):
-                    # Data keys are usually (q_L, q_phys, q_R) or similar
-                    # For a standard MPS block (L, P, R), axis 1 is phys.
-                    # We map unique q_phys to their dimension.
+                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2
                     phys_dims = {}
                     for key, block in Bs[0].data.items():
-                        # Key structure depends on the tensor. Assuming (q0, q1, q2)
-                        q_p = key[1] 
+                        # key is (qL, qR, qP)
+                        q_p = key[2]  
                         if q_p not in phys_dims:
-                            phys_dims[q_p] = block.shape[1]
+                            phys_dims[q_p] = block.shape[2]
                     self.dim = sum(phys_dims.values())
                 else:
                     self.dim = 0 # Should not happen
@@ -1981,15 +1994,67 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
         # 4. SVD and Split
         # AA_new is (L, R, Phys_L, Phys_R)
         # We need to return A(L, M, P_L) and B(M, R, P_R)
-        # Use our symmetric SVD
-        U, V, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
         
-        # U is (L, P_L, M). Transpose to (Bond_L, Bond_M, Phys_L)
-        A_new = U.transpose(0, 2, 1)
+        # Use our symmetric SVD, 3rd argument S_dict is used in normalization
+        U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
         
-        # V output from svd_symmetric is (Bond_M, Bond_R, Phys_R), as wanted
-        B_new = V
+        # U is (L, P_L, M).
+        # V is (M, R, P_R).
         
+        # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
+        
+        # Helper to contract Diagonal S into U
+        # U is (L, P_L, Bond). S is (Bond, Bond).
+        # We want U*S -> (L, P_L, Bond)
+        def multiply_U_S(U_tensor, S_data):
+            # U: data[(qL, qP, qM)] -> shape (dL, dP, dM)
+            # S: data[qM] -> shape (dM, dM)
+            new_data = {}
+            for (qL, qP, qM), block in U_tensor.data.items():
+                if qM in S_data:
+                    # Contract last index of U with S
+                    # block: (dL, dP, dM). S: (dM, dM)
+                    # Result: (dL, dP, dM)
+                    new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
+                    new_data[(qL, qP, qM)] = new_block
+            return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
+
+        # Helper to contract S into V
+        # S is (Bond, Bond). V is (Bond, R, P_R).
+        # We want S*V -> (Bond, R, P_R)
+        def multiply_S_V(S_data, V_tensor):
+            new_data = {}
+            for (qM, qR, qP), block in V_tensor.data.items():
+                if qM in S_data:
+                    # Contract S with first index of V
+                    # S: (dM, dM). block: (dM, dR, dP)
+                    # Result: (dM, dR, dP)
+                    new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
+                    new_data[(qM, qR, qP)] = new_block
+            return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
+
+        if dir == 'right':  # Right Sweep: Center moves Right.
+            # A = U. B = S * V.
+            
+            # U is (L, P_L, M). Transpose to standard MPS shape A(L, M, P_L)
+            A_new = U.transpose(0, 2, 1)
+            
+            # Contract S into V, then V is already (M, R, P_R), which is standard B shape
+            B_new = multiply_S_V(S_dict, V)
+            
+        else: # that is dir == 'left'
+            # Left Sweep: Center moves Left.
+            # A = U * S. B = V.
+            
+            # Contract U * S first
+            A_US = multiply_U_S(U, S_dict)
+            
+            # Transpose to standard MPS shape A(L, M, P_L)
+            A_new = A_US.transpose(0, 2, 1)
+            
+            # B is just V
+            B_new = V
+
         return energy, A_new, B_new, trunc, m_kept
 
     else:
