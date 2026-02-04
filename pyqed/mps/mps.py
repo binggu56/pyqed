@@ -1288,11 +1288,51 @@ class MPO:
         MPO @ MPS -> MPS 
         """
         if chi_max is None:
-            chi_max = max(self.bond_orders()+other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders())*2
+            chi_max = max(self.bond_orders() + other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders()) * 2
+            
         if isinstance(other, MPO):
-            new_factors = product_MPO(self.factors, other.factors)
-            new_factors, _ = compress(new_factors, chi_max)
-            return MPO(new_factors)
+            # 1. Compute raw product 
+            # Output format of product_MPO is (Left, Right, Up, Down)
+            raw_factors = product_MPO(self.factors, other.factors)
+            
+            # 2. Prepare for compress
+            # decompose.py strictly requires shape: (Left, Physical, Right)
+            # But our MPO product produces: (Left, Right, Up, Down)
+            mps_factors = []
+            phys_dims = [] 
+            
+            for W in raw_factors:
+                s = W.shape
+                # Store original physical dims (d_up, d_down)
+                phys_dims.append((s[2], s[3]))
+                
+                # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
+                W_flat = W.reshape(s[0], s[1], s[2] * s[3])
+                
+                # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
+                W_ready = W_flat.transpose(0, 2, 1)
+                
+                mps_factors.append(W_ready)
+            
+            # 3. Compress (Input is Left, Phys, Right)
+            # The output B will also be (Left, Phys, Right)
+            compressed_factors = compress(mps_factors, chi_max)
+            
+            # 4. Restore MPO format
+            final_factors = []
+            for i, B in enumerate(compressed_factors):
+                # B shape: (new_chi_L, d_combined, new_chi_R)
+                
+                # Step A: Transpose back -> (new_chi_L, new_chi_R, d_combined)
+                B_transposed = B.transpose(0, 2, 1)
+                
+                # Step B: Split physical legs -> (new_chi_L, new_chi_R, d_up, d_down)
+                d_up, d_down = phys_dims[i]
+                W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
+                
+                final_factors.append(W_final)
+                
+            return MPO(final_factors)
 
         elif isinstance(other, MPS):
             new_factors, _ = apply_mpo(self.factors, other.factors, chi_max)  
