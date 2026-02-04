@@ -4,6 +4,25 @@ from collections import defaultdict
 import time
 
 
+class QN(tuple):
+    """
+    Quantum Number class supporting vector addition for U(1) x U(1).
+    Example: QN(1, 0) + QN(1, 1) = QN(2, 1)
+    """
+    def __new__(cls, *args):
+        return super(QN, cls).__new__(cls, tuple(args))
+
+    def __add__(self, other):
+        return QN(*(x + y for x, y in zip(self, other)))
+
+    def __sub__(self, other):
+        return QN(*(x - y for x, y in zip(self, other)))
+        
+    def __neg__(self):
+        return QN(*(-x for x in self))
+        
+    def __repr__(self):
+        return f"QN{super().__repr__()}"
 
 class BlockTensor:
     """
@@ -88,11 +107,6 @@ class BlockTensor:
         new_data = {k: v.conj() for k, v in self.data.items()}
         new_dirs = [-d for d in self.dirs]
         return BlockTensor(new_data, self.qns, new_dirs)
-    
-    def reshape_flat(self):
-        """Flatten for debug (Do not use in hot loops)."""
-        # Complex to implement correctly for blocks, skipping for Davidson
-        pass
 
 def tensordot(A, B, axes):
     """

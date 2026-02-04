@@ -85,7 +85,6 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     AA_perm = AA.transpose(0, 2, 1, 3)
 
-    # blocks_by_q_mid is used to combine different (q_L, q_phys_L) pair that actually share same q_tot_L, which would belong to same sub-block after svd
     blocks_by_q_mid = {}
     row_map = {}
     col_map = {}
@@ -108,6 +107,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     sv_list = []   # (s, q_mid, local_index)
     U_store = {}
     V_store = {}
+    S_store = {} 
 
     for q_mid, entries in blocks_by_q_mid.items():
         rows = sorted(row_map[q_mid])
@@ -131,7 +131,6 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
                     break
 
         M = np.zeros((r_dim, c_dim), dtype=entries[0][1].dtype)
-
         for qn, blk in entries:
             r0 = r_starts[(qn[0], qn[1])]
             c0 = c_starts[(qn[2], qn[3])]
@@ -142,17 +141,19 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
               )
 
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
-
+        S_store[q_mid] = S 
         for i, s in enumerate(S):
             sv_list.append((s, q_mid, i))
-
         U_store[q_mid] = (U, rows, r_starts, entries)
         V_store[q_mid] = (Vt, cols, c_starts, entries)
 
-    # GLOBAL truncation with bookkeeping
     sv_list.sort(reverse=True, key=lambda x: x[0])
-    if m_max is not None:
-        sv_list = sv_list[:m_max]
+    full_sq_norm = sum(s**2 for s, _, _ in sv_list)
+    if m_max is not None: sv_list = sv_list[:m_max]
+        
+    trunc_err = 0.0
+    if full_sq_norm > 1e-12:
+        trunc_err = 1.0 - sum(s**2 for s, _, _ in sv_list) / full_sq_norm
 
     kept = {}
     for s, q_mid, i in sv_list:
@@ -160,10 +161,15 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     final_U = {}
     final_V = {}
+    final_S = {} # Capture S
 
     for q_mid, idxs in kept.items():
+        idxs = sorted(idxs)
         U, rows, r_starts, entries = U_store[q_mid]
         Vt, cols, c_starts, entries = V_store[q_mid]
+        
+        S_block = S_store[q_mid][idxs]
+        final_S[q_mid] = np.diag(S_block)
 
         for r in rows:
             for qn, blk in entries:
@@ -193,9 +199,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     qns_R      = AA_perm.qns[2]
     qns_pR     = AA_perm.qns[3]
 
-    # ----------------------------
-    # Construct tensors
-    # ----------------------------
+
     U = BlockTensor(
         final_U,
         qns=[qns_L, qns_pL, bond_qns],
@@ -208,7 +212,8 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
         dirs=[-1, AA_perm.dirs[2], AA_perm.dirs[3]]
     )
 
-    return U, V, 0.0, sum(len(v) for v in kept.values())
+    return U, V, final_S, trunc_err, sum(len(v) for v in kept.values())
+
 
 
 
@@ -293,30 +298,21 @@ class MPS:
 
         self.data = self.factors = Bs
         
-        # --- ROBUST DIM CALCULATION FOR BLOCKTENSORS ---
         if homogenous:
             try:
                 self.dim = Bs[0].shape[1]
             except TypeError:
-                # Fallback for BlockTensor if .shape property fails due to QN format mismatch
-                # Assumes Bs[0] is (Left, Phys, Right) or (Left, Right, Phys)?
-                # Standard MPS in this code seems to be (ChiL, d, ChiR) -> Axis 1 is Physical.
-                # We iterate data to sum up dimensions of unique physical QNs.
                 if hasattr(Bs[0], 'data'):
-                    # Data keys are usually (q_L, q_phys, q_R) or similar
-                    # For a standard MPS block (L, P, R), axis 1 is phys.
-                    # We map unique q_phys to their dimension.
+                    # FIX: U(1) tensor layout is (Left, Right, Phys) -> Phys is Index 2
                     phys_dims = {}
                     for key, block in Bs[0].data.items():
-                        # Key structure depends on the tensor. Assuming (q0, q1, q2)
-                        q_p = key[1] 
+                        q_p = key[2]  
                         if q_p not in phys_dims:
-                            phys_dims[q_p] = block.shape[1]
+                            phys_dims[q_p] = block.shape[2]
                     self.dim = sum(phys_dims.values())
                 else:
-                    self.dim = 0 # Should not happen
+                    self.dim = 0
         else:
-            # Similar logic for inhomogeneous
             self.dims = []
             for B in Bs:
                 try:
@@ -325,14 +321,12 @@ class MPS:
                     if hasattr(B, 'data'):
                         phys_dims = {}
                         for key, block in B.data.items():
-                            q_p = key[1]
+                            q_p = key[2] # FIX: Index 2
                             if q_p not in phys_dims:
-                                phys_dims[q_p] = block.shape[1]
+                                phys_dims[q_p] = block.shape[2]
                         self.dims.append(sum(phys_dims.values()))
                     else:
                         self.dims.append(0)
-
-        # self._mpo = None
 
     def copy(self):
         return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss], self.bc)
@@ -344,15 +338,16 @@ class MPS:
         try:
             return [self.Bs[i].shape[2] for i in range(self.nbonds)]
         except TypeError:
-             # Fallback for BlockTensor bond dims (Axis 2)
+             # Fallback for BlockTensor bond dims
              bonds = []
              for i in range(self.nbonds):
                  B = self.Bs[i]
                  bond_dims = {}
                  for key, block in B.data.items():
-                     q_r = key[2]
+                     # FIX: U(1) Right Bond is Index 1
+                     q_r = key[1] 
                      if q_r not in bond_dims:
-                         bond_dims[q_r] = block.shape[2]
+                         bond_dims[q_r] = block.shape[1]
                  bonds.append(sum(bond_dims.values()))
              return bonds
 
@@ -1503,6 +1498,7 @@ def initial_F(W, target_qn=0):
 def dense_to_symmetric(mps_list, phys_qns=None, tol=1e-12):
     """
     Convert a *product-state* dense MPS guess into a true U(1) BlockTensor MPS.
+    TODO: this now currently only supports particle number symmetry, add Sz, Lz etc. and also make each symmetry optional.
 
     Supports:
       - spin-orbital sites: d=2, phys_qns=[0,1]
@@ -1946,53 +1942,55 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
         if not SYMMETRY_AVAILABLE:
             raise ImportError("Symmetry module not found. Cannot run U1=True.")
             
-        # 1. Form Initial Guess (Bond Dimension expansion happens here naturally in SVD)
-        # A: (Bond_L, Bond_M, Phys_L)
-        # B: (Bond_M, Bond_R, Phys_R)
-        # AA = A * B -> (Bond_L, Phys_L, Bond_R, Phys_R)
-        # Note on A/B indices in BlockTensor:
-        # standard MPS layout: (Left, Right, Phys).
-        # Contraction: A[Right] -- B[Left]
-        
-        # Check rank to be sure
         if A.rank == 3:
             AA = tensordot(A, B, axes=([1], [0])) # this will return as BlockTensor Object
             AA = AA.transpose(0, 2, 1, 3)
-            
-            # add noise to AA
-            # forces Davidson to explore new sectors
-            noise_scale = 1e-4
-            for k in AA.data:
-                # Add random noise to existing blocks
-                AA.data[k] += (np.random.rand(*AA.data[k].shape) - 0.5) * noise_scale
         else:
-            raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
+            raise ValueError(f"Unexpected tensor rank {A.rank}")
 
-        # 2. Define Linear Operator
         H_op = HamiltonianMultiplyU1(E, [W1, W2], F)
-        
-        # 3. Solve Eigenproblem (Davidson)
-        # Normalize guess
         norm = AA.norm()
         AA = AA * (1.0/norm)
         
         energy, AA_new = solve_davidson(H_op, AA, tol=1e-5)
         
-        # 4. SVD and Split
-        # AA_new is (L, R, Phys_L, Phys_R)
-        # We need to return A(L, M, P_L) and B(M, R, P_R)
-        # Use our symmetric SVD
-        U, V, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
+        # Capture S_dict
+        U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
         
-        # U is (L, P_L, M). Transpose to (Bond_L, Bond_M, Phys_L)
-        A_new = U.transpose(0, 2, 1)
-        
-        # V output from svd_symmetric is (Bond_M, Bond_R, Phys_R), as wanted
-        B_new = V
-        
+        # Helper to contract Diagonal S into U
+        def multiply_U_S(U_tensor, S_data):
+            new_data = {}
+            for (qL, qP, qM), block in U_tensor.data.items():
+                if qM in S_data:
+                    # block: (dL, dP, dM). S: (dM, dM)
+                    new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
+                    new_data[(qL, qP, qM)] = new_block
+            return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
+
+        # Helper to contract S into V
+        def multiply_S_V(S_data, V_tensor):
+            new_data = {}
+            for (qM, qR, qP), block in V_tensor.data.items():
+                if qM in S_data:
+                    # S: (dM, dM). block: (dM, dR, dP)
+                    new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
+                    new_data[(qM, qR, qP)] = new_block
+            return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
+
+        if dir == 'right':
+            # Right Sweep: A = U, B = S * V
+            A_new = U.transpose(0, 2, 1)
+            B_new = multiply_S_V(S_dict, V)
+        else:
+            # Left Sweep: A = U * S, B = V
+            A_US = multiply_U_S(U, S_dict)
+            A_new = A_US.transpose(0, 2, 1)
+            B_new = V
+
         return energy, A_new, B_new, trunc, m_kept
 
     else:
+        # Dense implementation remains unchanged
         W = coarse_grain_MPO(W1,W2)
         AA = coarse_grain_MPS(A,B)
         H = HamiltonianMultiply(E,W,F)
@@ -2007,6 +2005,9 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
             assert dir == 'left'
             A = np.einsum("sij,jk->sik", A, np.diag(S))
         return E[0], A, B, trunc, m
+
+
+
 
 def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None, not_conv_err = True):
     """
@@ -2083,7 +2084,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
     if gauge == None:
         gauge = "Right"
 
-    return Energy, MPS, gauge
+    return Energy, MPS, gauge, converged
 
 
 def expect_mps(bra, MPO, ket=None):
@@ -2162,6 +2163,7 @@ class DMRG:
         self.ground_state = None
         self.ground_state_raw = None
         self.not_conv_err = not_conv_err
+        self.converged = False
 
 
     def run(self):
@@ -2174,9 +2176,8 @@ class DMRG:
                 self.init_guess = dense_to_symmetric(self.init_guess, phys_qns=None)
 
             if self.target_qn is not None:
-                target_qn = int(self.target_qn)
+                target_qn = self.target_qn 
             else:
-                # otherwise infer from last-site right-bond charge
                 qs = sorted({key[1] for key in self.init_guess[-1].data.keys()})
                 if len(qs) != 1:
                     raise ValueError(f"Ambiguous total charge on last bond: {qs}. Set DMRG(..., target_qn=...) explicitly.")
@@ -2184,9 +2185,8 @@ class DMRG:
 
         if self.opt == '1site':
             fDMRG_1site_GS_OBC(self.H, self.D, self.nsweeps)
-
         else:
-            self.e_tot, self.ground_state_raw, self.gauge = two_site_dmrg(
+            self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
                 self.init_guess, self.H, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err)
             self.ground_state = MPS(self.ground_state_raw)
         return self

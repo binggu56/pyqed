@@ -37,6 +37,7 @@ from collections import namedtuple
 from scipy.sparse import identity, kron, csr_matrix, diags
 
 from pyqed import Molecule
+from pyqed.qchem.mcscf.casci import CASCI
 from pyqed.mps.mps import DMRG
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
@@ -223,30 +224,30 @@ def get_entangled_guess(n_elec, n_spin):
         q_l_hf = curr_hf
         phys_hf = hf_config[i] # 1 or 0
         q_r_hf = q_l_hf + phys_hf
-        
+
         key_hf = (q_l_hf, q_r_hf, phys_hf)
         if key_hf not in data: data[key_hf] = np.zeros((1,1,1))
         data[key_hf][0,0,0] += 0.9 # Weight for HF
-        
+
         # Path 2: Doubles
         q_l_dbl = curr_dbl
         phys_dbl = dbl_config[i]
         q_r_dbl = q_l_dbl + phys_dbl
-        
+
         key_dbl = (q_l_dbl, q_r_dbl, phys_dbl)
         if key_dbl not in data: data[key_dbl] = np.zeros((1,1,1))
         data[key_dbl][0,0,0] += 0.1 # Weight for Doubles
-        
+
         qns_L = sorted(list(set(k[0] for k in data)))
         qns_R = sorted(list(set(k[1] for k in data)))
-        
+
         # [0, 1] means both Emp and Occ sectors are allowed
         bt = BlockTensor(data, [qns_L, qns_R, [0, 1]], [-1, 1, 1])
         mps.append(bt)
-        
+
         curr_hf += phys_hf
         curr_dbl += phys_dbl
-        
+
     return mps
 
 def make_u1_random_block_init_guess(
@@ -313,7 +314,7 @@ def make_u1_random_block_init_guess(
             chosen = sorted(set(chosen))
         bond_qns[i] = list(chosen)
 
-    # build site BlockTensors 
+    # build site BlockTensors
     Bs = []
     dtype = np.complex128 if complex_dtype else np.float64
 
@@ -393,12 +394,12 @@ def graphic(sys_block, env_block, sys_label="l"):
 
 
 
-class QCDMRG:
+class QCDMRG(CASCI):
     """
     ab initio DRMG quantum chemistry calculation
     """
-    def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
-                 spin=None, tol=1e-6, target_qn = None):
+    def __init__(self, mf, ncas, nelecas, D, init_guess='cid', m_warmup=None,\
+                 spin=None, tol=1e-6):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -429,6 +430,8 @@ class QCDMRG:
 
         # assert(mf.eri.shape == (self.L, self.L))
 
+        self.spin_purification = False
+
 
         self.D = self.m = D
 
@@ -439,17 +442,15 @@ class QCDMRG:
             m_warmup = D
         self.m_warmup = m_warmup
 
+
         self.ncas = ncas # number of MOs in active space
         self.nelecas = nelecas
 
         self.nelec = mf.nelec
-        if target_qn is None:
-            self.target_qn = self.nelec
-        else:
-            self.target_qn = target_qn
 
         ncore = mf.nelec//2 - self.nelecas//2 # core orbs
         assert(ncore >= 0)
+
 
         self.ncore = ncore
 
@@ -496,6 +497,275 @@ class QCDMRG:
         self.h2e = None
 
         self.init_guess = init_guess
+        
+
+    def get_initial_guess(self, method='cid', noise=1e-3):
+        """
+        Dispatcher for generating U(1) Symmetric Initial Guesses.
+        
+        Options:
+            'hf'       : Pure Hartree-Fock Product State (Bond Dim = 1)
+            'hf_noise' : HF with small random noise in valid sectors (Bond Dim = 1)
+            'cid'      : HF + Doubles (Bond Dim > 1, Entangled). 
+            'random'   : Fully random MPS in target sector (Bond Dim = D)
+        """
+        method = method.lower()
+        print(f"  [InitGuess] Generating U(1) guess: method='{method}' (Target N={self.nelecas})")
+
+        if method == 'hf':
+            return self._guess_hf(noise=0.0)
+        
+        elif method == 'hf_noise':
+            return self._guess_hf(noise=noise)
+        
+        elif method == 'cid':
+            return self._guess_cid(mixing_weight=0.5)
+        
+        elif method == 'cisd':
+            
+            return self._guess_random_cisd(n_states=10, mixing_weight=0.1)
+            
+        elif method == 'random':
+            return make_u1_random_block_init_guess(
+                L=2*self.ncas, 
+                target_qn=self.nelecas,
+                max_bond_sectors=8
+            )
+        else:
+            raise ValueError(f"Unknown initial guess method: {method}")
+
+    def _guess_hf(self, noise=0.0):
+        """
+        Constructs a U(1) BlockTensor MPS representing the Hartree-Fock state.
+        If noise > 0, adds small random values to the allowed blocks.
+        """
+        if not SYMMETRY_AVAILABLE: return []
+        
+        # 1. Define HF Occupation (Spin-Orbitals)
+        # First 'nelecas' orbitals are filled (1), rest are empty (0)
+        occ_pattern = [1]*self.nelecas + [0]*(2*self.ncas - self.nelecas)
+        
+        mps = []
+        curr_q = 0 # Current charge from left
+        
+        for site_idx, occ in enumerate(occ_pattern):
+            # Physical QN: 0 or 1
+            phys_q = occ
+            next_q = curr_q + phys_q
+            
+            # Key: (qL, qR, qP)
+            key = (curr_q, next_q, phys_q)
+            
+            # Create Block (1x1x1 for product state)
+            block = np.zeros((1,1,1), dtype=complex)
+            block[0,0,0] = 1.0
+            
+            # Add noise if requested (keeps it in the same sector)
+            if noise > 0:
+                block[0,0,0] += (np.random.rand() - 0.5) * noise
+                block /= np.linalg.norm(block) # Re-normalize
+            
+            data = {key: block}
+            qns_L = [curr_q]
+            qns_R = [next_q]
+            
+            # Create BlockTensor
+            bt = BlockTensor(data, [qns_L, qns_R, [0, 1]], [-1, 1, 1])
+            mps.append(bt)
+            
+            curr_q = next_q
+            
+        return mps
+
+    def _guess_cid(self, mixing_weight=0.1):
+        """
+        Constructs |HF> + mixing_weight * |Doubles>
+        Moves 2 electrons from HOMO/HOMO-1 to LUMO/LUMO+1
+        """
+        if not SYMMETRY_AVAILABLE: return []
+        
+        n_sites = 2 * self.ncas
+        mps = []
+        
+        # 1. Define Configurations
+        # HF: [1, 1, ..., 1, 0, 0, ...]
+        hf_occ = [1]*self.nelecas + [0]*(n_sites - self.nelecas)
+        
+        # Doubles: Flip last 2 occupied to 0, first 2 empty to 1
+        dbl_occ = hf_occ.copy()
+        if self.nelecas >= 2 and (n_sites - self.nelecas) >= 2:
+            # Annihilate HOMO, HOMO-1
+            dbl_occ[self.nelecas-1] = 0
+            dbl_occ[self.nelecas-2] = 0
+            # Create LUMO, LUMO+1
+            dbl_occ[self.nelecas]   = 1
+            dbl_occ[self.nelecas+1] = 1
+        else:
+            print("  [Warning] Active space too small for Doubles. Reverting to HF.")
+            return self._guess_hf()
+
+        # 2. Build MPS
+        curr_hf = 0
+        curr_dbl = 0
+        
+        for i in range(n_sites):
+            data = {}
+            
+            # HF part
+            q_hf_in = curr_hf
+            p_hf    = hf_occ[i]
+            q_hf_out = q_hf_in + p_hf
+            
+            key_hf = (q_hf_in, q_hf_out, p_hf)
+            if key_hf not in data: data[key_hf] = np.zeros((1,1,1), dtype=complex)
+            data[key_hf][0,0,0] += 1.0 # Main weight
+            
+            # CID part
+            q_dbl_in = curr_dbl
+            p_dbl    = dbl_occ[i]
+            q_dbl_out = q_dbl_in + p_dbl
+            
+            key_dbl = (q_dbl_in, q_dbl_out, p_dbl)
+            if key_dbl not in data: data[key_dbl] = np.zeros((1,1,1), dtype=complex)
+            data[key_dbl][0,0,0] += mixing_weight # Perturbation weight
+            
+            # Collect QNs for metadata
+            qns_L = sorted(list(set(k[0] for k in data)))
+            qns_R = sorted(list(set(k[1] for k in data)))
+            
+            bt = BlockTensor(data, [qns_L, qns_R, [0, 1]], [-1, 1, 1])
+            # Normalize the site
+            bt = bt * (1.0 / bt.norm())
+            
+            mps.append(bt)
+            
+            curr_hf = q_hf_out
+            curr_dbl = q_dbl_out
+            
+        return mps
+
+
+    def _guess_random_cisd(self, n_states=10, mixing_weight=0.1):
+        """
+        Constructs a superposition: |HF> + w * sum(|Excitations>)
+        Fixes boundaries to ensure Dim=1 at edges (Fan-Out / Fan-In).
+        """
+        if not SYMMETRY_AVAILABLE: return []
+        import numpy as np
+        from collections import defaultdict
+
+        # 1. Define HF Configuration
+        hf_config = [1]*self.nelecas + [0]*(2*self.ncas - self.nelecas)
+        
+        # 2. Generate Random Excitation Configs
+        configs = [tuple(hf_config)] # State 0 is HF
+        
+        # Identify Occupied and Virtual indices
+        occ_idxs = [i for i, x in enumerate(hf_config) if x == 1]
+        vir_idxs = [i for i, x in enumerate(hf_config) if x == 0]
+        
+        for _ in range(n_states):
+            new_cfg = list(hf_config)
+            
+            # Decide: Single (50%) or Double (50%)
+            if np.random.rand() > 0.5 and len(occ_idxs)>=2 and len(vir_idxs)>=2:
+                i, j = np.random.choice(occ_idxs, 2, replace=False)
+                a, b = np.random.choice(vir_idxs, 2, replace=False)
+                new_cfg[i] = 0; new_cfg[j] = 0
+                new_cfg[a] = 1; new_cfg[b] = 1
+            else:
+                i = np.random.choice(occ_idxs)
+                a = np.random.choice(vir_idxs)
+                new_cfg[i] = 0
+                new_cfg[a] = 1
+            
+            configs.append(tuple(new_cfg))
+
+        # 3. Trace Quantum Numbers
+        L = len(hf_config)
+        bond_qs = [[0] * len(configs)] # Left boundary 0
+        
+        for i in range(L):
+            curr_qs = bond_qs[-1]
+            next_qs = []
+            for k, cfg in enumerate(configs):
+                next_qs.append(curr_qs[k] + cfg[i])
+            bond_qs.append(next_qs)
+
+        # 4. Build MPS Tensors
+        mps = []
+        for i in range(L):
+            # Group states by Charge Sectors
+            left_groups = defaultdict(list)
+            for k, q in enumerate(bond_qs[i]):
+                left_groups[q].append(k)
+                
+            right_groups = defaultdict(list)
+            for k, q in enumerate(bond_qs[i+1]):
+                right_groups[q].append(k)
+
+            data = {}
+            
+            for k, cfg in enumerate(configs):
+                qL = bond_qs[i][k]
+                qR = bond_qs[i+1][k]
+                p  = cfg[i]
+                
+                # fix boundary rows/cols for Dim=1 at edges as needed in dmrg initialization
+                # Site 0: All states share input vacuum (row=0)
+                if i == 0:
+                    row = 0
+                else:
+                    row = left_groups[qL].index(k)
+                    
+                # Site L-1: All states share output vacuum (col=0)
+                if i == L-1:
+                    col = 0
+                else:
+                    col = right_groups[qR].index(k)
+                
+                key = (qL, qR, p)
+                
+                if key not in data:
+                    # Determine Block Dimensions
+                    if i == 0:   dL = 1
+                    else:        dL = len(left_groups[qL])
+                    
+                    if i == L-1: dR = 1
+                    else:        dR = len(right_groups[qR])
+                    
+                    data[key] = np.zeros((dL, dR, 1), dtype=complex)
+                
+                # Amplitude
+                amp = 1.0 if k == 0 else mixing_weight
+                amp += (np.random.rand() - 0.5) * 1e-4
+                
+                data[key][row, col, 0] = amp
+
+            # Construct QN infromation
+            # Correctly handle boundary dims of 1
+            if i == 0:
+                qns_L = [0]
+            else:
+                qns_L = []
+                for q in sorted(left_groups.keys()):
+                    qns_L.extend([q] * len(left_groups[q]))
+
+            if i == L-1:
+                # Use the target charge (should be same for all k)
+                qns_R = [bond_qs[i+1][0]] 
+            else:
+                qns_R = []
+                for q in sorted(right_groups.keys()):
+                    qns_R.extend([q] * len(right_groups[q]))
+
+            bt = BlockTensor(data, [qns_L, qns_R, [0, 1]], [-1, 1, 1])
+            bt = bt * (1.0 / bt.norm())
+            mps.append(bt)
+
+        print(f"  [InitGuess] Built Randomized CISD guess with {n_states} excitations.")
+        return mps
+
 
     def fix_nelec(self, shift):
         """
@@ -560,8 +830,7 @@ class QCDMRG:
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
-                                     mo_coeff=self.mo_coeff)
+        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore)
 
         self.e_core = energy_core
 
@@ -631,20 +900,58 @@ class QCDMRG:
         #     return H1, H2
         return H1, H2
 
-    def build(self):
+    def build(self, mo_coeff=None):
 
         # 1. Extract Integrals & dims
         # mol = mf.mol
-        mf = self.mf
-        if self.ncore == 0:
-            h1 = mf.get_hcore_mo()
-            eri = mf.get_eri_mo(notation='chem') # (pq|rs)
-        else:
-            h1e, eri = self.get_SO_matrix()
+        # mf = self.mf
+        # if self.ncore == 0:
+        #     h1 = mf.get_hcore_mo()
+        #     eri = mf.get_eri_mo(notation='chem') # (pq|rs)
+        # else:
+        #     h1e, eri = self.get_SO_matrix()
+        
+        # self.nstates = nstates
 
+        # if method == 'ci':
+
+        ncore = self.ncore
+        ncas = self.ncas
+
+        # define the core and active space orbitals
+        if mo_coeff is None:
+            self.mo_coeff = self.mf.mo_coeff # use HF MOs
+        else:
+            self.mo_coeff = mo_coeff
+
+        self.mo_core = self.mo_coeff[:, :ncore]
+        self.mo_cas = self.mo_coeff[:, ncore:ncore+ncas]
+
+
+        # effective H for CAS
+        h1e, eri = self.get_SO_matrix()
+        
+        if self.spin_purification:
+
+            logging.info('Purify spin by energy penalty')
+
+            # if self.shift is not None:
+            # H1, H2 = self.fix_spin(H1, H2, ss=ss, shift=shift)
+            shift = self.shift
+
+            norb = self.ncas
+            h1e = [h + 3./4 * shift * np.eye(norb) for h in h1e]
+
+            for p in range(norb):
+                for q in range(norb):
+                    eri[:, :, p, q, q, p] -=  0.5 * shift * 2
+                    eri[:, :, p, p, q, q] -= 0.25 * shift * 2
+
+        # h2e[0,0] -= h2e[0,0].swapaxes(1,3)
+        # h2e[1,1] -= h2e[1,1].swapaxes(1,3)
+        
 
         n_spatial = self.ncas
-
         nso = 2 * n_spatial
         print(f"  System: {n_spatial} spatial orbitals, {nso} spin-orbitals")
 
@@ -652,11 +959,10 @@ class QCDMRG:
         print("  Building Hamiltonian MPO...")
         ham_terms = []
         cutoff = 1e-10
-
         # --- One-Body Terms: h_pq a+_p a_q ---
-        for p in range(n_spatial):
-            for q in range(n_spatial):
-                val = h1[p, q]
+        for p in range(ncas):
+            for q in range(ncas):
+                val = h1e[0][p, q]
                 if abs(val) > cutoff:
                     # Spin Up (Indices 2p, 2q)
                     ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p, 2*q], val))
@@ -664,11 +970,11 @@ class QCDMRG:
                     ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p+1, 2*q+1], val))
 
         # --- Two-Body Terms: 0.5 * (pq|rs) a+_p a+_r a_s a_q ---
-        for p in range(n_spatial):
-            for q in range(n_spatial):
-                for r in range(n_spatial):
-                    for s in range(n_spatial):
-                        val = 0.5 * eri[p, q, r, s]
+        for p in range(ncas):
+            for q in range(ncas):
+                for r in range(ncas):
+                    for s in range(ncas):
+                        val = 0.5 * eri[0, 0, p, q, r, s]
                         if abs(val) < cutoff: continue
 
                         # p,r creation; s,q annihilation
@@ -710,55 +1016,96 @@ class QCDMRG:
 
         return self
 
-    def run(self, U1=False):
-        # if self.init_guess is None:
-        #     logging.info('Building initial guess by iDMRG')
-        #     # iDMRG
-        if self.H_raw is None: 
+    def run(self, symmetry=False, nsweeps=50):
+        """
+        Only support Abelian symmetry
+
+        Parameters
+        ----------
+        symmetry : TYPE, optional
+            DESCRIPTION. The default is False.
+        nsweeps : TYPE, optional
+            DESCRIPTION. The default is 50.
+
+        Raises
+        ------
+        NotImplementedError
+            DESCRIPTION.
+
+        Returns
+        -------
+        dmrg : TYPE
+            DESCRIPTION.
+
+        """
+
+        if self.H_raw is None:
             self.build()
         final_H = self.H
-        # DMRG Parameters
-        N_SWEEPS = 20
-        Initial_guess_NOISE    = 1e-3
+        
+        # Initial_guess_NOISE    = 1e-3
 
         # get mpo and mps initial guess
         # mpo_dmrg = qc_dmrg_mpo(mf)
-        if U1 and SYMMETRY_AVAILABLE:
+        if symmetry:
             print("  Converting MPO to U(1) Blocks (0=Emp, 1=Occ)...")
             H_input = [w.transpose(0, 3, 1, 2) for w in self.H_raw]
             final_H = convert_mpo_symmetric(H_input)
-            
-            print("  Generating Entangled Guess to force Bond Dim > 1...")
-            
-            if self.target_qn != self.nelec:
-              mps0 = make_u1_random_block_init_guess(2*self.ncas, target_qn=self.target_qn)  
-            else:
-                mps0 = get_entangled_guess(self.nelecas, 2*self.ncas)
 
+            print("  Generating Initial Guess")
+
+            # if self.target_qn != self.nelec:
+                
+            #     if self.init_guess == 'hf':
+            #         mps0 = make_u1_random_block_init_guess(2*self.ncas, target_qn=self.target_qn)
+            # else:
+            
+            # initial guess 
+            # init_guess = self.init_guess.lower()
+            # if init_guess == 'hf':
+            #     pass
+            # elif init_guess == 'cid':
+            #     mps0 = get_entangled_guess(self.nelecas, 2*self.ncas)
+            # elif init_guess == 'idmrg':
+            #     pass
+            # else:
+            #     raise NotImplementedError('Only CID is supported.')
+
+            init_guess = self.init_guess.lower()
+            mps0 = self.get_initial_guess(method=init_guess)
         else:
             print("  Running Dense DMRG...")
-            final_H = self.H 
+            final_H = self.H
+
+            
             mps0 = get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=1e-3)
-        # if self.init_guess == 'hf':
+
         #     mps0 = get_noisy_hf_guess(mol.nelec, 2*self.ncas, noise=Initial_guess_NOISE)
 
 
         t0 = time.time()
-
+        # print(x.shape for x in final_H)  ## for debug only
         # run dmrg!
         print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=N_SWEEPS, init_guess=mps0, U1=U1, target_qn=self.target_qn)
+        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, U1=symmetry, target_qn=self.nelecas, not_conv_err=False)
 
-        
+
         dmrg.run()
+        self.dmrg = dmrg
+        if symmetry:
+            self.check_u1_symmetry()
+
+
+        if not dmrg.converged and self.init_guess == 'hf':
+            print('Consider using initial guess with bond dimension > 1.')
 
         # 6. Report result
-        e_dmrg_total = dmrg.e_tot + self.mf.energy_nuc()
+        e_dmrg_total = dmrg.e_tot + self.e_core
 
         print('final number of electron is ',dmrg.nelec_dmrg())
         print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
         print(f"  E(DMRG) =  {e_dmrg_total:.8f} Ha")
-        print(f"  Correlation Energy = {e_dmrg_total - mf.e_tot:.8f} Ha")
+        print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
         print(f"  Time:               {time.time()-t0:.2f} s")
 
         return dmrg
@@ -767,6 +1114,60 @@ class QCDMRG:
     def dump(self):
         pass
 
+
+    def check_u1_symmetry(self):
+        """
+        Post-run analysis: Checks particle number conservation and prints 
+        the orbital occupancy profile in a Quantum Chemistry context.
+        """
+        if self.dmrg.ground_state is None:
+            print("  [Error] No ground state found. Run DMRG first.")
+            return
+
+        print("\n" + "="*45)
+        print("  U(1) Symmetry Check & Occupancy Profile")
+        print("="*45)
+
+        # 1. Get Occupations from DMRG (returns dict {site_idx: n_val})
+        # This automatically handles the trace logic for you.
+        total_N_measured, local_occs = self.dmrg.nelec_dmrg(return_local=True)
+        
+        # 2. Print Formatted Table
+        print(f"{'Orb':<5} {'Spin':<6} {'Occ':<10} {'Status'}")
+        print("-" * 40)
+        
+        # Iterate through spatial orbitals
+        # self.ncas is the number of spatial orbitals
+        for i in range(self.ncas): 
+            # Map spatial index 'i' to spin-orbital indices
+            idx_up = 2 * i
+            idx_dn = 2 * i + 1
+            
+            n_up = local_occs.get(idx_up, 0.0)
+            n_dn = local_occs.get(idx_dn, 0.0)
+            
+            # Helper to generate status bar
+            def get_status(n):
+                if n > 0.98: return "Full"
+                if n < 0.02: return "."
+                return "~" # Entangled
+
+            print(f"{i:<5} {'Up':<6} {n_up:<10.5f} {get_status(n_up)}")
+            print(f"{i:<5} {'Down':<6} {n_dn:<10.5f} {get_status(n_dn)}")
+            
+        print("-" * 40)
+        
+        # 3. Validation Logic
+        print(f"  Target N: {self.nelecas:.5f}")
+        print(f"  Actual N: {total_N_measured:.5f}")
+        
+        err = abs(total_N_measured - self.nelecas)
+        if err < 1e-5:
+             print("  [PASS] Particle number conserved.")
+        else:
+             print(f"  [FAIL] Particle conservation broken! Error: {err:.2e}")
+             print("         (Check your MPO definitions or Initial Guess)")
+        print("="*45 + "\n")
 
 
 
@@ -784,41 +1185,22 @@ if __name__=='__main__':
     np.set_printoptions(precision=10, suppress=True, threshold=10000, linewidth=300)
 
 
-    # mol = Molecule(atom = [
-    #     ['H' , (0. , 0. , 0)],
-    #     ['Li' , (0. , 0. , 4)]])
-    mol = Molecule(atom = [
-        ['H' , (0. , 0. , 0.91)],
-        ['H' , (0. , 0. , -0.91)],
-        ['H' , (0. , 0. , 3.6)],
-        ['H' , (0. , 0. , -3.6)]])
-        # ['H' , (0. , 0. , 24)],
-        # ['H' , (0. , 0. , 28)]])
-        # ['H' , (0. , 0. , 12)],
-        # ['H' , (0. , 0. , 16)],
-        # ['H' , (0. , 0. , 20)]])
-    # mol = Molecule(atom = [
-    #     ['H' , (0. , 0. , 0)],
-    #     ['H' , (0. , 0. , 4)],
-    #     ['H' , (0. , 0. , 8)],
-    #     ['H' , (0. , 0. , 12)],
-    #     ['H' , (0. , 0. , 16)],
-    #     ['H' , (0. , 0. , 20)]])
-    #     # ['H' , (0. , 0. , 24)],
-    #     # ['H' , (0. , 0. , 28)]])
-    #     # ['H' , (0. , 0. , 12)],
-    #     # ['H' , (0. , 0. , 16)],
-    #     # ['H' , (0. , 0. , 20)]])
-    mol.basis = 'aug-ccpvdz'
-    # mol.basis = '631g'
+    from pyqed.qchem.mol import atomic_chain
+    
+    natom = 6
+    z = np.linspace(-6, 6, natom)
+    mol = atomic_chain(natom, z)
+
+    # mol.basis = 'aug-ccpvdz'
+    mol.basis = 'ccpvdz'
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=20, nelecas=4, D=20, target_qn=None) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
-    dmrg.build().run(U1=True)
-    
+    dmrg = QCDMRG(mf, ncas=12, nelecas=4, D=60, init_guess='cisd') #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg.build().run(symmetry=True)
+
     # mc = CASCI(mf, ncas=8, nelecas=4)
     # mc.run()
 
