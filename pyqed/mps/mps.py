@@ -520,8 +520,8 @@ class MPS:
 
         return MPS(As)
 
-    def __add__(self, other):
-        pass
+    # def __add__(self, other):
+    #     pass
 
     # def evolve_t(self):
     #     pass
@@ -1317,10 +1317,204 @@ class MPO:
         elif isinstance(other, MPS):
             return apply_mpo(self.factors, other.factors)
 
-    def __add__(self, other, compress=False, D=None):
-        # return ...
-        # if compress
-        pass
+
+    def __mul__(self, other):
+        """
+        Element-wise multiplication of MPO with another MPO or scalar.
+
+        Supports:
+        - MPO * MPO: Element-wise (Hadamard) product
+        - MPO * scalar: Scalar multiplication
+
+        For MPO×MPO multiplication, virtual bonds are combined via Kronecker product.
+
+        Parameters
+        ----------
+        other : MPO, int, float, or complex
+            Second operand for multiplication
+
+        Returns
+        -------
+        MPO
+            Element-wise product
+
+        Raises
+        ------
+        ValueError
+            If MPOs have incompatible physical dimensions
+        """
+        # Scalar multiplication
+        if isinstance(other, (int, float, complex)):
+            factors_new = [f.copy() for f in self.factors]
+            factors_new[0] = factors_new[0] * other
+            return MPO(factors_new)
+
+        # MPO * MPO element-wise multiplication
+        elif isinstance(other, MPO):
+            if self.L != other.L:
+                raise ValueError(
+                    f"MPOs must have same length: {self.L} vs {other.L}")
+            
+            if self.dims != other.dims:
+                raise ValueError(
+                    f"Physical dimensions must match: {self.dims} vs {other.dims}")
+
+            factors_new = []
+            for i in range(self.L):
+                # self.factors[i]: (chi1, d, chi2, d)
+                # other.factors[i]: (xi1, d, xi2, d)
+                W1 = self.factors[i]
+                W2 = other.factors[i]
+                
+                # Element-wise product: einsum 'aijb,mijn->amijbn'
+                # Then reshape to (chi1*xi1, d, chi2*xi2, d)
+                core = np.reshape(
+                    np.einsum('aijb,mijn->amijbn', W1, W2),
+                    [W1.shape[0] * W2.shape[0], W1.shape[1], 
+                     W1.shape[2] * W2.shape[2], W1.shape[3]])
+                factors_new.append(core)
+
+            return MPO(factors_new)
+
+        else:
+            raise ValueError(
+                'Second operand must be MPO, int, float, or complex')
+
+    def __add__(self, other):
+        """
+        Add two MPOs element-wise.
+
+        Implements the direct sum in MPO format by concatenating virtual bonds.
+        Both MPOs must have compatible physical dimensions.
+
+        Parameters
+        ----------
+        other : MPO
+            Second MPO to add
+
+        Returns
+        -------
+        MPO
+            Sum of the two MPOs with increased bond dimensions
+
+        Raises
+        ------
+        TypeError
+            If other is not an MPO instance
+        ValueError
+            If MPOs have incompatible shapes
+        """
+        if not isinstance(other, MPO):
+            raise TypeError("Only support addition of two MPO objects.")
+
+        if self.L != other.L:
+            raise ValueError(
+                f"MPOs must have same length: {self.L} vs {other.L}")
+
+        if self.dims != other.dims:
+            raise ValueError(
+                f"Physical dimensions must match: {self.dims} vs {other.dims}")
+
+        sum_factors = []
+        for i in range(self.L):
+            # factors: (chi1, d, chi2, d)
+            W1 = self.factors[i]
+            W2 = other.factors[i]
+            r1_l, d, r1_r, _ = W1.shape
+            r2_l, _, r2_r, _ = W2.shape
+            
+            if i == 0:
+                # First site: concatenate along right bond (axis 2)
+                W_sum = np.concatenate([W1, W2], axis=2)
+            elif i == self.L - 1:
+                # Last site: concatenate along left bond (axis 0)
+                W_sum = np.concatenate([W1, W2], axis=0)
+            else:
+                # Middle sites: block diagonal structure
+                W_sum = np.zeros((r1_l + r2_l, d, r1_r + r2_r, d), 
+                                dtype=W1.dtype)
+                W_sum[:r1_l, :, :r1_r, :] = W1
+                W_sum[r1_l:, :, r1_r:, :] = W2
+
+            sum_factors.append(W_sum)
+        
+        return MPO(sum_factors)
+
+
+
+    def exponential(self, constant=1.0, method='taylor', order=4, scale=0):
+        """
+        Calculate the exponential of an MPO: exp(constant*self).
+
+        Parameters
+        ----------
+        constant : float
+            Constant coefficient in the exponent
+            For time propagation (time-evolution operator), use constant = -i*dt (with ℏ=1)
+            For thermal density matrix (Boltzmann operator), use constant = -β where β=1/kT
+        method : str
+            Method to use for calculation. Options:
+            - 'taylor': Taylor expansion (default)
+        order : int
+            Order of the Taylor expansion (only for method='taylor'), default is 4
+        scale : int
+            Scaling parameter 2^scale for better numerical stability, default is 0
+            Details: exp(x) = (exp(x/2^scale))^(2^scale) scale-squaring technique to ensure unitarity
+
+        Returns
+        -------
+        MPO
+            Result of the exponential operation exp(constant*self)
+        """
+        if method != 'taylor':
+            raise ValueError(f"Method '{method}' not implemented. Only 'taylor' is supported.")
+
+        # Scale constant for numerical stability
+        scaled_constant = constant / (2 ** scale)
+
+        # Create identity MPO
+        identity_factors = []
+        for i in range(self.L):
+            d = self.dims[i]
+            if i == 0:
+                # First site: (1, d, 1, d)
+                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
+                for j in range(d):
+                    W[0, j, 0, j] = 1.0
+            elif i == self.L - 1:
+                # Last site: (1, d, 1, d)
+                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
+                for j in range(d):
+                    W[0, j, 0, j] = 1.0
+            else:
+                # Middle sites: (1, d, 1, d)
+                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
+                for j in range(d):
+                    W[0, j, 0, j] = 1.0
+            identity_factors.append(W)
+
+        result = MPO(identity_factors)
+        
+        # Taylor expansion: exp(x) = sum_{k=0}^{order} x^k / k!
+        # term keeps track of (constant*self)^k
+        term = MPO([f.copy() for f in identity_factors])  # k=0 term
+        
+        factorial = 1
+        for k in range(1, order + 1):
+            # Compute next term: term = term @ self
+            term = term @ self
+            factorial = factorial * k
+            coefficient = (scaled_constant ** k) / factorial
+
+            # Add this term: result = result + coefficient * term
+            result = result + (term * coefficient)
+
+        # Apply scaling: result = result^(2^scale)
+        for _ in range(scale):
+            result = result @ result
+
+        return result
+
 
 
 # apply_mpo_to_mps = apply_mpo
@@ -2183,7 +2377,6 @@ def expect_mps(bra, MPO, ket=None):
     for i in range(0,len(MPO)):
         E = contract_from_left(MPO[i], AList[i], E, BList[i])
     return E[0][0][0]
-
 
 
 
