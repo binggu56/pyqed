@@ -520,8 +520,8 @@ class MPS:
 
         return MPS(As)
 
-    def __add__(self, other):
-        pass
+    # def __add__(self, other):
+    #     pass
 
     # def evolve_t(self):
     #     pass
@@ -1261,7 +1261,11 @@ class MPO:
         Parameters
         ----------
         factors : list
-            list of 4-tensors of dimension. [chi1, d, chi2, d]
+            list of 4-tensors of dimension. [chi1, chi2, d_up, d_down]
+            chi1: left virtual bond
+            chi2: right virtual bond  
+            d_up: physical output (bra)
+            d_down: physical input (ket)
         chi_max:
             maximum bond order used in compress. Default None.
 
@@ -1273,55 +1277,262 @@ class MPO:
         self.factors = self.data = self.cores = factors
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
-        # self.chi_max = chi_max
 
 
         if homogenous:
-            self.dims = [factors[0].shape[1], ] * self.nsites
+            self.dims = [factors[0].shape[2], ] * self.nsites
         else:
-            self.dims = [t.shape[1] for t in factors] # physical dims of each site
-
-        # self._mpo = None
+            self.dims = [t.shape[2] for t in factors]
 
     def bond_orders(self):
-        return [t.shape[0] for t in self.factors] # bond orders
+        """Return right bond dimensions for each site."""
+        return [t.shape[1] for t in self.factors] 
 
     def ground_state(self, algorithm='dmrg'):
         pass
 
     def dot(self, mps, rank):
         # apply MPO to MPS followed by a compression
-
-        factors = apply_mpo(self.factors, mps.factors, rank)
-
+        factors = apply_mpo(self.factors, mps.factors, rank)  
         return MPS(factors)
-
-    def __matmul__(self, other, compress=False, D=None):
+    
+    
+    def matmul(self, other, chi_max=None):
         """
-        define product of two MPOs
-
-        Parameters
-        ----------
-        other : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
+        MPO @ MPO -> MPO
+        MPO @ MPS -> MPS 
         """
+        if chi_max is None:
+            chi_max = max(self.bond_orders()+other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders())*2
         if isinstance(other, MPO):
-            return product_MPO(self.factors, other.factors)
+            new_factors = product_MPO(self.factors, other.factors)
+            new_factors, _ = compress(new_factors, chi_max)
+            return MPO(new_factors)
 
         elif isinstance(other, MPS):
-            return apply_mpo(self.factors, other.factors)
+            new_factors, _ = apply_mpo(self.factors, other.factors, chi_max)  
+            return MPS(new_factors)
+        
+        raise TypeError(f"Unsupported operand type: {type(other)}")
 
-    def __add__(self, other, compress=False, D=None):
-        # return ...
-        # if compress
-        pass
 
+    def __mul__(self, other):
+        """
+        Element-wise multiplication of MPO with another MPO or scalar.
+        MPO index order: [chi1, chi2, d_up, d_down]
+        """
+        # Scalar multiplication
+        if isinstance(other, (int, float, complex)):
+            factors_new = self.factors
+            factors_new[0] = factors_new[0] * other
+            return MPO(factors_new)
+
+        # MPO * MPO element-wise multiplication
+        elif isinstance(other, MPO):
+            if self.L != other.L:
+                raise ValueError(
+                    f"MPOs must have same length: {self.L} vs {other.L}")
+            
+            if self.dims != other.dims:
+                raise ValueError(
+                    f"Physical dimensions must match: {self.dims} vs {other.dims}")
+
+            factors_new = []
+            for i in range(self.L):
+                # W1, W2: [chi1, chi2, d_up, d_down] = [a, b, i, j]
+                W1 = self.factors[i]
+                W2 = other.factors[i]
+                
+                # Element-wise product on physical indices, Kronecker on virtual
+                # einsum: 'abij,mnij->ambnij' then reshape to [chi1*xi1, chi2*xi2, d_up, d_down]
+                core = np.reshape(
+                    np.einsum('abij,mnij->ambnij', W1, W2),
+                    [W1.shape[0] * W2.shape[0],   # chi1 * xi1
+                     W1.shape[1] * W2.shape[1],   # chi2 * xi2
+                     W1.shape[2],                  # d_up
+                     W1.shape[3]])                 # d_down
+                factors_new.append(core)
+
+            return MPO(factors_new)
+
+        else:
+            raise ValueError(
+                'Second operand must be MPO, int, float, or complex')
+
+
+    def __add__(self, other):
+        """
+        Add two MPOs element-wise.
+        MPO index order: [chi1, chi2, d_up, d_down]
+        """
+        if not isinstance(other, MPO):
+            raise TypeError("Only support addition of two MPO objects.")
+
+        if self.L != other.L:
+            raise ValueError(
+                f"MPOs must have same length: {self.L} vs {other.L}")
+
+        if self.dims != other.dims:
+            raise ValueError(
+                f"Physical dimensions must match: {self.dims} vs {other.dims}")
+
+        sum_factors = []
+        for i in range(self.L):
+            # factors: [chi1, chi2, d_up, d_down]
+            W1 = self.factors[i]
+            W2 = other.factors[i]
+            r1_l, r1_r, d_up, d_down = W1.shape  # chi1, chi2, d_up, d_down
+            r2_l, r2_r, _, _ = W2.shape
+            
+            if i == 0:
+                # First site: concatenate along right bond (axis 1)
+                W_sum = np.concatenate([W1, W2], axis=1)
+            elif i == self.L - 1:
+                # Last site: concatenate along left bond (axis 0)
+                W_sum = np.concatenate([W1, W2], axis=0)
+            else:
+                # Middle sites: block diagonal structure
+                out_dtype = np.result_type(W1.dtype, W2.dtype)
+                W_sum = np.zeros((r1_l + r2_l, r1_r + r2_r, d_up, d_down),
+                                    dtype=out_dtype)
+                W_sum[:r1_l, :r1_r, :, :] = W1
+                W_sum[r1_l:, r1_r:, :, :] = W2
+
+            sum_factors.append(W_sum)
+        
+        return MPO(sum_factors)
+
+    def __rmul__(self, other):
+        """
+        Support scalar * MPO and MPO * MPO via reflected multiplication.
+        This simply delegates to __mul__ so that multiplication is
+        effectively commutative for the supported operand types.
+        """
+        return self.__mul__(other)
+
+    def exponential(self, constant=1.0, D=None, method='taylor', order=4, scale=0):
+        """
+        Calculate the exponential of an MPO: exp(constant*self).
+        MPO index order: [chi1, chi2, d_up, d_down]
+        """
+        if method != 'taylor':
+            raise ValueError(f"Method '{method}' not implemented. Only 'taylor' is supported.")
+
+        scaled_constant = constant / (2 ** scale)
+
+        constant_dtype = np.array(scaled_constant).dtype
+        mpo_dtype = self.factors[0].dtype
+        result_dtype = np.result_type(constant_dtype, mpo_dtype)
+
+        # Create identity MPO with correct index order [chi1, chi2, d_up, d_down]
+        identity_factors = []
+        for i in range(self.L):
+            d = self.dims[i]
+            # Identity: [1, 1, d, d] with delta_{ij}
+            W = np.zeros((1, 1, d, d), dtype=result_dtype)
+            for j in range(d):
+                W[0, 0, j, j] = 1.0
+            identity_factors.append(W)
+
+        result = MPO(identity_factors)
+        term = MPO(identity_factors)
+        
+        factorial = 1
+        for k in range(1, order + 1):
+            term = term.matmul(self, chi_max=D)
+            factorial = factorial * k
+            coefficient = (scaled_constant ** k) / factorial
+            result = result + (term * coefficient)
+
+        for _ in range(scale):
+            result = result.matmul(result, chi_max=D)
+
+        return result
+
+
+def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
+    """
+    Generate a Gaussian wave packet (GWP) in matrix product state (MPS) format.
+    MPS index order: [chi1, chi2, d] = [left_bond, right_bond, physical]
+    """
+    ndim = len(coord)
+    mps = []
+    
+    if nstates is not None:
+        # State tensor: [chi1, chi2, d] = [1, 1, nstates]
+        s = np.zeros((1, 1, nstates), dtype=complex)
+        s[0, 0, inistates] = 1.0
+        mps.append(s)
+
+    if a is None:
+        a = np.eye(ndim)
+    if dx is None:
+        dx = np.ones(ndim)
+    if x0 is None:
+        x0 = [0] * ndim
+    else:
+        x0 = list(x0)
+        if len(x0) < ndim:
+            x0 += [0] * (ndim - len(x0))
+        else:
+            x0 = x0[:ndim]
+
+    for i in range(ndim):
+        # GWP tensor: [chi1, chi2, d] = [1, 1, len(coord[i])]
+        gwp = np.zeros((1, 1, len(coord[i])), dtype=complex)
+        x = coord[i]
+        ai = a[i, i]
+        gwp[0, 0, :] = (ai / np.pi) ** (1 / 4) * np.exp(-ai * (x - x0[i]) ** 2 / 2.) * np.exp(
+            1j * p0 * (x - x0[i])) * np.sqrt(dx[i])
+        mps.append(gwp)
+    return mps
+
+def show(tt_in):
+    """Check and display mode sizes and TT-ranks of the given TT-tensor.
+    
+    MPS index order: [chi1, chi2, d]
+    MPO index order: [chi1, chi2, d_up, d_down]
+    """
+    if not isinstance(tt_in, MPS) and not isinstance(tt_in, MPO):
+        tt = tt_in
+    else:
+        tt = tt_in.factors
+
+    d = len(tt)
+    n = []
+    r = [1]
+
+    for G in tt:
+        if len(G.shape) not in (3, 4):
+            raise ValueError('Invalid core for TT-tensor')
+
+        if G.shape[0] != r[-1]:
+            raise ValueError('Invalid shape of core for TT-tensor')
+        
+        if len(G.shape) == 4:
+            label = 'MPO'
+            n.append(G.shape[2])  
+        elif len(G.shape) == 3:
+            label = 'MPS'
+            n.append(G.shape[2])  
+
+        r.append(G.shape[1])  
+
+    if r[-1] != 1:
+        raise ValueError('Invalid shape of core for TT-tensor')
+
+    text1 = f'{label} with {d:-5d}D : '
+    text2 = ' '
+
+    for k in range(d):
+        text1 += ' ' * max(0, len(text2) - len(text1) - 1)
+        text1 += f'|{n[k]}|'
+
+        if k < d - 1:
+            text2 += ' ' * (len(text1) - len(text2) - 1)
+            text2 += f'\\{r[k + 1]}/'
+
+    print(text1 + '\n' + text2)
 
 # apply_mpo_to_mps = apply_mpo
 
@@ -1329,64 +1540,120 @@ def apply_mpo(w_list, B_list, chi_max):
     """
     Apply the MPO to an MPS.
 
-    MPS in :math:`[\alpha_l, d_l, \alpha_{l+1}]`
-
-    MPO in :math:`[\alpha_l, d_l, \alpha_{l+1}, d_l]`
+    MPS index order: [chi1, chi2, d] = [left_bond, right_bond, physical]
+    MPO index order: [chi1, chi2, d_up, d_down] = [left_bond, right_bond, out, in]
 
     Parameters
     ----------
-    B_list : TYPE
-        DESCRIPTION.
-    s_list : TYPE
-        DESCRIPTION.
-    w_list : TYPE
-        DESCRIPTION.
-    chi_max : TYPE
-        DESCRIPTION.
+    w_list : list
+        MPO tensors, each with shape [chi1, chi2, d_up, d_down].
+    B_list : list
+        MPS tensors, each with shape [chi1, chi2, d].
+    chi_max : int
+        Maximum bond dimension for compression.
 
     Returns
     -------
-    None.
-
+    tuple
+        (compressed_mps, truncation_error)
+        
+    Note
+    ----
+    This function does NOT modify the input B_list.
     """
+    if isinstance(w_list, MPO):
+        w_list_copy = w_list.factors
+    else:
+        w_list_copy = w_list
+    if isinstance(B_list, MPS):
+        B_list_copy = B_list.factors
+    else:
+        B_list_copy = B_list
 
-    # d = B_list[0].shape[1] # size of local space
-    # D = w_list[0].shape[1]
+    L = len(w_list_copy)
+    if L > len(B_list_copy):
+        raise ValueError("MPO must have the same or shorter length than MPS.")
+    
+    result = [B.copy() for B in B_list_copy]
 
-    L = len(B_list) # nsites
+    for i_site in range(L):
+        # B: [chi_L, chi_R, d]
+        # W: [b_L, b_R, d_out, d_in]
+        chi_L, chi_R, d = result[i_site].shape
+        b_L, b_R, d_out, d_in = w_list_copy[i_site].shape
+        # Contract W[..., d_in] with B[..., d]
+        # W: abij (a=b_L, b=b_R, i=d_out, j=d_in)
+        # B: klj (k=chi_L, l=chi_R, j=d)
+        # einsum: 'abij,klj->akbli' then reshape to [chi_L*b_L, chi_R*b_R, d_out]
+        B_new = np.einsum('abij,klj->akbli', w_list_copy[i_site], result[i_site])
+        B_new = np.reshape(B_new, (chi_L * b_L, chi_R * b_R, d_out))
+        result[i_site] = B_new
+    
+    return compress(result, chi_max)
 
-    chi1, d, chi2 = B_list[0].shape # left and right bond dims
-    b1, d, b2, d = w_list[0].shape # left and right bond dims
 
-    B = np.tensordot(w_list[0], B_list[0], axes=(3,1))
-    B = np.transpose(B,(3,0,1,4,2))
+def product_W(W, X):
+    """
+    'Vertical' product of MPO W-matrices.
+    
+    MPO index order: [chi1, chi2, d_up, d_down]
+    
+    Diagram:
+           |d_up (from W)
+          -W- 
+           | (W's d_down contracts with X's d_up)
+          -X-
+           |d_down (from X)
+           
+    W acts first (on ket), X acts second.
+    Result: [chi1_W * chi1_X, chi2_W * chi2_X, d_up_W, d_down_X]
+    """
+    # W: [a, b, s, t] = [chi1, chi2, d_up, d_down]
+    # X: [c, d, t, u] = [chi1, chi2, d_up, d_down]
+    # Contract W's d_down (t) with X's d_up (t)
+    # Result indices: a, b, s (from W), c, d, u (from X)
+    # Final shape: [a*c, b*d, s, u]
+    return np.reshape(
+        np.einsum("abst,cdtu->acbdsu", W, X), 
+        [W.shape[0] * X.shape[0],   # chi1
+         W.shape[1] * X.shape[1],   # chi2
+         W.shape[2],                 # d_up (from W)
+         X.shape[3]]                 # d_down (from X)
+    )
 
-    B = np.reshape(B,(chi1*b1, d, chi2*b2))
 
-    B_list[0] = B
+def product_MPO(M1, M2):
+    """
+    Vertical product of two MPOs: M1 @ M2.
+    
+    M1 acts first (closer to ket), M2 acts second (closer to bra).
+    
+    Note: This function does NOT modify M1 or M2.
+    """
+    if isinstance(M1, MPO):
+        M1_copy = M1.factors
+    else:
+        M1_copy = M1 
+    if isinstance(M2, MPO):
+        M2_copy = M2.factors
+    else:
+        M2_copy = M2
+    
+    L=min(len(M1_copy), len(M2_copy))
+    
+    Result = []
+    for i in range(L):
+        Result.append(product_W(M1_copy[i], M2_copy[i]))
+    if len(M1_copy) > L:
+        for i in range(L, len(M1_copy)):
+            Result.append(M1_copy[i])
+    if len(M2_copy) > L:
+        for i in range(L, len(M2_copy)):
+            Result.append(M2_copy[i])
+    return Result
 
-    for i_site in range(1,L-1):
-        chi1, d, chi2 = B_list[i_site].shape
-        b1, _, b2, _ = w_list[i_site].shape # left and right bond dims
 
-        B = np.tensordot(w_list[i_site], B_list[i_site], axes=(3,1))
-        B = np.reshape(np.transpose(B,(3,0,1,4,2)),(chi1*b1, d, chi2*b2))
 
-        B_list[i_site] = B
-        # s_list[i_site] = np.reshape(np.tensordot(s_list[i_site],np.ones(D),axes=0),D*chi1)
-
-    # last site
-    chi1, d, chi2 = B_list[L-1].shape
-    b1, _, b2, _ = w_list[L-1].shape # left and right bond dims
-
-    B = np.tensordot(w_list[L-1], B_list[L-1], axes=(3,1))
-    B = np.reshape(np.transpose(B,(3,0,1,4,2)),(chi1*b1, d, chi2*b2))
-
-    # s_list[L-1] = np.reshape(np.tensordot(s_list[L-1],np.ones(D),axes=0),D*chi1)
-    B_list[L-1] = B
-
-    return B
-    # return compress(B_list, chi_max)
 
 '''
     Function that makes the following contractions (numbers denote leg order):
@@ -1773,40 +2040,6 @@ def coarse_grain_MPO(W, X):
                        W.shape[3]*X.shape[3]])
 
 
-def product_W(W, X):
-    """
-    # 'vertical' product of MPO W-matrices
-    #        |
-    #  |    -W-
-    # -R- =  |
-    #  |    -X-
-    #        |
-
-    Parameters
-    ----------
-    W : TYPE
-        DESCRIPTION.
-    X : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    """
-    return np.reshape(np.einsum("abst,cdtu->acbdsu", W, X), [W.shape[0]*X.shape[0],
-                                                             W.shape[1]*X.shape[1],
-                                                             W.shape[2],X.shape[3]])
-
-
-def product_MPO(M1, M2):
-    assert len(M1) == len(M2)
-    Result = []
-    for i in range(0, len(M1)):
-        Result.append(product_W(M1[i], M2[i]))
-    return Result
-
 
 
 def coarse_grain_MPS(A,B):
@@ -2183,7 +2416,6 @@ def expect_mps(bra, MPO, ket=None):
     for i in range(0,len(MPO)):
         E = contract_from_left(MPO[i], AList[i], E, BList[i])
     return E[0][0][0]
-
 
 
 
