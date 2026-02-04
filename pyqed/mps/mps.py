@@ -1452,8 +1452,78 @@ class MPO:
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
     """
-    Generate a Gaussian wave packet (GWP) in matrix product state (MPS) format.
-    MPS index order: [chi1, chi2, d] = [left_bond, right_bond, physical]
+    Generate a separable Gaussian wave packet (GWP) in matrix product state (MPS) form.
+
+    This routine builds a product MPS where each physical dimension is represented by
+    a rank-3 tensor of shape ``[1, 1, d]``. The first tensor can optionally encode a
+    discrete internal state basis of size ``nstates``. The spatial part is a direct
+    product of 1D Gaussians, one per coordinate dimension, with optional momentum
+    phase factors.
+
+    MPS index order: ``[chi1, chi2, d] = [left_bond, right_bond, physical]``.
+
+    Parameters
+    ----------
+    coord : list or array-like
+        Sequence of 1D coordinate arrays. ``coord[i]`` provides the grid for the
+        ``i``-th spatial dimension.
+    nstates : int, optional
+        Number of internal (discrete) states. If provided, a leading state tensor of
+        shape ``[1, 1, nstates]`` is prepended to the MPS.
+    inistates : int, optional
+        Index of the initial internal state set to 1. Default is 0.
+    a : array-like, optional
+        Diagonal width matrix for the Gaussian. Only the diagonal entries ``a[i,i]``
+        are used. If omitted, the identity matrix is used.
+    x0 : float or array-like, optional
+        Initial position(s). If scalar, the same value is used for all dimensions.
+        If array-like, it is broadcast or truncated to match the number of dimensions.
+    p0 : float, optional
+        Initial momentum (same for all dimensions). Default is 0.
+    dx : array-like, optional
+        Grid spacings per dimension used for normalization. If omitted, all ones are used.
+    **kwargs : dict
+        Extra keyword arguments (currently unused; kept for API compatibility).
+
+    Returns
+    -------
+    mps : list of numpy.ndarray
+        List of MPS core tensors (complex dtype). Each tensor is rank-3 with
+        shape ``[1, 1, d]``.
+
+    Notes
+    -----
+    The 1D Gaussian for dimension ``i`` is
+
+    $$
+    \psi_i(x) = \left(\frac{a_i}{\pi}\right)^{1/4}
+    \exp\left[-\frac{a_i}{2}(x-x_{0,i})^2\right]
+    \exp\left[i p_0 (x-x_{0,i})\right],
+    $$
+
+    where ``a_i = a[i,i]``. The total wave packet is the product over dimensions.
+
+    Examples
+    --------
+    Build a 2D Gaussian packet on two grids (no internal state)::
+
+        x = np.linspace(-5.0, 5.0, 101)
+        y = np.linspace(-3.0, 3.0, 61)
+        mps = gwp_mps([x, y], a=np.diag([1.0, 2.0]), x0=[0.5, -0.2], p0=1.5)
+
+    Include a 3-level internal state with initial state index 1::
+        x = np.linspace(-4.0, 4.0, 81)
+        mps = gwp_mps([x], nstates=3, inistates=1, a=np.diag([0.8]))
+    return mps:
+        site0: shape (1, 1, 3)  # internal state, only have vaule at index (:,:,1)
+        site1: shape (1, 1, 81) # GWP
+        Notes
+    -----
+    - The first tensor in the MPS represents the quantum state if `nstates` is provided.
+    - The Gaussian wave packet is computed as:
+      `(a / π)^(1/4) * exp(-a * (x - x0)^2 / 2) * exp(1j * p0 * (x - x0))`
+      where `a` is the width parameter, `x` is the coordinate, `x0` is the initial position,
+      and `p0` is the momentum.
     """
     ndim = len(coord)
     mps = []
@@ -1488,10 +1558,26 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
     return mps
 
 def show(tt_in):
-    """Check and display mode sizes and TT-ranks of the given TT-tensor.
-    
-    MPS index order: [chi1, chi2, d]
-    MPO index order: [chi1, chi2, d_up, d_down]
+    """
+    Check and display mode sizes and TT-ranks of a TT/MPS/MPO tensor.
+
+    MPS index order: ``[chi1, chi2, d]``
+    MPO index order: ``[chi1, chi2, d_up, d_down]``
+
+    Parameters
+    ----------
+    tt_in : MPS, MPO, or list of numpy.ndarray
+        Input tensor network or list of cores. Each core must have shape
+        ``[r_{k}, r_{k+1}, d]`` (MPS) or ``[r_{k}, r_{k+1}, d_up, d_down]`` (MPO).
+
+
+    Examples
+    --------
+    Display summary for a list of cores (raw TT)::
+        cores = [np.random.rand(1, 4, 2, 2), np.random.rand(4, 6,4,4), np.random.rand(6, 1, 8, 8)]
+        show(cores)
+            TT-tensor     3D : |2| |4|  |8|
+            Type  = MPO :        \4/ \6/
     """
     if not isinstance(tt_in, MPS) and not isinstance(tt_in, MPO):
         tt = tt_in
