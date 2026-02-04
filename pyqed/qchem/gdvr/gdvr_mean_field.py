@@ -671,7 +671,7 @@ class SweepNewtonHelper(NewtonHelper):
             w = np.linalg.eigvalsh(H_nn)
             min_eig = w[0]
             # The ridge shift makes the minimum eigenvalue at least ridge_base
-            auto_ridge = max(0.0, ridge_base - min_eig)
+            auto_ridge = max(ridge_base, ridge_base - min_eig)
         except np.linalg.LinAlgError:
             # Fallback for extreme numerical cases
             auto_ridge = ridge_base
