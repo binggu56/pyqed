@@ -1448,7 +1448,7 @@ class MPO:
 
         Parameters
         ----------
-        constant : float
+        constant : float or complex
             Constant coefficient in the exponent
             For time propagation (time-evolution operator), use constant = -i*dt (with ℏ=1)
             For thermal density matrix (Boltzmann operator), use constant = -β where β=1/kT
@@ -1472,25 +1472,21 @@ class MPO:
         # Scale constant for numerical stability
         scaled_constant = constant / (2 ** scale)
 
-        # Create identity MPO
+        # Determine the appropriate dtype for the result
+        # Need to handle: real MPO with complex constant, complex MPO with real constant, etc.
+        constant_dtype = np.array(scaled_constant).dtype
+        mpo_dtype = self.factors[0].dtype
+        # Use numpy's result_type to determine the appropriate output dtype
+        result_dtype = np.result_type(constant_dtype, mpo_dtype)
+
+        # Create identity MPO with the correct dtype
         identity_factors = []
         for i in range(self.L):
             d = self.dims[i]
-            if i == 0:
-                # First site: (1, d, 1, d)
-                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
-                for j in range(d):
-                    W[0, j, 0, j] = 1.0
-            elif i == self.L - 1:
-                # Last site: (1, d, 1, d)
-                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
-                for j in range(d):
-                    W[0, j, 0, j] = 1.0
-            else:
-                # Middle sites: (1, d, 1, d)
-                W = np.zeros((1, d, 1, d), dtype=self.factors[0].dtype)
-                for j in range(d):
-                    W[0, j, 0, j] = 1.0
+            # All sites have the same structure for identity: (1, d, 1, d)
+            W = np.zeros((1, d, 1, d), dtype=result_dtype)
+            for j in range(d):
+                W[0, j, 0, j] = 1.0
             identity_factors.append(W)
 
         result = MPO(identity_factors)
