@@ -9,6 +9,7 @@ Created on Mon Feb  2 00:26:16 2026
 from pyqed import Molecule
 import numpy as np
 from math import pi
+import warnings
 
 #TODO: TO BE REMOVED
 from ase.utils import string2index
@@ -19,12 +20,18 @@ class Atoms(Molecule):
     This is to define Atoms for MD, learn from ASE.
     It should be combined with Molecule class. (or should it?)
     """
-    def __init__(self, atom, *args, cell=None, pbc=None, **kwargs):
+    def __init__(self, atom, *args, cell=None, pbc=None, calculator=None, \
+                 constraint=None, **kwargs):
         super().__init__(atom, *args, **kwargs)
-
-        if cell is None:
-            cell = np.zeros((3, 3))
-        self.set_cell(cell)
+        
+        # self.cell = cell
+        # if cell is None:
+        #     cell = np.zeros((3, 3))
+        #     self.set_cell(cell)
+        self.positions = self.atom_coords()
+        self.symbols = self.atom_symbols()
+        
+        
 
     def set_cell(self, cell, scale_atoms=False, apply_constraint=True):
         """Set unit cell vectors.
@@ -82,6 +89,15 @@ class Atoms(Molecule):
             self.positions[:] = np.dot(self.positions, M)
 
         self.cell[:] = cell
+    
+    def get_reciprocal_cell(self):
+        """Get the three reciprocal lattice vectors as a 3x3 ndarray.
+    
+        Note that the commonly used factor of 2 pi for Fourier
+        transforms is not included here."""
+    
+        rec_unit_cell = np.linalg.pinv(self.get_cell()).transpose()
+        return rec_unit_cell
 
     @property
     def pbc(self):
@@ -247,6 +263,50 @@ class Atoms(Molecule):
         axis = self.positions[a3] - self.positions[a2]
         center = self.positions[a3]
         self._masked_rotate(center, axis, diff, mask)
+        
+    def get_dihedral(self, a1, a2=None, a3=None, a4=None, mic=False):
+        """Calculate dihedral angle.
+
+        Calculate dihedral angle (in degrees) between the vectors a1->a2
+        and a3->a4.
+
+        Use mic=True to use the Minimum Image Convention and calculate the
+        angle across periodic boundaries.
+        """
+
+        if a2 is None:
+            # Old way - use radians
+            warnings.warn(
+                'Please use new API (which will return the angle in degrees): '
+                'atoms_obj.get_dihedral(a1,a2,a3,a4)*pi/180 instead of '
+                'atoms_obj.get_dihedral([a1,a2,a3,a4])')
+            assert a3 is None and a4 is None
+            a1, a2, a3, a4 = a1
+            f = pi / 180
+        else:
+            f = 1
+
+        # vector 1->2, 2->3, 3->4 and their normalized cross products:
+        a = self.positions[a2] - self.positions[a1]
+        b = self.positions[a3] - self.positions[a2]
+        c = self.positions[a4] - self.positions[a3]
+        if mic:
+            a, b, c = find_mic([a, b, c], self._cell, self._pbc)[0]
+        bxa = np.cross(b, a)
+        bxa /= np.linalg.norm(bxa)
+        cxb = np.cross(c, b)
+        cxb /= np.linalg.norm(cxb)
+        angle = np.vdot(bxa, cxb)
+        # check for numerical trouble due to finite precision:
+        if angle < -1:
+            angle = -1
+        if angle > 1:
+            angle = 1
+        angle = np.arccos(angle) * 180 / pi
+        if np.vdot(bxa, c) > 0:
+            angle = 360 - angle
+        return angle * f
+
 
     def rotate_dihedral(self, a1, a2, a3, a4, angle, mask=None, indices=None):
         """Rotate dihedral angle.
@@ -383,7 +443,7 @@ if __name__=='__main__':
     mol = Atoms(atom = [
         ['H' , (0. , 0. , 0.91)],
         ['H' , (0. , 0. , -0.91)],
-        ['H' , (0. , 0. , 3.6)],
-        ['H' , (0. , 0. , -3.6)]])
+        ['H' , (0. , 0.5 , 3.6)],
+        ['H' , (0. , 1. , -3.6)]])
 
-    print(mol.get_angle(1,2,3))
+    print(mol.get_dihedral(0,1,2,3))
