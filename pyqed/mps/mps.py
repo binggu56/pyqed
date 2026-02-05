@@ -347,14 +347,14 @@ class MPS:
 
         self.bc = bc
         self.L = len(Bs)
-        self.nbonds = self.L - 1 if self.bc == 'open' else self.L
+        self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
         self.gauge = None
 
         self.data = self.factors = Bs
         
         if homogenous:
             try:
-                self.dim = Bs[0].shape[1]
+                self.dim = Bs[0].shape[self.p_idx]
             except TypeError:
                 if hasattr(Bs[0], 'data'):
                     # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
@@ -421,8 +421,9 @@ class MPS:
         Internal Helper: Returns B[i] transposed to standard [Left, Phys, Right].
         """
         B = self.Bs[i]
-        if hasattr(B, 'data'): 
-            return B # avoid redundant transpose for BlockTensor
+        # Check if it has data AND that data is a dict (BlockTensor structure)
+        if hasattr(B, 'data') and isinstance(B.data, dict): 
+            return B 
         return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
     def get_bond_dimensions(self):
@@ -496,7 +497,7 @@ class MPS:
         bonds = range(1, self.L) if self.bc == 'finite' else range(0, self.L)
         result = []
         for i in bonds:
-            S = self.Ss[i].copy()
+            S = self.Ss[i-1].copy()
             S[S < 1.e-20] = 0.  # 0*log(0) should give 0; avoid warning or NaN.
             S2 = S * S
             assert abs(np.linalg.norm(S) - 1.) < 1.e-13
@@ -510,24 +511,37 @@ class MPS:
         """
         # 1. Get standardized B: [L, P, R]
         B_std = self._get_std_B(i)
-        
+        if i == 0:
+            if self.bc == 'infinite':
+                # For infinite, the bond to the left of 0 is the last bond
+                S_left = self.Ss[-1] 
+            else:
+                # For OBC, there is no S on the left of site 0.
+                return B_std
+        else:
+            # For site i, the bond on the left is index i-1
+            S_left = self.Ss[i-1]
         # 2. Contract with S on the Left index (Index 0 of B_std)
-        # S is diagonal, so we can just broadcast or tensordot
         # Result: [Left, Phys, Right]
-        return np.tensordot(np.diag(self.Ss[i]), B_std, axes=([1], [0]))
 
+        return np.tensordot(np.diag(S_left), B_std, axes=([1], [0]))
     def get_theta2(self, i):
         """
         Calculate effective two-site wave function on sites i, i+1.
-        Returns tensor with legs [Left, Phys_i, Phys_j, Right].
+        
+        Logic:
+        theta1(i) represents the state on site i including the left environment (S_{i-1}).
+        We simply extend this to site j by contracting with B_j.
+        
+        Formula: theta = (S_{i-1} * B_i) * B_{i+1}
         """
         j = (i + 1) % self.L
-        # theta1: [L, P_i, Bond]
+        # 1. Get theta1 = S_{i-1} * B_i  [Shape: L, Pi, Bond_Mid]
         theta1 = self.get_theta1(i)
-        # B_j: [Bond, P_j, R] (Standardized)
+        # 2. Get B_{i+1} standardized    [Shape: Bond_Mid, Pj, R]
         B_j_std = self._get_std_B(j)
-        # Contract Bond (Index 2 of theta1) with Left (Index 0 of B_j)
-        # Result: [L, P_i, P_j, R]
+        # 3. Contract Bond_Mid (Index 2 of theta1) with Left (Index 0 of B_j)
+        # Result: [L, Pi, Pj, R]
         return np.tensordot(theta1, B_j_std, axes=([2], [0]))
 
     def site_expectation_value(self, op):
