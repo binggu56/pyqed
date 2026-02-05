@@ -38,7 +38,7 @@ from scipy.sparse import identity, kron, csr_matrix, diags
 
 from pyqed import Molecule
 from pyqed.qchem.mcscf.casci import CASCI
-from pyqed.mps.mps import DMRG
+from pyqed.mps.mps import DMRG, MPS
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
@@ -164,32 +164,33 @@ def convert_mpo_symmetric(dense_H_list):
     return sym_H
 
 
-
-# initial guess from hf but with added noise to prevenr stuck in hf product state, it happens sometimes
 def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     """
-    Creates an MPS guess based on filling the first N_elec spin-orbitals,
-    but adds small noise to prevent the solver from getting stuck in the HF state.
+    Creates an MPS guess based on filling the first N_elec spin-orbitals.
+    Corrected Shape: (Left, Phys, Right) -> (1, d, 1)
     """
     d = 2
     mps_guess = []
     filled_count = 0
 
     for i in range(n_spin):
-        vec = np.zeros((d, 1, 1))
+        # 1. Correct base shape: (Left=1, Phys=d, Right=1)
+        vec = np.zeros((1, d, 1)) 
+        
         if filled_count < n_elec:
-            vec[1, 0, 0] = 1.0; filled_count += 1
+            vec[0, 1, 0] = 1.0 # Occupied
+            filled_count += 1
         else:
-            vec[0, 0, 0] = 1.0
+            vec[0, 0, 0] = 1.0 # Empty
 
-        # Add Noise
-        vec += (np.random.rand(d, 1, 1) - 0.5) * noise
+        # 2. Correct noise shape to match: (1, d, 1)
+        rand_noise = (np.random.rand(1, d, 1) - 0.5) * noise
+        vec += rand_noise
+        
         vec /= np.linalg.norm(vec)
         mps_guess.append(vec)
 
     return mps_guess
-
-
 
 # get initial guess to be |HF> + alpha*|Doubles>
 # this is a better guess for U(1) enabled case since that would preserve particle number in the guess
@@ -1075,7 +1076,8 @@ class QCDMRG(CASCI):
             mps0 = self.get_initial_guess(method=init_guess)
         else:
             print("  Running Dense DMRG...")
-            final_H = self.H
+            H_input = [w.transpose(0, 3, 1, 2) for w in self.H_raw]
+            final_H = H_input
 
             
             mps0 = get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=1e-3)
@@ -1198,7 +1200,7 @@ if __name__=='__main__':
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=12, nelecas=4, D=60, init_guess='cisd') #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg = QCDMRG(mf, ncas=12, nelecas=4, D=40, init_guess='cisd') #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
     dmrg.build().run(symmetry=True)
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
