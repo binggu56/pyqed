@@ -275,7 +275,7 @@ class HamiltonianMultiplyU1:
 
 
 class MPS:
-    def __init__(self, Bs, Ss=None, homogenous=True, bc='finite', labels=None):
+    def __init__(self, Bs, Ss=None, homogenous=True, bc='finite', labels=None, center = -1):
         """
         class for matrix product states.
         supports flexible tensor layouts via the `labels` argument.
@@ -325,10 +325,13 @@ class MPS:
             Physical dimension (d) of the sites.
         lv_idx, p_idx, rv_idx : int
             Cached integer positions of the axes based on `labels`.
+        Center : int
+            Canonical center site index. Default is -1 (no specific center).
         """
         assert bc in ['finite', 'infinite']
         self.Bs = self.factors = Bs
         self.Ss = Ss
+
 
         if labels is None:
             warnings.warn("MPS labels not specified, assuming ['lv', 'p', 'rv'].")
@@ -349,9 +352,12 @@ class MPS:
         self.L = len(Bs)
         self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
         self.gauge = None
-
         self.data = self.factors = Bs
-        
+        self.center = center
+        if (self.center < 0 or self.center >= self.L) and (self.center != -1):
+            raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
+        if self.center == -1:
+            warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
         if homogenous:
             try:
                 self.dim = Bs[0].shape[self.p_idx]
@@ -506,43 +512,58 @@ class MPS:
 
     def get_theta1(self, i):
         """
-        Calculate effective single-site wave function on sites i in mixed canonical form.
-        Returns tensor with legs [Left, Phys, Right].
+        Calculate effective single-site wave function on sites i.
+        Automatically detects Left/Right canonical forms based on self.center.
         """
-        # 1. Get standardized B: [L, P, R]
-        B_std = self._get_std_B(i)
-        if i == 0:
-            if self.bc == 'infinite':
-                # For infinite, the bond to the left of 0 is the last bond
-                S_left = self.Ss[-1] 
+        tensor = self._get_std_B(i)
+        if self.center == -1:
+            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta1(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+        # Right of Center
+        if i > self.center:
+            if i == 0:
+                if self.bc == 'infinite':
+                    S_left = self.Ss[-1]
+                else:
+                    return tensor # Open Boundary, no left weights
             else:
-                # For OBC, there is no S on the left of site 0.
-                return B_std
+                S_left = self.Ss[i-1]
+            # Contract S_left (diag) with Tensor (Left Index 0)
+            return np.tensordot(np.diag(S_left), tensor, axes=([1], [0]))
+        # Left of Center
+        elif i < self.center:
+            S_right = self.Ss[i]
+            # Contract Tensor (Right Index 2) with S_right (diag)
+            return np.tensordot(tensor, np.diag(S_right), axes=([2], [0]))
+        # At Center
         else:
-            # For site i, the bond on the left is index i-1
-            S_left = self.Ss[i-1]
-        # 2. Contract with S on the Left index (Index 0 of B_std)
-        # Result: [Left, Phys, Right]
-
-        return np.tensordot(np.diag(S_left), B_std, axes=([1], [0]))
+            return tensor
+    
     def get_theta2(self, i):
         """
         Calculate effective two-site wave function on sites i, i+1.
-        
-        Logic:
-        theta1(i) represents the state on site i including the left environment (S_{i-1}).
-        We simply extend this to site j by contracting with B_j.
-        
-        Formula: theta = (S_{i-1} * B_i) * B_{i+1}
+        Handles crossing the orthogonality center.
         """
         j = (i + 1) % self.L
-        # 1. Get theta1 = S_{i-1} * B_i  [Shape: L, Pi, Bond_Mid]
-        theta1 = self.get_theta1(i)
-        # 2. Get B_{i+1} standardized    [Shape: Bond_Mid, Pj, R]
-        B_j_std = self._get_std_B(j)
-        # 3. Contract Bond_Mid (Index 2 of theta1) with Left (Index 0 of B_j)
-        # Result: [L, Pi, Pj, R]
-        return np.tensordot(theta1, B_j_std, axes=([2], [0]))
+        if self.center < 0 or self.center > self.L -1:
+            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta2(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+        # The bond (i, j) is the center
+        # i is Left-Canonical (A), j is Right-Canonical (B)
+        if i == self.center: 
+            A_i = self._get_std_B(i) # Pure tensor
+            S_mid = self.Ss[i]
+            B_j = self._get_std_B(j) # Pure tensor
+            # A_i * S_mid
+            temp = np.tensordot(A_i, np.diag(S_mid), axes=([2], [0]))
+            # (A_i * S_mid) * B_j
+            return np.tensordot(temp, B_j, axes=([2], [0]))
+        # Entire block is to the Right of Center
+        # theta1(i) * B_j
+        elif self.center != -1 and i > self.center:
+            return np.tensordot(self.get_theta1(i), self._get_std_B(j), axes=([2], [0]))
+        # Entire block is to the Left of Center
+        # A_i * theta1(j) 
+        elif self.center != -1 and j < self.center:
+            return np.tensordot(self._get_std_B(i), self.get_theta1(j), axes=([2], [0]))
 
     def site_expectation_value(self, op):
         """Calculate expectation values of a local operator at each site."""
@@ -679,10 +700,81 @@ class MPS:
     #     pass
 
     def left_canonicalize(self):
-        pass
+        """
+        Sweeps from Left (0) to Right (L-1) to transform the MPS into Left-Canonical Form.
+        Effect:
+        - Tensors Bs[0]...Bs[L-2] become Left-Isometries (A).
+        - Populates self.Ss with bond weights.
+        - Moves orthogonality center to the last site (L-1).
+        """
+        if self.Ss is None or len(self.Ss) != self.nbonds:
+            self.Ss = [None] * self.nbonds
+        # Get permutation
+        perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
+        # Sweep Left -> Right
+        for i in range(self.L - 1):
+            B = self._get_std_B(i)
+            dl, dp, dr = B.shape
+            # Reshape (Left * Phys, Right)
+            mat = B.reshape(dl * dp, dr)
+            U, S, Vh = np.linalg.svd(mat, full_matrices=False)
+            chi = len(S)
+            # Update Site i and Reshape to (L,P,R) and Transpose back
+            self.Bs[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
+            # Ss[i] is the bond between i and i+1
+            self.Ss[i] = S / np.linalg.norm(S)
+            # Pass weights (S * Vh) 
+            # Matrix M = diag(S) * Vh  (Shape: chi, dr)
+            M = np.dot(np.diag(S), Vh)
+            # Contract M with B_next on its Left index
+            B_next = self._get_std_B(i+1) # [Left_Old, Phys, Right]
+            B_next_updated = np.tensordot(M, B_next, axes=([1], [0])) # (New_Bond, Phys, Right)
+            self.Bs[i+1] = B_next_updated.transpose(perm_inv)
+        # Normalize 
+        B_last = self._get_std_B(self.L - 1)
+        B_last /= np.linalg.norm(B_last)
+        self.Bs[self.L - 1] = B_last.transpose(perm_inv)
+        # Update Center
+        self.Center = self.L - 1
 
     def right_canonicalize(self):
-        pass
+        """
+        Sweeps from Right (L-1) to Left (0) to transform the MPS into Right-Canonical Form.
+        Effect:
+        - Tensors Bs[1]...Bs[L-1] become Right-Isometries (B).
+        - Populates self.Ss with bond weights.
+        - Moves orthogonality center to the first site (0).
+        """
+        if self.Ss is None or len(self.Ss) != self.nbonds:
+            self.Ss = [None] * self.nbonds
+        # Get permutation
+        perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
+        # Sweep Right -> Left
+        for i in range(self.L - 1, 0, -1):
+            B = self._get_std_B(i)
+            dl, dp, dr = B.shape
+            # Reshape (Left, Phys * Right)
+            mat = B.reshape(dl, dp * dr)
+            U, S, Vh = np.linalg.svd(mat, full_matrices=False)
+            chi = len(S)
+            # Update Site i (The Isometry Vh) 
+            # Reshape Vh to (New_Bond, Phys, Right) and Transpose back
+            self.Bs[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
+            # Ss[i-1] is the bond between i-1 and i
+            self.Ss[i-1] = S / np.linalg.norm(S)
+            # Pass weights (U * S)
+            # Matrix M = U * diag(S) (Shape: dl, chi)
+            M = np.dot(U, np.diag(S))
+            # Contract B_prev with M on its Right index
+            B_prev = self._get_std_B(i-1) # [Left, Phys, Right_Old]
+            B_prev_updated = np.tensordot(B_prev, M, axes=([2], [0])) # (Left, Phys, New_Bond)
+            self.Bs[i-1] = B_prev_updated.transpose(perm_inv)
+        # Normalize
+        B_first = self._get_std_B(0)
+        B_first /= np.linalg.norm(B_first)
+        self.Bs[0] = B_first.transpose(perm_inv)
+        # Update Center
+        self.Center = 0
 
     def left_to_vidal(self):
         pass
@@ -821,55 +913,22 @@ class MPS:
 
             return rdm
 
-        # 1-rdm calculation without U(1)
-        # 1. Build Left Environments (L_env[i] is contraction of 0...i-1)
-        # Format: Matrix (Bra_Bond, Ket_Bond)
-        L_env = [np.array([[1.0]])]
-        curr_L = L_env[0]
-        for i in range(self.L - 1):
-            B = self._get_std_B(i) # [L, P, R]
-            
-            # L(bra_L,ket_L) * B(ket_L, p, r) -> temp(bra_L, p, r)
-            temp = np.tensordot(curr_L, B, axes=(1, 0))
-            
-            # temp(bra_L, p, r) * B*(bra_L, p, r*) -> curr_L(r, r*) -> (ket_R, bra_R)
-            # Transpose to (bra_R, ket_R) to maintain convention
-            curr_L = np.tensordot(temp, B.conj(), axes=([0, 1], [0, 1])).T
-            L_env.append(curr_L)
-
-        # 2. Build Right Environments (R_env[i] is contraction of i+1...L-1)
-        R_env = [None] * self.L
-        curr_R = np.array([[1.0]])
-        R_env[-1] = curr_R
-        for i in range(self.L - 1, 0, -1):
-            B = self._get_std_B(i) # [L, P, R]
-            
-            # B(l, p, r) * R(bra_R, ket_R) -> temp(l, p, bra_R) (Contract R with Ket_R)
-            temp = np.tensordot(B, curr_R, axes=(2, 1))
-            
-            # temp(l, p, bra_R) * B*(l*, p, bra_R) -> curr_R(l, l*) -> (ket_L, bra_L)
-            # Transpose to (bra_L, ket_L)
-            curr_R = np.tensordot(temp, B.conj(), axes=([1, 2], [1, 2])).T
-            R_env[i - 1] = curr_R
-
+        if idx is None:
+            idx = list(range(self.L))
+        elif isinstance(idx, int):
+            idx = [idx]
         rdm = {}
         for i in idx:
-            B = self._get_std_B(i) # [L, P, R]
-            
-            # L_env(bra_L, ket_L) * B(ket_L, p, r) -> t1(bra_L, p, r)
-            t1 = np.tensordot(L_env[i], B, axes=(1, 0))
-            
-            # t1(bra_L, p, r) * R_env(bra_R, ket_R) -> t2(bra_L, p, bra_R) (Contract r with ket_R)
-            t2 = np.tensordot(t1, R_env[i], axes=(2, 1))
-            
-            # t2(bra_L, p, bra_R) * B*(bra_L, p', bra_R) -> rho(p, p')
-            rho = np.tensordot(t2, B.conj(), axes=([0, 2], [0, 2]))
-            
+            # Get Effective Wavefunction [Left, Phys, Right]
+            theta = self.get_theta1(i)
+            # Contract Left_env and Right_env
+            # Result is rho[Phys, Phys*]
+            rho = np.tensordot(theta, theta.conj(), axes=([0, 2], [0, 2]))
+            # Normalize 
             tr = np.trace(rho)
             if abs(tr) > 1e-12:
                 rho /= tr
             rdm[i] = rho
-
         return rdm
 
     def calc_2site_rdm(self, idx_pairs=None):
@@ -3003,7 +3062,12 @@ class DMRG:
             else:
                 # Dense engine returns [Left, Phys, Right]
                 final_labels = ['lv', 'p', 'rv']
-            self.ground_state = MPS(self.ground_state_raw, labels=final_labels)
+            if self.gauge == "Left":
+                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=len(self.mps_list) -1)
+                self.ground_state.left_canonicalize()
+            elif self.gauge == "Right":
+                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=0)
+                self.ground_state.right_canonicalize()
         return self
 
     def expect(self, e_ops):
@@ -3390,6 +3454,7 @@ if __name__ == '__main__':
     dmrg.init_guess = initial_mps
     dmrg.init_guess = MPS(initial_mps, labels=['lv', 'p', 'rv'])
     dmrg.run()
+    print(dmrg.ground_state.calc_1site_rdm())
 
     
 
