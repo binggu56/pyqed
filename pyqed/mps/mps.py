@@ -31,7 +31,7 @@ from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian mat
 # from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 from pyqed.mps.decompose import decompose, compress
 try:
-    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson
+    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
@@ -81,6 +81,7 @@ def SpinHalfFermionOperators(filling=1.):
                Sx=Sx, Sy=Sy, Sz=Sz, Sp=Sp, Sm=Sm)  # yapf: disable
     return ops
 
+# below is some helper functions for the dmrg sweep with U(1) symmetry.
 def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     AA_perm = AA.transpose(0, 2, 1, 3)
@@ -272,6 +273,85 @@ class HamiltonianMultiplyU1:
         
         return A_new
 
+def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
+    """
+    General converter from Dense MPO (L, R, Out, In) to Symmetric BlockTensor.
+    Includes strict type checking to prevent Integer/QN mismatches.
+    """
+    if not SYMMETRY_AVAILABLE:
+        raise ImportError("Symmetry module required.")
+    sym_H = []
+    # Determine Zero QN type
+    first_val = list(site_qn_maps[0].values())[0]
+    # Ensure zero_qn is of the same type as the map values (QN)
+    zero_qn = first_val * 0 if isinstance(first_val, tuple) else 0
+    # Track allowed Right-Bond QNs. Start with Vacuum (Left=0).
+    # Store (Dense_Index, QN_Value)
+    current_nodes = {(0, zero_qn)}
+    print(f"  [MPO Convert] Start. Sites={len(dense_mpo_list)}, ZeroQN={zero_qn} (Type: {type(zero_qn)})")
+    for site_idx, W in enumerate(dense_mpo_list):
+        new_data = {}
+        next_nodes = set()
+        phys_qns = site_qn_maps[site_idx]
+        # Metadata for BlockTensor
+        all_phys_out = sorted(list(set(phys_qns.values())))
+        all_phys_in = sorted(list(set(phys_qns.values())))
+        # Optimize lookup
+        valid_incoming = {}
+        for l_idx, q_l in current_nodes:
+            if l_idx not in valid_incoming: valid_incoming[l_idx] = set()
+            valid_incoming[l_idx].add(q_l)
+        # W shape: (Left, Right, Out, In)
+        idxs = np.nonzero(np.abs(W) > tol)
+        for i in range(len(idxs[0])):
+            l, r, out_s, in_s = idxs[0][i], idxs[1][i], idxs[2][i], idxs[3][i]
+            val = W[l, r, out_s, in_s]
+            if l not in valid_incoming: 
+                continue
+            # Retrieve Physical QNs
+            q_out = phys_qns[out_s]
+            q_in = phys_qns[in_s]
+            # Q_Right = Q_Left - (Q_Out - Q_In)
+            flux = q_out - q_in
+            for q_l in valid_incoming[l]:
+                # Ensure q_l is a QN (tuple), not an int
+                if not isinstance(q_l, tuple):
+                    raise TypeError(f"Site {site_idx}: q_l became {type(q_l)} ({q_l})! Expected QN/tuple.")
+                q_r = q_l - flux
+                next_nodes.add((r, q_r))
+                # Construct Key: Must be (QN, QN, QN, QN)
+                key = (q_l, q_r, q_out, q_in)
+                if key not in new_data: new_data[key] = []
+                new_data[key].append( ((l, q_l), (r, q_r), val) )
+        # Build BlockTensor Maps
+        l_map = {q: sorted([x for x in current_nodes if x[1]==q]) for q in set(x[1] for x in current_nodes)}
+        r_map = {q: sorted([x for x in next_nodes if x[1]==q]) for q in set(x[1] for x in next_nodes)}
+        final_blocks = {}
+        for key, elems in new_data.items():
+            q_l, q_r, q_o, q_i = key
+            # Validation
+            if q_l not in l_map or q_r not in r_map:    
+                continue
+            rows = l_map[q_l]; cols = r_map[q_r]
+            row_idx = {x: k for k, x in enumerate(rows)}
+            col_idx = {x: k for k, x in enumerate(cols)}
+            blk = np.zeros((len(rows), len(cols), 1, 1), dtype=W.dtype)
+            for (nl, nr, v) in elems:
+                blk[row_idx[nl], col_idx[nr], 0, 0] = v
+            final_blocks[key] = blk
+        qns_L = sorted(list(l_map.keys()))
+        qns_R = sorted(list(r_map.keys()))
+        qns_Out = all_phys_out
+        qns_In = all_phys_in
+        bt = BlockTensor(final_blocks, [qns_L, qns_R, qns_Out, qns_In], [-1, 1, 1, -1])
+        sym_H.append(bt)
+        # Verify generated keys for first site (debug use)
+        if site_idx == 0 and len(final_blocks) > 0:
+            sample_key = next(iter(final_blocks.keys()))
+            if not isinstance(sample_key[0], tuple):
+                 print(f"  [ERROR] Site 0 generated INTEGER keys: {sample_key}. Expected QNs.")
+        current_nodes = next_nodes        
+    return sym_H
 
 
 class MPS:
@@ -707,6 +787,9 @@ class MPS:
         - Populates self.Ss with bond weights.
         - Moves orthogonality center to the last site (L-1).
         """
+        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+            self.Center = self.L - 1
+            return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
         # Get permutation
@@ -745,6 +828,9 @@ class MPS:
         - Populates self.Ss with bond weights.
         - Moves orthogonality center to the first site (0).
         """
+        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+            self.Center = 0
+            return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
         # Get permutation
@@ -828,7 +914,11 @@ class MPS:
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
 
             def _make_id_mpo_from_phys_qns(phys_qns):
-                # phys_qns is a list with length d (may contain duplicates for degeneracy)
+                # Deduce the correct "Zero" type from physics
+                sample_qn = phys_qns[0]
+                # Multiply by 0 to get QN(0,0) or 0 depending on type
+                zero_qn = sample_qn * 0 
+                
                 from collections import defaultdict
                 idxs_by_q = defaultdict(list)
                 for k, q in enumerate(list(phys_qns)):
@@ -837,11 +927,11 @@ class MPS:
                 data = {}
                 for q, ks in idxs_by_q.items():
                     d = len(ks)
-                    # block for (L=0,R=0,Out=q,In=q): shape (1,1,d,d)
-                    data[(0, 0, q, q)] = np.eye(d).reshape(1, 1, d, d)
+                    # Use zero_qn for bond indices (L, R)
+                    # Shape: (BondL=1, BondR=1, Out=d, In=d)
+                    data[(zero_qn, zero_qn, q, q)] = np.eye(d).reshape(1, 1, d, d)
 
-                qns = [[0], [0], list(phys_qns), list(phys_qns)]
-                # Conventional MPO directions (bondL, bondR, out, in)
+                qns = [[zero_qn], [zero_qn], list(phys_qns), list(phys_qns)]
                 dirs = [1, -1, 1, -1]
                 return BlockTensor(data, qns, dirs)
 
@@ -880,6 +970,7 @@ class MPS:
 
             # Build right overlap environments R[s] for bond right of site s
             R = [None] * self.L
+            # this extract the total qn on the last bond 
             qs = sorted({key[1] for key in self.Bs[-1].data.keys()})
             if len(qs) != 1:
                 raise ValueError(f"Ambiguous total charge on last bond: {qs}.")
@@ -2160,9 +2251,16 @@ def initial_E(W):
         - U(1) keys: (0, 0, 0) -> 1.0 (Scalar identity block)
     """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
+        sample_qn = W.qns[0][0] if len(W.qns[0]) > 0 else 0
+        if isinstance(sample_qn, tuple):
+            zero_qn = sample_qn * 0 # e.g. QN(0,0)
+        else:
+            zero_qn = 0
+            
         # MPO (In), Bra (In), Ket (In) -> Need Out (+1)
-        data = {(0, 0, 0): np.ones((1, 1, 1))}
-        qns = [[0], [0], [0]]
+        # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
+        data = {(zero_qn, zero_qn, zero_qn): np.ones((1, 1, 1))}
+        qns = [[zero_qn], [zero_qn], [zero_qn]]
         dirs = [1, -1, 1] 
         return BlockTensor(data, qns, dirs)
     
@@ -2202,9 +2300,17 @@ def initial_F(W, target_qn=0):
         - U(1) keys: (0, target_qn, target_qn) -> 1.0
     """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
+        sample_qn = W.qns[1][0] if len(W.qns[1]) > 0 else 0
+        
+        if isinstance(sample_qn, tuple):
+            zero_qn = sample_qn * 0
+        else:
+            zero_qn = 0
+
         # MPO (In), Bra (Out), Ket (In) -> Need [In, Out, In] = [-1, 1, -1]
-        data = {(0, target_qn, target_qn): np.ones((1, 1, 1))}
-        qns = [[0], [target_qn], [target_qn]]
+        # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
+        data = {(zero_qn, target_qn, target_qn): np.ones((1, 1, 1))}
+        qns = [[zero_qn], [target_qn], [target_qn]]
         dirs = [-1, 1, -1]
         return BlockTensor(data, qns, dirs)
     
@@ -2695,8 +2801,59 @@ def optimize_site(A, W, E, F, tol=1E-8):
     E, V = sparse.linalg.eigsh(H,1,v0=A,which='SA', tol=tol)
     return (E[0],np.reshape(V[:,0], H.req_shape))
 
+def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
+    """
+    Injects noise into ALL valid symmetry sectors.
+    Args:
+        AA: The BlockTensor to perturb
+        sym_mgr: SymmetryManager instance to get valid physical QNs
+        noise_val: Magnitude of noise
+    """
+    if not hasattr(AA, 'data'): 
+        return AA
+    valid_qL = {}
+    valid_qR = {}
 
-def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
+    first_blk = next(iter(AA.data.values()))
+    is_complex = np.iscomplexobj(first_blk)
+    dtype = first_blk.dtype
+
+    for (qL, qR, qP1, qP2), blk in AA.data.items():
+        valid_qL[qL] = blk.shape[0]
+        valid_qR[qR] = blk.shape[1]
+        
+    # get valid physical QNs
+    # generate the QNs for standard spin-orbital states: Emp, Occ(Up), Occ(Dn)
+    # The manager knows if 'Occ' means QN(1) or QN(1,1) or QN(1,1,-1).
+    possible_phys_qns = set()
+    # Always include Vacuum
+    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'emp'))
+    # Include Occupied states
+    # We check both "Even-like" (Up) and "Odd-like" (Down) indices 
+    # to cover all bases for spin-orbitals.
+    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'occ')) # "Up"
+    possible_phys_qns.add(sym_mgr.get_phys_qn(1, 'occ')) # "Down"
+    possible_phys_qns = list(possible_phys_qns)
+    # Iterate and Inject (Same logic as before)
+    for qL, dL in valid_qL.items():
+        for qP1 in possible_phys_qns:
+            for qP2 in possible_phys_qns:
+                # Calculate required Right Sector
+                target_qR = qL + qP1 + qP2
+                if target_qR in valid_qR:
+                    dR = valid_qR[target_qR]
+                    key = (qL, target_qR, qP1, qP2)
+                    # Dimensions for spin-orbitals are 1
+                    dP1, dP2 = 1, 1 
+                    if key not in AA.data:
+                        noise = (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
+                        if is_complex:
+                            noise = noise + 1j * (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
+                        AA.data[key] = noise.astype(dtype)
+    return AA
+
+
+def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
     """
     two-site optimization of MPS A,B with respect to MPO W1,W2 and
     environment tensors E,F
@@ -2735,52 +2892,31 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
         DESCRIPTION.
 
     """
+
     if U1:
         if not SYMMETRY_AVAILABLE:
             raise ImportError("Symmetry module not found. Cannot run U1=True.")
-            
-        # 1. Form Initial Guess (Bond Dimension expansion happens here naturally in SVD)
+        # U(1) on branch is still using (L,R,P) MPS index convention. TODO:also fix to LPR if have time.
         # A: (Bond_L, Bond_M, Phys_L)
         # B: (Bond_M, Bond_R, Phys_R)
         # AA = A * B -> (Bond_L, Phys_L, Bond_R, Phys_R)
-        # Note on A/B indices in BlockTensor:
-        # standard MPS layout: (Left, Right, Phys).
-        # Contraction: A[Right] -- B[Left]
-        
-        # Check rank to be sure
         if A.rank == 3:
             AA = tensordot(A, B, axes=([1], [0])) # this will return as BlockTensor Object
-            AA = AA.transpose(0, 2, 1, 3)
+            AA = AA.transpose(0, 2, 1, 3) # standard MPO bond index currently is (L,R,out,in). TODO: reshape to (L, out, in, R) (note that currently dense branch is (L, R, out, in), better also fix that one)
             
-            # add noise to AA. TODO: make noise decay as round goes.
-            # forces Davidson to explore new sectors
-            noise_scale = 1e-4
-            for k in AA.data:
-                # Add random noise to existing blocks
-                AA.data[k] += (np.random.rand(*AA.data[k].shape) - 0.5) * noise_scale
+            # # add noise to AA. TODO: maby make noise decay as round goes? that should be done by injecting a smaller noise_val as dmrg sweep goes. fix and test for optimal value if have time
+            AA = inject_noise_symmetric(AA, noise_val=1e-4, sym_mgr=sym_mgr)
         else:
             raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
-
-        # 2. Define Linear Operator
         H_op = HamiltonianMultiplyU1(E, [W1, W2], F)
-        
-        # 3. Solve Eigenproblem (Davidson)
-        # Normalize guess
         norm = AA.norm()
         AA = AA * (1.0/norm)
-        
         energy, AA_new = solve_davidson(H_op, AA, tol=1e-5)
-        
-        # 4. SVD and Split
         # AA_new is (L, R, Phys_L, Phys_R)
         # We need to return A(L, M, P_L) and B(M, R, P_R)
-        
-        # Use our symmetric SVD, 3rd argument S_dict is used in normalization
         U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
-        
         # U is (L, P_L, M).
         # V is (M, R, P_R).
-        
         # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
         
         # Helper to contract Diagonal S into U
@@ -2798,7 +2934,6 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
                     new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
                     new_data[(qL, qP, qM)] = new_block
             return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
-
         # Helper to contract S into V
         # S is (Bond, Bond). V is (Bond, R, P_R).
         # We want S*V -> (Bond, R, P_R)
@@ -2812,49 +2947,35 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
                     new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
                     new_data[(qM, qR, qP)] = new_block
             return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
-
         if dir == 'right':  # Right Sweep: Center moves Right.
             # A = U. B = S * V.
-            
             # U is (L, P_L, M). Transpose to standard MPS shape A(L, M, P_L)
             A_new = U.transpose(0, 2, 1)
-            
             # Contract S into V, then V is already (M, R, P_R), which is standard B shape
             B_new = multiply_S_V(S_dict, V)
-            
         else: # that is dir == 'left'
             # Left Sweep: Center moves Left.
             # A = U * S. B = V.
-            
             # Contract U * S first
             A_US = multiply_U_S(U, S_dict)
-            
             # Transpose to standard MPS shape A(L, M, P_L)
             A_new = A_US.transpose(0, 2, 1)
-            
             # B is just V
             B_new = V
-
         return energy, A_new, B_new, trunc, m_kept
-
-    else:
-        # Dense Implementation (Standardized to Left, Phys, Right)
-
+    else: # Dense branch ( MPS index standardized to Left, Phys, Right)
         W = coarse_grain_MPO(W1,W2)
         # Returns (Left, Phys_A, Phys_B, Right)
         AA = coarse_grain_MPS(A,B)
         # Optimize
         H = HamiltonianMultiply(E,W,F)
         E, V_flat = sparse.linalg.eigsh(H,1,v0=AA,which='SA')
-        
-        # 4. Fine Grain (SVD Split)
-        # Unflatten physical dimensions first
+        # Fine Grain (SVD Split)
         # V_flat is (Left * Phys_A * Phys_B * Right)
         # We need V_tensor: (Left, Phys_A, Phys_B, Right)
         AA = V_flat.reshape(A.shape[0], A.shape[1], B.shape[1], B.shape[2])
         A,S,B = fine_grain_MPS(AA, [A.shape[1], B.shape[1]])
         A,S,B,trunc,m = truncate_SVD(A,S,B,m)
-        
         if (dir == 'right'):
             # B = S * B.  S is (m,), B is (m, d, R).
             # Contract S with B[0] (Left bond of B)
@@ -2866,7 +2987,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
             A = np.tensordot(A, np.diag(S), axes=(2, 0))
         return E[0], A, B, trunc, m
 
-def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None, not_conv_err = True):
+def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None, not_conv_err = True, sym_mgr=None):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -2900,7 +3021,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
     for sweep in range(0, int(sweeps/2)):
         for i in range(0, len(MPS)-2): 
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1
+                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr
             )
             print("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2,i,i+1, Energy, states, trunc))
@@ -2918,7 +3039,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
 
         for i in range(len(MPS)-2, 0, -1): 
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1
+                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr
             )
             print("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2+1, i, i+1, Energy, states, trunc))
@@ -2985,7 +3106,7 @@ class DMRG:
     """
     ground state finite DMRG in MPO/MPS framework
     """
-    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site', U1 = False, target_qn = None, not_conv_err = True):
+    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site', U1 = False, target_qn = None, not_conv_err = True, sym_mgr=None):
         """
 
 
@@ -3020,7 +3141,7 @@ class DMRG:
         self.ground_state_raw = None
         self.not_conv_err = not_conv_err
         self.converged = False
-
+        self.sym_mgr = sym_mgr
 
     def run(self):
 
@@ -3055,7 +3176,7 @@ class DMRG:
             fDMRG_1site_GS_OBC(self.mpo_list, self.D, self.nsweeps)
         else:
             self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
-                self.mps_list, self.mpo_list, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err)
+                self.mps_list, self.mpo_list, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err, sym_mgr=self.sym_mgr)
             if self.U1:
                 # U1 engine returns [Left, Right, Phys]
                 final_labels = ['lv', 'rv', 'p']
@@ -3110,89 +3231,6 @@ class DMRG:
             raise ValueError("Run DMRG first to generate a ground state.")
             
         return self.ground_state.calc_2site_rdm(idx_pairs)
-
-    def nelec_dmrg(self, idx=None, weights=None, return_local=False, normalize=True, atol=1e-10):
-        """
-        Return the total number of electrons deduced from the 1-site RDM(s).
-
-        Parameters
-        ----------
-        idx : None | int | list[int]
-            Which sites to include. None -> all sites.
-        weights : None | array-like
-            Local occupation eigenvalues for each physical basis state (dense case).
-            If None, uses common defaults:
-            d=2 -> [0,1]
-            d=4 -> [0,1,1,2]
-            For U(1) BlockTensor RDM, weights are taken from the block quantum number q.
-        return_local : bool
-            If True, also return a dict {i: <n_i>}.
-        normalize : bool
-            If True, divide by Tr(rho_i) when Tr deviates from 1 (robust against gauge / normalization issues).
-        atol : float
-            Tolerance for trace normalization check.
-
-        Returns
-        -------
-        float  or  (float, dict)
-            Total electron number, optionally with site-resolved occupations.
-        """
-        import numpy as np
-
-        rdm = self.make_rdm(idx)
-
-        local = {}
-        for i, rho in rdm.items():
-            # --- U(1) BlockTensor RDM path: use block labels q as particle number ---
-            if SYMMETRY_AVAILABLE and (BlockTensor is not None) and isinstance(rho, BlockTensor):
-                tr = 0.0 + 0.0j
-                n  = 0.0 + 0.0j
-                for (q_bra, q_ket), blk in rho.data.items():
-                    if q_bra == q_ket:
-                        t = np.trace(blk)
-                        tr += t
-                        n  += float(q_bra) * t
-
-                if normalize and abs(tr - 1.0) > atol and abs(tr) > atol:
-                    n = n / tr
-
-                local[i] = n
-                continue
-
-            # --- Dense ndarray RDM path ---
-            rho = np.asarray(rho)
-            d = rho.shape[0]
-            tr = np.trace(rho)
-
-            if weights is None:
-                if d == 2:
-                    w = np.array([0.0, 1.0], dtype=float)
-                elif d == 4:
-                    w = np.array([0.0, 1.0, 1.0, 2.0], dtype=float)
-                else:
-                    raise ValueError(
-                        f"nelec_dmrg: cannot infer occupation weights for local dim d={d}. "
-                        "Pass `weights=` explicitly."
-                    )
-            else:
-                w = np.asarray(weights, dtype=float)
-                if w.shape[0] != d:
-                    raise ValueError(f"nelec_dmrg: weights length {w.shape[0]} != local dim {d}.")
-
-            n = np.sum(w * np.real(np.diag(rho)))
-            if normalize and abs(tr - 1.0) > atol and abs(tr) > atol:
-                n = n / np.real(tr)
-
-            local[i] = n + 0.0j  # keep consistent type (will be real in practice)
-
-        total = np.real(np.sum(list(local.values()))).item()
-        if return_local:
-            # convert local to real python floats when possible
-            local_real = {i: np.real(v).item() for i, v in local.items()}
-            return total, local_real
-        return total
-
-
 
 def autoMPO(h1e, eri):
     """

@@ -6,7 +6,7 @@ import time
 
 class QN(tuple):
     """
-    Quantum Number class supporting vector addition for U(1) x U(1).
+    Quantum Number class supporting vector addition for U(1) x U(1) x ...
     Example: QN(1, 0) + QN(1, 1) = QN(2, 1)
     """
     def __new__(cls, *args):
@@ -20,9 +20,16 @@ class QN(tuple):
         
     def __neg__(self):
         return QN(*(-x for x in self))
+
+    def __mul__(self, other):
+        # Scalar multiplication
+        return QN(*(x * other for x in self))
         
     def __repr__(self):
         return f"QN{super().__repr__()}"
+    
+    def __lt__(self, other):
+        return super().__lt__(other)
 
 class BlockTensor:
     """
@@ -160,14 +167,59 @@ def tensordot(A, B, axes):
                     
     return BlockTensor(new_data, new_qns, new_dirs)
 
+class SymmetryManager:
+    def __init__(self, sym_list):
+        if sym_list is True: sym_list = ['charge', 'sz']
+        if sym_list is False or sym_list is None: sym_list = []
+        self.sym_types = [s.lower() for s in sym_list]
+        self.rank = len(self.sym_types)
+        self.enabled = self.rank > 0
 
+    def get_vac_qn(self):
+        return QN(*[0]*self.rank)
+
+    def get_phys_qn(self, site_idx, state_str):
+        """Map physical state ('emp', 'occ') to QN."""
+        vals = []
+        for sym in self.sym_types:
+            if sym in ['charge', 'n', 'particle']:
+                if state_str == 'emp': vals.append(0)
+                else: vals.append(1) # Occ (both Up and Down count as 1 charge)
+            
+            elif sym in ['sz', 'spin', 's_z']:
+                # Spin-Orbital logic: Even=Up(+1), Odd=Down(-1)
+                # Note: We return 2*Sz (integers) to allow QN class to work with ints. TODO: is it actually better to just return physical value? or change that when presenting to other people
+                if state_str == 'emp': 
+                    vals.append(0)
+                elif state_str == 'occ':
+                    if site_idx % 2 == 0: vals.append(1)  # Up
+                    else: vals.append(-1) # Down
+        return QN(*vals)
+
+    def get_target_qn(self, nelec, spin):
+        """
+        nelec: Total electrons (int)
+        spin: 2*S (int), e.g. 0 for singlet
+        """
+        vals = []
+        for sym in self.sym_types:
+            if sym in ['charge', 'n', 'particle']:
+                vals.append(int(nelec))
+            elif sym in ['sz', 'spin', 's_z']:
+                vals.append(int(spin))
+        return QN(*vals)
 
 
 
 def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
     norm_val = v0.norm()
-    if norm_val < 1e-12: v0 = v0 * 0.0 + 1.0
-    v0 = v0 * (1.0 / v0.norm())
+    if norm_val < 1e-12: 
+        # Create a random starting vector in the same sector
+        for k in v0.data:
+             v0.data[k] = np.random.rand(*v0.data[k].shape)
+        norm_val = v0.norm()
+        
+    v0 = v0 * (1.0 / norm_val)
     
     V = [v0]; HV = []; T = np.zeros((0,0), dtype=complex)
     curr_eig = 0.0; ritz_vec = v0
