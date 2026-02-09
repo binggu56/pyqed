@@ -33,5 +33,5 @@ mol.build(driver='pyscf')
 mf = mol.RHF().run()
 
 
-dmrg = QCDMRG(mf, ncas=12, nelecas=6, D=40, target_qn=None) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
-dmrg.build().run(U1=True)
+dmrg = QCDMRG(mf, ncas=4, nelecas=4, D=20, target_qn=None) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+dmrg.build().run()
