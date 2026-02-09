@@ -38,19 +38,19 @@ from scipy.sparse import identity, kron, csr_matrix, diags
 
 from pyqed import Molecule
 from pyqed.qchem.mcscf.casci import CASCI
-from pyqed.mps.mps import DMRG
+from pyqed.mps.mps import DMRG, MPS, dense_to_symmetric_mpo
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
 try:
     import pyqed.mps.symmetry as sym_module
-    from pyqed.mps.symmetry import BlockTensor, tensordot
+    from pyqed.mps.symmetry import BlockTensor, tensordot, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
     BlockTensor = None
-
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -106,259 +106,200 @@ def get_jw_term_robust(op_str_list, indices, factor):
     return Op(final_op_string, final_indices, factor=factor * ((-1) ** swaps) * extra_sign)
 
 
-def convert_mpo_symmetric(dense_H_list):
-    """ Standard Mapping: 0=Emp, 1=Occ """
-    if not SYMMETRY_AVAILABLE: return dense_H_list
-    print("  Converting MPO to U(1) Blocks (Standard: 0=Emp, 1=Occ)...")
-    sym_H = []
-    phys_qns = {0: 0, 1: 1} # 0=Emp, 1=Occ
+class SymmetryManager:
+    def __init__(self, sym_list):
+        if sym_list is True: sym_list = ['charge', 'sz']
+        if sym_list is False or sym_list is None: sym_list = []
+        self.sym_types = [s.lower() for s in sym_list]
+        self.rank = len(self.sym_types)
+        self.enabled = self.rank > 0
 
-    current_nodes = {(0, 0)}
-    for W in dense_H_list:
-        new_data = {}
-        next_nodes = set()
+    def get_vac_qn(self):
+        return QN(*[0]*self.rank)
 
-        valid_incoming = {}
-        for l, q in current_nodes:
-            if l not in valid_incoming: valid_incoming[l] = set()
-            valid_incoming[l].add(q)
+    def get_phys_qn(self, site_idx, state_str):
+        """Map physical state ('emp', 'occ') to QN based on active symmetries."""
+        vals = []
+        for sym in self.sym_types:
+            if sym in ['charge', 'n', 'particle']:
+                if state_str == 'emp': vals.append(0)
+                else: vals.append(1) 
+            
+            elif sym in ['sz', 'spin', 's_z']:
+                # Even=Up(+1), Odd=Down(-1) -> Returns 2*Sz integers
+                if state_str == 'emp': 
+                    vals.append(0)
+                elif state_str == 'occ':
+                    if site_idx % 2 == 0: vals.append(1)  # Up
+                    else: vals.append(-1) # Down
+        return QN(*vals)
+    
+    def get_target_qn(self, nelec, spin):
+        vals = []
+        for sym in self.sym_types:
+            if sym in ['charge', 'n', 'particle']:
+                vals.append(int(nelec))
+            elif sym in ['sz', 'spin', 's_z']:
+                vals.append(int(spin))
+        return QN(*vals)
 
-        idxs = np.nonzero(np.abs(W) > 1e-14)
-        for i in range(len(idxs[0])):
-            l, r, out_s, in_s = idxs[0][i], idxs[1][i], idxs[2][i], idxs[3][i]
-            val = W[l, r, out_s, in_s]
-            if l not in valid_incoming: continue
+# Configuration generators helpers for initial guess
+# non-normalized in those configs is fine. it is handeled in build_mps_from_configs.
+def gen_hf_config(nelec, nsites):
+    """Returns HF occupation list [1, 1, ..., 0, 0]"""
+    return [1]*nelec + [0]*(nsites - nelec)
 
-            # Flux = Q_Out - Q_In
-            q_out = phys_qns[out_s]
-            q_in = phys_qns[in_s]
-            flux = q_out - q_in
+def gen_cid_configs(nelec, nsites, mixing=0.1):
+    """Returns list of (config, amp) for HF + Doubles"""
+    hf = gen_hf_config(nelec, nsites)
+    configs = [(tuple(hf), 1.0)] # HF gets weight 1.0
+    # Simple Double: 2 on HOMO -> 2 on LUMO
+    if nelec >= 2 and (nsites - nelec) >= 2:
+        dbl = list(hf)
+        dbl[nelec-1] = 0; dbl[nelec-2] = 0
+        dbl[nelec]   = 1; dbl[nelec+1] = 1
+        configs.append((tuple(dbl), mixing))
+    return configs
 
-            for q_l in valid_incoming[l]:
-                q_r = q_l - flux
-                next_nodes.add((r, q_r))
-                # Key: (Q_L, Q_R, Q_Phys_Out, Q_Phys_In)
-                key = (q_l, q_r, phys_qns[out_s], phys_qns[in_s])
-                if key not in new_data: new_data[key] = []
-                new_data[key].append( ((l, q_l), (r, q_r), val) )
+def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
+    """Returns HF + Random Singles/Doubles"""
+    hf = gen_hf_config(nelec, nsites)
+    configs = [(tuple(hf), 1.0)]
 
-        l_map = {q: sorted([x for x in current_nodes if x[1]==q]) for q in set(x[1] for x in current_nodes)}
-        r_map = {q: sorted([x for x in next_nodes if x[1]==q]) for q in set(x[1] for x in next_nodes)}
+    occ_idxs = [i for i, x in enumerate(hf) if x == 1]
+    vir_idxs = [i for i, x in enumerate(hf) if x == 0]
+    
+    for _ in range(n_states):
+        new_cfg = list(hf)
+        if len(occ_idxs) >= 2 and len(vir_idxs) >= 2 and np.random.rand() > 0.5:
+            # Double
+            i, j = np.random.choice(occ_idxs, 2, replace=False)
+            a, b = np.random.choice(vir_idxs, 2, replace=False)
+            new_cfg[i]=0; new_cfg[j]=0; new_cfg[a]=1; new_cfg[b]=1
+        elif len(occ_idxs) >= 1 and len(vir_idxs) >= 1:
+            # Single
+            i = np.random.choice(occ_idxs)
+            a = np.random.choice(vir_idxs)
+            new_cfg[i]=0; new_cfg[a]=1
+            
+        configs.append((tuple(new_cfg), mixing))
+        
+    return configs
 
-        final_blocks = {}
-        for key, elems in new_data.items():
-            q_l, q_r, q_o, q_i = key
-            if q_l not in l_map or q_r not in r_map: continue
-            rows = l_map[q_l]; cols = r_map[q_r]
-            row_idx = {x: i for i, x in enumerate(rows)}
-            col_idx = {x: i for i, x in enumerate(cols)}
-            blk = np.zeros((len(rows), len(cols), 1, 1))
-            for (nl, nr, v) in elems:
-                blk[row_idx[nl], col_idx[nr], 0, 0] = v
-            final_blocks[key] = blk
+def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5):
+    """
+    Constructs an entangled U(1) symmetric MPS from a list of determinant configurations.
+    
+    Args:
+        configs_with_amps: List of tuples (occupation_list, amplitude).
+        sym_mgr: SymmetryManager instance.
+        nsites: Total number of sites.
+        noise_scale: Magnitude of random noise to inject for symmetry breaking.
+        
+    Returns:
+        List[BlockTensor]: The resulting MPS in (Left, Right, Phys) convention.
+    """
+    # Pre-calculate QN Trajectories for all configurations
+    # traj[k] is a list of bond QNs [BoundL, Q1, Q2, ..., BoundR] for config k
+    trajectories = []
+    vac_qn = sym_mgr.get_vac_qn()
 
-        qns_L = sorted(list(l_map.keys())); qns_R = sorted(list(r_map.keys()))
-        bt = BlockTensor(final_blocks, [qns_L, qns_R, [], []], [-1, 1, 1, -1])
-        sym_H.append(bt)
-        current_nodes = next_nodes
-    return sym_H
+    for cfg, _ in configs_with_amps:
+        curr_q = vac_qn
+        traj = [curr_q]
+        for site_i, occ in enumerate(cfg):
+            state_str = 'occ' if occ > 0 else 'emp'
+            phys_q = sym_mgr.get_phys_qn(site_i, state_str)
+            curr_q = curr_q + phys_q
+            traj.append(curr_q)
+        trajectories.append(traj)
+    mps = []
+    # 2. Build Tensors Site by Site
+    for i in range(nsites):
+        # Grouping Logic 
+        # Map QN -> List of configuration indices passing through this sector
+        left_groups = defaultdict(list)
+        right_groups = defaultdict(list)
+        
+        for k, _ in enumerate(configs_with_amps):
+            qL = trajectories[k][i]
+            qR = trajectories[k][i+1]
+            left_groups[qL].append(k)
+            right_groups[qR].append(k)
+        # Fill Block Data
+        data = {}
+        for k, (cfg, amp) in enumerate(configs_with_amps):
+            qL = trajectories[k][i]
+            qR = trajectories[k][i+1]
+            state_str = 'occ' if cfg[i] > 0 else 'emp'
+            qP = sym_mgr.get_phys_qn(i, state_str)
+            key = (qL, qR, qP)
+            # Determine Matrix Coordinates (Fan-Out / Fan-In boundaries)
+            # At i=0 (Left Boundary), all configs share row 0.
+            # At i=L-1 (Right Boundary), all configs share col 0.
+            row = 0 if i == 0 else left_groups[qL].index(k)
+            col = 0 if i == nsites - 1 else right_groups[qR].index(k)
+            
+            # Initialize Block if missing
+            if key not in data:
+                dL = 1 if i == 0 else len(left_groups[qL])
+                dR = 1 if i == nsites - 1 else len(right_groups[qR])
+                # Phys dimension is always 1 per sector for spin-orbitals
+                data[key] = np.zeros((dL, dR, 1), dtype=complex)
+            
+            # value = Amplitude (only applied at first site) + Noise
+            val = amp if i == 0 else 1.0
+            noise = (np.random.rand() - 0.5) * noise_scale
+            data[key][row, col, 0] += val + noise
+
+        # get basis data
+        # Construct flat lists of QNs for the BlockTensor axes
+        # Left Bond QNs
+        if i == 0:
+            final_qns_L = [trajectories[0][0]] # [Vacuum]
+        else:
+            # Repeat QN 'n' times if 'n' configs pass through it
+            final_qns_L = [q for q in sorted(left_groups.keys()) for _ in left_groups[q]]
+        # Right Bond QNs
+        if i == nsites - 1:
+            final_qns_R = [trajectories[0][-1]] # [Target]
+        else:
+            final_qns_R = [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
+        # Physical QNs (Generic from Manager)
+        final_qns_P = [sym_mgr.get_phys_qn(i, 'emp'), sym_mgr.get_phys_qn(i, 'occ')]
+        # Create BlockTensor 
+        bt = BlockTensor(data, [final_qns_L, final_qns_R, final_qns_P], [-1, 1, 1])
+        # Normalize 
+        nrm = bt.norm()
+        if nrm > 1e-12:
+            bt = bt * (1.0 / nrm)
+        mps.append(bt)
+    return mps
 
 
-
-# initial guess from hf but with added noise to prevenr stuck in hf product state, it happens sometimes
 def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     """
-    Creates an MPS guess based on filling the first N_elec spin-orbitals,
-    but adds small noise to prevent the solver from getting stuck in the HF state.
+    Creates an MPS guess based on filling the first N_elec spin-orbitals.
+    used in dense branch,
+    Corrected Shape: (Left, Phys, Right) -> (1, d, 1)
     """
     d = 2
     mps_guess = []
     filled_count = 0
-
     for i in range(n_spin):
-        vec = np.zeros((d, 1, 1))
+        # (Left=1, Phys=d, Right=1)
+        vec = np.zeros((1, d, 1)) 
         if filled_count < n_elec:
-            vec[1, 0, 0] = 1.0; filled_count += 1
+            vec[0, 1, 0] = 1.0 # Occupied
+            filled_count += 1
         else:
-            vec[0, 0, 0] = 1.0
-
-        # Add Noise
-        vec += (np.random.rand(d, 1, 1) - 0.5) * noise
+            vec[0, 0, 0] = 1.0 # Empty
+        # noise 
+        rand_noise = (np.random.rand(1, d, 1) - 0.5) * noise
+        vec += rand_noise
         vec /= np.linalg.norm(vec)
         mps_guess.append(vec)
-
     return mps_guess
-
-
-
-# get initial guess to be |HF> + alpha*|Doubles>
-# this is a better guess for U(1) enabled case since that would preserve particle number in the guess
-def get_entangled_guess(n_elec, n_spin):
-    """
-    Constructs a superposition |HF> + alpha*|Doubles>.
-    This guarantees Schmidt Rank > 1, preventing 'States=1' collapse.
-    """
-    if not SYMMETRY_AVAILABLE: return []
-    mps = []
-
-    # HF Config: First n_elec are Occ(1)
-    hf_config = [1]*n_elec + [0]*(n_spin - n_elec)
-
-    # Double Excitation Config: Move 2e from HOMO to LUMO
-    dbl_config = hf_config.copy()
-    if n_spin >= 4 and n_elec >= 2:
-        dbl_config[n_elec-1] = 0 # Emp
-        dbl_config[n_elec-2] = 0 # Emp
-        dbl_config[n_elec]   = 1 # Occ
-        dbl_config[n_elec+1] = 1 # Occ
-
-    print(f"  [Guess] HF: {hf_config}")
-    print(f"  [Guess] Dbl: {dbl_config}")
-
-    curr_hf = 0; curr_dbl = 0
-
-    for i in range(n_spin):
-        data = {}
-
-        # Path 1: HF
-        q_l_hf = curr_hf
-        phys_hf = hf_config[i] # 1 or 0
-        q_r_hf = q_l_hf + phys_hf
-
-        key_hf = (q_l_hf, q_r_hf, phys_hf)
-        if key_hf not in data: data[key_hf] = np.zeros((1,1,1))
-        data[key_hf][0,0,0] += 0.9 # Weight for HF
-
-        # Path 2: Doubles
-        q_l_dbl = curr_dbl
-        phys_dbl = dbl_config[i]
-        q_r_dbl = q_l_dbl + phys_dbl
-
-        key_dbl = (q_l_dbl, q_r_dbl, phys_dbl)
-        if key_dbl not in data: data[key_dbl] = np.zeros((1,1,1))
-        data[key_dbl][0,0,0] += 0.1 # Weight for Doubles
-
-        qns_L = sorted(list(set(k[0] for k in data)))
-        qns_R = sorted(list(set(k[1] for k in data)))
-
-        # [0, 1] means both Emp and Occ sectors are allowed
-        bt = BlockTensor(data, [qns_L, qns_R, [0, 1]], [-1, 1, 1])
-        mps.append(bt)
-
-        curr_hf += phys_hf
-        curr_dbl += phys_dbl
-
-    return mps
-
-def make_u1_random_block_init_guess(
-    L,
-    target_qn,
-    phys_qns=None,
-    max_bond_sectors=6,
-    seed=0,
-    complex_dtype=True,
-):
-    """
-    Build a random U(1) BlockTensor MPS with bond dimension > 1 (multiple charge sectors),
-    while enforcing total charge = target_qn on the *right boundary bond*.
-
-    Site tensor convention in your code: (LeftBond, RightBond, Phys)
-    Block key convention: (qL, qR, qP) with charge flow qR = qL + qP.
-
-    Default phys_qns:
-      - d=2 spin-orbital occupancy: [0,1]
-      - d=4 spatial orbital:        [0,1,1,2]
-    """
-    if not SYMMETRY_AVAILABLE:
-        raise ImportError("Symmetry module not found: cannot build BlockTensor init guess.")
-
-    import numpy as np
-    from collections import defaultdict
-
-    rng = np.random.default_rng(seed)
-
-    if phys_qns is None:
-        # default to spin-orbital (your current case looks like d=2)
-        phys_qns = [0, 1]
-    phys_qns = list(phys_qns)
-
-    # map charge -> list of physical basis indices (for degeneracy, e.g. charge 1 has 2 states in d=4)
-    idxs_by_q = defaultdict(list)
-    for i, q in enumerate(phys_qns):
-        idxs_by_q[q].append(i)
-
-    # choose bond charge sectors at each cut i (bond i is between sites i-1 and i) ----
-    # bond_qns[i] is the list of charges carried by that bond basis
-    bond_qns = [None] * (L + 1)
-    bond_qns[0] = [0]                 # left boundary fixed
-    bond_qns[L] = [int(target_qn)]    # right boundary fixed
-
-    for i in range(1, L):
-        # feasible charge range at cut i:
-        #   at least 0, at most target_qn
-        # also must be achievable with remaining sites (each site contributes <= max phys charge)
-        qmin = 0
-        qmax = int(target_qn)
-
-        # keep it simple: choose up to max_bond_sectors charges uniformly from [qmin,qmax]
-        # but always include something feasible; for better conditioning include neighbors too
-        candidates = list(range(qmin, qmax + 1))
-        if len(candidates) <= max_bond_sectors:
-            chosen = candidates
-        else:
-            chosen = sorted(rng.choice(candidates, size=max_bond_sectors, replace=False).tolist())
-
-        # this is important: make sure 0 is included early, and target_qn included late helps connectivity
-        if 0 not in chosen:
-            chosen[0] = 0
-            chosen = sorted(set(chosen))
-        bond_qns[i] = list(chosen)
-
-    # build site BlockTensors
-    Bs = []
-    dtype = np.complex128 if complex_dtype else np.float64
-
-    for i in range(L):
-        left_qs  = bond_qns[i]
-        right_qs = bond_qns[i + 1]
-
-        # sector degeneracy: we take 1 basis state per charge sector (you can increase by repeating charges)
-        # so dim(q) = 1 for each q in the list.
-        data = {}
-
-        for qL in left_qs:
-            for qP, idxs in idxs_by_q.items():
-                qR = qL + qP
-                if qR not in right_qs:
-                    continue
-
-                # block shape: (dimL, dimR, dimPhysSector)
-                # here dimL=dimR=1; dimPhysSector=len(idxs)
-                blk = (rng.standard_normal((1, 1, len(idxs))) +
-                       1j * rng.standard_normal((1, 1, len(idxs)))).astype(dtype)
-                data[(qL, qR, qP)] = blk
-
-        # If connectivity is too sparse (possible for unlucky random sector choices), fail loudly
-        if len(data) == 0:
-            raise RuntimeError(
-                f"Site {i}: no allowed (qL,qR,qP) blocks. "
-                f"left_qs={left_qs}, right_qs={right_qs}, phys_qns={phys_qns}"
-            )
-
-        qns  = [list(left_qs), list(right_qs), list(phys_qns)]
-        dirs = [-1, 1, 1]  # your convention
-        B = BlockTensor(data, qns, dirs)
-
-        # normalize each tensor a bit so Davidson doesn't start with huge norm variations
-        nrm = B.norm()
-        if nrm != 0:
-            B = B * (1.0 / nrm)
-
-        Bs.append(B)
-
-    return Bs
-
-
 
 
 def graphic(sys_block, env_block, sys_label="l"):
@@ -398,8 +339,8 @@ class QCDMRG(CASCI):
     """
     ab initio DRMG quantum chemistry calculation
     """
-    def __init__(self, mf, ncas, nelecas, D, init_guess='hf+d', m_warmup=None,\
-                 spin=None, tol=1e-6, target_qn = None):
+    def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
+                 spin=None, tol=1e-6):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -426,7 +367,7 @@ class QCDMRG(CASCI):
         self.d = 2 # local dimension for spin orbital
         # self.d = 4 # local dimension for spacial orbital
 
-        self.nsites = self.L = ncas*2
+        self.nsites = self.L = ncas
 
         # assert(mf.eri.shape == (self.L, self.L))
 
@@ -447,10 +388,6 @@ class QCDMRG(CASCI):
         self.nelecas = nelecas
 
         self.nelec = mf.nelec
-        if target_qn is None:
-            self.target_qn = self.nelec
-        else:
-            self.target_qn = target_qn
 
         ncore = mf.nelec//2 - self.nelecas//2 # core orbs
         assert(ncore >= 0)
@@ -503,6 +440,42 @@ class QCDMRG(CASCI):
         self.init_guess = init_guess
         
 
+    def get_initial_guess_symmetric(self, method='cid'):
+        """
+        New Robust Initial Guess Dispatcher.
+        """
+        method = method.lower()
+        nsites = 2 * self.ncas
+        
+        # Ensure Manager exists (created in run())
+        if not hasattr(self, 'sym_mgr'):
+            self.sym_mgr = SymmetryManager(['charge', 'sz']) # Default fallback
+            
+        print(f"  [InitGuess] Generating guess: '{method}' with {self.sym_mgr.sym_types}")
+
+        # 1. Generate Configurations (Physics)
+        if method == 'hf':
+            hf_cfg = gen_hf_config(self.nelecas, nsites)
+            configs = [(hf_cfg, 1.0)]
+            
+        elif method == 'cid':
+            configs = gen_cid_configs(self.nelecas, nsites, mixing=0.5)
+            
+        elif method == 'cisd' or method == 'random':
+            configs = gen_random_cisd_configs(self.nelecas, nsites, n_states=20)
+            
+        else:
+            # Fallback to HF
+            print(f"  [Warning] Method {method} not found. Defaulting to HF.")
+            hf_cfg = gen_hf_config(self.nelecas, nsites)
+            configs = [(hf_cfg, 1.0)]
+
+        # 2. Build Tensor (Math)
+        mps = build_mps_from_configs(configs, self.sym_mgr, nsites)
+        return mps
+
+    def get_initial_guess_dense(self, noise=1e-3):
+        return get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=noise)
 
     def fix_nelec(self, shift):
         """
@@ -567,9 +540,10 @@ class QCDMRG(CASCI):
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, mo_coeff=self.mo_coeff)
+        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore)
 
         self.e_core = energy_core
+
 
         # S = (uhf_pyscf.mol).intor("int1e_ovlp")
         # eig, v = np.linalg.eigh(S)
@@ -741,7 +715,7 @@ class QCDMRG(CASCI):
                         ))
 
         # 3. Generate MPO
-        basis_sites = [BasisSimpleElectron(i) for i in range(self.nsites)]
+        basis_sites = [BasisSimpleElectron(i) for i in range(nso)]
         model = Model(basis=basis_sites, ham_terms=ham_terms)
         mpo = Mpo(model, algo="qr")
 
@@ -752,97 +726,140 @@ class QCDMRG(CASCI):
 
         return self
 
-    def run(self, symmetry=True, nsweeps=50):
+    def run(self, symmetry_list=None, nsweeps=50, initial_guess=None):
         """
-        Only support Abelian symmetry
-
         Parameters
         ----------
-        symmetry : TYPE, optional
-            DESCRIPTION. The default is False.
-        nsweeps : TYPE, optional
-            DESCRIPTION. The default is 50.
-
-        Raises
-        ------
-        NotImplementedError
-            DESCRIPTION.
-
-        Returns
-        -------
-        dmrg : TYPE
-            DESCRIPTION.
-
+        symmetry_list : list of strings or bool
+            ['charge', 'sz'] or True/False.
         """
-
+        if initial_guess is not None:
+            self.init_guess = initial_guess
         if self.H_raw is None:
             self.build()
-        # final_H = self.H
-                
-        # Initial_guess_NOISE    = 1e-3
-
-        # get mpo and mps initial guess
-        # mpo_dmrg = qc_dmrg_mpo(mf)
-        if symmetry:
-            print("  Converting MPO to U(1) Blocks (0=Emp, 1=Occ)...")
-            # H_input = [w.transpose(0, 3, 1, 2) for w in self.H_raw]
-            final_H = convert_mpo_symmetric(self.H)
-
-            print("  Generating Initial Guess")
-
-            # if self.target_qn != self.nelec:
-                
-            #     if self.init_guess == 'hf':
-            #         mps0 = make_u1_random_block_init_guess(2*self.ncas, target_qn=self.target_qn)
-            # else:
-            
-            # initial guess 
-            init_guess = self.init_guess.lower()
-            if init_guess == 'hf':
-                pass
-            elif init_guess == 'hf+d':
-                mps0 = get_entangled_guess(self.nelecas, self.nsites)
-            elif init_guess == 'idmrg':
-                pass
-            else:
-                raise NotImplementedError('Only HF+D is supported.')
-
-        else:
-            print("  Running DMRG...")
+        # Initialize Symmetry 
+        self.sym_mgr = SymmetryManager(symmetry_list)
+        # Setup site QN, We are still assuming spin-orbitals (d=2) here TODO: make it more tobust
+        if self.sym_mgr.enabled:
+            print(f"  [Symmetry] Enabled: {self.sym_mgr.sym_types}")
+            site_qn_maps = []
+            for i in range(self.ncas):
+                # even (up) sites
+                map_up = {
+                    0: self.sym_mgr.get_phys_qn(2*i, 'emp'), 
+                    1: self.sym_mgr.get_phys_qn(2*i, 'occ')
+                }
+                site_qn_maps.append(map_up)
+                # Odd (Down) Site
+                map_dn = {
+                    0: self.sym_mgr.get_phys_qn(2*i+1, 'emp'), 
+                    1: self.sym_mgr.get_phys_qn(2*i+1, 'occ')
+                }
+                site_qn_maps.append(map_dn)
+            # get MPO in symmetric form with QN index
+            print("  Converting MPO to BlockTensors...")
+            final_H = dense_to_symmetric_mpo(self.H, site_qn_maps)
+            print(f"  MPO Converted. Sites: {len(final_H)}")
+            # Calculate Target QN
+            target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
+            print(f"  Target QN set to: {target_qn}")
+            # get Initial Guess
+            print(f"  Generating Initial Guess ({self.init_guess})...")
+            mps0 = self.get_initial_guess_symmetric(method=self.init_guess.lower())
+            use_symmetry = True
+        else: # dense branch without U(1) symmetry
             final_H = self.H
-            
-            mps0 = get_noisy_hf_guess(self.nelecas, self.L, noise=1e-3)
-
-        #     mps0 = get_noisy_hf_guess(mol.nelec, 2*self.ncas, noise=Initial_guess_NOISE)
-
-
+            mps0 = self.get_initial_guess_dense(noise=1e-3)
+            target_qn = None
+            use_symmetry = False
         t0 = time.time()
-
-        # run dmrg
         print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, U1=True, target_qn=self.target_qn)
-
-
+        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, 
+                    U1=use_symmetry, target_qn=target_qn, not_conv_err=False,sym_mgr = self.sym_mgr)
         dmrg.run()
-        
-        # if not dmrg.converged and self.init_guess == 'hf':
-        #     print('Consider using initial guess with bond dimension > 1.')
-
-        # 6. Report result
+        self.dmrg = dmrg
+        # Report
         e_dmrg_total = dmrg.e_tot + self.e_core
-
-        print('final number of electron is ',dmrg.nelec_dmrg())
         print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
-        print(f"  E(DMRG) =  {e_dmrg_total:.8f} Ha")
+        print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
         print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
         print(f"  Time:               {time.time()-t0:.2f} s")
-
+        if use_symmetry:
+            self.check_u1_symmetry()
         return dmrg
-
 
     def dump(self):
         pass
 
+    def check_u1_symmetry(self):
+        """
+        Post-run analysis: Checks conservation of all active symmetries 
+        (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
+        """
+        if self.dmrg.ground_state is None:
+            print("  [Error] No ground state found. Run DMRG first.")
+            return
+        print("\n" + "="*60)
+        print("  Symmetry Conservation Check")
+        print("="*60)
+        # Calculate 1-site RDMs for all sites, returns a dict {site_idx: rho_dense (d,d)}
+        try:
+            rdms = self.dmrg.ground_state.calc_1site_rdm()
+        except Exception as e:
+            print(f"  [Error] Failed to calculate RDM: {e}")
+            return
+        # initialize storage for quantum number
+        total_N_calc = 0.0
+        total_Sz_calc = 0.0
+        
+        print(f"{'Orb':<5} {'Spin':<6} {'Occ':<10} {'Sz_local':<10} {'Status'}")
+        print("-" * 60)
+        # Iterate over Spatial Orbitals (each splits into 2 Spin-Orbitals)
+        # now still assuming d=2 (Spin-Orbital) mapping: 2*i = Up, 2*i+1 = Down
+        for i in range(self.ncas):
+            # Spin Up Site
+            idx_up = 2 * i
+            rho_up = rdms[idx_up]
+            n_up = rho_up[1, 1].real 
+            # Spin Down Site
+            idx_dn = 2 * i + 1
+            rho_dn = rdms[idx_dn]
+            n_dn = rho_dn[1, 1].real
+            
+            # Charge = N_up + N_dn
+            n_local = n_up + n_dn
+            # Spin = 1/2 * (N_up - N_dn)
+            sz_local = 0.5 * (n_up - n_dn)
+            
+            total_N_calc += n_local
+            total_Sz_calc += sz_local
+            # get print nice looking 
+            def status(n):
+                if n > 0.98: return "Full"
+                if n < 0.02: return "."
+                return "~" # Entangled
+            print(f"{i:<5} {'Up':<6} {n_up:<10.5f} {0.5*n_up:<10.5f} {status(n_up)}")
+            print(f"{i:<5} {'Down':<6} {n_dn:<10.5f} {-0.5*n_dn:<10.5f} {status(n_dn)}")
+        print("-" * 60)
+        # compare with Targets 
+        target_qns = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
+        print(f"\n  Global Conservation Summary:")
+        # iterate over the active symmetries in the manager
+        for idx, sym_type in enumerate(self.sym_mgr.sym_types):
+            target_val = target_qns[idx]
+            if sym_type in ['charge', 'n', 'particle']:
+                measured = total_N_calc
+                diff = abs(measured - target_val)
+                label = "Charge (N)"
+            elif sym_type in ['sz', 'spin', 's_z']:
+                measured = total_Sz_calc * 2.0 
+                diff = abs(measured - target_val)
+                label = "Spin (2Sz)"
+            else:
+                measured = 0.0
+                diff = 0.0
+                label = f"Unknown ({sym_type})"
+            print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
 
 
@@ -862,19 +879,19 @@ if __name__=='__main__':
 
     from pyqed.qchem.mol import atomic_chain
     
-    natom = 4
+    natom = 6
     z = np.linspace(-6, 6, natom)
     mol = atomic_chain(natom, z)
 
     # mol.basis = 'aug-ccpvdz'
-    mol.basis = '631g'
+    mol.basis = 'ccpvdz'
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=2, nelecas=2, D=20) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
-    dmrg.build().run(symmetry=False)
+    dmrg = QCDMRG(mf, ncas=12, nelecas=6, D=60) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg.build().run(symmetry_list=['charge','s_z'], initial_guess='cid')
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
     # mc.run()

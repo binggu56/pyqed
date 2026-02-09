@@ -345,14 +345,14 @@ class SBM:
         # 5. Create Initial Guess (Product State)
         init_mps = []
 
-        # Site 0 (Spin): Shape (Phys, L, R) -> (2, 1, 1)
-        A_spin = np.zeros((2, 1, 1))
+        # Site 0 (Spin): Shape (L, Phys, R) -> (1, 2, 1)
+        A_spin = np.zeros((1, 2, 1))
         A_spin[0, 0, 0] = 1.0  # Up state
         init_mps.append(A_spin)
 
-        # Sites 1..N (Boson): Shape (Phys, L, R) -> (nb, 1, 1)
+        # Sites 1..N (Boson): Shape (L, Phys, R) -> (1, nb, 1)
         for _ in range(N):
-            A_boson = np.zeros((nb, 1, 1))
+            A_boson = np.zeros((1, nb, 1))
             A_boson[0, 0, 0] = 1.0 # Vacuum state
             init_mps.append(A_boson)
 

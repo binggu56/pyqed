@@ -31,7 +31,7 @@ from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian mat
 # from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 from pyqed.mps.decompose import decompose, compress
 try:
-    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson
+    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
@@ -81,11 +81,11 @@ def SpinHalfFermionOperators(filling=1.):
                Sx=Sx, Sy=Sy, Sz=Sz, Sp=Sp, Sm=Sm)  # yapf: disable
     return ops
 
+# below is some helper functions for the dmrg sweep with U(1) symmetry.
 def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     AA_perm = AA.transpose(0, 2, 1, 3)
 
-    # blocks_by_q_mid is used to combine different (q_L, q_phys_L) pair that actually share same q_tot_L, which would belong to same sub-block after svd
     blocks_by_q_mid = {}
     row_map = {}
     col_map = {}
@@ -108,8 +108,6 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     sv_list = []   # (s, q_mid, local_index)
     U_store = {}
     V_store = {}
-    
-    # Store S blocks temporarily
     S_store = {} 
 
     for q_mid, entries in blocks_by_q_mid.items():
@@ -134,7 +132,6 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
                     break
 
         M = np.zeros((r_dim, c_dim), dtype=entries[0][1].dtype)
-
         for qn, blk in entries:
             r0 = r_starts[(qn[0], qn[1])]
             c0 = c_starts[(qn[2], qn[3])]
@@ -145,21 +142,14 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
               )
 
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
-        
         S_store[q_mid] = S 
-
         for i, s in enumerate(S):
             sv_list.append((s, q_mid, i))
-
         U_store[q_mid] = (U, rows, r_starts, entries)
         V_store[q_mid] = (Vt, cols, c_starts, entries)
 
-    # GLOBAL truncation with bookkeeping
     sv_list.sort(reverse=True, key=lambda x: x[0])
-    
-    # Calculate truncation error
     full_sq_norm = sum(s**2 for s, _, _ in sv_list)
-    
     if m_max is not None:
         sv_list = sv_list[:m_max]
         
@@ -173,10 +163,10 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
     final_U = {}
     final_V = {}
-    final_S = {} # Dictionary to store S diagonal matrices
+    final_S = {} # Capture S
 
     for q_mid, idxs in kept.items():
-        idxs = sorted(idxs) # Ensure indices are sorted
+        idxs = sorted(idxs)
         U, rows, r_starts, entries = U_store[q_mid]
         Vt, cols, c_starts, entries = V_store[q_mid]
         
@@ -211,9 +201,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     qns_R      = AA_perm.qns[2]
     qns_pR     = AA_perm.qns[3]
 
-    # ----------------------------
-    # Construct tensors
-    # ----------------------------
+
     U = BlockTensor(
         final_U,
         qns=[qns_L, qns_pL, bond_qns],
@@ -225,9 +213,9 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
         qns=[bond_qns, qns_R, qns_pR],
         dirs=[-1, AA_perm.dirs[2], AA_perm.dirs[3]]
     )
-    
-    # Return S as a dictionary of arrays {q_mid: diagonal_matrix}
+
     return U, V, final_S, trunc_err, sum(len(v) for v in kept.values())
+
 
 
 
@@ -285,40 +273,177 @@ class HamiltonianMultiplyU1:
         
         return A_new
 
+def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
+    """
+    General converter from Dense MPO (L, R, Out, In) to Symmetric BlockTensor.
+    Includes strict type checking to prevent Integer/QN mismatches.
+    """
+    if not SYMMETRY_AVAILABLE:
+        raise ImportError("Symmetry module required.")
+    sym_H = []
+    # Determine Zero QN type
+    first_val = list(site_qn_maps[0].values())[0]
+    # Ensure zero_qn is of the same type as the map values (QN)
+    zero_qn = first_val * 0 if isinstance(first_val, tuple) else 0
+    # Track allowed Right-Bond QNs. Start with Vacuum (Left=0).
+    # Store (Dense_Index, QN_Value)
+    current_nodes = {(0, zero_qn)}
+    print(f"  [MPO Convert] Start. Sites={len(dense_mpo_list)}, ZeroQN={zero_qn} (Type: {type(zero_qn)})")
+    for site_idx, W in enumerate(dense_mpo_list):
+        new_data = {}
+        next_nodes = set()
+        phys_qns = site_qn_maps[site_idx]
+        # Metadata for BlockTensor
+        all_phys_out = sorted(list(set(phys_qns.values())))
+        all_phys_in = sorted(list(set(phys_qns.values())))
+        # Optimize lookup
+        valid_incoming = {}
+        for l_idx, q_l in current_nodes:
+            if l_idx not in valid_incoming: valid_incoming[l_idx] = set()
+            valid_incoming[l_idx].add(q_l)
+        # W shape: (Left, Right, Out, In)
+        idxs = np.nonzero(np.abs(W) > tol)
+        for i in range(len(idxs[0])):
+            l, r, out_s, in_s = idxs[0][i], idxs[1][i], idxs[2][i], idxs[3][i]
+            val = W[l, r, out_s, in_s]
+            if l not in valid_incoming: 
+                continue
+            # Retrieve Physical QNs
+            q_out = phys_qns[out_s]
+            q_in = phys_qns[in_s]
+            # Q_Right = Q_Left - (Q_Out - Q_In)
+            flux = q_out - q_in
+            for q_l in valid_incoming[l]:
+                # Ensure q_l is a QN (tuple), not an int
+                if not isinstance(q_l, tuple):
+                    raise TypeError(f"Site {site_idx}: q_l became {type(q_l)} ({q_l})! Expected QN/tuple.")
+                q_r = q_l - flux
+                next_nodes.add((r, q_r))
+                # Construct Key: Must be (QN, QN, QN, QN)
+                key = (q_l, q_r, q_out, q_in)
+                if key not in new_data: new_data[key] = []
+                new_data[key].append( ((l, q_l), (r, q_r), val) )
+        # Build BlockTensor Maps
+        l_map = {q: sorted([x for x in current_nodes if x[1]==q]) for q in set(x[1] for x in current_nodes)}
+        r_map = {q: sorted([x for x in next_nodes if x[1]==q]) for q in set(x[1] for x in next_nodes)}
+        final_blocks = {}
+        for key, elems in new_data.items():
+            q_l, q_r, q_o, q_i = key
+            # Validation
+            if q_l not in l_map or q_r not in r_map:    
+                continue
+            rows = l_map[q_l]; cols = r_map[q_r]
+            row_idx = {x: k for k, x in enumerate(rows)}
+            col_idx = {x: k for k, x in enumerate(cols)}
+            blk = np.zeros((len(rows), len(cols), 1, 1), dtype=W.dtype)
+            for (nl, nr, v) in elems:
+                blk[row_idx[nl], col_idx[nr], 0, 0] = v
+            final_blocks[key] = blk
+        qns_L = sorted(list(l_map.keys()))
+        qns_R = sorted(list(r_map.keys()))
+        qns_Out = all_phys_out
+        qns_In = all_phys_in
+        bt = BlockTensor(final_blocks, [qns_L, qns_R, qns_Out, qns_In], [-1, 1, 1, -1])
+        sym_H.append(bt)
+        # Verify generated keys for first site (debug use)
+        if site_idx == 0 and len(final_blocks) > 0:
+            sample_key = next(iter(final_blocks.keys()))
+            if not isinstance(sample_key[0], tuple):
+                 print(f"  [ERROR] Site 0 generated INTEGER keys: {sample_key}. Expected QNs.")
+        current_nodes = next_nodes        
+    return sym_H
 
 
 class MPS:
-    def __init__(self, Bs, Ss=None, homogenous=True, bc='finite', form="B"):
+    def __init__(self, Bs, Ss=None, homogenous=True, bc='finite', labels=None, center = -1):
         """
         class for matrix product states.
+        supports flexible tensor layouts via the `labels` argument.
 
         Parameters
         ----------
-        mps : list
-            list of 3-tensors.
+        Bs : list of np.ndarray
+            The site tensors.
+            - Must be a list of rank-3 tensors.
+            - Shape depends on `labels`, e.g., ['lv', 'p', 'rv'] -> means(Bond_L, Phys, Bond_R).
 
-        Returns
-        -------
-        None.
+        Ss : list of np.ndarray, optional
+            The bond singular values (Schmidt coefficients).
+            - `Ss[i]` corresponds to the bond between site `i` and `i+1`.
+            - Used for calculating entanglement entropy and handling canonical forms.
 
+        homogenous : bool, optional
+            If True, assumes all sites share the same physical dimension structure. Default is True.
+
+        bc : str, optional
+            Boundary conditions. Options:
+            - 'finite': Open Boundary Conditions (OBC).
+            - 'infinite': Infinite Boundary Conditions (IBC/PBC).
+            default is 'finite'.
+
+        labels : list of str, optional
+            Describes the index order of the tensors in `Bs`.
+            If None, defaults to ['lv', 'p', 'rv'].
+            
+            Supported Keys:
+            - 'lv': Left-Virtual (Bond to the left)
+            - 'rv': Right-Virtual (Bond to the right)
+            - 'p':  Physical (Local Hilbert space)
+
+            Common Examples: 
+            - ['lv', 'p', 'rv']: Standard Dense format (Left, Phys, Right).
+            - ['p', 'lv', 'rv']: "Physics" format (Phys, Left, Right).
+            - ['lv', 'rv', 'p']: "BlockTensor" format (Left, Right, Phys).
+
+        Attributes
+        ----------
+        L : int
+            Number of sites (length of the chain).
+        nbonds : int
+            Number of bonds (L-1 for finite, L for infinite).
+        dim : int
+            Physical dimension (d) of the sites.
+        lv_idx, p_idx, rv_idx : int
+            Cached integer positions of the axes based on `labels`.
+        Center : int
+            Canonical center site index. Default is -1 (no specific center).
         """
         assert bc in ['finite', 'infinite']
         self.Bs = self.factors = Bs
         self.Ss = Ss
+
+
+        if labels is None:
+            warnings.warn("MPS labels not specified, assuming ['lv', 'p', 'rv'].")
+            self.labels = ['lv', 'p', 'rv'] 
+        else:
+            self.labels = labels
+        try:
+            self.lv_idx = self.labels.index('lv')
+            self.rv_idx = self.labels.index('rv')
+            self.p_idx = self.labels.index('p')
+        except ValueError as e:
+            missing_label = str(e).split()[-1] 
+            raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
+        if len(self.labels) != 3:
+             warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
+
         self.bc = bc
         self.L = len(Bs)
-        self.nbonds = self.L - 1 if self.bc == 'open' else self.L
+        self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
         self.gauge = None
-
         self.data = self.factors = Bs
-        
-        # --- ROBUST DIM CALCULATION FOR BLOCKTENSORS ---
+        self.center = center
+        if (self.center < 0 or self.center >= self.L) and (self.center != -1):
+            raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
+        if self.center == -1:
+            warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
         if homogenous:
             try:
-                self.dim = Bs[0].shape[1]
+                self.dim = Bs[0].shape[self.p_idx]
             except TypeError:
                 if hasattr(Bs[0], 'data'):
-                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2
+                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
                     phys_dims = {}
                     for key, block in Bs[0].data.items():
                         # key is (qL, qR, qP)
@@ -327,9 +452,8 @@ class MPS:
                             phys_dims[q_p] = block.shape[2]
                     self.dim = sum(phys_dims.values())
                 else:
-                    self.dim = 0 # Should not happen
+                    self.dim = 0
         else:
-            # Similar logic for inhomogeneous
             self.dims = []
             for B in Bs:
                 try:
@@ -338,26 +462,60 @@ class MPS:
                     if hasattr(B, 'data'):
                         phys_dims = {}
                         for key, block in B.data.items():
-                            q_p = key[1]
+                            q_p = key[2]
                             if q_p not in phys_dims:
-                                phys_dims[q_p] = block.shape[1]
+                                phys_dims[q_p] = block.shape[2]
                         self.dims.append(sum(phys_dims.values()))
                     else:
                         self.dims.append(0)
 
-        # self._mpo = None
-
     def copy(self):
-        return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss], self.bc)
+        return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss] if self.Ss is not None else None, self.bc, labels=self.labels)
+
+
+    def set_labels(self, new_labels):
+        """
+        Allow user to manually assign/correct labels after creation.
+
+        Common examples: 
+        - ['lv', 'p', 'rv']  (Left-Virtual, Physical, Right-Virtual)
+        - ['lv', 'rv', 'p']  (Left-Virtual, Right-Virtual, Physical)
+        - ['p', 'lv', 'rv']  (Physical, Left-Virtual, Right-Virtual)
+        """
+        self.labels = new_labels
+        try:
+            self.lv_idx = self.labels.index('lv')
+            self.rv_idx = self.labels.index('rv')
+            self.p_idx = self.labels.index('p')
+        except ValueError as e:
+            missing_label = str(e).split()[-1] 
+            raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
+        if len(self.labels) != 3:
+             warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
+
+    def to_order(self, target_labels):
+        """Returns a new MPS with tensors transposed to target_labels."""
+        if self.labels == target_labels:
+            return self.copy()
+        
+        perm = [self.labels.index(l) for l in target_labels]
+        new_Bs = [B.transpose(perm) for B in self.Bs]
+        return MPS(new_Bs, self.Ss, self.bc, labels=target_labels)
+
+    def _get_std_B(self, i):
+        """
+        Internal Helper: Returns B[i] transposed to standard [Left, Phys, Right].
+        """
+        B = self.Bs[i]
+        # Check if it has data AND that data is a dict (BlockTensor structure)
+        if hasattr(B, 'data') and isinstance(B.data, dict): 
+            return B 
+        return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
     def get_bond_dimensions(self):
-        """
-        Return bond dimensions.
-        """
         try:
-            return [self.Bs[i].shape[2] for i in range(self.nbonds)]
-        except TypeError:
-             # Fallback for BlockTensor bond dims (Axis 2)
+            return [self.Bs[i].shape[self.rv_idx] for i in range(self.nbonds)]
+        except (TypeError, AttributeError):
              bonds = []
              for i in range(self.nbonds):
                  B = self.Bs[i]
@@ -373,21 +531,59 @@ class MPS:
     #     pass
 
     def __add__(self, other):
-        assert len(self.data) == len(other.data)
-        # for different length, we should choose the maximum one
-        C = []
-        for j in range(self.sites):
-            tmp = block_diag(self.data[j], other.data[j])
-            C.append(tmp.copy())
+        """
+        Sum of two MPS states: |Result> = |self> + |other>
+        
+        Logic:
+        - First Site: Concatenate [A, B] horizontally.
+        - Middle Sites: Block Diagonal.
+        - Last Site: Concatenate [[A], [B]] vertically.
 
-        return MPS(C)
+        not using block_diag from scipy since first site need to be row vector and last site need to be column vector. 
+        """
+        assert self.L == other.L
+        
+        C = []
+        for j in range(self.L):
+            A = self._get_std_B(j)
+            B = other._get_std_B(j) 
+            
+            la, d, ra = A.shape
+            lb, _, rb = B.shape
+            
+            if j == 0:
+                # first site is Row Vector [A, B]
+                # Left dim stays 1 (assuming La=Lb=1)
+                # Right dim sums: Ra + Rb
+                new_tensor = np.zeros((la, d, ra + rb), dtype=np.result_type(A, B))
+                new_tensor[:, :, :ra] = A
+                new_tensor[:, :, ra:] = B
+                
+            elif j == self.L - 1:
+                # last iste is Column Vector [[A], [B]]
+                # Left dim sums: La + Lb
+                # Right dim stays 1 (assuming Ra=Rb=1)
+                new_tensor = np.zeros((la + lb, d, ra), dtype=np.result_type(A, B))
+                new_tensor[:la, :, :] = A
+                new_tensor[la:, :, :] = B
+                
+            else:
+                # middles sites are Block Diagonal
+                # Left sums, Right sums
+                new_tensor = np.zeros((la + lb, d, ra + rb), dtype=np.result_type(A, B))
+                new_tensor[:la, :, :ra] = A
+                new_tensor[la:, :, ra:] = B
+            
+            C.append(new_tensor)
+
+        return MPS(C, labels=['lv', 'p', 'rv'])
 
     def entanglement_entropy(self):
         """Return the (von-Neumann) entanglement entropy for a bipartition at any of the bonds."""
         bonds = range(1, self.L) if self.bc == 'finite' else range(0, self.L)
         result = []
         for i in bonds:
-            S = self.Ss[i].copy()
+            S = self.Ss[i-1].copy()
             S[S < 1.e-20] = 0.  # 0*log(0) should give 0; avoid warning or NaN.
             S2 = S * S
             assert abs(np.linalg.norm(S) - 1.) < 1.e-13
@@ -395,39 +591,93 @@ class MPS:
         return np.array(result)
 
     def get_theta1(self, i):
-        """Calculate effective single-site wave function on sites i in mixed canonical form.
-
-        The returned array has legs ``vL, i, vR`` (as one of the Bs).
         """
-        return np.tensordot(np.diag(self.Ss[i]), self.Bs[i], [1, 0])  # vL [vL'], [vL] i vR
-
+        Calculate effective single-site wave function on sites i.
+        Automatically detects Left/Right canonical forms based on self.center.
+        """
+        tensor = self._get_std_B(i)
+        if self.center == -1:
+            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta1(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+        # Right of Center
+        if i > self.center:
+            if i == 0:
+                if self.bc == 'infinite':
+                    S_left = self.Ss[-1]
+                else:
+                    return tensor # Open Boundary, no left weights
+            else:
+                S_left = self.Ss[i-1]
+            # Contract S_left (diag) with Tensor (Left Index 0)
+            return np.tensordot(np.diag(S_left), tensor, axes=([1], [0]))
+        # Left of Center
+        elif i < self.center:
+            S_right = self.Ss[i]
+            # Contract Tensor (Right Index 2) with S_right (diag)
+            return np.tensordot(tensor, np.diag(S_right), axes=([2], [0]))
+        # At Center
+        else:
+            return tensor
+    
     def get_theta2(self, i):
-        """Calculate effective two-site wave function on sites i,j=(i+1) in mixed canonical form.
-
-        The returned array has legs ``vL, i, j, vR``.
+        """
+        Calculate effective two-site wave function on sites i, i+1.
+        Handles crossing the orthogonality center.
         """
         j = (i + 1) % self.L
-        return np.tensordot(self.get_theta1(i), self.Bs[j], [2, 0])  # vL i [vR], [vL] j vR
+        if self.center < 0 or self.center > self.L -1:
+            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta2(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+        # The bond (i, j) is the center
+        # i is Left-Canonical (A), j is Right-Canonical (B)
+        if i == self.center: 
+            A_i = self._get_std_B(i) # Pure tensor
+            S_mid = self.Ss[i]
+            B_j = self._get_std_B(j) # Pure tensor
+            # A_i * S_mid
+            temp = np.tensordot(A_i, np.diag(S_mid), axes=([2], [0]))
+            # (A_i * S_mid) * B_j
+            return np.tensordot(temp, B_j, axes=([2], [0]))
+        # Entire block is to the Right of Center
+        # theta1(i) * B_j
+        elif self.center != -1 and i > self.center:
+            return np.tensordot(self.get_theta1(i), self._get_std_B(j), axes=([2], [0]))
+        # Entire block is to the Left of Center
+        # A_i * theta1(j) 
+        elif self.center != -1 and j < self.center:
+            return np.tensordot(self._get_std_B(i), self.get_theta1(j), axes=([2], [0]))
 
     def site_expectation_value(self, op):
         """Calculate expectation values of a local operator at each site."""
         result = []
         for i in range(self.L):
-            theta = self.get_theta1(i)  # vL i vR
-            op_theta = np.tensordot(op, theta, axes=(1, 1))  # i [i*], vL [i] vR
-            result.append(np.tensordot(theta.conj(), op_theta, [[0, 1, 2], [1, 0, 2]]))
-            # [vL*] [i*] [vR*], [i] [vL] [vR]
+            # theta: [L, P, R]
+            theta = self.get_theta1(i)
+            
+            # op: [P_out, P_in]. Contract P_in (1) with theta P (1)
+            # op_theta: [P_out, L, R]
+            op_theta = np.tensordot(op, theta, axes=(1, 1))
+            
+            # Contract with theta*: [L, P, R]
+            # Match: L(1)-L(0), R(2)-R(2), P_out(0)-P(1)
+            # einsum: 'plr,lpr->'
+            val = np.tensordot(op_theta, theta.conj(), axes=([0, 1, 2], [1, 0, 2]))
+            result.append(val)
         return np.real_if_close(result)
 
     def bond_expectation_value(self, op):
         """Calculate expectation values of a local operator at each bond."""
         result = []
         for i in range(self.nbonds):
-            theta = self.get_theta2(i)  # vL i j vR
+            # theta: [L, Pi, Pj, R]
+            theta = self.get_theta2(i)
+            
+            # op[i]: [Pi_out, Pj_out, Pi_in, Pj_in]
+            # Contract (Pi_in, Pj_in) [2,3] with theta (Pi, Pj) [1,2]
             op_theta = np.tensordot(op[i], theta, axes=([2, 3], [1, 2]))
-            # i j [i*] [j*], vL [i] [j] vR
-            result.append(np.tensordot(theta.conj(), op_theta, [[0, 1, 2, 3], [2, 0, 1, 3]]))
-            # [vL*] [i*] [j*] [vR*], [i] [j] [vL] [vR]
+            
+            # op_theta: [Pi_out, Pj_out, L, R]
+            # Contract with theta*: [L, Pi, Pj, R]
+            val = np.tensordot(op_theta, theta.conj(), axes=([0, 1, 2, 3], [1, 2, 0, 3]))
+            result.append(val)
         return np.real_if_close(result)
 
     def correlation_length(self):
@@ -437,12 +687,12 @@ class MPS:
             warnings.warn("Skip calculating correlation_length() for large chi: could take long")
             return -1.
         assert self.bc == 'infinite'  # works only in the infinite case
-        B = self.Bs[0]  # vL i vR
+        B = self._get_std_B(0)  # vL i vR
         chi = B.shape[0]
         T = np.tensordot(B, np.conj(B), axes=(1, 1))  # vL [i] vR, vL* [i*] vR*
         T = np.transpose(T, [0, 2, 1, 3])  # vL vL* vR vR*
         for i in range(1, self.L):
-            B = self.Bs[i]
+            B = self._get_std_B(i)
             T = np.tensordot(T, B, axes=(2, 0))  # vL vL* [vR] vR*, [vL] i vR
             T = np.tensordot(T, np.conj(B), axes=([2, 3], [0, 1]))
             # vL vL* [vR*] [i] vR, [vL*] [i*] vR*
@@ -467,11 +717,11 @@ class MPS:
         C = np.tensordot(theta.conj(), C, axes=([0, 1], [1, 0]))  # [vL*] [i*] vR*, [i] [vL] vR
         for k in range(i + 1, j):
             k = k % self.L
-            B = self.Bs[k]  # vL k vR
+            B = self._get_std_B(k)  # vL k vR
             C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] k vR
             C = np.tensordot(B.conj(), C, axes=([0, 1], [0, 1])) # [vL*] [k*] vR*, [vR*] [k] vR
         j = j % self.L
-        B = self.Bs[j]  # vL k vR
+        B = self._get_std_B(j)  # vL k vR
         C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] j vR
         C = np.tensordot(op_j, C, axes=(1, 1))  # j [j*], vR* [j] vR
         C = np.tensordot(B.conj(), C, axes=([0, 1, 2], [1, 0, 2])) # [vL*] [j*] [vR*], [j] [vR*] [vR]
@@ -511,14 +761,17 @@ class MPS:
         As = []
         for n in range(self.L):
 
-            al, d, ar = self.factors[n].shape
-            bl, d, br = other.factors[n].shape
+            A = self._get_std_B(n)
+            V = other._get_std_B(n)
 
-            c = np.einsum('aib, cid -> acibd', other.factors[n], self.factors[n])
-            c.reshape((al * bl, d, ar * br))
+            al, d, ar = A.shape
+            vl, d, vr = V.shape
+
+            c = np.einsum('aib, cid -> acibd', V, A)
+            c = c.reshape((al * vl, d, ar * vr))
             As.append(c.copy())
 
-        return MPS(As)
+        return MPS(As, labels=['lv', 'p', 'rv'])
 
     # def __add__(self, other):
     #     pass
@@ -527,10 +780,87 @@ class MPS:
     #     pass
 
     def left_canonicalize(self):
-        pass
+        """
+        Sweeps from Left (0) to Right (L-1) to transform the MPS into Left-Canonical Form.
+        Effect:
+        - Tensors Bs[0]...Bs[L-2] become Left-Isometries (A).
+        - Populates self.Ss with bond weights.
+        - Moves orthogonality center to the last site (L-1).
+        """
+        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+            self.Center = self.L - 1
+            return
+        if self.Ss is None or len(self.Ss) != self.nbonds:
+            self.Ss = [None] * self.nbonds
+        # Get permutation
+        perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
+        # Sweep Left -> Right
+        for i in range(self.L - 1):
+            B = self._get_std_B(i)
+            dl, dp, dr = B.shape
+            # Reshape (Left * Phys, Right)
+            mat = B.reshape(dl * dp, dr)
+            U, S, Vh = np.linalg.svd(mat, full_matrices=False)
+            chi = len(S)
+            # Update Site i and Reshape to (L,P,R) and Transpose back
+            self.Bs[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
+            # Ss[i] is the bond between i and i+1
+            self.Ss[i] = S / np.linalg.norm(S)
+            # Pass weights (S * Vh) 
+            # Matrix M = diag(S) * Vh  (Shape: chi, dr)
+            M = np.dot(np.diag(S), Vh)
+            # Contract M with B_next on its Left index
+            B_next = self._get_std_B(i+1) # [Left_Old, Phys, Right]
+            B_next_updated = np.tensordot(M, B_next, axes=([1], [0])) # (New_Bond, Phys, Right)
+            self.Bs[i+1] = B_next_updated.transpose(perm_inv)
+        # Normalize 
+        B_last = self._get_std_B(self.L - 1)
+        B_last /= np.linalg.norm(B_last)
+        self.Bs[self.L - 1] = B_last.transpose(perm_inv)
+        # Update Center
+        self.Center = self.L - 1
 
     def right_canonicalize(self):
-        pass
+        """
+        Sweeps from Right (L-1) to Left (0) to transform the MPS into Right-Canonical Form.
+        Effect:
+        - Tensors Bs[1]...Bs[L-1] become Right-Isometries (B).
+        - Populates self.Ss with bond weights.
+        - Moves orthogonality center to the first site (0).
+        """
+        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+            self.Center = 0
+            return
+        if self.Ss is None or len(self.Ss) != self.nbonds:
+            self.Ss = [None] * self.nbonds
+        # Get permutation
+        perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
+        # Sweep Right -> Left
+        for i in range(self.L - 1, 0, -1):
+            B = self._get_std_B(i)
+            dl, dp, dr = B.shape
+            # Reshape (Left, Phys * Right)
+            mat = B.reshape(dl, dp * dr)
+            U, S, Vh = np.linalg.svd(mat, full_matrices=False)
+            chi = len(S)
+            # Update Site i (The Isometry Vh) 
+            # Reshape Vh to (New_Bond, Phys, Right) and Transpose back
+            self.Bs[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
+            # Ss[i-1] is the bond between i-1 and i
+            self.Ss[i-1] = S / np.linalg.norm(S)
+            # Pass weights (U * S)
+            # Matrix M = U * diag(S) (Shape: dl, chi)
+            M = np.dot(U, np.diag(S))
+            # Contract B_prev with M on its Right index
+            B_prev = self._get_std_B(i-1) # [Left, Phys, Right_Old]
+            B_prev_updated = np.tensordot(B_prev, M, axes=([2], [0])) # (Left, Phys, New_Bond)
+            self.Bs[i-1] = B_prev_updated.transpose(perm_inv)
+        # Normalize
+        B_first = self._get_std_B(0)
+        B_first /= np.linalg.norm(B_first)
+        self.Bs[0] = B_first.transpose(perm_inv)
+        # Update Center
+        self.Center = 0
 
     def left_to_vidal(self):
         pass
@@ -552,19 +882,22 @@ class MPS:
     #     pass
 
     def compress(self, chi_max):
-        return MPS(compress(self.factors, chi_max)[0])
+        compressed_factors = compress(self.factors, chi_max)
+        if isinstance(compressed_factors, tuple):
+            compressed_factors = compressed_factors[0]
+        return MPS(compressed_factors, labels=['lv','p','rv'])
     
     def calc_1site_rdm(self, idx=None):
         """
         Calculate 1-site reduced density matrices.
 
-        Dense (numpy) MPS path: uses the existing implementation assuming tensors
-        are ordered as (phys, chi_L, chi_R).
+        Dense (numpy) MPS path: uses standard [Left, Phys, Right] layout via _get_std_B.
 
         U(1) (BlockTensor) path: builds left/right overlap environments using the
         same contraction logic as the DMRG sweeps (contract_from_left/right),
         but leaves the physical indices at the target site open.
-        Returns *dense* (numpy) d×d matrices for convenience.
+        TODO: U(1) branch is now still in Left Phys Right layout for MPS tensors.  Need to standardize.
+        Both Branch give numpy d×d matrices for convenience.
         """
         import numpy as np
 
@@ -584,7 +917,11 @@ class MPS:
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
 
             def _make_id_mpo_from_phys_qns(phys_qns):
-                # phys_qns is a list with length d (may contain duplicates for degeneracy)
+                # Deduce the correct "Zero" type from physics
+                sample_qn = phys_qns[0]
+                # Multiply by 0 to get QN(0,0) or 0 depending on type
+                zero_qn = sample_qn * 0 
+                
                 from collections import defaultdict
                 idxs_by_q = defaultdict(list)
                 for k, q in enumerate(list(phys_qns)):
@@ -593,11 +930,11 @@ class MPS:
                 data = {}
                 for q, ks in idxs_by_q.items():
                     d = len(ks)
-                    # block for (L=0,R=0,Out=q,In=q): shape (1,1,d,d)
-                    data[(0, 0, q, q)] = np.eye(d).reshape(1, 1, d, d)
+                    # Use zero_qn for bond indices (L, R)
+                    # Shape: (BondL=1, BondR=1, Out=d, In=d)
+                    data[(zero_qn, zero_qn, q, q)] = np.eye(d).reshape(1, 1, d, d)
 
-                qns = [[0], [0], list(phys_qns), list(phys_qns)]
-                # Conventional MPO directions (bondL, bondR, out, in)
+                qns = [[zero_qn], [zero_qn], list(phys_qns), list(phys_qns)]
                 dirs = [1, -1, 1, -1]
                 return BlockTensor(data, qns, dirs)
 
@@ -636,6 +973,7 @@ class MPS:
 
             # Build right overlap environments R[s] for bond right of site s
             R = [None] * self.L
+            # this extract the total qn on the last bond 
             qs = sorted({key[1] for key in self.Bs[-1].data.keys()})
             if len(qs) != 1:
                 raise ValueError(f"Ambiguous total charge on last bond: {qs}.")
@@ -669,36 +1007,22 @@ class MPS:
 
             return rdm
 
-        # 1-rdm calculation without U(1)
-        # 1. Build Left Environments (L_env[i] is contraction of 0...i-1)
-        L_env = [np.array([[1.0]])]
-        curr_L = L_env[0]
-        for i in range(self.L - 1):
-            # L(bra_L,ket_L) * B(p,ket_L,ket_R) -> temp(bra_L,p,ket_R)
-            temp = np.tensordot(curr_L, self.Bs[i], axes=(1, 1))
-            # temp(bra_L,p,ket_R) * B*(p,bra_L,bra_R) -> curr_L(ket_R,bra_R)
-            curr_L = np.tensordot(temp, self.Bs[i].conj(), axes=([0, 1], [1, 0]))
-            curr_L = curr_L.T
-            L_env.append(curr_L)
-
-        # 2. Build Right Environments (R_env[i] is contraction of i+1...L-1)
-        R_env = [None] * self.L
-        curr_R = np.array([[1.0]])
-        R_env[-1] = curr_R
-        for i in range(self.L - 1, 0, -1):
-            # B(p,chiL,chiR) * R(bra_R,ket_R) -> temp(p,chiL,bra_R)
-            temp = np.tensordot(self.Bs[i], curr_R, axes=(2, 1))
-            # temp(p,chiL,bra_R) * B*(p,bra_L,bra_R) -> curr_R(chiL,bra_L)
-            curr_R = np.tensordot(temp, self.Bs[i].conj(), axes=([0, 2], [0, 2])).T
-            R_env[i - 1] = curr_R
-
+        if idx is None:
+            idx = list(range(self.L))
+        elif isinstance(idx, int):
+            idx = [idx]
         rdm = {}
         for i in idx:
-            t1 = np.tensordot(L_env[i], self.Bs[i], axes=(1, 1))
-            t2 = np.tensordot(t1, R_env[i], axes=(2, 1))
-            rho = np.tensordot(t2, self.Bs[i].conj(), axes=([0, 2], [1, 2]))
+            # Get Effective Wavefunction [Left, Phys, Right]
+            theta = self.get_theta1(i)
+            # Contract Left_env and Right_env
+            # Result is rho[Phys, Phys*]
+            rho = np.tensordot(theta, theta.conj(), axes=([0, 2], [0, 2]))
+            # Normalize 
+            tr = np.trace(rho)
+            if abs(tr) > 1e-12:
+                rho /= tr
             rdm[i] = rho
-
         return rdm
 
     def calc_2site_rdm(self, idx_pairs=None):
@@ -749,34 +1073,52 @@ class MPS:
 
         # 2-rdm calculation with U(1) off
         if not (SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor)):
-            # 1) Build overlap environments
+            # 1) Build Left Environments
             L_env = [np.array([[1.0]])]
             curr_L = L_env[0]
             for i in range(self.L - 1):
-                temp = np.tensordot(curr_L, self.Bs[i], axes=(1, 1))
-                curr_L = np.tensordot(temp, self.Bs[i].conj(), axes=([0, 1], [1, 0])).T
+                B = self._get_std_B(i)
+                # Contract L_env(Bra, Ket) with B(Ket, P, R) -> temp(Bra, P, R)
+                temp = np.tensordot(L_env[-1], B, axes=(1, 0))
+                # Contract temp with B*(Bra, P, R*) -> L_next(R, R*) -> Transpose to (R*, R)
+                curr_L = np.tensordot(temp, B.conj(), axes=([0, 1], [0, 1])).T
                 L_env.append(curr_L)
 
+            # Build Right Environments
             R_env = [None] * self.L
             curr_R = np.array([[1.0]])
             R_env[-1] = curr_R
             for i in range(self.L - 1, 0, -1):
-                temp = np.tensordot(self.Bs[i], curr_R, axes=(2, 1))
-                curr_R = np.tensordot(temp, self.Bs[i].conj(), axes=([0, 2], [0, 2])).T
+                B = self._get_std_B(i)
+                # Contract B(L, P, R) with R_env(Bra, Ket) -> temp(L, P, Bra)
+                temp = np.tensordot(B, R_env[i], axes=(2, 1))
+                # Contract temp with B*(L*, P, Bra) -> R_prev(L, L*) -> Transpose to (L*, L)
+                curr_R = np.tensordot(temp, B.conj(), axes=([1, 2], [1, 2])).T
                 R_env[i - 1] = curr_R
 
             # 2) Precompute components
+            # group the Environment + Site Tensor to expose Physical and Bond indices.
+            
+            # L_components[i]: [Pi, Pi*, R*, R]
             L_components = []
             for i in range(self.L):
-                t = np.tensordot(L_env[i], self.Bs[i], axes=(1, 1))
-                comp = np.tensordot(t, self.Bs[i].conj(), axes=(0, 1))
+                B = self._get_std_B(i)
+                # L_env(Bra, Ket) * B(Ket, P, R) -> t(Bra, P, R)
+                t = np.tensordot(L_env[i], B, axes=(1, 0))
+                # t(Bra, P, R) * B*(Bra, P*, R*) -> comp(P, R, P*, R*)
+                comp = np.tensordot(t, B.conj(), axes=(0, 0))
+                # Reorder to [Pi, Pi*, R*, R]
                 comp = comp.transpose(0, 2, 3, 1)
                 L_components.append(comp)
 
+            # R_components[j]: [L, L*, Pj*, Pj]
             R_components = []
             for i in range(self.L):
-                t = np.tensordot(self.Bs[i], R_env[i], axes=(2, 1))
-                comp = np.tensordot(t, self.Bs[i].conj(), axes=(2, 2))
+                B = self._get_std_B(i)
+                # B(L, P, R) * R_env(Bra, Ket) -> t(L, P, Bra)
+                t = np.tensordot(B, R_env[i], axes=(2, 1))
+                # t(L, P, Bra) * B*(L*, P*, Bra) -> comp(L, P, L*, P*)
+                comp = np.tensordot(t, B.conj(), axes=(2, 2))
                 comp = comp.transpose(0, 2, 3, 1)
                 R_components.append(comp)
 
@@ -786,28 +1128,38 @@ class MPS:
                 js = pairs_by_i.get(i, [])
                 if not js: continue
 
+                # Start with component at i: [Pi, Pi*, R*_i, R_i]
                 tensor = L_components[i]
                 max_j = max(js)
                 for j in range(i + 1, max_j + 1):
+                    # If exist sites between i and j, propagate the bond indices by tracing over the physical indices of the intermediate sites (Transfer Matrix).
                     if j > i + 1:
                         k = j - 1
-                        tensor = np.tensordot(tensor, self.Bs[k], axes=(3, 1))
-                        tensor = np.tensordot(tensor, self.Bs[k].conj(), axes=([2, 3], [1, 0]))
-                        tensor = tensor.transpose(0, 1, 3, 2)
+                        B = self._get_std_B(k) # [L, P, R]
+                        # Apply Transfer Matrix at site k:
+                        # tensor: [Pi, Pi*, L*_k, L_k]
+                        # B:      [L_k, P_k, R_k]
+                        # B*:     [L*_k, P_k, R*_k]
+                        # Contract L with L, L* with L*, trace P_k.
+                        # Output: [Pi, Pi*, R*_k, R_k]
+                        tensor = np.einsum('abcd, def, geh -> abfh', tensor, B, B.conj(), optimize=True)
 
                     if j in js:
-                        # FIX: Use np.tensordot explicitly here (not the symmetric one)
-                        rho_ij = np.tensordot(tensor, R_components[j], axes=([2, 3], [2, 3]))
-                        rho_ij = rho_ij.transpose(0, 2, 1, 3)
+                        # Contract with component at j: [L_j, L*_j, Pj*, Pj]
+                        # Connect Bond indices: R_prev(3) with L_j(0), R*_prev(2) with L*_j(1)
+                        rho_raw = np.tensordot(tensor, R_components[j], axes=([3, 2], [0, 1]))
+                        
+                        # rho_raw: [Pi, Pi*, Pj*, Pj]
+                        # Reorder to standard form [Pi, Pj, Pi*, Pj*]
+                        rho_ij = rho_raw.transpose(0, 3, 1, 2)
 
                         d_i, d_j = rho_ij.shape[0], rho_ij.shape[1]
+                        rho_mat = rho_ij.reshape(d_i * d_j, d_i * d_j)
                         
                         # Normalize
-                        rho_mat = rho_ij.reshape(d_i * d_j, d_i * d_j)
                         tr = np.trace(rho_mat)
                         if abs(tr) > 1e-12:
                             rho_mat /= tr
-                            
                         rdm[(i, j)] = rho_mat
 
             return rdm
@@ -1305,9 +1657,48 @@ class MPO:
         if chi_max is None:
             chi_max = max(self.bond_orders()+other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders())*2
         if isinstance(other, MPO):
-            new_factors = product_MPO(self.factors, other.factors)
-            new_factors, _ = compress(new_factors, chi_max)
-            return MPO(new_factors)
+            # 1. Compute raw product 
+            # Output format of product_MPO is (Left, Right, Up, Down)
+            raw_factors = product_MPO(self.factors, other.factors)
+            
+            # 2. Prepare for compress
+            # decompose.py strictly requires shape: (Left, Physical, Right)
+            # But our MPO product produces: (Left, Right, Up, Down)
+            mps_factors = []
+            phys_dims = [] 
+            
+            for W in raw_factors:
+                s = W.shape
+                # Store original physical dims (d_up, d_down)
+                phys_dims.append((s[2], s[3]))
+                
+                # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
+                W_flat = W.reshape(s[0], s[1], s[2] * s[3])
+                
+                # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
+                W_ready = W_flat.transpose(0, 2, 1)
+                
+                mps_factors.append(W_ready)
+            
+            # 3. Compress (Input is Left, Phys, Right)
+            # The output B will also be (Left, Phys, Right)
+            compressed_factors = compress(mps_factors, chi_max)
+            
+            # 4. Restore MPO format
+            final_factors = []
+            for i, B in enumerate(compressed_factors):
+                # B shape: (new_chi_L, d_combined, new_chi_R)
+                
+                # Step A: Transpose back -> (new_chi_L, new_chi_R, d_combined)
+                B_transposed = B.transpose(0, 2, 1)
+                
+                # Step B: Split physical legs -> (new_chi_L, new_chi_R, d_up, d_down)
+                d_up, d_down = phys_dims[i]
+                W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
+                
+                final_factors.append(W_final)
+                
+            return MPO(final_factors)
 
         elif isinstance(other, MPS):
             new_factors, _ = apply_mpo(self.factors, other.factors, chi_max)  
@@ -1454,13 +1845,11 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
     """
     Generate a separable Gaussian wave packet (GWP) in matrix product state (MPS) form.
 
-    This routine builds a product MPS where each physical dimension is represented by
-    a rank-3 tensor of shape ``[1, 1, d]``. The first tensor can optionally encode a
-    discrete internal state basis of size ``nstates``. The spatial part is a direct
-    product of 1D Gaussians, one per coordinate dimension, with optional momentum
-    phase factors.
+    This routine builds a product MPS where each physical dimension is represented by a rank-3 tensor of shape ``[1, d, 1]``. 
+    
+    The first tensor can optionally encode a discrete internal state basis of size ``nstates``. The spatial part is a direct product of 1D Gaussians, one per coordinate dimension, with optional momentum phase factors.
 
-    MPS index order: ``[chi1, chi2, d] = [left_bond, right_bond, physical]``.
+    MPS index order: ``[chi1, d, chi2] = [left_bond, physical, right_bond]``.
 
     Parameters
     ----------
@@ -1489,7 +1878,7 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
     -------
     mps : list of numpy.ndarray
         List of MPS core tensors (complex dtype). Each tensor is rank-3 with
-        shape ``[1, 1, d]``.
+        shape ``[1, d, 1]``.
 
     Notes
     -----
@@ -1529,9 +1918,8 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
     mps = []
     
     if nstates is not None:
-        # State tensor: [chi1, chi2, d] = [1, 1, nstates]
-        s = np.zeros((1, 1, nstates), dtype=complex)
-        s[0, 0, inistates] = 1.0
+        s = np.zeros((1, nstates, 1), dtype=complex)
+        s[0, inistates, 0] = 1.0
         mps.append(s)
 
     if a is None:
@@ -1548,14 +1936,16 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
             x0 = x0[:ndim]
 
     for i in range(ndim):
-        # GWP tensor: [chi1, chi2, d] = [1, 1, len(coord[i])]
-        gwp = np.zeros((1, 1, len(coord[i])), dtype=complex)
+        # GWP tensor: [chi1, d, chi2] = [1, len(coord[i]), 1]
+        gwp = np.zeros((1, len(coord[i]), 1), dtype=complex)
         x = coord[i]
         ai = a[i, i]
-        gwp[0, 0, :] = (ai / np.pi) ** (1 / 4) * np.exp(-ai * (x - x0[i]) ** 2 / 2.) * np.exp(
+        psi = (ai / np.pi) ** (1 / 4) * np.exp(-ai * (x - x0[i]) ** 2 / 2.) * np.exp(
             1j * p0 * (x - x0[i])) * np.sqrt(dx[i])
+        gwp[0, :, 0] = psi
         mps.append(gwp)
     return mps
+    # return MPS(mps, labels=['lv', 'p', 'rv']) # previously not returning MPS object (though we could let it be and actually is better), since currently shuoyi is not using this function, avoiding crashing in other places, so keeping the it unchanged
 
 def show(tt_in):
     """
@@ -1839,28 +2229,96 @@ def expect_zipper_right(mpo, mps):
 # [s,t] act on the local Hilbert space,
 # [i,j] act on the virtual bonds
 
-## initial E and F matrices for the left and right vacuum states
 def initial_E(W):
+    """
+    Construct the initial Left Environment (E) tensor for the vacuum state.
+    
+    This represents the contraction of all sites to the left of the chain 
+    (effectively scalar 1 for vacuum).
+    
+    Index Convention:
+    -----------------
+    [MPO_Bond, Bra_Bond, Ket_Bond]
+    
+    Parameters
+    ----------
+    W : np.ndarray or BlockTensor
+        The MPO tensor at the first site (index 0). 
+        Used to determine the MPO bond dimension (chi_MPO) and symmetry sector.
+
+    Returns
+    -------
+    E : np.ndarray or BlockTensor
+        The left environment tensor.
+        - Dense Shape: (W.shape[0], 1, 1)
+        - U(1) keys: (0, 0, 0) -> 1.0 (Scalar identity block)
+    """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
+        sample_qn = W.qns[0][0] if len(W.qns[0]) > 0 else 0
+        if isinstance(sample_qn, tuple):
+            zero_qn = sample_qn * 0 # e.g. QN(0,0)
+        else:
+            zero_qn = 0
+            
         # MPO (In), Bra (In), Ket (In) -> Need Out (+1)
-        data = {(0, 0, 0): np.ones((1, 1, 1))}
-        qns = [[0], [0], [0]]
+        # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
+        data = {(zero_qn, zero_qn, zero_qn): np.ones((1, 1, 1))}
+        qns = [[zero_qn], [zero_qn], [zero_qn]]
         dirs = [1, -1, 1] 
         return BlockTensor(data, qns, dirs)
+    
+    # Dense branch without U(1)
+    # MPO Left Bond dimension is W.shape[0]
     E = np.zeros((W.shape[0], 1, 1))
-    E[0] = 1
+    E[0] = 1 # vacuum state
     return E
 
 def initial_F(W, target_qn=0):
     """
     Constructs the initial Right Environment (Vacuum).
+    
+    represents the contraction of all sites to the right of the chain.
+    For U(1) symmetry, this enforces the total target charge of the system
+    (Bra and Ket must end at `target_qn`).
+    
+    Index Convention:
+    -----------------
+    [MPO_Bond, Bra_Bond, Ket_Bond]
+
+    Parameters
+    ----------
+    W : np.ndarray or BlockTensor
+        The MPO tensor at the last site (index -1).
+        Used to determine the MPO bond dimension.
+    target_qn : int, optional
+        The target quantum number (total charge) of the wavefunction. 
+        Required for BlockTensor to ensure the bra/ket bonds match the 
+        target sector at the boundary. Default is 0.
+
+    Returns
+    -------
+    F : np.ndarray or BlockTensor
+        The right environment tensor.
+        - Dense Shape: (W.shape[1], 1, 1)
+        - U(1) keys: (0, target_qn, target_qn) -> 1.0
     """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
+        sample_qn = W.qns[1][0] if len(W.qns[1]) > 0 else 0
+        
+        if isinstance(sample_qn, tuple):
+            zero_qn = sample_qn * 0
+        else:
+            zero_qn = 0
+
         # MPO (In), Bra (Out), Ket (In) -> Need [In, Out, In] = [-1, 1, -1]
-        data = {(0, target_qn, target_qn): np.ones((1, 1, 1))}
-        qns = [[0], [target_qn], [target_qn]]
+        # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
+        data = {(zero_qn, target_qn, target_qn): np.ones((1, 1, 1))}
+        qns = [[zero_qn], [target_qn], [target_qn]]
         dirs = [-1, 1, -1]
         return BlockTensor(data, qns, dirs)
+    
+    # Dense branch without U(1)
+    # MPO Right Bond dimension is W.shape[1]
     F = np.zeros((W.shape[1], 1, 1))
     F[-1] = 1
     return F
@@ -1869,6 +2327,7 @@ def initial_F(W, target_qn=0):
 def dense_to_symmetric(mps_list, phys_qns=None, tol=1e-12):
     """
     Convert a *product-state* dense MPS guess into a true U(1) BlockTensor MPS.
+    TODO: this now currently only supports particle number symmetry, add Sz, Lz etc. and also make each symmetry optional.
 
     Supports:
       - spin-orbital sites: d=2, phys_qns=[0,1]
@@ -1966,27 +2425,30 @@ def contract_from_right(W, A, F, B):
     ##   |      |  |
     ##  -+     -B--+
 
-    # the einsum function doesn't appear to optimize the contractions properly,
-    # so we split it into individual summations in the optimal order
-    #return np.einsum("abst,sij,bjl,tkl->aik",W,A,F,B, optimize=True)
+    Index Convention (Dense):
+    -------------------------
+    Input A, B: [Left, Phys, Right]
+    Input W:    [Left, Right, Out, In]
+    Input F:    [MPO_Bond, Bra_Bond, Ket_Bond]
+    Output F':  [MPO_Bond, Bra_Bond, Ket_Bond]
 
     Parameters
     ----------
-    W : TYPE
-        DESCRIPTION.
-    A : TYPE
-        DESCRIPTION.
-    F : TYPE
-        DESCRIPTION.
-    B : TYPE
-        DESCRIPTION.
+    W : np.ndarray or BlockTensor
+        MPO tensor at this site.
+    A : np.ndarray or MPS or BlockTensor
+        Ket MPS tensor.
+    F : np.ndarray or BlockTensor
+        Right environment tensor.
+    B : np.ndarray or MPS or BlockTensor
+        Bra MPS tensor.
 
     Returns
     -------
-    TYPE
-        DESCRIPTION.
-
+    F_new : np.ndarray or BlockTensor
+        The updated right environment.
     """
+
     if SYMMETRY_AVAILABLE and isinstance(A, BlockTensor):
         # F: (MPO, Bra, Ket). A_bra: A.conj().
         # Contract F.Bra(1) with A.conj().Right(1)
@@ -2003,10 +2465,43 @@ def contract_from_right(W, A, F, B):
         Temp = tensordot(Temp, B, axes=([1, 3], [1, 2])) 
         
         return Temp.transpose(1, 0, 2)
+
+    #  Dense Branch ---
+    if isinstance(A, MPS):
+        A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
+    elif isinstance(A, np.ndarray) and A.ndim == 3:
+        A_std = A 
     else:
-        Temp = np.einsum("sij,bjl->sbil", A, F)
-        Temp = np.einsum("sbil,abst->tail", Temp, W)
-        return np.einsum("tail,tkl->aik", Temp, B)
+        raise ValueError(f"Unknown type/shape for A: {type(A)}")
+
+    if isinstance(B, MPS):
+        B_std = B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx)
+    else:
+        B_std = B
+
+    # Contraction
+    # F: (MPO, Bra, Ket)
+    # A_std: (Left, Phys, Right)
+    
+    # Step A: Contract F with A* (Bra)
+    # F[Bra] (1) -- A*[Right] (2)
+    # T1: (MPO_R, Ket_R, Left_Bra, Phys_Bra)
+    T1 = np.tensordot(F, A_std.conj(), axes=(1, 2))
+
+    # Step B: Contract T1 with W
+    # T1[MPO_R] (0) -- W[Right] (1)
+    # T1[Phys_Bra] (3) -- W[Out] (2)
+    # T2: (Ket_R, Left_Bra, Left_MPO, Phys_In)
+    T2 = np.tensordot(T1, W, axes=([0, 3], [1, 2]))
+
+    # Step C: Contract T2 with B
+    # T2[Ket_R] (0) -- B[Right] (2)
+    # T2[Phys_In] (3) -- B[Phys] (1)
+    # Result: (Left_Bra, Left_MPO, Left_Ket)
+    F_new = np.tensordot(T2, B_std, axes=([0, 3], [2, 1]))
+
+    # 3. Reorder to (MPO, Bra, Ket) -> (1, 0, 2)
+    return F_new.transpose(1, 0, 2)
 
 def contract_from_left(W, A, E, B):
     """
@@ -2017,26 +2512,28 @@ def contract_from_left(W, A, E, B):
     ## |     |  |
     ## +-    +--B-
 
-    # the einsum function doesn't appear to optimize the contractions properly,
-    # so we split it into individual summations in the optimal order
-    # return np.einsum("abst,sij,aik,tkl->bjl",W,A,E,B, optimize=True)
+    Index Convention (Dense):
+    -------------------------
+    Input A, B: [Left, Phys, Right] (Standard MPS Site)
+    Input W:    [Left, Right, Out, In] (Standard MPO)
+    Input E:    [MPO_Bond, Bra_Bond, Ket_Bond] (Standard Env)
+    Output E':  [MPO_Bond, Bra_Bond, Ket_Bond]
 
     Parameters
     ----------
-    W : TYPE
-        DESCRIPTION.
-    A : TYPE
-        DESCRIPTION.
-    E : TYPE
-        DESCRIPTION.
-    B : TYPE
-        DESCRIPTION.
+    W : np.ndarray or BlockTensor
+        MPO tensor at this site.
+    A : np.ndarray or MPS or BlockTensor
+        Ket MPS tensor (top/bra in diagram) at this site.
+    E : np.ndarray or BlockTensor
+        Left environment tensor.
+    B : np.ndarray or MPS or BlockTensor
+        Bra MPS tensor (bottom/ket in diagram) at this site.
 
     Returns
     -------
-    TYPE
-        DESCRIPTION.
-
+    E_new : np.ndarray or BlockTensor
+        The updated left environment.
     """
 
     if SYMMETRY_AVAILABLE and isinstance(A, BlockTensor):
@@ -2055,10 +2552,50 @@ def contract_from_left(W, A, E, B):
         Temp = tensordot(Temp, B, axes=([0, 3], [0, 2])) 
         
         return Temp.transpose(1, 0, 2)
+
+    #  Dense Branch ---
+    # 1. Standardize Inputs to [Left, Phys, Right]
+    if isinstance(A, MPS):
+        A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
+    elif isinstance(A, np.ndarray) and A.ndim == 3:
+        A_std = A 
     else:
-        Temp = np.einsum("sij,aik->sajk", A, E)
-        Temp = np.einsum("sajk,abst->tbjk", Temp, W)
-        return np.einsum("tbjk,tkl->bjl", Temp, B)
+        raise ValueError(f"Unknown type/shape for A: {type(A)}")
+
+    if isinstance(B, MPS):
+        B_std = B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx)
+    elif isinstance(B, np.ndarray) and B.ndim == 3:
+        B_std = B
+    else:
+        raise ValueError(f"Unknown type/shape for B: {type(B)}")
+
+    # 2. Perform Contraction
+    # E: (a, i, k) -> (MPO_Left, Bra_Left, Ket_Left)
+    # A_std: (i, s, j) -> (Bra_Left, Phys, Bra_Right)
+    # W: (a, b, s, t) -> (MPO_L, MPO_R, Phys_Out, Phys_In)
+    # B_std: (k, t, l) -> (Ket_Left, Phys, Ket_Right)
+
+    # Step A: Contract E with A* (Bra)
+    # E[1] (Bra_L) -- A*[0] (Bra_L)
+    # T1 shape: (MPO_L, Ket_L, Phys_Bra, Bra_R)
+    T1 = np.tensordot(E, A_std.conj(), axes=(1, 0))
+    
+    # Step B: Contract T1 with W (MPO)
+    # T1[0] (MPO_L) -- W[0] (MPO_L)
+    # T1[2] (Phys_Bra) -- W[2] (Phys_Out)
+    # T2 shape: (Ket_L, Bra_R, MPO_R, Phys_In)
+    T2 = np.tensordot(T1, W, axes=([0, 2], [0, 2]))
+
+    # Step C: Contract T2 with B (Ket)
+    # T2[0] (Ket_L) -- B[0] (Ket_L)
+    # T2[3] (Phys_In) -- B[1] (Phys_In)
+    # Result shape: (Bra_R, MPO_R, Ket_R)
+    E_new = np.tensordot(T2, B_std, axes=([0, 3], [0, 1]))
+
+    # 3. Reorder to Standard Environment (MPO, Bra, Ket)
+    # Current: (Bra_R, MPO_R, Ket_R) -> (1, 0, 2)
+    return E_new.transpose(1, 0, 2)
+
 
 
 def construct_F(Alist, MPO, Blist, target_qn = None):
@@ -2131,72 +2668,68 @@ def coarse_grain_MPO(W, X):
 def coarse_grain_MPS(A,B):
     """
     # 2-1 coarse-graining of two-site MPS into one site
-    #   |     |  |
-      -R- <= -A--B-
+    #  |   |      |  |
+      -theta- <= -A--B-
 
     Parameters
     ----------
-    A : TYPE
-        DESCRIPTION.
-    B : TYPE
-        DESCRIPTION.
+    Input A, B: [Left, Phys, Right]
 
     Returns
     -------
-    TYPE
-        DESCRIPTION.
+    Output: [Left_A, Phys_A, Phys_B, Right_B]
 
     """
-    return np.reshape(np.einsum("sij,tjk->stik",A,B),
-                      [A.shape[0]*B.shape[0], A.shape[1], B.shape[2]])
+    # A: (L_a, P_a, R_a)
+    # B: (L_b, P_b, R_b)  where R_a == L_b
+    # Contract A[2] with B[0]
+    return np.reshape(np.tensordot(A, B, axes=(2, 0)),[A.shape[1]*B.shape[1], A.shape[0], B.shape[2]]) # Result: (L_a, P_a, P_b, R_b)
 
-def fine_grain_MPS(A, dims):
-    assert A.shape[0] == dims[0] * dims[1]
-    Theta = np.transpose(np.reshape(A, dims + [A.shape[1], A.shape[2]]),
-                         (0,2,1,3))
-    M = np.reshape(Theta, (dims[0]*A.shape[1], dims[1]*A.shape[2]))
-    U, S, V = np.linalg.svd(M, full_matrices=0)
-    U = np.reshape(U, (dims[0], A.shape[1], -1))
-    V = np.transpose(np.reshape(V, (-1, dims[1], A.shape[2])), (1,0,2))
-    # assert U is left-orthogonal
-    # assert V is right-orthogonal
-    #print(np.dot(V[0],np.transpose(V[0])) + np.dot(V[1],np.transpose(V[1])))
-    return U, S, V
+def fine_grain_MPS(Theta, dims):
+    """
+    Split a two-site tensor back into two MPS tensors via SVD.
+    Input Theta: [Left, Phys_A, Phys_B, Right]
+    #  |   |      |  |
+      -theta- => -A--B-
+    """
+    # Theta shape: (Chi_L, d_A, d_B, Chi_R)
+    
+    # 1. Group indices for SVD: (Chi_L * d_A) x (d_B * Chi_R)
+    # This corresponds to "Left Canonical" splitting
+    chi_L = Theta.shape[0]
+    chi_R = Theta.shape[3]
+    d_A = dims[0]
+    d_B = dims[1]
+    
+    # Reshape to Matrix
+    Psi = Theta.reshape(chi_L * d_A, d_B * chi_R)
+    
+    # SVD
+    U, S, V = np.linalg.svd(Psi, full_matrices=False)
+    
+    # Reshape U -> A [Left, Phys, Right_Bond]
+    # U columns are the new bond index
+    A = U.reshape(chi_L, d_A, -1)
+    
+    # Reshape V -> B [Left_Bond, Phys, Right]
+    # V rows are the new bond index
+    B = V.reshape(-1, d_B, chi_R)
+    
+    return A, S, B
 
 def truncate_SVD(U, S, V, m):
     """
     # truncate the matrices from an SVD to at most m states
-
-    Parameters
-    ----------
-    U : TYPE
-        DESCRIPTION.
-    S : TYPE
-        DESCRIPTION.
-    V : TYPE
-        DESCRIPTION.
-    m : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    U : TYPE
-        DESCRIPTION.
-    S : TYPE
-        DESCRIPTION.
-    V : TYPE
-        DESCRIPTION.
-    trunc : TYPE
-        DESCRIPTION.
-    m : TYPE
-        DESCRIPTION.
-
+    U shape: (Left, Phys, Right)
+    V shape: (Left, Phys, Right)
     """
     m = min(len(S), m)
     trunc = np.sum(S[m:])
     S = S[0:m]
-    U = U[:,:,0:m]
-    V = V[:,0:m,:]
+    # U has the bond on the last axis: (Left, Phys, Bond)
+    U = U[:, :, 0:m]
+    # V has the bond on the first axis: (Bond, Phys, Right)
+    V = V[0:m, :, :]
     return U,S,V,trunc,m
 
 # Functor to evaluate the Hamiltonian matrix-vector multiply
@@ -2208,21 +2741,58 @@ def truncate_SVD(U, S, V, m):
 class HamiltonianMultiply(sparse.linalg.LinearOperator):
     def __init__(self, E, W, F):
         self.E = E
-        self.W = W
+        self.W = W # MPO: (Left, Right, Out, In) -> (L, R, P_bra, P_ket)
         self.F = F
         self.dtype = np.dtype('d')
-        self.req_shape = [W.shape[2], E.shape[1], F.shape[2]]
-        self.size = self.req_shape[0]*self.req_shape[1]*self.req_shape[2]
-        self.shape = [self.size, self.size]
+        
+        # Determine shapes
+        # E: (MPO, Bra_L, Ket_L)
+        # F: (MPO, Bra_R, Ket_R)
+        # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
+        
+        # Required Input Vector Shape (Two-Site Tensor):
+        # We expect input vector 'v' to flatten a tensor of shape:
+        # (Ket_L, Phys_A, Phys_B, Ket_R) 
+        # Note: If it's 1-site, it's (Ket_L, Phys, Ket_R)
+        
+        self.chi_L = E.shape[2] # Ket_L
+        self.chi_R = F.shape[2] # Ket_R
+        
+        # W has combined physical dimensions if coarse-grained
+        self.d_out = W.shape[2]
+        self.d_in = W.shape[3]
+        
+        self.req_shape = (self.chi_L, self.d_in, self.chi_R)
+        self.size = self.chi_L * self.d_in * self.chi_R
+        self.shape = (self.size, self.size)
 
-    def _matvec(self, A):
-        # the einsum function doesn't appear to optimize the contractions properly,
-        # so we split it into individual summations in the optimal order
-        #R = np.einsum("aij,sik,abst,bkl->tjl",self.E,np.reshape(A, self.req_shape),
-        #              self.W,self.F, optimize=True)
-        R = np.einsum("aij,sik->ajsk", self.E, np.reshape(A, self.req_shape), optimize=True)
-        R = np.einsum("ajsk,abst->bjtk", R, self.W, optimize=True)
-        R = np.einsum("bjtk,bkl->tjl", R, self.F, optimize=True)
+    def _matvec(self, v):
+        # 1. Reshape vector to tensor A [Left, Phys, Right]
+        A = v.reshape(self.req_shape)
+        
+        # 2. Contract: E(a,i,k) * A(k,s,l) * W(a,b,r,s) * F(b,j,l)
+        # E: (MPO_L, Bra_L, Ket_L)
+        # A: (Ket_L, Phys_In, Ket_R)
+        # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
+        # F: (MPO_R, Bra_R, Ket_R)
+        
+        # Step A: E * A -> Contract Ket_L
+        # E[2] with A[0]
+        # T1: (MPO_L, Bra_L, Phys_In, Ket_R)
+        T1 = np.tensordot(self.E, A, axes=(2, 0))
+        
+        # Step B: T1 * W -> Contract MPO_L and Phys_In
+        # T1[0] (MPO_L) with W[0] (MPO_L)
+        # T1[2] (Phys_In) with W[3] (Phys_In)
+        # T2: (Bra_L, Ket_R, MPO_R, Phys_Out)
+        T2 = np.tensordot(T1, self.W, axes=([0, 2], [0, 3]))
+        
+        # Step C: T2 * F -> Contract MPO_R and Ket_R
+        # T2[2] (MPO_R) with F[0] (MPO_R)
+        # T2[1] (Ket_R) with F[2] (Ket_R)
+        # Result: (Bra_L, Phys_Out, Bra_R)
+        R = np.tensordot(T2, self.F, axes=([2, 1], [0, 2]))
+        
         return np.reshape(R, -1)
 
 ## optimize a single site given the MPO matrix W, and tensors E,F
@@ -2234,8 +2804,59 @@ def optimize_site(A, W, E, F, tol=1E-8):
     E, V = sparse.linalg.eigsh(H,1,v0=A,which='SA', tol=tol)
     return (E[0],np.reshape(V[:,0], H.req_shape))
 
+def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
+    """
+    Injects noise into ALL valid symmetry sectors.
+    Args:
+        AA: The BlockTensor to perturb
+        sym_mgr: SymmetryManager instance to get valid physical QNs
+        noise_val: Magnitude of noise
+    """
+    if not hasattr(AA, 'data'): 
+        return AA
+    valid_qL = {}
+    valid_qR = {}
 
-def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
+    first_blk = next(iter(AA.data.values()))
+    is_complex = np.iscomplexobj(first_blk)
+    dtype = first_blk.dtype
+
+    for (qL, qR, qP1, qP2), blk in AA.data.items():
+        valid_qL[qL] = blk.shape[0]
+        valid_qR[qR] = blk.shape[1]
+        
+    # get valid physical QNs
+    # generate the QNs for standard spin-orbital states: Emp, Occ(Up), Occ(Dn)
+    # The manager knows if 'Occ' means QN(1) or QN(1,1) or QN(1,1,-1).
+    possible_phys_qns = set()
+    # Always include Vacuum
+    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'emp'))
+    # Include Occupied states
+    # We check both "Even-like" (Up) and "Odd-like" (Down) indices 
+    # to cover all bases for spin-orbitals.
+    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'occ')) # "Up"
+    possible_phys_qns.add(sym_mgr.get_phys_qn(1, 'occ')) # "Down"
+    possible_phys_qns = list(possible_phys_qns)
+    # Iterate and Inject (Same logic as before)
+    for qL, dL in valid_qL.items():
+        for qP1 in possible_phys_qns:
+            for qP2 in possible_phys_qns:
+                # Calculate required Right Sector
+                target_qR = qL + qP1 + qP2
+                if target_qR in valid_qR:
+                    dR = valid_qR[target_qR]
+                    key = (qL, target_qR, qP1, qP2)
+                    # Dimensions for spin-orbitals are 1
+                    dP1, dP2 = 1, 1 
+                    if key not in AA.data:
+                        noise = (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
+                        if is_complex:
+                            noise = noise + 1j * (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
+                        AA.data[key] = noise.astype(dtype)
+    return AA
+
+
+def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
     """
     two-site optimization of MPS A,B with respect to MPO W1,W2 and
     environment tensors E,F
@@ -2274,52 +2895,31 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
         DESCRIPTION.
 
     """
+
     if U1:
         if not SYMMETRY_AVAILABLE:
             raise ImportError("Symmetry module not found. Cannot run U1=True.")
-            
-        # 1. Form Initial Guess (Bond Dimension expansion happens here naturally in SVD)
+        # U(1) on branch is still using (L,R,P) MPS index convention. TODO:also fix to LPR if have time.
         # A: (Bond_L, Bond_M, Phys_L)
         # B: (Bond_M, Bond_R, Phys_R)
         # AA = A * B -> (Bond_L, Phys_L, Bond_R, Phys_R)
-        # Note on A/B indices in BlockTensor:
-        # standard MPS layout: (Left, Right, Phys).
-        # Contraction: A[Right] -- B[Left]
-        
-        # Check rank to be sure
         if A.rank == 3:
             AA = tensordot(A, B, axes=([1], [0])) # this will return as BlockTensor Object
-            AA = AA.transpose(0, 2, 1, 3)
+            AA = AA.transpose(0, 2, 1, 3) # standard MPO bond index currently is (L,R,out,in). TODO: reshape to (L, out, in, R) (note that currently dense branch is (L, R, out, in), better also fix that one)
             
-            # add noise to AA
-            # forces Davidson to explore new sectors
-            noise_scale = 1e-4
-            for k in AA.data:
-                # Add random noise to existing blocks
-                AA.data[k] += (np.random.rand(*AA.data[k].shape) - 0.5) * noise_scale
+            # # add noise to AA. TODO: maby make noise decay as round goes? that should be done by injecting a smaller noise_val as dmrg sweep goes. fix and test for optimal value if have time
+            AA = inject_noise_symmetric(AA, noise_val=1e-4, sym_mgr=sym_mgr)
         else:
             raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
-
-        # 2. Define Linear Operator
         H_op = HamiltonianMultiplyU1(E, [W1, W2], F)
-        
-        # 3. Solve Eigenproblem (Davidson)
-        # Normalize guess
         norm = AA.norm()
         AA = AA * (1.0/norm)
-        
         energy, AA_new = solve_davidson(H_op, AA, tol=1e-5)
-        
-        # 4. SVD and Split
         # AA_new is (L, R, Phys_L, Phys_R)
         # We need to return A(L, M, P_L) and B(M, R, P_R)
-        
-        # Use our symmetric SVD, 3rd argument S_dict is used in normalization
         U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
-        
         # U is (L, P_L, M).
         # V is (M, R, P_R).
-        
         # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
         
         # Helper to contract Diagonal S into U
@@ -2337,7 +2937,6 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
                     new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
                     new_data[(qL, qP, qM)] = new_block
             return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
-
         # Helper to contract S into V
         # S is (Bond, Bond). V is (Bond, R, P_R).
         # We want S*V -> (Bond, R, P_R)
@@ -2351,48 +2950,47 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False):
                     new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
                     new_data[(qM, qR, qP)] = new_block
             return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
-
         if dir == 'right':  # Right Sweep: Center moves Right.
             # A = U. B = S * V.
-            
             # U is (L, P_L, M). Transpose to standard MPS shape A(L, M, P_L)
             A_new = U.transpose(0, 2, 1)
-            
             # Contract S into V, then V is already (M, R, P_R), which is standard B shape
             B_new = multiply_S_V(S_dict, V)
-            
         else: # that is dir == 'left'
             # Left Sweep: Center moves Left.
             # A = U * S. B = V.
-            
             # Contract U * S first
             A_US = multiply_U_S(U, S_dict)
-            
             # Transpose to standard MPS shape A(L, M, P_L)
             A_new = A_US.transpose(0, 2, 1)
-            
             # B is just V
             B_new = V
-
         return energy, A_new, B_new, trunc, m_kept
-
-    else:
+    else: # Dense branch ( MPS index standardized to Left, Phys, Right)
         W = coarse_grain_MPO(W1,W2)
+        # Returns (Left, Phys_A, Phys_B, Right)
         AA = coarse_grain_MPS(A,B)
+        # Optimize
         H = HamiltonianMultiply(E,W,F)
-        E,V = sparse.linalg.eigsh(H,1,v0=AA,which='SA')
-        AA = np.reshape(V[:,0], H.req_shape)
-        A,S,B = fine_grain_MPS(AA, [A.shape[0], B.shape[0]])
+        E, V_flat = sparse.linalg.eigsh(H,1,v0=AA,which='SA')
+        # Fine Grain (SVD Split)
+        # V_flat is (Left * Phys_A * Phys_B * Right)
+        # We need V_tensor: (Left, Phys_A, Phys_B, Right)
+        AA = V_flat.reshape(A.shape[0], A.shape[1], B.shape[1], B.shape[2])
+        A,S,B = fine_grain_MPS(AA, [A.shape[1], B.shape[1]])
         A,S,B,trunc,m = truncate_SVD(A,S,B,m)
-        
         if (dir == 'right'):
-            B = np.einsum("ij,sjk->sik", np.diag(S), B)
+            # B = S * B.  S is (m,), B is (m, d, R).
+            # Contract S with B[0] (Left bond of B)
+            B = np.tensordot(np.diag(S), B, axes=(1, 0)) 
         else:
             assert dir == 'left'
-            A = np.einsum("sij,jk->sik", A, np.diag(S))
+            # A = A * S.  A is (L, d, m), S is (m,)
+            # Contract A[2] (Right bond) with S
+            A = np.tensordot(A, np.diag(S), axes=(2, 0))
         return E[0], A, B, trunc, m
 
-def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None, not_conv_err = True):
+def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None, not_conv_err = True, sym_mgr=None):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -2426,7 +3024,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
     for sweep in range(0, int(sweeps/2)):
         for i in range(0, len(MPS)-2): 
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1
+                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr
             )
             print("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2,i,i+1, Energy, states, trunc))
@@ -2444,7 +3042,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
 
         for i in range(len(MPS)-2, 0, -1): 
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1
+                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr
             )
             print("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2+1, i, i+1, Energy, states, trunc))
@@ -2467,7 +3065,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
     if gauge == None:
         gauge = "Right"
 
-    return Energy, MPS, gauge
+    return Energy, MPS, gauge, converged
 
 
 def expect_mps(bra, MPO, ket=None):
@@ -2511,7 +3109,7 @@ class DMRG:
     """
     ground state finite DMRG in MPO/MPS framework
     """
-    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site', U1 = False, target_qn = None, not_conv_err = True):
+    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site', U1 = False, target_qn = None, not_conv_err = True, sym_mgr=None):
         """
 
 
@@ -2545,33 +3143,55 @@ class DMRG:
         self.ground_state = None
         self.ground_state_raw = None
         self.not_conv_err = not_conv_err
-
+        self.converged = False
+        self.sym_mgr = sym_mgr
 
     def run(self):
 
         if self.init_guess is None:
             raise ValueError('Invalid initial guess.')
 
+        # Standardize MPS to ['lv', 'p', 'rv']
+        # but currently we are not using the initial guess as MPS objects a lot, but i do think that is the better option. so need to fix initial guess in dmrg.py. remve this TODO when fixed.
+        if isinstance(self.init_guess, MPS):
+            mps_std = self.init_guess.to_order(['lv', 'p', 'rv'])
+            self.mps_list = mps_std.factors
+        else:
+            # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
+            self.mps_list = self.init_guess
+
+        if isinstance(self.H, MPO):
+            self.mpo_list = self.H.factors
+        else:
+            self.mpo_list = self.H
+
         if self.U1:
-            if isinstance(self.init_guess, list) and not isinstance(self.init_guess[0], BlockTensor):
-                self.init_guess = dense_to_symmetric(self.init_guess, phys_qns=None)
+            if isinstance(self.mps_list, list) and not isinstance(self.mps_list[0], BlockTensor):
+                self.mps_list = dense_to_symmetric(self.mps_list, phys_qns=None)
 
             if self.target_qn is not None:
-                target_qn = int(self.target_qn)
-            else:
-                # otherwise infer from last-site right-bond charge
-                qs = sorted({key[1] for key in self.init_guess[-1].data.keys()})
+                qs = sorted({key[1] for key in self.mps_list[-1].data.keys()})
                 if len(qs) != 1:
-                    raise ValueError(f"Ambiguous total charge on last bond: {qs}. Set DMRG(..., target_qn=...) explicitly.")
-                target_qn = qs[0]
+                    raise ValueError(f"Ambiguous total charge: {qs}.")
+                self.target_qn = qs[0]
 
         if self.opt == '1site':
-            fDMRG_1site_GS_OBC(self.H, self.D, self.nsweeps)
-
+            fDMRG_1site_GS_OBC(self.mpo_list, self.D, self.nsweeps)
         else:
-            self.e_tot, self.ground_state_raw, self.gauge = two_site_dmrg(
-                self.init_guess, self.H, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err)
-            self.ground_state = MPS(self.ground_state_raw)
+            self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
+                self.mps_list, self.mpo_list, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err, sym_mgr=self.sym_mgr)
+            if self.U1:
+                # U1 engine returns [Left, Right, Phys]
+                final_labels = ['lv', 'rv', 'p']
+            else:
+                # Dense engine returns [Left, Phys, Right]
+                final_labels = ['lv', 'p', 'rv']
+            if self.gauge == "Left":
+                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=len(self.mps_list) -1)
+                self.ground_state.left_canonicalize()
+            elif self.gauge == "Right":
+                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=0)
+                self.ground_state.right_canonicalize()
         return self
 
     def expect(self, e_ops):
@@ -2614,89 +3234,6 @@ class DMRG:
             raise ValueError("Run DMRG first to generate a ground state.")
             
         return self.ground_state.calc_2site_rdm(idx_pairs)
-
-    def nelec_dmrg(self, idx=None, weights=None, return_local=False, normalize=True, atol=1e-10):
-        """
-        Return the total number of electrons deduced from the 1-site RDM(s).
-
-        Parameters
-        ----------
-        idx : None | int | list[int]
-            Which sites to include. None -> all sites.
-        weights : None | array-like
-            Local occupation eigenvalues for each physical basis state (dense case).
-            If None, uses common defaults:
-            d=2 -> [0,1]
-            d=4 -> [0,1,1,2]
-            For U(1) BlockTensor RDM, weights are taken from the block quantum number q.
-        return_local : bool
-            If True, also return a dict {i: <n_i>}.
-        normalize : bool
-            If True, divide by Tr(rho_i) when Tr deviates from 1 (robust against gauge / normalization issues).
-        atol : float
-            Tolerance for trace normalization check.
-
-        Returns
-        -------
-        float  or  (float, dict)
-            Total electron number, optionally with site-resolved occupations.
-        """
-        import numpy as np
-
-        rdm = self.make_rdm(idx)
-
-        local = {}
-        for i, rho in rdm.items():
-            # --- U(1) BlockTensor RDM path: use block labels q as particle number ---
-            if SYMMETRY_AVAILABLE and (BlockTensor is not None) and isinstance(rho, BlockTensor):
-                tr = 0.0 + 0.0j
-                n  = 0.0 + 0.0j
-                for (q_bra, q_ket), blk in rho.data.items():
-                    if q_bra == q_ket:
-                        t = np.trace(blk)
-                        tr += t
-                        n  += float(q_bra) * t
-
-                if normalize and abs(tr - 1.0) > atol and abs(tr) > atol:
-                    n = n / tr
-
-                local[i] = n
-                continue
-
-            # --- Dense ndarray RDM path ---
-            rho = np.asarray(rho)
-            d = rho.shape[0]
-            tr = np.trace(rho)
-
-            if weights is None:
-                if d == 2:
-                    w = np.array([0.0, 1.0], dtype=float)
-                elif d == 4:
-                    w = np.array([0.0, 1.0, 1.0, 2.0], dtype=float)
-                else:
-                    raise ValueError(
-                        f"nelec_dmrg: cannot infer occupation weights for local dim d={d}. "
-                        "Pass `weights=` explicitly."
-                    )
-            else:
-                w = np.asarray(weights, dtype=float)
-                if w.shape[0] != d:
-                    raise ValueError(f"nelec_dmrg: weights length {w.shape[0]} != local dim {d}.")
-
-            n = np.sum(w * np.real(np.diag(rho)))
-            if normalize and abs(tr - 1.0) > atol and abs(tr) > atol:
-                n = n / np.real(tr)
-
-            local[i] = n + 0.0j  # keep consistent type (will be real in practice)
-
-        total = np.real(np.sum(list(local.values()))).item()
-        if return_local:
-            # convert local to real python floats when possible
-            local_real = {i: np.real(v).item() for i, v in local.items()}
-            return total, local_real
-        return total
-
-
 
 def autoMPO(h1e, eri):
     """
@@ -2919,11 +3456,10 @@ if __name__ == '__main__':
     N=10 # number of sites
 
     ## initial state |+-+-+-+-+->
-
-    InitialA1 = np.zeros((d,1,1))
-    InitialA1[0,0,0] = 1
-    InitialA2 = np.zeros((d,1,1))
-    InitialA2[1,0,0] = 1
+    InitialA1 = np.zeros((1, d, 1))
+    InitialA1[0, 0, 0] = 1  # Up state
+    InitialA2 = np.zeros((1, d, 1))
+    InitialA2[0, 1, 0] = 1  # Down state
 
     initial_mps = [InitialA1, InitialA2] * int(N/2)
 
@@ -2953,11 +3489,13 @@ if __name__ == '__main__':
     Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])
 
     # the complete MPO
-    H = MPO = [Wfirst] + ([W] * (N-2)) + [Wlast]
+    H = [Wfirst] + ([W] * (N-2)) + [Wlast]
 
     dmrg = DMRG(H, D=10, nsweeps=8)
     dmrg.init_guess = initial_mps
+    dmrg.init_guess = MPS(initial_mps, labels=['lv', 'p', 'rv'])
     dmrg.run()
+    print(dmrg.ground_state.calc_1site_rdm())
 
     
 
