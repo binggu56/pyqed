@@ -882,7 +882,10 @@ class MPS:
     #     pass
 
     def compress(self, chi_max):
-        return MPS(compress(self.factors, chi_max)[0])
+        compressed_factors = compress(self.factors, chi_max)
+        if isinstance(compressed_factors, tuple):
+            compressed_factors = compressed_factors[0]
+        return MPS(compressed_factors, labels=['lv','p','rv'])
     
     def calc_1site_rdm(self, idx=None):
         """
