@@ -3299,7 +3299,8 @@ class DMRG:
     """
     ground state finite DMRG in MPO/MPS framework
     """
-    def __init__(self, H, D, nsweeps=None, init_guess=None, opt='2site', U1 = False, target_qn = None, not_conv_err = True, sym_mgr=None):
+    def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
+                 U1=False, charge=None, not_conv_err=True, sym_mgr=None):
         """
 
 
@@ -3329,7 +3330,7 @@ class DMRG:
         self.mps = None
         self.e_tot = None
         self.U1 = U1
-        self.target_qn = target_qn
+        self.target_qn = self.charge = charge
         self.ground_state = None
         self.ground_state_raw = None
         self.not_conv_err = not_conv_err
@@ -3339,7 +3340,7 @@ class DMRG:
     def run(self):
 
         if self.init_guess is None:
-            raise ValueError('Invalid initial guess.')
+            raise ValueError('Please provide an initial guess.')
 
         # Standardize MPS to ['lv', 'p', 'rv']
         # but currently we are not using the initial guess as MPS objects a lot, but i do think that is the better option. so need to fix initial guess in dmrg.py. remve this TODO when fixed.
@@ -3356,7 +3357,10 @@ class DMRG:
             self.mpo_list = self.H
 
         if self.U1:
-            if isinstance(self.mps_list, list) and not isinstance(self.mps_list[0], BlockTensor):
+            
+            if isinstance(self.mps_list, list) and not \
+                isinstance(self.mps_list[0], BlockTensor):
+                
                 self.mps_list = dense_to_symmetric(self.mps_list, phys_qns=None)
 
             if self.target_qn is not None:
@@ -3366,22 +3370,30 @@ class DMRG:
                 self.target_qn = qs[0]
 
         if self.opt == '1site':
+        
             fDMRG_1site_GS_OBC(self.mpo_list, self.D, self.nsweeps)
-        else:
+        
+        elif self.opt == '2sites':
+            
             self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
                 self.mps_list, self.mpo_list, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err, sym_mgr=self.sym_mgr)
+            
             if self.U1:
                 # U1 engine returns [Left, Right, Phys]
                 final_labels = ['lv', 'rv', 'p']
             else:
                 # Dense engine returns [Left, Phys, Right]
                 final_labels = ['lv', 'p', 'rv']
+                
             if self.gauge == "Left":
                 self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=len(self.mps_list) -1)
                 self.ground_state.left_canonicalize()
+            
             elif self.gauge == "Right":
+                
                 self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=0)
                 self.ground_state.right_canonicalize()
+        
         return self
 
     def expect(self, e_ops):
@@ -3424,30 +3436,6 @@ class DMRG:
             raise ValueError("Run DMRG first to generate a ground state.")
 
         return self.ground_state.calc_2site_rdm(idx_pairs)
-
-def autoMPO(h1e, eri):
-    """
-    write the Hamiltonian into the MPO form
-
-    .. math::
-
-        H = \sum_{i,j} h_{ij} E_{ij} + \sum_{i < j} v_{ij} n_i n_j
-
-        E_{ij} = \sum_\sigma c_{i\sigma}^\dagger c_{j\sigma}
-
-    Parameters
-    ----------
-    h1e : TYPE
-        one-electron core Hamiltonian.
-    eri : TYPE
-        electron-repulsion integral
-
-    Returns
-    -------
-    None.
-
-    """
-    pass
 
 
 class TEBD(DMRG):
