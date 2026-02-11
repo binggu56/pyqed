@@ -487,6 +487,20 @@ class MPS:
     def bond_orders(self):
         """Return right bond dimensions for each site."""
         return [t.shape[2] for t in self.factors]
+    
+    def norm(self):
+        """
+        Calculates :math:`N = \sqrt{<\psi|\psi>}` robustly using standard layouts.
+        """
+        val = np.ones((1, 1), dtype=complex)
+        for i in range(self.L):
+            B = self._get_std_B(i) # (lv, rv, p)
+            # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
+            T = np.tensordot(val, B, axes=(1, 0))
+            # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
+            val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
+        return np.sqrt(np.abs(val[0, 0]))
+
 
     def set_labels(self, new_labels):
         """
@@ -508,6 +522,7 @@ class MPS:
         if len(self.labels) != 3:
              warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
 
+    
     def to_order(self, target_labels):
         """Returns a new MPS with tensors transposed to target_labels."""
         if self.labels == target_labels:
@@ -516,6 +531,23 @@ class MPS:
         perm = [self.labels.index(l) for l in target_labels]
         new_Bs = [B.transpose(perm) for B in self.Bs]
         return MPS(new_Bs, self.Ss, self.bc, labels=target_labels)
+    
+    def transpose(self, labels):
+        """
+        transpose ALL tensors to target sequence
+
+        Parameters
+        ----------
+        labels : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
+        return self.to_order(labels)
 
     def _get_std_B(self, i):
         """
@@ -541,9 +573,6 @@ class MPS:
                          bond_dims[q_r] = block.shape[2]
                  bonds.append(sum(bond_dims.values()))
              return bonds
-
-    # def decompose(self, chi_max):
-    #     pass
 
     def __add__(self, other):
         """
