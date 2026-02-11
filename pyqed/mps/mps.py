@@ -678,7 +678,9 @@ class MPS:
         return MPS(C, labels=['lv', 'p', 'rv'])
 
     def entanglement_entropy(self):
-        """Return the (von-Neumann) entanglement entropy for a bipartition at any of the bonds."""
+        """Return the (von-Neumann) entanglement entropy for a bipartition 
+        at any of the bonds.
+        """
         bonds = range(1, self.L) if self.bc == 'finite' else range(0, self.L)
         result = []
         for i in bonds:
@@ -986,6 +988,9 @@ class MPS:
             compressed_factors = compressed_factors[0]
         return MPS(compressed_factors, labels=['lv','p','rv'])
 
+    def make_rdm1(self, idx=None):
+        return self.calc_1site_rdm(idx)
+    
     def calc_1site_rdm(self, idx=None):
         """
         Calculate 1-site reduced density matrices.
@@ -2809,14 +2814,14 @@ def construct_F(Alist, MPO, Blist, target_qn = None):
         DESCRIPTION.
 
     """
-    if SYMMETRY_AVAILABLE and isinstance(Blist[-1], BlockTensor):
-        if target_qn is None:
-            # pick the unique right-bond qR from the last site tensor
-            # key = (qL, qR, qP) for site tensors in this code
-            qs = sorted({key[1] for key in Blist[-1].data.keys()})
-            if len(qs) != 1:
-                raise ValueError(f"Ambiguous total charge on last bond: {qs}. Pass target_qn explicitly.")
-            target_qn = qs[0]
+    # if SYMMETRY_AVAILABLE and isinstance(Blist[-1], BlockTensor):
+    #     if target_qn is None:
+    #         # pick the unique right-bond qR from the last site tensor
+    #         # key = (qL, qR, qP) for site tensors in this code
+    #         qs = sorted({key[1] for key in Blist[-1].data.keys()})
+    #         if len(qs) != 1:
+    #             raise ValueError(f"Ambiguous total charge on last bond: {qs}. Pass target_qn explicitly.")
+    #         target_qn = qs[0]
 
     F = [initial_F(MPO[-1], target_qn=target_qn if target_qn is not None else 0)]
     for i in range(len(MPO)-1, 0, -1):
@@ -3300,7 +3305,7 @@ class DMRG:
     ground state finite DMRG in MPO/MPS framework
     """
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
-                 U1=False, charge=None, not_conv_err=True, sym_mgr=None):
+                 symmetry=None, charge=None, not_conv_err=True):
         """
 
 
@@ -3329,13 +3334,16 @@ class DMRG:
         self.init_guess = init_guess
         self.mps = None
         self.e_tot = None
-        self.U1 = U1
+        self.U1 = self.symmetry = symmetry
+        
         self.target_qn = self.charge = charge
+        
         self.ground_state = None
-        self.ground_state_raw = None
+        # self.ground_state_raw = None
+        
         self.not_conv_err = not_conv_err
         self.converged = False
-        self.sym_mgr = sym_mgr
+        # self.sym_mgr = sym_mgr
 
     def run(self):
 
@@ -3363,20 +3371,22 @@ class DMRG:
                 
                 self.mps_list = dense_to_symmetric(self.mps_list, phys_qns=None)
 
-            if self.target_qn is not None:
+            if self.charge is not None:
+                
                 qs = sorted({key[1] for key in self.mps_list[-1].data.keys()})
                 if len(qs) != 1:
                     raise ValueError(f"Ambiguous total charge: {qs}.")
-                self.target_qn = qs[0]
+                self.charge = qs[0]
 
         if self.opt == '1site':
         
             fDMRG_1site_GS_OBC(self.mpo_list, self.D, self.nsweeps)
         
-        elif self.opt == '2sites':
+        elif self.opt == '2site':
             
             self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
-                self.mps_list, self.mpo_list, self.D, self.nsweeps, U1=self.U1, target_qn=self.target_qn, not_conv_err = self.not_conv_err, sym_mgr=self.sym_mgr)
+                self.mps_list, self.mpo_list, self.D, self.nsweeps, \
+                    U1=self.U1, target_qn=self.charge, not_conv_err=self.not_conv_err, sym_mgr=None)
             
             if self.U1:
                 # U1 engine returns [Left, Right, Phys]
@@ -3385,14 +3395,18 @@ class DMRG:
                 # Dense engine returns [Left, Phys, Right]
                 final_labels = ['lv', 'p', 'rv']
                 
-            if self.gauge == "Left":
+            if self.gauge == "left":
+                
                 self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=len(self.mps_list) -1)
                 self.ground_state.left_canonicalize()
             
-            elif self.gauge == "Right":
+            elif self.gauge == "right":
                 
                 self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=0)
                 self.ground_state.right_canonicalize()
+        
+        else:
+            raise ValueError('Optimization algorithm {self.opt} does not exist. Use "1site" or "2site".')
         
         return self
 
@@ -3438,51 +3452,7 @@ class DMRG:
         return self.ground_state.calc_2site_rdm(idx_pairs)
 
 
-class TEBD(DMRG):
 
-    def run(self, psi0):
-        return tebd(psi0, self.U, chi_max=self.D)
-
-
-def tebd(B_list, s_list, U_list, chi_max):
-    """
-    Use TEBD to optmize the MPS and to rduce it back to the orginal size.
-    """
-    d = B_list[0].shape[0]
-    L = len(B_list)
-
-    for p in [0,1]:
-
-        for i_bond in np.arange(p,L-1,2):
-            i1=i_bond
-            i2=i_bond+1
-
-            chi1 = B_list[i1].shape[1]
-            chi3 = B_list[i2].shape[2]
-
-            # Construct theta matrix #
-            C = np.tensordot(B_list[i1],B_list[i2],axes=(2,1))
-            #C = np.einsum('aij, bjk -> aibk', B_list[i1], B_list[i2])
-            C = np.tensordot(C,U_list[i_bond],axes=([0,2],[2,3]))
-            print(np.shape(C))
-
-            # ? Why not directly SVD the C tensor?
-
-            theta = np.reshape(np.transpose(np.transpose(C)*s_list[i1],(1,3,0,2)),(d*chi1,d*chi3))
-
-            C = np.reshape(np.transpose(C,(2,0,3,1)),(d*chi1,d*chi3))
-            # Schmidt decomposition #
-            X, Y, Z = np.linalg.svd(theta)
-            Z=Z.T
-
-            W = np.dot(C,Z.conj())
-            chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
-
-            # Obtain the new values for B and l #
-            invsq = np.sqrt(sum(Y[:chi2]**2))
-            s_list[i2] = Y[:chi2]/invsq
-            B_list[i1] = np.reshape(W[:,:chi2],(d,chi1,chi2))/invsq
-            B_list[i2] = np.transpose(np.reshape(Z[:,:chi2],(d,chi3,chi2)),(0,2,1))
 
 
 class TDVP(DMRG):
@@ -3673,7 +3643,7 @@ if __name__ == '__main__':
     dmrg.init_guess = initial_mps
     dmrg.init_guess = MPS(initial_mps, labels=['lv', 'p', 'rv'])
     dmrg.run()
-    print(dmrg.ground_state.calc_1site_rdm())
+    # print(dmrg.ground_state.calc_1site_rdm())
 
 
 

@@ -22,7 +22,7 @@ from pyqed.qchem.dmrg.dmrg import QCDMRG
 #     ['He' , (0. , 0. , -0.91)],
 #     ['H' , (0. , 0. , 3.6)],
 #     ['H' , (0. , 0. , -3.6)]])
-natom = 6
+natom = 4
 z = np.linspace(-5, 5, natom)
 print(z)
 mol = atomic_chain(natom, z)
@@ -33,5 +33,9 @@ mol.build(driver='pyscf')
 mf = mol.RHF().run()
 
 
-dmrg = QCDMRG(mf, ncas=4, nelecas=4, D=20, target_qn=None) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+dmrg = QCDMRG(mf, ncas=4, nelecas=4, D=20) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
 dmrg.build().run()
+
+dm1, dm2 = dmrg.make_rdm1(0)
+
+print(dm1)
