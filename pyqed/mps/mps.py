@@ -108,7 +108,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     sv_list = []   # (s, q_mid, local_index)
     U_store = {}
     V_store = {}
-    S_store = {} 
+    S_store = {}
 
     for q_mid, entries in blocks_by_q_mid.items():
         rows = sorted(row_map[q_mid])
@@ -142,7 +142,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
               )
 
         U, S, Vt = np.linalg.svd(M, full_matrices=False)
-        S_store[q_mid] = S 
+        S_store[q_mid] = S
         for i, s in enumerate(S):
             sv_list.append((s, q_mid, i))
         U_store[q_mid] = (U, rows, r_starts, entries)
@@ -152,7 +152,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
     full_sq_norm = sum(s**2 for s, _, _ in sv_list)
     if m_max is not None:
         sv_list = sv_list[:m_max]
-        
+
     trunc_err = 0.0
     if full_sq_norm > 1e-12:
         trunc_err = 1.0 - sum(s**2 for s, _, _ in sv_list) / full_sq_norm
@@ -169,7 +169,7 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
         idxs = sorted(idxs)
         U, rows, r_starts, entries = U_store[q_mid]
         Vt, cols, c_starts, entries = V_store[q_mid]
-        
+
         S_block = S_store[q_mid][idxs]
         final_S[q_mid] = np.diag(S_block)
 
@@ -227,21 +227,21 @@ class HamiltonianMultiplyU1:
         self.E = E
         self.W = W
         self.F = F
-        self.dtype = np.float64 
+        self.dtype = np.float64
 
     def matvec(self, A):
         # A is BlockTensor with indices (Left, Right, Phys_L, Phys_R)
         # E: (MPO_L, MPS_L, MPS_L')
         # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
         # F: (MPO_R, MPS_R, MPS_R')
-        
+
         # 1. Contract E with A
         # E indices: (a, i, j) -> (MPO, Bra, Ket)
         # A indices: (j, k, s1, s2) -> (Left, Right, PhysL, PhysR)
         # Contract E[Ket] with A[Left] -> E[2] with A[0]
         # Result R: (a, i, k, s1, s2)
         R = tensordot(self.E, A, axes=([2], [0]))
-        
+
         # 2. Contract R with W1 (Left Site)
         # W1: (a, b, s1', s1) -> (Left, Right, Out, In)
         # R: (a, i, k, s1, s2)
@@ -249,7 +249,7 @@ class HamiltonianMultiplyU1:
         # Contract R[Phys1]=R[3] with W1[In]=W1[3]
         T2 = tensordot(R, self.W[0], axes=([0, 3], [0, 3]))
         # T2: (i, k, s2, b, s1') -> (Bra_L, Right, PhysR, MPO_R, PhysL_Out)
-        
+
         # 3. Contract T2 with W2 (Right Site)
         # W2: (b, c, s2', s2) -> (Left, Right, Out, In)
         # T2: (i, k, s2, b, s1')
@@ -257,20 +257,20 @@ class HamiltonianMultiplyU1:
         # Contract T2[PhysR]=T2[2] with W2[In]=W2[3]
         T3 = tensordot(T2, self.W[1], axes=([3, 2], [0, 3]))
         # T3: (i, k, s1', c, s2') -> (Bra_L, Right, PhysL_Out, MPO_R, PhysR_Out)
-        
+
         # 4. Contract T3 with F
         # F: (c, k, l) -> (MPO_R, Bra_R, Ket_R)
-        # contract T3[Right]=T3[1] (which corresponds to A's Right/Ket) 
+        # contract T3[Right]=T3[1] (which corresponds to A's Right/Ket)
         # with F[Ket]=F[2].
         # And T3[MPO_R]=T3[3] with F[MPO]=F[0].
-        T4 = tensordot(T3, self.F, axes=([3, 1], [0, 2])) 
+        T4 = tensordot(T3, self.F, axes=([3, 1], [0, 2]))
         # Result indices: (i, s1', s2', l) -> (Bra_L, PhysL_Out, PhysR_Out, Bra_R)
-        
+
         # 5. Transpose to match A structure (Left, Right, PhysL, PhysR)
         # Current: (Bra_L, PhysL, PhysR, Bra_R) -> (0, 1, 2, 3)
         # Target: (Bra_L, Bra_R, PhysL, PhysR) -> (0, 3, 1, 2)
         A_new = T4.transpose(0, 3, 1, 2)
-        
+
         return A_new
 
 def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
@@ -306,7 +306,7 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
         for i in range(len(idxs[0])):
             l, r, out_s, in_s = idxs[0][i], idxs[1][i], idxs[2][i], idxs[3][i]
             val = W[l, r, out_s, in_s]
-            if l not in valid_incoming: 
+            if l not in valid_incoming:
                 continue
             # Retrieve Physical QNs
             q_out = phys_qns[out_s]
@@ -330,7 +330,7 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
         for key, elems in new_data.items():
             q_l, q_r, q_o, q_i = key
             # Validation
-            if q_l not in l_map or q_r not in r_map:    
+            if q_l not in l_map or q_r not in r_map:
                 continue
             rows = l_map[q_l]; cols = r_map[q_r]
             row_idx = {x: k for k, x in enumerate(rows)}
@@ -350,14 +350,38 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
             sample_key = next(iter(final_blocks.keys()))
             if not isinstance(sample_key[0], tuple):
                  print(f"  [ERROR] Site 0 generated INTEGER keys: {sample_key}. Expected QNs.")
-        current_nodes = next_nodes        
+        current_nodes = next_nodes
     return sym_H
 
 
+class UniformMPS:
+    #TODO uniform MPS 
+    def __init__(self, Bs, labels='lpr'):
+        
+        self.labels = labels        
+        self.p_idx = self.labels.index('p')
+
+        try:
+            self.dim = Bs[0].shape[self.p_idx]
+        except TypeError:
+            if hasattr(Bs[0], 'data'):
+                # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
+                phys_dims = {}
+                for key, block in Bs[0].data.items():
+                    # key is (qL, qR, qP)
+                    q_p = key[2]
+                    if q_p not in phys_dims:
+                        phys_dims[q_p] = block.shape[2]
+                self.dim = sum(phys_dims.values())
+            else:
+                self.dim = 0
+
+
 class MPS:
-    def __init__(self, Bs, Ss=None, homogenous=True, bc='finite', labels=None, center = -1):
+    def __init__(self, Bs, Ss=None, bc='finite', \
+                 labels='lpr', center = -1):
         """
-        class for matrix product states.
+        Base class for matrix product states.
         supports flexible tensor layouts via the `labels` argument.
 
         Parameters
@@ -382,15 +406,15 @@ class MPS:
             default is 'finite'.
 
         labels : list of str, optional
-            Describes the index order of the tensors in `Bs`.
-            If None, defaults to ['lv', 'p', 'rv'].
-            
+            Describes the leg index order in tensors `Bs`.
+            The default is ['lv', 'p', 'rv'].
+
             Supported Keys:
             - 'lv': Left-Virtual (Bond to the left)
             - 'rv': Right-Virtual (Bond to the right)
             - 'p':  Physical (Local Hilbert space)
 
-            Common Examples: 
+            Common Examples:
             - ['lv', 'p', 'rv']: Standard Dense format (Left, Phys, Right).
             - ['p', 'lv', 'rv']: "Physics" format (Phys, Left, Right).
             - ['lv', 'rv', 'p']: "BlockTensor" format (Left, Right, Phys).
@@ -408,14 +432,14 @@ class MPS:
         Center : int
             Canonical center site index. Default is -1 (no specific center).
         """
-        assert bc in ['finite', 'infinite']
+        assert bc in ['finite', 'periodic']
         self.Bs = self.factors = Bs
         self.Ss = Ss
 
-
+        # leg sequence
         if labels is None:
             warnings.warn("MPS labels not specified, assuming ['lv', 'p', 'rv'].")
-            self.labels = ['lv', 'p', 'rv'] 
+            self.labels = ['lv', 'p', 'rv']
         else:
             self.labels = labels
         try:
@@ -423,10 +447,12 @@ class MPS:
             self.rv_idx = self.labels.index('rv')
             self.p_idx = self.labels.index('p')
         except ValueError as e:
-            missing_label = str(e).split()[-1] 
+            missing_label = str(e).split()[-1]
             raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
         if len(self.labels) != 3:
              warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
+
+
 
         self.bc = bc
         self.L = len(Bs)
@@ -438,46 +464,35 @@ class MPS:
             raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
         if self.center == -1:
             warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
-        if homogenous:
+
+
+        self.dims = []
+        for B in Bs:
             try:
-                self.dim = Bs[0].shape[self.p_idx]
+                self.dims.append(B.shape[1])
             except TypeError:
-                if hasattr(Bs[0], 'data'):
-                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
+                if hasattr(B, 'data'):
                     phys_dims = {}
-                    for key, block in Bs[0].data.items():
-                        # key is (qL, qR, qP)
-                        q_p = key[2]  
+                    for key, block in B.data.items():
+                        q_p = key[2]
                         if q_p not in phys_dims:
                             phys_dims[q_p] = block.shape[2]
-                    self.dim = sum(phys_dims.values())
+                    self.dims.append(sum(phys_dims.values()))
                 else:
-                    self.dim = 0
-        else:
-            self.dims = []
-            for B in Bs:
-                try:
-                    self.dims.append(B.shape[1])
-                except TypeError:
-                    if hasattr(B, 'data'):
-                        phys_dims = {}
-                        for key, block in B.data.items():
-                            q_p = key[2]
-                            if q_p not in phys_dims:
-                                phys_dims[q_p] = block.shape[2]
-                        self.dims.append(sum(phys_dims.values()))
-                    else:
-                        self.dims.append(0)
+                    self.dims.append(0)
 
     def copy(self):
         return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss] if self.Ss is not None else None, self.bc, labels=self.labels)
 
+    def bond_orders(self):
+        """Return right bond dimensions for each site."""
+        return [t.shape[2] for t in self.factors]
 
     def set_labels(self, new_labels):
         """
         Allow user to manually assign/correct labels after creation.
 
-        Common examples: 
+        Common examples:
         - ['lv', 'p', 'rv']  (Left-Virtual, Physical, Right-Virtual)
         - ['lv', 'rv', 'p']  (Left-Virtual, Right-Virtual, Physical)
         - ['p', 'lv', 'rv']  (Physical, Left-Virtual, Right-Virtual)
@@ -488,7 +503,7 @@ class MPS:
             self.rv_idx = self.labels.index('rv')
             self.p_idx = self.labels.index('p')
         except ValueError as e:
-            missing_label = str(e).split()[-1] 
+            missing_label = str(e).split()[-1]
             raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
         if len(self.labels) != 3:
              warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
@@ -497,7 +512,7 @@ class MPS:
         """Returns a new MPS with tensors transposed to target_labels."""
         if self.labels == target_labels:
             return self.copy()
-        
+
         perm = [self.labels.index(l) for l in target_labels]
         new_Bs = [B.transpose(perm) for B in self.Bs]
         return MPS(new_Bs, self.Ss, self.bc, labels=target_labels)
@@ -508,8 +523,8 @@ class MPS:
         """
         B = self.Bs[i]
         # Check if it has data AND that data is a dict (BlockTensor structure)
-        if hasattr(B, 'data') and isinstance(B.data, dict): 
-            return B 
+        if hasattr(B, 'data') and isinstance(B.data, dict):
+            return B
         return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
     def get_bond_dimensions(self):
@@ -533,24 +548,24 @@ class MPS:
     def __add__(self, other):
         """
         Sum of two MPS states: |Result> = |self> + |other>
-        
+
         Logic:
         - First Site: Concatenate [A, B] horizontally.
         - Middle Sites: Block Diagonal.
         - Last Site: Concatenate [[A], [B]] vertically.
 
-        not using block_diag from scipy since first site need to be row vector and last site need to be column vector. 
+        not using block_diag from scipy since first site need to be row vector and last site need to be column vector.
         """
         assert self.L == other.L
-        
+
         C = []
         for j in range(self.L):
             A = self._get_std_B(j)
-            B = other._get_std_B(j) 
-            
+            B = other._get_std_B(j)
+
             la, d, ra = A.shape
             lb, _, rb = B.shape
-            
+
             if j == 0:
                 # first site is Row Vector [A, B]
                 # Left dim stays 1 (assuming La=Lb=1)
@@ -558,7 +573,7 @@ class MPS:
                 new_tensor = np.zeros((la, d, ra + rb), dtype=np.result_type(A, B))
                 new_tensor[:, :, :ra] = A
                 new_tensor[:, :, ra:] = B
-                
+
             elif j == self.L - 1:
                 # last iste is Column Vector [[A], [B]]
                 # Left dim sums: La + Lb
@@ -566,14 +581,14 @@ class MPS:
                 new_tensor = np.zeros((la + lb, d, ra), dtype=np.result_type(A, B))
                 new_tensor[:la, :, :] = A
                 new_tensor[la:, :, :] = B
-                
+
             else:
                 # middles sites are Block Diagonal
                 # Left sums, Right sums
                 new_tensor = np.zeros((la + lb, d, ra + rb), dtype=np.result_type(A, B))
                 new_tensor[:la, :, :ra] = A
                 new_tensor[la:, :, ra:] = B
-            
+
             C.append(new_tensor)
 
         return MPS(C, labels=['lv', 'p', 'rv'])
@@ -617,7 +632,7 @@ class MPS:
         # At Center
         else:
             return tensor
-    
+
     def get_theta2(self, i):
         """
         Calculate effective two-site wave function on sites i, i+1.
@@ -628,7 +643,7 @@ class MPS:
             raise NotImplementedError("need to first do canonicalization to have a center site for get_theta2(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
         # The bond (i, j) is the center
         # i is Left-Canonical (A), j is Right-Canonical (B)
-        if i == self.center: 
+        if i == self.center:
             A_i = self._get_std_B(i) # Pure tensor
             S_mid = self.Ss[i]
             B_j = self._get_std_B(j) # Pure tensor
@@ -641,7 +656,7 @@ class MPS:
         elif self.center != -1 and i > self.center:
             return np.tensordot(self.get_theta1(i), self._get_std_B(j), axes=([2], [0]))
         # Entire block is to the Left of Center
-        # A_i * theta1(j) 
+        # A_i * theta1(j)
         elif self.center != -1 and j < self.center:
             return np.tensordot(self._get_std_B(i), self.get_theta1(j), axes=([2], [0]))
 
@@ -651,11 +666,11 @@ class MPS:
         for i in range(self.L):
             # theta: [L, P, R]
             theta = self.get_theta1(i)
-            
+
             # op: [P_out, P_in]. Contract P_in (1) with theta P (1)
             # op_theta: [P_out, L, R]
             op_theta = np.tensordot(op, theta, axes=(1, 1))
-            
+
             # Contract with theta*: [L, P, R]
             # Match: L(1)-L(0), R(2)-R(2), P_out(0)-P(1)
             # einsum: 'plr,lpr->'
@@ -669,11 +684,11 @@ class MPS:
         for i in range(self.nbonds):
             # theta: [L, Pi, Pj, R]
             theta = self.get_theta2(i)
-            
+
             # op[i]: [Pi_out, Pj_out, Pi_in, Pj_in]
             # Contract (Pi_in, Pj_in) [2,3] with theta (Pi, Pj) [1,2]
             op_theta = np.tensordot(op[i], theta, axes=([2, 3], [1, 2]))
-            
+
             # op_theta: [Pi_out, Pj_out, L, R]
             # Contract with theta*: [L, Pi, Pj, R]
             val = np.tensordot(op_theta, theta.conj(), axes=([0, 1, 2, 3], [1, 2, 0, 3]))
@@ -806,14 +821,14 @@ class MPS:
             self.Bs[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
             # Ss[i] is the bond between i and i+1
             self.Ss[i] = S / np.linalg.norm(S)
-            # Pass weights (S * Vh) 
+            # Pass weights (S * Vh)
             # Matrix M = diag(S) * Vh  (Shape: chi, dr)
             M = np.dot(np.diag(S), Vh)
             # Contract M with B_next on its Left index
             B_next = self._get_std_B(i+1) # [Left_Old, Phys, Right]
             B_next_updated = np.tensordot(M, B_next, axes=([1], [0])) # (New_Bond, Phys, Right)
             self.Bs[i+1] = B_next_updated.transpose(perm_inv)
-        # Normalize 
+        # Normalize
         B_last = self._get_std_B(self.L - 1)
         B_last /= np.linalg.norm(B_last)
         self.Bs[self.L - 1] = B_last.transpose(perm_inv)
@@ -843,7 +858,7 @@ class MPS:
             mat = B.reshape(dl, dp * dr)
             U, S, Vh = np.linalg.svd(mat, full_matrices=False)
             chi = len(S)
-            # Update Site i (The Isometry Vh) 
+            # Update Site i (The Isometry Vh)
             # Reshape Vh to (New_Bond, Phys, Right) and Transpose back
             self.Bs[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
             # Ss[i-1] is the bond between i-1 and i
@@ -886,7 +901,7 @@ class MPS:
         if isinstance(compressed_factors, tuple):
             compressed_factors = compressed_factors[0]
         return MPS(compressed_factors, labels=['lv','p','rv'])
-    
+
     def calc_1site_rdm(self, idx=None):
         """
         Calculate 1-site reduced density matrices.
@@ -920,8 +935,8 @@ class MPS:
                 # Deduce the correct "Zero" type from physics
                 sample_qn = phys_qns[0]
                 # Multiply by 0 to get QN(0,0) or 0 depending on type
-                zero_qn = sample_qn * 0 
-                
+                zero_qn = sample_qn * 0
+
                 from collections import defaultdict
                 idxs_by_q = defaultdict(list)
                 for k, q in enumerate(list(phys_qns)):
@@ -973,7 +988,7 @@ class MPS:
 
             # Build right overlap environments R[s] for bond right of site s
             R = [None] * self.L
-            # this extract the total qn on the last bond 
+            # this extract the total qn on the last bond
             qs = sorted({key[1] for key in self.Bs[-1].data.keys()})
             if len(qs) != 1:
                 raise ValueError(f"Ambiguous total charge on last bond: {qs}.")
@@ -1018,7 +1033,7 @@ class MPS:
             # Contract Left_env and Right_env
             # Result is rho[Phys, Phys*]
             rho = np.tensordot(theta, theta.conj(), axes=([0, 2], [0, 2]))
-            # Normalize 
+            # Normalize
             tr = np.trace(rho)
             if abs(tr) > 1e-12:
                 rho /= tr
@@ -1098,7 +1113,7 @@ class MPS:
 
             # 2) Precompute components
             # group the Environment + Site Tensor to expose Physical and Bond indices.
-            
+
             # L_components[i]: [Pi, Pi*, R*, R]
             L_components = []
             for i in range(self.L):
@@ -1148,14 +1163,14 @@ class MPS:
                         # Contract with component at j: [L_j, L*_j, Pj*, Pj]
                         # Connect Bond indices: R_prev(3) with L_j(0), R*_prev(2) with L*_j(1)
                         rho_raw = np.tensordot(tensor, R_components[j], axes=([3, 2], [0, 1]))
-                        
+
                         # rho_raw: [Pi, Pi*, Pj*, Pj]
                         # Reorder to standard form [Pi, Pj, Pi*, Pj*]
                         rho_ij = rho_raw.transpose(0, 3, 1, 2)
 
                         d_i, d_j = rho_ij.shape[0], rho_ij.shape[1]
                         rho_mat = rho_ij.reshape(d_i * d_j, d_i * d_j)
-                        
+
                         # Normalize
                         tr = np.trace(rho_mat)
                         if abs(tr) > 1e-12:
@@ -1221,7 +1236,7 @@ class MPS:
 
                     rho_dense = _bt_to_dense(rho_ij)
                     d_i, d_j = rho_dense.shape[0], rho_dense.shape[1]
-                    
+
                     # Normalize
                     rho_mat = rho_dense.reshape(d_i * d_j, d_i * d_j)
                     tr = np.trace(rho_mat)
@@ -1606,7 +1621,7 @@ def RightCanonical(M):
 
 
 class MPO:
-    def __init__(self, factors, homogenous=False):
+    def __init__(self, factors, labels='lrud', homogenous=False):
         """
         class for matrix product operators.
 
@@ -1615,7 +1630,7 @@ class MPO:
         factors : list
             list of 4-tensors of dimension. [chi1, chi2, d_up, d_down]
             chi1: left virtual bond
-            chi2: right virtual bond  
+            chi2: right virtual bond
             d_up: physical output (bra)
             d_down: physical input (ket)
         chi_max:
@@ -1638,72 +1653,79 @@ class MPO:
 
     def bond_orders(self):
         """Return right bond dimensions for each site."""
-        return [t.shape[1] for t in self.factors] 
+        return [t.shape[1] for t in self.factors]
 
     def ground_state(self, algorithm='dmrg'):
         pass
 
-    def dot(self, mps, rank):
+    def dot(self, mps, D=None):
+        if D is None:
+            D = max(self.bond_orders()+mps.bond_orders()) if isinstance(mps, MPO) \
+                else max(mps.bond_orders())*2
+
         # apply MPO to MPS followed by a compression
-        factors = apply_mpo(self.factors, mps.factors, rank)  
+        factors = apply_mpo(self.factors, mps.factors, D)
         return MPS(factors)
-    
-    
+
+
     def matmul(self, other, chi_max=None):
         """
         MPO @ MPO -> MPO
-        MPO @ MPS -> MPS 
+        MPO @ MPS -> MPS
         """
+
+        # if self.labels :
+
         if chi_max is None:
             chi_max = max(self.bond_orders()+other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders())*2
         if isinstance(other, MPO):
-            # 1. Compute raw product 
+            # 1. Compute raw product
             # Output format of product_MPO is (Left, Right, Up, Down)
             raw_factors = product_MPO(self.factors, other.factors)
-            
+
             # 2. Prepare for compress
             # decompose.py strictly requires shape: (Left, Physical, Right)
             # But our MPO product produces: (Left, Right, Up, Down)
             mps_factors = []
-            phys_dims = [] 
-            
+            phys_dims = []
+
             for W in raw_factors:
                 s = W.shape
                 # Store original physical dims (d_up, d_down)
                 phys_dims.append((s[2], s[3]))
-                
+
                 # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
                 W_flat = W.reshape(s[0], s[1], s[2] * s[3])
-                
+
                 # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
                 W_ready = W_flat.transpose(0, 2, 1)
-                
+
                 mps_factors.append(W_ready)
-            
+
             # 3. Compress (Input is Left, Phys, Right)
             # The output B will also be (Left, Phys, Right)
             compressed_factors = compress(mps_factors, chi_max)
-            
+
             # 4. Restore MPO format
             final_factors = []
             for i, B in enumerate(compressed_factors):
                 # B shape: (new_chi_L, d_combined, new_chi_R)
-                
+
                 # Step A: Transpose back -> (new_chi_L, new_chi_R, d_combined)
                 B_transposed = B.transpose(0, 2, 1)
-                
+
                 # Step B: Split physical legs -> (new_chi_L, new_chi_R, d_up, d_down)
                 d_up, d_down = phys_dims[i]
                 W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
-                
+
                 final_factors.append(W_final)
-                
+
             return MPO(final_factors)
 
         elif isinstance(other, MPS):
-            new_factors, _ = apply_mpo(self.factors, other.factors, chi_max)  
+            new_factors, _ = apply_mpo(self.factors, other.factors, chi_max)
             return MPS(new_factors)
-        
+
         raise TypeError(f"Unsupported operand type: {type(other)}")
 
 
@@ -1723,7 +1745,7 @@ class MPO:
             if self.L != other.L:
                 raise ValueError(
                     f"MPOs must have same length: {self.L} vs {other.L}")
-            
+
             if self.dims != other.dims:
                 raise ValueError(
                     f"Physical dimensions must match: {self.dims} vs {other.dims}")
@@ -1733,7 +1755,7 @@ class MPO:
                 # W1, W2: [chi1, chi2, d_up, d_down] = [a, b, i, j]
                 W1 = self.factors[i]
                 W2 = other.factors[i]
-                
+
                 # Element-wise product on physical indices, Kronecker on virtual
                 # einsum: 'abij,mnij->ambnij' then reshape to [chi1*xi1, chi2*xi2, d_up, d_down]
                 core = np.reshape(
@@ -1774,7 +1796,7 @@ class MPO:
             W2 = other.factors[i]
             r1_l, r1_r, d_up, d_down = W1.shape  # chi1, chi2, d_up, d_down
             r2_l, r2_r, _, _ = W2.shape
-            
+
             if i == 0:
                 # First site: concatenate along right bond (axis 1)
                 W_sum = np.concatenate([W1, W2], axis=1)
@@ -1790,7 +1812,7 @@ class MPO:
                 W_sum[r1_l:, r1_r:, :, :] = W2
 
             sum_factors.append(W_sum)
-        
+
         return MPO(sum_factors)
 
     def __rmul__(self, other):
@@ -1801,52 +1823,41 @@ class MPO:
         """
         return self.__mul__(other)
 
-    def exponential(self, constant=1.0, D=None, method='taylor', order=4, scale=0):
+    def exponential(self, constant=1.0, D=None, method='taylor', \
+                    order=4, scale=0):
         """
         Calculate the exponential of an MPO: exp(constant*self).
         MPO index order: [chi1, chi2, d_up, d_down]
+
+        Parameters
+        ----------
+        constant : TYPE, optional
+            DESCRIPTION. The default is 1.0.
+        D : TYPE, optional
+            DESCRIPTION. The default is None.
+        method : str, optional
+            algorithm for exponentiating an MPO. The default is 'taylor'.
+        order : TYPE, optional
+            DESCRIPTION. The default is 4.
+        scale : TYPE, optional
+            DESCRIPTION. The default is 0.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
         """
-        if method != 'taylor':
-            raise ValueError(f"Method '{method}' not implemented. Only 'taylor' is supported.")
 
-        scaled_constant = constant / (2 ** scale)
-
-        constant_dtype = np.array(scaled_constant).dtype
-        mpo_dtype = self.factors[0].dtype
-        result_dtype = np.result_type(constant_dtype, mpo_dtype)
-
-        # Create identity MPO with correct index order [chi1, chi2, d_up, d_down]
-        identity_factors = []
-        for i in range(self.L):
-            d = self.dims[i]
-            # Identity: [1, 1, d, d] with delta_{ij}
-            W = np.zeros((1, 1, d, d), dtype=result_dtype)
-            for j in range(d):
-                W[0, 0, j, j] = 1.0
-            identity_factors.append(W)
-
-        result = MPO(identity_factors)
-        term = MPO(identity_factors)
-        
-        factorial = 1
-        for k in range(1, order + 1):
-            term = term.matmul(self, chi_max=D)
-            factorial = factorial * k
-            coefficient = (scaled_constant ** k) / factorial
-            result = result + (term * coefficient)
-
-        for _ in range(scale):
-            result = result.matmul(result, chi_max=D)
-
-        return result
+        return expmpo(self.H, constant, D=D, method='taylor', order=4, scale=0)
 
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
     """
     Generate a separable Gaussian wave packet (GWP) in matrix product state (MPS) form.
 
-    This routine builds a product MPS where each physical dimension is represented by a rank-3 tensor of shape ``[1, d, 1]``. 
-    
+    This routine builds a product MPS where each physical dimension is represented by a rank-3 tensor of shape ``[1, d, 1]``.
+
     The first tensor can optionally encode a discrete internal state basis of size ``nstates``. The spatial part is a direct product of 1D Gaussians, one per coordinate dimension, with optional momentum phase factors.
 
     MPS index order: ``[chi1, d, chi2] = [left_bond, physical, right_bond]``.
@@ -1916,7 +1927,7 @@ def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, *
     """
     ndim = len(coord)
     mps = []
-    
+
     if nstates is not None:
         s = np.zeros((1, nstates, 1), dtype=complex)
         s[0, inistates, 0] = 1.0
@@ -1984,15 +1995,15 @@ def show(tt_in):
 
         if G.shape[0] != r[-1]:
             raise ValueError('Invalid shape of core for TT-tensor')
-        
+
         if len(G.shape) == 4:
             label = 'MPO'
-            n.append(G.shape[2])  
+            n.append(G.shape[2])
         elif len(G.shape) == 3:
             label = 'MPS'
-            n.append(G.shape[2])  
+            n.append(G.shape[2])
 
-        r.append(G.shape[1])  
+        r.append(G.shape[1])
 
     if r[-1] != 1:
         raise ValueError('Invalid shape of core for TT-tensor')
@@ -2011,6 +2022,44 @@ def show(tt_in):
     print(text1 + '\n' + text2)
 
 # apply_mpo_to_mps = apply_mpo
+def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
+    """
+    Calculate the exponential of an MPO: exp(constant * H ).
+    MPO index order: [chi1, chi2, d_up, d_down]
+    """
+    if method.lower() != 'taylor':
+        raise ValueError(f"Method '{method}' not implemented. Only 'taylor' is supported.")
+
+    scaled_constant = constant / (2 ** scale)
+
+    constant_dtype = np.array(scaled_constant).dtype
+    mpo_dtype = H.factors[0].dtype
+    result_dtype = np.result_type(constant_dtype, mpo_dtype)
+
+    # Create identity MPO with correct index order [chi1, chi2, d_up, d_down]
+    identity_factors = []
+    for i in range(H.L):
+        d = H.dims[i]
+        # Identity: [1, 1, d, d] with delta_{ij}
+        W = np.zeros((1, 1, d, d), dtype=result_dtype)
+        for j in range(d):
+            W[0, 0, j, j] = 1.0
+        identity_factors.append(W)
+
+    result = MPO(identity_factors)
+    term = MPO(identity_factors)
+
+    factorial = 1
+    for k in range(1, order + 1):
+        term = term.matmul(H, chi_max=D)
+        factorial = factorial * k
+        coefficient = (scaled_constant ** k) / factorial
+        result = result + (term * coefficient)
+
+    for _ in range(scale):
+        result = result.matmul(result, chi_max=D)
+
+    return result
 
 def apply_mpo(w_list, B_list, chi_max):
     """
@@ -2032,7 +2081,7 @@ def apply_mpo(w_list, B_list, chi_max):
     -------
     tuple
         (compressed_mps, truncation_error)
-        
+
     Note
     ----
     This function does NOT modify the input B_list.
@@ -2049,7 +2098,7 @@ def apply_mpo(w_list, B_list, chi_max):
     L = len(w_list_copy)
     if L > len(B_list_copy):
         raise ValueError("MPO must have the same or shorter length than MPS.")
-    
+
     result = [B.copy() for B in B_list_copy]
 
     for i_site in range(L):
@@ -2064,23 +2113,23 @@ def apply_mpo(w_list, B_list, chi_max):
         B_new = np.einsum('abij,klj->akbli', w_list_copy[i_site], result[i_site])
         B_new = np.reshape(B_new, (chi_L * b_L, chi_R * b_R, d_out))
         result[i_site] = B_new
-    
+
     return compress(result, chi_max)
 
 
 def product_W(W, X):
     """
     'Vertical' product of MPO W-matrices.
-    
+
     MPO index order: [chi1, chi2, d_up, d_down]
-    
+
     Diagram:
            |d_up (from W)
-          -W- 
+          -W-
            | (W's d_down contracts with X's d_up)
           -X-
            |d_down (from X)
-           
+
     W acts first (on ket), X acts second.
     Result: [chi1_W * chi1_X, chi2_W * chi2_X, d_up_W, d_down_X]
     """
@@ -2090,7 +2139,7 @@ def product_W(W, X):
     # Result indices: a, b, s (from W), c, d, u (from X)
     # Final shape: [a*c, b*d, s, u]
     return np.reshape(
-        np.einsum("abst,cdtu->acbdsu", W, X), 
+        np.einsum("abst,cdtu->acbdsu", W, X),
         [W.shape[0] * X.shape[0],   # chi1
          W.shape[1] * X.shape[1],   # chi2
          W.shape[2],                 # d_up (from W)
@@ -2101,22 +2150,22 @@ def product_W(W, X):
 def product_MPO(M1, M2):
     """
     Vertical product of two MPOs: M1 @ M2.
-    
+
     M1 acts first (closer to ket), M2 acts second (closer to bra).
-    
+
     Note: This function does NOT modify M1 or M2.
     """
     if isinstance(M1, MPO):
         M1_copy = M1.factors
     else:
-        M1_copy = M1 
+        M1_copy = M1
     if isinstance(M2, MPO):
         M2_copy = M2.factors
     else:
         M2_copy = M2
-    
+
     L=min(len(M1_copy), len(M2_copy))
-    
+
     Result = []
     for i in range(L):
         Result.append(product_W(M1_copy[i], M2_copy[i]))
@@ -2232,18 +2281,18 @@ def expect_zipper_right(mpo, mps):
 def initial_E(W):
     """
     Construct the initial Left Environment (E) tensor for the vacuum state.
-    
-    This represents the contraction of all sites to the left of the chain 
+
+    This represents the contraction of all sites to the left of the chain
     (effectively scalar 1 for vacuum).
-    
+
     Index Convention:
     -----------------
     [MPO_Bond, Bra_Bond, Ket_Bond]
-    
+
     Parameters
     ----------
     W : np.ndarray or BlockTensor
-        The MPO tensor at the first site (index 0). 
+        The MPO tensor at the first site (index 0).
         Used to determine the MPO bond dimension (chi_MPO) and symmetry sector.
 
     Returns
@@ -2259,14 +2308,14 @@ def initial_E(W):
             zero_qn = sample_qn * 0 # e.g. QN(0,0)
         else:
             zero_qn = 0
-            
+
         # MPO (In), Bra (In), Ket (In) -> Need Out (+1)
         # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
         data = {(zero_qn, zero_qn, zero_qn): np.ones((1, 1, 1))}
         qns = [[zero_qn], [zero_qn], [zero_qn]]
-        dirs = [1, -1, 1] 
+        dirs = [1, -1, 1]
         return BlockTensor(data, qns, dirs)
-    
+
     # Dense branch without U(1)
     # MPO Left Bond dimension is W.shape[0]
     E = np.zeros((W.shape[0], 1, 1))
@@ -2276,11 +2325,11 @@ def initial_E(W):
 def initial_F(W, target_qn=0):
     """
     Constructs the initial Right Environment (Vacuum).
-    
+
     represents the contraction of all sites to the right of the chain.
     For U(1) symmetry, this enforces the total target charge of the system
     (Bra and Ket must end at `target_qn`).
-    
+
     Index Convention:
     -----------------
     [MPO_Bond, Bra_Bond, Ket_Bond]
@@ -2291,8 +2340,8 @@ def initial_F(W, target_qn=0):
         The MPO tensor at the last site (index -1).
         Used to determine the MPO bond dimension.
     target_qn : int, optional
-        The target quantum number (total charge) of the wavefunction. 
-        Required for BlockTensor to ensure the bra/ket bonds match the 
+        The target quantum number (total charge) of the wavefunction.
+        Required for BlockTensor to ensure the bra/ket bonds match the
         target sector at the boundary. Default is 0.
 
     Returns
@@ -2304,7 +2353,7 @@ def initial_F(W, target_qn=0):
     """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
         sample_qn = W.qns[1][0] if len(W.qns[1]) > 0 else 0
-        
+
         if isinstance(sample_qn, tuple):
             zero_qn = sample_qn * 0
         else:
@@ -2316,7 +2365,7 @@ def initial_F(W, target_qn=0):
         qns = [[zero_qn], [target_qn], [target_qn]]
         dirs = [-1, 1, -1]
         return BlockTensor(data, qns, dirs)
-    
+
     # Dense branch without U(1)
     # MPO Right Bond dimension is W.shape[1]
     F = np.zeros((W.shape[1], 1, 1))
@@ -2453,24 +2502,24 @@ def contract_from_right(W, A, F, B):
         # F: (MPO, Bra, Ket). A_bra: A.conj().
         # Contract F.Bra(1) with A.conj().Right(1)
         Temp = tensordot(A.conj(), F, axes=([1], [1]))
-        
+
         # Contract with W (L, R, Out, In)
         # Contract Temp.MPO(2) with W.Right(1)
         # Contract Temp.P(1) with W.Out(2)
-        Temp = tensordot(Temp, W, axes=([2, 1], [1, 2])) 
-        
+        Temp = tensordot(Temp, W, axes=([2, 1], [1, 2]))
+
         # Contract with B(Ket): (L, R, P)
         # Contract Temp.Ket(1) with B.Right(1)
         # Contract Temp.In_W(3) with B.Phys(2)
-        Temp = tensordot(Temp, B, axes=([1, 3], [1, 2])) 
-        
+        Temp = tensordot(Temp, B, axes=([1, 3], [1, 2]))
+
         return Temp.transpose(1, 0, 2)
 
     #  Dense Branch ---
     if isinstance(A, MPS):
         A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
     elif isinstance(A, np.ndarray) and A.ndim == 3:
-        A_std = A 
+        A_std = A
     else:
         raise ValueError(f"Unknown type/shape for A: {type(A)}")
 
@@ -2482,7 +2531,7 @@ def contract_from_right(W, A, F, B):
     # Contraction
     # F: (MPO, Bra, Ket)
     # A_std: (Left, Phys, Right)
-    
+
     # Step A: Contract F with A* (Bra)
     # F[Bra] (1) -- A*[Right] (2)
     # T1: (MPO_R, Ket_R, Left_Bra, Phys_Bra)
@@ -2539,18 +2588,18 @@ def contract_from_left(W, A, E, B):
     if SYMMETRY_AVAILABLE and isinstance(A, BlockTensor):
         # E: (MPO, Bra, Ket). A_bra: A.conj().
         # Contract E.Bra(1) with A.conj().Left(0)
-        Temp = tensordot(E, A.conj(), axes=([1], [0])) 
-        
+        Temp = tensordot(E, A.conj(), axes=([1], [0]))
+
         # Contract with W (L, R, Out, In)
         # Contract Temp.MPO(0) with W.Left(0)
         # Contract Temp.P(3) with W.Out(2)
-        Temp = tensordot(Temp, W, axes=([0, 3], [0, 2])) 
-        
+        Temp = tensordot(Temp, W, axes=([0, 3], [0, 2]))
+
         # Contract with B (L, R, P)
         # Contract Temp.Ket(0) with B.Left(0)
         # Contract Temp.W_In(3) with B.Phys(2)
-        Temp = tensordot(Temp, B, axes=([0, 3], [0, 2])) 
-        
+        Temp = tensordot(Temp, B, axes=([0, 3], [0, 2]))
+
         return Temp.transpose(1, 0, 2)
 
     #  Dense Branch ---
@@ -2558,7 +2607,7 @@ def contract_from_left(W, A, E, B):
     if isinstance(A, MPS):
         A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
     elif isinstance(A, np.ndarray) and A.ndim == 3:
-        A_std = A 
+        A_std = A
     else:
         raise ValueError(f"Unknown type/shape for A: {type(A)}")
 
@@ -2579,7 +2628,7 @@ def contract_from_left(W, A, E, B):
     # E[1] (Bra_L) -- A*[0] (Bra_L)
     # T1 shape: (MPO_L, Ket_L, Phys_Bra, Bra_R)
     T1 = np.tensordot(E, A_std.conj(), axes=(1, 0))
-    
+
     # Step B: Contract T1 with W (MPO)
     # T1[0] (MPO_L) -- W[0] (MPO_L)
     # T1[2] (Phys_Bra) -- W[2] (Phys_Out)
@@ -2693,28 +2742,28 @@ def fine_grain_MPS(Theta, dims):
       -theta- => -A--B-
     """
     # Theta shape: (Chi_L, d_A, d_B, Chi_R)
-    
+
     # 1. Group indices for SVD: (Chi_L * d_A) x (d_B * Chi_R)
     # This corresponds to "Left Canonical" splitting
     chi_L = Theta.shape[0]
     chi_R = Theta.shape[3]
     d_A = dims[0]
     d_B = dims[1]
-    
+
     # Reshape to Matrix
     Psi = Theta.reshape(chi_L * d_A, d_B * chi_R)
-    
+
     # SVD
     U, S, V = np.linalg.svd(Psi, full_matrices=False)
-    
+
     # Reshape U -> A [Left, Phys, Right_Bond]
     # U columns are the new bond index
     A = U.reshape(chi_L, d_A, -1)
-    
+
     # Reshape V -> B [Left_Bond, Phys, Right]
     # V rows are the new bond index
     B = V.reshape(-1, d_B, chi_R)
-    
+
     return A, S, B
 
 def truncate_SVD(U, S, V, m):
@@ -2744,24 +2793,24 @@ class HamiltonianMultiply(sparse.linalg.LinearOperator):
         self.W = W # MPO: (Left, Right, Out, In) -> (L, R, P_bra, P_ket)
         self.F = F
         self.dtype = np.dtype('d')
-        
+
         # Determine shapes
         # E: (MPO, Bra_L, Ket_L)
         # F: (MPO, Bra_R, Ket_R)
         # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
-        
+
         # Required Input Vector Shape (Two-Site Tensor):
         # We expect input vector 'v' to flatten a tensor of shape:
-        # (Ket_L, Phys_A, Phys_B, Ket_R) 
+        # (Ket_L, Phys_A, Phys_B, Ket_R)
         # Note: If it's 1-site, it's (Ket_L, Phys, Ket_R)
-        
+
         self.chi_L = E.shape[2] # Ket_L
         self.chi_R = F.shape[2] # Ket_R
-        
+
         # W has combined physical dimensions if coarse-grained
         self.d_out = W.shape[2]
         self.d_in = W.shape[3]
-        
+
         self.req_shape = (self.chi_L, self.d_in, self.chi_R)
         self.size = self.chi_L * self.d_in * self.chi_R
         self.shape = (self.size, self.size)
@@ -2769,30 +2818,30 @@ class HamiltonianMultiply(sparse.linalg.LinearOperator):
     def _matvec(self, v):
         # 1. Reshape vector to tensor A [Left, Phys, Right]
         A = v.reshape(self.req_shape)
-        
+
         # 2. Contract: E(a,i,k) * A(k,s,l) * W(a,b,r,s) * F(b,j,l)
         # E: (MPO_L, Bra_L, Ket_L)
         # A: (Ket_L, Phys_In, Ket_R)
         # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
         # F: (MPO_R, Bra_R, Ket_R)
-        
+
         # Step A: E * A -> Contract Ket_L
         # E[2] with A[0]
         # T1: (MPO_L, Bra_L, Phys_In, Ket_R)
         T1 = np.tensordot(self.E, A, axes=(2, 0))
-        
+
         # Step B: T1 * W -> Contract MPO_L and Phys_In
         # T1[0] (MPO_L) with W[0] (MPO_L)
         # T1[2] (Phys_In) with W[3] (Phys_In)
         # T2: (Bra_L, Ket_R, MPO_R, Phys_Out)
         T2 = np.tensordot(T1, self.W, axes=([0, 2], [0, 3]))
-        
+
         # Step C: T2 * F -> Contract MPO_R and Ket_R
         # T2[2] (MPO_R) with F[0] (MPO_R)
         # T2[1] (Ket_R) with F[2] (Ket_R)
         # Result: (Bra_L, Phys_Out, Bra_R)
         R = np.tensordot(T2, self.F, axes=([2, 1], [0, 2]))
-        
+
         return np.reshape(R, -1)
 
 ## optimize a single site given the MPO matrix W, and tensors E,F
@@ -2812,7 +2861,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
         sym_mgr: SymmetryManager instance to get valid physical QNs
         noise_val: Magnitude of noise
     """
-    if not hasattr(AA, 'data'): 
+    if not hasattr(AA, 'data'):
         return AA
     valid_qL = {}
     valid_qR = {}
@@ -2824,7 +2873,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
     for (qL, qR, qP1, qP2), blk in AA.data.items():
         valid_qL[qL] = blk.shape[0]
         valid_qR[qR] = blk.shape[1]
-        
+
     # get valid physical QNs
     # generate the QNs for standard spin-orbital states: Emp, Occ(Up), Occ(Dn)
     # The manager knows if 'Occ' means QN(1) or QN(1,1) or QN(1,1,-1).
@@ -2832,7 +2881,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
     # Always include Vacuum
     possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'emp'))
     # Include Occupied states
-    # We check both "Even-like" (Up) and "Odd-like" (Down) indices 
+    # We check both "Even-like" (Up) and "Odd-like" (Down) indices
     # to cover all bases for spin-orbitals.
     possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'occ')) # "Up"
     possible_phys_qns.add(sym_mgr.get_phys_qn(1, 'occ')) # "Down"
@@ -2847,7 +2896,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
                     dR = valid_qR[target_qR]
                     key = (qL, target_qR, qP1, qP2)
                     # Dimensions for spin-orbitals are 1
-                    dP1, dP2 = 1, 1 
+                    dP1, dP2 = 1, 1
                     if key not in AA.data:
                         noise = (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
                         if is_complex:
@@ -2906,7 +2955,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         if A.rank == 3:
             AA = tensordot(A, B, axes=([1], [0])) # this will return as BlockTensor Object
             AA = AA.transpose(0, 2, 1, 3) # standard MPO bond index currently is (L,R,out,in). TODO: reshape to (L, out, in, R) (note that currently dense branch is (L, R, out, in), better also fix that one)
-            
+
             # # add noise to AA. TODO: maby make noise decay as round goes? that should be done by injecting a smaller noise_val as dmrg sweep goes. fix and test for optimal value if have time
             AA = inject_noise_symmetric(AA, noise_val=1e-4, sym_mgr=sym_mgr)
         else:
@@ -2921,7 +2970,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         # U is (L, P_L, M).
         # V is (M, R, P_R).
         # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
-        
+
         # Helper to contract Diagonal S into U
         # U is (L, P_L, Bond). S is (Bond, Bond).
         # We want U*S -> (L, P_L, Bond)
@@ -2982,7 +3031,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         if (dir == 'right'):
             # B = S * B.  S is (m,), B is (m, d, R).
             # Contract S with B[0] (Left bond of B)
-            B = np.tensordot(np.diag(S), B, axes=(1, 0)) 
+            B = np.tensordot(np.diag(S), B, axes=(1, 0))
         else:
             assert dir == 'left'
             # A = A * S.  A is (L, d, m), S is (m,)
@@ -3016,13 +3065,13 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
     E = construct_E(MPS, MPO, MPS)
     F = construct_F(MPS, MPO, MPS, target_qn=target_qn)
     F.pop()
-    
+
     # Skip dense expectation check for U1 to avoid crash
-    Eold = 0.0 
+    Eold = 0.0
     converged = False
     gauge = None
     for sweep in range(0, int(sweeps/2)):
-        for i in range(0, len(MPS)-2): 
+        for i in range(0, len(MPS)-2):
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
                 MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr
             )
@@ -3040,7 +3089,7 @@ def two_site_dmrg(MPS, MPO, m, sweeps=50, conv=1e-6, U1=False, target_qn = None,
         else:
             Eold = Energy
 
-        for i in range(len(MPS)-2, 0, -1): 
+        for i in range(len(MPS)-2, 0, -1):
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
                 MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr
             )
@@ -3222,7 +3271,7 @@ class DMRG:
         """
         if self.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
-            
+
         return self.ground_state.calc_1site_rdm(idx)
 
     def make_rdm2(self, idx_pairs=None):
@@ -3232,7 +3281,7 @@ class DMRG:
         """
         if self.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
-            
+
         return self.ground_state.calc_2site_rdm(idx_pairs)
 
 def autoMPO(h1e, eri):
@@ -3497,7 +3546,7 @@ if __name__ == '__main__':
     dmrg.run()
     print(dmrg.ground_state.calc_1site_rdm())
 
-    
+
 
 
 
