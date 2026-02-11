@@ -361,25 +361,12 @@ class UniformMPS:
         self.labels = labels        
         self.p_idx = self.labels.index('p')
 
-        try:
-            self.dim = Bs[0].shape[self.p_idx]
-        except TypeError:
-            if hasattr(Bs[0], 'data'):
-                # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
-                phys_dims = {}
-                for key, block in Bs[0].data.items():
-                    # key is (qL, qR, qP)
-                    q_p = key[2]
-                    if q_p not in phys_dims:
-                        phys_dims[q_p] = block.shape[2]
-                self.dim = sum(phys_dims.values())
-            else:
-                self.dim = 0
+
 
 
 class MPS:
     def __init__(self, Bs, Ss=None, bc='finite', \
-                 labels='lpr', center = -1):
+                 labels=['lv', 'p', 'rv'], homogenous=False, center=None, gauge=None):
         """
         Base class for matrix product states.
         supports flexible tensor layouts via the `labels` argument.
@@ -433,8 +420,9 @@ class MPS:
             Canonical center site index. Default is -1 (no specific center).
         """
         assert bc in ['finite', 'periodic']
-        self.Bs = self.factors = Bs
+        self.Bs = self.data = self.factors = Bs
         self.Ss = Ss
+        self.gauge = gauge
 
         # leg sequence
         if labels is None:
@@ -457,29 +445,50 @@ class MPS:
         self.bc = bc
         self.L = len(Bs)
         self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
-        self.gauge = None
-        self.data = self.factors = Bs
-        self.center = center
-        if (self.center < 0 or self.center >= self.L) and (self.center != -1):
-            raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
-        if self.center == -1:
-            warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
 
 
-        self.dims = []
-        for B in Bs:
+        if self.gauge == 'mixed':
+            if not 0 <= self.center <= self.L:
+                raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
+            if self.center is None:
+                warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
+
+        self.homogenous = homogenous
+        if homogenous: 
             try:
-                self.dims.append(B.shape[1])
+                self.dim = Bs[0].shape[self.p_idx]
             except TypeError:
-                if hasattr(B, 'data'):
+                if hasattr(Bs[0], 'data'):
+                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
                     phys_dims = {}
-                    for key, block in B.data.items():
+                    for key, block in Bs[0].data.items():
+                        # key is (qL, qR, qP)
                         q_p = key[2]
                         if q_p not in phys_dims:
                             phys_dims[q_p] = block.shape[2]
-                    self.dims.append(sum(phys_dims.values()))
+                    self.dim = sum(phys_dims.values())
                 else:
-                    self.dims.append(0)
+                    self.dim = 0
+        else:  # inhomogenous
+
+            self.dims = []
+            for B in Bs:
+                try:
+                    self.dims.append(B.shape[1])
+                except TypeError:
+                    if hasattr(B, 'data'):
+                        phys_dims = {}
+                        for key, block in B.data.items():
+                            q_p = key[2]
+                            if q_p not in phys_dims:
+                                phys_dims[q_p] = block.shape[2]
+                        self.dims.append(sum(phys_dims.values()))
+                    else:
+                        self.dims.append(0)
+    
+    def check_sanity(self):
+        # TODO make sure the specified gauge is correct 
+        pass
 
     def copy(self):
         return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss] if self.Ss is not None else None, self.bc, labels=self.labels)
@@ -490,17 +499,63 @@ class MPS:
     
     def norm(self):
         """
-        Calculates :math:`N = \sqrt{<\psi|\psi>}` robustly using standard layouts.
+        Calculate the MPS norm :math:`N = \sqrt{<\psi|\psi>}` robustly using standard layouts.
         """
-        val = np.ones((1, 1), dtype=complex)
-        for i in range(self.L):
-            B = self._get_std_B(i) # (lv, rv, p)
-            # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
-            T = np.tensordot(val, B, axes=(1, 0))
-            # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
-            val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
-        return np.sqrt(np.abs(val[0, 0]))
+        if self.gauge is None:
+            
+            val = np.ones((1, 1), dtype=complex)
+            for i in range(self.L):
+                B = self._get_std_B(i) # (lv, p, rv)
+                # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
+                T = np.tensordot(val, B, axes=(1, 0))
+                # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
+                val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
+            return np.abs(val[0, 0])
+        
+        elif self.gauge == 'right_canonical':
+            B = self.Bs[0]
+            return np.einsum('aib, aib ->', B.conj(), B)
+        
+        elif self.gauge == 'left_canonical':
+            B = self.Bs[-1]
+            return np.einsum('aib, aib ->', B.conj(), B)
+        
+        elif self.gauge == 'mixed':
+            B = self.Bs[self.center]
+            return np.einsum('aib, aib ->', B.conj(), B)
 
+    def normalize(self):
+        """
+        normalize a MPS norm :math:`N = \sqrt{<\psi|\psi>}` 
+        """
+        if self.gauge is None:
+            
+            val = np.ones((1, 1), dtype=complex)
+            for i in range(self.L):
+                B = self._get_std_B(i) # (lv, p, rv)
+                # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
+                T = np.tensordot(val, B, axes=(1, 0))
+                # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
+                val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
+            
+            if val < 1e-12: raise warnings.warn('Norm {val} is too small.')
+            
+            self.Bs[0] /=  np.sqrt(np.abs(val[0, 0]))
+        
+        elif self.gauge == 'right_canonical':
+            B = self.Bs[0]
+            self.Bs[0] /= np.sqrt(np.einsum('aib, aib ->', B.conj(), B))
+        
+        elif self.gauge == 'left_canonical':
+            B = self.Bs[-1]
+            self.Bs[-1] /= np.einsum('aib, aib ->', B.conj(), B)
+        
+        elif self.gauge == 'mixed':
+            B = self.Bs[self.center]
+            self.Bs[self.center] /= np.einsum('aib, aib ->', B.conj(), B)
+            
+        return self 
+                        
 
     def set_labels(self, new_labels):
         """
@@ -640,7 +695,7 @@ class MPS:
         Automatically detects Left/Right canonical forms based on self.center.
         """
         tensor = self._get_std_B(i)
-        if self.center == -1:
+        if self.center == None:
             raise NotImplementedError("need to first do canonicalization to have a center site for get_theta1(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
         # Right of Center
         if i > self.center:
@@ -1650,9 +1705,11 @@ def RightCanonical(M):
 
 
 class MPO:
-    def __init__(self, factors, labels='lrud', homogenous=False):
+    def __init__(self, factors, labels='left, right, up, down', homogenous=False):
         """
         class for matrix product operators.
+        
+        TODO: switch leg orders to left, up, down, right
 
         Parameters
         ----------
@@ -1707,6 +1764,7 @@ class MPO:
 
         if chi_max is None:
             chi_max = max(self.bond_orders()+other.bond_orders()) if isinstance(other, MPO) else max(self.bond_orders())*2
+            
         if isinstance(other, MPO):
             # 1. Compute raw product
             # Output format of product_MPO is (Left, Right, Up, Down)
@@ -1756,6 +1814,56 @@ class MPO:
             return MPS(new_factors)
 
         raise TypeError(f"Unsupported operand type: {type(other)}")
+        
+    def __matmul__(self, other):
+        
+        assert isinstance(other, MPS)
+        
+        """
+        one step for psi = U @ psi done in tensor
+        Contracts MPO (U) with MPS (psi)
+
+        Args:
+            w_list: List of MPO tensors. shape: (Left, Right, Phys_Out, Phys_In) TODO: also add index label for MPO
+            psi_mps: MPS object (handles its own internal layout).
+
+        Returns:
+            list: New tensors in standard (Left, Phys, Right) layout.
+        """
+        L = other.L
+        if L != self.L:
+            raise ValueError(f"MPO length does not match ({self.L}) and MPS ({L}).")
+
+        factors = []
+
+        for i in range(L):
+            W = self.factors[i] # Shape: (wL, wR, pOut, pIn)
+            # B = psi_mps._get_std_B(i) # MPS to (Left, Phys, Right)
+            B = other.factors[i] 
+            
+            # psi = U @ psi
+            # B: (bL, pIn, bR)
+            # W: (wL, wR, pOut, pIn)
+            # Contract B[Phys] (axis 1) with W[PhysIn] (axis 3)
+            T = np.tensordot(B, W, axes=(1, 3))
+
+            # Result T: (bL, bR, wL, wR, pOut)
+            # rearrange to: (NewLeft, NewPhys, NewRight)
+            # NewLeft  = (bL, wL) -> Indices (0, 2)
+            # NewPhys  = (pOut)   -> Index   (4)
+            # NewRight = (bR, wR) -> Indices (1, 3)
+            # Transpose: (0, 2, 4, 1, 3)
+            T = T.transpose(0, 2, 4, 1, 3)
+
+            # Fuse Bonds
+            s = T.shape
+            dim_L = s[0] * s[1]
+            dim_P = s[2]
+            dim_R = s[3] * s[4]
+            T_flat = T.reshape(dim_L, dim_P, dim_R)
+            factors.append(T_flat)
+            
+        return MPS(factors)
 
 
     def __mul__(self, other):
@@ -2090,7 +2198,7 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
 
     return result
 
-def apply_mpo(w_list, B_list, chi_max):
+def apply_mpo(w_list, B_list, chi_max=None):
     """
     Apply the MPO to an MPS.
 
@@ -2104,7 +2212,7 @@ def apply_mpo(w_list, B_list, chi_max):
     B_list : list
         MPS tensors, each with shape [chi1, chi2, d].
     chi_max : int
-        Maximum bond dimension for compression.
+        Maximum bond dimension for compression. Default is None.
 
     Returns
     -------
@@ -2143,7 +2251,11 @@ def apply_mpo(w_list, B_list, chi_max):
         B_new = np.reshape(B_new, (chi_L * b_L, chi_R * b_R, d_out))
         result[i_site] = B_new
 
-    return compress(result, chi_max)
+    if chi_max is None:
+        return result 
+    else:
+        return compress(result, chi_max)
+    
 
 
 def product_W(W, X):
