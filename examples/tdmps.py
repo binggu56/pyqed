@@ -89,6 +89,9 @@ class Heisenberg:
         H = self.build_H_mpo()
         return TDMPS(psi0, H, dt)
     
+    def TEBD(self):
+        pass
+    
     def DMRG(self, D=None, **kwargs):
         from pyqed.mps.mps import DMRG
         
@@ -115,6 +118,8 @@ psi0 = mol.build_neel_state()
 
 dmrg = mol.DMRG(D=40, init_guess=psi0)
 dmrg.run()
+
+dmrg = mol.TEBD(D=40, init_guess=psi0)
 
 print(dmrg.e_tot)
 

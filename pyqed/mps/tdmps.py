@@ -105,16 +105,6 @@ class TDMPS:
 
         return self.U
 
-
-    # def normalize(self, psi):
-    #     """
-    #     Re-normalizes the MPS.
-    #     """
-    #     norm = psi.norm()
-    #     if norm > 1e-12:
-    #         psi.Bs[0] /= np.sqrt(norm)
-    #     return norm
-
     def step(self, psi):
         """
         Evolve system by one step dt.
@@ -124,16 +114,9 @@ class TDMPS:
         # psi = propagate(self.U.factors, psi)
         
         psi = self.U @ psi
-
-        # Create MPS object for Compression
         return psi.compress(self.D).normalize()
 
-        # # Normalize, update time
-        # self.normalize(psi)
 
-        # step_mag = abs(self.dt) if np.isreal(self.dt) else abs(self.dt.imag)
-        # self.time += step_mag
-        # return psi
     def fast_run(self):
         pass
 
