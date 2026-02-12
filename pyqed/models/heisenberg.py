@@ -164,7 +164,6 @@ if __name__ == '__main__':
     ax.plot(td.times, td.observables[:,0])
 
 
-
     # dmrg = mol.TEBD(D=40, init_guess=psi0)
 
     
