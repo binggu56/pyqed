@@ -1,5 +1,5 @@
 import numpy as np
-from pyqed.mps.mps import MPS, MPO, expect_mps, expmpo, apply_mpo
+from pyqed.mps.mps import MPS, MPO, expmpo, apply_mpo, expect_mps
 import logging
 
 # def propagate(w_list, psi_mps):
@@ -48,7 +48,7 @@ import logging
 #     return MPS(psi_new)
 
 class TDMPS:
-    def __init__(self, psi0, H_mpo, dt, D=40):
+    def __init__(self, H_mpo, D=40):
         """
         Time-Dependent MPS Solver (Layout Agnostic).
 
@@ -58,11 +58,10 @@ class TDMPS:
             dt (complex): Time step.
             bond_dim (int): Max bond dimension.
         """
-        if not isinstance(psi0, MPS):
-            raise TypeError("initialize psi0 as an MPS class object.")
-        self.psi0 = psi0
+
+        # self.psi0 = psi0
         self.H = H_mpo
-        self.dt = dt
+        # self.dt = dt
         self.bond_dim = self.D = D
         # self.order = order
         # self.scale = scale
@@ -71,9 +70,10 @@ class TDMPS:
 
         # DO NOT CHANGE
         self.U = None
+        self.observables = None
         
 
-    def build_propagator(self, order=2, scale=0):
+    def build_propagator(self, dt, order=2, scale=0):
         """
         Construct the MPO of the short-time propagator
         .. math::
@@ -97,8 +97,8 @@ class TDMPS:
 
         """
 
-        logging.info(f"Build propagator (dt={self.dt}, order={order})...")
-        constant = -1j * self.dt
+        logging.info(f"Build propagator (dt={dt}, order={order})...")
+        constant = -1j * dt
 
         self.U = expmpo(self.H, constant=constant, D=self.D,
                         method='taylor', order=order, scale=scale)
@@ -120,7 +120,7 @@ class TDMPS:
     def fast_run(self):
         pass
 
-    def run(self, steps, e_ops=[], interval=1):
+    def run(self, psi0, dt, steps, e_ops=[], interval=1):
         """
         Run time evolution.
 
@@ -139,21 +139,20 @@ class TDMPS:
             DESCRIPTION.
 
         """
-        dt = self.dt 
+        if not isinstance(psi0, MPS):
+            raise TypeError("Initialize state is not an MPS object.")
+            
+        # dt = self.dt 
         
-        # results = {
-        #     'time': [],
-        #     'norm_check': [],
-        #     'obs': [[] for _ in observables]
-        # }
-        if self.U is None:
-            self.build_propagator()
+        self.build_propagator(dt)
 
-        print(f"Starting Evolution for {steps} steps...")
+        print(f"Starting time-evolution for {steps} steps with dt = {dt}...")
         self.times = np.arange(0, steps, interval) * dt
-
-        observables = np.zeros((len(e_ops), len(self.times)))
-        psi = self.psi0
+        
+        # if e_ops:
+        observables = np.zeros((len(self.times), len(e_ops)))
+            
+        psi = psi0
         for i in range(steps//interval):
             for k in range(interval):
                 
@@ -161,16 +160,11 @@ class TDMPS:
 
             # compute observables
 
-
-            # results['time'].append(self.time)
-            # results['norm_check'].append(self.compute_norm())
-
             # Measure Observables
             # psi_std = [self.psi._get_std_B(k) for k in range(self.psi.L)]
 
-            # for idx, op in enumerate(e_ops):
-            #     val = expect_mps(psi, op.factors)
-            #     results['obs'][idx].append(val)
+            # note the first observable is computed at t = dt
+            observables[i] = [expect_mps(psi.factors, e.factors) for e in e_ops]
 
             
             
@@ -178,6 +172,8 @@ class TDMPS:
             #     # Print Energy
             #     e_str = f", Obs[0]={np.real(results['obs'][0][-1]):.6f}" if observables else ""
             #     print(f"Step {i+1}/{steps}, Time={self.time:.4f}{e_str}")
+        self.observables = observables
+        
         return self
 
 if __name__ == "__main__":

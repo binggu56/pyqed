@@ -5,4 +5,4 @@ from .hf import *
 from .ci.cisd import *
 from .ci.fci import *
 from .dmrg.dmrg import QCDMRG
-from mcscf.casscf import CASSCF
+from .mcscf.casscf import CASSCF
