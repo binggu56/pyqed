@@ -682,10 +682,9 @@ class OQS(Mol):
         H = self.hamiltonian
         c_ops = self.c_ops
 
-        correlation_2p_1t(H, rho0, ops=ops, c_ops=c_ops, dt=dt,\
+        return _correlation_2p_1t(H, rho0, ops=ops, c_ops=c_ops, dt=dt,\
                           Nt=Nt, method=method, output=output)
 
-        return
 
     # def tcl2(self):
     #     """
@@ -1339,7 +1338,8 @@ class Lindblad():
 
 
 
-class HEOMSolver():
+
+class HEOM():
     def __init__(self, H=None, c_ops=None, e_ops=None):
         self.c_ops = c_ops
         self.e_ops = e_ops
@@ -1445,6 +1445,9 @@ class HEOMSolver():
                 e_ops=[b_op], return_result=True).observables[:,0]
 
         return corr_mat
+
+
+HEOMSolver = HEOM
 
 # exponential series solvers
 

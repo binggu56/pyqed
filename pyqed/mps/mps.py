@@ -423,16 +423,53 @@ class MPS:
             Canonical center site index. Default is -1 (no specific center).
         """
         assert bc in ['finite', 'periodic']
-        self.Bs = self.data = self.factors = Bs
+        self.bc = bc
+
+        self.L = len(Bs)
+        self.nbonds = self.L - 1 if self.bc == 'finite' else self.L        
         self.Ss = Ss
-        self.gauge = gauge
+        
+        if center is not None and gauge is None:
+            self.center = center 
+
+        elif center is None and gauge is not None:
+            
+            gauge = gauge.lower()
+            self.gauge = gauge
+            
+            if gauge in ['left', 'lv', 'l']:
+                self.center = self.L - 1
+            elif gauge in ['right', 'rv', 'r']:
+                self.center = 0
+            elif gauge in ['mixed']:
+                
+                assert isinstance(center, int)
+                if not 0 <= center <= self.L:
+                    raise ValueError(f"Invalid center index {center} for MPS with {self.L} sites.")
+                self.center = center
+            
+            else:
+                raise ValueError('Unrecognized gauge {gauge} for MPS')
+        
+        elif center is None and gauge is None:
+            print('You are creating a MPS without a gauge. \
+                  Suggest calling right_canonicalize() for canonicalization first.")')
+        
+        else:
+            raise ValueError('Cannot specify both gauge and center. Use only one.')
+
+        
 
         # leg sequence
         if labels is None:
             warnings.warn("MPS labels not specified, assuming ['lv', 'p', 'rv'].")
             self.labels = ['lv', 'p', 'rv']
         else:
+
+            if len(labels) != 3:
+                 warnings.warn(f"Warning: You provided {len(labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
             self.labels = labels
+            
         try:
             self.lv_idx = self.labels.index('lv')
             self.rv_idx = self.labels.index('rv')
@@ -440,26 +477,18 @@ class MPS:
         except ValueError as e:
             missing_label = str(e).split()[-1]
             raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
-        if len(self.labels) != 3:
-             warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
+        
+        # order legs to [left, phys, right] 
+        if self.lv_idx != 0 and self.p_idx != 1:
+            Bs = [B.transpose(self.lv_idx, self.p_idx, self.rv_idx) for B in Bs]
+        
+        self.Bs = self.data = self.factors = Bs
 
-
-
-        self.bc = bc
-        self.L = len(Bs)
-        self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
-
-
-        if self.gauge == 'mixed':
-            if not 0 <= self.center <= self.L:
-                raise ValueError(f"Invalid center index {self.center} for MPS with {self.L} sites.")
-            if self.center is None:
-                warnings.warn("MPS created without a canonical center. Some operations may require canonicalization first.")
 
         self.homogenous = homogenous
         if homogenous:
             try:
-                self.dim = Bs[0].shape[self.p_idx]
+                self.dim = Bs[0].shape[1]
             except TypeError:
                 if hasattr(Bs[0], 'data'):
                     # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
@@ -582,7 +611,8 @@ class MPS:
 
 
     def to_order(self, target_labels):
-        """Returns a new MPS with tensors transposed to target_labels."""
+        """Returns a new MPS with tensors transposed to target_labels. 
+        DEPRECATED. Use transpose()"""
         if self.labels == target_labels:
             return self.copy()
 
@@ -631,6 +661,9 @@ class MPS:
                          bond_dims[q_r] = block.shape[2]
                  bonds.append(sum(bond_dims.values()))
              return bonds
+    
+    def get_singular_values(self, bond_id):
+        pass
 
     def __add__(self, other):
         """
@@ -700,7 +733,7 @@ class MPS:
         Automatically detects Left/Right canonical forms based on self.center.
         """
         tensor = self._get_std_B(i)
-        if self.center == None:
+        if self.center is None:
             raise NotImplementedError("need to first do canonicalization to have a center site for get_theta1(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
         # Right of Center
         if i > self.center:
@@ -1006,7 +1039,7 @@ class MPS:
         TODO: U(1) branch is now still in Left Phys Right layout for MPS tensors.  Need to standardize.
         Both Branch give numpy d×d matrices for convenience.
         """
-        import numpy as np
+        # import numpy as np
 
         if idx is None:
             idx = list(range(self.L))
@@ -1114,10 +1147,11 @@ class MPS:
 
             return rdm
 
-        if idx is None:
-            idx = list(range(self.L))
-        elif isinstance(idx, int):
-            idx = [idx]
+        # if idx is None:
+        #     idx = list(range(self.L))
+        # elif isinstance(idx, int):
+        #     idx = [idx]
+        
         rdm = {}
         for i in idx:
             # Get Effective Wavefunction [Left, Phys, Right]
