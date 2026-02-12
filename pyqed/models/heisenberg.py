@@ -134,18 +134,21 @@ if __name__ == '__main__':
     mol = Heisenberg(L=10)
     neel = mol.build_neel_state()
     
-    # dmrg = mol.DMRG(D=40, init_guess = neel)
-    # dmrg.run()
+    # ground state 
+    dmrg = mol.DMRG(D=40, init_guess = neel)
+    dmrg.run()
 
-    # dmrg = mol.TEBD(D=40, init_guess=psi0)
-
+    # real-time evolution
     td = mol.TDDMRG()
     td.run(psi0=neel, dt=0.01, steps=10, e_ops=[mol.H])
     
+    # make plots
     import ultraplot as plt 
-    
     fig, ax = plt.subplots()
     ax.plot(td.times, td.observables[:,0])
+
+
+    # dmrg = mol.TEBD(D=40, init_guess=psi0)
 
     
     # # Initialize TDMPS Solver
