@@ -45,6 +45,7 @@ class DMRG:
         """
 
         self.H = H
+        # self.L = self.H.L
         self.D = D
         self.nsweeps = nsweeps
         self.opt = opt
@@ -57,7 +58,9 @@ class DMRG:
         self.target_qn = self.charge = charge
 
         self.ground_state = None
-        self.ground_state_raw = None
+        self.mps = None # to hold eigenstates
+        
+        # self.ground_state_raw = None
 
         self.not_conv_err = not_conv_err
         self.converged = False
@@ -102,25 +105,30 @@ class DMRG:
 
         elif self.opt == '2site':
 
-            self.e_tot, self.ground_state_raw, self.gauge, self.converged = two_site_dmrg(
+            self.e_tot, ground_state, self.gauge, self.converged = two_site_dmrg(
                 mps_list, mpo_list, self.D, self.nsweeps, \
                     U1=self.U1, target_qn=self.charge, not_conv_err=self.not_conv_err, sym_mgr=None)
 
             if self.U1:
                 # U1 engine returns [Left, Right, Phys]
-                final_labels = ['lv', 'rv', 'p']
+                labels = ['lv', 'rv', 'p']
             else:
                 # Dense engine returns [Left, Phys, Right]
-                final_labels = ['lv', 'p', 'rv']
+                labels = ['lv', 'p', 'rv']
+            
+            # self.ground_state = self.mps = MPS(ground_state, labels=labels, gauge=gauge)
 
-            if self.gauge == "left":
+            if self.gauge.lower() == "left":
 
-                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=len(self.mps_list) -1)
+                self.ground_state = MPS(ground_state, labels=labels,\
+                                        center=len(ground_state)-1)
+                    
                 self.ground_state.left_canonicalize()
 
-            elif self.gauge == "right":
+            elif self.gauge.lower() == "right":
 
-                self.ground_state = MPS(self.ground_state_raw, labels=final_labels, center=0)
+                self.ground_state = MPS(ground_state, labels=labels,
+                                        center=0)
                 self.ground_state.right_canonicalize()
 
         else:

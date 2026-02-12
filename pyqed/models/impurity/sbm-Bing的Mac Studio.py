@@ -80,12 +80,12 @@ from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSHO, BasisHalfSpin, BasisSpin
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
-from pyqed.mps.mps import DMRG as DMRG_Solver
+from pyqed.mps import DMRG as DMRG_Solver
 
 
 class SBM:
     """
-    NRG bosonic for open quantum systems
+    spin-boson model for open quantum systems with NRG solver 
 
     .. math::
 
@@ -357,9 +357,10 @@ class SBM:
             init_mps.append(A_boson)
 
         # 6. Return DMRG Object
-        dmrg_obj = DMRG_Solver(H=mpo_fixed, D=D, nsweeps=nsweeps, init_guess=init_mps, U1= False, not_conv_err = True)
+        return DMRG_Solver(H=mpo_fixed, D=D, nsweeps=nsweeps, \
+                               init_guess=init_mps, not_conv_err=True)
         
-        return dmrg_obj
+
 
     def exact_diag(self, N, nb):
         """
@@ -617,27 +618,33 @@ if __name__=='__main__':
     H = 0.5 * (epsilon * Z - X * Delta)
     nb = 5  #local bosonic dimension
 
-    nrg = SBM(H, s=0.8, L=2., alpha=0.05, omegac=1, epsilon = epsilon, delta = Delta)
+    mol = SBM(H, s=0.8, L=2., alpha=0.05, omegac=1, epsilon = epsilon, delta = Delta)
 
-    eps, t = nrg.discretize(N=20)
-    nrg_dmrg = nrg.DMRG(nb=nb, D=20)  # this will return an object under DMRG class, nb defines local bosonic dimension, D defines maximum bond dimension, nsweep defines maximum dmrg scan rounds, default dmrg sweep number is 50.
+    eps, t = mol.discretize(N=20)
+    dmrg = mol.DMRG(nb=nb, D=20)  
+    # D defines maximum bond dimension, nsweep defines maximum dmrg scan rounds,\
+    # default dmrg sweep number is 50.
+    
+    dmrg.run() # ground state stored in dmrg.ground_state as a MPS object
 
-    nrg_dmrg.run() # this will perform dmrg scan, and have its ground state stored in nrg_dmrg.ground_state as a MPS object
 
-
-
-    ###### below is example on how to get the rdm and how to use the rdm
+    print(dmrg.ground_state)
+    
+    ######  get the rdm and how to use the rdm
 
     ###### to get 1-rdm, call make_rdm, site idx to be calculated could be assigned, as integer, or as list, rdm will return as dictionary
-    print(nrg_dmrg.make_rdm(idx=0))
-    print(nrg_dmrg.make_rdm(idx=[0,1]))
+    print(dmrg.make_rdm1(idx=0))
+    print(dmrg.make_rdm1(idx=[0,1]))
+    
     # or if you want thm all
-    all_rdms = nrg_dmrg.make_rdm()
+    all_rdms = dmrg.make_rdm1()
+    
     # then extract local rdm, for example spin site
     rho_spin = all_rdms[0]
+    
     # you may get <sigma_z> from rdm on spin site
-    val_sz = np.trace(rho_spin @ Z)
-    print(f"  <sigma_z> = {np.real(val_sz):.8f}")
+    szAve = np.trace(rho_spin @ Z)
+    print(f"  <sigma_z> = {np.real(szAve):.8f}")
 
     # you may get <b^dag b> from rdm on certain bosonic site
     bath_sites = sorted([k for k in all_rdms.keys() if k > 0])
@@ -664,8 +671,8 @@ if __name__=='__main__':
 
 
     ###### to get 2-rdm, call make_rdm2, site idx to be calculated could be assigned, as list of turple
-    print(nrg_dmrg.make_rdm2(idx_pairs=[(0,1)]))
-    print(nrg_dmrg.make_rdm2(idx_pairs=[(0,1),(1,2)]))
+    print(dmrg.make_rdm2(idx_pairs=[(0,1)]))
+    print(dmrg.make_rdm2(idx_pairs=[(0,1),(1,2)]))
 
     ##### Note, here in Spin Boson Model, site 0 and other sites have different local dimension, so assign index carefully 
 
