@@ -7,11 +7,7 @@ Heisenberg model
 
 @author: Shuoyi Hu, Bing Gu (gubing at westlake dot edu dot cn)
 """
-from pyqed.mps.tdmps import TDMPS
-from pyqed.mps.mps import MPO, MPS
-
-# import ultraplot as plt
-
+from pyqed.mps import TDMPS, MPO, MPS
 import numpy as np
 import logging
 
@@ -88,14 +84,15 @@ class Heisenberg:
             factors.append(B)
         return MPS(factors, labels=['lv', 'p', 'rv'])
 
-    def TDDMRG(self):
+    def TDDMRG(self, D=20, **kwargs):
         """
         TDDMRG 
 
         Parameters
         ----------
-        psi0 : TYPE, optional
-            DESCRIPTION. The default is None.
+        D : int, optional
+            the maximum bond dimension for building the short-time propagator. 
+            The default is 20.
         dt : TYPE, optional
             DESCRIPTION. The default is 0.01.
         nt : TYPE, optional
@@ -107,13 +104,10 @@ class Heisenberg:
             DESCRIPTION.
 
         """
-        # if psi0 is None:
-        #     print('Initial state not provided. Using Neel state.')
-        #     psi0 = self.build_neel_state()
         
         if self.H is None: self.build_H_mpo()
         
-        return TDMPS(self.H)
+        return TDMPS(self.H, D=D, **kwargs)
 
     def TEBD(self):
         pass

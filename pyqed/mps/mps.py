@@ -30,6 +30,9 @@ from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian mat
 
 # from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 from pyqed.mps.decompose import decompose, compress
+
+import logging
+
 try:
     from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
@@ -3300,7 +3303,7 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
                 MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr
             )
-            print("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
+            logging.info("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2,i,i+1, Energy, states, trunc))
 
             E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
@@ -3318,7 +3321,7 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
                 MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr
             )
-            print("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
+            logging.info("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2+1, i, i+1, Energy, states, trunc))
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
             E.pop()
