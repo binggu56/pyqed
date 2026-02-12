@@ -36,6 +36,6 @@ mf = mol.RHF().run()
 dmrg = QCDMRG(mf, ncas=4, nelecas=4, D=20) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
 dmrg.build().run()
 
-dm1, dm2 = dmrg.make_rdm1(0)
+# dm1 = dmrg.make_rdm1(0)
 
-print(dm1)
+# print(dm1)

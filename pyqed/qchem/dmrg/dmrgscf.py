@@ -13,6 +13,7 @@ import numpy as np
 
 class DMRGSCF(QCDMRG):
    def __init__(self, mf, ncas, nelecas, D=20, max_cycles=30, **kwargs):
+       
        super().__init__(mf, ncas, nelecas, D, **kwargs)
 
        self.max_cycles = max_cycles # macroiterations
@@ -78,3 +79,5 @@ class DMRGSCF(QCDMRG):
        self.nstates = len(weights)
        self.weights = weights
        return self
+   
+# TODO: requires make_rdm12 from DMRG solver

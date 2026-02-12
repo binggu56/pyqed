@@ -108,6 +108,8 @@ class Heisenberg:
         if self.H is None: self.build_H_mpo()
         
         return TDMPS(self.H, D=D, **kwargs)
+    
+    TDMPS = TDDMRG
 
     def TEBD(self):
         pass
@@ -145,11 +147,11 @@ if __name__ == '__main__':
     neel = mol.build_neel_state()
     
     # ground state 
-    dmrg = mol.DMRG(D=40, init_guess = neel)
-    dmrg.run()
+    # dmrg = mol.DMRG(D=40, init_guess = neel)
+    # dmrg.run()
 
     # real-time evolution
-    td = mol.TDDMRG()
+    td = mol.TDMPS()
     td.run(psi0=neel, dt=0.01, steps=10, e_ops=[mol.H])
     
     # make plots
@@ -159,37 +161,3 @@ if __name__ == '__main__':
 
 
     # dmrg = mol.TEBD(D=40, init_guess=psi0)
-
-    
-    # # Initialize TDMPS Solver
-    # # solver = TDMPS(psi0, H_mpo, dt, bond_dim=bond_dim, order=4)
-    
-    
-    # # Plot if you wish
-    # times = results['time']
-    # energy = np.real(results['obs'][0])
-    # norms = results['norm_check']
-    
-    # print("\nSimulation Complete.")
-    # print(f"Final Energy: {energy[-1]:.6f}")
-    # print(f"Energy Conservation Error: {np.max(np.abs(energy - energy[0])):.2e}")
-    
-    # import matplotlib.pyplot as plt
-    # plt.figure(figsize=(10, 5))
-    
-    # plt.subplot(1, 2, 1)
-    # plt.plot(times, energy, 'b.-')
-    # plt.title('Total Energy <H>(t)')
-    # plt.xlabel('Time')
-    # plt.ylabel('Energy')
-    # plt.grid(True)
-    
-    # plt.subplot(1, 2, 2)
-    # plt.plot(times, norms, 'r--')
-    # plt.title('Norm <psi|psi>')
-    # plt.xlabel('Time')
-    # plt.ylim(0.99, 1.01)
-    # plt.grid(True)
-    
-    # plt.tight_layout()
-    # plt.show()
