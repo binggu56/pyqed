@@ -1,0 +1,8 @@
+expected output:
+1D: E=(n+0.5)
+2D: E=(nx+ny+1)
+3D: E=(nx+ny+nz+1.5)
+ni = 0,1,2,..
+
+RUN via bash:
+> ./run.sh

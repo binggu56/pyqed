@@ -1,0 +1,7 @@
+12800          # number of trajectories
+4            # number of DOF 
+4000,0.001d0         # time steps
+2d0          # initial guassian width
+1d0 		# particle mass 
+8d0          # friction coeff
+2.5d0        # interparticle distance 

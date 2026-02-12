@@ -1,0 +1,3 @@
+10,4d0         # time steps
+0.75d0          # initial guassian width
+12d0          # friction coeff
