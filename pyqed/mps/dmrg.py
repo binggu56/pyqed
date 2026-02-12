@@ -105,7 +105,7 @@ class DMRG:
 
         elif self.opt == '2site':
 
-            self.e_tot, ground_state, self.gauge, self.converged = two_site_dmrg(
+            self.e_tot, ground_state, gauge, self.converged = two_site_dmrg(
                 mps_list, mpo_list, self.D, self.nsweeps, \
                     U1=self.U1, target_qn=self.charge, not_conv_err=self.not_conv_err, sym_mgr=None)
 
@@ -117,15 +117,19 @@ class DMRG:
                 labels = ['lv', 'p', 'rv']
             
             # self.ground_state = self.mps = MPS(ground_state, labels=labels, gauge=gauge)
-
-            if self.gauge.lower() == "left":
+            
+            gauge = gauge.lower()
+            if gauge == "left":
 
                 self.ground_state = MPS(ground_state, labels=labels,\
                                         center=len(ground_state)-1)
-                    
-                self.ground_state.left_canonicalize()
+                
+                # TODO:THIS IS REDUNDENT, but retained here for computing Ss 
+                # which is needed in make_rdm1()
+                
+                self.ground_state.left_canonicalize() 
 
-            elif self.gauge.lower() == "right":
+            elif gauge == "right":
 
                 self.ground_state = MPS(ground_state, labels=labels,
                                         center=0)
