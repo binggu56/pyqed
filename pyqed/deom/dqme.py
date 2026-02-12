@@ -7,7 +7,7 @@ Created on Wed Jun 25 17:53:53 2025
 
 dissipaton quantum master equation
 
-# mailto: wy2010@ustc dot edu dot cn
+mailto: wy2010@ustc dot edu dot cn
 """
 
 
@@ -161,7 +161,7 @@ def rem(rho):
 
 dt = 0.02
 ti = 0
-tf = 2
+tf = 1
 N = int((tf - ti) / dt)
 dt2 = dt / 2
 dt6 = dt / 6
@@ -218,7 +218,7 @@ magic_str = '{}-{}'.format(beta1, npsd1)
 # t1 = data1[:, 0]
 # data1 = np.reshape(data1[:, 1:], (len(t1), 4, 4, 2))
 # rhot1 = data1[:, :, :, 0] + 1j * data1[:, :, :, 1]
-import ultraplot as plt
+import matplotlib.pyplot as plt
 
 plt.plot(tdqme, outdqme.real,'b-')
 #plt.plot(t, rhos.imag,'r-')

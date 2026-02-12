@@ -191,7 +191,7 @@ if __name__ == "__main__":
     t0 = time.time()
     # run dmrg!
     print(f"  Starting Sweeps (D={BOND_DIM})...")
-    solver = DMRG(mpo_dmrg, D=BOND_DIM, nsweeps=N_SWEEPS, init_guess=mps_guess)
+    solver = DMRG(mpo_dmrg, D=BOND_DIM, init_guess=mps_guess)
     solver.run()
 
     # 6. Report result

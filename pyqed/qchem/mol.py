@@ -32,7 +32,6 @@ from pyqed import dag, au2angstrom
 from pyqed.qchem.hf import RHF, UHF
 
 from periodictable import elements
-from pyscf import dft, scf, gto, ao2mo
 
 
 # import scipy.linalg as linalg
@@ -940,10 +939,10 @@ class Molecule:
     def build(self, driver='gbasis'):
         """
         build molecular integrals
-        
-        Parameters 
+
+        Parameters
         ----------
-        driver : str 
+        driver : str
             external driver for AO integrals. Supported are 'gbasis' and 'pyscf'.
 
         Returns
@@ -952,20 +951,23 @@ class Molecule:
 
         """
         driver = driver.lower()
-        
-        if driver is None: 
-            pass 
+
+        if driver is None:
+            pass # our own AO integrals, VERY SLOW
         elif driver == 'gbasis':
             build(self)
-            
+
+        elif driver == 'gbasis-pyscf':
+            build(self, pyscf=True)
+
         elif driver == 'pyscf':
-            # extract AO integrals from PySCF 
-            
+            # extract AO integrals from PySCF
+
             mol = self.topyscf()
             mol.build()
-            
+
             self.nao = mol.nao
-            
+
             kin = mol.intor('int1e_kin')
             vnuc = mol.intor('int1e_nuc')
             self.hcore =  kin + vnuc
@@ -1593,6 +1595,8 @@ def eckart(reference, changed, mass, option=None):
 
 
 def scan_pes(method='dft'):
+    from pyscf import dft, scf, gto, ao2mo
+
     x = np.arange(0.7, 4.01, .1)
 
     mol = gto.Mole()
@@ -1762,12 +1766,25 @@ def find_homo_lumo(mf):
     return homo, homo_idx, lumo, lumo_idx
 
 
-def view_mo():
+def view_mo(fname):
+    """
+    cube file
+
+    Parameters
+    ----------
+    fname : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
 
     import py3Dmol
 
     data = None
-    with open("ibo_homo.cube", "r") as infile:
+    with open(fname, "r") as infile:
         data = infile.read()
 
     view = py3Dmol.view()
@@ -1807,7 +1824,7 @@ if __name__ == '__main__':
     # np.set_printoptions(suppress=True)
 
     # import proplot as plt
-
+    from timeit import time
 
     # mol = gto.Mole()
     # mol.verbose = 3
@@ -1827,11 +1844,15 @@ if __name__ == '__main__':
 
 
 
+    start = time.time()
 
-    mol.basis = '631g'
+    mol.basis = '6311g'
     mol.build(driver='pyscf')
 
+    print("time building AO integrals = ", time.time()-start)
     mol.RHF().run()
+
+
 
     # print(mol.atom_symbols())
     # print(mol.atom_mass_list())
