@@ -2,50 +2,6 @@ import numpy as np
 from pyqed.mps.mps import MPS, MPO, expmpo, apply_mpo, expect_mps
 import logging
 
-# def propagate(w_list, psi_mps):
-#     """
-#     one step for psi = U @ psi done in tensor
-#     Contracts MPO (U) with MPS (psi)
-
-#     Args:
-#         w_list: List of MPO tensors. shape: (Left, Right, Phys_Out, Phys_In) TODO: also add index label for MPO
-#         psi_mps: MPS object (handles its own internal layout).
-
-#     Returns:
-#         list: New tensors in standard (Left, Phys, Right) layout.
-#     """
-#     L = psi_mps.L
-#     if L != len(w_list):
-#         raise ValueError(f"MPO length ({len(w_list)}) and MPS length ({L}) mismatch.")
-
-#     psi_new = []
-
-#     for i in range(L):
-#         W = w_list[i] # Shape: (wL, wR, pOut, pIn)
-#         B = psi_mps._get_std_B(i) # MPS to (Left, Phys, Right)
-
-#         # psi = U @ psi
-#         # B: (bL, pIn, bR)
-#         # W: (wL, wR, pOut, pIn)
-#         # Contract B[Phys] (axis 1) with W[PhysIn] (axis 3)
-#         T = np.tensordot(B, W, axes=(1, 3))
-
-#         # Result T: (bL, bR, wL, wR, pOut)
-#         # rearrange to: (NewLeft, NewPhys, NewRight)
-#         # NewLeft  = (bL, wL) -> Indices (0, 2)
-#         # NewPhys  = (pOut)   -> Index   (4)
-#         # NewRight = (bR, wR) -> Indices (1, 3)
-#         # Transpose: (0, 2, 4, 1, 3)
-#         T = T.transpose(0, 2, 4, 1, 3)
-
-#         # Fuse Bonds
-#         s = T.shape
-#         dim_L = s[0] * s[1]
-#         dim_P = s[2]
-#         dim_R = s[3] * s[4]
-#         T_flat = T.reshape(dim_L, dim_P, dim_R)
-#         psi_new.append(T_flat)
-#     return MPS(psi_new)
 
 class TDMPS:
     def __init__(self, H_mpo, D=40):
@@ -178,82 +134,19 @@ class TDMPS:
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    from pyqed.models.heisenberg import Heisenberg
 
-
-    # below is an example using TDMPS with heisenberg chain
-    # helpers here are just dense MPS and MPO builderr
-    def build_heisenberg_mpo(N):
-        """
-        Constructs the Heisenberg Hamiltonian MPO for N sites.
-        """
-        # d = 2
-        I = np.identity(2)
-        Z = np.zeros((2, 2))
-        Sz = np.array([[0.5, 0], [0, -0.5]])
-        Sp = np.array([[0, 0], [1, 0]])
-        Sm = np.array([[0, 1], [0, 0]])
-
-        # Define the bulk MPO tensor W (5x5 matrix of operators)
-        # Rows/Cols: I, Sz, Sp, Sm, Hamiltonian-accumulator
-        W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm, Z],
-                    [Z, Z,  Z,      Z,      Sz],
-                    [Z, Z,  Z,      Z,      Sm],
-                    [Z, Z,  Z,      Z,      Sp],
-                    [Z, Z,  Z,      Z,      I]])
-
-        # Boundary vectors
-        Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm, Z]]) # 1x5
-        Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])  # 5x1
-
-        # Construct full list
-        H_factors = [Wfirst] + ([W] * (N - 2)) + [Wlast]
-        return MPO(H_factors)
-
-    def build_neel_state(N):
-        """
-        Builds a Neel state |up down up down ...>
-        Layout: (Left, Phys, Right) -> labels=['lv', 'p', 'rv']
-        """
-        factors = []
-        for i in range(N):
-            # MPS Shape (L,P,R)
-            B = np.zeros((1, 2, 1))
-            if i % 2 == 0:
-                B[0, 0, 0] = 1.0 # Up
-            else:
-                B[0, 1, 0] = 1.0 # Down
-            factors.append(B)
-        return MPS(factors, labels=['lv', 'p', 'rv'])
-
-    def build_ferom_state(N):
-        """
-        Builds a ferromagnetic state |up up up up ...>
-        Layout: (Left, Phys, Right) -> labels=['lv', 'p', 'rv']
-        """
-        factors = []
-        for i in range(N):
-            # Shape (Left=1, Phys=2, Right=1)
-            B = np.zeros((1, 2, 1))
-            B[0, 0, 0] = 1.0 # Up
-            factors.append(B)
-        return MPS(factors, labels=['lv', 'p', 'rv'])
-
-    N = 10
-    dt = 0.01 - 0.0j
-    # dt = -0.1j
+    mol = Heisenberg(L=10)
+    H = mol.build_H_mpo()
+    neel = mol.build_neel_state()
+    
+    dt = 0.01 
     steps = 10
-    bond_dim = 50
-
-    print(f"Initializing Heisenberg Chain (N={N})...")
-    H_mpo = build_heisenberg_mpo(N)
-    psi0 = build_neel_state(N)
-    # psi0 = build_ferom_state(N)
 
     # Initialize TDMPS Solver
-    solver = TDMPS(psi0, H_mpo, dt)
-
-    # Run Evolution
-    results = solver.run(steps, e_ops=[H_mpo])
+    td = TDMPS(H, D=40)
+    td.run(neel, dt, steps, e_ops=[H])
+    
 
     # # Plot if you wish
     # times = results['time']
@@ -263,22 +156,3 @@ if __name__ == "__main__":
     # print("\nSimulation Complete.")
     # print(f"Final Energy: {energy[-1]:.6f}")
     # print(f"Energy Conservation Error: {np.max(np.abs(energy - energy[0])):.2e}")
-
-    # plt.figure(figsize=(10, 5))
-
-    # plt.subplot(1, 2, 1)
-    # plt.plot(times, energy, 'b.-')
-    # plt.title('Total Energy <H>(t)')
-    # plt.xlabel('Time')
-    # plt.ylabel('Energy')
-    # plt.grid(True)
-
-    # plt.subplot(1, 2, 2)
-    # plt.plot(times, norms, 'r--')
-    # plt.title('Norm <psi|psi>')
-    # plt.xlabel('Time')
-    # plt.ylim(0.99, 1.01)
-    # plt.grid(True)
-
-    # plt.tight_layout()
-    # plt.show()

@@ -7,7 +7,7 @@ Created on Wed Feb 11 17:15:58 2026
 """
 
 from pyqed.mps import MPS, MPO, fDMRG_1site_GS_OBC, two_site_dmrg, dense_to_symmetric,\
-    expect
+    expect_mps
 import numpy as np
 
 try:
@@ -146,7 +146,7 @@ class DMRG:
 
         psi = self.ground_state
 
-        return [expect(psi, e_op) for e_op in e_ops]
+        return [expect_mps(psi, e_op) for e_op in e_ops]
 
     def make_rdm1(self, idx=None):
         """
@@ -170,49 +170,14 @@ class DMRG:
         return self.ground_state.calc_2site_rdm(idx_pairs)
 
 if __name__ == '__main__':
-    ##
-    ## Parameters for the DMRG simulation for spin-1/2 chain
-    ## To apply to fermions, we only need to change the MPO if H
-    ##
 
-    d=2   # local bond dimension, 0=up, 1=down
-    N=10 # number of sites
+    from pyqed.models.heisenberg import Heisenberg
 
-    ## initial state |+-+-+-+-+->
-    InitialA1 = np.zeros((1, d, 1))
-    InitialA1[0, 0, 0] = 1  # Up state
-    InitialA2 = np.zeros((1, d, 1))
-    InitialA2[0, 1, 0] = 1  # Down state
-
-    initial_mps = [InitialA1, InitialA2] * int(N/2)
-
-    ## Local operators
-    I = np.identity(2)
-    Z = np.zeros((2,2))
-    Sz = np.array([[0.5,  0  ],
-                 [0  , -0.5]])
-    Sp = np.array([[0, 0],
-                 [1, 0]])
-    Sm = np.array([[0, 1],
-                 [0, 0]])
-
-    ## Hamiltonian MPO
-    W = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z],
-                  [Z,  Z,      Z,      Z,  Sz],
-                  [Z,  Z,      Z,      Z,  Sm],
-                  [Z,  Z,      Z,      Z,  Sp],
-                  [Z,  Z,      Z,      Z,   I]])
-
-    # left-hand edge is 1x5 matrix
-    Wfirst = np.array([[I, Sz, 0.5*Sp, 0.5*Sm,   Z]])
-
-    # right-hand edge is 5x1 matrix
-    Wlast = np.array([[Z], [Sz], [Sm], [Sp], [I]])
-
-    # the complete MPO
-    H = [Wfirst] + ([W] * (N-2)) + [Wlast]
-
-    dmrg = DMRG(H, D=10, nsweeps=8)
-    # dmrg.init_guess = initial_mps
-    dmrg.init_guess = MPS(initial_mps, labels=['lv', 'p', 'rv'])
+    mol = Heisenberg(L=10)
+    H = mol.build_H_mpo()
+    neel = mol.build_neel_state()
+    
+    dmrg = DMRG(H, D=20, nsweeps=8)
+    dmrg.init_guess = neel
     dmrg.run()
+    

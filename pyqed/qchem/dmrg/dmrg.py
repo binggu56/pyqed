@@ -775,7 +775,7 @@ class QCDMRG(CASCI):
         t0 = time.time()
         print(f"  Starting Sweeps (D={self.D})...")
         dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, 
-                    U1=use_symmetry, target_qn=target_qn, not_conv_err=False,sym_mgr = self.sym_mgr)
+                    symmetry=use_symmetry, charge=target_qn, not_conv_err=False)
         dmrg.run()
         self.dmrg = dmrg
         # Report
