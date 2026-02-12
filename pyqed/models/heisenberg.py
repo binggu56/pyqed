@@ -119,6 +119,22 @@ class Heisenberg:
         pass
 
     def DMRG(self, D=None, **kwargs):
+        """
+        
+
+        Parameters
+        ----------
+        D : TYPE, optional
+            DESCRIPTION. The default is None.
+        **kwargs : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        """
         from pyqed.mps import DMRG
 
         if self.H is None:
@@ -146,6 +162,7 @@ if __name__ == '__main__':
     import ultraplot as plt 
     fig, ax = plt.subplots()
     ax.plot(td.times, td.observables[:,0])
+
 
 
     # dmrg = mol.TEBD(D=40, init_guess=psi0)
