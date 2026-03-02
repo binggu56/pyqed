@@ -88,6 +88,7 @@ class CASSCF(CASCI):
         self.mo_coeff = C
         self.e_tot = mc.e_tot
         self.ci = mc.ci
+        self.binary = mc.binary 
 
         return self
 

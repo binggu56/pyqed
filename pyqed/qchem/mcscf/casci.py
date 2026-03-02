@@ -647,7 +647,7 @@ class CASCI:
 
         if self.spin_purification:
 
-            logging.info('Purify spin by energy penalty')
+            # logging.info('Purify spin by energy penalty')
 
             # if self.shift is not None:
             # H1, H2 = self.fix_spin(H1, H2, ss=ss, shift=shift)
