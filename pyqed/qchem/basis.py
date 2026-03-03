@@ -369,6 +369,7 @@ ALIAS = {
     '6311g**'    : "6-311g_st__st_.0.gbs",
     '6311g'      : "6-311g.0.gbs",
     '631g++'     : "/6-31g++.gbs",
+    '631g*'      : "6-31g_st_.0.gbs",
     'ccpvdz'     : 'cc-pvdz.0.gbs'    ,
     'ccpvtz'     : 'cc-pvtz.dat'    ,
     'ccpvqz'     : 'cc-pvqz.dat'    ,

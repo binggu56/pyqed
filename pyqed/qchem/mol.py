@@ -1846,7 +1846,7 @@ if __name__ == '__main__':
 
     start = time.time()
 
-    mol.basis = '6311g'
+    mol.basis = '631g*'
     mol.build(driver='pyscf')
 
     print("time building AO integrals = ", time.time()-start)
