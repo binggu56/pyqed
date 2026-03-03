@@ -863,8 +863,22 @@ class QCDMRG(CASCI):
 
     def make_rdm1(self):
         """
-        Calculate the global 1-site reduced density matrix of the active space.
-        Returns a (2*Ncas, 2*Ncas) spin-orbital density matrix.
+        Calculate the global 1-particle reduced density matrix (1-RDM) of the active space.
+
+        The elements are defined in the spin-orbital basis as:
+        :math:`\gamma_{ij} = \langle \Psi | c_i^\dagger c_j | \Psi \rangle`
+        where `i` and `j` range over all `2 * N_{cas}` spin-orbitals.
+
+        Returns
+        -------
+        numpy.ndarray
+            A dense complex array of shape `(2*ncas, 2*ncas)` representing the global 
+            spin-orbital 1-RDM.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
@@ -872,8 +886,30 @@ class QCDMRG(CASCI):
 
     def make_rdm2(self, idx_pairs=None):
         """
-        Calculate the global 2-site reduced density matrix of the active space.
-        Returns a (2*Ncas, 2*Ncas, 2*Ncas, 2*Ncas) spin-orbital tensor.
+        Calculate the global 2-particle reduced density matrix (2-RDM) of the active space.
+
+        The elements are defined in the spin-orbital basis as:
+        :math:`\Gamma_{pqrs} = \langle \Psi | c_p^\dagger c_r^\dagger c_s c_q | \Psi \rangle`
+        where `p, q, r, s` range over all `2 * N_{cas}` spin-orbitals. 
+        Note that this scales as :math:`\mathcal{O}(L^4)`.
+
+        Parameters
+        ----------
+        idx_pairs : list of tuple of int, optional
+            A placeholder parameter to maintain API compatibility with the underlying 
+            MPS methods. Currently ignored, as the function computes the full global tensor. 
+            By default None.
+
+        Returns
+        -------
+        numpy.ndarray
+            A dense complex array of shape `(2*ncas, 2*ncas, 2*ncas, 2*ncas)` representing 
+            the complete spin-orbital 2-RDM.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
@@ -882,7 +918,28 @@ class QCDMRG(CASCI):
     def make_local_site_rdm(self, idx=None):
         """
         Calculate the local reduced density matrices for individual, isolated spin-orbitals.
-        Returns a dictionary mapping site index to its (d, d) density matrix.
+
+        This method traces out the rest of the chain to isolate the internal 
+        quantum state of specific sites.
+
+        Parameters
+        ----------
+        idx : int or list of int, optional
+            The specific site index (or indices) to evaluate. If None, evaluates 
+            the local density matrices for all sites in the active space. 
+            By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping the requested site indices (int) to their corresponding 
+            local density matrices (numpy.ndarray). For spin-orbitals with a physical 
+            dimension `d`, the returned matrix shape is `(d, d)`.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
@@ -891,7 +948,29 @@ class QCDMRG(CASCI):
     def make_diagonal_rdm2(self, idx_pairs=None):
         """
         Calculate the diagonal blocks of the 2-site reduced density matrix.
-        Returns a dictionary mapping (i, j) tuples to dense matrices.
+
+        Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute 
+        density-density correlations (e.g., :math:`\langle n_i n_j \rangle`) without 
+        evaluating the full :math:`\mathcal{O}(L^4)` global 2-RDM tensor.
+
+        Parameters
+        ----------
+        idx_pairs : list of tuple of int, optional
+            A list of site index pairs `(i, j)` to calculate the 2-site RDM for. 
+            If None, computes RDMs for all possible unique pairs in the active space. 
+            By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping each requested `(i, j)` tuple to its corresponding 
+            dense reduced density matrix (numpy.ndarray). If the physical dimension 
+            of a single site is `d`, the returned matrix shape is `(d*d, d*d)`.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
