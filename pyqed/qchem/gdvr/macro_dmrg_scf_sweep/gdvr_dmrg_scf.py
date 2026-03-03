@@ -100,7 +100,7 @@ class DMRGNewtonHelper(SweepNewtonHelper):
 #     Extracts P (1-RDM) and D (Diagonal 2-RDM) for the helper.
 #     """
 #     rdm1_dict = solver.make_rdm()
-#     rdm2_dict = solver.make_rdm2()
+#     rdm2_dict = solver.make_diagonal_rdm2()
     
 #     # --- 1-RDM (P) ---
 #     n_spin = 2 * n_spatial
@@ -148,13 +148,12 @@ import numpy as np
 def extract_rdms_for_helper(solver, n_spatial, verbose=False):
     """
     Build spatial 1-RDM P[p,q] and a 'diagonal 2-RDM' D[p,q] needed by your AO Newton helper,
-    from solver.make_rdm() (1-site RDMs) and solver.make_rdm2() (2-site RDMs).
+    from solver.make_local_site_rdm() (1-site RDMs) and solver.make_diagonal_rdm2() (2-site RDMs).
 
     Key fix for U(1): infer and correct the 2-site basis ordering before reading <c†_i c_j>.
     """
-
-    rdm1_dict = solver.make_rdm()
-    rdm2_dict = solver.make_rdm2()
+    rdm1_dict = solver.make_local_site_rdm()
+    rdm2_dict = solver.make_diagonal_rdm2()
 
     n_spin = 2 * n_spatial
 

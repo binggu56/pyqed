@@ -23,7 +23,8 @@ class DMRG:
     ground state finite DMRG in MPO/MPS framework
     """
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
-                 symmetry=None, charge=None, not_conv_err=True):
+                symmetry=False, charge=None, spin = None,\
+                target_qn = None, sym_mgr = None, not_conv_err=True):
         """
 
 
@@ -55,7 +56,20 @@ class DMRG:
         self.e_tot = None
         self.U1 = self.symmetry = symmetry
 
-        self.target_qn = self.charge = charge
+        if target_qn is not None and (sym_mgr is None):
+            raise ValueError("Symmetry manager must be provided when target quantum number is specified as QN object.")
+        elif target_qn is None and sym_mgr is not None:
+            raise ValueError("Target quantum number must be specified when sym_mgr is given. If you are restricting symmetry by charge and spin, don't need to input sym_mgr to avoid conflict.")
+        elif (charge is not None) and (spin is not None):
+            sym_mgr = SymmetryManager(['charge', 'sz'])
+            self.target_qn = sym_mgr.get_target_qn(charge, 2*spin)
+        elif (charge is not None) and (spin is None):
+            sym_mgr = SymmetryManager(['charge'])
+            self.target_qn = sym_mgr.get_target_qn(charge)
+        elif (charge is None) and (spin is not None):
+            sym_mgr = SymmetryManager(['sz'])
+            self.target_qn = sym_mgr.get_target_qn(2*spin)
+        self.charge = charge
 
         self.ground_state = None
         self.mps = None # to hold eigenstates
@@ -64,7 +78,8 @@ class DMRG:
 
         self.not_conv_err = not_conv_err
         self.converged = False
-        # self.sym_mgr = sym_mgr
+        self.target_qn = target_qn
+        self.sym_mgr = sym_mgr
 
     def run(self):
 
@@ -92,12 +107,12 @@ class DMRG:
 
                 mps_list = dense_to_symmetric(mps_list, phys_qns=None)
 
-            if self.charge is not None:
+            if self.target_qn is not None:
 
                 qs = sorted({key[1] for key in mps_list[-1].data.keys()})
                 if len(qs) != 1:
                     raise ValueError(f"Ambiguous total charge: {qs}.")
-                self.charge = qs[0]
+                self.target_qn = qs[0]
 
         if self.opt == '1site':
 
@@ -107,7 +122,7 @@ class DMRG:
 
             self.e_tot, ground_state, self.gauge, self.converged = two_site_dmrg(
                 mps_list, mpo_list, self.D, self.nsweeps, \
-                    U1=self.U1, target_qn=self.charge, not_conv_err=self.not_conv_err, sym_mgr=None)
+                    U1=self.U1, target_qn=self.target_qn, not_conv_err=self.not_conv_err, sym_mgr=self.sym_mgr)
 
             if self.U1:
                 # U1 engine returns [Left, Right, Phys]
@@ -156,26 +171,95 @@ class DMRG:
 
         return [expect_mps(psi, e_op) for e_op in e_ops]
 
-    def make_rdm1(self, idx=None):
+    def make_rdm1(self):
         """
-        Calculate 1-site reduced density matrix of the ground state.
-        Wrapper for MPS.calc_1site_rdm
-        \gamma_{ij} = < 0| c_j^\dagger c_i | 0 >
-        """
-        if self.ground_state is None:
-            raise ValueError("Run DMRG first to generate a ground state.")
+        Calculate the global 1-site reduced density matrix of the optimized ground state.
+        
+        Wrapper for `MPS.make_rdm1`. Computes the matrix $\\gamma_{ij} = \\langle 0 | c_i^\\dagger c_j | 0 \\rangle$.
 
-        return self.ground_state.calc_1site_rdm(idx)
+        Parameters
+        ----------
+        idx : optional
+            Placeholder parameter to maintain API compatibility. Currently ignored as 
+            the function computes the full `(L, L)` global matrix. By default None.
+
+        Returns
+        -------
+        np.ndarray
+            A dense complex numpy array of shape `(L, L)` representing the global 1-RDM.
+        """
+        # if self.ground_state is None:
+        #     raise ValueError("Run DMRG first to generate a ground state.")
+            
+        return self.ground_state.make_rdm1(sym_mgr=self.sym_mgr)
+
+    def make_local_site_rdm(self, idx=None):
+        """
+        Calculate the local reduced density matrices for individual, isolated sites.
+        
+        Wrapper for `MPS.calc_local_site_rdms`. Traces out the rest of the chain 
+        to isolate the internal $d \\times d$ quantum state of specific sites.
+
+        Parameters
+        ----------
+        idx : int or list of int, optional
+            The specific site index (or indices) to evaluate. If None, evaluates 
+            the local density matrices for all sites in the chain. By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping the requested site indices to their corresponding 
+            $d \\times d$ local density matrices (as numpy arrays).
+        """
+        return self.ground_state.calc_local_site_rdms(idx=idx)
 
     def make_rdm2(self, idx_pairs=None):
         """
-        Calculate 2-site reduced density matrix of the ground state.
-        Wrapper for MPS.calc_2site_rdm
-        """
-        if self.ground_state is None:
-            raise ValueError("Run DMRG first to generate a ground state.")
+        Calculate the full global 2-site reduced density matrix of the ground state.
+        
+        Wrapper for `MPS.make_rdm2`. Computes the complete $\\mathcal{O}(L^4)$ tensor 
+        $\\Gamma_{pqrs} = \\langle c_p^\\dagger c_r^\\dagger c_s c_q \\rangle$.
 
-        return self.ground_state.calc_2site_rdm(idx_pairs)
+        Parameters
+        ----------
+        idx_pairs : optional
+            Placeholder parameter to maintain API compatibility. Currently ignored as 
+            the function computes the full `(L, L, L, L)` global tensor. By default None.
+
+        Returns
+        -------
+        np.ndarray
+            A dense complex numpy array of shape `(L, L, L, L)`.
+        """
+        # if self.ground_state is None:
+        #     raise ValueError("Run DMRG first to generate a ground state.")
+            
+        return self.ground_state.make_rdm2(sym_mgr=self.sym_mgr)
+
+    def make_diagonal_rdm2(self, idx_pairs=None):
+        """
+        Calculate the diagonal blocks of the 2-site reduced density matrix.
+        
+        Wrapper for `MPS.make_diagonal_rdm2`. Extracts the two-site quantum state $\\rho_{ij}$ needed to compute density-density correlations like $\\langle n_i n_j \\rangle$ without evaluating the full $\\mathcal{O}(L^4)$ tensor.
+
+        Parameters
+        ----------
+        idx_pairs : list of tuple of int, optional
+            A list of site index pairs `(i, j)` to calculate the 2-site RDM for. 
+            If None, computes RDMs for all possible unique pairs. By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping each requested `(i, j)` tuple to its corresponding 
+            dense reduced density matrix numpy array.
+        """
+        # if self.ground_state is None:
+        #     raise ValueError("Run DMRG first to generate a ground state.")
+            
+        return self.ground_state.make_diagonal_rdm2(idx_pairs=idx_pairs)
+
 
 if __name__ == '__main__':
 

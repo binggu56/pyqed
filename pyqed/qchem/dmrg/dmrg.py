@@ -772,10 +772,10 @@ class QCDMRG(CASCI):
             mps0 = self.get_initial_guess_dense(noise=1e-3)
             target_qn = None
             use_symmetry = False
+            self.sym_mgr = None
         t0 = time.time()
         print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, 
-                    symmetry=use_symmetry, charge=target_qn, not_conv_err=False)
+        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False)
         dmrg.run()
         self.dmrg = dmrg
         # Report
@@ -785,13 +785,13 @@ class QCDMRG(CASCI):
         print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
         print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry:
-            self.check_u1_symmetry()
+            self.check_abelian_symmetry()
         return dmrg
 
     def dump(self):
         pass
 
-    def check_u1_symmetry(self):
+    def check_abelian_symmetry(self):
         """
         Post-run analysis: Checks conservation of all active symmetries 
         (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
@@ -802,9 +802,9 @@ class QCDMRG(CASCI):
         print("\n" + "="*60)
         print("  Symmetry Conservation Check")
         print("="*60)
-        # Calculate 1-site RDMs for all sites, returns a dict {site_idx: rho_dense (d,d)}
+        # Calculate local site RDMs, returns a dict {site_idx: rho_dense (d,d)}
         try:
-            rdms = self.dmrg.ground_state.calc_1site_rdm()
+            rdms = self.dmrg.ground_state.calc_local_site_rdms()
         except Exception as e:
             print(f"  [Error] Failed to calculate RDM: {e}")
             return
@@ -890,8 +890,8 @@ if __name__=='__main__':
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=12, nelecas=6, D=60) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
-    dmrg.build().run(symmetry_list=['charge','s_z'], initial_guess='cid')
+    dmrg = QCDMRG(mf, ncas=10, nelecas=6, D=40) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg.build().run(symmetry_list=['charge','sz'], initial_guess='cid')
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
     # mc.run()
