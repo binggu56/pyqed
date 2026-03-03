@@ -1710,6 +1710,8 @@ class MPS:
         if SYMMETRY_AVAILABLE and isinstance(mps1.Bs[0], BlockTensor):
             mps1_std = mps1.to_order(['lv', 'rv', 'p'])
             mps2_std = mps2.to_order(['lv', 'rv', 'p'])
+            if len(mps1_std.Bs[0].data) == 0 or len(mps2_std.Bs[0].data) == 0:
+                return 0.0j
             # E[q_bra_bond, q_ket_bond] = Matrix(dim_bra x dim_ket)
             # Detect Vacuum QN from the first block
             first_key = next(iter(mps1_std.Bs[0].data.keys()))

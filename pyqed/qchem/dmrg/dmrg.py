@@ -861,6 +861,41 @@ class QCDMRG(CASCI):
                 label = f"Unknown ({sym_type})"
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
+    def make_rdm1(self):
+        """
+        Calculate the global 1-site reduced density matrix of the active space.
+        Returns a (2*Ncas, 2*Ncas) spin-orbital density matrix.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_rdm1()
+
+    def make_rdm2(self, idx_pairs=None):
+        """
+        Calculate the global 2-site reduced density matrix of the active space.
+        Returns a (2*Ncas, 2*Ncas, 2*Ncas, 2*Ncas) spin-orbital tensor.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_rdm2(idx_pairs=idx_pairs)
+
+    def make_local_site_rdm(self, idx=None):
+        """
+        Calculate the local reduced density matrices for individual, isolated spin-orbitals.
+        Returns a dictionary mapping site index to its (d, d) density matrix.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_local_site_rdm(idx=idx)
+
+    def make_diagonal_rdm2(self, idx_pairs=None):
+        """
+        Calculate the diagonal blocks of the 2-site reduced density matrix.
+        Returns a dictionary mapping (i, j) tuples to dense matrices.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
 
 class DMRGSCF(QCDMRG):
