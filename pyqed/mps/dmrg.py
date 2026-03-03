@@ -79,8 +79,8 @@ class DMRG:
 
         self.not_conv_err = not_conv_err
         self.converged = False
-        self.target_qn = target_qn  # This now properly catches the generated target_qn!
-        self.sym_mgr = sym_mgr      # This correctly catches the generated sym_mgr!
+        self.target_qn = target_qn 
+        self.sym_mgr = sym_mgr
 
     def run(self):
 
