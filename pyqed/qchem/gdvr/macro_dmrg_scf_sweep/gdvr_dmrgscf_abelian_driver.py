@@ -497,7 +497,7 @@ def calculate_overlap_with_hf_robust(mps_tensors, C_mo_spatial, occupied_indices
     # 1. Safely convert BlockTensors and force them into [Left, Phys, Right]
     curr_mps = []
     for t in mps_tensors:
-        if hasattr(t, 'data'):
+        if hasattr(t, 'qns'):
             dense_t = _bt_to_dense(t) # Output from helper is [Left, Right, Phys]
             curr_mps.append(dense_t.transpose(0, 2, 1)) # Transpose to [Left, Phys, Right]
         else:
@@ -983,7 +983,7 @@ if __name__ == "__main__":
     
     E, S = run_gdvr_dmrg_loop(
         mol, Lz=6.0, Nz=32, basis_cfg=basis_cfg,
-        pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
+        pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=20, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
         U1=True, checkpoint_dir=checkpoint_path
     )
     

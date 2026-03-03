@@ -489,7 +489,7 @@ class MPS:
             try:
                 self.dim = Bs[0].shape[1]
             except TypeError:
-                if hasattr(Bs[0], 'data'):
+                if hasattr(Bs[0], 'qns'):
                     # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
                     phys_dims = {}
                     for key, block in Bs[0].data.items():
@@ -507,7 +507,7 @@ class MPS:
                 try:
                     self.dims.append(B.shape[1])
                 except TypeError:
-                    if hasattr(B, 'data'):
+                    if hasattr(B, 'qns'):
                         phys_dims = {}
                         for key, block in B.data.items():
                             q_p = key[2]
@@ -642,7 +642,7 @@ class MPS:
         """
         B = self.Bs[i]
         # Check if it has data AND that data is a dict (BlockTensor structure)
-        if hasattr(B, 'data') and isinstance(B.data, dict):
+        if hasattr(B, 'qns') and isinstance(B.data, dict):
             return B
         return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
@@ -1074,104 +1074,10 @@ class MPS:
         if self.L == 0:
             return {}
 
-        # U(1) BlockTensor way of 1-rdm calculation
-        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
-
-            def _make_id_mpo_from_phys_qns(phys_qns):
-                # Deduce the correct "Zero" type from physics
-                sample_qn = phys_qns[0]
-                # Multiply by 0 to get QN(0,0) or 0 depending on type
-                zero_qn = sample_qn * 0 
-                
-                from collections import defaultdict
-                idxs_by_q = defaultdict(list)
-                for k, q in enumerate(list(phys_qns)):
-                    idxs_by_q[q].append(k)
-
-                data = {}
-                for q, ks in idxs_by_q.items():
-                    d = len(ks)
-                    # Use zero_qn for bond indices (L, R)
-                    # Shape: (BondL=1, BondR=1, Out=d, In=d)
-                    data[(zero_qn, zero_qn, q, q)] = np.eye(d).reshape(1, 1, d, d)
-
-                qns = [[zero_qn], [zero_qn], list(phys_qns), list(phys_qns)]
-                dirs = [1, -1, 1, -1]
-                return BlockTensor(data, qns, dirs)
-
-            def _blockmat_to_dense(rho_bt, phys_qns):
-                # rho_bt is a 2-index BlockTensor over physical indices
-                d = len(phys_qns)
-                out = np.zeros((d, d), dtype=complex)
-
-                # map q -> positions in the physical basis ordering
-                from collections import defaultdict
-                pos = defaultdict(list)
-                for k, q in enumerate(list(phys_qns)):
-                    pos[q].append(k)
-
-                for (q0, q1), blk in rho_bt.data.items():
-                    rows = pos[q0]
-                    cols = pos[q1]
-                    # blk is (len(rows), len(cols))
-                    for a, ra in enumerate(rows):
-                        for b, cb in enumerate(cols):
-                            out[ra, cb] = blk[a, b]
-                return out
-
-            # Build an identity MPO list (bond dims 1) just to trace out other sites correctly.
-            W_id = []
-            for s in range(self.L):
-                # physical qns live on index 2 for MPS tensors in this code path (L,R,Phys)
-                phys_qns = self.Bs[s].qns[2]
-                W_id.append(_make_id_mpo_from_phys_qns(phys_qns))
-
-            # Build left overlap environments E[s] for bond left of site s
-            E = [None] * self.L
-            E[0] = initial_E(W_id[0])
-            for s in range(0, self.L - 1):
-                E[s + 1] = contract_from_left(W_id[s], self.Bs[s], E[s], self.Bs[s])
-
-            # Build right overlap environments R[s] for bond right of site s
-            R = [None] * self.L
-            # this extract the total qn on the last bond 
-            qs = sorted({key[1] for key in self.Bs[-1].data.keys()})
-            if len(qs) != 1:
-                raise ValueError(f"Ambiguous total charge on last bond: {qs}.")
-            target_qn = qs[0]
-            R[-1] = initial_F(W_id[-1], target_qn=target_qn)
-            for s in range(self.L - 1, 0, -1):
-                R[s - 1] = contract_from_right(W_id[s], self.Bs[s], R[s], self.Bs[s])
-
-            rdm = {}
-            for s in idx:
-                # L: (wL, bra_L, ket_L),  B: (ket_L, ket_R, phys)
-                t1 = tensordot(E[s], self.Bs[s], axes=([2], [0]))          # (wL, bra_L, ket_R, phys)
-                # R: (wR, bra_R, ket_R)
-                t2 = tensordot(t1, R[s], axes=([2], [2]))                  # (wL, bra_L, phys, wR, bra_R)
-                # B*: (bra_L, bra_R, phys')
-                rho4 = tensordot(t2, self.Bs[s].conj(), axes=([1, 4], [0, 1]))  # (wL, phys, wR, phys')
-
-                # Squeeze singleton MPO bond dims (they are always 1 here)
-                data2 = {}
-                for (qwL, qP, qwR, qPp), blk in rho4.data.items():
-                    # blk shape (1, dP, 1, dPp) -> (dP, dPp)
-                    data2[(qP, qPp)] = blk.reshape(blk.shape[1], blk.shape[3])
-                phys_qns = self.Bs[s].qns[2]
-                rho2 = BlockTensor(data2, [list(phys_qns), list(phys_qns)], [1, -1])
-
-                rho_dense = _blockmat_to_dense(rho2, phys_qns)
-                tr = np.trace(rho_dense)
-                if abs(tr) > 0:
-                    rho_dense = rho_dense / tr   # enforce Tr(rho)=1
-                rdm[s] = rho_dense
-
-            return rdm
-
-        if idx is None:
-            idx = list(range(self.L))
-        elif isinstance(idx, int):
-            idx = [idx]
+        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+            from pyqed.mps.mps import symmetric_to_dense
+            dense_self = symmetric_to_dense(self)
+            return dense_self.calc_local_site_rdms(idx=idx)
 
         # 1. Build Left Environments
         L_env = [np.array([[1.0]], dtype=complex)]
@@ -1236,30 +1142,10 @@ class MPS:
         import numpy as np
         from collections import defaultdict
 
-        # Helper for build identity on a bond for BlockTensor envs
-        def _bond_eye(qns_bond, dir0=1):
-            idxs_by_q = defaultdict(list)
-            for k, q in enumerate(qns_bond):
-                idxs_by_q[q].append(k)
-            data = {}
-            for q, ks in idxs_by_q.items():
-                data[(q, q)] = np.eye(len(ks), dtype=complex)
-            return BlockTensor(data, [list(qns_bond), list(qns_bond)], [dir0, -dir0])
-
-        # Helper for densify a BlockTensor
-        def _bt_to_dense(bt):
-            maps = []
-            for qlist in bt.qns:
-                m = defaultdict(list)
-                for i, q in enumerate(qlist):
-                    m[q].append(i)
-                maps.append(m)
-            shape = tuple(len(q) for q in bt.qns)
-            out = np.zeros(shape, dtype=complex)
-            for qkey, block in bt.data.items():
-                idx_lists = [maps[leg][qkey[leg]] for leg in range(bt.rank)]
-                out[np.ix_(*idx_lists)] += block
-            return out
+        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+            from pyqed.mps.mps import symmetric_to_dense
+            dense_self = symmetric_to_dense(self)
+            return dense_self.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
         # Normalize idx_pairs
         if idx_pairs is None:
@@ -1275,7 +1161,7 @@ class MPS:
             for i in pairs_by_i:
                 pairs_by_i[i] = sorted(set(pairs_by_i[i]))
 
-        # 2-rdm calculation with U(1) off
+        # dense branch without abelian symmetry
         if not (SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor)):
             # 1) Build Left Environments
             L_env = [np.array([[1.0]])]
@@ -1368,73 +1254,6 @@ class MPS:
 
             return rdm
 
-        # U(1) = True BRANCH (BlockTensors)
-        # 1) Build overlap environments
-        L_env = []
-        curr_L = _bond_eye(self.Bs[0].qns[0], dir0=self.Bs[0].dirs[0])
-        L_env.append(curr_L)
-        for i in range(self.L - 1):
-            temp = tensordot(curr_L, self.Bs[i], axes=([1], [0]))
-            curr_L = tensordot(temp, self.Bs[i].conj(), axes=([0, 2], [0, 2]))
-            curr_L = curr_L.transpose(1, 0)
-            L_env.append(curr_L)
-
-        R_env = [None] * self.L
-        curr_R = _bond_eye(self.Bs[-1].qns[1], dir0=self.Bs[-1].dirs[1])
-        R_env[-1] = curr_R
-        for i in range(self.L - 1, 0, -1):
-            temp = tensordot(self.Bs[i], curr_R, axes=([1], [1]))
-            curr_R = tensordot(temp, self.Bs[i].conj(), axes=([2, 1], [1, 2]))
-            curr_R = curr_R.transpose(1, 0)
-            R_env[i - 1] = curr_R
-
-        # 2) Precompute components
-        L_components = []
-        for i in range(self.L):
-            t = tensordot(L_env[i], self.Bs[i], axes=([1], [0]))
-            comp = tensordot(t, self.Bs[i].conj(), axes=([0], [0]))
-            comp = comp.transpose(1, 3, 2, 0)
-            L_components.append(comp)
-
-        R_components = []
-        for i in range(self.L):
-            t = tensordot(self.Bs[i], R_env[i], axes=([1], [1]))
-            comp = tensordot(t, self.Bs[i].conj(), axes=([2], [1]))
-            comp = comp.transpose(1, 3, 2, 0)
-            R_components.append(comp)
-
-        # 3) Assemble
-        rdm = {}
-        for i in range(self.L):
-            js = pairs_by_i.get(i, [])
-            if not js: continue
-
-            tensor = L_components[i]
-            max_j = max(js)
-
-            for j in range(i + 1, max_j + 1):
-                if j > i + 1:
-                    k = j - 1
-                    tensor = tensordot(tensor, self.Bs[k], axes=([3], [0]))
-                    tensor = tensordot(tensor, self.Bs[k].conj(), axes=([2, 4], [0, 2]))
-                    tensor = tensor.transpose(0, 1, 3, 2)
-
-                if j in js:
-                    rho_ij = tensordot(tensor, R_components[j], axes=([2, 3], [2, 3]))
-                    rho_ij = rho_ij.transpose(0, 2, 1, 3)
-
-                    rho_dense = _bt_to_dense(rho_ij)
-                    d_i, d_j = rho_dense.shape[0], rho_dense.shape[1]
-                    
-                    # Normalize
-                    rho_mat = rho_dense.reshape(d_i * d_j, d_i * d_j)
-                    tr = np.trace(rho_mat)
-                    if abs(tr) > 1e-12:
-                        rho_mat /= tr
-
-                    rdm[(i, j)] = rho_mat
-
-        return rdm
     
     def make_rdm1(self, sym_mgr=None):
         """
@@ -3052,7 +2871,7 @@ def initial_F(W, target_qn=0):
 
 def dense_to_symmetric(mps_list, phys_qns=None, tol=1e-12):
     """
-    Convert a *product-state* dense MPS guess into a true U(1) BlockTensor MPS.
+    Convert a product-state dense MPS guess into a true U(1) BlockTensor MPS.
     TODO: this now currently only supports particle number symmetry, add Sz, Lz etc. and also make each symmetry optional.
 
     Supports:
@@ -3141,6 +2960,42 @@ def dense_to_symmetric(mps_list, phys_qns=None, tol=1e-12):
 
     return new_list
 
+def symmetric_to_dense(mps_obj):
+    """
+    Converts a U(1) symmetric BlockTensor MPS back to a standard dense NumPy MPS.
+    """
+    import collections
+    from pyqed.mps.mps import MPS
+    
+    dense_factors = []
+    for bt in mps_obj.factors:
+        # If it's already dense, return it safely in standard layout
+        if not hasattr(bt, 'qns'):
+            if mps_obj.labels != ['lv', 'p', 'rv']:
+                return mps_obj.to_order(['lv', 'p', 'rv'])
+            return mps_obj
+            
+        # Map QNs to absolute array indices
+        maps = []
+        for qlist in bt.qns:
+            m = collections.defaultdict(list)
+            for i, q in enumerate(qlist): 
+                m[q].append(i)
+            maps.append(m)
+            
+        # Allocate dense block and fill with symmetry sectors
+        shape = tuple(len(q) for q in bt.qns)
+        out = np.zeros(shape, dtype=complex)
+        for qkey, block in bt.data.items():
+            idx_lists = [maps[leg][qkey[leg]] for leg in range(bt.rank)]
+            out[np.ix_(*idx_lists)] += block
+            
+        # BlockTensors in this code are (Left, Right, Phys). 
+        # Transpose to standard (Left, Phys, Right)
+        out_std = out.transpose(0, 2, 1)
+        dense_factors.append(out_std)
+        
+    return MPS(dense_factors, labels=['lv', 'p', 'rv'])
 
 def contract_from_right(W, A, F, B):
     """
@@ -3538,7 +3393,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
         sym_mgr: SymmetryManager instance to get valid physical QNs
         noise_val: Magnitude of noise
     """
-    if not hasattr(AA, 'data'):
+    if not hasattr(AA, 'qns'):
         return AA
     valid_qL = {}
     valid_qR = {}
