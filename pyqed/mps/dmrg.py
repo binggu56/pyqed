@@ -62,13 +62,14 @@ class DMRG:
             raise ValueError("Target quantum number must be specified when sym_mgr is given. If you are restricting symmetry by charge and spin, don't need to input sym_mgr to avoid conflict.")
         elif (charge is not None) and (spin is not None):
             sym_mgr = SymmetryManager(['charge', 'sz'])
-            self.target_qn = sym_mgr.get_target_qn(charge, 2*spin)
+            target_qn = sym_mgr.get_target_qn(charge, 2*spin)
         elif (charge is not None) and (spin is None):
             sym_mgr = SymmetryManager(['charge'])
-            self.target_qn = sym_mgr.get_target_qn(charge)
+            target_qn = sym_mgr.get_target_qn(charge)
         elif (charge is None) and (spin is not None):
             sym_mgr = SymmetryManager(['sz'])
-            self.target_qn = sym_mgr.get_target_qn(2*spin)
+            target_qn = sym_mgr.get_target_qn(2*spin)
+            
         self.charge = charge
 
         self.ground_state = None
@@ -78,8 +79,8 @@ class DMRG:
 
         self.not_conv_err = not_conv_err
         self.converged = False
-        self.target_qn = target_qn
-        self.sym_mgr = sym_mgr
+        self.target_qn = target_qn  # This now properly catches the generated target_qn!
+        self.sym_mgr = sym_mgr      # This correctly catches the generated sym_mgr!
 
     def run(self):
 

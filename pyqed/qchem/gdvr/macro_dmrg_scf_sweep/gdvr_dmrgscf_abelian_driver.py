@@ -914,6 +914,8 @@ def run_gdvr_dmrg_loop(
             symmetry=U1, 
             charge = mol.nelec,
             spin=2*mol.spin,
+            # sym_mgr = sym_mgr,
+            # target_qn=target_qn,
             not_conv_err=False,
         )
         solver.run()
