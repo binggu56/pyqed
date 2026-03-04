@@ -27,7 +27,7 @@ import scipy.sparse as sparse
 import math
 from copy import deepcopy
 from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian matrices
-
+from collections import defaultdict
 # from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
 from pyqed.mps.decompose import decompose, compress
 
@@ -451,8 +451,7 @@ class MPS:
                 raise ValueError('Unrecognized gauge {gauge} for MPS')
         
         elif (center == -1) and gauge is None:
-            print('You are creating a MPS without a gauge. \
-                  Suggest calling right_canonicalize() for canonicalization first.")')
+            # print('You are creating a MPS without a gauge. Suggest calling right_canonicalize() for canonicalization first.")')
             self.gauge = None
         else:
             raise ValueError('Cannot specify both gauge and center. Use only one.')
@@ -1118,30 +1117,32 @@ class MPS:
 
     def make_diagonal_rdm2(self, idx_pairs=None):
         """
-        Calculate the 2-site reduced density matrices for specified pairs of sites.
+        Calculate the 2-site density-density correlation <n_i n_j> for specified pairs of sites.
         
-        This method computes the exact local two-site density matrices by explicitly 
-        building the left and right environments from the boundaries inward. This 
-        exact trace bypasses any reliance on the canonical center of the MPS, 
-        ensuring numerically stable and physically valid results for any arbitrary state.
+        This method computes the exact local two-site probability trace by explicitly 
+        building the left and right environments. To maximize memory efficiency for 
+        quantum chemistry applications using spin-orbitals (where local dimension d=2), 
+        it discards the full 16-element density matrix and strictly returns the 
+        joint occupation probability |11><11|.
 
         Parameters
         ----------
         idx_pairs : list of tuple of int, optional
-            A list of site index pairs `(i, j)` to calculate the 2-site RDM for. 
-            If None, the function calculates the RDMs for all possible unique 
+            A list of site index pairs `(i, j)` to calculate the correlation for. 
+            If None, the function calculates the values for all possible unique 
             pairs `i < j` in the chain. By default None.
 
         Returns
         -------
         dict
-            A dictionary mapping each requested `(i, j)` tuple to its corresponding 
-            reduced density matrix (as a 2D dense complex numpy array). The dimension 
-            of the matrix is `(d_i * d_j, d_i * d_j)`.
+            A dictionary mapping each requested `(i, j)` tuple to its corresponding scalar correlation value `<n_i n_j>` (as a real float).
+            
+        Notes
+        -----
+        This method assumes a spin-orbital mapping where the local physical dimension 
+        is d=2 (Empty, Occupied). The returned scalar corresponds to the bottom-right 
+        diagonal element of the theoretical 4x4 two-site reduced density matrix.
         """
-        import numpy as np
-        from collections import defaultdict
-
         if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
@@ -1161,99 +1162,70 @@ class MPS:
             for i in pairs_by_i:
                 pairs_by_i[i] = sorted(set(pairs_by_i[i]))
 
-        # dense branch without abelian symmetry
-        if not (SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor)):
-            # 1) Build Left Environments
-            L_env = [np.array([[1.0]])]
-            curr_L = L_env[0]
-            for i in range(self.L - 1):
-                B = self._get_std_B(i)
-                # Contract L_env(Bra, Ket) with B(Ket, P, R) -> temp(Bra, P, R)
-                temp = np.tensordot(L_env[-1], B, axes=(1, 0))
-                # Contract temp with B*(Bra, P, R*) -> L_next(R, R*) -> Transpose to (R*, R)
-                curr_L = np.tensordot(temp, B.conj(), axes=([0, 1], [0, 1])).T
-                L_env.append(curr_L)
+        # 1) Build Left Environments
+        L_env = [np.array([[1.0]])]
+        curr_L = L_env[0]
+        for i in range(self.L - 1):
+            B = self._get_std_B(i)
+            temp = np.tensordot(L_env[-1], B, axes=(1, 0))
+            curr_L = np.tensordot(temp, B.conj(), axes=([0, 1], [0, 1])).T
+            L_env.append(curr_L)
 
-            # Build Right Environments
-            R_env = [None] * self.L
-            curr_R = np.array([[1.0]])
-            R_env[-1] = curr_R
-            for i in range(self.L - 1, 0, -1):
-                B = self._get_std_B(i)
-                # Contract B(L, P, R) with R_env(Bra, Ket) -> temp(L, P, Bra)
-                temp = np.tensordot(B, R_env[i], axes=(2, 1))
-                # Contract temp with B*(L*, P, Bra) -> R_prev(L, L*) -> Transpose to (L*, L)
-                curr_R = np.tensordot(temp, B.conj(), axes=([1, 2], [1, 2])).T
-                R_env[i - 1] = curr_R
+        # 2) Build Right Environments
+        R_env = [None] * self.L
+        curr_R = np.array([[1.0]])
+        R_env[-1] = curr_R
+        for i in range(self.L - 1, 0, -1):
+            B = self._get_std_B(i)
+            temp = np.tensordot(B, R_env[i], axes=(2, 1))
+            curr_R = np.tensordot(temp, B.conj(), axes=([1, 2], [1, 2])).T
+            R_env[i - 1] = curr_R
 
-            # 2) Precompute components
-            # group the Environment + Site Tensor to expose Physical and Bond indices.
-            
-            # L_components[i]: [Pi, Pi*, R*, R]
-            L_components = []
-            for i in range(self.L):
-                B = self._get_std_B(i)
-                # L_env(Bra, Ket) * B(Ket, P, R) -> t(Bra, P, R)
-                t = np.tensordot(L_env[i], B, axes=(1, 0))
-                # t(Bra, P, R) * B*(Bra, P*, R*) -> comp(P, R, P*, R*)
-                comp = np.tensordot(t, B.conj(), axes=(0, 0))
-                # Reorder to [Pi, Pi*, R*, R]
-                comp = comp.transpose(0, 2, 3, 1)
-                L_components.append(comp)
+        # 3) Precompute components
+        L_components = []
+        for i in range(self.L):
+            B = self._get_std_B(i)
+            t = np.tensordot(L_env[i], B, axes=(1, 0))
+            comp = np.tensordot(t, B.conj(), axes=(0, 0))
+            comp = comp.transpose(0, 2, 3, 1)
+            L_components.append(comp)
 
-            # R_components[j]: [L, L*, Pj*, Pj]
-            R_components = []
-            for i in range(self.L):
-                B = self._get_std_B(i)
-                # B(L, P, R) * R_env(Bra, Ket) -> t(L, P, Bra)
-                t = np.tensordot(B, R_env[i], axes=(2, 1))
-                # t(L, P, Bra) * B*(L*, P*, Bra) -> comp(L, P, L*, P*)
-                comp = np.tensordot(t, B.conj(), axes=(2, 2))
-                comp = comp.transpose(0, 2, 3, 1)
-                R_components.append(comp)
+        R_components = []
+        for i in range(self.L):
+            B = self._get_std_B(i)
+            t = np.tensordot(B, R_env[i], axes=(2, 1))
+            comp = np.tensordot(t, B.conj(), axes=(2, 2))
+            comp = comp.transpose(0, 2, 3, 1)
+            R_components.append(comp)
 
-            # 3) Assemble
-            rdm = {}
-            for i in range(self.L):
-                js = pairs_by_i.get(i, [])
-                if not js: continue
+        # 4) Assemble and Extract Scalar
+        rdm = {}
+        for i in range(self.L):
+            js = pairs_by_i.get(i, [])
+            if not js: continue
 
-                # Start with component at i: [Pi, Pi*, R*_i, R_i]
-                tensor = L_components[i]
-                max_j = max(js)
-                for j in range(i + 1, max_j + 1):
-                    # If exist sites between i and j, propagate the bond indices by tracing over the physical indices of the intermediate sites (Transfer Matrix).
-                    if j > i + 1:
-                        k = j - 1
-                        B = self._get_std_B(k) # [L, P, R]
-                        # Apply Transfer Matrix at site k:
-                        # tensor: [Pi, Pi*, L*_k, L_k]
-                        # B:      [L_k, P_k, R_k]
-                        # B*:     [L*_k, P_k, R*_k]
-                        # Contract L with L, L* with L*, trace P_k.
-                        # Output: [Pi, Pi*, R*_k, R_k]
-                        tensor = np.einsum('abcd, def, ceh -> abhf', tensor, B, B.conj(), optimize=True)
+            tensor = L_components[i]
+            max_j = max(js)
+            for j in range(i + 1, max_j + 1):
+                # Propagate transfer matrix for intermediate sites
+                if j > i + 1:
+                    k = j - 1
+                    B = self._get_std_B(k) 
+                    tensor = np.einsum('abcd, def, ceh -> abhf', tensor, B, B.conj(), optimize=True)
 
-                    if j in js:
-                        # Contract with component at j: [L_j, L*_j, Pj*, Pj]
-                        # Connect Bond indices: R_prev(3) with L_j(0), R*_prev(2) with L*_j(1)
-                        rho_raw = np.tensordot(tensor, R_components[j], axes=([3, 2], [0, 1]))
-                        
-                        # rho_raw: [Pi, Pi*, Pj*, Pj]
-                        # Reorder to standard form [Pi, Pj, Pi*, Pj*]
-                        rho_ij = rho_raw.transpose(0, 3, 1, 2)
+                if j in js:
+                    rho_raw = np.tensordot(tensor, R_components[j], axes=([3, 2], [0, 1]))
+                    rho_ij = rho_raw.transpose(0, 3, 1, 2)
 
-                        d_i, d_j = rho_ij.shape[0], rho_ij.shape[1]
-                        rho_mat = rho_ij.reshape(d_i * d_j, d_i * d_j)
-                        
-                        # Normalize
-                        tr = np.trace(rho_mat)
-                        if abs(tr) > 1e-12:
-                            rho_mat /= tr
-                        rdm[(i, j)] = rho_mat
-
-            return rdm
-
+                    d_i, d_j = rho_ij.shape[0], rho_ij.shape[1]
+                    rho_mat = rho_ij.reshape(d_i * d_j, d_i * d_j)
+                    
+                    tr = np.trace(rho_mat)
+                    if abs(tr) > 1e-12:
+                        rho_mat /= tr
+                    
+                    rdm[(i, j)] = np.real(rho_mat[-1, -1])
+        return rdm
     
     def make_rdm1(self, sym_mgr=None):
         """

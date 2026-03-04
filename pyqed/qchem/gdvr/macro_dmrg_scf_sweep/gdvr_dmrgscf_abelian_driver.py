@@ -112,7 +112,7 @@ def get_entangled_guess(n_elec, n_spin):
         curr_hf += phys_hf; curr_dbl += phys_dbl
     return mps
 
-def make_u1_random_block_init_guess(L, target_qn, phys_qns=None, max_bond_sectors=6, seed=0):
+def make_abelian_random_block_init_guess(L, target_qn, phys_qns=None, max_bond_sectors=6, seed=0):
     if not SYMMETRY_AVAILABLE: raise ImportError("Symmetry required")
     import numpy as np
     from collections import defaultdict
@@ -568,11 +568,11 @@ def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, 
 #     dmrg_bond_dim=20,
 #     dmrg_sweeps=10,
 #     post_dmrg_opt_cycles=5,
-#     U1 = True,
+#     abelian_symmetry = True,
 #     checkpoint_dir = "."
 # ):
 #     print("="*60)
-#     print(f"GDVR-DMRG | Exact HF Guess Mode | U1={U1}")
+#     print(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
 #     print(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
 #     print("="*60)
     
@@ -668,7 +668,7 @@ def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, 
 #         model = Model(basis=basis, ham_terms=ham_terms)
 #         mpo = Mpo(model, algo="qr")
 #         mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-#         final_H = convert_mpo_symmetric(mpo_dmrg) if U1 else mpo_dmrg
+#         final_H = convert_mpo_symmetric(mpo_dmrg) if abelian_symmetry else mpo_dmrg
         
 #         if last_mps_tensors is None:
 #             # USE EXACT HF GUESS (FIXED)
@@ -677,7 +677,7 @@ def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, 
 #             mps_guess = [t.copy() for t in last_mps_tensors]
         
 #         print(f"  3. Running DMRG (D={dmrg_bond_dim})...")
-#         solver = mps_lib.DMRG(final_H, D=dmrg_bond_dim, nsweeps=dmrg_sweeps, init_guess=mps_guess, U1=U1, target_qn=mol.nelec, not_conv_err=False)
+#         solver = mps_lib.DMRG(final_H, D=dmrg_bond_dim, nsweeps=dmrg_sweeps, init_guess=mps_guess, abelian_symmetry=abelian_symmetry, target_qn=mol.nelec, not_conv_err=False)
 #         solver.run()
         
 #         try:
@@ -730,7 +730,7 @@ def run_gdvr_dmrg_loop(
     dmrg_bond_dim=20,
     dmrg_sweeps=10,
     post_dmrg_opt_cycles=5,
-    U1 = True,
+    abelian_symmetry = True,
     checkpoint_dir = "."
 ):
     """
@@ -756,7 +756,7 @@ def run_gdvr_dmrg_loop(
         _description_, by default 10
     post_dmrg_opt_cycles : int, optional
         _description_, by default 5
-    U1 : bool, optional
+    abelian_symmetry : bool, optional
         _description_, by default True
     checkpoint_dir : str, optional
         _description_, by default "."
@@ -767,7 +767,7 @@ def run_gdvr_dmrg_loop(
         _description_
     """
     print("="*60)
-    print(f"GDVR-DMRG | Exact HF Guess Mode | U1={U1}")
+    print(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
     print(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
     print("="*60)
     
@@ -824,7 +824,7 @@ def run_gdvr_dmrg_loop(
 
     save_checkpoint("02_HF_NewtonOpt", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
 
-    if U1:
+    if abelian_symmetry:
         from pyqed.mps.mps import dense_to_symmetric_mpo, SymmetryManager
         sym_mgr = SymmetryManager(['charge', 'sz'])
         print(f"  [Symmetry] Manager initialized: {sym_mgr.sym_types}")
@@ -884,14 +884,14 @@ def run_gdvr_dmrg_loop(
         # Transpose to (L, R, Out, In) for standard converter
         mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
         
-        if U1:
+        if abelian_symmetry:
             from pyqed.mps.mps import dense_to_symmetric_mpo
             final_H = dense_to_symmetric_mpo(mpo_dmrg, site_qn_maps)
         else:
             final_H = mpo_dmrg
         
         if last_mps_tensors is None:
-            if U1:
+            if abelian_symmetry:
                 # Use Symmetric Exact HF Guess
                 mps_guess = generate_exact_hf_guess(mol, Cmo, Nz, sym_mgr)
             else:
@@ -903,7 +903,7 @@ def run_gdvr_dmrg_loop(
         print(f"  3. Running DMRG (D={dmrg_bond_dim})...")
         
         target_qn = None
-        if U1:
+        if abelian_symmetry:
             target_qn = sym_mgr.get_target_qn(mol.nelec, 2*mol.spin)
 
         solver = dmrg_lib.DMRG(
@@ -911,7 +911,7 @@ def run_gdvr_dmrg_loop(
             D=dmrg_bond_dim, 
             nsweeps=dmrg_sweeps, 
             init_guess=mps_guess, 
-            symmetry=U1, 
+            symmetry=abelian_symmetry, 
             charge = mol.nelec,
             spin=2*mol.spin,
             # sym_mgr = sym_mgr,
@@ -937,7 +937,7 @@ def run_gdvr_dmrg_loop(
         if cycle < dmrg_cycles - 1: 
             print("  4. Re-optimizing AOs using DMRG 1-RDM...")
             d_stack = gdvr_dmrg_scf.dmrg_ao_optimization_step(
-                mol, d_stack, None, S_prim, ERIop, h1_nm_func, 
+                mol, d_stack, sym_mgr, S_prim, ERIop, h1_nm_func,
                 z, Kz_grid, T_prim, alphas, centers, labels, K_h, Kx_h, 
                 solver=solver, Enuc=Enuc, n_cycles=post_dmrg_opt_cycles, verbose=True
             )
@@ -983,8 +983,8 @@ if __name__ == "__main__":
     
     E, S = run_gdvr_dmrg_loop(
         mol, Lz=6.0, Nz=32, basis_cfg=basis_cfg,
-        pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=20, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
-        U1=True, checkpoint_dir=checkpoint_path
+        pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
+        abelian_symmetry=True, checkpoint_dir=checkpoint_path
     )
     
     result_file = os.path.join(master_dir, f"result_idx_{idx:02d}.npz")
