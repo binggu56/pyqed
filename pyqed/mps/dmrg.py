@@ -198,7 +198,7 @@ class DMRG:
         """
         Calculate the local reduced density matrices for individual, isolated sites.
         
-        Wrapper for `MPS.calc_local_site_rdms`. Traces out the rest of the chain 
+        Wrapper for `MPS._calc_local_site_rdms`. Traces out the rest of the chain 
         to isolate the internal $d \\times d$ quantum state of specific sites.
 
         Parameters
@@ -213,7 +213,7 @@ class DMRG:
             A dictionary mapping the requested site indices to their corresponding 
             $d \\times d$ local density matrices (as numpy arrays).
         """
-        return self.ground_state.calc_local_site_rdms(idx=idx)
+        return self.ground_state._calc_local_site_rdms(idx=idx)
 
     def make_rdm2(self, idx_pairs=None):
         """

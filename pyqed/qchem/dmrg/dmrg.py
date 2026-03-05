@@ -804,7 +804,7 @@ class QCDMRG(CASCI):
         print("="*60)
         # Calculate local site RDMs, returns a dict {site_idx: rho_dense (d,d)}
         try:
-            rdms = self.dmrg.ground_state.calc_local_site_rdms()
+            rdms = self.dmrg.ground_state._calc_local_site_rdms()
         except Exception as e:
             print(f"  [Error] Failed to calculate RDM: {e}")
             return
