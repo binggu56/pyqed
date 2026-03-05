@@ -93,58 +93,6 @@ class DMRGNewtonHelper(SweepNewtonHelper):
         H_nn *= 2.0
         return H_nn
 
-
-# # 2. RDM Extraction
-# def extract_rdms_for_helper(solver, n_spatial, verbose=False):
-#     """
-#     Extracts P (1-RDM) and D (Diagonal 2-RDM) for the helper.
-#     """
-#     rdm1_dict = solver.make_rdm()
-#     rdm2_dict = solver.make_diagonal_rdm2()
-    
-#     # --- 1-RDM (P) ---
-#     n_spin = 2 * n_spatial
-#     P_spin = np.zeros((n_spin, n_spin), dtype=complex)
-#     for i in range(n_spin):
-#         if i in rdm1_dict:
-#             rho = rdm1_dict[i]
-#             if hasattr(rho, 'shape') and rho.shape == (2, 2):
-#                 P_spin[i, i] = rho[1, 1]
-#     for (i, j), rho_flat in rdm2_dict.items():
-#         rho = rho_flat.reshape(4, 4)
-#         val = rho[1, 2] 
-#         P_spin[i, j] = val
-#         P_spin[j, i] = np.conj(val)
-
-#     P_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
-#     for p in range(n_spatial):
-#         for q in range(n_spatial):
-#             val = P_spin[2*p, 2*q] + P_spin[2*p+1, 2*q+1]
-#             P_spatial[p, q] = np.real(val)
-
-#     # --- Diagonal 2-RDM (D) ---
-#     D_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
-#     def get_nn(i, j):
-#         if i == j: return np.real(P_spin[i, i])
-#         idx = (i, j) if i < j else (j, i)
-#         if idx not in rdm2_dict: return 0.0
-#         rho = rdm2_dict[idx].reshape(4,4)
-#         return np.real(rho[3, 3])
-
-#     for p in range(n_spatial):
-#         for q in range(n_spatial):
-#             if p == q:
-#                 val = 2.0 * get_nn(2*p, 2*p+1)
-#             else:
-#                 val  = get_nn(2*p, 2*q)     + get_nn(2*p, 2*q+1)
-#                 val += get_nn(2*p+1, 2*q)   + get_nn(2*p+1, 2*q+1)
-#             D_spatial[p, q] = val
-            
-#     if verbose: print(f"[DMRG-SCF] Extracted RDM Tr(P)={np.trace(P_spatial):.4f}")
-#     return P_spatial, D_spatial
-
-import numpy as np
-
 def extract_rdms_for_helper(solver, n_spatial, sym_mgr=None, verbose=False):
     """
     Build spatial 1-RDM P[p,q] and a 'diagonal 2-RDM' D[p,q] needed by your AO Newton helper.
@@ -152,7 +100,7 @@ def extract_rdms_for_helper(solver, n_spatial, sym_mgr=None, verbose=False):
     """
     state = solver.ground_state
     
-    # --- 1. Get exact global 1-RDM (with proper Jordan-Wigner strings) ---
+    # Get 1-RDM
     if sym_mgr is not None and hasattr(state.Bs[0], 'qns'):
         P_spin = state.make_rdm1(sym_mgr=sym_mgr)
     elif hasattr(state.Bs[0], 'qns'):

@@ -383,7 +383,7 @@ def apply_mpo_symmetric(W_list, M_list, vac_qn):
     return new_mps
 
 def generate_exact_hf_guess(mol, C_mo_spatial, Nz, sym_mgr):
-    print(f"  [Guess] Generating EXACT HF Slater Determinant (AO Basis)...")
+    logger.info(f"  [Guess] Generating EXACT HF Slater Determinant (AO Basis)...")
     n_spin = 2 * Nz
     
     # 1. Start with Symmetric Vacuum
@@ -407,14 +407,14 @@ def generate_exact_hf_guess(mol, C_mo_spatial, Nz, sym_mgr):
         mps = apply_mpo_symmetric(mpo_dn, mps, vac_qn)
         
     dims = [sum([b.shape[0]*b.shape[1] for b in t.data.values()]) for t in mps] 
-    print(f"  [Guess] Finished. Dims ~ {max(dims)}")
+    logger.info(f"  [Guess] Finished. Dims ~ {max(dims)}")
     return mps
 
 
 
 def convert_mpo_symmetric(dense_H_list):
     if not SYMMETRY_AVAILABLE: return dense_H_list
-    print("  Converting MPO to U(1) Blocks...")
+    logger.info("  Converting MPO to U(1) Blocks...")
     sym_H = []
     phys_qns = {0: 0, 1: 1} 
     current_nodes = {(0, 0)}
@@ -553,7 +553,7 @@ def calculate_overlap_with_hf_robust(mps_tensors, C_mo_spatial, occupied_indices
 def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     filename = f"{output_dir}/{stage_name}"
-    print(f"  [Save] Checkpoint: {stage_name}")
+    logger.info(f"  [Save] Checkpoint: {stage_name}")
     np.savez_compressed(f"{filename}_orbitals.npz", d_stack=d_stack)
     if mps_tensors is not None:
         np.savez_compressed(f"{filename}_mps.npz", *mps_tensors)
@@ -766,10 +766,10 @@ def run_gdvr_dmrg_loop(
     _type_
         _description_
     """
-    print("="*60)
-    print(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
-    print(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
-    print("="*60)
+    logger.info("="*60)
+    logger.info(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
+    logger.info(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
+    logger.info("="*60)
     
     energy_log = {"hf_initial": None, "hf_pre_opt": [], "dmrg_cycles": [], "final_overlap": None}
     run_params = {"Lz": Lz, "Nz": Nz, "basis": basis_cfg}
@@ -797,7 +797,7 @@ def run_gdvr_dmrg_loop(
     Enuc = mol.nuclear_repulsion_energy()
     Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
     
-    print(f"  -> Initial HF Energy: {Etot:.8f} Ha")
+    logger.info(f"  -> Initial HF Energy: {Etot:.8f} Ha")
     energy_log["hf_initial"] = Etot
     d_stack = np.vstack([C_list[n][:, 0] for n in range(Nz)])
     save_checkpoint("01_HF_Initial", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
@@ -807,7 +807,7 @@ def run_gdvr_dmrg_loop(
     h1_nm_func = build_h1_nm(Kz_grid, S_prim, T_prim, z, lambda zz: V_en_sp_total_at_z(alphas, centers, labels, nuclei, zz))
 
     if pre_opt_cycles > 0:
-        print(f"\n[Phase A.5] Pre-optimization...")
+        logger.info(f"\n[Phase A.5] Pre-optimization...")
         nh_sweep = SweepNewtonHelper(h1_nm_func, S_prim, ERIop)
         for pcyc in range(pre_opt_cycles):
             P_slice = P.reshape(Nz, 1, Nz, 1)[:, 0, :, 0].copy()
@@ -820,14 +820,14 @@ def run_gdvr_dmrg_loop(
             ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
             Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore_curr, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
             energy_log["hf_pre_opt"].append(Etot)
-            if (pcyc + 1) % 2 == 0: print(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
+            if (pcyc + 1) % 2 == 0: logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
 
     save_checkpoint("02_HF_NewtonOpt", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
 
     if abelian_symmetry:
         from pyqed.mps.mps import dense_to_symmetric_mpo, SymmetryManager
         sym_mgr = SymmetryManager(['charge', 'sz'])
-        print(f"  [Symmetry] Manager initialized: {sym_mgr.sym_types}")
+        logger.info(f"  [Symmetry] Manager initialized: {sym_mgr.sym_types}")
         
         # Pre-calculate Site QN Maps for MPO Conversion
         # Spin-orbital mapping: Even=Up, Odd=Down
@@ -849,7 +849,7 @@ def run_gdvr_dmrg_loop(
     final_Cmo = None
     
     for cycle in range(dmrg_cycles):
-        print(f"\n[Macro Cycle {cycle+1}/{dmrg_cycles}]")
+        logger.info(f"\n[Macro Cycle {cycle+1}/{dmrg_cycles}]")
         d_stack, _ = align_orbital_phases(d_stack_old, d_stack, S_prim)
         d_stack_old = d_stack.copy()
         
@@ -883,7 +883,8 @@ def run_gdvr_dmrg_loop(
         mpo = Mpo(model, algo="qr")
         # Transpose to (L, R, Out, In) for standard converter
         mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-        
+        for w in mpo_dmrg:
+            w[np.abs(w) < 1e-10] = 0.0
         if abelian_symmetry:
             from pyqed.mps.mps import dense_to_symmetric_mpo
             final_H = dense_to_symmetric_mpo(mpo_dmrg, site_qn_maps)
@@ -900,7 +901,7 @@ def run_gdvr_dmrg_loop(
         else:
             mps_guess = [t.copy() for t in last_mps_tensors]
         
-        print(f"  3. Running DMRG (D={dmrg_bond_dim})...")
+        logger.info(f"  3. Running DMRG (D={dmrg_bond_dim})...")
         
         target_qn = None
         if abelian_symmetry:
@@ -929,13 +930,13 @@ def run_gdvr_dmrg_loop(
             
         last_mps_tensors = solver.ground_state.Bs
         final_dmrg_energy = e_dmrg
-        print(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")
+        logger.info(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")
         
         if cycle == 0:
             save_checkpoint("03_DMRG_FirstIter", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
 
         if cycle < dmrg_cycles - 1: 
-            print("  4. Re-optimizing AOs using DMRG 1-RDM...")
+            logger.info("  4. Re-optimizing AOs using DMRG 1-RDM...")
             d_stack = gdvr_dmrg_scf.dmrg_ao_optimization_step(
                 mol, d_stack, sym_mgr, S_prim, ERIop, h1_nm_func,
                 z, Kz_grid, T_prim, alphas, centers, labels, K_h, Kx_h, 
@@ -944,19 +945,19 @@ def run_gdvr_dmrg_loop(
             energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": True})
         else:
             energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": False})
-            print("  4. Calculating final RHF solution for Overlap analysis...")
+            logger.info("  4. Calculating final RHF solution for Overlap analysis...")
             ERI_J_fin, ERI_K_fin = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
             _, _, final_Cmo, _, _ = scf_rhf_method2(Hcore_curr, ERI_J_fin, ERI_K_fin, Nz, 1, mol.nelec, Enuc, verbose=False)
 
     final_overlap = 0.0
     try:
         if final_Cmo is not None and last_mps_tensors is not None:
-            print("\n" + "-"*30)
-            print("Calculating Final Overlap...")
+            logger.info("\n" + "-"*30)
+            logger.info("Calculating Final Overlap...")
             final_overlap = calculate_overlap_with_hf_robust(last_mps_tensors, final_Cmo, range(mol.nelec // 2), Nz)
-            print(f"Overlap |S|^2 : {abs(final_overlap)**2:.6f}")
+            logger.info(f"Overlap |S|^2 : {abs(final_overlap)**2:.6f}")
     except Exception as e:
-        print(f"Overlap calculation failed (returning 0.0): {e}")
+        logger.info(f"Overlap calculation failed (returning 0.0): {e}")
         final_overlap = 0.0
     
     energy_log["final_overlap"] = final_overlap
@@ -982,11 +983,11 @@ if __name__ == "__main__":
     checkpoint_path = os.path.join(master_dir)
     
     E, S = run_gdvr_dmrg_loop(
-        mol, Lz=6.0, Nz=32, basis_cfg=basis_cfg,
+        mol, Lz=6.0, Nz=128, basis_cfg=basis_cfg,
         pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
         abelian_symmetry=True, checkpoint_dir=checkpoint_path
     )
     
     result_file = os.path.join(master_dir, f"result_idx_{idx:02d}.npz")
     np.savez(result_file, Energy=E, Overlap=S)
-    print(f"Done. Saved to {result_file}")
+    logger.info(f"Done. Saved to {result_file}")

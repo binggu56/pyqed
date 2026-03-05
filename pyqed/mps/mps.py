@@ -32,7 +32,7 @@ from collections import defaultdict
 from pyqed.mps.decompose import decompose, compress
 
 import logging
-
+logger = logging.getLogger(__name__)
 try:
     from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
@@ -291,7 +291,7 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
     # Track allowed Right-Bond QNs. Start with Vacuum (Left=0).
     # Store (Dense_Index, QN_Value)
     current_nodes = {(0, zero_qn)}
-    print(f"  [MPO Convert] Start. Sites={len(dense_mpo_list)}, ZeroQN={zero_qn} (Type: {type(zero_qn)})")
+    logger.info(f"  [MPO Convert] Start. Sites={len(dense_mpo_list)}, ZeroQN={zero_qn} (Type: {type(zero_qn)})")
     for site_idx, W in enumerate(dense_mpo_list):
         new_data = {}
         next_nodes = set()
