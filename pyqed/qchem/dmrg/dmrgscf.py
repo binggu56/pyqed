@@ -8,6 +8,7 @@ DMRGSCF
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
 from pyqed.qchem import QCDMRG, CASSCF
+from pyqed.qchem.mcscf.casscf import kernel, kernel_state_average
 import numpy as np
 
 
@@ -25,14 +26,21 @@ class DMRGSCF(QCDMRG):
         self.nstates = 1
 
 
-    def run(self, nstates=1):
+    def run(self, nstates=1, weights = None, **kwargs):
         mf = self.mf
 
         # canonical molecular orbs
         C0 = mf.mo_coeff
 
         # CASCI roots
-        nstates = self.nstates
+        if nstates == None:
+            nstates = self.nstates
+        else:
+            self.nstates = nstates
+        if weights != None:
+            self.weights = weights
+            if nstates != len(self.weights):
+                raise ValueError("the nstates you requires does not align with the nstates indicated by the weights. check input.")
 
         nmo = self.mf.nao
         ncas = self.ncas
@@ -46,9 +54,7 @@ class DMRGSCF(QCDMRG):
         mc.ss = self.ss
         mc.shift = self.shift
 
-
-        mc.run(nstates)
-
+        mc.run(**kwargs)
 
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo()
@@ -62,10 +68,11 @@ class DMRGSCF(QCDMRG):
             C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
 
         elif nstates > 1:
-
             if self.weights is None:
-                raise ValueError('State weights not provided.')
-
+                self.state_average(weights = np.ones(nstates)/nstates)
+            if len(self.weights) != nstates: 
+                self.state_average(weights = np.ones(nstates)/nstates)
+            mc.nstates = self.nstates
             C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
                                             C0=C0, h1e=h1e, eri=eri)
 
@@ -79,5 +86,22 @@ class DMRGSCF(QCDMRG):
         self.nstates = len(weights)
         self.weights = weights
         return self
-   
-# TODO: requires make_rdm12 from DMRG solver
+
+if __name__=='__main__':
+
+    from pyqed import Molecule
+    # from pyqed.qchem.mcscf.direct_ci import CASCI
+
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='6311g')
+    mol.build(driver='pyscf')
+
+    mf = mol.RHF().run()
+
+    mc = DMRGSCF(mf, ncas=6, nelecas=3, D=60, max_cycles=50)
+
+    mc.fix_spin(ss=0, shift=0.2)
+    mc.run(
+        nstates=2, 
+        symmetry_list=['charge', 'sz'], 
+        initial_guess='cid'
+    )

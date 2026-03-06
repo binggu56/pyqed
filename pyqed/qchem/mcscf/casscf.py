@@ -36,15 +36,21 @@ class CASSCF(CASCI):
         self.nstates = 1
 
 
-    def run(self, nstates=1):
+    def run(self, nstates= None, weights = None):
         mf = self.mf
 
         # canonical molecular orbs
         C0 = mf.mo_coeff
 
         # CASCI roots
-        nstates = self.nstates
-
+        if nstates == None:
+            nstates = self.nstates
+        else:
+            self.nstates = nstates
+        if weights != None:
+            self.weights = weights
+            if nstates != len(self.weights):
+                raise ValueError("the nstates you requires does not align with the nstates indicated by the weights. check input.")
         nmo = self.mf.nao
         ncas = self.ncas
         nelecas = self.nelecas
@@ -78,9 +84,10 @@ class CASSCF(CASCI):
             C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
 
         elif nstates > 1:
-
             if self.weights is None:
-                raise ValueError('State weights not provided.')
+                self.state_average(weights = np.ones(nstates)/nstates)
+            if len(self.weights) != nstates: 
+                self.state_average(weights = np.ones(nstates)/nstates)
 
             C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
                                          C0=C0, h1e=h1e, eri=eri)

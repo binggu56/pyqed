@@ -1036,7 +1036,7 @@ class MPS:
             compressed_factors = compressed_factors[0]
         return MPS(compressed_factors, labels=['lv','p','rv'])
 
-    def calc_local_site_rdms(self, idx=None):
+    def _calc_local_site_rdms(self, idx=None):
         """
         Calculate the local reduced density matrix for individual, isolated sites.
         (it is not 1 site rdm getting all <c^\dagger_i c_j>, this function only provides local information, such as the probability of the site being empty, singly occupied, or doubly occupied (<c^\dagger_i c_i>).
@@ -1076,7 +1076,7 @@ class MPS:
         if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
-            return dense_self.calc_local_site_rdms(idx=idx)
+            return dense_self._calc_local_site_rdms(idx=idx)
 
         # 1. Build Left Environments
         L_env = [np.array([[1.0]], dtype=complex)]
