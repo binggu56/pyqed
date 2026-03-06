@@ -1036,7 +1036,7 @@ class MPS:
             compressed_factors = compressed_factors[0]
         return MPS(compressed_factors, labels=['lv','p','rv'])
 
-    def _calc_local_site_rdms(self, idx=None):
+    def calc_local_site_rdms(self, idx=None):
         """
         Calculate the local reduced density matrix for individual, isolated sites.
         (it is not 1 site rdm getting all <c^\dagger_i c_j>, this function only provides local information, such as the probability of the site being empty, singly occupied, or doubly occupied (<c^\dagger_i c_i>).
@@ -1076,7 +1076,7 @@ class MPS:
         if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
-            return dense_self._calc_local_site_rdms(idx=idx)
+            return dense_self.calc_local_site_rdms(idx=idx)
 
         # 1. Build Left Environments
         L_env = [np.array([[1.0]], dtype=complex)]
@@ -1293,7 +1293,7 @@ class MPS:
         # 2. Dense Branch (Exact O(L^2 D^3) evaluation with JW strings)
         else:
             P = np.zeros((L, L), dtype=complex)
-            d = self.dim
+            d = self.Bs[0].shape[1]
             
             if d == 2:
                 c_op    = np.array([[0, 1], [0, 0]], dtype=complex)
@@ -1427,7 +1427,7 @@ class MPS:
                             G[p, r, s, q] = val
             return G
         else:
-            d = self.dim
+            d = self.Bs[0].shape[1]
             if d != 2:
                 raise NotImplementedError(f"Dense 2-RDM currently supports d=2 spin-orbitals, got d={d}.")
                 
@@ -3890,7 +3890,7 @@ def apply_mpo_symmetric(W_list, M_list):
     new_mps = []
     L = len(M_list)
     
-    # Dynamically determine the Vacuum QN from the first tensor's first bond
+    # [FIX] Dynamically determine the Vacuum QN from the first tensor's first bond
     # This handles both int (0) and QN objects (QN(0,0))
     first_key = next(iter(M_list[0].data.keys()))
     vac_qn = first_key[0] # Left bond QN
