@@ -586,7 +586,7 @@ class QCDMRG(CASCI):
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore)
+        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, mo_coeff=self.mo_coeff)
 
         self.e_core = energy_core
 

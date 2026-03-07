@@ -92,16 +92,16 @@ if __name__=='__main__':
     from pyqed import Molecule
     # from pyqed.qchem.mcscf.direct_ci import CASCI
 
-    mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='6311g')
+    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
-    mc = DMRGSCF(mf, ncas=6, nelecas=3, D=60, max_cycles=50)
+    mc = DMRGSCF(mf, ncas=2, nelecas=2, D=60, max_cycles=50)
 
     mc.fix_spin(ss=0, shift=0.2)
     mc.run(
-        nstates=2, 
+        nstates=1, # currently the nstates for dmrgscf is a dummy stuff, since we have not get excited states in the qcdmrg solver (or the dmrg solver)
         symmetry_list=['charge', 'sz'], 
         initial_guess='cid'
     )
