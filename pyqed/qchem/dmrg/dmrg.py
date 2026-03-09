@@ -499,27 +499,73 @@ class QCDMRG(CASCI):
         # self.eri += ...
         return
 
-    def fix_spin(self, shift, spin=0):
+    # def fix_spin(self, shift, spin=0, ss = 0):
+    #     """
+    #     fix the number of electrons by energy penalty
+
+    #     .. math::
+
+    #         \mathcal{H} = H + \lambda (\hat{S}^2 - S(S+1))^2
+
+    #     Parameters
+    #     ----------
+    #     shift : TYPE
+    #         DESCRIPTION.
+
+    #     Returns
+    #     -------
+    #     None.
+
+    #     """
+    #     # self.h1e += ...
+    #     # self.eri += ...
+    #     return self
+
+    def fix_spin(self, s=None, ss=0, shift=0.2):
         """
-        fix the number of electrons by energy penalty
+        fix the spin by energy penalty
 
         .. math::
 
-            \mathcal{H} = H + \lambda (\hat{S}^2 - S(S+1))^2
+            H = H + \mu (\hat{S}^2 - S(S+1))
 
         Parameters
         ----------
-        shift : TYPE
-            DESCRIPTION.
+        s : TYPE, optional
+            DESCRIPTION. The default is None.
+        ss : TYPE, optional
+            DESCRIPTION. The default is 0.
+        shift : TYPE, optional
+            DESCRIPTION. The default is 0.2.
 
         Returns
         -------
         None.
-
         """
-        # self.h1e += ...
-        # self.eri += ...
-        return
+        if s is None:
+            s = (np.sqrt(4*ss+1)-1)/2
+            if not np.isclose(2*s, round(2*s)):
+                raise Warning("s = {} inconsistent spin value".format(s))
+        else:
+            if ss is None:
+                ss = s * (s+1)
+            else:
+                raise ValueError('s and ss cannot be specified simultaneously.')
+
+        if ss == 0:
+            # first-order spin penalty J. Phys. Chem. A 2022, 126, 12, 2050–2060
+            # H' = H + J \hat{S}^2
+
+            self.ss = ss
+            self.shift = shift
+            self.spin_purification = True
+
+            return self
+
+
+        else:
+            # second-order spin penalty
+            raise NotImplementedError('Second-order spin panelty not implemented.')
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
         """
@@ -540,7 +586,7 @@ class QCDMRG(CASCI):
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore)
+        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, mo_coeff=self.mo_coeff)
 
         self.e_core = energy_core
 
@@ -641,21 +687,7 @@ class QCDMRG(CASCI):
         # effective H for CAS
         h1e, eri = self.get_SO_matrix()
         
-        if self.spin_purification:
 
-            logging.info('Purify spin by energy penalty')
-
-            # if self.shift is not None:
-            # H1, H2 = self.fix_spin(H1, H2, ss=ss, shift=shift)
-            shift = self.shift
-
-            norb = self.ncas
-            h1e = [h + 3./4 * shift * np.eye(norb) for h in h1e]
-
-            for p in range(norb):
-                for q in range(norb):
-                    eri[:, :, p, q, q, p] -=  0.5 * shift * 2
-                    eri[:, :, p, p, q, q] -= 0.25 * shift * 2
 
         # h2e[0,0] -= h2e[0,0].swapaxes(1,3)
         # h2e[1,1] -= h2e[1,1].swapaxes(1,3)
@@ -713,8 +745,33 @@ class QCDMRG(CASCI):
                             [r"a^\dagger", r"a^\dagger", "a", "a"],
                             [2*p+1, 2*r, 2*s, 2*q+1], val
                         ))
-
-        # 3. Generate MPO
+        if self.spin_purification:
+            J = self.shift
+            print(f"  [Spin Penalty] Adding Exact S^2 Operator (J = {J})...")
+            
+            # On-site terms (p == q)
+            for p in range(ncas):
+                # 3/4 J * (n_{p, up} + n_{p, dn})
+                ham_terms.append(Op("n", 2*p) * (0.75 * J))
+                ham_terms.append(Op("n", 2*p+1) * (0.75 * J))
+                # -3/2 J * n_{p, up} n_{p, dn}
+                ham_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5 * J))
+                
+            # Cross-site terms (p != q)
+            for p in range(ncas):
+                for q in range(ncas):
+                    if p == q: continue
+                    # S_z^2 
+                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q) * (0.25 * J))
+                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * (0.25 * J))
+                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25 * J))
+                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25 * J))
+                    # S_+ S_- (Spin Flip)
+                    # 1.0 * J * a^+_{p, up} a_{p, dn} a^+_{q, dn} a_{q, up}
+                    ham_terms.append(get_jw_term_robust(
+                        [r"a^\dagger", "a", r"a^\dagger", "a"],
+                        [2*p, 2*p+1, 2*q+1, 2*q], J
+                    ))
         basis_sites = [BasisSimpleElectron(i) for i in range(nso)]
         model = Model(basis=basis_sites, ham_terms=ham_terms)
         mpo = Mpo(model, algo="qr")
@@ -726,15 +783,69 @@ class QCDMRG(CASCI):
 
         return self
 
-    def run(self, symmetry_list=None, nsweeps=50, initial_guess=None):
+    def calc_spin_square(self):
+        """
+        Builds the S^2 MPO and evaluates its expectation value.
+
+        Returns
+        -------
+        _type_
+            _description_
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            return 0.0
+            
+        import pyqed.mps.mps as mps_lib
+        
+        ncas = self.ncas
+        s2_terms = []
+        
+        # On-site terms
+        for p in range(ncas):
+            s2_terms.append(Op("n", 2*p) * 0.75)
+            s2_terms.append(Op("n", 2*p+1) * 0.75)
+            s2_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5))
+            
+        # Cross-site terms
+        for p in range(ncas):
+            for q in range(ncas):
+                if p == q: continue
+                s2_terms.append(Op("n", 2*p) * Op("n", 2*q) * 0.25)
+                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * 0.25)
+                s2_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25))
+                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25))
+                s2_terms.append(get_jw_term_robust(
+                    [r"a^\dagger", "a", r"a^\dagger", "a"],
+                    [2*p, 2*p+1, 2*q+1, 2*q], 1.0
+                ))
+                
+        basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+        model = Model(basis=basis_sites, ham_terms=s2_terms)
+        mpo = Mpo(model, algo="qr")
+        mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
+        
+        state = self.dmrg.ground_state
+        if hasattr(state.Bs[0], 'qns'):
+            dense_state = mps_lib.symmetric_to_dense(state)
+            psi_for_eval = dense_state.Bs
+        else:
+            psi_for_eval = state.Bs
+            
+        s2_val = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
+        return float(np.real(s2_val))
+
+    def run(self, nstates=1, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff = None):
         """
         Parameters
         ----------
         symmetry_list : list of strings or bool
             ['charge', 'sz'] or True/False.
         """
+        self.nstates = nstates
         if initial_guess is not None:
             self.init_guess = initial_guess
+        if mo_coeff is not None:
+            self.build(mo_coeff=mo_coeff)
         if self.H_raw is None:
             self.build()
         # Initialize Symmetry 
@@ -772,26 +883,31 @@ class QCDMRG(CASCI):
             mps0 = self.get_initial_guess_dense(noise=1e-3)
             target_qn = None
             use_symmetry = False
+            self.sym_mgr = None
         t0 = time.time()
         print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, 
-                    symmetry=use_symmetry, charge=target_qn, not_conv_err=False)
+        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False)
         dmrg.run()
         self.dmrg = dmrg
         # Report
         e_dmrg_total = dmrg.e_tot + self.e_core
+        s2_val = self.calc_spin_square()
+        if self.spin_purification:
+            e_dmrg_total -= self.shift * s2_val
+        self.e_tot = e_dmrg_total
         print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
         print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
         print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
+        print(f"  <S^2> =             {s2_val:.6f}")
         print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry:
-            self.check_u1_symmetry()
+            self.check_abelian_symmetry()
         return dmrg
 
     def dump(self):
         pass
 
-    def check_u1_symmetry(self):
+    def check_abelian_symmetry(self):
         """
         Post-run analysis: Checks conservation of all active symmetries 
         (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
@@ -802,9 +918,9 @@ class QCDMRG(CASCI):
         print("\n" + "="*60)
         print("  Symmetry Conservation Check")
         print("="*60)
-        # Calculate 1-site RDMs for all sites, returns a dict {site_idx: rho_dense (d,d)}
+        # Calculate local site RDMs, returns a dict {site_idx: rho_dense (d,d)}
         try:
-            rdms = self.dmrg.ground_state.calc_1site_rdm()
+            rdms = self.dmrg.make_local_site_rdm()
         except Exception as e:
             print(f"  [Error] Failed to calculate RDM: {e}")
             return
@@ -861,6 +977,222 @@ class QCDMRG(CASCI):
                 label = f"Unknown ({sym_type})"
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
+    def make_rdm1(self, state_id=0, spatial=False, with_core=False):
+        """
+        Calculates the 1-RDM. 
+        If spatial=True, spin-traces to the spatial MO basis.
+        If with_core=True, re-embeds the frozen core electrons on the diagonal.
+        \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
+        Parameters
+        ----------
+        state_id : int, optional
+            _description_, by default 0
+        spatial : bool, optional
+            _description_, by default False
+        with_core : bool, optional
+            _description_, by default False
+
+        Returns
+        -------
+        _type_
+            _description_
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a state.")
+        if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+            state = self.dmrg.states[state_id]
+        else:
+            state = self.dmrg.ground_state
+        
+        # Get Spin-Orbital RDM
+        if hasattr(state.Bs[0], 'qns'):
+            from pyqed.mps.mps import symmetric_to_dense
+            dense_state = symmetric_to_dense(state)
+            dense_state.dim = 2 
+            P_raw = dense_state.make_rdm1()
+        else:
+            P_raw = state.make_rdm1()
+            
+        # Convert to Spatial MO basis if requested (or if with_core is True)
+        if spatial or with_core:
+            ncas = self.ncas
+            P_spatial = np.zeros((ncas, ncas), dtype=float)
+            for p in range(ncas):
+                for q in range(ncas):
+                    val = P_raw[2*p, 2*q] + P_raw[2*p+1, 2*q+1]
+                    P_spatial[q,p] = float(np.real(val))
+            P_out = P_spatial
+        else:
+            P_out = P_raw
+
+        # Embed Frozen Core for CASSCF optimizations
+        if with_core:
+            ncore = self.ncore
+            norb = ncore + self.ncas
+            D = np.zeros((norb, norb), dtype=float)
+            if ncore > 0:
+                np.fill_diagonal(D[:ncore, :ncore], 2.0)
+            D[ncore:norb, ncore:norb] = P_out
+            return D
+            
+        return P_out
+
+    def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
+        """
+        Calculates the 2-RDM.
+        If spatial=True, spin-traces to the spatial MO basis.
+
+        Parameters
+        ----------
+        state_id : int, optional
+            _description_, by default 0
+        spatial : bool, optional
+            _description_, by default False
+        with_core : bool, optional
+            _description_, by default False
+        idx_pairs : _type_, optional
+            _description_, by default None
+
+        Returns
+        -------
+        _type_
+            _description_
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a state.")
+        if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+            state = self.dmrg.states[state_id]
+        else:
+            state = self.dmrg.ground_state
+        
+        # Get Spin-Orbital RDM
+        if hasattr(state.Bs[0], 'qns'):
+            from pyqed.mps.mps import symmetric_to_dense
+            dense_state = symmetric_to_dense(state)
+            dense_state.dim = 2 
+            G_raw = dense_state.make_rdm2()
+        else:
+            G_raw = state.make_rdm2()
+            
+        # Convert to Spatial MO basis if requested
+        if spatial or with_core:
+            ncas = self.ncas
+            D_spatial = np.zeros((ncas, ncas, ncas, ncas), dtype=float)
+            for p in range(ncas):
+                for q in range(ncas):
+                    for r in range(ncas):
+                        for s in range(ncas):
+                            # p^dag r^dag sq Spatial Convention: dm2[p,q,r,s] = sum_{sig, tau} <p_sig^dag r_tau^dag s_tau q_sig>
+                            val = G_raw[2*p,   2*r,   2*s,   2*q] + \
+                                  G_raw[2*p,   2*r+1, 2*s+1, 2*q] + \
+                                  G_raw[2*p+1, 2*r,   2*s,   2*q+1] + \
+                                  G_raw[2*p+1, 2*r+1, 2*s+1, 2*q+1]
+                            D_spatial[p, q, r, s] = float(np.real(val))
+            G_out = D_spatial
+        else:
+            G_out = G_raw
+            
+        # Embed Frozen Core 
+        if with_core:
+            ncore = self.ncore
+            norb = ncore + self.ncas
+            D2 = np.zeros((norb, norb, norb, norb), dtype=float)
+            if ncore > 0:
+                I = np.eye(ncore)
+                D2[:ncore, :ncore, :ncore, :ncore] = 4 * np.einsum('ij,kl->ijkl', I, I) - 2 * np.einsum('ps,rq->pqrs', I, I)
+                
+                dm1 = self.make_rdm1(state_id, spatial=True, with_core=False)
+                for i in range(ncore):
+                    D2[i, i, ncore:norb, ncore:norb] = 2 * dm1
+                    D2[ncore:norb, ncore:norb, i, i] = 2 * dm1
+                    D2[i, ncore:norb, i, ncore:norb] = -dm1
+                    D2[ncore:norb, i, ncore:norb, i] = -dm1
+                    
+            D2[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = G_out
+            return D2
+            
+        return G_out
+
+    def make_rdm12(self, state_id=0, spatial=True, with_core=False):
+        """
+        standard rdm calculator used for SCF
+
+        Parameters
+        ----------
+        state_id : int, optional
+            _description_, by default 0
+        spatial : bool, optional
+            _description_, by default True
+        with_core : bool, optional
+            _description_, by default False
+
+        Returns
+        -------
+        _type_
+            _description_
+        """
+        return self.make_rdm1(state_id, spatial, with_core), self.make_rdm2(state_id, spatial, with_core)
+
+    def make_local_site_rdm(self, idx=None):
+        """
+        Calculate the local reduced density matrices for individual, isolated spin-orbitals.
+
+        This method traces out the rest of the chain to isolate the internal 
+        quantum state of specific sites.
+
+        Parameters
+        ----------
+        idx : int or list of int, optional
+            The specific site index (or indices) to evaluate. If None, evaluates 
+            the local density matrices for all sites in the active space. 
+            By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping the requested site indices (int) to their corresponding 
+            local density matrices (numpy.ndarray). For spin-orbitals with a physical 
+            dimension `d`, the returned matrix shape is `(d, d)`.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_local_site_rdm(idx=idx)
+
+    def make_diagonal_rdm2(self, idx_pairs=None):
+        """
+        Calculate the diagonal blocks of the 2-site reduced density matrix.
+
+        Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute 
+        density-density correlations (e.g., :math:`\langle n_i n_j \rangle`) without 
+        evaluating the full :math:`\mathcal{O}(L^4)` global 2-RDM tensor.
+
+        Parameters
+        ----------
+        idx_pairs : list of tuple of int, optional
+            A list of site index pairs `(i, j)` to calculate the 2-site RDM for. 
+            If None, computes RDMs for all possible unique pairs in the active space. 
+            By default None.
+
+        Returns
+        -------
+        dict
+            A dictionary mapping each requested `(i, j)` tuple to its corresponding 
+            dense reduced density matrix (numpy.ndarray). If the physical dimension 
+            of a single site is `d`, the returned matrix shape is `(d*d, d*d)`.
+
+        Raises
+        ------
+        ValueError
+            If the DMRG solver has not been run and no ground state is available.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError("Run DMRG first to generate a ground state.")
+        return self.dmrg.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
 
 class DMRGSCF(QCDMRG):
@@ -890,8 +1222,8 @@ if __name__=='__main__':
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=12, nelecas=6, D=60) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
-    dmrg.build().run(symmetry_list=['charge','s_z'], initial_guess='cid')
+    dmrg = QCDMRG(mf, ncas=10, nelecas=6, D=40) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg.build().run(symmetry_list=['charge','sz'], initial_guess='cid')
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
     # mc.run()

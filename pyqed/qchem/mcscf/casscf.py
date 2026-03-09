@@ -36,15 +36,21 @@ class CASSCF(CASCI):
         self.nstates = 1
 
 
-    def run(self, nstates=1):
+    def run(self, nstates= None, weights = None):
         mf = self.mf
 
         # canonical molecular orbs
         C0 = mf.mo_coeff
 
         # CASCI roots
-        nstates = self.nstates
-
+        if nstates == None:
+            nstates = self.nstates
+        else:
+            self.nstates = nstates
+        if weights != None:
+            self.weights = weights
+            if nstates != len(self.weights):
+                raise ValueError("the nstates you requires does not align with the nstates indicated by the weights. check input.")
         nmo = self.mf.nao
         ncas = self.ncas
         nelecas = self.nelecas
@@ -78,9 +84,10 @@ class CASSCF(CASCI):
             C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
 
         elif nstates > 1:
-
             if self.weights is None:
-                raise ValueError('State weights not provided.')
+                self.state_average(weights = np.ones(nstates)/nstates)
+            if len(self.weights) != nstates: 
+                self.state_average(weights = np.ones(nstates)/nstates)
 
             C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
                                          C0=C0, h1e=h1e, eri=eri)
@@ -362,14 +369,14 @@ if __name__=='__main__':
     from pyqed import Molecule
     # from pyqed.qchem.mcscf.direct_ci import CASCI
 
-    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='6311g')
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
     mc = CASSCF(mf, ncas=2, nelecas=2, max_cycles=50)
 
-    nstates = 2
+    nstates = 1
     mc.state_average(weights = np.ones(nstates)/nstates)
     mc.fix_spin(ss=0, shift=0.2)
     mc.run()

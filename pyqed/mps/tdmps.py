@@ -146,6 +146,7 @@ if __name__ == "__main__":
     # Initialize TDMPS Solver
     td = TDMPS(H, D=40)
     td.run(neel, dt, steps, e_ops=[H])
+    # print(td.observables)
     
 
     # # Plot if you wish

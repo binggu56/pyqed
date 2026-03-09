@@ -22,7 +22,7 @@ from pyqed.qchem.gdvr.gdvr_integrals import (
 
 #  Basic molecule holder
 class Molecule:
-    def __init__(self, charges, coords, nelec=None):
+    def __init__(self, charges, coords, nelec=None, spin = None):
         self.charges = np.asarray(charges, float).reshape(-1)
         self.coords  = np.asarray(coords,  float).reshape(-1, 3)
         assert self.charges.shape[0] == self.coords.shape[0]
@@ -31,6 +31,8 @@ class Molecule:
             self.nelec = int(round(float(np.sum(self.charges))))
         else:
             self.nelec = int(nelec)
+
+        self.spin = spin
 
     def to_tuples(self):
         return [(float(Z), float(x), float(y), float(z))

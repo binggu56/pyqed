@@ -93,165 +93,22 @@ class DMRGNewtonHelper(SweepNewtonHelper):
         H_nn *= 2.0
         return H_nn
 
-
-# # 2. RDM Extraction
-# def extract_rdms_for_helper(solver, n_spatial, verbose=False):
-#     """
-#     Extracts P (1-RDM) and D (Diagonal 2-RDM) for the helper.
-#     """
-#     rdm1_dict = solver.make_rdm()
-#     rdm2_dict = solver.make_rdm2()
+def extract_rdms_for_helper(solver, n_spatial, sym_mgr=None, verbose=False):
+    """
+    Build spatial 1-RDM P[p,q] and a 'diagonal 2-RDM' D[p,q] needed by your AO Newton helper.
+    Uses full make_rdm1() to capture exact off-diagonal hopping terms.
+    """
+    state = solver.ground_state
     
-#     # --- 1-RDM (P) ---
-#     n_spin = 2 * n_spatial
-#     P_spin = np.zeros((n_spin, n_spin), dtype=complex)
-#     for i in range(n_spin):
-#         if i in rdm1_dict:
-#             rho = rdm1_dict[i]
-#             if hasattr(rho, 'shape') and rho.shape == (2, 2):
-#                 P_spin[i, i] = rho[1, 1]
-#     for (i, j), rho_flat in rdm2_dict.items():
-#         rho = rho_flat.reshape(4, 4)
-#         val = rho[1, 2] 
-#         P_spin[i, j] = val
-#         P_spin[j, i] = np.conj(val)
-
-#     P_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
-#     for p in range(n_spatial):
-#         for q in range(n_spatial):
-#             val = P_spin[2*p, 2*q] + P_spin[2*p+1, 2*q+1]
-#             P_spatial[p, q] = np.real(val)
-
-#     # --- Diagonal 2-RDM (D) ---
-#     D_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
-#     def get_nn(i, j):
-#         if i == j: return np.real(P_spin[i, i])
-#         idx = (i, j) if i < j else (j, i)
-#         if idx not in rdm2_dict: return 0.0
-#         rho = rdm2_dict[idx].reshape(4,4)
-#         return np.real(rho[3, 3])
-
-#     for p in range(n_spatial):
-#         for q in range(n_spatial):
-#             if p == q:
-#                 val = 2.0 * get_nn(2*p, 2*p+1)
-#             else:
-#                 val  = get_nn(2*p, 2*q)     + get_nn(2*p, 2*q+1)
-#                 val += get_nn(2*p+1, 2*q)   + get_nn(2*p+1, 2*q+1)
-#             D_spatial[p, q] = val
-            
-#     if verbose: print(f"[DMRG-SCF] Extracted RDM Tr(P)={np.trace(P_spatial):.4f}")
-#     return P_spatial, D_spatial
-
-import numpy as np
-
-def extract_rdms_for_helper(solver, n_spatial, verbose=False):
-    """
-    Build spatial 1-RDM P[p,q] and a 'diagonal 2-RDM' D[p,q] needed by your AO Newton helper,
-    from solver.make_rdm() (1-site RDMs) and solver.make_rdm2() (2-site RDMs).
-
-    Key fix for U(1): infer and correct the 2-site basis ordering before reading <c†_i c_j>.
-    """
-
-    rdm1_dict = solver.make_rdm()
-    rdm2_dict = solver.make_rdm2()
-
-    n_spin = 2 * n_spatial
-
-    # helpers 
-    def _as4x4(x):
-        a = np.asarray(x)
-        a = a.reshape(4, 4)
-        return a
-
-    # local operators in |0>,|1>
-    I2 = np.eye(2)
-    n_op = np.array([[0.0, 0.0],
-                     [0.0, 1.0]])
-    c_op = np.array([[0.0, 1.0],
-                     [0.0, 0.0]])
-    cd_op = c_op.T
-
-    # 2-site operators in lex basis |00>,|01>,|10>,|11>
-    nI_lex  = np.kron(n_op, I2)     # n on first site
-    In_lex  = np.kron(I2, n_op)     # n on second site
-    nn_lex  = np.kron(n_op, n_op)   # n_i n_j
-    cd_c_lex = np.kron(cd_op, c_op) # c† (site i) c (site j) for 2-site ordering (i, j)
-
-    # permutation for swapping |01> <-> |10| (i.e., basis [0,2,1,3])
-    perm = np.array([0, 2, 1, 3], dtype=int)
-
-    def _permute_4x4(rho, p):
-        # rho' = P rho P^T where P reorders basis states
-        return rho[np.ix_(p, p)]
-
-    def _trace1(rho):
-        return float(np.real(np.trace(rho)))
-
-    def _expect(rho, op):
-        # Tr(rho op)
-        return np.trace(rho @ op)
-
-    #  1-site occupations (diag of 1-RDM) 
-    P_spin = np.zeros((n_spin, n_spin), dtype=complex)
-
-    # We only rely on 1-site RDM for diagonal n_i
-    for i in range(n_spin):
-        if i in rdm1_dict:
-            rho1 = np.asarray(rdm1_dict[i])
-            # expected shape (2,2)
-            if rho1.shape == (2, 2):
-                P_spin[i, i] = rho1[1, 1]
-
-    #  off-diagonal <c†_i c_j> from 2-site RDM with ordering detection 
-    # We detect whether rho_ij is in lex basis or the swapped-middle-states basis by matching <n_i> and <n_j>.
-    for (i, j), rho_flat in rdm2_dict.items():
-        if not (isinstance(i, int) and isinstance(j, int)):
-            continue
-        if i == j:
-            continue
-
-        rho = _as4x4(rho_flat)
-
-        # normalize rho_ij if needed (some implementations store unnormalized two-site objects)
-        tr = np.trace(rho)
-        if abs(tr) > 1e-12 and abs(tr - 1.0) > 1e-8:
-            rho = rho / tr
-
-        # target occupations from 1-site RDMs (best available reference)
-        ni_ref = P_spin[i, i]
-        nj_ref = P_spin[j, j]
-
-        # compute occupations assuming lex ordering
-        ni_lex = _expect(rho, nI_lex)
-        nj_lex = _expect(rho, In_lex)
-
-        # compute occupations assuming swapped-middle ordering
-        rho_sw = _permute_4x4(rho, perm)
-        ni_sw = _expect(rho_sw, nI_lex)
-        nj_sw = _expect(rho_sw, In_lex)
-
-        # choose ordering that matches 1-site occupations better
-        err_lex = abs(ni_lex - ni_ref) + abs(nj_lex - nj_ref)
-        err_sw  = abs(ni_sw  - ni_ref) + abs(nj_sw  - nj_ref)
-
-        use_swapped = (err_sw < err_lex)
-
-        if use_swapped:
-            rho_use = rho_sw
-        else:
-            rho_use = rho
-
-        # <c†_i c_j> = Tr(rho_ij * (c† ⊗ c)) in the chosen basis
-        val = _expect(rho_use, cd_c_lex)
-
-        P_spin[i, j] = val
-        P_spin[j, i] = np.conj(val)
-
-        if verbose and (i, j) in [(0, 1), (0, 2), (0, 3)]:
-            print(f"[DMRG-SCF] (i,j)=({i},{j}) tr={np.trace(rho):.6f} use_swapped={use_swapped} "
-                  f"ni_ref={ni_ref:.6f} ni={(_expect(rho_use,nI_lex)):.6f} "
-                  f"nj_ref={nj_ref:.6f} nj={(_expect(rho_use,In_lex)):.6f}")
+    # Get 1-RDM
+    if sym_mgr is not None and hasattr(state.Bs[0], 'qns'):
+        P_spin = state.make_rdm1(sym_mgr=sym_mgr)
+    elif hasattr(state.Bs[0], 'qns'):
+        from pyqed.mps.mps import symmetric_to_dense
+        dense_state = symmetric_to_dense(state)
+        P_spin = dense_state.make_rdm1()
+    else:
+        P_spin = state.make_rdm1()
 
     #  spin-sum to spatial 1-RDM 
     P_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
@@ -260,52 +117,15 @@ def extract_rdms_for_helper(solver, n_spatial, verbose=False):
             val = P_spin[2*p, 2*q] + P_spin[2*p+1, 2*q+1]
             P_spatial[p, q] = float(np.real(val))
 
-    #  spatial "diagonal 2-RDM" D[p,q] from <n_{pσ} n_{qτ}> 
-    # IMPORTANT: n_i n_j does NOT require JW strings; it’s diagonal in occupation basis.
-    def _nn_from_rho2(rho):
-        # <n_i n_j> = Tr(rho * (n ⊗ n)) in lex basis; if rho is swapped-middle we must use the same correction
-        # We reuse the same ordering detection based on matching <n_i>,<n_j> (already done above),
-        # but here we only need consistent basis. We'll just compute in both and choose the one that yields
-        # consistent single-site occupations (same criterion).
-        rho = rho / np.trace(rho) if abs(np.trace(rho)) > 1e-12 else rho
-        return _expect(rho, nn_lex)
-
+    # Get Diagonal 2-RDM
+    rdm2_dict = state.make_diagonal_rdm2()
     D_spatial = np.zeros((n_spatial, n_spatial), dtype=float)
-
-    # precompute <n_i n_j> for spin-orbital pairs present in rdm2_dict
-    nn_cache = {}
-
-    for (i, j), rho_flat in rdm2_dict.items():
-        if not (isinstance(i, int) and isinstance(j, int)):
-            continue
-        if i == j:
-            continue
-        rho = _as4x4(rho_flat)
-        tr = np.trace(rho)
-        if abs(tr) > 1e-12 and abs(tr - 1.0) > 1e-8:
-            rho = rho / tr
-
-        ni_ref = P_spin[i, i]
-        nj_ref = P_spin[j, j]
-
-        ni_lex = _expect(rho, nI_lex)
-        nj_lex = _expect(rho, In_lex)
-
-        rho_sw = _permute_4x4(rho, perm)
-        ni_sw = _expect(rho_sw, nI_lex)
-        nj_sw = _expect(rho_sw, In_lex)
-
-        err_lex = abs(ni_lex - ni_ref) + abs(nj_lex - nj_ref)
-        err_sw  = abs(ni_sw  - ni_ref) + abs(nj_sw  - nj_ref)
-        rho_use = rho_sw if (err_sw < err_lex) else rho
-
-        nn_cache[(i, j)] = _expect(rho_use, nn_lex)
-        nn_cache[(j, i)] = nn_cache[(i, j)]
 
     def get_nn(i, j):
         if i == j:
             return float(np.real(P_spin[i, i]))
-        return float(np.real(nn_cache.get((i, j), 0.0)))
+        a, b = (i, j) if i < j else (j, i)
+        return float(np.real(rdm2_dict.get((a, b), 0.0)))
 
     for p in range(n_spatial):
         for q in range(n_spatial):
@@ -330,12 +150,12 @@ def extract_rdms_for_helper(solver, n_spatial, verbose=False):
 
 # 3. Main ReOptimization for at AO level
 def dmrg_ao_optimization_step(
-    mol, d_stack, dummy, S_prim, ERIop, h1_nm_func, 
+    mol, d_stack, sym_mgr, S_prim, ERIop, h1_nm_func, 
     z, Kz, T_prim, alphas, centers, labels, K_h, Kx_h,
     solver, Enuc=0.0, n_cycles=5, ridge=0.5, verbose=True
 ):
     # 1. Extract RDMs
-    P_spatial, D_spatial = extract_rdms_for_helper(solver, d_stack.shape[0], verbose=verbose)
+    P_spatial, D_spatial = extract_rdms_for_helper(solver, d_stack.shape[0], sym_mgr=sym_mgr, verbose=verbose)
     
     # 2. Instantiate the Custom Helper
     nh = DMRGNewtonHelper(h1_nm_func, S_prim, ERIop, D_spatial)
