@@ -584,7 +584,7 @@ class CASCI(mcscf.casci.CASCI):
         s : TYPE, optional
             DESCRIPTION. The default is None.
         ss : TYPE, optional
-            DESCRIPTION. The default is None.
+            DESCRIPTION. The default is 0.
         shift : TYPE, optional
             DESCRIPTION. The default is 0.2.
 
