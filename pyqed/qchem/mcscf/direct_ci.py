@@ -265,7 +265,7 @@ def hamiltonian_matrix_elements(Binary, H1, H2, SC1, SC2):
 
 
 class CASCI(mcscf.casci.CASCI):
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None):
+    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, tol=0):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -289,6 +289,7 @@ class CASCI(mcscf.casci.CASCI):
             DESCRIPTION. The default is None.
         nelecas : TYPE, optional
             DESCRIPTION. The default is None.
+        etol: energy convergence for diagonalization
 
         mu: float
             chemical pontential. The default is None.
@@ -351,6 +352,8 @@ class CASCI(mcscf.casci.CASCI):
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
+        
+        self.tol = tol
 
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
@@ -717,6 +720,10 @@ class CASCI(mcscf.casci.CASCI):
 
 
             E, X = eigsh(H_CI, k=nstates, which='SA')
+            
+            # from pyqed.davidson import davidson
+            
+            # E, X = davidson(H_CI, nstates, tol=1e-13)
 
         elif method == 'direct_ci':
 
@@ -781,7 +788,8 @@ class CASCI(mcscf.casci.CASCI):
 
             H = LinearOperator((binary.shape[0], binary.shape[0]), matvec=mv)
 
-            E, X = eigsh(H, k=nstates, which='SA')
+            E, X = eigsh(H, k=nstates, which='SA', tol=self.tol)
+            
 
 
 

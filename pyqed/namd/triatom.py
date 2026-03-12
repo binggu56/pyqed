@@ -8,11 +8,16 @@ from kinetic import *
 # from pyqed.ldr.ldr import *
 
 
-class Triatom:
+class Triatom(Molecule):
     """
     nonadiabatic geometric quantum dynamics for triatomic molecules ABC
     (vibrational, rovibrational, rovibronic)
+    
+
+    
     """
+    
+    
     def __init__(self, symbols, coord='eckart', with_rotation=False):
         
         # Parse chemical formula into a list of atoms
@@ -76,7 +81,7 @@ class Triatom:
             self.dim = 6 # rotation + vibration
 
         self.x = None # list of grids
-
+        self.equibrium_geometry = None
 
 
 
@@ -108,6 +113,10 @@ class Triatom:
         r2  \
              H
 
+
+        Analytical expressions for the Eckart frame KEO can be found at 
+        J. Chem. Phys., Vol. 107, No. 22, 8 December 1997
+    
         Returns
         -------
         TYPE
@@ -334,7 +343,7 @@ class Triatom:
     def internal_to_xyz(self):
         pass
 
-    def run(self, domain, npts=[15, 15, 15], dvr_type='sine'):
+    def set_dvr(self, domain, npts=[15, 15, 15], dvr_type='sine'):
 
         from pyqed.dvr.dvr_1d import SineDVR
 
@@ -351,8 +360,7 @@ class Triatom:
 
 
 
-        # compute the KEO in the DVR
-        T = self.buildK()
+
 
         # build the potential energy and overlap matrix
 
@@ -360,6 +368,16 @@ class Triatom:
 
 
         pass
+    
+    def run(self, dt, nt=1):
+        
+        # compute the KEO in the DVR
+        T = self.buildK()
+    
+        
+        
+        pass
+    
 
 
 if __name__ == '__main__':
@@ -368,6 +386,7 @@ if __name__ == '__main__':
     from pyqed.phys import gwp, discretize
     from pyqed.units import au2fs, au2wavenumber
     import time
+    from pyqed.qchem import Molecule
 
     # ===== 1. Define system and DVR basis =====
     N_r1, N_r2, N_th =7,7,7
@@ -378,30 +397,59 @@ if __name__ == '__main__':
 
     nstates = 2
 
+    # equlibirum geometry 
+    atom = [['H' , (0, 0., 0.)],
+            ['H', (0, 0., 2)], 
+            ['H', (1.5, 0, 0)]]
+    #mol.basis = {'Ne': '6-31G'}
+    # mol = Molecule(atom, basis='631g', charge=1)
+    
+    # transform to principle axes 
+    # mol.molecular_frame()
+    
     # ===== 2. Initialize Triatom class =====
-    mol = Triatom('H2O')
-
-    # ===== 3. Triatom builds full kinetic energy matrix T_total, pass to LDRN =====
+    mol = Triatom(atom, coord='eckart')
+    
+    
     start_time = time.time()
+    
+    # set up the DVR grid 
+    
+    domains = [[1.0, 4.0], [1.0, 4.0], [1.2, 2.8]]
+    levels = [3,3,3]  # so that 2^level - 1 = N per dimension
+
+    mol.set_dvr(domain, npts, dvr_type='sine')
+    
+    # =====Triatom builds full kinetic energy matrix T_total    
     T_total = mol.buildK()
     print(f"T_total built in {time.time() - start_time:.2f} s, shape = {T_total.shape}")
 
 
-    domains = [[1.0, 4.0], [1.0, 4.0], [1.2, 2.8]]
-    levels = [3,3,3]  # so that 2^level - 1 = N per dimension
+    # PES
+    from pyqed.qchem import CASCI 
+    
+    for p in mol.grid:
+        mc.run(p)
 
-    solver = LDRN(domains, levels, nstates=nstates,
-                  mass=[mol.mu1, mol.mu2, 1.0], ndim=3)
+    # build the NN overlap matrix 
+    
+    # construct the global A
+    
+    
 
-    nx_list = solver.nx  # e.g. [N_r1, N_r2, N_th]
-    x = solver.x         # [r1_grid, r2_grid, th_grid]
-    dx = solver.dx
+
+    # solver = LDRN(domains, levels, nstates=nstates,
+    #               mass=[mol.mu1, mol.mu2, 1.0], ndim=3)
+
+    # nx_list = solver.nx  # e.g. [N_r1, N_r2, N_th]
+    # x = solver.x         # [r1_grid, r2_grid, th_grid]
+    # dx = solver.dx
 
 
     solver.apes = np.zeros((*nx_list, nstates))
     solver.adiabatic_states = np.zeros((*nx_list, nstates, nstates))
 
-
+    
 
     dt = 0.2 / au2fs
     nt = 100
