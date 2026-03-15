@@ -453,6 +453,7 @@ class MPS:
         elif (center == -1) and gauge is None:
             # print('You are creating a MPS without a gauge. Suggest calling right_canonicalize() for canonicalization first.")')
             self.gauge = None
+            self.center = center
         else:
             raise ValueError('Cannot specify both gauge and center. Use only one.')
 
@@ -2280,6 +2281,40 @@ class MPO:
 
         return expmpo(self.H, constant, D=D, method='taylor', order=4, scale=0)
 
+    def compress(self, chi_max):
+        """
+        Compresses the MPO back to a maximum bond dimension.
+        """
+        mps_factors = []
+        phys_dims = []
+
+        for W in self.factors:
+            s = W.shape
+            # Store original physical dims (d_up, d_down)
+            phys_dims.append((s[2], s[3]))
+
+            # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
+            W_flat = W.reshape(s[0], s[1], s[2] * s[3])
+
+            # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
+            W_ready = W_flat.transpose(0, 2, 1)
+            mps_factors.append(W_ready)
+
+        # Compress the MPO (treated as an MPS)
+        compressed_factors = compress(mps_factors, chi_max)
+        if isinstance(compressed_factors, tuple):
+            compressed_factors = compressed_factors[0]
+
+        # Restore MPO format
+        final_factors = []
+        for i, B in enumerate(compressed_factors):
+            # B shape: (new_chi_L, d_combined, new_chi_R)
+            B_transposed = B.transpose(0, 2, 1)
+            d_up, d_down = phys_dims[i]
+            W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
+            final_factors.append(W_final)
+
+        return MPO(final_factors)
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
     """
@@ -2516,7 +2551,8 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
         factorial = factorial * k
         coefficient = (scaled_constant ** k) / factorial
         result = result + (term * coefficient)
-
+        if D is not None:
+            result = result.compress(D)
     for _ in range(scale):
         result = result.matmul(result, chi_max=D)
 
