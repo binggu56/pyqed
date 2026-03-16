@@ -2,7 +2,8 @@ import numpy as np
 import itertools
 from collections import defaultdict
 import time
-
+from scipy.sparse.linalg import LinearOperator, eigsh
+import copy
 
 class QN(tuple):
     """
@@ -221,8 +222,9 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
         
     v0 = v0 * (1.0 / norm_val)
     
-    V = [v0]; HV = []; T = np.zeros((0,0), dtype=complex)
-    curr_eig = 0.0; ritz_vec = v0
+    V = [v0]
+    HV = []
+    T = np.zeros((0,0), dtype=complex)
     
     for it in range(max_iter):
         v_new = V[-1]
@@ -237,21 +239,47 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
             T_new[m-1,i] = el.conjugate()
         T = T_new
         w, v = np.linalg.eigh(T)
-        curr_eig = w[0]
-        ritz_vec = V[0]*v[0,0]
-        ritz_H = HV[0]*v[0,0]
-        for i in range(1,m):
-            ritz_vec = ritz_vec + V[i]*v[i,0]
-            ritz_H = ritz_H + HV[i]*v[i,0]
-        resid = ritz_H - ritz_vec*curr_eig
-        if resid.norm() < tol: return curr_eig, ritz_vec
         
-        # Scale residual
-        q = resid * -10.0 
+        k_roots = min(n_eig, m)
+        ritz_vecs = []
+        ritz_Hs = []
+        for k in range(k_roots):
+            r_vec = V[0]*v[0,k]
+            r_H = HV[0]*v[0,k]
+            for i in range(1, m):
+                r_vec = r_vec + V[i]*v[i,k]
+                r_H = r_H + HV[i]*v[i,k]
+            ritz_vecs.append(r_vec)
+            ritz_Hs.append(r_H)
+            
+        resid_max = 0.0
+        for k in range(k_roots):
+            resid = ritz_Hs[k] - ritz_vecs[k] * w[k]
+            resid_max = max(resid_max, resid.norm())
+            
+        if resid_max < tol and k_roots == n_eig:
+            if n_eig == 1: return w[0], ritz_vecs[0]
+            else: return w[:k_roots], ritz_vecs
+            
+        # Preconditioner for next vector using sum of residuals
+        resid_sum = ritz_Hs[0] - ritz_vecs[0] * w[0]
+        for k in range(1, k_roots):
+            resid_sum = resid_sum + (ritz_Hs[k] - ritz_vecs[k] * w[k])
+            
+        q = resid_sum * -10.0 
         for vec in V:
             ov = vec.dot(q)
             q = q - vec*ov
         qn = q.norm()
-        if qn < 1e-9: return curr_eig, ritz_vec
+        if qn < 1e-9: 
+            if n_eig == 1: 
+                return w[0], ritz_vecs[0]
+            else: 
+                return w[:k_roots], ritz_vecs
         V.append(q * (1.0/qn))
-    return curr_eig, ritz_vec
+        
+    if n_eig == 1: 
+        return w[0], ritz_vecs[0]
+    else: 
+        return w[:k_roots], ritz_vecs
+

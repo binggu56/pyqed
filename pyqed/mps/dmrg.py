@@ -24,42 +24,42 @@ class DMRG:
     """
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
                 symmetry=False, charge=None, spin = None,\
-                target_qn = None, sym_mgr = None, not_conv_err=True):
+                target_qn = None, sym_mgr = None, not_conv_err=True,
+                nstates=1, weights=None): # [FIX] Added nstates and weights
         """
-
-
         Parameters
         ----------
-        H : TYPE
-            MPO of H.
-        D : TYPE
+        H : MPO
+            MPO of the Hamiltonian.
+        D : int
             maximum bond dimension.
-        nsweeps : TYPE, optional
-            DESCRIPTION. The default is None.
-        init_guess : TYPE, optional
-            DESCRIPTION. The default is None.
-
-        Returns
-        -------
-        None.
-
+        nsweeps : int
+            Number of sweeps to perform.
+        nstates : int
+            Number of states for State-Averaged DMRG.
+        weights : list
+            Weights for state averaging.
         """
 
         self.H = H
-        # self.L = self.H.L
+        self.L = len(self.H)
         self.D = D
         self.nsweeps = nsweeps
         self.opt = opt
 
         self.init_guess = init_guess
-        self.mps = None
         self.e_tot = None
         self.U1 = self.symmetry = symmetry
+        
 
+        self.nstates = nstates
+        self.weights = weights if weights is not None else [1.0/nstates]*nstates
+
+        # Symmetry Logic
         if target_qn is not None and (sym_mgr is None):
-            raise ValueError("Symmetry manager must be provided when target quantum number is specified as QN object.")
+            raise ValueError("Symmetry manager must be provided when target quantum number is specified.")
         elif target_qn is None and sym_mgr is not None:
-            raise ValueError("Target quantum number must be specified when sym_mgr is given. If you are restricting symmetry by charge and spin, don't need to input sym_mgr to avoid conflict.")
+            raise ValueError("Target quantum number must be specified when sym_mgr is given.")
         elif (charge is not None) and (spin is not None):
             sym_mgr = SymmetryManager(['charge', 'sz'])
             target_qn = sym_mgr.get_target_qn(charge, 2*spin)
@@ -71,16 +71,13 @@ class DMRG:
             target_qn = sym_mgr.get_target_qn(2*spin)
             
         self.charge = charge
-
-        self.ground_state = None
-        self.mps = None # to hold eigenstates
-        
-        # self.ground_state_raw = None
-
-        self.not_conv_err = not_conv_err
-        self.converged = False
         self.target_qn = target_qn 
         self.sym_mgr = sym_mgr
+
+        self.ground_state = None # Holds Root 0
+        self.states = None       # Holds list of all Roots
+        self.not_conv_err = not_conv_err
+        self.converged = False
 
     def run(self):
 
@@ -96,62 +93,45 @@ class DMRG:
             # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
             mps_list = self.init_guess
 
-        if isinstance(self.H, MPO):
-            mpo_list = self.H.factors
-        else:
-            mpo_list = self.H
+        mpo_list = self.H.factors if isinstance(self.H, MPO) else self.H
 
-        if self.symmetry:
-
-            if isinstance(mps_list, list) and not \
-                isinstance(mps_list[0], BlockTensor):
-
-                mps_list = dense_to_symmetric(mps_list, phys_qns=None)
-
-            if self.target_qn is not None:
-
-                qs = sorted({key[1] for key in mps_list[-1].data.keys()})
-                if len(qs) != 1:
-                    raise ValueError(f"Ambiguous total charge: {qs}.")
-                self.target_qn = qs[0]
+        if self.symmetry and not isinstance(mps_list[0], BlockTensor):
+            mps_list = dense_to_symmetric(mps_list, sym_mgr=self.sym_mgr)
 
         if self.opt == '1site':
 
             fDMRG_1site_GS_OBC(mpo_list, self.D, self.nsweeps)
 
         elif self.opt == '2site':
+            res = two_site_dmrg(
+                mps_list, mpo_list, self.D, self.nsweeps, 
+                U1=self.U1, target_qn=self.target_qn, 
+                not_conv_err=self.not_conv_err, sym_mgr=self.sym_mgr,
+                nstates=self.nstates, weights=self.weights
+            )
+            e_elec, mps_out, self.gauge, self.converged = res
 
-            self.e_tot, ground_state, self.gauge, self.converged = two_site_dmrg(
-                mps_list, mpo_list, self.D, self.nsweeps, \
-                    U1=self.U1, target_qn=self.target_qn, not_conv_err=self.not_conv_err, sym_mgr=self.sym_mgr)
-
-            if self.U1:
-                # U1 engine returns [Left, Right, Phys]
-                labels = ['lv', 'rv', 'p']
-            else:
-                # Dense engine returns [Left, Phys, Right]
-                labels = ['lv', 'p', 'rv']
+            shift = getattr(self.H, 'constant', 0.0)
             
-            # self.ground_state = self.mps = MPS(ground_state, labels=labels, gauge=gauge)
+            labels = ['lv', 'rv', 'p'] if self.U1 else ['lv', 'p', 'rv']
+            center = (len(self.H) - 1) if self.gauge.lower() == "left" else 0
 
-            if self.gauge.lower() == "left":
+            if self.nstates == 1:
+                self.e_tot = e_elec + shift
+                self.ground_state = MPS(mps_out, labels=labels, center=center)
+                self.states = [self.ground_state]
+            else:
+                self.e_tot = [e + shift for e in e_elec]
+                self.states = [MPS(s, labels=labels, center=center) for s in mps_out]
+                self.ground_state = self.states[0]
 
-                self.ground_state = MPS(ground_state, labels=labels,\
-                                        center=len(ground_state)-1)
-                    
-                self.ground_state.left_canonicalize()
-
-            elif self.gauge.lower() == "right":
-
-                self.ground_state = MPS(ground_state, labels=labels,
-                                        center=0)
-                self.ground_state.right_canonicalize()
-
-        else:
-            raise ValueError('Optimization algorithm {self.opt} does not exist. Use "1site" or "2site".')
+            for s in self.states:
+                if self.gauge.lower() == "left": 
+                    s.left_canonicalize()
+                else: 
+                    s.right_canonicalize()
 
         return self
-
     def expect(self, e_ops):
         """
         Compute expectation value of ground states

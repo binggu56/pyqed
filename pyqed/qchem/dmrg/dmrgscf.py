@@ -7,6 +7,7 @@ DMRGSCF
 
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
+# TODO: so since we are sharing CASSCF optimization code, currently after the DMRGSCF, final print get E(CASSCF) = xxxxxxx, it might be better if we fix that.
 from pyqed.qchem import QCDMRG, CASSCF
 from pyqed.qchem.mcscf.casscf import kernel, kernel_state_average
 import numpy as np
@@ -54,7 +55,7 @@ class DMRGSCF(QCDMRG):
         mc.ss = self.ss
         mc.shift = self.shift
 
-        mc.run(**kwargs)
+        mc.run(nstates=self.nstates, weights=self.weights, **kwargs)
 
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo()
@@ -97,11 +98,11 @@ if __name__=='__main__':
 
     mf = mol.RHF().run()
 
-    mc = DMRGSCF(mf, ncas=2, nelecas=2, D=60, max_cycles=50)
+    mc = DMRGSCF(mf, ncas=6, nelecas=6, D=60, max_cycles=50)
 
     mc.fix_spin(ss=0, shift=0.2)
     mc.run(
-        nstates=1, # currently the nstates for dmrgscf is a dummy stuff, since we have not get excited states in the qcdmrg solver (or the dmrg solver)
+        nstates=2,
         symmetry_list=['charge', 'sz'], 
         initial_guess='cid'
     )
