@@ -25,7 +25,7 @@ class DMRG:
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
                 symmetry=False, charge=None, spin = None,\
                 target_qn = None, sym_mgr = None, not_conv_err=True,
-                nstates=1, weights=None): # [FIX] Added nstates and weights
+                nstates=1, weights=None):
         """
         Parameters
         ----------

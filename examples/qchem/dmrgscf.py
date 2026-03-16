@@ -6,7 +6,7 @@ mol.build(driver='pyscf')
 
 mf = mol.RHF().run()
 
-mc = DMRGSCF(mf, ncas=6, nelecas=6, D=60, max_cycles=50)
+mc = DMRGSCF(mf, ncas=4, nelecas=4, D=60, max_cycles=50)
 
 mc.fix_spin(ss=0, shift=0.2)
 mc.run(

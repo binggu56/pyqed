@@ -34,7 +34,7 @@ from pyqed.mps.decompose import decompose, compress
 import logging
 logger = logging.getLogger(__name__)
 try:
-    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
+    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, solve_davidson_block, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
@@ -937,7 +937,7 @@ class MPS:
         - Moves orthogonality center to the last site (L-1).
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
-            self.Center = self.L - 1
+            self.center = self.L - 1
             return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
@@ -967,7 +967,7 @@ class MPS:
         B_last /= np.linalg.norm(B_last)
         self.Bs[self.L - 1] = B_last.transpose(perm_inv)
         # Update Center
-        self.Center = self.L - 1
+        self.center = self.L - 1
 
     def right_canonicalize(self):
         """
@@ -978,7 +978,7 @@ class MPS:
         - Moves orthogonality center to the first site (0).
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
-            self.Center = 0
+            self.center = 0
             return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
@@ -1009,7 +1009,7 @@ class MPS:
         B_first /= np.linalg.norm(B_first)
         self.Bs[0] = B_first.transpose(perm_inv)
         # Update Center
-        self.Center = 0
+        self.center = 0
 
     def left_to_vidal(self):
         pass
@@ -3536,7 +3536,22 @@ def sa_svd_symmetric(AA_list, weights, dir, m_max=None):
     V_t = BlockTensor(final_V, [bond_qns, AA_perm_0.qns[2], AA_perm_0.qns[3]], [-1, AA_perm_0.dirs[2], AA_perm_0.dirs[3]])
     return U_t, V_t, final_S, 0.0, sum(len(v) for v in kept.values())
 
-def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstates=1, weights=None):
+def compatible_blocktensor_structure(x, y):
+    if x.rank != y.rank:
+        return False
+    if x.dirs != y.dirs:
+        return False
+    if len(x.qns) != len(y.qns):
+        return False
+    for qx, qy in zip(x.qns, y.qns):
+        if qx != qy:
+            return False
+    for k, bx in x.data.items():
+        if k in y.data and bx.shape != y.data[k].shape:
+            return False
+    return True
+
+def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstates=1, weights=None, init_vecs = None):
     """
     two-site optimization of MPS A,B with respect to MPO W1,W2 and
     environment tensors E,F
@@ -3622,7 +3637,37 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
                 B_new = V
             return energy, A_new, B_new, trunc, m_kept
         else: # state average dmrg
-            energies, AA_new_list = solve_davidson(H_op, AA, n_eig=nstates, tol=1e-5)
+            guess_list = [AA]
+            if init_vecs is not None:
+                valid = [g for g in init_vecs if compatible_blocktensor_structure(g, AA)]
+                if len(valid) > 0:
+                    guess_list = valid[:nstates]
+
+            # Add tiny random companions if we need more than one state
+            # and no previous local state guesses are being passed in yet.
+            rng = np.random.default_rng(1234)
+            for _ in range(1, nstates):
+                data = {}
+                for k, blk in AA.data.items():
+                    noise = rng.standard_normal(blk.shape)
+                    if np.iscomplexobj(blk):
+                        noise = noise + 1j * rng.standard_normal(blk.shape)
+                    data[k] = noise.astype(blk.dtype, copy=False)
+                guess = BlockTensor(data, AA.qns[:], AA.dirs[:])
+
+                # Bias toward the current AA sector structure a bit
+                guess = AA * 1e-3 + guess
+                guess_list.append(guess)
+
+            energies, AA_new_list = solve_davidson_block(
+                H_op,
+                guess_list,
+                n_eig=nstates,
+                tol=1e-5,
+                max_iter=30,
+                max_subspace=max(8, 4 * nstates),
+            )
+
             U, V, S_dict, trunc, m_kept = sa_svd_symmetric(AA_new_list, weights, dir=dir, m_max=m)
             if dir == 'right':
                 A_new, B_new = U.transpose(0, 2, 1), multiply_S_V(S_dict, V)
@@ -3693,13 +3738,15 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     
     last_i = 0
     last_AA_list = None
-    
+    bond_guess_cache = {}
     for sweep in range(0, int(sweeps/2)):
         for i in range(0, len(MPS)-2):
             if nstates > 1:
+                init_vecs = bond_guess_cache.get(i, None)
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights, init_vecs=last_AA_list)
                 E_ground_state = Energy[0]
+                bond_guess_cache[i] = last_AA_list
             else:
                 Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
                     MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr)
