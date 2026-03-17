@@ -267,7 +267,7 @@ def get_excitation_op(i, j, binary, sign, spin=0):
 
     # print(a.shape, a_t.shape)
 
-        # return a_t, a
+            return a_t, a
 
     return sign[j, spin]*a_t, sign[i, spin]*a
 
