@@ -96,6 +96,7 @@ class CASSCF(CASCI):
         self.mo_coeff = C
         self.e_tot = mc.e_tot
         self.ci = mc.ci
+        self.e_history = getattr(mc, 'e_history', [self.e_tot])
 
         return self
 
@@ -386,3 +387,8 @@ if __name__=='__main__':
     mc.run()
 
     # correct result is E(CASSCF) = [-7.67160344]
+    # energy logs for you to use
+    print(mc.e_tot[0]) #ground state energy
+    print(mc.e_tot[1]) #fitst excited state
+    print([list(h) for h in mc.e_history]) #whole energy log in list
+    print(mc.e_history) #whole energy log in array
