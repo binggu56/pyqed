@@ -2,7 +2,8 @@ import numpy as np
 import itertools
 from collections import defaultdict
 import time
-
+from scipy.sparse.linalg import LinearOperator, eigsh
+import copy
 
 class QN(tuple):
     """
@@ -221,8 +222,9 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
         
     v0 = v0 * (1.0 / norm_val)
     
-    V = [v0]; HV = []; T = np.zeros((0,0), dtype=complex)
-    curr_eig = 0.0; ritz_vec = v0
+    V = [v0]
+    HV = []
+    T = np.zeros((0,0), dtype=complex)
     
     for it in range(max_iter):
         v_new = V[-1]
@@ -237,21 +239,270 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
             T_new[m-1,i] = el.conjugate()
         T = T_new
         w, v = np.linalg.eigh(T)
-        curr_eig = w[0]
-        ritz_vec = V[0]*v[0,0]
-        ritz_H = HV[0]*v[0,0]
-        for i in range(1,m):
-            ritz_vec = ritz_vec + V[i]*v[i,0]
-            ritz_H = ritz_H + HV[i]*v[i,0]
-        resid = ritz_H - ritz_vec*curr_eig
-        if resid.norm() < tol: return curr_eig, ritz_vec
         
-        # Scale residual
-        q = resid * -10.0 
+        k_roots = min(n_eig, m)
+        ritz_vecs = []
+        ritz_Hs = []
+        for k in range(k_roots):
+            r_vec = V[0]*v[0,k]
+            r_H = HV[0]*v[0,k]
+            for i in range(1, m):
+                r_vec = r_vec + V[i]*v[i,k]
+                r_H = r_H + HV[i]*v[i,k]
+            ritz_vecs.append(r_vec)
+            ritz_Hs.append(r_H)
+            
+        resid_max = 0.0
+        for k in range(k_roots):
+            resid = ritz_Hs[k] - ritz_vecs[k] * w[k]
+            resid_max = max(resid_max, resid.norm())
+            
+        if resid_max < tol and k_roots == n_eig:
+            if n_eig == 1: 
+                return w[0], ritz_vecs[0]
+            else: 
+                return w[:k_roots], ritz_vecs
+            
+        # Preconditioner for next vector using sum of residuals
+        resid_sum = ritz_Hs[0] - ritz_vecs[0] * w[0]
+        for k in range(1, k_roots):
+            resid_sum = resid_sum + (ritz_Hs[k] - ritz_vecs[k] * w[k])
+            
+        q = resid_sum * -10.0 
         for vec in V:
             ov = vec.dot(q)
             q = q - vec*ov
         qn = q.norm()
-        if qn < 1e-9: return curr_eig, ritz_vec
+        if qn < 1e-9: 
+            if n_eig == 1: 
+                return w[0], ritz_vecs[0]
+            else: 
+                return w[:k_roots], ritz_vecs
         V.append(q * (1.0/qn))
-    return curr_eig, ritz_vec
+        
+    if n_eig == 1: 
+        return w[0], ritz_vecs[0]
+    else: 
+        return w[:k_roots], ritz_vecs
+
+
+
+def _bt_random_like(v, seed=None):
+    """
+    Make a random BlockTensor with the same block structure as v.
+    """
+    rng = np.random.default_rng(seed)
+    data = {}
+    for k, blk in v.data.items():
+        arr = rng.standard_normal(blk.shape)
+        if np.iscomplexobj(blk):
+            arr = arr + 1j * rng.standard_normal(blk.shape)
+        data[k] = arr.astype(blk.dtype, copy=False)
+    return BlockTensor(data, v.qns[:], v.dirs[:])
+
+
+def _bt_orthonormalize(vec, basis, tol=1e-12, n_pass=2):
+    """
+    Modified Gram-Schmidt for BlockTensor vectors.
+    Returns normalized vector, or None if it becomes linearly dependent.
+    """
+    q = vec
+    for _ in range(n_pass):
+        for b in basis:
+            ov = b.dot(q)
+            q = q - b * ov
+    qn = q.norm()
+    if qn < tol:
+        return None
+    return q * (1.0 / qn)
+
+
+def solve_davidson_block(
+    H_linop,
+    v0_list,
+    n_eig=2,
+    tol=1e-5,
+    max_iter=30,
+    max_subspace=None,
+    lindep_tol=1e-12,
+    resid_add_tol=1e-10,
+    verbose=False,
+):
+    """
+    Block Davidson for BlockTensor-based linear operators.
+
+    Parameters
+    ----------
+    H_linop : object
+        Must provide matvec(v)
+    v0_list : BlockTensor or list[BlockTensor]
+        Initial guess vectors. For best performance, provide >= n_eig guesses.
+        If fewer are provided, the solver will auto-complete with random guesses
+        in the same sector/block structure as the first one.
+    n_eig : int
+        Number of lowest Ritz roots to target.
+    tol : float
+        Convergence threshold on max residual norm.
+    max_iter : int
+        Maximum number of outer iterations.
+    max_subspace : int or None
+        If exceeded, restart from current Ritz vectors.
+    lindep_tol : float
+        Threshold for removing linearly dependent trial vectors.
+    resid_add_tol : float
+        Threshold for accepting a correction vector.
+    verbose : bool
+        Print simple diagnostics.
+
+    Returns
+    -------
+    evals : ndarray shape (k,)
+    evecs : list[BlockTensor]
+    """
+    if not isinstance(v0_list, (list, tuple)):
+        v0_list = [v0_list]
+
+    if len(v0_list) == 0:
+        raise ValueError("solve_davidson_block needs at least one initial guess.")
+
+    proto = v0_list[0]
+
+    # If not enough guesses, augment with random vectors of same structure
+    guesses = [v.copy() for v in v0_list]
+    seed = 12345
+    while len(guesses) < n_eig:
+        guesses.append(_bt_random_like(proto, seed=seed))
+        seed += 1
+
+    # Build initial orthonormal basis
+    V = []
+    for v in guesses:
+        vn = v.norm()
+        if vn < lindep_tol:
+            continue
+        v = v * (1.0 / vn)
+        v = _bt_orthonormalize(v, V, tol=lindep_tol)
+        if v is not None:
+            V.append(v)
+
+    if len(V) == 0:
+        raise ValueError("All initial guesses are linearly dependent or zero.")
+
+    # Initial H|v>
+    HV = [H_linop.matvec(v) for v in V]
+
+    # Initial projected matrix T = V^† H V
+    m = len(V)
+    T = np.zeros((m, m), dtype=np.complex128)
+    for i in range(m):
+        for j in range(m):
+            T[i, j] = V[i].dot(HV[j])
+
+    evals = None
+    ritz_vecs = None
+
+    for it in range(max_iter):
+        # Hermitian projected problem
+        w, alpha = np.linalg.eigh(T)
+        idx = np.argsort(w.real)
+        w = w[idx]
+        alpha = alpha[:, idx]
+
+        k_roots = min(n_eig, len(w))
+        evals = w[:k_roots]
+
+        ritz_vecs = []
+        residuals = []
+        resid_norms = []
+
+        # Build Ritz vectors x_k = sum_i alpha_i^k V_i
+        # and Hx_k = sum_i alpha_i^k HV_i
+        for k in range(k_roots):
+            coeff = alpha[:, k]
+
+            xk = V[0] * coeff[0]
+            Hxk = HV[0] * coeff[0]
+            for i in range(1, len(V)):
+                xk = xk + V[i] * coeff[i]
+                Hxk = Hxk + HV[i] * coeff[i]
+
+            rk = Hxk - xk * w[k]
+
+            ritz_vecs.append(xk)
+            residuals.append(rk)
+            resid_norms.append(rk.norm())
+
+        max_resid = max(resid_norms) if resid_norms else 0.0
+
+        if verbose:
+            print(f"[Block-Davidson] iter={it:2d}  roots={k_roots}  "
+                  f"evals={np.real_if_close(evals)}  max_resid={max_resid:.3e}")
+
+        if k_roots == n_eig and max_resid < tol:
+            return evals, ritz_vecs
+
+        # Build one correction vector per unconverged root
+        new_vecs = []
+        trial_basis = V.copy()
+
+        for k in range(k_roots):
+            if resid_norms[k] < tol:
+                continue
+
+            # Identity preconditioner for now: q = r
+            q = residuals[k]
+
+            # Orthogonalize against current basis and accepted new vectors
+            q = _bt_orthonormalize(q, trial_basis, tol=resid_add_tol)
+            if q is None:
+                continue
+
+            new_vecs.append(q)
+            trial_basis.append(q)
+
+        # If no usable new direction was generated, return best current Ritz set
+        if len(new_vecs) == 0:
+            if verbose:
+                print("[Block-Davidson] No new directions generated; returning current Ritz vectors.")
+            return evals, ritz_vecs
+
+        # Simple restart if subspace too large
+        if max_subspace is not None and (len(V) + len(new_vecs) > max_subspace):
+            if verbose:
+                print(f"[Block-Davidson] Restarting subspace at dim={len(V)}")
+            V = []
+            for xk in ritz_vecs[:k_roots]:
+                xk = _bt_orthonormalize(xk, V, tol=lindep_tol)
+                if xk is not None:
+                    V.append(xk)
+
+            HV = [H_linop.matvec(v) for v in V]
+            m = len(V)
+            T = np.zeros((m, m), dtype=np.complex128)
+            for i in range(m):
+                for j in range(m):
+                    T[i, j] = V[i].dot(HV[j])
+            continue
+
+        # Append new directions
+        old_m = len(V)
+        for q in new_vecs:
+            V.append(q)
+            HV.append(H_linop.matvec(q))
+
+        new_m = len(V)
+
+        # Incrementally enlarge T
+        T_new = np.zeros((new_m, new_m), dtype=np.complex128)
+        T_new[:old_m, :old_m] = T
+
+        for j in range(old_m, new_m):
+            hj = HV[j]
+            for i in range(new_m):
+                val = V[i].dot(hj)
+                T_new[i, j] = val
+                T_new[j, i] = np.conjugate(val)
+
+        T = T_new
+
+    return evals, ritz_vecs

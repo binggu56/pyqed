@@ -162,25 +162,56 @@ def gen_cid_configs(nelec, nsites, mixing=0.1):
     return configs
 
 def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
-    """Returns HF + Random Singles/Doubles"""
+    """Returns HF + Random Singles/Doubles that strictly conserve Sz."""
+    # Assuming gen_hf_config returns a list like [1, 1, 1, 1, 0, 0, ...]
     hf = gen_hf_config(nelec, nsites)
     configs = [(tuple(hf), 1.0)]
 
-    occ_idxs = [i for i, x in enumerate(hf) if x == 1]
-    vir_idxs = [i for i, x in enumerate(hf) if x == 0]
+    # Segregate occupied and virtual indices by Spin (Alpha=Even, Beta=Odd)
+    occ_alpha = [i for i, x in enumerate(hf) if x == 1 and i % 2 == 0]
+    occ_beta  = [i for i, x in enumerate(hf) if x == 1 and i % 2 == 1]
+    vir_alpha = [i for i, x in enumerate(hf) if x == 0 and i % 2 == 0]
+    vir_beta  = [i for i, x in enumerate(hf) if x == 0 and i % 2 == 1]
     
     for _ in range(n_states):
         new_cfg = list(hf)
-        if len(occ_idxs) >= 2 and len(vir_idxs) >= 2 and np.random.rand() > 0.5:
-            # Double
-            i, j = np.random.choice(occ_idxs, 2, replace=False)
-            a, b = np.random.choice(vir_idxs, 2, replace=False)
-            new_cfg[i]=0; new_cfg[j]=0; new_cfg[a]=1; new_cfg[b]=1
-        elif len(occ_idxs) >= 1 and len(vir_idxs) >= 1:
-            # Single
-            i = np.random.choice(occ_idxs)
-            a = np.random.choice(vir_idxs)
-            new_cfg[i]=0; new_cfg[a]=1
+        
+        # Determine physically valid excitations based on available electrons/holes
+        exc_types = []
+        if len(occ_alpha) >= 1 and len(vir_alpha) >= 1: exc_types.append('S_alpha')
+        if len(occ_beta) >= 1 and len(vir_beta) >= 1: exc_types.append('S_beta')
+        if len(occ_alpha) >= 2 and len(vir_alpha) >= 2: exc_types.append('D_aa')
+        if len(occ_beta) >= 2 and len(vir_beta) >= 2: exc_types.append('D_bb')
+        if len(occ_alpha) >= 1 and len(vir_alpha) >= 1 and len(occ_beta) >= 1 and len(vir_beta) >= 1: exc_types.append('D_ab')
+        
+        if not exc_types:
+            break # Active space too small for further excitations
+            
+        choice = np.random.choice(exc_types)
+        
+        if choice == 'S_alpha':
+            i = np.random.choice(occ_alpha); a = np.random.choice(vir_alpha)
+            new_cfg[i] = 0; new_cfg[a] = 1
+            
+        elif choice == 'S_beta':
+            i = np.random.choice(occ_beta); a = np.random.choice(vir_beta)
+            new_cfg[i] = 0; new_cfg[a] = 1
+            
+        elif choice == 'D_aa':
+            i, j = np.random.choice(occ_alpha, 2, replace=False)
+            a, b = np.random.choice(vir_alpha, 2, replace=False)
+            new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
+            
+        elif choice == 'D_bb':
+            i, j = np.random.choice(occ_beta, 2, replace=False)
+            a, b = np.random.choice(vir_beta, 2, replace=False)
+            new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
+            
+        elif choice == 'D_ab':
+            # The most important correlation for singlet states
+            i = np.random.choice(occ_alpha); a = np.random.choice(vir_alpha)
+            j = np.random.choice(occ_beta);  b = np.random.choice(vir_beta)
+            new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
             
         configs.append((tuple(new_cfg), mixing))
         
@@ -747,7 +778,6 @@ class QCDMRG(CASCI):
                         ))
         if self.spin_purification:
             J = self.shift
-            print(f"  [Spin Penalty] Adding Exact S^2 Operator (J = {J})...")
             
             # On-site terms (p == q)
             for p in range(ncas):
@@ -824,17 +854,26 @@ class QCDMRG(CASCI):
         mpo = Mpo(model, algo="qr")
         mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
         
-        state = self.dmrg.ground_state
-        if hasattr(state.Bs[0], 'qns'):
-            dense_state = mps_lib.symmetric_to_dense(state)
-            psi_for_eval = dense_state.Bs
+        states_to_eval = self.dmrg.states 
+        if (hasattr(self.dmrg, 'states') and self.dmrg.states is not None):
+            states_to_eval = self.dmrg.states
         else:
-            psi_for_eval = state.Bs
+            states_to_eval = [self.dmrg.ground_state]
+        s2_vals = []
+        
+        for state in states_to_eval:
+            if hasattr(state.Bs[0], 'qns'):
+                dense_state = mps_lib.symmetric_to_dense(state)
+                psi_for_eval = dense_state.Bs
+            else:
+                psi_for_eval = state.Bs
+                
+            s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
+            s2_vals.append(float(np.real(s2)))
             
-        s2_val = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
-        return float(np.real(s2_val))
+        return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
 
-    def run(self, nstates=1, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff = None):
+    def run(self, nstates=1, weights=None, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff = None, **kwargs):
         """
         Parameters
         ----------
@@ -842,6 +881,14 @@ class QCDMRG(CASCI):
             ['charge', 'sz'] or True/False.
         """
         self.nstates = nstates
+        if weights is None:
+            self.weights = np.ones(nstates) / nstates
+        else:
+            self.weights = np.array(weights)
+        if symmetry_list is not None:
+            self.saved_symmetry_list = symmetry_list
+        else:
+            symmetry_list = getattr(self, 'saved_symmetry_list', None)
         if initial_guess is not None:
             self.init_guess = initial_guess
         if mo_coeff is not None:
@@ -886,7 +933,7 @@ class QCDMRG(CASCI):
             self.sym_mgr = None
         t0 = time.time()
         print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False)
+        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False, nstates=self.nstates, weights=self.weights)
         dmrg.run()
         self.dmrg = dmrg
         # Report
@@ -896,9 +943,14 @@ class QCDMRG(CASCI):
             e_dmrg_total -= self.shift * s2_val
         self.e_tot = e_dmrg_total
         print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
-        print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
-        print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
-        print(f"  <S^2> =             {s2_val:.6f}")
+        if self.nstates == 1:
+            print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
+            print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
+            print(f"  <S^2> =             {s2_val:.6f}")
+        else:
+            for i in range(self.nstates):
+                print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha")
+                print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha, <S^2> = {s2_val[i]:.6f}")
         print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry:
             self.check_abelian_symmetry()

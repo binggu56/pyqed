@@ -34,7 +34,7 @@ from pyqed.mps.decompose import decompose, compress
 import logging
 logger = logging.getLogger(__name__)
 try:
-    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, QN, SymmetryManager
+    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, solve_davidson_block, QN, SymmetryManager
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
@@ -938,7 +938,7 @@ class MPS:
         - Moves orthogonality center to the last site (L-1).
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
-            self.Center = self.L - 1
+            self.center = self.L - 1
             return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
@@ -968,7 +968,7 @@ class MPS:
         B_last /= np.linalg.norm(B_last)
         self.Bs[self.L - 1] = B_last.transpose(perm_inv)
         # Update Center
-        self.Center = self.L - 1
+        self.center = self.L - 1
 
     def right_canonicalize(self):
         """
@@ -979,7 +979,7 @@ class MPS:
         - Moves orthogonality center to the first site (0).
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
-            self.Center = 0
+            self.center = 0
             return
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
@@ -1010,7 +1010,7 @@ class MPS:
         B_first /= np.linalg.norm(B_first)
         self.Bs[0] = B_first.transpose(perm_inv)
         # Update Center
-        self.Center = 0
+        self.center = 0
 
     def left_to_vidal(self):
         pass
@@ -3444,8 +3444,150 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
                         AA.data[key] = noise.astype(dtype)
     return AA
 
+# Helper to contract Diagonal S into U
+# U is (L, P_L, Bond). S is (Bond, Bond).
+# We want U*S -> (L, P_L, Bond)
+def multiply_U_S(U_tensor, S_data):
+    # U: data[(qL, qP, qM)] -> shape (dL, dP, dM)
+    # S: data[qM] -> shape (dM, dM)
+    new_data = {}
+    for (qL, qP, qM), block in U_tensor.data.items():
+        if qM in S_data:
+            # Contract last index of U with S
+            # block: (dL, dP, dM). S: (dM, dM)
+            # Result: (dL, dP, dM)
+            new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
+            new_data[(qL, qP, qM)] = new_block
+    return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
+# Helper to contract S into V
+# S is (Bond, Bond). V is (Bond, R, P_R).
+# We want S*V -> (Bond, R, P_R)
+def multiply_S_V(S_data, V_tensor):
+    new_data = {}
+    for (qM, qR, qP), block in V_tensor.data.items():
+        if qM in S_data:
+            # Contract S with first index of V
+            # S: (dM, dM). block: (dM, dR, dP)
+            # Result: (dM, dR, dP)
+            new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
+            new_data[(qM, qR, qP)] = new_block
+    return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
 
-def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
+def sa_svd_symmetric(AA_list, weights, dir, m_max=None):
+    """State-Averaged SVD for U(1) BlockTensors."""
+    AA_perm_0 = AA_list[0].transpose(0, 2, 1, 3)
+    blocks_by_q_mid = {}
+    row_map, col_map = {}, {}
+    M_dict = {k: {} for k in range(len(AA_list))}
+    
+    for k, AA in enumerate(AA_list):
+        AA_perm = AA.transpose(0, 2, 1, 3)
+        for qn_tuple, block in AA_perm.data.items():
+            q_L, q_phys_L, q_R, q_phys_R = qn_tuple
+            q_mid = q_L + q_phys_L
+            if q_mid not in blocks_by_q_mid:
+                blocks_by_q_mid[q_mid] = []
+                row_map[q_mid] = set()
+                col_map[q_mid] = set()
+            if k == 0:
+                blocks_by_q_mid[q_mid].append(qn_tuple)
+                row_map[q_mid].add((q_L, q_phys_L))
+                col_map[q_mid].add((q_R, q_phys_R))
+            M_dict[k].setdefault(q_mid, []).append((qn_tuple, block))
+            
+    sv_list = []
+    U_store, V_store, S_store = {}, {}, {}
+    
+    for q_mid in blocks_by_q_mid.keys():
+        rows, cols = sorted(row_map[q_mid]), sorted(col_map[q_mid])
+        r_starts, c_starts = {}, {}
+        r_dim = c_dim = 0
+        entries_0 = M_dict[0][q_mid]
+        
+        for r in rows:
+            for qn, blk in entries_0:
+                if (qn[0], qn[1]) == r:
+                    r_starts[r] = r_dim; r_dim += blk.shape[0] * blk.shape[1]; break
+        for c in cols:
+            for qn, blk in entries_0:
+                if (qn[2], qn[3]) == c:
+                    c_starts[c] = c_dim; c_dim += blk.shape[2] * blk.shape[3]; break
+                    
+        M_matrices = []
+        for k in range(len(AA_list)):
+            M = np.zeros((r_dim, c_dim), dtype=entries_0[0][1].dtype)
+            for qn, blk in M_dict[k][q_mid]:
+                r0, c0 = r_starts[(qn[0], qn[1])], c_starts[(qn[2], qn[3])]
+                M[r0:r0+blk.shape[0]*blk.shape[1], c0:c0+blk.shape[2]*blk.shape[3]] = blk.reshape(blk.shape[0]*blk.shape[1], blk.shape[2]*blk.shape[3])
+            M_matrices.append(M)
+            
+        if dir == 'right':
+            rho = np.zeros((r_dim, r_dim), dtype=M.dtype)
+            for k in range(len(AA_list)): rho += weights[k] * (M_matrices[k] @ M_matrices[k].conj().T)
+            S2, U = np.linalg.eigh(rho)
+            idx = np.argsort(S2)[::-1]; S2, U = S2[idx], U[:, idx]
+            S = np.sqrt(np.abs(S2))
+            S_inv = np.zeros_like(S); S_inv[S > 1e-12] = 1.0 / S[S > 1e-12]
+            Vt = np.diag(S_inv) @ U.conj().T @ M_matrices[0] # Project State 0 to propagate
+        else:
+            rho = np.zeros((c_dim, c_dim), dtype=M.dtype)
+            for k in range(len(AA_list)): rho += weights[k] * (M_matrices[k].conj().T @ M_matrices[k])
+            S2, V = np.linalg.eigh(rho)
+            idx = np.argsort(S2)[::-1]; S2, V = S2[idx], V[:, idx]
+            S = np.sqrt(np.abs(S2))
+            Vt = V.conj().T
+            S_inv = np.zeros_like(S); S_inv[S > 1e-12] = 1.0 / S[S > 1e-12]
+            U = M_matrices[0] @ V @ np.diag(S_inv) # Project State 0 to propagate
+            
+        S_store[q_mid] = S
+        for i, s in enumerate(S): sv_list.append((s, q_mid, i))
+        U_store[q_mid] = (U, rows, r_starts, entries_0)
+        V_store[q_mid] = (Vt, cols, c_starts, entries_0)
+        
+    sv_list.sort(reverse=True, key=lambda x: x[0])
+    if m_max is not None: sv_list = sv_list[:m_max]
+    kept = {}
+    for s, q_mid, i in sv_list: kept.setdefault(q_mid, []).append(i)
+        
+    final_U, final_V, final_S, bond_qns = {}, {}, {}, []
+    for q_mid, idxs in kept.items():
+        idxs = sorted(idxs)
+        U, rows, r_starts, entries_0 = U_store[q_mid]
+        Vt, cols, c_starts, entries_0 = V_store[q_mid]
+        final_S[q_mid] = np.diag(S_store[q_mid][idxs])
+        bond_qns.extend([q_mid] * len(idxs))
+        
+        for r in rows:
+            for qn, blk in entries_0:
+                if (qn[0], qn[1]) == r: d1, d2 = blk.shape[0], blk.shape[1]; break
+            r0 = r_starts[r]
+            final_U[(r[0], r[1], q_mid)] = U[r0:r0+d1*d2, idxs].reshape(d1, d2, len(idxs))
+        for c in cols:
+            for qn, blk in entries_0:
+                if (qn[2], qn[3]) == c: d3, d4 = blk.shape[2], blk.shape[3]; break
+            c0 = c_starts[c]
+            final_V[(q_mid, c[0], c[1])] = Vt[idxs, c0:c0+d3*d4].reshape(len(idxs), d3, d4)
+            
+    U_t = BlockTensor(final_U, [AA_perm_0.qns[0], AA_perm_0.qns[1], bond_qns], [AA_perm_0.dirs[0], AA_perm_0.dirs[1], 1])
+    V_t = BlockTensor(final_V, [bond_qns, AA_perm_0.qns[2], AA_perm_0.qns[3]], [-1, AA_perm_0.dirs[2], AA_perm_0.dirs[3]])
+    return U_t, V_t, final_S, 0.0, sum(len(v) for v in kept.values())
+
+def compatible_blocktensor_structure(x, y):
+    if x.rank != y.rank:
+        return False
+    if x.dirs != y.dirs:
+        return False
+    if len(x.qns) != len(y.qns):
+        return False
+    for qx, qy in zip(x.qns, y.qns):
+        if qx != qy:
+            return False
+    for k, bx in x.data.items():
+        if k in y.data and bx.shape != y.data[k].shape:
+            return False
+    return True
+
+def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstates=1, weights=None, init_vecs = None):
     """
     two-site optimization of MPS A,B with respect to MPO W1,W2 and
     environment tensors E,F
@@ -3484,7 +3626,8 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         DESCRIPTION.
 
     """
-
+    if weights is None: 
+        weights = [1.0/nstates] * nstates
     if U1:
         if not SYMMETRY_AVAILABLE:
             raise ImportError("Symmetry module not found. Cannot run U1=True.")
@@ -3503,58 +3646,70 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         H_op = HamiltonianMultiplyU1(E, [W1, W2], F)
         norm = AA.norm()
         AA = AA * (1.0/norm)
-        energy, AA_new = solve_davidson(H_op, AA, tol=1e-5)
-        # AA_new is (L, R, Phys_L, Phys_R)
-        # We need to return A(L, M, P_L) and B(M, R, P_R)
-        U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
-        # U is (L, P_L, M).
-        # V is (M, R, P_R).
-        # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
 
-        # Helper to contract Diagonal S into U
-        # U is (L, P_L, Bond). S is (Bond, Bond).
-        # We want U*S -> (L, P_L, Bond)
-        def multiply_U_S(U_tensor, S_data):
-            # U: data[(qL, qP, qM)] -> shape (dL, dP, dM)
-            # S: data[qM] -> shape (dM, dM)
-            new_data = {}
-            for (qL, qP, qM), block in U_tensor.data.items():
-                if qM in S_data:
-                    # Contract last index of U with S
-                    # block: (dL, dP, dM). S: (dM, dM)
-                    # Result: (dL, dP, dM)
-                    new_block = np.tensordot(block, S_data[qM], axes=([2], [0]))
-                    new_data[(qL, qP, qM)] = new_block
-            return BlockTensor(new_data, U_tensor.qns, U_tensor.dirs)
-        # Helper to contract S into V
-        # S is (Bond, Bond). V is (Bond, R, P_R).
-        # We want S*V -> (Bond, R, P_R)
-        def multiply_S_V(S_data, V_tensor):
-            new_data = {}
-            for (qM, qR, qP), block in V_tensor.data.items():
-                if qM in S_data:
-                    # Contract S with first index of V
-                    # S: (dM, dM). block: (dM, dR, dP)
-                    # Result: (dM, dR, dP)
-                    new_block = np.tensordot(S_data[qM], block, axes=([1], [0]))
-                    new_data[(qM, qR, qP)] = new_block
-            return BlockTensor(new_data, V_tensor.qns, V_tensor.dirs)
-        if dir == 'right':  # Right Sweep: Center moves Right.
-            # A = U. B = S * V.
-            # U is (L, P_L, M). Transpose to standard MPS shape A(L, M, P_L)
-            A_new = U.transpose(0, 2, 1)
-            # Contract S into V, then V is already (M, R, P_R), which is standard B shape
-            B_new = multiply_S_V(S_dict, V)
-        else: # that is dir == 'left'
-            # Left Sweep: Center moves Left.
-            # A = U * S. B = V.
-            # Contract U * S first
-            A_US = multiply_U_S(U, S_dict)
-            # Transpose to standard MPS shape A(L, M, P_L)
-            A_new = A_US.transpose(0, 2, 1)
-            # B is just V
-            B_new = V
-        return energy, A_new, B_new, trunc, m_kept
+        if nstates == 1:
+            energy, AA_new = solve_davidson(H_op, AA, n_eig=1, tol=1e-5)
+            # AA_new is (L, R, Phys_L, Phys_R)
+            # We need to return A(L, M, P_L) and B(M, R, P_R)
+            U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
+            # U is (L, P_L, M).
+            # V is (M, R, P_R).
+            # We need to contract S_dict into either U or V depending on 'dir'. (left or right sweep)
+
+            if dir == 'right':  # Right Sweep: Center moves Right.
+                # A = U. B = S * V.
+                # U is (L, P_L, M). Transpose to standard MPS shape A(L, M, P_L)
+                A_new = U.transpose(0, 2, 1)
+                # Contract S into V, then V is already (M, R, P_R), which is standard B shape
+                B_new = multiply_S_V(S_dict, V)
+            else: # that is dir == 'left'
+                # Left Sweep: Center moves Left.
+                # A = U * S. B = V.
+                # Contract U * S first
+                A_US = multiply_U_S(U, S_dict)
+                # Transpose to standard MPS shape A(L, M, P_L)
+                A_new = A_US.transpose(0, 2, 1)
+                # B is just V
+                B_new = V
+            return energy, A_new, B_new, trunc, m_kept
+        else: # state average dmrg
+            guess_list = [AA]
+            if init_vecs is not None:
+                valid = [g for g in init_vecs if compatible_blocktensor_structure(g, AA)]
+                if len(valid) > 0:
+                    guess_list = valid[:nstates]
+
+            # Add tiny random companions if we need more than one state
+            # and no previous local state guesses are being passed in yet.
+            rng = np.random.default_rng(1234)
+            for _ in range(1, nstates):
+                data = {}
+                for k, blk in AA.data.items():
+                    noise = rng.standard_normal(blk.shape)
+                    if np.iscomplexobj(blk):
+                        noise = noise + 1j * rng.standard_normal(blk.shape)
+                    data[k] = noise.astype(blk.dtype, copy=False)
+                guess = BlockTensor(data, AA.qns[:], AA.dirs[:])
+
+                # Bias toward the current AA sector structure a bit
+                guess = AA * 1e-3 + guess
+                guess_list.append(guess)
+
+            energies, AA_new_list = solve_davidson_block(
+                H_op,
+                guess_list,
+                n_eig=nstates,
+                tol=1e-5,
+                max_iter=30,
+                max_subspace=max(8, 4 * nstates),
+            )
+
+            U, V, S_dict, trunc, m_kept = sa_svd_symmetric(AA_new_list, weights, dir=dir, m_max=m)
+            if dir == 'right':
+                A_new, B_new = U.transpose(0, 2, 1), multiply_S_V(S_dict, V)
+            else:
+                A_new, B_new = multiply_U_S(U, S_dict).transpose(0, 2, 1), V
+            return energies, A_new, B_new, trunc, m_kept, AA_new_list
     else: # Dense branch ( MPS index standardized to Left, Phys, Right)
         W = coarse_grain_MPO(W1,W2)
         # Returns (Left, Phys_A, Phys_B, Right)
@@ -3580,7 +3735,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None):
         return E[0], A, B, trunc, m
 
 def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
-                  not_conv_err=True, sym_mgr=None):
+                  not_conv_err=True, sym_mgr=None, nstates=1, weights=None):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -3602,6 +3757,9 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         DESCRIPTION.
 
     """
+    if weights is None: 
+        weights = [1.0/nstates] * nstates
+    weights = np.array(weights)
     MPS = mps 
     MPO = mpo 
     
@@ -3613,41 +3771,67 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     Eold = 0.0
     converged = False
     gauge = None
+    
+    last_i = 0
+    last_AA_list = None
+    bond_guess_cache = {}
     for sweep in range(0, int(sweeps/2)):
         for i in range(0, len(MPS)-2):
-            Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr
-            )
-            logging.info("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
-                     .format(sweep*2,i,i+1, Energy, states, trunc))
+            if nstates > 1:
+                init_vecs = bond_guess_cache.get(i, None)
+                Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights, init_vecs=last_AA_list)
+                E_ground_state = Energy[0]
+                bond_guess_cache[i] = last_AA_list
+            else:
+                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr)
+                E_ground_state = Energy
+            logging.info("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}".format(sweep*2,i,i+1, E_ground_state, states, trunc))
 
             E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
             F.pop()
+            last_i = i
 
-        if abs(Energy - Eold) < conv:
-            print("DMRG Converged at sweep {}. \n Total energy = {}".format(sweep, Energy))
+        if nstates > 1:
+            print(Energy)
+            e_avg = np.sum(weights * Energy) 
+        else:
+            e_avg = Energy
+        if abs(e_avg - Eold) < conv:
+            print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
             converged = True
             gauge = "Left"
             break
         else:
-            Eold = Energy
+            Eold = e_avg
 
         for i in range(len(MPS)-2, 0, -1):
-            Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr
-            )
+            if nstates > 1:
+                Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr, nstates=nstates, weights=weights)
+                E_ground_state = Energy[0]
+            else:
+                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr)
+                
+                E_ground_state = Energy
             logging.info("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
-                     .format(sweep*2+1, i, i+1, Energy, states, trunc))
+                     .format(sweep*2+1, i, i+1, E_ground_state, states, trunc))
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
             E.pop()
-
-        if abs(Energy - Eold) < conv:
-            print("DMRG Converged at sweep {}. \n Total energy = {}".format(sweep, Energy))
+            last_i = i
+        if nstates > 1:
+            e_avg = np.sum(weights * Energy) 
+        else:
+            e_avg = Energy
+        if abs(e_avg - Eold) < conv:
+            print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
             converged = True
             gauge = "Right"
             break
         else:
-            Eold = Energy
+            Eold = e_avg
 
     if not_conv_err == True:
         if converged == False:
@@ -3658,7 +3842,49 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     if gauge == None:
         gauge = "Right"
 
-    return Energy, MPS, gauge, converged
+    center_i = len(MPS) // 2 - 1
+    
+    if gauge == "Left" and last_i > center_i: 
+        # Broke after Right Sweep. E and F are perfectly set up for a Left sweep start.
+        for i in range(len(MPS)-2, center_i - 1, -1):
+            if nstates > 1:
+                Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr, nstates, weights)
+            else:
+                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr)
+            if i > center_i: # Don't shift environments on the final stop
+                F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
+                E.pop()
+            last_i = i
+
+    elif gauge == "Right" and last_i < center_i: 
+        # Broke after Left Sweep. E and F are perfectly set up for a Right sweep start.
+        for i in range(0, center_i + 1):
+            if nstates > 1:
+                Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights)
+            else:
+                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr)
+            if i < center_i: # Don't shift environments on the final stop
+                E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
+                F.pop()
+            last_i = i
+            
+    if nstates == 1:
+            return Energy, MPS, gauge, converged
+    else:
+        final_states = []
+        for k in range(nstates):
+            MPS_k = [B.copy() for B in MPS]
+            # Unspool the exact roots found at the last bond
+            U, V, S_dict, _, _ = svd_symmetric(last_AA_list[k], m_max=None)
+            A_US = multiply_U_S(U, S_dict)
+            MPS_k[last_i] = A_US.transpose(0, 2, 1)
+            MPS_k[last_i+1] = V
+            final_states.append(MPS_k)
+        return Energy, final_states, gauge, converged
 
 
 def expect_mps(bra, MPO, ket=None):
