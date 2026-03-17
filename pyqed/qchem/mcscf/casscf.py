@@ -230,7 +230,8 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         with_core = False
 
     nstates = mc.nstates
-
+    mc.e_history = [mc.e_tot]
+    
     dm1 = 0
     dm2 = 0
     for n in range(nstates):
@@ -250,6 +251,8 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         mo_coeff = C0 @ U
 
         mc.run(nstates, mo_coeff=mo_coeff, **kwargs)
+
+        mc.e_history.append(mc.e_tot)
 
         eAve = sum(weights * mc.e_tot)
 
