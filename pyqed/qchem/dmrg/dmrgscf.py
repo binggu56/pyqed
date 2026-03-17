@@ -80,6 +80,7 @@ class DMRGSCF(QCDMRG):
         self.mo_coeff = C
         self.e_tot = mc.e_tot
         self.ci = mc.ci
+        self.e_history = getattr(mc, 'e_history', [self.e_tot])
 
         return self
 
