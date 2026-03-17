@@ -34,6 +34,7 @@ class CASSCF(CASCI):
 
         self.weights = None
         self.nstates = 1
+        self.e_history = []
 
 
     def run(self, nstates= None, weights = None):
