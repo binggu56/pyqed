@@ -7,12 +7,22 @@ Created on Wed Dec  3 10:36:15 2025
 """
 
 from pyqed import Molecule
-# from pyqed.qchem.mcscf import CASCI
+from pyqed.qchem.mcscf.casscf import CASSCF
 
-mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='6311g')
-# mol.build()
+mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='631g')
+mol.build()
+mf = mol.RHF().run()
+
+
+
+ncas, nelecas = 4, 4
+
+mc = CASSCF(mf, ncas, nelecas)
+mc.run()
+
+####### PYSCF ########
+
 mol = mol.topyscf()
-
 mf = mol.RHF().run()
 
 
@@ -24,7 +34,7 @@ from pyscf import mcscf
 # weights = [0.5, 0.5]
 # mc.state_average(weights)
 
-ncas, nelecas = 4, 4
+
 mc = mcscf.CASSCF(mf, ncas, nelecas)
 mc.kernel()
 

@@ -284,6 +284,15 @@ def eig(a, k=None, **kwargs):
     return e, x
 
 
+class RTTDHF(TDHF):
+    """
+    real-time TDHF 
+    """
+    def run(self):
+        pass
+
+
+
 if __name__ == '__main__':
     from pyscf import gto, scf, tddft
 

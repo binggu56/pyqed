@@ -31,7 +31,7 @@ from pyqed.mol import Result
 
 from pyqed.nonherm import eig
 
-
+from pyqed.spo.spo2 import k_evolve_2d
 
 
 
@@ -1668,29 +1668,29 @@ def x_evolve_2d(dt, psi, v):
     return vpsi
 
 
-def k_evolve_2d(dt, masses, kx, ky, psi):
-    """
-    propagate the state in grid basis a time step forward with H = K
-    :param dt: float, time step
-    :param kx: float, momentum corresponding to x
-    :param ky: float, momentum corresponding to y
-    :param psi_grid: list, the two-electronic-states vibrational states in
-                           grid basis
-    :return: psi_grid(update): list, the two-electronic-states vibrational
-                                     states in grid basis
-    """
+# def k_evolve_2d(dt, mass, kx, ky, psi):
+#     """
+#     propagate the state in grid basis a time step forward with H = K
+#     :param dt: float, time step
+#     :param kx: float, momentum corresponding to x
+#     :param ky: float, momentum corresponding to y
+#     :param psi_grid: list, the two-electronic-states vibrational states in
+#                            grid basis
+#     :return: psi_grid(update): list, the two-electronic-states vibrational
+#                                      states in grid basis
+#     """
 
-    psi_k = fft2(psi)
-    mx, my = masses
+#     psi_k = fft2(psi)
+#     mx, my = mass
 
-    Kx, Ky = np.meshgrid(kx, ky)
+#     Kx, Ky = np.meshgrid(kx, ky)
 
-    kin = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
+#     kin = np.exp(-1j * (Kx**2/2./mx + Ky**2/2./my) * dt)
 
-    psi_k = kin * psi_k
-    psi = ifft2(psi_k)
+#     psi_k = kin * psi_k
+#     psi = ifft2(psi_k)
 
-    return psi
+#     return psi
 
 
 def dpsi(psi, kx, ky, ndim=2):

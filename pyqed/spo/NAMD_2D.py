@@ -13,7 +13,7 @@ import numpy as np
 import scipy
 import matplotlib.pyplot as plt
 
-from numba import autojit 
+from numba import jit 
 from scipy.fftpack import fft2, ifft2, fftfreq
 from numpy.linalg import inv, det
 
@@ -161,57 +161,68 @@ def k_evolve_2d(dt, kx, ky, psi_grid):
 #        return psi_x
 
 
-
-def spo_dynamics(dt, v_2d, psi0, num_steps=0):
-    """
-    perform the propagation of the dynamics and calculate the purity at
-    every time step
-    :param dt: time step
-    :param v_2d: list
-                potential matrices in 2D
-    :param psi_grid_0: list
-                the initial state
-    :param num_steps: the number of the time steps
-                   num_steps=0 indicates that no propagation has been done,
-                   only the initial state and the initial purity would be
-                   the output
-    :return: psi_end: list
-                      the final state
-             purity: float array
-                      purity values at each time point
-    """
-    #f = open('density_matrix.dat', 'w')
-    t = 0.0
-    psi_grid = psi0
-
-    purity = np.zeros(num_steps)
-    #purity[0] = density_matrix(psi_grid)[4].real 
-
-    kx = fftfreq(nx, dx)
-    ky = fftfreq(ny, dy)
-
-    dt2 = dt * 0.5 
+class SPO2:
     
-    vpsi(dt2, v_2d, psi_grid)
-
-    for i in range(num_steps):
-        t += dt
+    def __init__(self, x, y, v=None):
+        self.x = x 
+        self.y = y 
+        self.v = v
         
-        k_evolve_2d(dt, kx, ky, psi_grid)
-        vpsi(dt, v_2d, psi_grid)
+        self.nx = len(x)
+        self.ny = len(y)
         
-        output_tmp = density_matrix(psi_grid)
-
-        #f.write('{} {} {} {} {} \n'.format(t, *rho))
-        purity[i] = output_tmp[4].real 
-
-    #k_evolve_2d(dt, kx, ky, psi_grid)
-    #vpsi(dt, v_2d, psi_grid)
-
-    # t += dt
-    #f.close()
-
-    return psi_grid, purity
+    
+    def run(self, dt, psi0, nt=1):
+        """
+        perform the propagation of the dynamics and calculate observables at
+        every time step
+        
+        :param dt: time step
+        :param v_2d: list
+                    potential matrices in 2D
+        :param psi_grid_0: list
+                    the initial state
+        :param num_steps: the number of the time steps
+                       num_steps=0 indicates that no propagation has been done,
+                       only the initial state and the initial purity would be
+                       the output
+        :return: psi_end: list
+                          the final state
+                 purity: float array
+                          purity values at each time point
+        """
+        #f = open('density_matrix.dat', 'w')
+        t = 0.0
+        psi = psi0
+    
+        purity = np.zeros(nt)
+    
+        kx = fftfreq(nx, dx)
+        ky = fftfreq(ny, dy)
+    
+        dt2 = dt * 0.5 
+        v = self.v 
+        
+        vpsi(dt2, v, psi)
+    
+        for i in range(nt):
+            t += dt
+            
+            k_evolve_2d(dt, kx, ky, psi)
+            vpsi(dt, v, psi)
+            
+            output_tmp = density_matrix(psi)
+    
+            #f.write('{} {} {} {} {} \n'.format(t, *rho))
+            purity[i] = output_tmp[4].real 
+    
+        #k_evolve_2d(dt, kx, ky, psi_grid)
+        #vpsi(dt, v_2d, psi_grid)
+    
+        # t += dt
+        #f.close()
+    
+        return psi
 
 
 ######################################################################
@@ -284,13 +295,13 @@ def main(dt, sigma, x0, y0, kx0, ky0, coeff1, x_range_half, y_range_half,
                         couple_type)
 
     # setup the initial state
-    coeff2 = np.sqrt(1-coeff1**2)
+    # coeff2 = np.sqrt(1-coeff1**2)
 
-    psi0 = [coeff1 * gauss_x_2d(sigma, x0, y0, kx0, ky0) * np.exp(1j*phase),
-                  coeff2 * gauss_x_2d(sigma, x0, y0, kx0, ky0)]
-
+    psi0 = gauss_x_2d(sigma, x0, y0, kx0, ky0) 
+    
     # propagate
-    psi, purity = spo_dynamics(dt, v_2d, psi0, num_steps)
+    spo = SPO2(x, y, v_2d)
+    psi = spo.run(dt, psi0, num_steps)
 
     # store the final wavefunction
     #f = open('wft.dat','w')
@@ -298,11 +309,20 @@ def main(dt, sigma, x0, y0, kx0, ky0, coeff1, x_range_half, y_range_half,
     #    f.write('{} {} {} \n'.format(x[i], psi_x[i,0], psi_x[i,1]))
     #f.close()
 
-    return tlist, purity
+    import ultraplot as plt 
+    
+    fig, ax = plt.subplots()
+    ax.imshow(np.abs(psi)**2)
+    
 
 # covergence test wrt the grid points
-for i in range(5, 6):
+# for i in range(5, 6):
     # the variables below are global variables for this module
+
+
+if __name__=='__main__':
+
+    i = 5
     nx = 2 ** i
     ny = 2 ** i
     xmin = -11
@@ -330,12 +350,15 @@ for i in range(5, 6):
 
     # test the main
     sigma_tmp = np.identity(2) * 2.
-    t_axis, purity = main(0.001, sigma_tmp, -3, -3, 0, 0, 1./2.,
+    
+    main(0.001, sigma_tmp, -3, -3, 0, 0, 1./2.,
                                              3, 3, 0, 2., 0,
                                              1)
-    plt.plot(t_axis, purity)
+    
+    
+    
 
-plt.show()
+    # plt.show()
 
 # test the 2d gaussian distribution
 # psigrid = ['', '']
