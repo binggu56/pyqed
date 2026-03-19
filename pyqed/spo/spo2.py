@@ -115,8 +115,8 @@ class SPO2:
         # purity = np.zeros(nt)
     
         # k-space grid
-        kx = 2. * np.pi * fftfreq(nx, dx)
-        ky = 2. * np.pi * fftfreq(ny, dy)
+        kx = 2. * np.pi * fftfreq(self.nx, self.dx)
+        ky = 2. * np.pi * fftfreq(self.ny, self.dy)
         
     
         dt2 = dt * 0.5 
@@ -182,25 +182,21 @@ if __name__=='__main__':
     ymax = -ymin
     x = np.linspace(xmin, xmax, nx)
     y = np.linspace(ymin, ymax, ny)
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
-
-    print('x range = ', x[0], x[-1])
-    print('dx = {}'.format(dx))
-    print('number of grid points along x = {}'.format(nx))
-    print('y range = ', y[0], y[-1])
-    print('dy = {}'.format(dy))
-    print('number of grid points along y = {}'.format(ny))
-
-
     
-    num_steps = 100
-    dt = 0.05
-    print('number of timesteps = ', num_steps)
+    # dx = x[1] - x[0]
+    # dy = y[1] - y[0]
+
+    # print('x range = ', x[0], x[-1])
+    # print('dx = {}'.format(dx))
+    # print('number of grid points along x = {}'.format(nx))
+    # print('y range = ', y[0], y[-1])
+    # print('dy = {}'.format(dy))
+    # print('number of grid points along y = {}'.format(ny))
 
 
     X, Y = np.meshgrid(x, y, indexing='ij')    
-    # specify potential
+    
+    ### specify potential
     v_2d = X**2/2 + Y**2/2
 
 
@@ -210,7 +206,9 @@ if __name__=='__main__':
     spo = SPO2(x, y, v_2d, mass=[1,1])
     
     import ultraplot as plt 
-
+    
+    num_steps = 100
+    dt = 0.05
     psi = spo.run(dt, psi0, num_steps)
 
     # store the final wavefunction
