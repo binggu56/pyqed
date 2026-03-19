@@ -34,6 +34,7 @@ class CASSCF(CASCI):
 
         self.weights = None
         self.nstates = 1
+        self.e_history = []
 
 
     def run(self, nstates= None, weights = None):
@@ -69,7 +70,7 @@ class CASSCF(CASCI):
         # if self.spin_purification:
         #     mc.fix_spin(ss=self.ss, shift=self.shift)
 
-        mc.run(nstates)
+        mc.run(nstates, method='ci')
 
 
         # matrix elements in CMOs
@@ -95,7 +96,7 @@ class CASSCF(CASCI):
         self.mo_coeff = C
         self.e_tot = mc.e_tot
         self.ci = mc.ci
-        self.binary = mc.binary 
+        self.e_history = getattr(mc, 'e_history', [self.e_tot])
 
         return self
 
@@ -231,7 +232,8 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         with_core = False
 
     nstates = mc.nstates
-
+    mc.e_history = [mc.e_tot]
+    
     dm1 = 0
     dm2 = 0
     for n in range(nstates):
@@ -251,6 +253,8 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         mo_coeff = C0 @ U
 
         mc.run(nstates, mo_coeff=mo_coeff, **kwargs)
+
+        mc.e_history.append(mc.e_tot)
 
         eAve = sum(weights * mc.e_tot)
 
@@ -370,16 +374,21 @@ if __name__=='__main__':
     from pyqed import Molecule
     # from pyqed.qchem.mcscf.direct_ci import CASCI
 
-    mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='6311g')
+    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
-    mc = CASSCF(mf, ncas=2, nelecas=2, max_cycles=50)
+    mc = CASSCF(mf, ncas=6, nelecas=6, max_cycles=50)
 
-    nstates = 1
+    nstates = 2
     mc.state_average(weights = np.ones(nstates)/nstates)
     mc.fix_spin(ss=0, shift=0.2)
     mc.run()
 
     # correct result is E(CASSCF) = [-7.67160344]
+    # energy logs for you to use
+    print(mc.e_tot[0]) #ground state energy
+    print(mc.e_tot[1]) #fitst excited state
+    print([list(h) for h in mc.e_history]) #whole energy log in list
+    print(mc.e_history) #whole energy log in array
