@@ -49,9 +49,31 @@ class GDVRTDMPS(TDMPS):
         else:
             self.psi_gs = self.dmrg_obj.ground_state 
         
-        # Initialize the TDMPS engine using the dense Hamiltonian
-        H_mpo = MPO(dense_H_mpo) if isinstance(dense_H_mpo, list) else dense_H_mpo
-        super().__init__(H_mpo=H_mpo, D=self.D)
+        self.H_meas = MPO(dense_H_mpo) if isinstance(dense_H_mpo, list) else dense_H_mpo
+        
+        # 2. Build the Energy-Shifted Hamiltonian for Time Evolution
+        logger.info(f"Shifting TD Hamiltonian by ground state energy: {E_gs}")
+        L = len(self.H_meas.factors)
+        I_factors = []
+        for i in range(L):
+            d = self.H_meas.factors[i].shape[2]
+            W = np.zeros((1, 1, d, d), dtype=complex)
+            for j in range(d): 
+                W[0, 0, j, j] = 1.0
+            
+            # Apply the -E_gs shift to the very first site
+            if i == 0: 
+                W *= -E_gs  
+            I_factors.append(W)
+            
+        I_mpo = MPO(I_factors)
+        H_shifted = self.H_meas + I_mpo
+        
+        # Compress it back down to prevent bond dimension growth
+        H_shifted = H_shifted.compress(max(self.H_meas.bond_orders()))
+        
+        # Initialize the TDMPS engine using the SHIFTED Hamiltonian
+        super().__init__(H_mpo=H_shifted, D=self.D)
         
         return E_gs
 
@@ -81,7 +103,7 @@ class GDVRTDMPS(TDMPS):
 
         return MPO(mpo_tensors)
 
-    def run(self, dt, steps, e_ops=[], interval=10, flush_interval=10, save_dir="dynamics_data"):
+    def run(self, dt, steps, e_ops=[], interval=10, flush_interval=10, save_dir="dynamics_data", order =2):
         """
         Executes Strang-split dense time-evolution.
         
@@ -96,7 +118,7 @@ class GDVRTDMPS(TDMPS):
             os.makedirs(save_dir, exist_ok=True)
             logger.info(f"Data will be dynamically flushed to: {save_dir}/")
 
-        self.build_propagator(dt)
+        self.build_propagator(dt, order=order)
         
         logger.info(f"Starting TD-DMRG: {steps} steps, dt={dt}...")
         
@@ -132,12 +154,15 @@ class GDVRTDMPS(TDMPS):
             site_rdms = psi._calc_local_site_rdms()
             site_pops = np.array([np.real(site_rdms[j][1, 1]) for j in range(2 * self.Nz)])
             spatial_densities[step_idx] = site_pops[0::2] + site_pops[1::2]
+            total_electrons = np.sum(site_pops)
+            logger.info(f"Step {step_idx + 1} (t={current_time:.3f}): Total Electrons = {total_electrons:.8f}")
 
             # measure energy every 'interval'
             if (step_idx + 1) % interval == 0:
                 obs_idx = (step_idx + 1) // interval - 1
                 obs_times[obs_idx] = current_time
                 observables[obs_idx] = [expect_mps(psi.factors, e.factors) for e in e_ops]
+                print(observables)
 
             if save_dir and (step_idx + 1) % flush_interval == 0:
                 # Update the density data file (Overwrites single file)
@@ -158,6 +183,16 @@ class GDVRTDMPS(TDMPS):
         self.observables = observables
         self.densities = spatial_densities
         return self
+    
+def diagnose_dipole_coupling(H1, z):
+    Z = np.diag(z)
+    comm = Z @ H1 - H1 @ Z
+    print("=" * 60)
+    print("Dipole-coupling diagnostic")
+    print("-" * 60)
+    print(f"||[Z,H1]||            : {np.linalg.norm(comm):.6e}")
+    print(f"max |[Z,H1]_ij|       : {np.max(np.abs(comm)):.6e}")
+    print("=" * 60)
 if __name__ == "__main__":
     from pyqed.qchem.gdvr.gdvr_mean_field import Molecule
     S_EXPS = [18.73113696, 2.825394365, 0.6401216923, 0.1612777588]
@@ -168,14 +203,15 @@ if __name__ == "__main__":
 
     def electric_field(t):
         # return 0
-        return 0.5 * np.cos(0.1 * t)
+        return 0.5 * t
 
     td_solver = GDVRTDMPS(
-        mol=mol, Lz=6.0, Nz=32, basis_cfg=basis_cfg, 
-        e_field_func=electric_field, D=20
+        mol=mol, Lz=6.0, Nz=16, basis_cfg=basis_cfg, 
+        e_field_func=electric_field, D=30
     )
 
-    E_gs = td_solver.run_dmrg(pre_opt_cycles=10, dmrg_bond_dim=20)
+    E_gs = td_solver.run_dmrg(pre_opt_cycles=10, dmrg_bond_dim=30)
     print(f"Ground state found: {E_gs}")
-
-    td_solver.run(dt=0.01, steps=1000, e_ops=[td_solver.H], interval=10)
+    H1 = td_solver.dmrg_obj.Hcore
+    diagnose_dipole_coupling(H1, td_solver.z_grid)
+    # td_solver.run(dt=0.005, steps=100, e_ops=[td_solver.H], interval=2)

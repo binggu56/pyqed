@@ -770,6 +770,9 @@ def run_gdvr_dmrg(
         if cycle == 0:
             save_checkpoint("03_DMRG_FirstIter", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
 
+    solver.Hcore = Hcore_curr  # The final one-body matrix
+    solver.V_coul = V_coul     # The final two-body interaction matrix
+
     return final_dmrg_energy, solver, z, site_qn_maps, mpo_dmrg
 
 

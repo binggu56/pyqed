@@ -569,7 +569,11 @@ class MPS:
                 # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
                 val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
 
-            if val < 1e-12: raise warnings.warn('Norm {val} is too small.')
+            # if val < 1e-12: raise warnings.warn('Norm {val} is too small.')
+            val_scalar = np.abs(np.atleast_1d(val)[0])
+            if val_scalar < 1e-12:
+                import warnings
+                warnings.warn(f'Norm {val_scalar} is too small.')
 
             self.Bs[0] /=  np.sqrt(np.abs(val[0, 0]))
 
@@ -939,7 +943,7 @@ class MPS:
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
             self.center = self.L - 1
-            return
+            return self
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
         # Get permutation
@@ -969,6 +973,7 @@ class MPS:
         self.Bs[self.L - 1] = B_last.transpose(perm_inv)
         # Update Center
         self.center = self.L - 1
+        return self
 
     def right_canonicalize(self):
         """
@@ -980,7 +985,7 @@ class MPS:
         """
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
             self.center = 0
-            return
+            return self
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
         # Get permutation
@@ -1011,6 +1016,7 @@ class MPS:
         self.Bs[0] = B_first.transpose(perm_inv)
         # Update Center
         self.center = 0
+        return self
 
     def left_to_vidal(self):
         pass
@@ -2279,7 +2285,7 @@ class MPO:
 
         """
 
-        return expmpo(self.H, constant, D=D, method='taylor', order=4, scale=0)
+        return expmpo(self.H, constant, method='taylor', order=4, scale=0)
 
     def compress(self, chi_max):
         """
@@ -2551,8 +2557,7 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
         factorial = factorial * k
         coefficient = (scaled_constant ** k) / factorial
         result = result + (term * coefficient)
-        if D is not None:
-            result = result.compress(D)
+
     for _ in range(scale):
         result = result.matmul(result, chi_max=D)
 

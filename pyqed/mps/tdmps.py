@@ -56,7 +56,7 @@ class TDMPS:
         logging.info(f"Build propagator (dt={dt}, order={order})...")
         constant = -1j * dt
         print(self.D)
-        self.U = expmpo(self.H, constant=constant, D=self.D,
+        self.U = expmpo(self.H, constant=constant,
                         method='taylor', order=order, scale=scale)
 
         return self.U
