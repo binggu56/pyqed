@@ -2173,7 +2173,7 @@ class MPO:
         """
         # Scalar multiplication
         if isinstance(other, (int, float, complex)):
-            factors_new = self.factors
+            factors_new = [W.copy() for W in self.factors]
             factors_new[0] = factors_new[0] * other
             return MPO(factors_new)
 
