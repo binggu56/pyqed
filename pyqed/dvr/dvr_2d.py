@@ -539,7 +539,8 @@ class DVR2(object):
     #         self.buildH(**kwargs)
         
         
-        
+    def TDSE(self):
+        pass
     
     def run(self, k=6, **kwargs):
         """

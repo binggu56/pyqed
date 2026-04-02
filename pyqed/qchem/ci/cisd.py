@@ -203,6 +203,9 @@ class CISD(CI):
 
     def make_rdm1(self):
         return make_rdm1(self)
+    
+    def make_rdm2(self):
+        pass
 
 
 def make_rdm1(myci, civec=None, nmo=None, nocc=None, ao_repr=False):
