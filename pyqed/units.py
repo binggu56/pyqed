@@ -12,7 +12,6 @@ au2k = 315775.13 #K
 
 au2ev = 27.2116
 
-
 au2tesla = 2.35051756758e5
 tesla = 1/au2tesla
 
@@ -84,11 +83,13 @@ atomic_mass = {'H' : 1.008,'HE' : 4.003, 'LI' : 6.941, 'BE' : 9.012,\
                  'OG' : 294}
 
 # 
-electronvolt = 1/au2ev
+electronvolt = eV = 1/au2ev
 wavenumber = 1/au2wavenumber
 kelvin = 1/au2k
 attosecond = 1/au2as
-femtosecond = 1/au2fs
+femtosecond = fs = 1/au2fs
+eV_per_angstrom = 0.01944675245116053
+
 
 class AtomicUnits:
     def __init__(self):

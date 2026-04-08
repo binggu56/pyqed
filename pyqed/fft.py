@@ -132,6 +132,9 @@ def fft3(f, x, y, z):
     """
     customized FFT for 3D function
     
+    .. math::
+        g(r) = \iiint dx dy dz f(r) * e^{- i \mathbf{k r} }
+    
     input:
         f: 2d array,
             input array

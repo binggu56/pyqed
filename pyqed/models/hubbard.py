@@ -1,36 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jun 11 10:32:12 2025
+Created on Thu Apr  2 11:58:13 2026
 
-Fermi-Hubbard and Bose-Hubbard models
-
-@author: Bing Gu (gubing@westlake.edu.cn)
+@author: gugroup
 """
 
 from pyqed.mps.fermion import SpinHalfFermionChain, annihilate, create
-from pyqed import dag, tensor, transform
+from pyqed.mps.hubbard import FermiHubbard
 
-
-from pyqed import SpinHalfFermionOperators, eigh
-from pyqed.mps.dmrg import MPO, DMRG
-
-
-from scipy.sparse.linalg import eigsh
-# from scipy.sparse import kron, eye, csr_matrix
-
-from opt_einsum import contract
-
+from pyqed.qchem.mol import atomic_chain
 import numpy as np
+from pyqed import dag
 
-from pyqed import TFIM, multispin, Molecule
 
-# from pyqed.qchem.ci.fci import FCI
-# from pyqed.phys import obs, isdiag
 
-class FermiHubbard(SpinHalfFermionChain):
+class Hubbard(SpinHalfFermionChain):
     """
-    exact diagonalization of spin-half Fermi Hubbard model (with long-range interactions)
+    exact diagonalization of spin-half Fermi-Hubbard model (with long-range interactions)
     by Jordan-Wigner transformation
 
     .. math::
@@ -84,6 +71,9 @@ class FermiHubbard(SpinHalfFermionChain):
         self.eigvals = None # TBE
         self.e_tot = None
         self.eigvecs = None
+
+        self.operators = None # basic operators for a chain
+
 
     def exact_diag(self, nstates=1):
         """
@@ -310,170 +300,68 @@ class FermiHubbard(SpinHalfFermionChain):
     def spin_tot(self, psi):
         pass
 
-
-class BoseHubbard():
-    """
-    Bose-Hubbard model
-
-    .. math::
-        H = -t\sum _{\left\langle i,j\right\rangle }\left({\hat {b}}_{i}^{\dagger }{\hat {b}}_{j}+{\hat {b}}_{j}^{\dagger }{\hat {b}}_{i}\right) + {\frac{U}{2}}\sum_{i} {\hat{n}}_{i} ({\hat{n}}_i -1) -\mu \sum_{i} {\hat{n}}_i
-    """
-    def __init__(self, t, U, nsites, filling=None, nelec=None, mu=None):
-        self.t = t
-        self.U = U
-        self.nsites = nsites
-        self.filling = filling
-        self.nelec = nelec
-        self.mu = mu
-
-        self.H = None
-        self.ntot = None
-
-        self.eigvals = None
-        self.eigvecs = None
-
-    def buildH(self):
-        pass
-
-    def run(self, nstates=1):
-        pass
-
-    def DMRG(self):
-        pass
-
-    def NARG(self):
-        pass
+from pyqed.units import au2ev, au2angstrom, au2fs, eV_per_angstrom, au2wavenumber
 
 
-class LongRangeChain(FermiHubbard):
-    def __init__(self, L):
-        self.L = L # length
+# SSH parameters (apart from U, which is not contained in SSH)
+t = 2.5/au2ev
+U = 0./au2ev 
+K = 21/au2ev * au2angstrom**2 # spring constant
+M = 1349.14 /au2ev / au2fs**2 * au2angstrom**2
+a = 1.22/au2angstrom
+alpha = 4.1 * eV_per_angstrom
 
-        self.H = None
-        self.W = None
+omega = np.sqrt(K/M) 
+print(omega * au2wavenumber)
 
-    def add_single_site(self, operators):
-        """
 
-        the MPO of the Hamiltonian for single-site operators
-
-        .. math::
-
-            H = \sum_i O_i
-
-        Returns
-        -------
-        None.
-
-        """
-
-        ops = SpinHalfFermionOperators()
-        # JWu = ops['JWu']
-        # JWd = ops['JWd']
-        JW = ops['JW']
-        Cu = ops['Cu']
-        Cdu = ops['Cdu']
-        Cd = ops['Cd']
-        Cdd = ops['Cdd']
-        Sz = ops['Sz']
-        Nu = ops['Nu']
-        Nd = ops['Nd']
-        Ntot = ops['Ntot']
-
-        L = self.L
-
-        U = self.U
-        mu = self.mu
-
-        self.I = I = np.eye(4)
-        Z = np.zeros((4,4))
-
-        W_first = np.array([[operators[0]], [I]])
-
-        W = [W_first]
-        for l in range(1, L-1):
-
-            Wl = np.array([[I, Z],
-                          [operators[l], I]])
-            W.append(Wl)
-
-        W_last = np.array([[I], [operators[-1]]])
-        W += [W_last]
-
-        self.W_first = W_first
-
-        self.W = W
-        self.W_last = W_last
-        # print('w_first',np.shape(W_first))
-        # print('w',np.shape(W))
-
-        if self.L >= 3:
-            mpo = [self.W_first] + ([self.W] * (self.L-2)) + [self.W_last]
-            # result = mpo[0]
-            # for i in range(1,self.L):
-            #     result = coarse_gain_MPO(result,mpo[i])   # translate MPO form into exact form
-
-        elif self.L == 2:
-            mpo = [self.W_first] + [self.W_last]
-            # result = coarse_gain_MPO(mpo[0],mpo[1])
-
-        else:
-            print("L should be more than 2")
-            # result = -1
-            mpo = -1
-
-        self.h_mpo = MPO(mpo)
-        return
-
-    def add_exponentially_decaying_coupling(self, strength, lambda_decay, \
-                                            op_i='Sz', op_j='Sz'):
-        """
-
-        an exponentially decaying matrix product operator (MPO) can be created
-
-        .. math::
-
-            H = \sum _{i,j}\text{strength} \times e^{-\lambda |i-j|} O_{i} \otimes O_{j}
-
-        Parameters
-        ----------
-        strength : TYPE, optional
-            DESCRIPTION. The default is strength_decay.
-        lambda_decay : TYPE
-            DESCRIPTION.
-        op_i : TYPE, optional
-            DESCRIPTION. The default is 'Sz'.
-        op_j : TYPE, optional
-            DESCRIPTION. The default is 'Sz'.
-
-        Returns
-        -------
-        None.
-
-        """
-        pass
-    
-    def build_h_mpo(self):
-        # exponential decomposition t, v
-        
-        # call self.add_expo...
-        
-        # call self.add_single_site...
-        
-        # call DMRG... 
-        pass
-        
-    def transition_density_matrix(self):
-        pass
+model = Hubbard(t, U, nsites=8, nelec=8)
+model.run(10)
 
 
 
 
-if __name__=='__main__':
-    # pass
+# natom = 4
+# z = np.linspace(-3, 3, natom)
+# mol = atomic_chain(natom, z)
+# mol.basis = 'sto6g'
+# mol.build()
+# # mf = scf.RHF(mol).run()
 
-    hubbard = FermiHubbard(t=1, U=0., nsites=6)
-    hubbard.exact_diag(10)
+# print(type(mol.nelec))
 
-    # dmrg = hubbard.DMRG(D=10)
-    # dmrg.run()
+# mf = mol.RHF().run()
+
+# print('number of electrons', mol.nelec)
+# print('number of orbs = ', mol.nao)
+
+# # e, fcivec = pyscf.fci.FCI(mf).kernel(verbose=4)
+# # print(e)
+# # Ca = mf.mo_coeff[0ArithmeticError
+# # n = Ca.shape[-1]
+
+# # mo_coeff = mf.mo_coeff
+# # get the two-electron integrals as a numpy array
+# # eri = get_eri_mo(mol, mo_coeff)
+
+# # n = mol.nao
+# # Ca = mo_coeff
+
+# # h1e = get_hcore_mo(mf)
+# # eri = get_eri_mo(mf)
+
+# # print(mol.nelec)
+# # model = SpinHalfFermionChain(h1e, eri).run(3)
+
+
+# h1e = mf.get_hcore_mo()
+# eri = mf.get_eri_mo()
+
+
+# model = SpinHalfFermionChain(h1e, eri, mol.nelec)
+#    # model = SpinHalfFermionChain(h1e, eri)
+
+# model.run(nstates=10)
+#    # narg = NARG(h1e, eri, D=20)
+
+#    # block = model.initialize()
