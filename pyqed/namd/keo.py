@@ -1302,7 +1302,7 @@ def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0
             return T_vib
 
     if J_val == 0 and mode == 'all':
-        if verbose: print("[KEO] J=0, returning pure vibrational T_vib.")
+        print("[KEO] J=0, returning pure vibrational T_vib.")
         return T_vib
 
     if mode in ['rot', 'all']:
@@ -1436,85 +1436,91 @@ if __name__ == "__main__":
     mesh_int = jnp.meshgrid(*grids_int, indexing='ij')
     q_batch_int = jnp.stack([m.flatten() for m in mesh_int], axis=1)
 
-    print("  [Transform] 将内坐标批量转换为笛卡尔坐标...")
+    print("  [Transform] Transform internal coordinates to Cartesian coordinates")
     X_batch_list = [np.array(h2o_3d_transform_dft(q_int)) for q_int in q_batch_int]
 
-    print(f"  [PySCF] 正在开启多进程扫描 {len(X_batch_list)} 个 DVR 网格点势能...")
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        energies_raw = list(tqdm.tqdm(
-            executor.map(calc_single_point, X_batch_list),
-            total=len(X_batch_list),
-            desc="PES Parallel Scanning"
-        ))
+    # print(f"  [PySCF] 正在开启多进程扫描 {len(X_batch_list)} 个 DVR 网格点势能...")
+    # with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+    #     energies_raw = list(tqdm.tqdm(
+    #         executor.map(calc_single_point, X_batch_list),
+    #         total=len(X_batch_list),
+    #         desc="PES Parallel Scanning"
+    #     ))
 
-    E_min_scan = np.min(energies_raw)
-    V_pyscf_vals = [E - E_min_scan for E in energies_raw]
-    V_diag_vib = np.diag(np.array(V_pyscf_vals))
+    # E_min_scan = np.min(energies_raw)
+    # V_pyscf_vals = [E - E_min_scan for E in energies_raw]
+    # V_diag_vib = np.diag(np.array(V_pyscf_vals))
 
     # 先提取 J=0 的绝对零点能作为绘图基准
-    print("  [J=0] 正在计算基准 ZPE...")
-    T_vib_J0 = calculate_exact_keo(dvrs_int, jnp.array(masses), h2o_3d_transform_dft, mode='all', J_val=0, verbose=False)
-    E_J0, _ = la.eigh(T_vib_J0 + V_diag_vib)
-    ZPE = E_J0[0] * cm_inv
+    print("  [J=0] Computing ZPE...")
+    # Gmat(q, masses, internal_to_cartesian)
+    
+    T_vib_J0 = calculate_exact_keo(dvrs_int, jnp.array(masses), \
+                                   h2o_3d_transform_dft, mode='G', J_val=0, verbose=False)
+    
+    print(T_vib_J0.shape)
+    
+    # E_J0, _ = la.eigh(T_vib_J0 + V_diag_vib)
+    # ZPE = E_J0[0] * cm_inv
 
     # 准备绘图数据
     J_max = 3
     plot_data = []
 
-    print("\n  [Rovibrational] 开始批量计算 J=0 到 J={J_max} 的全维振转能级...")
-    for J in range(J_max + 1):
-        print(f"    --> 正在求解 J = {J} ...")
-        dim_rot = (2 * J + 1) ** 2
+    # print("\n  [Rovibrational] 开始批量计算 J=0 到 J={J_max} 的全维振转能级...")
+    # for J in range(J_max + 1):
+    #     print(f"    --> 正在求解 J = {J} ...")
+    #     dim_rot = (2 * J + 1) ** 2
 
-        # 构建 J > 0 的全动能矩阵
-        T_all = calculate_exact_keo(dvrs_int, jnp.array(masses), h2o_3d_transform_dft, mode='all', J_val=J, verbose=False)
+    #     # 构建 J > 0 的全动能矩阵
+    #     T_all = calculate_exact_keo(dvrs_int, jnp.array(masses), h2o_3d_transform_dft, mode='all', J_val=J, verbose=False)
 
-        # 将纯振动势能扩展到全振转空间
-        I_rot = np.eye(dim_rot)
-        V_all = np.kron(V_diag_vib, I_rot)
+    #     # 将纯振动势能扩展到全振转空间
+    #     I_rot = np.eye(dim_rot)
+    #     V_all = np.kron(V_diag_vib, I_rot)
 
-        # 对角化全哈密顿量
-        E_all, _ = la.eigh(T_all + V_all)
-        E_all_cm = E_all * cm_inv
+    #     # 对角化全哈密顿量
+    #     E_all, _ = la.eigh(T_all + V_all)
+    #     E_all_cm = E_all * cm_inv
 
-        # 记录前 150 个能级（或所有能级，取其小者）用于绘图
-        n_levels = min(35, len(E_all_cm))
-        rel_energies = E_all_cm[:n_levels] - ZPE
-        print(rel_energies[:5])
-        # 过滤掉高于 6500 cm-1 的能级，保持图面整洁
-        rel_energies = rel_energies[rel_energies < 6500]
+    #     # 记录前 150 个能级（或所有能级，取其小者）用于绘图
+    #     n_levels = min(35, len(E_all_cm))
+    #     rel_energies = E_all_cm[:n_levels] - ZPE
+    #     print(rel_energies[:5])
+    #     # 过滤掉高于 6500 cm-1 的能级，保持图面整洁
+    #     rel_energies = rel_energies[rel_energies < 6500]
 
-        plot_data.append(rel_energies)
+    #     plot_data.append(rel_energies)
 
 
-    plt.figure(figsize=(10, 8))
-    colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'y', 'black']
+    # plt.figure(figsize=(10, 8))
+    # colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'y', 'black']
 
-    for J, energies in enumerate(plot_data):
-        x_start = J - 0.35
-        x_end = J + 0.35
-        # 画每一条水平能级线
-        for E in energies:
-            plt.hlines(E, x_start, x_end, colors=colors[J], linewidth=1.0)
+    # for J, energies in enumerate(plot_data):
+    #     x_start = J - 0.35
+    #     x_end = J + 0.35
+    #     # 画每一条水平能级线
+    #     for E in energies:
+    #         plt.hlines(E, x_start, x_end, colors=colors[J], linewidth=1.0)
 
-    plt.xticks(range(J_max + 1), [str(j) for j in range(J_max + 1)], fontsize=14)
-    plt.xlabel('J =', fontsize=16)
-    plt.ylabel(r'$\Delta E$ / cm$^{-1}$', fontsize=16)
-    plt.title('Rovibrational Energy Levels ($\Delta E$ vs $J$)', fontsize=18)
+    # plt.xticks(range(J_max + 1), [str(j) for j in range(J_max + 1)], fontsize=14)
+    # plt.xlabel('J =', fontsize=16)
+    # plt.ylabel(r'$\Delta E$ / cm$^{-1}$', fontsize=16)
+    # plt.title('Rovibrational Energy Levels ($\Delta E$ vs $J$)', fontsize=18)
 
-    # 限制 y 轴显示范围对齐文献图
-    plt.ylim(-100, 6500)
-    plt.xlim(-0.5, 6.5)
+    # # 限制 y 轴显示范围对齐文献图
+    # plt.ylim(-100, 6500)
+    # plt.xlim(-0.5, 6.5)
 
-    # 隐藏上方和右方的边框
-    ax = plt.gca()
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    # # 隐藏上方和右方的边框
+    # ax = plt.gca()
+    # ax.spines['top'].set_visible(False)
+    # ax.spines['right'].set_visible(False)
 
-    # 将 x 轴下移，模仿文献的刻度样式
-    ax.spines['bottom'].set_position(('data', 0))
-    ax.xaxis.set_label_coords(0.5, -0.05)
+    # # 将 x 轴下移，模仿文献的刻度样式
+    # ax.spines['bottom'].set_position(('data', 0))
+    # ax.xaxis.set_label_coords(0.5, -0.05)
 
-    plt.tight_layout()
-    plt.savefig("h2o_rovibrational_levels.png", dpi=300)
-    plt.show()
+    # plt.tight_layout()
+    # plt.savefig("h2o_rovibrational_levels.png", dpi=300)
+    # plt.show()
