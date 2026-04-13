@@ -17,6 +17,7 @@ from scipy.optimize import minimize
 from pyqed.qchem.mol import Molecule
 
 from .grid import AOGrid, BOHR_TO_ANGSTROM
+from .hessian import analyze_cartesian_hessian
 from .xc import needs_gradients
 
 
@@ -29,6 +30,65 @@ class GeometryOptimizationResult:
     gradient: np.ndarray
     trajectory: list
     backend: str
+    approximate_hessian: np.ndarray | None = None
+    approximate_inverse_hessian: np.ndarray | None = None
+    exact_hessian: np.ndarray | None = None
+
+    def hessian(self, exact=False, inverse=False):
+        """
+        Return an optimizer Hessian in Cartesian coordinates.
+
+        Parameters
+        ----------
+        exact : bool
+            Return the exact final Cartesian Hessian when available.
+        inverse : bool
+            Return the approximate inverse Hessian when available.
+        """
+        if exact and inverse:
+            raise ValueError("exact and inverse cannot both be True.")
+        if exact:
+            if self.exact_hessian is None:
+                raise ValueError("No exact final Hessian is available for this optimization.")
+            return self.exact_hessian
+        if inverse:
+            if self.approximate_inverse_hessian is None:
+                raise ValueError("No approximate inverse Hessian is available for this optimization.")
+            return self.approximate_inverse_hessian
+        if self.approximate_hessian is None:
+            raise ValueError("No approximate Hessian is available for this optimization.")
+        return self.approximate_hessian
+
+    def vibrational_analysis(
+        self,
+        exact=False,
+        remove_translation_rotation=True,
+        negative_imaginary=True,
+        zero_tol=1e-7,
+    ):
+        """
+        Analyze a Cartesian Hessian into vibrational frequencies and normal modes.
+        """
+        return analyze_cartesian_hessian(
+            self.hessian(exact=exact),
+            self.coords,
+            self.mf.mol.atom_mass_list(),
+            remove_translation_rotation=remove_translation_rotation,
+            negative_imaginary=negative_imaginary,
+            zero_tol=zero_tol,
+        )
+
+    def frequencies(self, exact=False, unit='cm^-1', **kwargs):
+        """
+        Convenience accessor for vibrational frequencies.
+        """
+        data = self.vibrational_analysis(exact=exact, **kwargs)
+        unit = unit.lower()
+        if unit in ('cm^-1', 'cm-1', 'wavenumber', 'wavenumbers'):
+            return data['freq_cm1']
+        if unit in ('au', 'a.u.', 'hartree'):
+            return data['freq_au']
+        raise ValueError("unit must be 'cm^-1' or 'au'.")
 
 
 def _copy_molecule(mol):
@@ -55,6 +115,14 @@ def _build_grid(mf, mol):
     settings.setdefault('with_grad', needs_gradients(mf.xc))
     return AOGrid.atom_centered(mol, **settings)
 
+
+def _approximate_hessian_from_inverse(inv_hessian):
+    if inv_hessian is None:
+        return None, None
+    mat = np.asarray(inv_hessian, dtype=float)
+    if mat.ndim != 2:
+        return None, None
+    return np.linalg.pinv(mat), mat
 
 def _evaluate_geometry(mf, mol_template, coords, trajectory, callback):
     mol = _copy_molecule(mol_template)
@@ -117,6 +185,9 @@ def _optimize_geometry_scipy(mf, method='BFGS', maxiter=50, gtol=1e-3, callback=
         evaluate(result.x)
 
     final = last['record']
+    approx_hessian, approx_inv_hessian = _approximate_hessian_from_inverse(
+        getattr(result, 'hess_inv', None)
+    )
     return GeometryOptimizationResult(
         mf=final['mf'],
         result=result,
@@ -125,6 +196,8 @@ def _optimize_geometry_scipy(mf, method='BFGS', maxiter=50, gtol=1e-3, callback=
         gradient=final['gradient'],
         trajectory=trajectory,
         backend='scipy',
+        approximate_hessian=approx_hessian,
+        approximate_inverse_hessian=approx_inv_hessian,
     )
 
 
@@ -150,6 +223,31 @@ def _load_geometric():
         pass
 
     return geometric, engine, GeomOptNotConvergedError
+
+
+def _write_quiet_log_ini(dirname):
+    path = os.path.join(dirname, 'geometric_quiet.ini')
+    logfile = os.path.join(dirname, 'geometric.log')
+    with open(path, 'w', encoding='ascii') as fh:
+        fh.write(
+            "[loggers]\n"
+            "keys=root\n\n"
+            "[handlers]\n"
+            "keys=file_handler\n\n"
+            "[formatters]\n"
+            "keys=formatter\n\n"
+            "[logger_root]\n"
+            "level=WARNING\n"
+            "handlers=file_handler\n\n"
+            "[handler_file_handler]\n"
+            "class=logging.FileHandler\n"
+            "level=WARNING\n"
+            "formatter=formatter\n"
+            f"args=(r'{logfile}', 'w')\n\n"
+            "[formatter_formatter]\n"
+            "format=%(message)s\n"
+        )
+    return path
 
 
 def _optimize_geometry_geometric(mf, maxiter=50, callback=None, **kwargs):
@@ -183,6 +281,14 @@ def _optimize_geometry_geometric(mf, maxiter=50, callback=None, **kwargs):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_stub = os.path.join(tmpdir, str(uuid.uuid4()))
+        approx_hessian_file = kwargs.get('write_cart_hess')
+        if approx_hessian_file is None:
+            approx_hessian_file = os.path.join(tmpdir, 'approx_hessian.txt')
+            kwargs['write_cart_hess'] = approx_hessian_file
+        if 'verbose' not in kwargs:
+            kwargs['verbose'] = 0
+        if 'logIni' not in kwargs:
+            kwargs['logIni'] = _write_quiet_log_ini(tmpdir)
         try:
             optimize_result = geometric.optimize.run_optimizer(
                 customengine=optimizer_engine,
@@ -195,6 +301,15 @@ def _optimize_geometry_geometric(mf, maxiter=50, callback=None, **kwargs):
             optimize_result = exc
             success = False
             message = f'Optimization did not converge in {maxiter} steps.'
+
+        approx_hessian = None
+        if os.path.exists(approx_hessian_file):
+            approx_hessian = np.loadtxt(approx_hessian_file)
+
+        exact_hessian = None
+        exact_hessian_file = os.path.join(f"{input_stub}.tmp", 'hessian', 'hessian.txt')
+        if os.path.exists(exact_hessian_file):
+            exact_hessian = np.loadtxt(exact_hessian_file)
 
     final = last['record']
     if final is None:
@@ -214,6 +329,8 @@ def _optimize_geometry_geometric(mf, maxiter=50, callback=None, **kwargs):
         gradient=final['gradient'],
         trajectory=trajectory,
         backend='geometric',
+        approximate_hessian=approx_hessian,
+        exact_hessian=exact_hessian,
     )
 
 

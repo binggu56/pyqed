@@ -95,6 +95,10 @@ class RKS:
         from .grad import Gradients
         return Gradients(self)
 
+    def Hessian(self):
+        from .hessian import Hessian
+        return Hessian(self)
+
     def optimize_geometry(
         self,
         backend='scipy',

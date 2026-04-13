@@ -134,6 +134,33 @@ def test_rks_geometry_optimization_lowers_h2_energy():
     assert opt.energy < e0
     assert r1 < r0
     assert np.linalg.norm(opt.gradient) < 1e-2
+    assert opt.hessian().shape == (6, 6)
+    assert opt.hessian(inverse=True).shape == (6, 6)
+    vib = opt.vibrational_analysis()
+    assert vib['freq_cm1'].shape == (1,)
+    assert vib['modes'].shape == (1, 2, 3)
+    assert opt.frequencies().shape == (1,)
+
+
+def test_rks_hessian_runs_and_exposes_frequencies():
+    mol = Molecule(atom='H 0 0 -0.8; H 0 0 0.8', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    grid = AOGrid.atom_centered(mol, n_radial=8, n_angular=14, with_grad=False)
+    mf = RKS(mol, grid=grid, xc='svwn')
+    mf.max_cycle = 80
+    mf.conv_tol = 1e-9
+    mf.run()
+
+    hobj = mf.Hessian()
+    hess = hobj.run(step=2e-3)
+    vib = hobj.vibrational_analysis()
+
+    assert hess.shape == (6, 6)
+    np.testing.assert_allclose(hess, hess.T, atol=1e-8)
+    assert vib['freq_cm1'].shape == (1,)
+    assert vib['modes'].shape == (1, 2, 3)
+    assert hobj.frequencies().shape == (1,)
 
 
 def test_rks_geometry_optimization_rejects_unknown_backend():
@@ -162,3 +189,4 @@ def test_rks_geometry_optimization_geometric_requires_dependency():
         opt = mf.optimize_geometry(backend='geometric', maxiter=10)
         assert np.isfinite(opt.energy)
         assert opt.backend == 'geometric'
+        assert opt.hessian().shape == (6, 6)
