@@ -242,7 +242,7 @@ class CBasis1e:
         """
         return int(self._ao_slices[ia]), int(self._ao_slices[ia + 1])
 
-    def int1e(self, func_name, components=tuple(), inv_origin=None):
+    def int1e(self, func_name, components=tuple(), inv_origin=None, hermi=True):
         """
         Evaluate a one-electron integral.
         """
@@ -271,7 +271,11 @@ class CBasis1e:
                 shls[0] = ishl
                 p_off = int(self._offs[ishl])
                 jpos = 0
-                for jshl in range(ishl + 1):
+                if hermi:
+                    jshl_range = range(ishl + 1)
+                else:
+                    jshl_range = range(self.nbas)
+                for jshl in jshl_range:
                     shls[1] = jshl
                     q_off = int(self._offs[jshl])
                     func(buf, None, shls, self.atm, self.natm, self.bas, self.nbas, env, opt, None)
@@ -279,7 +283,8 @@ class CBasis1e:
                         p_off, q_off, *shape_comp, order="F"
                     )
                     out[ipos:ipos + p_off, jpos:jpos + q_off] = buf_array
-                    out[jpos:jpos + q_off, ipos:ipos + p_off] = np.swapaxes(buf_array, 0, 1)
+                    if hermi and jshl != ishl:
+                        out[jpos:jpos + q_off, ipos:ipos + p_off] = np.swapaxes(buf_array, 0, 1)
                     buf[:] = 0.0
                     jpos += q_off
                 ipos += p_off

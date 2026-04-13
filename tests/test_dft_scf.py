@@ -56,6 +56,22 @@ def test_rks_builds_default_atom_centered_grid():
 
 
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
+def test_rks_pbe_smoke():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RKS(mol, xc='pbe')
+    mf.max_cycle = 80
+    mf.conv_tol = 1e-9
+    mf.run()
+
+    assert mf.converged
+    assert mf.grid.ao_grad is not None
+    assert np.isfinite(mf.e_tot)
+    assert abs(np.einsum('ij,ji->', mol.overlap, mf.dm).real - mol.nelec) < 1e-4
+
+
+@pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
 def test_rks_b3lyp_smoke():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='gbasis')
@@ -97,3 +113,52 @@ def test_run_rks_b3lyp_rebuilds_default_grid_when_custom_grid_lacks_coords():
     assert out['grid'] is not bare_grid
     assert out['grid'].coords is not None
     assert out['grid'].ao_grad is not None
+
+
+def test_rks_geometry_optimization_lowers_h2_energy():
+    mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    grid = AOGrid.atom_centered(mol, n_radial=8, n_angular=14, with_grad=False)
+    mf = RKS(mol, grid=grid, xc='svwn')
+    mf.max_cycle = 80
+    mf.conv_tol = 1e-9
+    mf.run()
+    e0 = mf.e_tot
+    r0 = np.linalg.norm(mol.atom_coords()[1] - mol.atom_coords()[0])
+
+    opt = mf.optimize_geometry(maxiter=20, gtol=1e-3)
+    r1 = np.linalg.norm(opt.coords[1] - opt.coords[0])
+
+    assert np.isfinite(opt.energy)
+    assert opt.energy < e0
+    assert r1 < r0
+    assert np.linalg.norm(opt.gradient) < 1e-2
+
+
+def test_rks_geometry_optimization_rejects_unknown_backend():
+    mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RKS(mol, xc='svwn')
+    with pytest.raises(ValueError, match='backend must be either'):
+        mf.optimize_geometry(backend='nope')
+
+
+def test_rks_geometry_optimization_geometric_requires_dependency():
+    pytest.importorskip('pyscf')
+
+    mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RKS(mol, xc='svwn')
+
+    try:
+        import geometric  # noqa: F401
+    except ImportError:
+        with pytest.raises(ImportError, match='geomeTRIC is not installed'):
+            mf.optimize_geometry(backend='geometric', maxiter=3)
+    else:
+        opt = mf.optimize_geometry(backend='geometric', maxiter=10)
+        assert np.isfinite(opt.energy)
+        assert opt.backend == 'geometric'

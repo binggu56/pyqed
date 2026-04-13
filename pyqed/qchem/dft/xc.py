@@ -14,7 +14,14 @@ VWN_A = 0.0310907
 VWN_B = 3.72744
 VWN_C = 12.9352
 VWN_X0 = -0.10498
-_LIBXC_NAMES = {'b3lyp', 'hyb_gga_xc_b3lyp'}
+_LIBXC_NAMES = {
+    'pbe',
+    'gga_xc_pbe',
+    'blyp',
+    'gga_xc_blyp',
+    'b3lyp',
+    'hyb_gga_xc_b3lyp',
+}
 
 
 def _clip_density(rho):
@@ -197,5 +204,5 @@ def eval_xc(rho, xc='lda_x', grad_rho=None):
 
     raise NotImplementedError(
         "Supported functionals are 'lda'/'lda_x', 'lda_c_vwn'/'vwn', "
-        "'svwn'/'lda,vwn', and 'b3lyp'."
+        "'svwn'/'lda,vwn', 'pbe', 'blyp', and 'b3lyp'."
     )

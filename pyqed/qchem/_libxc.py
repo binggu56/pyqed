@@ -16,6 +16,26 @@ import numpy as np
 
 
 _SUPPORTED_XC = {
+    'pbe': {
+        'libxc_names': ('GGA_X_PBE', 'GGA_C_PBE'),
+        'xctype': 'GGA',
+        'hyb': 0.0,
+    },
+    'gga_xc_pbe': {
+        'libxc_names': ('GGA_X_PBE', 'GGA_C_PBE'),
+        'xctype': 'GGA',
+        'hyb': 0.0,
+    },
+    'blyp': {
+        'libxc_names': ('GGA_X_B88', 'GGA_C_LYP'),
+        'xctype': 'GGA',
+        'hyb': 0.0,
+    },
+    'gga_xc_blyp': {
+        'libxc_names': ('GGA_X_B88', 'GGA_C_LYP'),
+        'xctype': 'GGA',
+        'hyb': 0.0,
+    },
     'b3lyp': {
         'libxc_name': 'HYB_GGA_XC_B3LYP',
         'xctype': 'GGA',
@@ -68,21 +88,23 @@ class _LibXC:
     def functional_number(self, name):
         return int(self._lib.xc_functional_get_number(name.encode()))
 
-    def init_functional(self, number):
-        numbers = (c_int * 1)(number)
-        return self._lib.LIBXC_xc_func_init(1, numbers, 0)
+    def init_functional(self, numbers):
+        numbers = tuple(int(num) for num in numbers)
+        numbers_array = (c_int * len(numbers))(*numbers)
+        return self._lib.LIBXC_xc_func_init(len(numbers), numbers_array, 0)
 
     def end_functional(self, handle):
         self._lib.LIBXC_xc_func_end(1, handle)
 
-    def eval_xc(self, handle, fac, rho, nvar, deriv=1):
+    def eval_xc(self, handle, facs, rho, nvar, deriv=1):
         ngrids = int(rho.shape[-1])
         outlen = 2 if nvar == 1 else 3
         rho = np.asarray(rho, dtype=np.double, order='C').reshape(1, nvar, ngrids)
         out = np.zeros((outlen, ngrids), dtype=np.double, order='C')
-        factors = (c_double * 1)(fac)
+        facs = tuple(float(fac) for fac in facs)
+        factors = (c_double * len(facs))(*facs)
         self._lib.LIBXC_eval_xc(
-            1,
+            len(facs),
             handle,
             factors,
             0,
@@ -110,18 +132,21 @@ class RestrictedLibXCFunctional:
             raise ValueError(f"Unsupported libxc functional '{xc}'.")
 
         info = _SUPPORTED_XC[self.name]
-        libxc_name = info['libxc_name']
-        number = LIBXC.functional_number(libxc_name)
-        if number < 0:
+        libxc_names = info.get('libxc_names')
+        if libxc_names is None:
+            libxc_names = (info['libxc_name'],)
+        numbers = tuple(LIBXC.functional_number(name) for name in libxc_names)
+        if any(number < 0 for number in numbers):
             raise ValueError(f"Unsupported libxc functional '{xc}'.")
 
-        self.handle = LIBXC.init_functional(number)
+        self.handle = LIBXC.init_functional(numbers)
         if self.handle is None:
             raise ValueError(f"Failed to initialize libxc functional '{xc}'.")
 
         self.xctype = info['xctype']
         self.nvar = 1 if self.xctype == 'LDA' else 4
         self.hyb = info['hyb']
+        self.facs = (1.0,) * len(numbers)
 
     def eval(self, rho, grad_rho=None):
         """
@@ -129,7 +154,7 @@ class RestrictedLibXCFunctional:
         """
         rho = np.asarray(rho, dtype=float)
         if self.xctype == 'LDA':
-            out = LIBXC.eval_xc(self.handle, 1.0, rho, nvar=1, deriv=1)
+            out = LIBXC.eval_xc(self.handle, self.facs, rho, nvar=1, deriv=1)
             return out[0], out[1]
 
         if grad_rho is None:
@@ -138,7 +163,13 @@ class RestrictedLibXCFunctional:
         if grad_rho.shape[0] != 3:
             raise ValueError("grad_rho must have shape (3, ngrids).")
 
-        out = LIBXC.eval_xc(self.handle, 1.0, np.vstack((rho, grad_rho)), nvar=4, deriv=1)
+        out = LIBXC.eval_xc(
+            self.handle,
+            self.facs,
+            np.vstack((rho, grad_rho)),
+            nvar=4,
+            deriv=1,
+        )
         return out[0], out[1], out[2]
 
     def __del__(self):

@@ -91,6 +91,30 @@ class RKS:
     def energy_nuc(self):
         return self.mol.energy_nuc()
 
+    def nuc_grad_method(self):
+        from .grad import Gradients
+        return Gradients(self)
+
+    def optimize_geometry(
+        self,
+        backend='scipy',
+        method='BFGS',
+        maxiter=50,
+        gtol=1e-3,
+        callback=None,
+        **kwargs,
+    ):
+        from .geomopt import optimize_geometry
+        return optimize_geometry(
+            self,
+            backend=backend,
+            method=method,
+            maxiter=maxiter,
+            gtol=gtol,
+            callback=callback,
+            **kwargs,
+        )
+
     def get_j(self, dm=None):
         if dm is None:
             if self.dm is None:
