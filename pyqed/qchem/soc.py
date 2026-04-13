@@ -1,83 +1,181 @@
-#!/usr/bin/env python
-#
-# Author: Qiming Sun <osirpt.sun@gmail.com>
-#
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Spin-orbit coupling helpers for scalar-reference wavefunctions.
 
-import numpy
-from pyscf import gto, scf, ao2mo, mcscf
+The functions in this module are designed for the common "RHF + perturbative
+SOC" workflow:
 
-'''
-MO integrals needed by spin-orbit coupling
-'''
+1. Run a scalar RHF calculation to obtain orthonormal MOs.
+2. Build one-electron Breit-Pauli SOC integrals in the AO or MO basis.
+3. Expand the spatial operator to a spin-orbital matrix for use in
+   post-HF/state-interaction models.
 
-mol = gto.M(
-    atom = 'H 0 0 -1.8; Li 0 0 0; H 0. 0 1.8',
-    basis = 'augccpvdz',
-    spin = 1,
-    charge = 4)
+Notes
+-----
+This module currently provides only the one-electron nuclear spin-orbit
+operator.  By default it uses the one-center approximation, which is often the
+cheapest useful first model.
+"""
+
+import numpy as np
+from opt_einsum import contract
+
+from pyqed.qchem._libcint import CBasis1e
+
+LIGHT_SPEED = 137.03599967994
 
 
-def soc(mol):
+def soc_1e_prefactor(light_speed=None):
     """
-    
-    Ref:
-        JCP, 122, 034107
+    Breit-Pauli one-electron SOC prefactor in atomic units.
+    """
+    if light_speed is None:
+        light_speed = LIGHT_SPEED
+    return 1.0 / (4.0 * light_speed ** 2)
+
+
+def _get_cbasis(mol):
+    """
+    Build a libcint-compatible basis wrapper from a pyqed Molecule.
+    """
+    if getattr(mol, '_bas', None) is None:
+        raise ValueError(
+            "mol._bas is not available. Build the molecule with driver='gbasis' "
+            "before requesting SOC integrals without PySCF."
+        )
+
+    coord_type = getattr(mol._bas[0], 'coord_type', 'spherical')
+    return CBasis1e(mol._bas, mol.atom_symbols(), mol.atom_coords(), coord_type=coord_type)
+
+
+def get_pvxp_ao(mol, one_center=True):
+    """
+    Raw three-component ``p V x p`` operator in the AO basis.
 
     Parameters
     ----------
-    mol : TYPE
-        DESCRIPTION.
+    mol : pyqed.qchem.Molecule-like
+        Must provide ``topyscf()``.
+    one_center : bool
+        If ``True``, build the standard one-center approximation by keeping
+        only atom-local shell blocks for each nucleus.  If ``False``, build the
+        full one-electron nuclear SOC operator by summing over all nuclei.
 
     Returns
     -------
-    h1 : TYPE
-        DESCRIPTION.
-    h2 : TYPE
-        DESCRIPTION.
-
+    ndarray
+        Array of shape ``(3, nao, nao)`` with components ``(x, y, z)``.
     """
-    
-    myhf = scf.RHF(mol)
-    myhf.kernel()
-    print(myhf.mo_energy[:10])
-    # mycas = mcscf.CASSCF(myhf, 2, 1) # 6 orbital, 8 electron
-    # mycas.kernel()
+    cbasis = _get_cbasis(mol)
+    mat = np.zeros((3, cbasis.nbfn, cbasis.nbfn), dtype=float)
+    atom_coords = np.asarray(mol.atom_coords(), dtype=float)
+    atom_charges = np.asarray(mol.atom_charges(), dtype=float)
 
-    # CAS space orbitals
-    # cas_orb = mycas.mo_coeff[:,mycas.ncore:mycas.ncore+mycas.ncas]
-    
-    # 2-electron part spin-same-orbit coupling
-    #       [ijkl] = <ik| p1 1/r12 cross p1 |jl>
-    # JCP, 122, 034107 Eq (3) = h2 * (-i)
-    # For simplicty, we didn't consider the permutation symmetry k >= l, therefore aosym='s1'
-    
-    # if mol.nelectron > 1:
-    #     h2 = ao2mo.kernel(mol, cas_orb, intor='int2e_p1vxp1_sph', comp=3, aosym='s1')
-    #     print('SSO 2e integrals shape %s' % str(h2.shape))
-    
-    # 1-electron part for atom A
-    #       <i| p 1/|r-R_A| cross p |j>
-    # JCP, 122, 034107 Eq (2) = h1 * (iZ_A)
-    mo = myhf.mo_coeff
-    
-    # OAM of MOs
-    # l = numpy.einsum('xpq,pi,qj->xij', mol.intor('int1e_giao_irjxp_sph')  , mo, mo)
-    # for p in range(mol.nao):
-    #     print(l[2, p, p])
-              
-    # print(mo.shape)
-    mol.set_rinv_origin(mol.atom_coord(1))  # set the gauge origin on second atom
-    
+    if one_center:
+        for ia, coord in enumerate(atom_coords):
+            p0, p1 = cbasis.ao_slice_by_atom(ia)
+            w = -atom_charges[ia] * cbasis.int1e('int1e_prinvxp', components=(3,), inv_origin=coord)
+            mat[:, p0:p1, p0:p1] = np.moveaxis(w[p0:p1, p0:p1], -1, 0)
+    else:
+        for ia, coord in enumerate(atom_coords):
+            w = -atom_charges[ia] * cbasis.int1e('int1e_prinvxp', components=(3,), inv_origin=coord)
+            mat += np.moveaxis(w, -1, 0)
 
-    h1 = numpy.einsum('xpq,pi,qj->xij', mol.intor('int1e_prinvxp'), mo, mo)
-    print('1e integral shape %s' % str(h1.shape))
-    for p in range(10):
-        print(1j * h1[2, p, p])
-    # print(1j * h1[2, 3, 3])
-    
-    # transition density matrix 
-    
-    
-    return h1
+    return mat
 
-soc(mol)
+
+def get_soc_1e_ao(mol, one_center=True, with_prefactor=True, light_speed=None):
+    """
+    One-electron Breit-Pauli SOC vector operator in the AO basis.
+    """
+    mat = get_pvxp_ao(mol, one_center=one_center)
+    if with_prefactor:
+        mat = soc_1e_prefactor(light_speed=light_speed) * mat
+    return mat
+
+
+def get_soc_1e_mo(mf, mo_coeff=None, one_center=True, with_prefactor=True,
+                  light_speed=None):
+    """
+    One-electron Breit-Pauli SOC vector operator in the MO basis.
+
+    Parameters
+    ----------
+    mf : RHF-like object
+        Must provide ``mol`` and converged ``mo_coeff``.
+    mo_coeff : ndarray, optional
+        MO coefficients.  If ``None``, use ``mf.mo_coeff``.
+    """
+    if mo_coeff is None:
+        mo_coeff = mf.mo_coeff
+
+    if mo_coeff is None:
+        raise ValueError("MO coefficients are required. Run RHF first.")
+
+    hso_ao = get_soc_1e_ao(
+        mf.mol,
+        one_center=one_center,
+        with_prefactor=with_prefactor,
+        light_speed=light_speed,
+    )
+    return contract('xpq,pi,qj->xij', hso_ao, mo_coeff.conj(), mo_coeff)
+
+
+def spatial_soc_to_spin_orbital(hso_xyz):
+    """
+    Expand a 3-component spatial SOC operator to a 2-spinor matrix.
+
+    Parameters
+    ----------
+    hso_xyz : ndarray
+        Array of shape ``(3, n, n)``.
+
+    Returns
+    -------
+    ndarray
+        Complex Hermitian matrix of shape ``(2*n, 2*n)`` in the spin-orbital
+        basis ordered as ``(alpha_0, beta_0, alpha_1, beta_1, ...)``.
+    """
+    pauli = 1j * np.asarray([
+        [[0.0, 1.0], [1.0, 0.0]],
+        [[0.0, -1.0j], [1.0j, 0.0]],
+        [[1.0, 0.0], [0.0, -1.0]],
+    ], dtype=complex)
+    n = hso_xyz.shape[-1]
+    return np.einsum('sxy,spq->xpyq', pauli, hso_xyz).reshape(2 * n, 2 * n)
+
+
+def get_soc_1e_spin_orbital(mf, representation='mo', mo_coeff=None,
+                            one_center=True, with_prefactor=True,
+                            light_speed=None):
+    """
+    One-electron SOC Hamiltonian in a spin-orbital basis.
+
+    Parameters
+    ----------
+    mf : RHF-like object
+        Mean-field reference.
+    representation : {'ao', 'mo'}
+        Spatial basis in which the spin-orbital Hamiltonian is built.
+    """
+    rep = representation.lower()
+    if rep == 'ao':
+        hso_xyz = get_soc_1e_ao(
+            mf.mol,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+    elif rep == 'mo':
+        hso_xyz = get_soc_1e_mo(
+            mf,
+            mo_coeff=mo_coeff,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+    else:
+        raise ValueError("representation must be 'ao' or 'mo'.")
+
+    return spatial_soc_to_spin_orbital(hso_xyz)

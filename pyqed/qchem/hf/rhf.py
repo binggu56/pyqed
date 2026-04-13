@@ -129,6 +129,54 @@ class RHF:
         # print("Imag part of ERIs =", np.linalg.norm(eri.imag))
         return eri
 
+    def get_soc_pvxp_ao(self, one_center=True):
+        """
+        Raw three-component p V x p operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_pvxp_ao
+        return get_pvxp_ao(self.mol, one_center=one_center)
+
+    def get_soc_1e_ao(self, one_center=True, with_prefactor=True, light_speed=None):
+        """
+        One-electron Breit-Pauli SOC operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_ao
+        return get_soc_1e_ao(
+            self.mol,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_1e_mo(self, mo_coeff=None, one_center=True, with_prefactor=True,
+                      light_speed=None):
+        """
+        One-electron Breit-Pauli SOC operator in the MO basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_mo
+        return get_soc_1e_mo(
+            self,
+            mo_coeff=mo_coeff,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_1e_so(self, representation='mo', mo_coeff=None, one_center=True,
+                      with_prefactor=True, light_speed=None):
+        """
+        One-electron Breit-Pauli SOC Hamiltonian in a spin-orbital basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_spin_orbital
+        return get_soc_1e_spin_orbital(
+            self,
+            representation=representation,
+            mo_coeff=mo_coeff,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
     def make_rdm1(self):
         return make_rdm1(self.mo_coeff, self.mo_occ)
 
@@ -215,7 +263,38 @@ class RHF:
 
     def to_uhf(self):
         # transform a RHF to UHF format with spin orbitals
-        pass
+        from .uhf import UHF
+
+        uhf = UHF(self.mol, init_guess=self.init_guess)
+        uhf.e_tot = self.e_tot
+        uhf.e_nuc = self.e_nuc
+        uhf.hcore = (self.hcore, self.hcore)
+        uhf.mo_energy = (self.mo_energy.copy(), self.mo_energy.copy())
+        uhf.mo_coeff = (self.mo_coeff.copy(), self.mo_coeff.copy())
+
+        mo_occ_a = np.zeros_like(self.mo_occ, dtype=float)
+        mo_occ_b = np.zeros_like(self.mo_occ, dtype=float)
+        mo_occ_a[:self.nocc] = 1.0
+        mo_occ_b[:self.nocc] = 1.0
+        uhf.mo_occ = (mo_occ_a, mo_occ_b)
+        uhf.dm = np.array((
+            make_rdm1(uhf.mo_coeff[0], mo_occ_a),
+            make_rdm1(uhf.mo_coeff[1], mo_occ_b),
+        ))
+        uhf.vhf = uhf.get_veff(uhf.dm)
+        uhf.converged = self.e_tot is not None
+        uhf.na = self.nocc
+        uhf.nb = self.nocc
+        uhf.nocc = (self.nocc, self.nocc)
+        uhf.nvir = (self.nvir, self.nvir)
+        return uhf
+
+    def RTTDHF(self, interaction_ao=None, field=None, **kwargs):
+        """
+        Convenience constructor for real-time TDHF propagation.
+        """
+        from pyqed.qchem.rttdhf import RTTDHF
+        return RTTDHF(self, interaction_ao=interaction_ao, field=field, **kwargs)
 
 
     def energy_elec(self,dm=None):
@@ -655,7 +734,10 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
         for b1 in range(bsize):
             for b2 in range(bsize):
                 bmat[b1, b2] = np.trace(diis_error_matrices[b1].dot(diis_error_matrices[b2]))
-        C =  np.linalg.solve(bmat, rhs)
+        try:
+            C = np.linalg.solve(bmat, rhs)
+        except np.linalg.LinAlgError:
+            return fock, diis_error
 
         # form new interpolated diis fock matrix
         for i, k in enumerate(C[:-1]):

@@ -1020,7 +1020,13 @@ class Molecule:
 
         """
         from pyscf import gto
-        return gto.M(atom=self.atom, basis=self.basis, unit=self.unit)
+        return gto.M(
+            atom=self.atom,
+            basis=self.basis,
+            unit=self.unit,
+            charge=self.charge,
+            spin=self.spin,
+        )
 
     def atom_mass_list(self):
         '''
