@@ -55,20 +55,19 @@ if __name__ == '__main__':
 
 
 
-    # # CASSCF with pcm
-    # print('@ ' * 40)
-    # mc2 = CASSCF(mf, ncas=2, nelecas=2, max_cycles=50)
-    # mc2.state_average(weights = np.ones(nstates)/nstates)
-    # mc2.fix_spin(ss=0, shift=0.2)
-    # mc2 = solvent.PCM(mc2)
+    # CASSCF with pcm
+    mc2 = CASSCF(mf, ncas=2, nelecas=2, max_cycles=50)
+    mc2.state_average(weights = np.ones(nstates)/nstates)
+    mc2.fix_spin(ss=0, shift=0.2)
+    mc2 = solvent.PCM(mc2)
 
-    # # mc.with_solvent.eps = 32.613   # methanol
-    # # mc.with_solvent.eps = 24.852   # ethanol
-    # # mc.with_solvent.eps = 78.3553   # water
-    # mc2.with_solvent.eps = 2.3653   # 1,2,4-TriMethylBenzene
-    # mc2.run(nstates=nstates)
-    # # print('casscf solll ener', mc2.with_solvent.e)
-    # # print('e_tot', mc2.e_tot)
+    # mc.with_solvent.eps = 32.613   # methanol
+    # mc.with_solvent.eps = 24.852   # ethanol
+    # mc.with_solvent.eps = 78.3553   # water
+    mc2.with_solvent.eps = 2.3653   # 1,2,4-TriMethylBenzene
+    mc2.run(nstates=nstates)
+    # print('casscf solll ener', mc2.with_solvent.e)
+    # print('e_tot', mc2.e_tot)
 
 
     print('---------- compare with pyscf ----------')
