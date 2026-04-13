@@ -30,7 +30,7 @@ import numpy as np
 
 from pyqed import dag, au2angstrom
 from pyqed.qchem.hf import RHF, UHF
-
+from pyscf import dft, scf, gto, ao2mo
 from periodictable import elements
 
 
@@ -51,6 +51,45 @@ from pyqed.qchem.basis import build
 # except ImportError:
 #     print("Failed to load cclib!")
 #     raise
+
+# for _atm, _bas, _env
+CHARGE_OF  = 0
+PTR_COORD  = 1
+NUC_MOD_OF = 2
+PTR_ZETA   = 3
+PTR_FRAC_CHARGE = 4
+PTR_RADIUS = 5
+ATM_SLOTS  = 6
+ATOM_OF    = 0
+ANG_OF     = 1
+NPRIM_OF   = 2
+NCTR_OF    = 3
+RADI_POWER = 3 # for ECP
+KAPPA_OF   = 4
+SO_TYPE_OF = 4 # for ECP
+PTR_EXP    = 5
+PTR_COEFF  = 6
+BAS_SLOTS  = 8
+# pointer to env
+PTR_EXPCUTOFF   = 0
+PTR_COMMON_ORIG = 1
+PTR_RINV_ORIG   = 4
+PTR_RINV_ZETA   = 7
+PTR_RANGE_OMEGA = 8
+PTR_F12_ZETA    = 9
+PTR_GTG_ZETA    = 10
+NGRIDS          = 11
+PTR_GRIDS       = 12
+AS_RINV_ORIG_ATOM = 17
+AS_ECPBAS_OFFSET = 18
+AS_NECPBAS      = 19
+PTR_ENV_START   = 20
+# parameters from libcint
+NUC_POINT = 1
+NUC_GAUSS = 2
+# nucleus with fractional charges. It can be used to mimic MM particles
+NUC_FRAC_CHARGE = 3
+NUC_ECP = 4  # atoms with pseudo potential
 
 def atomic_chain(natom, z, element='H', basis='631g', spin=0):
 
@@ -935,6 +974,12 @@ class Molecule:
 
         return self._nelec
 
+    def nuc_charge_center(self):
+
+        charges = self.atom_charges()
+        coords = self.atom_coords()
+
+        return np.einsum('z,zx->x', charges, coords) / charges.sum()
 
     def build(self, driver='gbasis'):
         """
@@ -967,6 +1012,7 @@ class Molecule:
             mol.build()
 
             self.nao = mol.nao
+            self.nbas = mol.nbas
 
             kin = mol.intor('int1e_kin')
             vnuc = mol.intor('int1e_nuc')
@@ -975,6 +1021,22 @@ class Molecule:
             self.overlap = mol.intor('int1e_ovlp')
             self.eri = mol.intor('int2e')
 
+            self.ao_moment = 1j * mol.intor('int1e_ipovlp', comp=3)
+
+            mol.set_common_orig(coord = self.nuc_charge_center())
+            self.ao_dip = -mol.intor('int1e_r', comp=3)
+            self.ao_magnetic_dip = mol.intor('int1e_cg_irxp', comp=3)
+
+            self.cart = mol.cart
+
+            self._atm = mol._atm
+            self._bas = mol._bas
+            self._env = mol._env
+
+    def _add_suffix(self, intor, cart=None):
+        mol = self.topyscf()
+        return mol._add_suffix(intor, cart) 
+    
     def moment_integral(self, orders=None, center=np.array([0,0,0])):
         """
 
@@ -1314,6 +1376,16 @@ class Molecule:
 
     def energy_nuc(self):
         return energy_nuc(self.atom_coords(), self.atom_charges())
+
+def fakemol_for_charges(coords, expnt=1e16):
+    return gto.fakemol_for_charges(coords=coords, expnt=expnt)
+
+def intor_cross(intor, mol1, mol2, comp=None, grids=None):
+    return gto.intor_cross(intor=intor, mol1=mol1, mol2=mol2, comp=comp, grids=grids)
+
+def make_cintopt(atm, basis, env, intor):
+    mol = gto.Mole()
+    return gto.moleintor.make_cintopt(atm=mol._atm, bas=mol._bas, env=mol._env, intor=intor)
 
 def energy_nuc(atcoords, atnums):
     # Compute Nucleus-Nucleus repulsion
