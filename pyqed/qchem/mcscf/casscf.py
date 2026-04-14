@@ -24,12 +24,16 @@ class CASSCF(CASCI):
 
 
     """
-    def __init__(self, mf, ncas, nelecas, max_cycles=30, **kwargs):
+    def __init__(self, mf, ncas, nelecas, max_cycles=30,
+                 optimizer='RCG', optimizer_history=7, **kwargs):
         super().__init__(mf, ncas, nelecas, **kwargs)
 
         self.max_cycles = max_cycles # macroiterations
         self.tol = 1e-6 # energy tol
         self.mo_coeff = None # opt orb
+        # Orbital optimization backend for the U-matrix formulation.
+        self.optimizer = optimizer.upper()
+        self.optimizer_history = optimizer_history
 
 
         self.weights = None
@@ -82,7 +86,12 @@ class CASSCF(CASCI):
             U0[i, i] = 1.
 
         if nstates == 1: # ground state only
-            C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
+            C, mc = kernel(
+                mc, U0, nelecas, ncas, C0, h1e, eri,
+                max_cycles=self.max_cycles,
+                optimizer=self.optimizer,
+                optimizer_history=self.optimizer_history,
+            )
 
         elif nstates > 1:
             if self.weights is None:
@@ -90,8 +99,12 @@ class CASSCF(CASCI):
             if len(self.weights) != nstates: 
                 self.state_average(weights = np.ones(nstates)/nstates)
 
-            C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
-                                         C0=C0, h1e=h1e, eri=eri)
+            C, mc = kernel_state_average(
+                mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
+                C0=C0, h1e=h1e, eri=eri,
+                optimizer=self.optimizer,
+                optimizer_history=self.optimizer_history,
+            )
 
         self.mo_coeff = C
         self.e_tot = mc.e_tot
@@ -136,7 +149,8 @@ def energy(U, h1e, eri, dm1, dm2):
 
 
 
-def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwargs):
+def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
+           optimizer='RCG', optimizer_history=7, **kwargs):
     """
     complete active space orbital optimization with orthonomality constraint
 
@@ -189,7 +203,10 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
     # ``U`` is the current orbital subspace transform.  We improve this same
     # variable across macroiterations instead of restarting every time from the
     # initial guess ``U0``.
-    U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+    U, E = minimize(
+        energy, U0, args=(h1e, eri, dm1, dm2),
+        algorithm=optimizer, history_size=optimizer_history,
+    )
 
     k = 0
 
@@ -216,7 +233,10 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
         # Keep refining the current orbital subspace.  Restarting from ``U0``
         # here would throw away all previous orbital optimization work and can
         # bias the macroiterations away from the true CASSCF stationary point.
-        U, E = minimize(energy, U, args=(h1e, eri, dm1, dm2), tau=1)
+        U, E = minimize(
+            energy, U, args=(h1e, eri, dm1, dm2), tau=1,
+            algorithm=optimizer, history_size=optimizer_history,
+        )
         # print(E + mol.energy_nuc())
 
         k += 1
@@ -238,7 +258,8 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
 
 
 def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
-                         max_cycles=50, tol=1e-6, **kwargs):
+                         max_cycles=50, tol=1e-6, optimizer='RCG',
+                         optimizer_history=7, **kwargs):
 
     if mc.ncore > 0:
         with_core = True
@@ -258,7 +279,10 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     # State-averaged CASSCF uses the same ``U`` variable as the state-specific
     # kernel, so it should also keep improving the latest orbital transform
     # rather than restarting from ``U0`` in every macroiteration.
-    U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+    U, E = minimize(
+        energy, U0, args=(h1e, eri, dm1, dm2),
+        algorithm=optimizer, history_size=optimizer_history,
+    )
 
 
     e_old = sum(weights * mc.e_tot)
@@ -292,7 +316,10 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             dm2 += _dm2 * weights[n]
 
 
-        U, E = minimize(energy, U, args=(h1e, eri, dm1, dm2))
+        U, E = minimize(
+            energy, U, args=(h1e, eri, dm1, dm2),
+            algorithm=optimizer, history_size=optimizer_history,
+        )
         # print(E + mol.energy_nuc())
 
         k += 1

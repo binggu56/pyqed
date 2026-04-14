@@ -11,7 +11,8 @@ from opt_einsum import contract
 
 
 def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
-             rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG'):
+             rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
+             history_size=7):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -42,8 +43,10 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Backtracking reduction factor.
     epsilon : float, optional
         Convergence threshold on the Riemannian gradient norm.
-    algorithm : {'RCG', 'SD'}, optional
+    algorithm : {'RCG', 'SD', 'LBFGS'}, optional
         Optimization algorithm on the Stiefel manifold.
+    history_size : int, optional
+        Number of secant pairs kept by the limited-memory BFGS backend.
 
     Returns
     -------
@@ -56,9 +59,10 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     ----------
     Optimization Lett. 2022, 16:1773
     """
-    if algorithm not in ('RCG', 'SD'):
+    algorithm = algorithm.upper()
+    if algorithm not in ('RCG', 'SD', 'LBFGS'):
         raise ValueError(
-            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG' or 'SD'.".format(
+            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG', 'SD' or 'LBFGS'.".format(
                 algorithm
             )
         )
@@ -73,8 +77,13 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     direction = -df
     v = C
     k = 0
+    lbfgs_s = []
+    lbfgs_y = []
 
     while norm(df) > epsilon:
+        if algorithm == 'LBFGS':
+            direction = -lbfgs_direction(df, lbfgs_s, lbfgs_y)
+
         directional_derivative = np.real(inner(df, direction))
         if directional_derivative >= 0:
             # Restart if conjugacy was lost numerically and the direction no
@@ -113,6 +122,9 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
             beta = max(0.0, beta_num / beta_den)
             transported_dir = transport(Xnew, direction)
             direction = -df_new + beta * transported_dir
+        elif algorithm == 'LBFGS':
+            update_lbfgs_history(lbfgs_s, lbfgs_y, Xnew, Xnew - X, df_new - transported_grad, history_size)
+            direction = -lbfgs_direction(df_new, lbfgs_s, lbfgs_y)
         else:
             direction = -df_new
 
@@ -287,6 +299,73 @@ def safe_stepsize(k, dU, dG, fallback):
     if not np.isfinite(tau) or tau <= 0:
         return fallback
     return tau
+
+
+def lbfgs_direction(grad_vec, s_history, y_history):
+    """
+    Apply the standard two-loop recursion for limited-memory BFGS.
+
+    The secant pairs are tangent vectors on the Stiefel manifold.  We use the
+    usual Euclidean algebra on those tangent coordinates because the optimizer
+    already transports them back to the current tangent space before they enter
+    the history.
+    """
+    if len(s_history) == 0:
+        return grad_vec.copy()
+
+    q = grad_vec.copy()
+    alpha = []
+    rho = []
+
+    for s_vec, y_vec in zip(reversed(s_history), reversed(y_history)):
+        sy = np.real(inner(s_vec, y_vec))
+        if abs(sy) < 1e-16:
+            alpha.append(0.0)
+            rho.append(0.0)
+            continue
+        rho_i = 1.0 / sy
+        alpha_i = rho_i * np.real(inner(s_vec, q))
+        q = q - alpha_i * y_vec
+        alpha.append(alpha_i)
+        rho.append(rho_i)
+
+    s_last = s_history[-1]
+    y_last = y_history[-1]
+    yy = np.real(inner(y_last, y_last))
+    sy = np.real(inner(s_last, y_last))
+    gamma = sy / yy if yy > 1e-16 else 1.0
+    r = gamma * q
+
+    for idx, (s_vec, y_vec) in enumerate(zip(s_history, y_history)):
+        rho_i = rho[-1 - idx]
+        alpha_i = alpha[-1 - idx]
+        if rho_i == 0.0:
+            continue
+        beta = rho_i * np.real(inner(y_vec, r))
+        r = r + s_vec * (alpha_i - beta)
+
+    return r
+
+
+def update_lbfgs_history(s_history, y_history, Xnew, raw_step, raw_grad_diff, history_size):
+    """
+    Store one transported secant pair for the manifold L-BFGS update.
+
+    ``raw_step`` and ``raw_grad_diff`` are first built in ambient coordinates
+    and then projected to the new tangent space before they are stored.
+    """
+    s_vec = transport(Xnew, raw_step)
+    y_vec = transport(Xnew, raw_grad_diff)
+    curvature = np.real(inner(s_vec, y_vec))
+    if curvature <= 1e-12:
+        return
+
+    s_history.append(s_vec.copy())
+    y_history.append(y_vec.copy())
+
+    if len(s_history) > history_size:
+        del s_history[0]
+        del y_history[0]
 
 def inner(a, b):
     return np.trace(a.T.conj() @ b)
