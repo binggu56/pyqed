@@ -1020,10 +1020,11 @@ class Molecule:
 
         """
         from pyscf import gto
+        atom = build_atom_from_coords(self.atom_symbols(), self.atom_coords())
         return gto.M(
-            atom=self.atom,
+            atom=atom,
             basis=self.basis,
-            unit=self.unit,
+            unit='bohr',
             charge=self.charge,
             spin=self.spin,
         )

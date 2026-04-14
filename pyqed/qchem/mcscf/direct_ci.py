@@ -20,19 +20,437 @@ from opt_einsum import contract
 from pyqed import tensor
 from itertools import combinations
 import warnings
+from dataclasses import dataclass
 
 from pyqed.qchem import get_veff
-from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
+from pyqed.qchem.ci.fci import (
+    givenΛgetB,
+    SpinOuterProduct,
+    get_fci_combos,
+    SlaterCondon,
+    CI_H,
+    determinantsign,
+    get_excitation_op,
+)
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
             create, Is #, jordan_wigner_two_body
 
 
 from pyqed.qchem.hf.rhf import ao2mo
 
-from pyqed.qchem.mcscf.casci import h1e_for_cas, size_of_cas, spin_square
+from pyqed.qchem.mcscf.casci import h1e_for_cas, size_of_cas, spin_square as spin_square_from_rdm
 from pyqed.qchem import mcscf
 
 from numba import njit, prange
+
+
+DIRECT_CI_DENSE_FALLBACK_NDETS = 256
+
+
+@dataclass
+class DirectConnectivity:
+    """
+    Compact determinant connectivity cache for the matrix-free direct-CI solver.
+
+    ``Binary`` is still stored on the CASCI object for overlap/RDM helpers.
+    This structure only replaces the expensive all-pairs Slater-Condon setup in
+    the direct-CI matvec path.
+    """
+    I_A: np.ndarray
+    J_A: np.ndarray
+    p_A: np.ndarray
+    q_A: np.ndarray
+    phase_A: np.ndarray
+    I_B: np.ndarray
+    J_B: np.ndarray
+    p_B: np.ndarray
+    q_B: np.ndarray
+    phase_B: np.ndarray
+    I_AA: np.ndarray
+    J_AA: np.ndarray
+    p_AA: np.ndarray
+    q_AA: np.ndarray
+    r_AA: np.ndarray
+    s_AA: np.ndarray
+    phase_AA: np.ndarray
+    I_BB: np.ndarray
+    J_BB: np.ndarray
+    p_BB: np.ndarray
+    q_BB: np.ndarray
+    r_BB: np.ndarray
+    s_BB: np.ndarray
+    phase_BB: np.ndarray
+    I_AB: np.ndarray
+    J_AB: np.ndarray
+    p_AB: np.ndarray
+    q_AB: np.ndarray
+    r_AB: np.ndarray
+    s_AB: np.ndarray
+    phase_AB: np.ndarray
+
+
+def _orthonormalize_columns(V, tol=1e-12):
+    """
+    Return an orthonormal basis spanning the columns of ``V``.
+
+    Davidson restarts and correction vectors can become nearly linearly
+    dependent.  Using a small QR-based helper keeps the solver code readable and
+    centralizes the rank filtering in one place.
+    """
+    if V.size == 0:
+        return np.zeros((V.shape[0], 0), dtype=V.dtype)
+
+    Q, R = np.linalg.qr(V, mode='reduced')
+    keep = np.abs(np.diag(R)) > tol
+    if not np.any(keep):
+        return np.zeros((V.shape[0], 0), dtype=V.dtype)
+    return Q[:, keep]
+
+
+def _build_davidson_guess(diag, nroots, guess=None):
+    """
+    Build an initial Davidson subspace from the diagonal and optional user seeds.
+
+    The default strategy mirrors standard CI Davidson practice: use unit vectors
+    associated with the smallest diagonal Hamiltonian elements.  If the caller
+    provides trial vectors via ``ci0`` we include them first, then fill any
+    missing columns from the diagonal guess.
+    """
+    n = diag.size
+    cols = []
+
+    if guess is not None:
+        if isinstance(guess, (list, tuple)):
+            guess_cols = [np.asarray(v, dtype=float).reshape(n) for v in guess]
+        else:
+            arr = np.asarray(guess, dtype=float)
+            if arr.ndim == 1:
+                guess_cols = [arr.reshape(n)]
+            else:
+                guess_cols = [arr[:, i].reshape(n) for i in range(arr.shape[1])]
+        cols.extend(guess_cols[:nroots])
+
+    order = np.argsort(diag)
+    for idx in order:
+        e = np.zeros(n, dtype=float)
+        e[idx] = 1.0
+        cols.append(e)
+        if len(cols) >= max(nroots, 2 * nroots):
+            break
+
+    return _orthonormalize_columns(np.column_stack(cols))
+
+
+def _select_direct_ci_guess(casci, nstates, ci0=None):
+    """
+    Choose the starting vectors for the direct-CI eigensolver.
+
+    Priority:
+    1. Explicit user-provided ``ci0``
+    2. Previously converged CI roots stored on the same CASCI object
+    3. Fall back to the diagonal-based guess in ``_build_davidson_guess``
+
+    Reusing previous CI roots is especially helpful for repeated runs on the
+    same active space, which is exactly how we benchmark and scan solver
+    settings.  It turns the Davidson solve into a true restart instead of
+    rebuilding the subspace from unit vectors every time.
+    """
+    if ci0 is not None:
+        return ci0
+    if casci.ci is not None and len(casci.ci) > 0:
+        return casci.ci[:nstates]
+    return None
+
+
+def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
+                    max_subspace=None, guess=None):
+    """
+    Solve for the lowest ``nroots`` eigenpairs of a symmetric CI Hamiltonian.
+
+    This Davidson implementation is tailored for the direct-CI backend:
+
+    - ``matvec`` is the matrix-free CI sigma builder
+    - ``diag`` is the precomputed Hamiltonian diagonal used for preconditioning
+    - only a few lowest roots are needed, so block Davidson is a better fit
+      than a generic sparse eigensolver
+
+    The routine keeps the implementation compact and readable rather than trying
+    to reproduce every feature of a production FCI Davidson solver.
+    """
+    n = diag.size
+    if nroots < 1 or nroots > n:
+        raise ValueError('nroots must be between 1 and the CI dimension.')
+
+    if max_subspace is None:
+        # A modest subspace is usually enough for low-root CASCI while keeping
+        # the Rayleigh-Ritz diagonalization cheap.  This default works better
+        # for the current direct-CI benchmarks than the larger initial choice.
+        max_subspace = min(n, max(16, 6 * nroots))
+
+    V = _build_davidson_guess(diag, nroots, guess=guess)
+    AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+
+    for _ in range(max_cycle):
+        T = V.T @ AV
+        theta_all, alpha_all = eigh(T)
+        order = np.argsort(theta_all)[:nroots]
+        theta = theta_all[order]
+        alpha = alpha_all[:, order]
+
+        ritz = V @ alpha
+        Aritz = AV @ alpha
+        resid = Aritz - ritz * theta
+        resid_norm = np.linalg.norm(resid, axis=0)
+
+        if np.all(resid_norm < tol):
+            return theta, ritz
+
+        new_vecs = []
+        for root in range(nroots):
+            if resid_norm[root] < tol:
+                continue
+
+            denom = theta[root] - diag
+            safe = np.where(np.abs(denom) > 1e-12, denom, np.where(denom >= 0, 1e-12, -1e-12))
+            corr = resid[:, root] / safe
+
+            if V.shape[1] > 0:
+                corr -= V @ (V.T @ corr)
+            for prev in new_vecs:
+                corr -= prev * np.dot(prev, corr)
+
+            norm = np.linalg.norm(corr)
+            if norm > 1e-12:
+                new_vecs.append(corr / norm)
+
+        if not new_vecs:
+            return theta, ritz
+
+        if V.shape[1] + len(new_vecs) > max_subspace:
+            # Restart from the current Ritz vectors.  This keeps the subspace
+            # size bounded without losing the best approximation accumulated so
+            # far.
+            V = _orthonormalize_columns(ritz)
+            AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+        else:
+            new_block = np.column_stack(new_vecs)
+            AV_new = np.column_stack([matvec(new_block[:, i]) for i in range(new_block.shape[1])])
+            V = np.column_stack((V, new_block))
+            AV = np.column_stack((AV, AV_new))
+
+    raise RuntimeError('Davidson solver did not converge within max_cycle iterations.')
+
+
+def build_spin_square_operator(norb):
+    """
+    Return the active-space one- and two-electron pieces of the ``S^2`` operator.
+
+    The tensor layout matches the direct-CI Hamiltonian convention:
+
+    ``H1 = [h_alpha, h_beta]``
+    ``H2 = [[eri_aa, eri_ab], [eri_ba, eri_bb]]``
+
+    This is the same operator that is implicitly used by ``fix_spin()`` when the
+    code adds a first-order ``J * S^2`` penalty. Keeping it as a standalone
+    helper lets us evaluate ``<Psi|S^2|Psi>`` directly from CI vectors without
+    building 1- and 2-RDMs.
+    """
+    h1 = np.asarray([0.75 * np.eye(norb), 0.75 * np.eye(norb)])
+    h2 = np.zeros((2, 2, norb, norb, norb, norb))
+
+    for p in range(norb):
+        for q in range(norb):
+            h2[:, :, p, q, q, p] -= 1.0
+            h2[:, :, p, p, q, q] -= 0.5
+
+    # Same-spin blocks need the antisymmetrized ``(pq||rs)`` form used by the
+    # CI solver. Cross-spin blocks remain in Coulomb form.
+    h2[0, 0] -= h2[0, 0].swapaxes(1, 3)
+    h2[1, 1] -= h2[1, 1].swapaxes(1, 3)
+
+    return h1, h2
+
+
+def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore):
+    """
+    Build the active-space spatial-orbital Hamiltonian for the direct-CI solver.
+
+    Unlike ``get_SO_matrix()``, this helper keeps the two-electron piece as a
+    single spatial ERI tensor ``(pq|rs)``. The matrix-free direct-CI kernel can
+    then apply the spin cases logically:
+
+    - same-spin terms use the antisymmetrized combination
+      ``(pq|rs) - (ps|rq)``
+    - opposite-spin terms use the Coulomb term ``(pq|rs)``
+
+    This avoids storing a full ``2 x 2`` block tensor when the direct solver
+    only needs the spatial integrals plus the spin-resolved occupation patterns.
+    """
+    h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
+    mo_cas = mo_coeff[:, ncore:ncore+ncas]
+    eri_spatial = contract('ip, jq, ijkl, kr, ls -> pqrs',
+                           mo_cas.conj(), mo_cas, mf.eri, mo_cas.conj(), mo_cas)
+    return h1, eri_spatial, energy_core
+
+
+def _binary_row_to_bits(occ):
+    bits = 0
+    for p, val in enumerate(occ):
+        if val:
+            bits |= 1 << p
+    return bits
+
+
+def _empty_int_array():
+    return np.zeros(0, dtype=np.int32)
+
+
+def _empty_phase_array():
+    return np.zeros(0, dtype=np.int8)
+
+
+def _extract_single_data(I, J, Binary, sign, spin):
+    if len(I) == 0:
+        return _empty_int_array(), _empty_int_array(), _empty_phase_array()
+
+    a_t, a = get_excitation_op(I, J, Binary, sign, spin=spin)
+    p = np.argmax(a_t != 0, axis=1).astype(np.int32)
+    q = np.argmax(a != 0, axis=1).astype(np.int32)
+    phase = (a_t[np.arange(len(I)), p] * a[np.arange(len(I)), q]).astype(np.int8)
+    return p, q, phase
+
+
+def _extract_double_same_data(I, J, Binary, sign, spin):
+    if len(I) == 0:
+        return (_empty_int_array(), _empty_int_array(), _empty_int_array(),
+                _empty_int_array(), _empty_phase_array())
+
+    a_t, a = get_excitation_op(I, J, Binary, sign, spin=spin)
+    p = np.argmax(a_t[0] != 0, axis=1).astype(np.int32)
+    q = np.argmax(a[0] != 0, axis=1).astype(np.int32)
+    r = np.argmax(a_t[1] != 0, axis=1).astype(np.int32)
+    s = np.argmax(a[1] != 0, axis=1).astype(np.int32)
+    phase = (
+        a_t[0, np.arange(len(I)), p]
+        * a[0, np.arange(len(I)), q]
+        * a_t[1, np.arange(len(I)), r]
+        * a[1, np.arange(len(I)), s]
+    ).astype(np.int8)
+    return p, q, r, s, phase
+
+
+def _extract_double_ab_data(I, J, Binary, sign):
+    if len(I) == 0:
+        return (_empty_int_array(), _empty_int_array(), _empty_int_array(),
+                _empty_int_array(), _empty_phase_array())
+
+    ab_t, ab = get_excitation_op(I, J, Binary, sign, spin=0)
+    ba_t, ba = get_excitation_op(I, J, Binary, sign, spin=1)
+    p = np.argmax(ab_t != 0, axis=1).astype(np.int32)
+    q = np.argmax(ab != 0, axis=1).astype(np.int32)
+    r = np.argmax(ba_t != 0, axis=1).astype(np.int32)
+    s = np.argmax(ba != 0, axis=1).astype(np.int32)
+    phase = (
+        ab_t[np.arange(len(I)), p]
+        * ab[np.arange(len(I)), q]
+        * ba_t[np.arange(len(I)), r]
+        * ba[np.arange(len(I)), s]
+    ).astype(np.int8)
+    return p, q, r, s, phase
+
+
+def build_direct_connectivity(Binary):
+    """
+    Enumerate only the determinant pairs that are connected by the Hamiltonian.
+
+    The legacy Slater-Condon builder compares every determinant to every other
+    determinant. For the direct-CI solver we only need connected neighbors, so
+    we enumerate those directly from each determinant's occupied/virtual orbital
+    lists and store compact orbital-index records.
+    """
+    n_det, _, n_mo = Binary.shape
+    alpha_bits = [_binary_row_to_bits(Binary[i, 0]) for i in range(n_det)]
+    beta_bits = [_binary_row_to_bits(Binary[i, 1]) for i in range(n_det)]
+    lookup = {(alpha_bits[i], beta_bits[i]): i for i in range(n_det)}
+
+    singles_a = []
+    singles_b = []
+    doubles_aa = []
+    doubles_bb = []
+    doubles_ab = []
+
+    for J in range(n_det):
+        occ_a = np.where(Binary[J, 0] == 1)[0]
+        vir_a = np.where(Binary[J, 0] == 0)[0]
+        occ_b = np.where(Binary[J, 1] == 1)[0]
+        vir_b = np.where(Binary[J, 1] == 0)[0]
+
+        a_bits = alpha_bits[J]
+        b_bits = beta_bits[J]
+
+        for q in occ_a:
+            removed = a_bits ^ (1 << q)
+            for p in vir_a:
+                I = lookup[(removed | (1 << p), b_bits)]
+                singles_a.append((I, J))
+
+        for q in occ_b:
+            removed = b_bits ^ (1 << q)
+            for p in vir_b:
+                I = lookup[(a_bits, removed | (1 << p))]
+                singles_b.append((I, J))
+
+        for iq, q in enumerate(occ_a):
+            for is_, s in enumerate(occ_a[iq + 1:], start=iq + 1):
+                removed = a_bits ^ (1 << q) ^ (1 << s)
+                for ip, p in enumerate(vir_a):
+                    for ir, r in enumerate(vir_a[ip + 1:], start=ip + 1):
+                        I = lookup[(removed | (1 << p) | (1 << r), b_bits)]
+                        doubles_aa.append((I, J))
+
+        for iq, q in enumerate(occ_b):
+            for is_, s in enumerate(occ_b[iq + 1:], start=iq + 1):
+                removed = b_bits ^ (1 << q) ^ (1 << s)
+                for ip, p in enumerate(vir_b):
+                    for ir, r in enumerate(vir_b[ip + 1:], start=ip + 1):
+                        I = lookup[(a_bits, removed | (1 << p) | (1 << r))]
+                        doubles_bb.append((I, J))
+
+        for q in occ_a:
+            a_removed = a_bits ^ (1 << q)
+            for s in occ_b:
+                b_removed = b_bits ^ (1 << s)
+                for p in vir_a:
+                    for r in vir_b:
+                        I = lookup[(a_removed | (1 << p), b_removed | (1 << r))]
+                        doubles_ab.append((I, J))
+
+    sign = determinantsign(Binary)
+
+    I_A = np.asarray([x[0] for x in singles_a], dtype=np.int32) if singles_a else _empty_int_array()
+    J_A = np.asarray([x[1] for x in singles_a], dtype=np.int32) if singles_a else _empty_int_array()
+    I_B = np.asarray([x[0] for x in singles_b], dtype=np.int32) if singles_b else _empty_int_array()
+    J_B = np.asarray([x[1] for x in singles_b], dtype=np.int32) if singles_b else _empty_int_array()
+    I_AA = np.asarray([x[0] for x in doubles_aa], dtype=np.int32) if doubles_aa else _empty_int_array()
+    J_AA = np.asarray([x[1] for x in doubles_aa], dtype=np.int32) if doubles_aa else _empty_int_array()
+    I_BB = np.asarray([x[0] for x in doubles_bb], dtype=np.int32) if doubles_bb else _empty_int_array()
+    J_BB = np.asarray([x[1] for x in doubles_bb], dtype=np.int32) if doubles_bb else _empty_int_array()
+    I_AB = np.asarray([x[0] for x in doubles_ab], dtype=np.int32) if doubles_ab else _empty_int_array()
+    J_AB = np.asarray([x[1] for x in doubles_ab], dtype=np.int32) if doubles_ab else _empty_int_array()
+
+    p_A, q_A, phase_A = _extract_single_data(I_A, J_A, Binary, sign, spin=0)
+    p_B, q_B, phase_B = _extract_single_data(I_B, J_B, Binary, sign, spin=1)
+    p_AA, q_AA, r_AA, s_AA, phase_AA = _extract_double_same_data(I_AA, J_AA, Binary, sign, spin=0)
+    p_BB, q_BB, r_BB, s_BB, phase_BB = _extract_double_same_data(I_BB, J_BB, Binary, sign, spin=1)
+    p_AB, q_AB, r_AB, s_AB, phase_AB = _extract_double_ab_data(I_AB, J_AB, Binary, sign)
+
+    return DirectConnectivity(
+        I_A, J_A, p_A, q_A, phase_A,
+        I_B, J_B, p_B, q_B, phase_B,
+        I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+        I_AB, J_AB, p_AB, q_AB, r_AB, s_AB, phase_AB,
+    )
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_diag(H1, H2, Binary):
@@ -90,6 +508,13 @@ def _compute_diag(H1, H2, Binary):
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_single_excitation(H1_spin, H2_same, H2_cross, a_t, a, ca, binary_complement):
+    """
+    Evaluate all same-spin single-excitation Hamiltonian matrix elements.
+
+    Each row ``k`` in ``a_t`` / ``a`` describes one excitation pair ``I <- J`` from
+    the Slater-Condon tables. The returned vector contains the scalar matrix
+    element for each pair, ready to be scattered into the CI sigma vector.
+    """
 
     n_exc = a_t.shape[0]
     n_mo = H1_spin.shape[0]
@@ -133,6 +558,12 @@ def _compute_single_excitation(H1_spin, H2_same, H2_cross, a_t, a, ca, binary_co
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_double_excitation(H2_tensor, at1, a1, at2, a2):
+    """
+    Evaluate double-excitation matrix elements for a batch of determinant pairs.
+
+    ``at1/a1`` and ``at2/a2`` encode the two creation/annihilation operators
+    needed to connect a bra/ket determinant pair by a double excitation.
+    """
 
     n_exc = at1.shape[0]
     n_mo = H2_tensor.shape[0]
@@ -162,6 +593,82 @@ def _compute_double_excitation(H2_tensor, at1, a1, at2, a2):
         H_result[k] = val
 
     return H_result
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_diag_spatial(h1, eri_spatial, Binary):
+    """
+    Diagonal CI matrix elements using spatial integrals plus spin occupations.
+
+    Same-spin electron pairs use the antisymmetrized spatial combination
+    ``(pp|qq) - (pq|qp)``, while opposite-spin pairs use the Coulomb term
+    ``(pp|qq)``.
+    """
+    n_dets, _, n_mo = Binary.shape
+    h1_diag = np.diag(h1)
+    H_diag = np.zeros(n_dets)
+
+    for i in prange(n_dets):
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                H_diag[i] += h1_diag[p]
+            if Binary[i, 1, p]:
+                H_diag[i] += h1_diag[p]
+
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                for q in range(n_mo):
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * (eri_spatial[p, p, q, q] - eri_spatial[p, q, q, p])
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * eri_spatial[p, p, q, q]
+
+            if Binary[i, 1, p]:
+                for q in range(n_mo):
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * (eri_spatial[p, p, q, q] - eri_spatial[p, q, q, p])
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * eri_spatial[p, p, q, q]
+
+    return H_diag
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_diag_compact(h1, eri_same, eri_cross, Binary):
+    """
+    Diagonal CI matrix elements using a compact two-tensor representation.
+
+    ``eri_same`` stores the antisymmetrized same-spin tensor, while
+    ``eri_cross`` stores the Coulomb tensor for opposite-spin electron pairs.
+    This is the direct-CI representation used by the compact backend.
+    """
+    n_dets, _, n_mo = Binary.shape
+    h1_diag = np.diag(h1)
+    H_diag = np.zeros(n_dets)
+
+    for i in prange(n_dets):
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                H_diag[i] += h1_diag[p]
+            if Binary[i, 1, p]:
+                H_diag[i] += h1_diag[p]
+
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                for q in range(n_mo):
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * eri_same[p, p, q, q]
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * eri_cross[p, p, q, q]
+
+            if Binary[i, 1, p]:
+                for q in range(n_mo):
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * eri_same[p, p, q, q]
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * eri_cross[p, p, q, q]
+
+    return H_diag
 
 
 
@@ -264,6 +771,406 @@ def hamiltonian_matrix_elements(Binary, H1, H2, SC1, SC2):
     return H_diag, H_A, H_B, H_AA, H_BB, H_AB
 
 
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_single_excitation(
+    sigma_vec, c, I, J, H1_spin, H2_same, H2_cross, a_t, a, ca, binary_complement
+):
+    """
+    Add all single-excitation contributions directly into ``sigma_vec``.
+
+    This is the matrix-free version of ``_compute_single_excitation``: instead of
+    forming a temporary vector of matrix elements and scattering it later, we
+    contract the Hamiltonian contribution and immediately accumulate
+    ``H[I, J] * c[J]`` into the output sigma vector.
+    """
+    n_exc = a_t.shape[0]
+    n_mo = H1_spin.shape[0]
+
+    for k in range(n_exc):
+        val = 0.0
+        for p in range(n_mo):
+            a_t_val = a_t[k, p]
+            if a_t_val == 0:
+                continue
+            for q in range(n_mo):
+                a_val = a[k, q]
+                if a_val == 0:
+                    continue
+
+                val -= H1_spin[p, q] * a_t_val * a_val
+                for r in range(n_mo):
+                    ca_val = ca[k, r]
+                    if ca_val != 0:
+                        val -= H2_same[p, q, r, r] * a_t_val * a_val * ca_val
+
+                    comp_val = binary_complement[k, r]
+                    if comp_val != 0:
+                        val -= H2_cross[p, q, r, r] * a_t_val * a_val * comp_val
+
+        sigma_vec[I[k]] += val * c[J[k]]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_single_excitation_spatial(
+    sigma_vec, c, I, J, h1, eri_spatial, a_t, a, ca, binary_complement
+):
+    """
+    Add single-excitation contributions using spatial integrals only.
+
+    The same-spin part uses the antisymmetrized contribution
+    ``(pq|rr) - (pr|rq)``, while the opposite-spin part uses only the Coulomb
+    term ``(pq|rr)``.
+    """
+    n_exc = a_t.shape[0]
+    n_mo = h1.shape[0]
+
+    for k in range(n_exc):
+        val = 0.0
+        for p in range(n_mo):
+            a_t_val = a_t[k, p]
+            if a_t_val == 0:
+                continue
+            for q in range(n_mo):
+                a_val = a[k, q]
+                if a_val == 0:
+                    continue
+
+                val -= h1[p, q] * a_t_val * a_val
+
+                for r in range(n_mo):
+                    ca_val = ca[k, r]
+                    if ca_val != 0:
+                        val -= (eri_spatial[p, q, r, r] - eri_spatial[p, r, r, q]) * a_t_val * a_val * ca_val
+
+                    comp_val = binary_complement[k, r]
+                    if comp_val != 0:
+                        val -= eri_spatial[p, q, r, r] * a_t_val * a_val * comp_val
+
+        sigma_vec[I[k]] += val * c[J[k]]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_double_excitation(sigma_vec, c, I, J, H2_tensor, at1, a1, at2, a2):
+    """
+    Add all double-excitation contributions directly into ``sigma_vec``.
+
+    This avoids allocating a temporary ``H_AA/H_BB/H_AB`` vector during each
+    Lanczos matvec.
+    """
+    n_exc = at1.shape[0]
+    n_mo = H2_tensor.shape[0]
+
+    for k in range(n_exc):
+        val = 0.0
+        for p in range(n_mo):
+            at1_val = at1[k, p]
+            if at1_val == 0:
+                continue
+            for q in range(n_mo):
+                a1_val = a1[k, q]
+                if a1_val == 0:
+                    continue
+                for r in range(n_mo):
+                    at2_val = at2[k, r]
+                    if at2_val == 0:
+                        continue
+                    for s in range(n_mo):
+                        a2_val = a2[k, s]
+                        if a2_val == 0:
+                            continue
+                        val += H2_tensor[p, q, r, s] * at1_val * a1_val * at2_val * a2_val
+
+        sigma_vec[I[k]] += val * c[J[k]]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_double_excitation_spatial(
+    sigma_vec, c, I, J, eri_spatial, at1, a1, at2, a2, antisymmetrize
+):
+    """
+    Add double-excitation contributions from a spatial ERI tensor.
+
+    ``antisymmetrize=True`` is used for same-spin double excitations, giving the
+    usual ``(pq|rs) - (ps|rq)`` matrix element. For opposite-spin doubles we use
+    the Coulomb term ``(pq|rs)`` directly.
+    """
+    n_exc = at1.shape[0]
+    n_mo = eri_spatial.shape[0]
+
+    for k in range(n_exc):
+        val = 0.0
+        for p in range(n_mo):
+            at1_val = at1[k, p]
+            if at1_val == 0:
+                continue
+            for q in range(n_mo):
+                a1_val = a1[k, q]
+                if a1_val == 0:
+                    continue
+                for r in range(n_mo):
+                    at2_val = at2[k, r]
+                    if at2_val == 0:
+                        continue
+                    for s in range(n_mo):
+                        a2_val = a2[k, s]
+                        if a2_val == 0:
+                            continue
+                        contrib = eri_spatial[p, q, r, s]
+                        if antisymmetrize:
+                            contrib -= eri_spatial[p, s, r, q]
+                        val += contrib * at1_val * a1_val * at2_val * a2_val
+
+        sigma_vec[I[k]] += val * c[J[k]]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_on_the_fly_numba(
+    H1, H2, H_diag, c,
+    I_A, J_A, a_t, a, ca, binary_I_A_complement,
+    I_B, J_B, b_t, b, cb, binary_I_B_complement,
+    I_AA, J_AA, aa_t1, aa1, aa_t2, aa2,
+    I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
+    I_AB, J_AB, ab_t, ab, ba_t, ba,
+):
+    """
+    Fully compiled sigma-vector builder for the direct-CI backend.
+
+    The diagonal part is applied first. Singles and doubles are then accumulated
+    directly from the Slater-Condon connectivity tables without ever forming the
+    full CI Hamiltonian matrix.
+    """
+    sigma_vec = H_diag * c
+
+    if len(I_A) > 0:
+        _accumulate_single_excitation(
+            sigma_vec, c, I_A, J_A,
+            H1[0], H2[0, 0], H2[0, 1],
+            a_t, a, ca, binary_I_A_complement
+        )
+
+    if len(I_B) > 0:
+        _accumulate_single_excitation(
+            sigma_vec, c, I_B, J_B,
+            H1[1], H2[1, 1], H2[1, 0],
+            b_t, b, cb, binary_I_B_complement
+        )
+
+    if len(I_AA) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_AA, J_AA,
+            H2[0, 0], aa_t1, aa1, aa_t2, aa2
+        )
+
+    if len(I_BB) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_BB, J_BB,
+            H2[1, 1], bb_t1, bb1, bb_t2, bb2
+        )
+
+    if len(I_AB) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_AB, J_AB,
+            H2[0, 1], ab_t, ab, ba_t, ba
+        )
+
+    return sigma_vec
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_spatial_on_the_fly_numba(
+    h1, eri_spatial, H_diag, c,
+    I_A, J_A, a_t, a, ca, binary_I_A_complement,
+    I_B, J_B, b_t, b, cb, binary_I_B_complement,
+    I_AA, J_AA, aa_t1, aa1, aa_t2, aa2,
+    I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
+    I_AB, J_AB, ab_t, ab, ba_t, ba,
+):
+    """
+    Matrix-free sigma-vector build using one spatial ERI tensor.
+
+    This is the same direct-CI algorithm as ``_sigma_on_the_fly_numba``, but it
+    derives the different spin cases from a single spatial integral tensor
+    instead of receiving pre-expanded spin blocks.
+    """
+    sigma_vec = H_diag * c
+
+    if len(I_A) > 0:
+        _accumulate_single_excitation_spatial(
+            sigma_vec, c, I_A, J_A, h1, eri_spatial, a_t, a, ca, binary_I_A_complement
+        )
+
+    if len(I_B) > 0:
+        _accumulate_single_excitation_spatial(
+            sigma_vec, c, I_B, J_B, h1, eri_spatial, b_t, b, cb, binary_I_B_complement
+        )
+
+    if len(I_AA) > 0:
+        _accumulate_double_excitation_spatial(
+            sigma_vec, c, I_AA, J_AA, eri_spatial, aa_t1, aa1, aa_t2, aa2, True
+        )
+
+    if len(I_BB) > 0:
+        _accumulate_double_excitation_spatial(
+            sigma_vec, c, I_BB, J_BB, eri_spatial, bb_t1, bb1, bb_t2, bb2, True
+        )
+
+    if len(I_AB) > 0:
+        _accumulate_double_excitation_spatial(
+            sigma_vec, c, I_AB, J_AB, eri_spatial, ab_t, ab, ba_t, ba, False
+        )
+
+    return sigma_vec
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_compact_on_the_fly_numba(
+    h1, eri_same, eri_cross, H_diag, c,
+    I_A, J_A, a_t, a, ca, binary_I_A_complement,
+    I_B, J_B, b_t, b, cb, binary_I_B_complement,
+    I_AA, J_AA, aa_t1, aa1, aa_t2, aa2,
+    I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
+    I_AB, J_AB, ab_t, ab, ba_t, ba,
+):
+    """
+    Matrix-free sigma build with one same-spin tensor and one cross-spin tensor.
+
+    This keeps only the tensors the direct-CI kernel actually needs:
+    ``eri_same = (pq|rs) - (ps|rq)`` and ``eri_cross = (pq|rs)``.
+    Relative to the pure spatial backend, this avoids doing the exchange
+    subtraction inside every excitation loop.
+    """
+    sigma_vec = H_diag * c
+
+    if len(I_A) > 0:
+        _accumulate_single_excitation(
+            sigma_vec, c, I_A, J_A, h1, eri_same, eri_cross, a_t, a, ca, binary_I_A_complement
+        )
+
+    if len(I_B) > 0:
+        _accumulate_single_excitation(
+            sigma_vec, c, I_B, J_B, h1, eri_same, eri_cross, b_t, b, cb, binary_I_B_complement
+        )
+
+    if len(I_AA) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_AA, J_AA, eri_same, aa_t1, aa1, aa_t2, aa2
+        )
+
+    if len(I_BB) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_BB, J_BB, eri_same, bb_t1, bb1, bb_t2, bb2
+        )
+
+    if len(I_AB) > 0:
+        _accumulate_double_excitation(
+            sigma_vec, c, I_AB, J_AB, eri_cross, ab_t, ab, ba_t, ba
+        )
+
+    return sigma_vec
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_single_from_conn(
+    sigma_vec, c, I, J, p_idx, q_idx, phase, h1, eri_same, eri_cross, Binary, spin
+):
+    n_exc = len(I)
+    n_mo = h1.shape[0]
+
+    for k in range(n_exc):
+        p = p_idx[k]
+        q = q_idx[k]
+        sign = phase[k]
+        j = J[k]
+
+        val = -sign * h1[p, q]
+        for r in range(n_mo):
+            if Binary[j, spin, r] and r != q:
+                val -= sign * eri_same[p, q, r, r]
+            if Binary[j, 1 - spin, r]:
+                val -= sign * eri_cross[p, q, r, r]
+
+        sigma_vec[I[k]] += val * c[j]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _accumulate_double_from_conn(
+    sigma_vec, c, I, J, p_idx, q_idx, r_idx, s_idx, phase, eri_tensor
+):
+    n_exc = len(I)
+    for k in range(n_exc):
+        sigma_vec[I[k]] += phase[k] * eri_tensor[p_idx[k], q_idx[k], r_idx[k], s_idx[k]] * c[J[k]]
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_compact_conn_numba(
+    h1, eri_same, eri_cross, H_diag, c, Binary,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    I_AB, J_AB, p_AB, q_AB, r_AB, s_AB, phase_AB,
+):
+    """
+    Matrix-free sigma build from compact determinant connectivity lists.
+
+    This is the setup-light direct-CI backend: determinant neighbors are
+    enumerated once in Python, then the compiled matvec only walks the compact
+    connection records.
+    """
+    sigma_vec = H_diag * c
+    _accumulate_single_from_conn(sigma_vec, c, I_A, J_A, p_A, q_A, phase_A, h1, eri_same, eri_cross, Binary, 0)
+    _accumulate_single_from_conn(sigma_vec, c, I_B, J_B, p_B, q_B, phase_B, h1, eri_same, eri_cross, Binary, 1)
+    _accumulate_double_from_conn(sigma_vec, c, I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA, eri_same)
+    _accumulate_double_from_conn(sigma_vec, c, I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB, eri_same)
+    _accumulate_double_from_conn(sigma_vec, c, I_AB, J_AB, p_AB, q_AB, r_AB, s_AB, phase_AB, eri_cross)
+    return sigma_vec
+
+
+def sigma_on_the_fly(Binary, SC1, SC2, H1, H2, H_diag, c):
+    """
+    Matrix-free CI sigma-vector build without precomputing all excitation values.
+
+    This keeps the Slater-Condon connectivity tables but evaluates the matrix
+    elements inside each matvec, which avoids the large eager setup cost of the
+    original direct_ci path.
+    """
+    I_A, J_A, a_t, a, I_B, J_B, b_t, b, ca, cb = SC1
+    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
+
+    if len(I_A) > 0:
+        binary_I_A_complement = Binary[I_A, 1]
+    else:
+        binary_I_A_complement = np.zeros((0, Binary.shape[2]), dtype=Binary.dtype)
+
+    if len(I_B) > 0:
+        binary_I_B_complement = Binary[I_B, 0]
+    else:
+        binary_I_B_complement = np.zeros((0, Binary.shape[2]), dtype=Binary.dtype)
+
+    if getattr(aa_t, "ndim", 2) == 3:
+        aa_t1, aa1 = aa_t[0], aa[0]
+        aa_t2, aa2 = aa_t[1], aa[1]
+    else:
+        aa_t1 = aa_t2 = aa_t
+        aa1 = aa2 = aa
+
+    if getattr(bb_t, "ndim", 2) == 3:
+        bb_t1, bb1 = bb_t[0], bb[0]
+        bb_t2, bb2 = bb_t[1], bb[1]
+    else:
+        bb_t1 = bb_t2 = bb_t
+        bb1 = bb2 = bb
+
+    return _sigma_on_the_fly_numba(
+        H1, H2, H_diag, c,
+        I_A, J_A, a_t, a, ca, binary_I_A_complement,
+        I_B, J_B, b_t, b, cb, binary_I_B_complement,
+        I_AA, J_AA, aa_t1, aa1, aa_t2, aa2,
+        I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
+        I_AB, J_AB, ab_t, ab, ba_t, ba,
+    )
+
+
 class CASCI(mcscf.casci.CASCI):
     def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, tol=0):
         """
@@ -345,6 +1252,7 @@ class CASCI(mcscf.casci.CASCI):
         self.binary = None
         self.SC1 = None # SlaterCondon rule 1
         self.SC2 = None # SlaterCondon rule 2
+        self.direct_connectivity = None
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
 
         self.spin_purification = False
@@ -354,19 +1262,49 @@ class CASCI(mcscf.casci.CASCI):
         self.h2e = None
         
         self.tol = tol
+        self.direct_ci_dense_fallback_ndets = DIRECT_CI_DENSE_FALLBACK_NDETS
+        self.solver_backend = None
+        self.direct_ci_eigensolver = 'davidson'
+        self.direct_ci_max_cycle = 100
+        self.direct_ci_max_subspace = None
+        self.direct_ci_reuse_guess = True
+        self._s2_operator = None
+        self._s2_diag = None
+        self._direct_spatial_h1 = None
+        self._direct_spatial_eri = None
+        self._direct_same_spin_eri = None
+        self._direct_cross_spin_eri = None
+        self._direct_integrals_mo_ref = None
+        self._direct_integrals_ncore = None
+        self._direct_integrals_ncas = None
 
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
         """
-        Given a rhf object get Spin-Orbit Matrices
+        Build the active-space Hamiltonian in spin-orbital block form.
 
-        SF: bool
+        The direct-CI code uses a spin-block representation instead of a single
+        dense spin-orbital tensor:
+
+        ``H1 = [h_alpha, h_beta]``
+        ``H2 = [[eri_aa, eri_ab], [eri_ba, eri_bb]]``
+
+        For the current CASCI path we use the same spatial active orbitals for
+        alpha and beta channels. In the restricted case this lets us reuse one
+        AO->MO ERI transformation for all four spin blocks before the
+        same-spin antisymmetrization step in ``run()``.
+
+        Parameters
+        ----------
+        spin_flip : bool
             spin-flip
 
         Returns
         -------
-        H1: list of [h1e_a, h1e_b]
-        H2: list of ERIs [[ERI_aa, ERI_ab], [ERI_ba, ERI_bb]]
+        H1 : list
+            ``[h1e_alpha, h1e_beta]`` in the active MO basis.
+        H2 : ndarray
+            Spin-block ERIs with shape ``(2, 2, ncas, ncas, ncas, ncas)``.
         """
         # from pyscf import ao2mo
 
@@ -393,18 +1331,22 @@ class CASCI(mcscf.casci.CASCI):
 
         eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
 
-        ### compute SO ERIs (MO)
-        eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+        same_spin_orbitals = Ca is Cb or np.array_equal(Ca, Cb)
 
-        # physicts notation <pq|rs>
-        # eri_aa = contract('ip, jq, ij, ir, js -> pqrs', Ca.conj(), Ca.conj(), eri, Ca, Ca)
-
-        # eri_aa -= eri_aa.swapaxes(1,3)
-
-        eri_bb = eri_aa.copy()
-
-        eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-        eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
+        if same_spin_orbitals:
+            # Restricted references use the same spatial active orbitals for both
+            # spin channels, so all spin blocks start from the same spatial ERI.
+            eri_spatial = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+            eri_aa = eri_spatial
+            eri_ab = eri_spatial
+            eri_ba = eri_spatial
+            eri_bb = eri_spatial
+        else:
+            ### compute SO ERIs (MO)
+            eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+            eri_bb = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Cb.conj(), Cb)
+            eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
+            eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
 
 
 
@@ -445,6 +1387,71 @@ class CASCI(mcscf.casci.CASCI):
         # else:
         #     return H1, H2
         return H1, H2
+
+    def get_direct_spatial_integrals(self):
+        """
+        Return cached active-space spatial integrals for the direct-CI backend.
+
+        The matrix-free solver may be called repeatedly on the same CASCI
+        object, for example when benchmarking or requesting multiple roots after
+        changing solver options. Reusing the transformed active-space integrals
+        avoids paying the AO->MO contraction cost every time.
+        """
+        if (
+            self._direct_spatial_h1 is not None
+            and self._direct_spatial_eri is not None
+            and self._direct_integrals_mo_ref is self.mo_coeff
+            and self._direct_integrals_ncore == self.ncore
+            and self._direct_integrals_ncas == self.ncas
+        ):
+            return self._direct_spatial_h1, self._direct_spatial_eri, self.e_core
+
+        h1, eri_spatial, energy_core = transform_active_space_spatial_integrals(
+            self.mf, self.mo_coeff, self.ncas, self.ncore
+        )
+        self._direct_spatial_h1 = h1
+        self._direct_spatial_eri = eri_spatial
+        self._direct_integrals_mo_ref = self.mo_coeff
+        self._direct_integrals_ncore = self.ncore
+        self._direct_integrals_ncas = self.ncas
+        self.e_core = energy_core
+        return h1, eri_spatial, energy_core
+
+    def get_direct_compact_integrals(self):
+        """
+        Return the compact direct-CI two-electron representation.
+
+        The direct solver only needs two versions of the active-space ERIs:
+        the antisymmetrized same-spin tensor and the Coulomb cross-spin tensor.
+        Caching them keeps the direct-CI setup light across repeated runs.
+        """
+        h1, eri_spatial, energy_core = self.get_direct_spatial_integrals()
+        if (
+            self._direct_same_spin_eri is None
+            or self._direct_cross_spin_eri is None
+            or self._direct_integrals_mo_ref is not self.mo_coeff
+            or self._direct_integrals_ncore != self.ncore
+            or self._direct_integrals_ncas != self.ncas
+        ):
+            self._direct_cross_spin_eri = eri_spatial
+            self._direct_same_spin_eri = eri_spatial - eri_spatial.swapaxes(1, 3)
+
+        return h1, self._direct_same_spin_eri, self._direct_cross_spin_eri, energy_core
+
+    def ensure_slater_condon_cache(self):
+        """
+        Lazily build the legacy Slater-Condon tables when helper routines need them.
+
+        ``direct_ci`` itself no longer relies on ``SC1/SC2`` for setup or its
+        fast matvec path, but overlap/RDM/TDM helpers still use the original
+        representations. Keeping this lazy preserves those APIs without paying
+        the all-pairs setup cost during every direct-CI solve.
+        """
+        if self.binary is None:
+            raise ValueError('Build the determinant basis before requesting Slater-Condon tables.')
+        if self.SC1 is None or self.SC2 is None:
+            self.SC1, self.SC2 = SlaterCondon(self.binary)
+        return self.SC1, self.SC2
 
 
     def natural_orbitals(self, dm, nco=None):
@@ -651,6 +1658,7 @@ class CASCI(mcscf.casci.CASCI):
         self.nstates = nstates
 
         if method == 'ci':
+            self.solver_backend = 'ci'
 
             # define the core and active space orbitals
             if mo_coeff is None:
@@ -702,8 +1710,9 @@ class CASCI(mcscf.casci.CASCI):
 
                         h2e[:, :, p, p, q, q] -= 0.25 * shift * 2
 
-            h2e[0,0] -= h2e[0,0].swapaxes(1,3)
-            h2e[1,1] -= h2e[1,1].swapaxes(1,3)
+            if h2e is not None:
+                h2e[0,0] -= h2e[0,0].swapaxes(1,3)
+                h2e[1,1] -= h2e[1,1].swapaxes(1,3)
 
 
             self.hcore = h1e
@@ -743,20 +1752,28 @@ class CASCI(mcscf.casci.CASCI):
             if self.binary is None:
                 mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
                 binary = get_fci_combos(mo_occ = mo_occ)
-
-                SC1, SC2 = SlaterCondon(binary)
-
-                self.SC1 = SC1
-                self.SC2 = SC2
                 self.binary = binary
+                self.direct_connectivity = build_direct_connectivity(binary)
 
             else:
                 binary = self.binary
-                SC1 = self.SC1
-                SC2 = self.SC2
+                if self.direct_connectivity is None:
+                    self.direct_connectivity = build_direct_connectivity(binary)
 
 
-            h1e, h2e = self.get_SO_matrix()
+            if self.spin_purification:
+                # The first-order spin-penalty code is currently expressed in the
+                # older spin-block Hamiltonian form, so we keep that path until
+                # the penalty is rewritten in terms of spatial integrals.
+                h1e, h2e = self.get_SO_matrix()
+                h1e = np.asarray(h1e)
+                spatial_h1 = None
+                spatial_eri = None
+            else:
+                spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals()
+                spatial_eri = cross_spin_eri
+                h1e = np.asarray([spatial_h1, spatial_h1])
+                h2e = None
 
             if self.spin_purification:
                 logging.info('Purify spin by energy penalty')
@@ -773,27 +1790,112 @@ class CASCI(mcscf.casci.CASCI):
                         h2e[:, :, p, q, q, p] -=  0.5 * shift * 2
                         h2e[:, :, p, p, q, q] -= 0.25 * shift * 2
 
-            h2e[0,0] -= h2e[0,0].swapaxes(1,3)
-            h2e[1,1] -= h2e[1,1].swapaxes(1,3)
-
-
+            if h2e is not None:
+                h2e[0,0] -= h2e[0,0].swapaxes(1,3)
+                h2e[1,1] -= h2e[1,1].swapaxes(1,3)
 
             self.hcore = h1e
+            self.h2e_cas = spatial_eri
             self.eri_so = h2e
 
-            H_diag, H_A, H_B, H_AA, H_BB, H_AB = hamiltonian_matrix_elements(binary, h1e, h2e, SC1, SC2)
+            if (
+                self.direct_ci_dense_fallback_ndets is not None
+                and self.direct_ci_dense_fallback_ndets > 0
+                and binary.shape[0] <= self.direct_ci_dense_fallback_ndets
+            ):
+                # For small determinant spaces the dense/vectorized CI builder is
+                # faster than paying the Numba JIT + setup overhead of direct_ci.
+                self.solver_backend = 'ci_dense_fallback'
+                if spatial_eri is not None:
+                    # The dense CI builder still expects the explicit spin-block
+                    # Hamiltonian, so create it only for the small-space fallback.
+                    h2e = np.stack((np.stack((spatial_eri.copy(), spatial_eri.copy())),
+                                    np.stack((spatial_eri.copy(), spatial_eri.copy()))))
+                    h2e[0,0] -= h2e[0,0].swapaxes(1,3)
+                    h2e[1,1] -= h2e[1,1].swapaxes(1,3)
+                    self.eri_so = h2e
 
-            def mv(c):
-                return sigma(SC1, SC2, H_diag, H_A, H_B, H_AA, H_BB, H_AB, c)
+                SC1, SC2 = self.ensure_slater_condon_cache()
+                H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
+                E, X = eigsh(H_CI, k=nstates, which='SA')
+            else:
+                self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
+                # The diagonal is reused in every matvec, so it is worth
+                # computing once up front even in the matrix-free solver.
+                H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary) if spatial_eri is not None else _compute_diag(h1e, h2e, binary)
+                conn = self.direct_connectivity
 
-            H = LinearOperator((binary.shape[0], binary.shape[0]), matvec=mv)
+                def mv(c):
+                    # Keep the Lanczos matvec almost entirely inside compiled
+                    # code. The Python closure only forwards cached arrays.
+                    if spatial_eri is not None:
+                        return _sigma_compact_conn_numba(
+                            spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c, binary,
+                            conn.I_A, conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                            conn.I_B, conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                            conn.I_AA, conn.J_AA, conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA,
+                            conn.I_BB, conn.J_BB, conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB,
+                            conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
+                        )
+                    SC1, SC2 = self.ensure_slater_condon_cache()
+                    I_A, J_A, a_t, a, I_B, J_B, b_t, b, ca, cb = SC1
+                    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
+                    binary_I_A_complement = binary[I_A, 1] if len(I_A) > 0 else np.zeros((0, binary.shape[2]), dtype=binary.dtype)
+                    binary_I_B_complement = binary[I_B, 0] if len(I_B) > 0 else np.zeros((0, binary.shape[2]), dtype=binary.dtype)
+                    if getattr(aa_t, "ndim", 2) == 3:
+                        aa_t1, aa1 = aa_t[0], aa[0]
+                        aa_t2, aa2 = aa_t[1], aa[1]
+                    else:
+                        aa_t1 = aa_t2 = aa_t
+                        aa1 = aa2 = aa
+                    if getattr(bb_t, "ndim", 2) == 3:
+                        bb_t1, bb1 = bb_t[0], bb[0]
+                        bb_t2, bb2 = bb_t[1], bb[1]
+                    else:
+                        bb_t1 = bb_t2 = bb_t
+                        bb1 = bb2 = bb
+                    return _sigma_on_the_fly_numba(h1e, h2e, H_diag, c,
+                        I_A, J_A, a_t, a, ca, binary_I_A_complement,
+                        I_B, J_B, b_t, b, cb, binary_I_B_complement,
+                        I_AA, J_AA, aa_t1, aa1, aa_t2, aa2,
+                        I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
+                        I_AB, J_AB, ab_t, ab, ba_t, ba)
 
-            E, X = eigsh(H, k=nstates, which='SA', tol=self.tol)
+                if self.direct_ci_eigensolver == 'davidson':
+                    # Use a CI-specific Davidson iteration by default.  The
+                    # direct-CI backend already has a cheap diagonal
+                    # preconditioner and only needs a few low roots, which is
+                    # exactly the regime where Davidson is preferable to a
+                    # generic sparse eigensolver.
+                    guess = _select_direct_ci_guess(
+                        self,
+                        nstates,
+                        ci0=ci0 if ci0 is not None or not self.direct_ci_reuse_guess else None,
+                    )
+                    E, X = davidson_lowest(
+                        mv,
+                        H_diag,
+                        nroots=nstates,
+                        tol=self.tol if self.tol > 0 else 1e-8,
+                        max_cycle=self.direct_ci_max_cycle,
+                        max_subspace=self.direct_ci_max_subspace,
+                        guess=guess,
+                    )
+                elif self.direct_ci_eigensolver == 'eigsh':
+                    H = LinearOperator((binary.shape[0], binary.shape[0]), matvec=mv)
+                    E, X = eigsh(H, k=nstates, which='SA', tol=self.tol)
+                else:
+                    raise ValueError(
+                        "Unknown direct_ci eigensolver '{}'. Use 'davidson' or 'eigsh'.".format(
+                            self.direct_ci_eigensolver
+                        )
+                    )
             
 
 
 
         elif method == 'jw':
+            self.solver_backend = 'jw'
 
 
             # exact diagonalization by JW transform
@@ -809,7 +1911,7 @@ class CASCI(mcscf.casci.CASCI):
         self.ci = [X[:, n] for n in range(nstates)]
 
         for i in range(nstates):
-            ss = spin_square(*self.make_rdm12(i))
+            ss = self.spin_square(i)
             print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
         return self
@@ -828,6 +1930,7 @@ class CASCI(mcscf.casci.CASCI):
 
         """
 
+        self.ensure_slater_condon_cache()
         ci = self.ci[state_id]
         if representation.lower() == 'ao':
             C = self.mf.mo_coeff
@@ -865,6 +1968,7 @@ class CASCI(mcscf.casci.CASCI):
 
         """
 
+        self.ensure_slater_condon_cache()
         ci = self.ci[state_id]
         # if representation.lower() == 'ao':
         #     C = self.mf.mo_coeff
@@ -936,6 +2040,7 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
+        self.ensure_slater_condon_cache()
         ci = self.ci[state_id]
 
 
@@ -974,6 +2079,7 @@ class CASCI(mcscf.casci.CASCI):
 
 
     def contract_with_rdm2(self, h2e, state_id=0):
+        self.ensure_slater_condon_cache()
 
         if h2e.ndim == 4: # spin-free operator
             h2e = np.einsum('IJ, pqrs -> IJpqrs', np.ones((2,2)), h2e)
@@ -989,7 +2095,41 @@ class CASCI(mcscf.casci.CASCI):
         return dm1, dm2
 
     def spin_square(self, state_id=0):
-        pass
+        """
+        Evaluate ``<Psi|S^2|Psi>`` directly from the CI vector.
+
+        This avoids building the full 1- and 2-RDMs, which can dominate the
+        post-processing cost after a fast direct-CI diagonalization.
+        """
+        if self.ci is None:
+            raise ValueError('Run CASCI before requesting S^2.')
+
+        ci = self.ci[state_id]
+
+        if self.direct_connectivity is not None and self.binary is not None:
+            if self._s2_operator is None:
+                h1_s2, h2_s2 = build_spin_square_operator(self.ncas)
+                self._s2_operator = (
+                    h1_s2[0],
+                    h2_s2[0, 0].copy(),
+                    h2_s2[0, 1].copy(),
+                )
+                self._s2_diag = _compute_diag_compact(
+                    self._s2_operator[0], self._s2_operator[1], self._s2_operator[2], self.binary
+                )
+
+            conn = self.direct_connectivity
+            sigma_s2 = _sigma_compact_conn_numba(
+                self._s2_operator[0], self._s2_operator[1], self._s2_operator[2], self._s2_diag, ci, self.binary,
+                conn.I_A, conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                conn.I_B, conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                conn.I_AA, conn.J_AA, conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA,
+                conn.I_BB, conn.J_BB, conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB,
+                conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
+            )
+            return float(np.vdot(ci, sigma_s2).real)
+
+        return spin_square_from_rdm(*self.make_rdm12(state_id))
 
 
 
@@ -1026,6 +2166,7 @@ class CASCI(mcscf.casci.CASCI):
 
         """
 
+        self.ensure_slater_condon_cache()
         if bra_id == ket_id:
 
             print("CI ket and bra are the same. Computing 1e RDM instead.")
@@ -1068,6 +2209,7 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
+        self.ensure_slater_condon_cache()
         cibra = self.ci[bra_id]
         ciket = self.ci[ket_id]
 

@@ -9,83 +9,117 @@ Created on Mon Dec  1 23:03:15 2025
 import numpy as np
 from opt_einsum import contract
 
-def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85, 
-             rho1=0.5, delta=0.2, epsilon=1e-5):
+
+def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
+             rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG'):
     """
-    Implicit Steepest Descent Method for Optimization
-    with Orthogonality Constraints (Implicit–SD)
+    Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
+
+    The optimizer keeps the original ``U``-matrix formulation used by the local
+    CASSCF code, but upgrades the search direction from plain steepest descent
+    to a Riemannian conjugate-gradient (RCG) step on the Stiefel manifold.
+    ``algorithm='SD'`` is kept as a fallback for debugging or comparison.
 
     Parameters
     ----------
-    f : TYPE
-        DESCRIPTION.
-    X0 : TYPE
-        DESCRIPTION.
-    tau : TYPE, optional
-        DESCRIPTION. The default is 1.
-    eta : TYPE, optional
-        DESCRIPTION. The default is 0.5.
-    delta : TYPE, optional
-        DESCRIPTION. The default is 0.5.
-    epsilon : TYPE, optional
-        DESCRIPTION. The default is 1e-5.
+    f : callable
+        Objective function.
+    X0 : ndarray
+        Initial orthonormal-column guess.
+    args : tuple, optional
+        Extra arguments forwarded to ``f`` and ``gradient``.
+    tau : float, optional
+        Initial step size.
+    taum : float, optional
+        Minimum allowed step size.
+    tauM : float, optional
+        Maximum allowed step size.
+    eta : float, optional
+        Weight for the non-monotone line-search reference energy.
+    rho1 : float, optional
+        Armijo factor.
+    delta : float, optional
+        Backtracking reduction factor.
+    epsilon : float, optional
+        Convergence threshold on the Riemannian gradient norm.
+    algorithm : {'RCG', 'SD'}, optional
+        Optimization algorithm on the Stiefel manifold.
 
     Returns
     -------
-    TYPE
-        DESCRIPTION.
+    X : ndarray
+        Optimized matrix with orthonormal columns.
+    v : float
+        Objective value at ``X``.
 
     References
     ----------
-
     Optimization Lett. 2022, 16:1773
-
     """
+    if algorithm not in ('RCG', 'SD'):
+        raise ValueError(
+            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG' or 'SD'.".format(
+                algorithm
+            )
+        )
 
-    n, p = X0.shape
-
-    Q0 = 1
-    k = 0
-    C = f(X0, *args)
-    Id = np.identity(n)
-
-    X = X0
-
-    # taum = 1
-    # tauM = 2
-
-    Q = Q0
-    G = gradient(X0, *args)
-    # print('gradient', G)
-
+    # Start from a projected point so the optimizer can be called with slightly
+    # noisy guesses without violating the manifold constraint.
+    X = project(X0)
+    C = f(X, *args)
+    Q = 1.0
+    G = gradient(X, *args)
     df = grad(X, G)
+    direction = -df
+    v = C
+    k = 0
 
     while norm(df) > epsilon:
+        directional_derivative = np.real(inner(df, direction))
+        if directional_derivative >= 0:
+            # Restart if conjugacy was lost numerically and the direction no
+            # longer points downhill.
+            direction = -df
+            directional_derivative = -np.real(inner(df, df))
 
-        A = G @ X.T - X @ G.T
-        Y = project(np.linalg.inv(Id + tau * A) @ X)
+        step = max(min(tau, tauM), taum)
+        Y = retract(X, step * direction)
+        trial_value = f(Y, *args)
 
-        while f(Y, *args) > C + rho1 * tau * (-1/2 * norm(A)**2):
-            tau = tau * delta
-            Y = project(np.linalg.inv(Id + tau * A) @ X)
+        # Non-monotone Armijo backtracking: use the weighted reference energy
+        # ``C`` so the optimizer can occasionally accept small uphill moves
+        # while still converging more aggressively than strict monotone descent.
+        while trial_value > C + rho1 * step * directional_derivative:
+            step *= delta
+            if step < taum:
+                step = taum
+                Y = retract(X, step * direction)
+                trial_value = f(Y, *args)
+                break
+            Y = retract(X, step * direction)
+            trial_value = f(Y, *args)
 
         Xnew = Y
-        Qnew = eta * Q + 1
-
-        v = f(Xnew, *args)
-        # print('energy = ', v)
-
-        Cnew = (eta * Q * C + v)/Qnew
+        Qnew = eta * Q + 1.0
+        v = trial_value
+        Cnew = (eta * Q * C + v) / Qnew
         Gnew = gradient(Xnew, *args)
-
         df_new = grad(Xnew, Gnew)
 
-        tau = stepsize(k+1, Xnew-X, df_new-df)
+        transported_grad = transport(Xnew, df)
+        if algorithm == 'RCG':
+            beta_num = np.real(inner(df_new, df_new - transported_grad))
+            beta_den = max(abs(np.real(inner(df, df))), 1e-16)
+            beta = max(0.0, beta_num / beta_den)
+            transported_dir = transport(Xnew, direction)
+            direction = -df_new + beta * transported_dir
+        else:
+            direction = -df_new
+
+        tau = safe_stepsize(k + 1, Xnew - X, df_new - transported_grad, step)
         tau = max(min(tau, tauM), taum)
 
         k += 1
-
-        # update
         X = Xnew
         Q = Qnew
         C = Cnew
@@ -103,30 +137,42 @@ def norm(A):
 
         ||A||_F = \sqrt{ A^\dagger A }
     """
-    return np.sqrt(np.trace(A.T.conj() @ A))
+    return np.sqrt(np.real(np.trace(A.T.conj() @ A)))
+
+
+def sym(A):
+    """Hermitian/symmetric part of a square matrix."""
+    return 0.5 * (A + A.T.conj())
 
 def grad(X, G=None):
     """
-    Riemmann gradient
+    Project the Euclidean gradient onto the Stiefel tangent space at ``X``.
 
-    Parameters
-    ----------
-    X : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
+    The tangent-space projection is the Riemannian gradient used by the
+    manifold optimizer.
     """
     if G is None:
         G = gradient(X)
-    return G - X @ G.T @ X
+    return tangent_projection(X, G)
+
+
+def tangent_projection(X, Z):
+    """Project ``Z`` onto the tangent space of the Stiefel manifold at ``X``."""
+    return Z - X @ sym(X.T.conj() @ Z)
+
+
+def transport(X, Z):
+    """
+    Transport a tangent vector to the tangent space at a new point ``X``.
+
+    For the current projected-retraction optimizer, a simple tangent-space
+    reprojection is a practical vector transport.
+    """
+    return tangent_projection(X, Z)
 
 def project(V):
     """
-    projection to Siefel manifold by orthonormalization
+    Project ``V`` onto the Stiefel manifold by polar orthonormalization.
 
     .. math::
 
@@ -151,6 +197,16 @@ def project(V):
     """
     w, Q = np.linalg.eigh(V.T @ V)
     return V @ Q @ np.diag(1/np.sqrt(w)) @ Q.T
+
+
+def retract(X, D):
+    """
+    Retract a tangent step ``D`` back to the Stiefel manifold.
+
+    Keeping retraction as a small helper makes the line search and the search
+    direction logic easier to read in ``minimize``.
+    """
+    return project(X + D)
 
 def orth(V):
     """
@@ -217,8 +273,23 @@ def stepsize(k, dU, dG):
 
     return tau
 
+
+def safe_stepsize(k, dU, dG, fallback):
+    """
+    Barzilai-Borwein step with a safe fallback when the secant data degenerates.
+    """
+    denom1 = abs(inner(dG, dG))
+    denom2 = abs(inner(dU, dG))
+    if denom1 < 1e-16 or denom2 < 1e-16:
+        return fallback
+
+    tau = stepsize(k, dU, dG)
+    if not np.isfinite(tau) or tau <= 0:
+        return fallback
+    return tau
+
 def inner(a, b):
-    return np.trace(a.T @ b)
+    return np.trace(a.T.conj() @ b)
 
 def gradient(U, h1e, h2e, dm1, dm2):
     g = h1e @ U @ dm1.T + h1e.T @ U @ dm1  # these two terms are probably the same

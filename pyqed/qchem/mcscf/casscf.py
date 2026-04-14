@@ -186,6 +186,9 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
     # for i in range(ncas):
     #     U0[i, i] = 1
 
+    # ``U`` is the current orbital subspace transform.  We improve this same
+    # variable across macroiterations instead of restarting every time from the
+    # initial guess ``U0``.
     U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
 
     k = 0
@@ -210,9 +213,10 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
 
         dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
 
-        # U0 = orth(U + 0.1 * np.random.randn(nmo, ncas))
-
-        U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2), tau=1)
+        # Keep refining the current orbital subspace.  Restarting from ``U0``
+        # here would throw away all previous orbital optimization work and can
+        # bias the macroiterations away from the true CASSCF stationary point.
+        U, E = minimize(energy, U, args=(h1e, eri, dm1, dm2), tau=1)
         # print(E + mol.energy_nuc())
 
         k += 1
@@ -220,7 +224,17 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
     if not converged:
         raise RuntimeError('Max macro steps reached. CASSCF not converged.')
 
-    return mo_coeff, mc
+    # Rebuild the final CASCI result from scratch at the returned orbitals.
+    # Reusing the same CASCI object across many macroiterations can leave the
+    # final reported energy out of sync with the best orbitals, while a fresh
+    # CASCI solve at ``mo_coeff`` is consistent.
+    final_mc = CASCI(mc.mf, ncas=ncas, nelecas=nelecas)
+    final_mc.spin_purification = mc.spin_purification
+    final_mc.ss = mc.ss
+    final_mc.shift = mc.shift
+    final_mc.run(mo_coeff=mo_coeff, **kwargs)
+
+    return mo_coeff, final_mc
 
 
 def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
@@ -241,6 +255,9 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         dm1 += _dm1 * weights[n]
         dm2 += _dm2 * weights[n]
 
+    # State-averaged CASSCF uses the same ``U`` variable as the state-specific
+    # kernel, so it should also keep improving the latest orbital transform
+    # rather than restarting from ``U0`` in every macroiteration.
     U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
 
 
@@ -275,7 +292,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             dm2 += _dm2 * weights[n]
 
 
-        U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+        U, E = minimize(energy, U, args=(h1e, eri, dm1, dm2))
         # print(E + mol.energy_nuc())
 
         k += 1
@@ -283,7 +300,17 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     if not converged:
         raise RuntimeError('Max macro steps reached. CASSCF not converged.')
 
-    return mo_coeff, mc
+    # As in the state-specific kernel, build a fresh final CASCI result so the
+    # returned state-averaged orbitals and energies are self-consistent.
+    final_mc = CASCI(mc.mf, ncas=ncas, nelecas=nelecas)
+    final_mc.spin_purification = mc.spin_purification
+    final_mc.ss = mc.ss
+    final_mc.shift = mc.shift
+    final_mc.nstates = nstates
+    final_mc.run(nstates, mo_coeff=mo_coeff, **kwargs)
+    final_mc.e_history = mc.e_history
+
+    return mo_coeff, final_mc
 
 
 # def constrained_optimization(U, h1e, h2e, dm1, dm2, max_steps=50):

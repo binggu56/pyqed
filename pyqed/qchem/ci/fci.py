@@ -163,8 +163,14 @@ def get_fci_combos(mf=None, mo_occ=None):
 
     N = O_sp.shape[1]
 
-    Λ_α = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[0] ) ) )
-    Λ_β = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[1] ) ) )
+    Λ_α = np.asarray(
+        list(combinations(np.arange(0, N, 1, dtype=np.int8), N_s[0])),
+        dtype=np.int8,
+    )
+    Λ_β = np.asarray(
+        list(combinations(np.arange(0, N, 1, dtype=np.int8), N_s[1])),
+        dtype=np.int8,
+    )
     ΛA, ΛB = SpinOuterProduct(Λ_α, Λ_β)
     Binary = givenΛgetB(ΛA, ΛB, N)
     return Binary

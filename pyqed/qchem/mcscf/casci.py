@@ -22,7 +22,6 @@ from itertools import combinations
 import itertools
 import warnings
 
-from pyqed.qchem import get_veff
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
             create, Is #, jordan_wigner_two_body
@@ -119,6 +118,88 @@ def get_combos(mo_occ, space='fci', ncore=None, ncas=None, nvir=None):
         #     mo_occ = mf.mo_occ
 
 
+def _is_uhf_reference(mo_coeff):
+    return isinstance(mo_coeff, (tuple, list)) and len(mo_coeff) == 2
+
+
+def _as_spin_tuple(values):
+    if _is_uhf_reference(values):
+        return values[0], values[1]
+    return values, values
+
+
+def _normalize_active_electrons(nelecas, spin):
+    if isinstance(nelecas, (tuple, list)):
+        if len(nelecas) != 2:
+            raise ValueError('nelecas must be an int or a length-2 (nalpha, nbeta) pair.')
+        na, nb = (int(nelecas[0]), int(nelecas[1]))
+    else:
+        nelecas = int(nelecas)
+        spin = int(round(spin))
+        if (nelecas + spin) % 2 != 0:
+            raise ValueError(
+                f'Incompatible active electron count/spin: nelecas={nelecas}, spin={spin}.'
+            )
+        na = (nelecas + spin) // 2
+        nb = nelecas - na
+
+    if na < 0 or nb < 0:
+        raise ValueError(f'Invalid active electron count: {(na, nb)}')
+    return na, nb
+
+
+def _spin_occupations(mo_occ, ncore, ncas):
+    if _is_uhf_reference(mo_occ):
+        occ_a = np.asarray(mo_occ[0][ncore:ncore+ncas], dtype=np.int8)
+        occ_b = np.asarray(mo_occ[1][ncore:ncore+ncas], dtype=np.int8)
+    else:
+        occ = np.asarray(mo_occ[ncore:ncore+ncas], dtype=np.int8)
+        occ_a = occ_b = occ // 2
+    return [occ_a, occ_b]
+
+
+def _slice_active_orbitals(mo_coeff, ncore, ncas):
+    if _is_uhf_reference(mo_coeff):
+        core = (
+            mo_coeff[0][:, :ncore],
+            mo_coeff[1][:, :ncore],
+        )
+        cas = (
+            mo_coeff[0][:, ncore:ncore+ncas],
+            mo_coeff[1][:, ncore:ncore+ncas],
+        )
+    else:
+        core = mo_coeff[:, :ncore]
+        cas = mo_coeff[:, ncore:ncore+ncas]
+    return core, cas
+
+
+def _normalize_spin_1e_operator(h1e):
+    """
+    Normalize a one-electron operator into explicit alpha/beta blocks.
+    """
+    if isinstance(h1e, (tuple, list)) and len(h1e) == 2:
+        return np.asarray(h1e[0]), np.asarray(h1e[1])
+
+    h1e = np.asarray(h1e)
+    if h1e.ndim == 3 and h1e.shape[0] == 2:
+        return h1e[0], h1e[1]
+    return h1e, h1e
+
+
+def _transform_1e_operator_ao_to_mo(h1e, mo_coeff):
+    h1a, h1b = _normalize_spin_1e_operator(h1e)
+    if _is_uhf_reference(mo_coeff):
+        return (
+            ao2mo(h1a, mo_coeff[0]),
+            ao2mo(h1b, mo_coeff[1]),
+        )
+    out = ao2mo(h1a, mo_coeff)
+    if h1b is h1a:
+        return out
+    return (out, ao2mo(h1b, mo_coeff))
+
+
 
 # def ao2mo(mf, mo_coeff=None, spin_flip=False, H1=None, H2=None):
 #     """
@@ -205,19 +286,45 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
         A tuple, the first is the effective one-electron hamiltonian defined in CAS space,
         the second is the electronic energy from core.
     '''
-    if mo_coeff is None: mo_coeff = mf.mo_coeff
-    # if ncas is None: ncas = .ncas
-    # if ncore is None: ncore = casci.ncore
-    mo_core = mo_coeff[:,:ncore]
-    mo_cas = mo_coeff[:,ncore:ncore+ncas]
+    if mo_coeff is None:
+        mo_coeff = mf.mo_coeff
 
+    mo_core, mo_cas = _slice_active_orbitals(mo_coeff, ncore, ncas)
     hcore = mf.get_hcore()
+
+    if _is_uhf_reference(mo_coeff):
+        hcore_a, hcore_b = _as_spin_tuple(hcore)
+        mo_core_a, mo_core_b = mo_core
+        mo_cas_a, mo_cas_b = mo_cas
+
+        energy_core = mf.energy_nuc()
+        if mo_core_a.size == 0:
+            corevhf = (0, 0)
+        else:
+            core_dm = np.array((
+                np.dot(mo_core_a, mo_core_a.conj().T),
+                np.dot(mo_core_b, mo_core_b.conj().T),
+            ))
+            corevhf = mf.get_veff(core_dm)
+            energy_core += np.einsum('ij,ji', core_dm[0], hcore_a).real
+            energy_core += np.einsum('ij,ji', core_dm[1], hcore_b).real
+            energy_core += 0.5 * np.einsum('ij,ji', core_dm[0], corevhf[0]).real
+            energy_core += 0.5 * np.einsum('ij,ji', core_dm[1], corevhf[1]).real
+
+        h1eff = np.array((
+            reduce(np.dot, (mo_cas_a.conj().T, hcore_a + corevhf[0], mo_cas_a)),
+            reduce(np.dot, (mo_cas_b.conj().T, hcore_b + corevhf[1], mo_cas_b)),
+        ))
+        return h1eff, energy_core
+
+    mo_core = mo_core
+    mo_cas = mo_cas
     energy_core = mf.energy_nuc()
     if mo_core.size == 0:
         corevhf = 0
     else:
         core_dm = np.dot(mo_core, mo_core.conj().T) * 2
-        corevhf = get_veff(mf.mol, core_dm)
+        corevhf = mf.get_veff(core_dm)
         energy_core += np.einsum('ij,ji', core_dm, hcore).real
         energy_core += np.einsum('ij,ji', core_dm, corevhf).real * .5
 
@@ -260,9 +367,22 @@ class CASCI:
 
         """
         self.ncas = ncas # number of MOs in active space
-        self.nelecas = nelecas
 
-        ncore = mf.nelec//2 - self.nelecas//2 # core orbs
+        if spin is None:
+            spin = mf.mol.spin
+        self.spin = spin
+
+        self.nelecas = nelecas
+        self.nelecas_spin = _normalize_active_electrons(nelecas, self.spin)
+        self.nelecas_total = sum(self.nelecas_spin)
+
+        ncore_electrons = mf.nelec - self.nelecas_total
+        if ncore_electrons < 0 or ncore_electrons % 2 != 0:
+            raise ValueError(
+                'Frozen-core CASCI currently requires the inactive space to contain '
+                'an even number of electrons.'
+            )
+        ncore = ncore_electrons // 2
         assert(ncore >= 0)
 
         self.ncore = ncore
@@ -280,10 +400,6 @@ class CASCI:
 
         self.mo_core = None
         self.mo_cas = None
-
-        if spin is None:
-            spin = mf.mol.spin
-        self.spin = spin
         self.ss = None
         self.shift = None
         self.spin_purification = False
@@ -331,7 +447,7 @@ class CASCI:
         mf = self.mf
 
         # molecular orbitals
-        Ca, Cb = [self.mo_cas, ] * 2
+        Ca, Cb = _as_spin_tuple(self.mo_cas)
 
         H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
                                      mo_coeff=self.mo_coeff)
@@ -382,7 +498,10 @@ class CASCI:
 
         # H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca),
                          # np.einsum("AB, Ap, Bq -> pq", H, Cb, Cb)])
-        H1 = [H, H]
+        if isinstance(H, np.ndarray) and H.ndim == 3:
+            H1 = [H[0], H[1]]
+        else:
+            H1 = [H, H]
 
         if spin_flip:
             raise NotImplementedError('Spin-flip matrix elements not implemented yet')
@@ -461,8 +580,9 @@ class CASCI:
 
         I = tensor(Is(self.ncas))
 
-        self.H += shift * ((Na - self.nelecas/2 * I) @ (Na - self.nelecas/2 * I) + \
-            (Nb - self.nelecas/2 * I) @ (Nb - self.nelecas/2 * I))
+        target = self.nelecas_total / 2
+        self.H += shift * ((Na - target * I) @ (Na - target * I) + \
+            (Nb - target * I) @ (Nb - target * I))
 
     def jordan_wigner(self, h1e, v):
         """
@@ -629,12 +749,11 @@ class CASCI:
         else:
             self.mo_coeff = mo_coeff
 
-        self.mo_core = self.mo_coeff[:, :ncore]
-        self.mo_cas = self.mo_coeff[:, ncore:ncore+ncas]
+        self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
 
 
         if self.binary is None:
-            mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
+            mo_occ = _spin_occupations(self.mf.mo_occ, ncore, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
         else:
@@ -731,22 +850,28 @@ class CASCI:
 
         ci = self.ci[state_id]
         if representation.lower() == 'ao':
-            C = self.mf.mo_coeff
-            h1e = ao2mo(h1e, C)
+            h1e = _transform_1e_operator_ao_to_mo(h1e, self.mf.mo_coeff)
 
         ncore = self.ncore
         ncas = self.ncas
 
+        h1a, h1b = _normalize_spin_1e_operator(h1e)
         if ncore > 0:
-            c_core = 2 * np.trace(h1e[:ncore,:ncore])
+            c_core = np.trace(h1a[:ncore, :ncore]) + np.trace(h1b[:ncore, :ncore])
         else:
             c_core = 0
 
-        h1e = h1e[ncore:ncas+ncore, ncore:ncas+ncore]
+        h1e = (
+            h1a[ncore:ncas+ncore, ncore:ncas+ncore],
+            h1b[ncore:ncas+ncore, ncore:ncas+ncore],
+        )
 
         c_cas = contract_with_rdm1(ci, self.binary, self.SC1, h1e=h1e)
 
         return c_core + c_cas
+
+    def contract_with_rdm1(self, state_id, h1e=None, representation='ao'):
+        return self.make_rdm1_contract(state_id, h1e=h1e, representation=representation)
 
     def make_rdm1(self, state_id, with_core=False, with_vir=False, representation='mo'):
         """
@@ -818,7 +943,8 @@ class CASCI:
 
         """
 
-        raise NotImplementedError()
+        ci = self.ci[state_id]
+        return make_rdm1s(ci, self.binary, self.SC1)
 
     def make_rdm2(self, state_id=0, with_core=False, with_vir=False):
         """
@@ -930,28 +1056,25 @@ class CASCI:
         """
 
         if bra_id == ket_id:
+            return self.contract_with_rdm1(bra_id, h1e=h1e, representation=representation)
 
-            print("CI ket and bra are the same. Computing 1e RDM instead.")
-            return self.make_rdm1(ket_id, h1e)
+        if representation.lower() == 'ao':
+            h1e = _transform_1e_operator_ao_to_mo(h1e, self.mf.mo_coeff)
 
+        h1a, h1b = _normalize_spin_1e_operator(h1e)
+        ncore = self.ncore
+        ncas = self.ncas
+
+        if ncore > 0:
+            c_core = np.trace(h1a[:ncore, :ncore]) + np.trace(h1b[:ncore, :ncore])
         else:
+            c_core = 0
 
-            if representation.lower() == 'ao':
-                C = self.mf.mo_coeff
-                h1e = ao2mo(h1e, C)
-
-            ncore = self.ncore
-            ncas = self.ncas
-
-            if ncore > 0:
-                c_core = 2 * np.trace(h1e[:ncore,:ncore])
-            else:
-                c_core = 0
-
-            h1e = h1e[ncore:ncas+ncore, ncore:ncas+ncore]
-
-
-            c_cas = make_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e)
+        h1e_cas = (
+            h1a[ncore:ncas+ncore, ncore:ncas+ncore],
+            h1b[ncore:ncas+ncore, ncore:ncas+ncore],
+        )
+        c_cas = contract_with_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e_cas)
 
         return c_cas + c_core
 
@@ -975,6 +1098,15 @@ class CASCI:
         ciket = self.ci[ket_id]
 
         return make_tdm1(cibra, ciket, self.binary, self.SC1)
+
+    def make_tdm1s(self, bra_id, ket_id=0):
+        """
+        Spin-resolved one-particle transition density matrices in MO basis.
+        """
+        cibra = self.ci[bra_id]
+        ciket = self.ci[ket_id]
+
+        return make_tdm1s(cibra, ciket, self.binary, self.SC1)
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
@@ -1155,8 +1287,7 @@ def contract_with_tdm1(cibra, ciket, binary, SC1, h1e):
     HCI: CI Hamiltonian
     """
 
-    if isinstance(h1e, np.ndarray): # spin-independent 1e operator
-        h1e = [h1e, h1e]
+    h1e = _normalize_spin_1e_operator(h1e)
 
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
 
@@ -1199,8 +1330,7 @@ def contract_with_rdm1(ci, binary, SC1, h1e):
     HCI: CI Hamiltonian
     """
 
-    if isinstance(h1e, np.ndarray): # spin-independent 1e operator
-        h1e = [h1e, h1e]
+    h1e = _normalize_spin_1e_operator(h1e)
 
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
 
@@ -1215,6 +1345,34 @@ def contract_with_rdm1(ci, binary, SC1, h1e):
 
 
     return np.einsum('I, IJ, J -> ', ci.conj(), H, ci)
+
+def _build_spin_rdm1_operators(binary, SC1):
+    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
+
+    nsd, _, nmo = binary.shape
+    H_a = np.zeros((nsd, nsd, nmo, nmo))
+    H_b = np.zeros((nsd, nsd, nmo, nmo))
+
+    for I in range(nsd):
+        for p in range(nmo):
+            H_a[I, I, p, p] = binary[I, 0, p]
+            H_b[I, I, p, p] = binary[I, 1, p]
+
+    H_a[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
+    H_b[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
+
+    return H_a, H_b
+
+
+def make_rdm1s(ci, binary, SC1):
+    """
+    Make spin-resolved 1e RDMs in MO basis.
+    """
+    H_a, H_b = _build_spin_rdm1_operators(binary, SC1)
+    dm1a = np.einsum('I, IJpq, J -> pq', ci.conj(), H_a, ci).T
+    dm1b = np.einsum('I, IJpq, J -> pq', ci.conj(), H_b, ci).T
+    return dm1a, dm1b
+
 
 def make_rdm1(ci, binary, SC1):
     """
@@ -1244,29 +1402,18 @@ def make_rdm1(ci, binary, SC1):
     ======
     HCI: CI Hamiltonian
     """
+    dm1a, dm1b = make_rdm1s(ci, binary, SC1)
+    return dm1a + dm1b
 
 
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', ci.conj(), H, ci).T
+def make_tdm1s(cibra, ciket, binary, SC1):
+    """
+    Make spin-resolved 1e TDMs in MO basis.
+    """
+    H_a, H_b = _build_spin_rdm1_operators(binary, SC1)
+    tdm1a = np.einsum('I, IJpq, J -> pq', cibra.conj(), H_a, ciket)
+    tdm1b = np.einsum('I, IJpq, J -> pq', cibra.conj(), H_b, ciket)
+    return tdm1a, tdm1b
 
 def make_tdm1(cibra, ciket, binary, SC1):
     """
@@ -1296,29 +1443,8 @@ def make_tdm1(cibra, ciket, binary, SC1):
     ======
     HCI: CI Hamiltonian
     """
-
-
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', cibra.conj(), H, ciket)
+    tdm1a, tdm1b = make_tdm1s(cibra, ciket, binary, SC1)
+    return tdm1a + tdm1b
 
 
 

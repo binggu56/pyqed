@@ -41,6 +41,19 @@ def test_xc_aliases_match_pyscf_style_conventions():
     np.testing.assert_allclose(v_svwn, v_ldavwn)
 
 
+def test_topyscf_preserves_geometry_for_angstrom_input():
+    pytest.importorskip('pyscf')
+
+    mol = Molecule(
+        atom='H 0 0 0; H 0 0 0.74',
+        unit='angstrom',
+        basis='sto-3g',
+    )
+    pmol = mol.topyscf()
+
+    np.testing.assert_allclose(pmol.atom_coords(), mol.atom_coords(), atol=1e-12)
+
+
 def test_rks_builds_default_atom_centered_grid():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='gbasis')
