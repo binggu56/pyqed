@@ -11,9 +11,15 @@ from scipy.linalg import eigh
 from opt_einsum import contract
 from pyqed.qchem.mcscf.direct_ci import CASCI
 # from pyqed.qchem.mcscf.casci import CASCI
-
+import matplotlib.pyplot as plt
+from pyqed import optimize
 
 from pyqed.optimize import minimize
+# from pyqed.optimize import Optimize
+import time
+
+from scipy.linalg import sqrtm, fractional_matrix_power, logm, expm
+from functools import reduce
 
 class CASSCF(CASCI):
     """
@@ -34,10 +40,34 @@ class CASSCF(CASCI):
 
         self.weights = None
         self.nstates = 1
-        self.e_history = []
+
+        self.dipole_moment = None
+
+        self.dm1 = None
+        self.dm2 = None
+
+        self.electric_dipole = None
+        self.magnetic_dipole = None
+
+        hcore = mf.get_hcore()
+        if hcore.dtype == complex:
+            self.dtype = np.complex128
+        else:
+            self.dtype = np.float64
+
+    def _make_casci(self, mf, ncas, nelecas):
+
+        mc = CASCI(mf, ncas=ncas, nelecas=nelecas)
+
+        mc.spin_purification = self.spin_purification
+        mc.ss = self.ss
+        mc.shift = self.shift
+
+        return mc
 
 
-    def run(self, nstates= None, weights = None):
+    def run(self, nstates=1, method='newton'):
+
         mf = self.mf
 
         # canonical molecular orbs
@@ -48,20 +78,26 @@ class CASSCF(CASCI):
             nstates = self.nstates
         else:
             self.nstates = nstates
-        if weights != None:
-            self.weights = weights
+        if self.weights is not None:
+            # self.weights = weights
             if nstates != len(self.weights):
+                print('nstates', nstates)
+                print('len weight', len(self.weights))
                 raise ValueError("the nstates you requires does not align with the nstates indicated by the weights. check input.")
+
         nmo = self.mf.nao
         ncas = self.ncas
         nelecas = self.nelecas
         ncore = self.ncore
 
-        mc = CASCI(mf, ncas=ncas, nelecas=nelecas)
-        # spin
-        mc.spin_purification = self.spin_purification
-        mc.ss = self.ss
-        mc.shift = self.shift
+        # mc = CASCI(mf, ncas=ncas, nelecas=nelecas)
+        # # spin
+        # mc.spin_purification = self.spin_purification
+        # mc.ss = self.ss
+        # mc.shift = self.shift
+
+        mc = self._make_casci(mf, ncas=ncas, nelecas=nelecas)
+
 
         # shift = self.shift
         # purify_spin = self.spin_purification
@@ -69,8 +105,8 @@ class CASSCF(CASCI):
 
         # if self.spin_purification:
         #     mc.fix_spin(ss=self.ss, shift=self.shift)
-
-        mc.run(nstates, method='ci')
+        # print('nstate.....', nstates)
+        mc.run(nstates)
 
 
         # matrix elements in CMOs
@@ -81,29 +117,88 @@ class CASSCF(CASCI):
         for i in range(ncas+ncore):
             U0[i, i] = 1.
 
+
         if nstates == 1: # ground state only
-            C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
+            C, mc, e_table, num_iter, dm1, dm2 = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
 
         elif nstates > 1:
+
             if self.weights is None:
                 self.state_average(weights = np.ones(nstates)/nstates)
             if len(self.weights) != nstates: 
                 self.state_average(weights = np.ones(nstates)/nstates)
 
-            C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
-                                         C0=C0, h1e=h1e, eri=eri)
+            C, mc, e_table, num_iter, dm1, dm2 = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
+                                         C0=C0, h1e=h1e, eri=eri, max_cycles=self.max_cycles)
 
         self.mo_coeff = C
         self.e_tot = mc.e_tot
         self.ci = mc.ci
-        self.e_history = getattr(mc, 'e_history', [self.e_tot])
+        self.e_table = e_table
+        self.num_iter = num_iter
+        self.dm1 = dm1
+        self.dm2 = dm2
 
         return self
 
-    def state_average(self, weights):
+    def state_average(self, weights=None):
         self.nstates = len(weights)
         self.weights = weights
         return self
+
+    def get_electric_dip(self, initial_state, final_state, unit, **kwargs):
+
+        # # mf = self.mf
+
+        # # # canonical molecular orbs
+        # # C0 = mf.mo_coeff
+
+        # # CASCI roots
+        # nstates = self.nstates
+
+        # nmo = self.mf.nao
+        # ncas = self.ncas
+        # nelecas = self.nelecas
+        # ncore = self.ncore
+
+        # mc = CASCI(mf, ncas=ncas, nelecas=nelecas, electric_field=self.electric_field, vector_potential=self.vector_potential)
+        # # spin
+        # mc.spin_purification = self.spin_purification
+        # mc.ss = self.ss
+        # mc.shift = self.shift
+
+        # mc.run(nstates, mo_coeff=self.mo_coeff)
+
+        # # matrix elements in CMOs
+        # h1e = mf.get_hcore_mo()
+        # eri = mf.get_eri_mo()
+        # print('ci',self.ci)
+        # mc = CASCI(mf=self, ncas=self.ncas, nelecas=self.nelecas, electric_field=self.electric_field, vector_potential=self.vector_potential)
+        # self.electric_dipole =  CASCI.get_electric_dip(self, initial_state, final_state, unit, **kwargs)
+
+        return self.electric_dipole
+
+    # def get_dip_moment(self, nstates, unit='Debye', **kwargs):
+
+    #     dm1 = self.dm1
+    #     mo_coeff = self.mo_coeff[:, 0:self.ncas + self.ncore]
+
+
+    #     if nstates == 1:
+    #         print('mo_coeff shape', np.shape(mo_coeff))
+    #         dip = dipole_moment(self.mol, dm1, mo_coeff, unit)
+    #         print(' dipole moment : {} {}'.format(dip, unit))
+    #         self.dipole_moment = dip
+    #     else:
+    #         self.dipole_moment = []
+    #         for state_id in range(nstates):
+    #             dip = dipole_moment(self.mol, dm1[state_id], mo_coeff, unit)
+    #             print('state : {}; dipole moment : {} {}'.format(state_id, dip, unit))
+    #             self.dipole_moment.append(dip)
+
+    #     return self.dipole_moment
+
+
 
 
 def energy(U, h1e, eri, dm1, dm2):
@@ -130,13 +225,16 @@ def energy(U, h1e, eri, dm1, dm2):
 
     """
 
-    e = contract('pq, pa, qb, ab ->', h1e, U, U, dm1)
-    e += 0.5 * (contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U, U, U, U, dm2))
+    e = contract('pq, pa, qb, ab ->', h1e, U.conj(), U, dm1)
+    e += 0.5 * (contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U.conj(), U.conj(), U, U, dm2))
+    # e += 0.5 * (contract('pqrs, pa, qb, rc, sd, acdb ->', eri, U.conj(), U.conj(), U, U, dm2))
+
     return e
 
 
 
-def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwargs):
+
+def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=50, tol=1e-6, method='newton', dtype = np.float64, **kwargs):
     """
     complete active space orbital optimization with orthonomality constraint
 
@@ -171,7 +269,66 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
     None.
 
     """
+    e_table = np.zeros((mc.nstates, max_cycles))
 
+    # diis 
+    maxdiis = 6
+    diis_U = []
+    diis_err = []
+
+    def diis(U, iter):
+        diis_U.append(U.copy())
+
+        if len(diis_U) > 1:
+            diis_err.append((diis_U[-1] - diis_U[-2]).copy())
+
+        if iter <= 1:
+            return U
+
+        if len(diis_err) > maxdiis:
+            diis_err.pop(0)
+            diis_U.pop(0)
+
+        print('len(u)_1', len(diis_U))
+        print('len(err)', len(diis_err))
+
+        bsize = len(diis_err)
+        if bsize < 2:
+            return U
+
+        bmat = -1.0 * np.ones((bsize + 1, bsize + 1), dtype=float)
+        rhs = np.zeros(bsize + 1, dtype=float)
+        bmat[bsize, bsize] = 0.0
+        rhs[bsize] = -1.0
+
+        for b1 in range(bsize):
+            for b2 in range(bsize):
+                bmat[b1, b2] = np.vdot(diis_err[b1], diis_err[b2]).real
+
+        try:
+            C = np.linalg.solve(bmat, rhs)
+        except np.linalg.LinAlgError:
+            print("DIIS: singular B matrix, trying regularization")
+            try:
+                bmat[:-1, :-1] += np.eye(bsize) * 1.0e-10
+                C = np.linalg.solve(bmat, rhs)
+            except np.linalg.LinAlgError:
+                print("DIIS: regularized solve failed")
+                return U
+
+        U_new = np.zeros_like(U, dtype=U.dtype)
+        for i, k in enumerate(C[:-1]):
+            U_new += k * diis_U[i + 1]
+
+        print('len(u)_2', len(diis_U))
+
+        A = U_new.conj().T @ U_new
+        A_inv_sqrt = np.linalg.inv(sqrtm(A))
+
+        return U_new @ A_inv_sqrt
+
+
+    
     if mc.ncore > 0:
         with_core = True
     else:
@@ -186,54 +343,136 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6, **kwarg
     # for i in range(ncas):
     #     U0[i, i] = 1
 
-    U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
-
     k = 0
+    U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+    U = diis(U, k)
+    # U_mix = update_U(U)
+    # U, E = minimize_2(energy, U0, args=(h1e, eri, dm1, dm2))
+
+
+    e_table[:,k] = mc.e_tot
+    k += 1
 
     e_old = mc.e_tot
 
     converged = False
     while k < max_cycles:
+        # print('mo_coeff shape', mo_coeff.shape)
+        # print('U shape', U.shape)
+        # if k == 1:
+        #     mo_coeff = C0 @ U
+        # else:
+        #     mo_coeff = 0.5 * C0 @ (U + U_old)
 
         mo_coeff = C0 @ U
-
         mc.run(mo_coeff=mo_coeff, **kwargs)
+        e_table[:,k] = mc.e_tot
 
         if abs(mc.e_tot - e_old) < tol:
-            print('\nCASSCF converged at macroiteration {}'.format(k))
+            print('\nCASSCF converged at macroiteration {}'.format(k+1))
             print("E(CASSCF) = {}".format(mc.e_tot))
             converged = True
+            e_table[:,k] = mc.e_tot
+            k += 1
             break
 
         e_old = mc.e_tot
 
 
         dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
-
+        # U_old = U
         # U0 = orth(U + 0.1 * np.random.randn(nmo, ncas))
+   
 
         U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2), tau=1)
+        U = diis(U, k)
+        # U, E = minimize_2(energy, U0, args=(h1e, eri, dm1, dm2))
+        k += 1
+        print('k = ', k)
         # print(E + mol.energy_nuc())
 
-        k += 1
 
     if not converged:
-        raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        # raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        print(f"Max macro steps reached. CASSCF not converged.")
 
-    return mo_coeff, mc
+    # if k >= max_cycles:
+    #     k -= 1 
+    # print('dm1 shape', np.shape(dm1))
+    
+    return mo_coeff, mc, e_table, k, dm1, dm2
+
+
 
 
 def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                          max_cycles=50, tol=1e-6, **kwargs):
 
+    e_table = np.zeros((mc.nstates, max_cycles))
+
+    # diis 
+    maxdiis = 6
+    diis_U = []
+    diis_err = []
+
+    def diis(U, iter):
+        diis_U.append(U.copy())
+
+        if len(diis_U) > 1:
+            diis_err.append((diis_U[-1] - diis_U[-2]).copy())
+
+        if iter <= 1:
+            return U
+
+        if len(diis_err) > maxdiis:
+            diis_err.pop(0)
+            diis_U.pop(0)
+
+        print('len(u)_1', len(diis_U))
+        print('len(err)', len(diis_err))
+
+        bsize = len(diis_err)
+        if bsize < 2:
+            return U
+
+        bmat = -1.0 * np.ones((bsize + 1, bsize + 1), dtype=float)
+        rhs = np.zeros(bsize + 1, dtype=float)
+        bmat[bsize, bsize] = 0.0
+        rhs[bsize] = -1.0
+
+        for b1 in range(bsize):
+            for b2 in range(bsize):
+                bmat[b1, b2] = np.vdot(diis_err[b1], diis_err[b2]).real
+
+        try:
+            C = np.linalg.solve(bmat, rhs)
+        except np.linalg.LinAlgError:
+            print("DIIS: singular B matrix, trying regularization")
+            try:
+                bmat[:-1, :-1] += np.eye(bsize) * 1.0e-10
+                C = np.linalg.solve(bmat, rhs)
+            except np.linalg.LinAlgError:
+                print("DIIS: regularized solve failed")
+                return U
+
+        U_new = np.zeros_like(U, dtype=U.dtype)
+        for i, k in enumerate(C[:-1]):
+            U_new += k * diis_U[i + 1]
+
+        print('len(u)_2', len(diis_U))
+
+        A = U_new.conj().T @ U_new
+        A_inv_sqrt = np.linalg.inv(sqrtm(A))
+
+        return U_new @ A_inv_sqrt
+    
     if mc.ncore > 0:
         with_core = True
     else:
         with_core = False
 
     nstates = mc.nstates
-    mc.e_history = [mc.e_tot]
-    
+
     dm1 = 0
     dm2 = 0
     for n in range(nstates):
@@ -241,27 +480,32 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         dm1 += _dm1 * weights[n]
         dm2 += _dm2 * weights[n]
 
+    k = 0
     U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+    U = diis(U, k)
+    # U, E = Optimize(energy, U0, args=(h1e, eri, dm1, dm2))
 
+    e_table[:,k] = mc.e_tot
+    k += 1
 
     e_old = sum(weights * mc.e_tot)
 
     converged = False
-    k = 0
     while k < max_cycles:
 
         mo_coeff = C0 @ U
 
         mc.run(nstates, mo_coeff=mo_coeff, **kwargs)
 
-        mc.e_history.append(mc.e_tot)
-
         eAve = sum(weights * mc.e_tot)
+        e_table[:,k] = mc.e_tot
 
         if abs(eAve - e_old) < tol:
-            print('CASSCF converged at macroiteration {}'.format(k))
+            print('CASSCF converged at macroiteration {}'.format(k+1))
             print("E(CASSCF) = {}".format(mc.e_tot))
             converged = True
+            e_table[:,k] = mc.e_tot
+            k += 1
             break
 
         e_old = eAve
@@ -276,14 +520,27 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
 
 
         U, E = minimize(energy, U0, args=(h1e, eri, dm1, dm2))
+        U = diis(U, k)
+        k += 1
+        print('k = ', k)
+        # U, E = Optimize(energy, U0, args=(h1e, eri, dm1, dm2))
         # print(E + mol.energy_nuc())
 
-        k += 1
 
     if not converged:
-        raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        # raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        print(f"Max macro steps reached. CASSCF not converged.")
 
-    return mo_coeff, mc
+    # if k >= max_cycles:
+    #     k -= 1
+
+    dm1 = []
+    dm2 = []
+    for n in range(nstates):
+        _dm1, _dm2 = mc.make_rdm12(n, with_core=with_core)
+        dm1.append(_dm1)
+        dm2.append(_dm2)
+    return mo_coeff, mc, e_table, k, dm1, dm2
 
 
 # def constrained_optimization(U, h1e, h2e, dm1, dm2, max_steps=50):
@@ -374,21 +631,21 @@ if __name__=='__main__':
     from pyqed import Molecule
     # from pyqed.qchem.mcscf.direct_ci import CASCI
 
-    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
+    print('-------------------- pyqed --------------------')
+    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='sto3g')
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
 
-    mc = CASSCF(mf, ncas=6, nelecas=6, max_cycles=50)
+    mc = CASSCF(mf, ncas=6, nelecas=6, max_cycles=100)
 
-    nstates = 2
+    nstates = 1
     mc.state_average(weights = np.ones(nstates)/nstates)
     mc.fix_spin(ss=0, shift=0.2)
-    mc.run()
+    mc.run(nstates=nstates)
 
-    # correct result is E(CASSCF) = [-7.67160344]
-    # energy logs for you to use
-    print(mc.e_tot[0]) #ground state energy
-    print(mc.e_tot[1]) #fitst excited state
-    print([list(h) for h in mc.e_history]) #whole energy log in list
-    print(mc.e_history) #whole energy log in array
+
+
+
+
+
