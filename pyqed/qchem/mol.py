@@ -15,6 +15,7 @@ from __future__ import division
 # import math
 import os
 import sys
+import hashlib
 import numpy
 from numpy import pi
 from numpy.linalg import norm
@@ -30,8 +31,14 @@ import numpy as np
 
 from pyqed import dag, au2angstrom
 from pyqed.qchem.hf import RHF, UHF
-from pyscf import dft, scf, gto, ao2mo
 from periodictable import elements
+try:
+    from pyscf import dft, scf, gto, ao2mo
+except ImportError:
+    dft = None
+    scf = None
+    gto = None
+    ao2mo = None
 
 
 # import scipy.linalg as linalg
@@ -41,7 +48,8 @@ from periodictable import elements
 # import pyscf.ao2mo
 # import pyscf
 # from functools import reduce
-from pyqed.qchem.basis import build
+from pyqed.qchem.basis import build as build_gbasis
+from pyqed.qchem.basis import build_builtin
 
 
 
@@ -70,6 +78,73 @@ SO_TYPE_OF = 4 # for ECP
 PTR_EXP    = 5
 PTR_COEFF  = 6
 BAS_SLOTS  = 8
+
+
+_BUILTIN_OPTION_SPECS = (
+    ("parallel", "builtin_parallel", "native_parallel", bool, False),
+    ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
+    ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
+    ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 0.0),
+    ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "dense"),
+    ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
+    ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
+    ("build_factors", "builtin_build_factors", "native_build_factors", bool, False),
+)
+
+
+def _pop_builtin_options(kwargs):
+    """
+    Collect builtin backend options from a namespaced dict plus legacy kwargs.
+
+    Precedence is:
+    1. explicit top-level builtin_* kwargs
+    2. explicit top-level native_* kwargs
+    3. builtin_options mapping
+    4. native_options mapping
+    5. defaults
+    """
+    raw_builtin = kwargs.pop("builtin_options", None)
+    raw_native = kwargs.pop("native_options", None)
+    builtin_options = {} if raw_builtin is None else dict(raw_builtin)
+    native_options = {} if raw_native is None else dict(raw_native)
+
+    options = {}
+    for short_name, builtin_name, native_name, caster, default in _BUILTIN_OPTION_SPECS:
+        value = default
+
+        for source in (native_options, builtin_options):
+            if short_name in source:
+                value = source[short_name]
+            elif builtin_name in source:
+                value = source[builtin_name]
+            elif native_name in source:
+                value = source[native_name]
+
+        if native_name in kwargs:
+            value = kwargs.pop(native_name)
+        if builtin_name in kwargs:
+            value = kwargs.pop(builtin_name)
+
+        options[short_name] = caster(value)
+
+    return options
+
+
+def _normalize_builtin_options(options, strict=False):
+    """
+    Normalize a build-time builtin options mapping.
+    """
+    if options is None:
+        return None
+    if not hasattr(options, "items"):
+        raise TypeError("build(options=...) must be a mapping.")
+
+    tmp = {"builtin_options": dict(options)}
+    normalized = _pop_builtin_options(tmp)
+    if strict and tmp:
+        unknown = ", ".join(sorted(tmp))
+        raise ValueError(f"Unknown builtin build option(s): {unknown}")
+    return normalized
 # pointer to env
 PTR_EXPCUTOFF   = 0
 PTR_COMMON_ORIG = 1
@@ -134,11 +209,11 @@ def get_hcore_mo(mf):
 
     """
 
-    if isinstance(mf, scf.rhf.RHF):
+    if scf is not None and isinstance(mf, scf.rhf.RHF):
         mo_coeff = mf.mo_coeff
         return dag(mo_coeff) @ mf.get_hcore() @ mo_coeff
 
-    elif isinstance(mf, scf.uhf.UHF):
+    elif scf is not None and isinstance(mf, scf.uhf.UHF):
 
         ha, hb = mf.get_hcore()
         Ca, Cb = mf.mo_coeff  # MOs for alpha and beta electrons
@@ -167,7 +242,7 @@ def get_eri_mo(mf):
         DESCRIPTION.
 
     """
-    if isinstance(mf, scf.rhf.RHF):
+    if scf is not None and ao2mo is not None and isinstance(mf, scf.rhf.RHF):
         Ca = mf.mo_coeff
         n = Ca.shape[-1]
         # eri = ao2mo.get_mo_eri(mol, mo_coeff)
@@ -175,9 +250,10 @@ def get_eri_mo(mf):
                                 compact=False)).reshape((n,n,n,n), order="C")
         return  eri_aa
 
-    elif isinstance(mf, scf.uhf.UHF):
+    elif scf is not None and ao2mo is not None and isinstance(mf, scf.uhf.UHF):
 
         Ca, Cb = mf.mo_coeff
+        n = Ca.shape[-1]
 
         eri_aa = (ao2mo.general( mf._eri , (Ca, Ca, Ca, Ca),
                                 compact=False)).reshape((n,n,n,n), order="C")
@@ -938,11 +1014,18 @@ class Molecule:
         self.overlap = None
         self.hcore = None
         self.eri = None
+        self.eri_factors = None
 
         self.nao = None
         self.nmo = None
         self.unit = unit
         self._bas = None
+        self._build_driver = None
+        builtin_options = _pop_builtin_options(kwargs)
+        self._set_builtin_options(builtin_options)
+        self._builtin_build_info = None
+
+        self._native_build_info = self._builtin_build_info
 
 
     @property
@@ -966,6 +1049,31 @@ class Molecule:
     def atom_symbols(self):
         return [self.atom_symbol(i) for i in range(self.natom)]
 
+    def _set_builtin_options(self, options):
+        """
+        Apply builtin backend options and keep legacy aliases in sync.
+        """
+        self.builtin_options = dict(options)
+        self.builtin_parallel = self.builtin_options["parallel"]
+        self.builtin_eri_workers = self.builtin_options["eri_workers"]
+        self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
+        self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
+        self.builtin_eri_representation = self.builtin_options["eri_representation"]
+        self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
+        self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
+        self.builtin_build_factors = self.builtin_options["build_factors"]
+
+        # Backward-compatible aliases for the older native_* API.
+        self.native_options = self.builtin_options
+        self.native_parallel = self.builtin_parallel
+        self.native_eri_workers = self.builtin_eri_workers
+        self.native_parallel_min_nao = self.builtin_parallel_min_nao
+        self.native_eri_screen_tol = self.builtin_eri_screen_tol
+        self.native_eri_representation = self.builtin_eri_representation
+        self.native_low_rank_tol = self.builtin_low_rank_tol
+        self.native_low_rank_max_rank = self.builtin_low_rank_max_rank
+        self.native_build_factors = self.builtin_build_factors
+
 
     @property
     def nelec(self):
@@ -981,32 +1089,61 @@ class Molecule:
 
         return np.einsum('z,zx->x', charges, coords) / charges.sum()
 
-    def build(self, driver='gbasis'):
+    def build(self, driver='builtin', options=None):
         """
         build molecular integrals
 
         Parameters
         ----------
         driver : str
-            external driver for AO integrals. Supported are 'gbasis' and 'pyscf'.
+            AO integral backend. Supported are:
+            - 'builtin' (default): pyqed in-house integral engine;
+            - 'native' (alias for 'builtin');
+            - 'gbasis';
+            - 'gbasis-pyscf';
+            - 'pyscf'.
+        options : dict, optional
+            Backend-specific build options. For ``driver='builtin'``, use short
+            keys such as ``eri_representation``, ``low_rank_tol``,
+            ``eri_screen_tol``, ``parallel``, and ``eri_workers``.
 
         Returns
         -------
         None.
 
         """
-        driver = driver.lower()
-
         if driver is None:
-            pass # our own AO integrals, VERY SLOW
+            driver = 'builtin'
+        driver = driver.lower()
+        if driver in ('native', 'own', 'pyqed'):
+            driver = 'builtin'
+
+        if options is not None:
+            if driver != 'builtin':
+                raise ValueError(
+                    "build(options=...) is only supported for driver='builtin' or its 'native' alias."
+                )
+            self._set_builtin_options(_normalize_builtin_options(options, strict=True))
+
+        self._build_driver = driver
+        self.eri_factors = None
+        self._builtin_build_info = None
+        self._native_build_info = None
+
+        if driver == 'builtin':
+            build_builtin(self)
         elif driver == 'gbasis':
-            build(self)
+            build_gbasis(self)
 
         elif driver == 'gbasis-pyscf':
-            build(self, pyscf=True)
+            build_gbasis(self, pyscf=True)
 
         elif driver == 'pyscf':
             # extract AO integrals from PySCF
+            if gto is None:
+                raise ImportError(
+                    "PySCF is not available but driver='pyscf' was requested."
+                )
 
             mol = self.topyscf()
             mol.build()
@@ -1032,6 +1169,33 @@ class Molecule:
             self._atm = mol._atm
             self._bas = mol._bas
             self._env = mol._env
+        else:
+            raise ValueError(
+                f"Unsupported integral driver '{driver}'. "
+                "Use 'builtin', 'native', 'gbasis', 'gbasis-pyscf', or 'pyscf'."
+            )
+
+    def geometry_signature(self, digits=12):
+        """
+        Hashable signature for the current geometry and integral build context.
+        """
+        coords = np.asarray(self.atom_coords(), dtype=float)
+        rounded = np.round(coords, digits).reshape(-1)
+        return (
+            tuple(self.atom_symbols()),
+            repr(self.basis),
+            int(self.charge),
+            int(self.spin),
+            getattr(self, '_build_driver', None),
+            coords.shape,
+            tuple(rounded.tolist()),
+        )
+
+    def geometry_hash(self, digits=12):
+        """
+        Short digest of the current geometry signature.
+        """
+        return hashlib.sha1(repr(self.geometry_signature(digits=digits)).encode('utf-8')).hexdigest()
 
     def _add_suffix(self, intor, cart=None):
         mol = self.topyscf()
@@ -1081,7 +1245,8 @@ class Molecule:
             DESCRIPTION.
 
         """
-        from pyscf import gto
+        if gto is None:
+            raise ImportError("PySCF is not available in this environment.")
         atom = build_atom_from_coords(self.atom_symbols(), self.atom_coords())
         return gto.M(
             atom=atom,
@@ -1153,7 +1318,19 @@ class Molecule:
         """
         # update coordinates
         for i in range(self.natom):
-            self._atom[i][1] = R[i]
+            self._atom[i][1] = list(np.asarray(R[i], dtype=float))
+
+        # Invalidate AO integral data; low-rank history is preserved separately
+        # and keyed by geometry/build settings.
+        self.overlap = None
+        self.hcore = None
+        self.eri = None
+        self.nao = None
+        self.nmo = None
+        self._bas = None
+        for attr in ('ao_moment', 'ao_dip', 'ao_magnetic_dip', '_atm', '_env'):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
 
         # self.build()
 
@@ -1385,12 +1562,18 @@ class Molecule:
         return energy_nuc(self.atom_coords(), self.atom_charges())
 
 def fakemol_for_charges(coords, expnt=1e16):
+    if gto is None:
+        raise ImportError("PySCF is not available in this environment.")
     return gto.fakemol_for_charges(coords=coords, expnt=expnt)
 
 def intor_cross(intor, mol1, mol2, comp=None, grids=None):
+    if gto is None:
+        raise ImportError("PySCF is not available in this environment.")
     return gto.intor_cross(intor=intor, mol1=mol1, mol2=mol2, comp=comp, grids=grids)
 
 def make_cintopt(atm, basis, env, intor):
+    if gto is None:
+        raise ImportError("PySCF is not available in this environment.")
     mol = gto.Mole()
     return gto.moleintor.make_cintopt(atm=mol._atm, bas=mol._bas, env=mol._env, intor=intor)
 

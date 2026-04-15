@@ -3,7 +3,7 @@ import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf import RHF, UHF
-from pyqed.qchem.mcscf.casci import CASCI
+from pyqed.qchem.mcscf.casci import CASCI, transform_spatial_eri_to_mo
 from pyqed.qchem.mcscf import direct_ci
 
 
@@ -138,3 +138,43 @@ def test_direct_ci_spin_square_matches_rdm_definition():
             direct_ci.spin_square_from_rdm(dm1, dm2),
             atol=1e-10,
         )
+
+
+def test_cholesky_active_space_eri_transform_matches_dense():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis-pyscf')
+
+    mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
+    mo_cas = mf.mo_coeff[:, 1:5]
+
+    eri_dense = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=False)
+    eri_cd = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=True)
+
+    np.testing.assert_allclose(eri_cd, eri_dense, atol=1e-8)
+
+
+def test_casci_use_cholesky_matches_dense_energy():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis-pyscf')
+
+    mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
+
+    mc_dense = CASCI(mf, ncas=4, nelecas=4).run(nstates=2)
+    mc_cd = CASCI(mf, ncas=4, nelecas=4).run(nstates=2, use_cholesky=True)
+
+    np.testing.assert_allclose(mc_cd.e_tot, mc_dense.e_tot, atol=1e-8)
+
+
+def test_direct_ci_use_cholesky_matches_dense_energy():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis-pyscf')
+
+    mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
+
+    mc_direct = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_direct.direct_ci_dense_fallback_ndets = 1
+    mc_direct.run(nstates=2, method='direct_ci', use_cholesky=True)
+
+    mc_dense = CASCI(mf, ncas=4, nelecas=4).run(nstates=2)
+
+    np.testing.assert_allclose(mc_direct.e_tot, mc_dense.e_tot, atol=1e-8)

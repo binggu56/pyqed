@@ -29,14 +29,12 @@ def main():
         widths=[wx, wy],
         labels=['x', 'y'],
     )
-    sd = fbr.to_sddvr()
-
-    t_sd = sd.fbr2dvr(fbr.orthonormal_kinetic(mass=[1.0, 1.0]))
-    qx, qy = fbr.orthonormal_coordinate_ops()
-    # For a quadratic oscillator potential we can project V exactly in the
-    # orthonormal Gaussian basis before moving to the SD-DVR basis.
-    v_sd = sd.fbr2dvr(0.5 * (wx ** 2 * (qx @ qx) + wy ** 2 * (qy @ qy)))
-    h_sd = t_sd + v_sd
+    # Default: use diagonal local-potential approximation in SD-DVR.
+    # Set approximation='projected' for projected quadratic potential.
+    h_sd, sd = fbr.harmonic_hamiltonian_sddvr(
+        omega=[wx, wy],
+        mass=[1.0, 1.0],
+    )
 
     e, _ = np.linalg.eigh(h_sd)
     e_exact = exact_energies(wx, wy, nmax=4)

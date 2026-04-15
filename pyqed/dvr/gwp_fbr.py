@@ -119,6 +119,17 @@ def _parse_ho_scales(omega, mass):
     return omega, mass
 
 
+def _as_omega(omega, ndim):
+    omega = np.asarray(omega, dtype=float)
+    if omega.ndim == 0:
+        omega = np.full(ndim, float(omega))
+    if omega.shape != (ndim,):
+        raise ValueError("omega must be a scalar or have shape (ndim,).")
+    if np.any(omega <= 0.0):
+        raise ValueError("omega must be positive.")
+    return omega
+
+
 def _normal_quasi_sample(engine, ndim):
     sample = np.asarray(engine.random(1)[0], dtype=float)
     sample = np.clip(sample, 1e-12, 1.0 - 1e-12)
@@ -366,6 +377,76 @@ class GaussianWavepacketFBR:
         """
         return self.orthonormalize(self.kinetic(mass=mass))
 
+    def harmonic_hamiltonian(self, omega, mass=1.0, approximation="diagonal"):
+        """
+        Build an independent-HO Hamiltonian in the orthonormal Gaussian basis.
+
+        Parameters
+        ----------
+        omega : float or array-like
+            Per-dimension oscillator frequencies.
+        mass : float or array-like, optional
+            Per-dimension masses. A scalar applies to every coordinate.
+        approximation : {'diagonal', 'projected'}, optional
+            Potential representation. ``diagonal`` uses the diagonal local
+            operator approximation (default). ``projected`` uses the projected
+            quadratic operator ``0.5 * sum_i omega_i^2 Q_i^2``.
+        """
+        omega = _as_omega(omega, self.ndim)
+        t = self.orthonormal_kinetic(mass=mass)
+        mode = str(approximation).lower()
+        if mode in ("diagonal", "diag", "local"):
+            v = self.diagonal_local_operator(
+                lambda *q: 0.5 * sum((omega[i] ** 2) * (q[i] ** 2) for i in range(self.ndim))
+            )
+        elif mode in ("projected", "exact", "quadratic"):
+            q_ops = self.orthonormal_coordinate_ops()
+            v = np.zeros((self.nbasis, self.nbasis), dtype=q_ops.dtype)
+            for i in range(self.ndim):
+                v += 0.5 * omega[i] ** 2 * (q_ops[i] @ q_ops[i])
+            v = 0.5 * (v + v.conj().T)
+        else:
+            raise ValueError(
+                "approximation must be 'diagonal' or 'projected'."
+            )
+        return t + v
+
+    def harmonic_hamiltonian_sddvr(
+        self,
+        omega,
+        mass=1.0,
+        approximation="diagonal",
+        sddvr=None,
+        tol=1e-10,
+        max_iter=1000,
+        verbose=False,
+    ):
+        """
+        Build an independent-HO Hamiltonian in the SD-DVR basis.
+
+        The default potential mode is the diagonal local approximation.
+        """
+        omega = _as_omega(omega, self.ndim)
+        sd = self.to_sddvr(tol=tol, max_iter=max_iter, verbose=verbose) if sddvr is None else sddvr
+        t_sd = sd.fbr2dvr(self.orthonormal_kinetic(mass=mass))
+        mode = str(approximation).lower()
+        if mode in ("diagonal", "diag", "local"):
+            v_sd = sd.local_operator(
+                lambda *q: 0.5 * sum((omega[i] ** 2) * (q[i] ** 2) for i in range(self.ndim))
+            )
+        elif mode in ("projected", "exact", "quadratic"):
+            q_ops = self.orthonormal_coordinate_ops()
+            v_fbr = np.zeros((self.nbasis, self.nbasis), dtype=q_ops.dtype)
+            for i in range(self.ndim):
+                v_fbr += 0.5 * omega[i] ** 2 * (q_ops[i] @ q_ops[i])
+            v_fbr = 0.5 * (v_fbr + v_fbr.conj().T)
+            v_sd = sd.fbr2dvr(v_fbr)
+        else:
+            raise ValueError(
+                "approximation must be 'diagonal' or 'projected'."
+            )
+        return t_sd + v_sd, sd
+
     def to_sddvr(self, tol=1e-10, max_iter=1000, verbose=False):
         """
         Build an SD-DVR from the orthonormalized Gaussian coordinate operators.
@@ -510,6 +591,76 @@ class MatrixGaussianWavepacketFBR:
 
     def orthonormal_kinetic(self, mass=1.0):
         return self.orthonormalize(self.kinetic(mass=mass))
+
+    def harmonic_hamiltonian(self, omega, mass=1.0, approximation="diagonal"):
+        """
+        Build an independent-HO Hamiltonian in the orthonormal Gaussian basis.
+
+        Parameters
+        ----------
+        omega : float or array-like
+            Per-dimension oscillator frequencies.
+        mass : float or array-like, optional
+            Per-dimension masses. A scalar applies to every coordinate.
+        approximation : {'diagonal', 'projected'}, optional
+            Potential representation. ``diagonal`` uses the diagonal local
+            operator approximation (default). ``projected`` uses the projected
+            quadratic operator ``0.5 * sum_i omega_i^2 Q_i^2``.
+        """
+        omega = _as_omega(omega, self.ndim)
+        t = self.orthonormal_kinetic(mass=mass)
+        mode = str(approximation).lower()
+        if mode in ("diagonal", "diag", "local"):
+            v = self.diagonal_local_operator(
+                lambda *q: 0.5 * sum((omega[i] ** 2) * (q[i] ** 2) for i in range(self.ndim))
+            )
+        elif mode in ("projected", "exact", "quadratic"):
+            q_ops = self.orthonormal_coordinate_ops()
+            v = np.zeros((self.nbasis, self.nbasis), dtype=q_ops.dtype)
+            for i in range(self.ndim):
+                v += 0.5 * omega[i] ** 2 * (q_ops[i] @ q_ops[i])
+            v = 0.5 * (v + v.conj().T)
+        else:
+            raise ValueError(
+                "approximation must be 'diagonal' or 'projected'."
+            )
+        return t + v
+
+    def harmonic_hamiltonian_sddvr(
+        self,
+        omega,
+        mass=1.0,
+        approximation="diagonal",
+        sddvr=None,
+        tol=1e-10,
+        max_iter=1000,
+        verbose=False,
+    ):
+        """
+        Build an independent-HO Hamiltonian in the SD-DVR basis.
+
+        The default potential mode is the diagonal local approximation.
+        """
+        omega = _as_omega(omega, self.ndim)
+        sd = self.to_sddvr(tol=tol, max_iter=max_iter, verbose=verbose) if sddvr is None else sddvr
+        t_sd = sd.fbr2dvr(self.orthonormal_kinetic(mass=mass))
+        mode = str(approximation).lower()
+        if mode in ("diagonal", "diag", "local"):
+            v_sd = sd.local_operator(
+                lambda *q: 0.5 * sum((omega[i] ** 2) * (q[i] ** 2) for i in range(self.ndim))
+            )
+        elif mode in ("projected", "exact", "quadratic"):
+            q_ops = self.orthonormal_coordinate_ops()
+            v_fbr = np.zeros((self.nbasis, self.nbasis), dtype=q_ops.dtype)
+            for i in range(self.ndim):
+                v_fbr += 0.5 * omega[i] ** 2 * (q_ops[i] @ q_ops[i])
+            v_fbr = 0.5 * (v_fbr + v_fbr.conj().T)
+            v_sd = sd.fbr2dvr(v_fbr)
+        else:
+            raise ValueError(
+                "approximation must be 'diagonal' or 'projected'."
+            )
+        return t_sd + v_sd, sd
 
     def to_sddvr(self, tol=1e-10, max_iter=1000, verbose=False):
         ops = self.orthonormal_coordinate_ops()

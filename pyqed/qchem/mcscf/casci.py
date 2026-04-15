@@ -27,8 +27,12 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
             create, Is #, jordan_wigner_two_body
 
 
-from pyqed.qchem.hf.rhf import ao2mo
-from pyqed.qchem.soc import get_soc_1e_spin_orbital, reorder_spin_orbital_matrix
+from pyqed.qchem.hf.rhf import ao2mo, get_or_build_low_rank_eri_factors
+from pyqed.qchem.soc import (
+    get_soc_1e_spin_orbital,
+    get_soc_somf_spin_orbital,
+    reorder_spin_orbital_matrix,
+)
 
 def cistring(norb, nelec, sz=0):
     """
@@ -208,6 +212,89 @@ def _transform_1e_operator_ao_to_mo(h1e, mo_coeff):
     if h1b is h1a:
         return out
     return (out, ao2mo(h1b, mo_coeff))
+
+
+def _get_mf_cholesky_factors(mf):
+    eri_factors = getattr(mf, 'eri_factors', None)
+    if eri_factors is not None:
+        return eri_factors
+
+    tol = getattr(mf, 'cholesky_tol', None)
+    if tol is None:
+        tol = getattr(mf, 'low_rank_tol', None)
+    if tol is None:
+        tol = 1e-8
+
+    max_rank = getattr(mf, 'cholesky_max_rank', None)
+    if max_rank is None:
+        max_rank = getattr(mf, 'low_rank_max_rank', None)
+
+    eri_factors = get_or_build_low_rank_eri_factors(mf.mol, tol=tol, max_rank=max_rank)
+    mf.eri_factors = eri_factors
+    return eri_factors
+
+
+def _resolve_use_cholesky_integrals(mf, use_cholesky=False):
+    """
+    Enable the factor/Cholesky CASCI path automatically for factor-only RHF.
+    """
+    if use_cholesky:
+        return True
+    return getattr(mf, 'eri', None) is None and getattr(mf, 'eri_factors', None) is not None
+
+
+def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+    """
+    Transform AO Cholesky factors ``L_P[mu,nu]`` to an MO pair basis.
+    """
+    if mo_right is None:
+        mo_right = mo_left
+    return contract('Pmn,mp,nq->Ppq', eri_factors, mo_left.conj(), mo_right)
+
+
+def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):
+    """
+    Assemble a spatial ERI tensor from transformed Cholesky pair factors.
+    """
+    if pair_factors_rs is None:
+        pair_factors_rs = pair_factors_pq
+    return contract('Ppq,Prs->pqrs', pair_factors_pq, pair_factors_rs)
+
+
+def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None,
+                                use_cholesky=False, eri_factors=None):
+    """
+    Transform AO spatial ERIs to MO form, optionally via AO Cholesky factors.
+    """
+    if mo_right is None:
+        mo_right = mo_left
+    if mo_left_2 is None:
+        mo_left_2 = mo_left
+    if mo_right_2 is None:
+        mo_right_2 = mo_right
+
+    if use_cholesky:
+        if eri_factors is None:
+            eri_factors = _get_mf_cholesky_factors(mf)
+        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        if (
+            mo_left_2 is mo_left and mo_right_2 is mo_right
+        ) or (
+            np.array_equal(mo_left_2, mo_left) and np.array_equal(mo_right_2, mo_right)
+        ):
+            pair_factors_rs = pair_factors_pq
+        else:
+            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+        return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
+
+    return contract(
+        'ip, jq, ijkl, kr, ls -> pqrs',
+        mo_left.conj(),
+        mo_right,
+        mf.eri,
+        mo_left_2.conj(),
+        mo_right_2,
+    )
 
 
 def _validate_matching_active_spaces(cibra_obj, ciket_obj):
@@ -518,6 +605,7 @@ class CASCI:
         self.binary = None
         self.SC1 = None # SlaterCondon rule 1
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
+        self.use_cholesky_integrals = False
 
 
         # effective CAS Hamiltonian
@@ -525,7 +613,7 @@ class CASCI:
         self.h2e = None
 
 
-    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
+    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None, use_cholesky=None):
         """
         Given a rhf object get Spin-Orbit Matrices
 
@@ -540,6 +628,9 @@ class CASCI:
         # from pyscf import ao2mo
 
         mf = self.mf
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
 
         # molecular orbitals
         Ca, Cb = _as_spin_tuple(self.mo_cas)
@@ -560,16 +651,42 @@ class CASCI:
 
         # nmo = Ca.shape[1] # n
 
-        eri = mf.eri  # (pq||rs) = (pq|rs) - (ps|qr) 1^* 1 2^* 2
+        same_spin_orbitals = Ca is Cb or np.array_equal(Ca, Cb)
+        eri_factors = _get_mf_cholesky_factors(mf) if use_cholesky else None
 
-        ### compute SO antisymmetrized ERIs (MO)
-        eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-        # eri_aa -= eri_aa.swapaxes(1,3)
-
-        eri_bb = eri_aa.copy()
-
-        eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-        eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
+        if same_spin_orbitals:
+            # Restricted references use the same spatial active orbitals for both
+            # spin channels, so all spin blocks share one spatial ERI transform.
+            eri_spatial = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_aa = eri_spatial
+            eri_ab = eri_spatial
+            eri_ba = eri_spatial
+            eri_bb = eri_spatial
+        else:
+            eri_aa = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_bb = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ab = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ba = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
 
 
 
@@ -799,7 +916,7 @@ class CASCI:
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='ci', ci0=None):
+    def run(self, nstates=1, mo_coeff=None, method='ci', ci0=None, use_cholesky=False):
         """
         solve the full CI in the active space, more efficient than the JW solver
 
@@ -829,6 +946,7 @@ class CASCI:
         # print("             CASCI              ")
         # print('------------------------------\n')
         self.nstates = nstates
+        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
 
         # if method == 'ci':
 
@@ -854,10 +972,45 @@ class CASCI:
         else:
             binary = self.binary
 
+        if method == 'ci' and self.use_cholesky_integrals and not self.spin_purification:
+            from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
+
+            direct_solver = DirectCASCI(
+                self.mf,
+                ncas=self.ncas,
+                nelecas=self.nelecas,
+                ncore=self.ncore,
+                spin=self.spin,
+                tol=getattr(self, 'tol', 0),
+            )
+            direct_solver.binary = binary
+            direct_solver.run(
+                nstates=nstates,
+                mo_coeff=self.mo_coeff,
+                method='direct_ci',
+                ci0=ci0,
+                use_cholesky=use_cholesky,
+            )
+
+            self.mo_coeff = direct_solver.mo_coeff
+            self.mo_core = direct_solver.mo_core
+            self.mo_cas = direct_solver.mo_cas
+            self.binary = direct_solver.binary
+            self.e_core = direct_solver.e_core
+            self.e_tot = direct_solver.e_tot
+            self.ci = direct_solver.ci
+            self.hcore = direct_solver.hcore
+            self.eri_so = direct_solver.eri_so
+            self.h2e_cas = getattr(direct_solver, 'h2e_cas', None)
+            self.SC1 = getattr(direct_solver, 'SC1', None)
+            self.SC2 = getattr(direct_solver, 'SC2', None)
+            self.solver_backend = getattr(direct_solver, 'solver_backend', 'direct_ci_factor_conn')
+            return self
+
         # print('Number of determinants', binary.shape[0])
 
         # effective hamiltonian in the CAS
-        h1e, h2e = self.get_SO_matrix()
+        h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
 
         if self.spin_purification:
 
@@ -1259,9 +1412,10 @@ class CASCI:
 
     def soc_matrix_element(self, bra_id, ket_id=0, other=None, hso=None,
                            one_center=True, with_prefactor=True,
-                           light_speed=None, order='grouped'):
+                           light_speed=None, order='grouped',
+                           soc_model='1e', dm=None, states=None):
         """
-        One-electron SOC matrix element between CASCI states.
+        SOC matrix element between CASCI states.
 
         If ``hso`` is not provided, the active-space SOC operator is built from
         the current active orbitals.
@@ -1270,15 +1424,31 @@ class CASCI:
             other = self
         _validate_matching_active_spaces(self, other)
         if hso is None:
-            hso = get_soc_1e_spin_orbital(
-                self.mf,
-                representation='mo',
-                mo_coeff=self.mo_cas,
-                one_center=one_center,
-                with_prefactor=with_prefactor,
-                light_speed=light_speed,
-                order=order,
-            )
+            model = soc_model.lower()
+            if model == '1e':
+                hso = get_soc_1e_spin_orbital(
+                    self.mf,
+                    representation='mo',
+                    mo_coeff=self.mo_cas,
+                    one_center=one_center,
+                    with_prefactor=with_prefactor,
+                    light_speed=light_speed,
+                    order=order,
+                )
+            elif model == 'somf':
+                hso = get_soc_somf_spin_orbital(
+                    self.mf,
+                    representation='mo',
+                    mo_coeff=self.mo_cas,
+                    dm=dm,
+                    states=states,
+                    one_center=one_center,
+                    with_prefactor=with_prefactor,
+                    light_speed=light_speed,
+                    order=order,
+                )
+            else:
+                raise ValueError("soc_model must be '1e' or 'somf'.")
         return self.contract_with_tdm1_spin_orbital(
             bra_id,
             ket_id=ket_id,

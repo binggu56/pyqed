@@ -38,7 +38,15 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
 
 from pyqed.qchem.hf.rhf import ao2mo
 
-from pyqed.qchem.mcscf.casci import h1e_for_cas, size_of_cas, spin_square as spin_square_from_rdm
+from pyqed.qchem.mcscf.casci import (
+    h1e_for_cas,
+    size_of_cas,
+    spin_square as spin_square_from_rdm,
+    transform_spatial_eri_to_mo,
+    transform_eri_factors_to_mo_pair,
+    _get_mf_cholesky_factors,
+    _resolve_use_cholesky_integrals,
+)
 from pyqed.qchem import mcscf
 
 from numba import njit, prange
@@ -271,7 +279,7 @@ def build_spin_square_operator(norb):
     return h1, h2
 
 
-def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore):
+def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore, use_cholesky=False):
     """
     Build the active-space spatial-orbital Hamiltonian for the direct-CI solver.
 
@@ -288,9 +296,28 @@ def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore):
     """
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
     mo_cas = mo_coeff[:, ncore:ncore+ncas]
-    eri_spatial = contract('ip, jq, ijkl, kr, ls -> pqrs',
-                           mo_cas.conj(), mo_cas, mf.eri, mo_cas.conj(), mo_cas)
+    eri_spatial = transform_spatial_eri_to_mo(
+        mf,
+        mo_cas,
+        mo_cas,
+        mo_cas,
+        mo_cas,
+        use_cholesky=use_cholesky,
+        eri_factors=_get_mf_cholesky_factors(mf) if use_cholesky else None,
+    )
     return h1, eri_spatial, energy_core
+
+
+def transform_active_space_pair_factors(mf, mo_coeff, ncas, ncore, eri_factors=None):
+    """
+    Build active-space MO-pair Cholesky factors for the direct-CI solver.
+    """
+    h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
+    mo_cas = mo_coeff[:, ncore:ncore+ncas]
+    if eri_factors is None:
+        eri_factors = _get_mf_cholesky_factors(mf)
+    pair_factors = transform_eri_factors_to_mo_pair(eri_factors, mo_cas, mo_cas)
+    return h1, pair_factors, energy_core
 
 
 def _binary_row_to_bits(occ):
@@ -667,6 +694,52 @@ def _compute_diag_compact(h1, eri_same, eri_cross, Binary):
                         H_diag[i] += 0.5 * eri_same[p, p, q, q]
                     if Binary[i, 0, q]:
                         H_diag[i] += 0.5 * eri_cross[p, p, q, q]
+
+    return H_diag
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _factor_coulomb(pair_factors, p, q, r, s):
+    val = 0.0
+    for t in range(pair_factors.shape[0]):
+        val += pair_factors[t, p, q] * pair_factors[t, r, s]
+    return val
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_diag_compact_factors(h1, pair_factors, Binary):
+    """
+    Diagonal CI matrix elements using MO-pair factors directly.
+    """
+    n_dets, _, n_mo = Binary.shape
+    h1_diag = np.diag(h1)
+    H_diag = np.zeros(n_dets)
+
+    for i in prange(n_dets):
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                H_diag[i] += h1_diag[p]
+            if Binary[i, 1, p]:
+                H_diag[i] += h1_diag[p]
+
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                for q in range(n_mo):
+                    coul = _factor_coulomb(pair_factors, p, p, q, q)
+                    if Binary[i, 0, q]:
+                        exch = _factor_coulomb(pair_factors, p, q, q, p)
+                        H_diag[i] += 0.5 * (coul - exch)
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * coul
+
+            if Binary[i, 1, p]:
+                for q in range(n_mo):
+                    coul = _factor_coulomb(pair_factors, p, p, q, q)
+                    if Binary[i, 1, q]:
+                        exch = _factor_coulomb(pair_factors, p, q, q, p)
+                        H_diag[i] += 0.5 * (coul - exch)
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * coul
 
     return H_diag
 
@@ -1126,6 +1199,80 @@ def _sigma_compact_conn_numba(
     return sigma_vec
 
 
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_single_values_from_factors(J, p_idx, q_idx, phase, h1, pair_factors, Binary, spin):
+    n_exc = len(J)
+    n_mo = h1.shape[0]
+    values = np.zeros(n_exc)
+
+    for k in prange(n_exc):
+        p = p_idx[k]
+        q = q_idx[k]
+        sign = phase[k]
+        j = J[k]
+
+        val = -sign * h1[p, q]
+        for r in range(n_mo):
+            coul = _factor_coulomb(pair_factors, p, q, r, r)
+            if Binary[j, spin, r] and r != q:
+                exch = _factor_coulomb(pair_factors, p, r, r, q)
+                val -= sign * (coul - exch)
+            if Binary[j, 1 - spin, r]:
+                val -= sign * coul
+
+        values[k] = val
+
+    return values
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_double_same_values_from_factors(p_idx, q_idx, r_idx, s_idx, phase, pair_factors):
+    n_exc = len(p_idx)
+    values = np.zeros(n_exc)
+
+    for k in prange(n_exc):
+        values[k] = phase[k] * (
+            _factor_coulomb(pair_factors, p_idx[k], q_idx[k], r_idx[k], s_idx[k]) -
+            _factor_coulomb(pair_factors, p_idx[k], s_idx[k], r_idx[k], q_idx[k])
+        )
+
+    return values
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_double_cross_values_from_factors(p_idx, q_idx, r_idx, s_idx, phase, pair_factors):
+    n_exc = len(p_idx)
+    values = np.zeros(n_exc)
+
+    for k in prange(n_exc):
+        values[k] = phase[k] * _factor_coulomb(
+            pair_factors, p_idx[k], q_idx[k], r_idx[k], s_idx[k]
+        )
+
+    return values
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_values_conn_numba(
+    H_diag, H_A, H_B, H_AA, H_BB, H_AB, c,
+    I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+):
+    sigma_vec = H_diag * c
+
+    for k in range(len(I_A)):
+        sigma_vec[I_A[k]] += H_A[k] * c[J_A[k]]
+    for k in range(len(I_B)):
+        sigma_vec[I_B[k]] += H_B[k] * c[J_B[k]]
+    for k in range(len(I_AA)):
+        sigma_vec[I_AA[k]] += H_AA[k] * c[J_AA[k]]
+    for k in range(len(I_BB)):
+        sigma_vec[I_BB[k]] += H_BB[k] * c[J_BB[k]]
+    for k in range(len(I_AB)):
+        sigma_vec[I_AB[k]] += H_AB[k] * c[J_AB[k]]
+
+    return sigma_vec
+
+
 def sigma_on_the_fly(Binary, SC1, SC2, H1, H2, H_diag, c):
     """
     Matrix-free CI sigma-vector build without precomputing all excitation values.
@@ -1220,14 +1367,22 @@ class CASCI(mcscf.casci.CASCI):
         self._s2_diag = None
         self._direct_spatial_h1 = None
         self._direct_spatial_eri = None
+        self._direct_pair_factors = None
         self._direct_same_spin_eri = None
         self._direct_cross_spin_eri = None
+        self._direct_factor_H_diag = None
+        self._direct_factor_H_A = None
+        self._direct_factor_H_B = None
+        self._direct_factor_H_AA = None
+        self._direct_factor_H_BB = None
+        self._direct_factor_H_AB = None
         self._direct_integrals_mo_ref = None
         self._direct_integrals_ncore = None
         self._direct_integrals_ncas = None
+        self._direct_integrals_use_cholesky = None
 
 
-    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
+    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None, use_cholesky=None):
         """
         Build the active-space Hamiltonian in spin-orbital block form.
 
@@ -1257,6 +1412,9 @@ class CASCI(mcscf.casci.CASCI):
         # from pyscf import ao2mo
 
         mf = self.mf
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
 
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
@@ -1277,24 +1435,43 @@ class CASCI(mcscf.casci.CASCI):
 
         # nmo = Ca.shape[1] # n
 
-        eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
-
         same_spin_orbitals = Ca is Cb or np.array_equal(Ca, Cb)
+        eri_factors = _get_mf_cholesky_factors(mf) if use_cholesky else None
 
         if same_spin_orbitals:
             # Restricted references use the same spatial active orbitals for both
             # spin channels, so all spin blocks start from the same spatial ERI.
-            eri_spatial = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+            eri_spatial = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
             eri_aa = eri_spatial
             eri_ab = eri_spatial
             eri_ba = eri_spatial
             eri_bb = eri_spatial
         else:
             ### compute SO ERIs (MO)
-            eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-            eri_bb = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Cb.conj(), Cb)
-            eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-            eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
+            eri_aa = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_bb = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ab = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ba = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
 
 
 
@@ -1336,7 +1513,7 @@ class CASCI(mcscf.casci.CASCI):
         #     return H1, H2
         return H1, H2
 
-    def get_direct_spatial_integrals(self):
+    def get_direct_spatial_integrals(self, use_cholesky=None):
         """
         Return cached active-space spatial integrals for the direct-CI backend.
 
@@ -1345,27 +1522,64 @@ class CASCI(mcscf.casci.CASCI):
         changing solver options. Reusing the transformed active-space integrals
         avoids paying the AO->MO contraction cost every time.
         """
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
         if (
             self._direct_spatial_h1 is not None
             and self._direct_spatial_eri is not None
             and self._direct_integrals_mo_ref is self.mo_coeff
             and self._direct_integrals_ncore == self.ncore
             and self._direct_integrals_ncas == self.ncas
+            and self._direct_integrals_use_cholesky == bool(use_cholesky)
         ):
             return self._direct_spatial_h1, self._direct_spatial_eri, self.e_core
 
         h1, eri_spatial, energy_core = transform_active_space_spatial_integrals(
-            self.mf, self.mo_coeff, self.ncas, self.ncore
+            self.mf, self.mo_coeff, self.ncas, self.ncore, use_cholesky=use_cholesky
         )
         self._direct_spatial_h1 = h1
         self._direct_spatial_eri = eri_spatial
         self._direct_integrals_mo_ref = self.mo_coeff
         self._direct_integrals_ncore = self.ncore
         self._direct_integrals_ncas = self.ncas
+        self._direct_integrals_use_cholesky = bool(use_cholesky)
         self.e_core = energy_core
         return h1, eri_spatial, energy_core
 
-    def get_direct_compact_integrals(self):
+    def get_direct_pair_factors(self, use_cholesky=None):
+        """
+        Return cached active-space MO-pair factors for the direct-CI backend.
+        """
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        if not use_cholesky:
+            return None, None, self.e_core
+
+        if (
+            self._direct_spatial_h1 is not None
+            and self._direct_pair_factors is not None
+            and self._direct_integrals_mo_ref is self.mo_coeff
+            and self._direct_integrals_ncore == self.ncore
+            and self._direct_integrals_ncas == self.ncas
+            and self._direct_integrals_use_cholesky == bool(use_cholesky)
+        ):
+            return self._direct_spatial_h1, self._direct_pair_factors, self.e_core
+
+        h1, pair_factors, energy_core = transform_active_space_pair_factors(
+            self.mf, self.mo_coeff, self.ncas, self.ncore
+        )
+        self._direct_spatial_h1 = h1
+        self._direct_pair_factors = pair_factors
+        self._direct_integrals_mo_ref = self.mo_coeff
+        self._direct_integrals_ncore = self.ncore
+        self._direct_integrals_ncas = self.ncas
+        self._direct_integrals_use_cholesky = bool(use_cholesky)
+        self.e_core = energy_core
+        return h1, pair_factors, energy_core
+
+    def get_direct_compact_integrals(self, use_cholesky=None):
         """
         Return the compact direct-CI two-electron representation.
 
@@ -1373,18 +1587,89 @@ class CASCI(mcscf.casci.CASCI):
         the antisymmetrized same-spin tensor and the Coulomb cross-spin tensor.
         Caching them keeps the direct-CI setup light across repeated runs.
         """
-        h1, eri_spatial, energy_core = self.get_direct_spatial_integrals()
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        h1, eri_spatial, energy_core = self.get_direct_spatial_integrals(use_cholesky=use_cholesky)
         if (
             self._direct_same_spin_eri is None
             or self._direct_cross_spin_eri is None
             or self._direct_integrals_mo_ref is not self.mo_coeff
             or self._direct_integrals_ncore != self.ncore
             or self._direct_integrals_ncas != self.ncas
+            or self._direct_integrals_use_cholesky != bool(use_cholesky)
         ):
             self._direct_cross_spin_eri = eri_spatial
             self._direct_same_spin_eri = eri_spatial - eri_spatial.swapaxes(1, 3)
 
         return h1, self._direct_same_spin_eri, self._direct_cross_spin_eri, energy_core
+
+    def get_direct_factor_hamiltonian(self, binary, use_cholesky=None):
+        """
+        Precompute direct-CI Hamiltonian connection values from MO-pair factors.
+        """
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        if not use_cholesky:
+            return None
+
+        h1, pair_factors, energy_core = self.get_direct_pair_factors(use_cholesky=use_cholesky)
+        if pair_factors is None:
+            return None
+
+        if self.direct_connectivity is None:
+            self.direct_connectivity = build_direct_connectivity(binary)
+        conn = self.direct_connectivity
+
+        cache_valid = (
+            self._direct_factor_H_diag is not None
+            and self._direct_integrals_mo_ref is self.mo_coeff
+            and self._direct_integrals_ncore == self.ncore
+            and self._direct_integrals_ncas == self.ncas
+            and self._direct_integrals_use_cholesky == bool(use_cholesky)
+        )
+        if cache_valid:
+            return (
+                h1,
+                pair_factors,
+                self._direct_factor_H_diag,
+                self._direct_factor_H_A,
+                self._direct_factor_H_B,
+                self._direct_factor_H_AA,
+                self._direct_factor_H_BB,
+                self._direct_factor_H_AB,
+                energy_core,
+            )
+
+        self._direct_factor_H_diag = _compute_diag_compact_factors(h1, pair_factors, binary)
+        self._direct_factor_H_A = _compute_single_values_from_factors(
+            conn.J_A, conn.p_A, conn.q_A, conn.phase_A, h1, pair_factors, binary, 0
+        )
+        self._direct_factor_H_B = _compute_single_values_from_factors(
+            conn.J_B, conn.p_B, conn.q_B, conn.phase_B, h1, pair_factors, binary, 1
+        )
+        self._direct_factor_H_AA = _compute_double_same_values_from_factors(
+            conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA, pair_factors
+        )
+        self._direct_factor_H_BB = _compute_double_same_values_from_factors(
+            conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB, pair_factors
+        )
+        self._direct_factor_H_AB = _compute_double_cross_values_from_factors(
+            conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB, pair_factors
+        )
+
+        return (
+            h1,
+            pair_factors,
+            self._direct_factor_H_diag,
+            self._direct_factor_H_A,
+            self._direct_factor_H_B,
+            self._direct_factor_H_AA,
+            self._direct_factor_H_BB,
+            self._direct_factor_H_AB,
+            energy_core,
+        )
 
     def ensure_slater_condon_cache(self):
         """
@@ -1574,7 +1859,7 @@ class CASCI(mcscf.casci.CASCI):
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None):
+    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=False):
         """
         solve the full CI in the active space
 
@@ -1604,6 +1889,8 @@ class CASCI(mcscf.casci.CASCI):
         # print("             CASCI              ")
         # print('------------------------------\n')
         self.nstates = nstates
+        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        use_cholesky = self.use_cholesky_integrals
 
         if method == 'ci':
             self.solver_backend = 'ci'
@@ -1629,7 +1916,7 @@ class CASCI(mcscf.casci.CASCI):
 
             # print('Number of determinants', binary.shape[0])
 
-            h1e, h2e = self.get_SO_matrix()
+            h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
 
             if self.spin_purification:
 
@@ -1709,19 +1996,41 @@ class CASCI(mcscf.casci.CASCI):
                     self.direct_connectivity = build_direct_connectivity(binary)
 
 
+            factor_data = None
             if self.spin_purification:
                 # The first-order spin-penalty code is currently expressed in the
                 # older spin-block Hamiltonian form, so we keep that path until
                 # the penalty is rewritten in terms of spatial integrals.
-                h1e, h2e = self.get_SO_matrix()
+                h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
                 h1e = np.asarray(h1e)
                 spatial_h1 = None
                 spatial_eri = None
             else:
-                spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals()
-                spatial_eri = cross_spin_eri
-                h1e = np.asarray([spatial_h1, spatial_h1])
-                h2e = None
+                factor_data = self.get_direct_factor_hamiltonian(binary, use_cholesky=use_cholesky)
+                if factor_data is not None:
+                    (
+                        spatial_h1,
+                        pair_factors,
+                        H_diag_factor,
+                        H_A_factor,
+                        H_B_factor,
+                        H_AA_factor,
+                        H_BB_factor,
+                        H_AB_factor,
+                        energy_core,
+                    ) = factor_data
+                    same_spin_eri = None
+                    cross_spin_eri = None
+                    spatial_eri = None
+                    h1e = np.asarray([spatial_h1, spatial_h1])
+                    h2e = None
+                else:
+                    spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals(
+                        use_cholesky=use_cholesky
+                    )
+                    spatial_eri = cross_spin_eri
+                    h1e = np.asarray([spatial_h1, spatial_h1])
+                    h2e = None
 
             if self.spin_purification:
                 logging.info('Purify spin by energy penalty')
@@ -1747,6 +2056,8 @@ class CASCI(mcscf.casci.CASCI):
             self.eri_so = h2e
 
             if (
+                factor_data is None
+                and
                 self.direct_ci_dense_fallback_ndets is not None
                 and self.direct_ci_dense_fallback_ndets > 0
                 and binary.shape[0] <= self.direct_ci_dense_fallback_ndets
@@ -1767,15 +2078,36 @@ class CASCI(mcscf.casci.CASCI):
                 H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
                 E, X = eigsh(H_CI, k=nstates, which='SA')
             else:
-                self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
+                if factor_data is not None:
+                    self.solver_backend = 'direct_ci_factor_conn'
+                else:
+                    self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
                 # The diagonal is reused in every matvec, so it is worth
                 # computing once up front even in the matrix-free solver.
-                H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary) if spatial_eri is not None else _compute_diag(h1e, h2e, binary)
+                if factor_data is not None:
+                    H_diag = H_diag_factor
+                else:
+                    H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary) if spatial_eri is not None else _compute_diag(h1e, h2e, binary)
                 conn = self.direct_connectivity
 
                 def mv(c):
                     # Keep the Lanczos matvec almost entirely inside compiled
                     # code. The Python closure only forwards cached arrays.
+                    if factor_data is not None:
+                        return _sigma_values_conn_numba(
+                            H_diag,
+                            H_A_factor,
+                            H_B_factor,
+                            H_AA_factor,
+                            H_BB_factor,
+                            H_AB_factor,
+                            c,
+                            conn.I_A, conn.J_A,
+                            conn.I_B, conn.J_B,
+                            conn.I_AA, conn.J_AA,
+                            conn.I_BB, conn.J_BB,
+                            conn.I_AB, conn.J_AB,
+                        )
                     if spatial_eri is not None:
                         return _sigma_compact_conn_numba(
                             spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c, binary,

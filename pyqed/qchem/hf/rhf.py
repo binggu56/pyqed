@@ -58,11 +58,123 @@ class RHF:
         # self.eri_so = None
 
         self.mo_energy = None
+        self._pyscf_mf = None
+        self.density_fit = False
+        self.auxbasis = None
+        self.cholesky_jk = False
+        self.cholesky_tol = None
+        self.cholesky_max_rank = None
+        self.low_rank_jk = False
+        self.low_rank_tol = None
+        self.low_rank_max_rank = None
+        self.eri_factors = None
 
     def run(self, **kwargs):
-        self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
-            self.vhf, self.dm = hartree_fock(self.mol, **kwargs)
+        density_fit = bool(kwargs.pop('density_fit', False))
+        auxbasis = kwargs.pop('auxbasis', None)
+        cholesky_jk_kw = kwargs.pop('cholesky_jk', None)
+        low_rank_jk_kw = kwargs.pop('low_rank_jk', None)
+        if cholesky_jk_kw is not None and low_rank_jk_kw is not None \
+                and bool(cholesky_jk_kw) != bool(low_rank_jk_kw):
+            raise ValueError("cholesky_jk and low_rank_jk aliases disagree.")
+
+        cholesky_tol_kw = kwargs.pop('cholesky_tol', None)
+        low_rank_tol_kw = kwargs.pop('low_rank_tol', None)
+        if cholesky_tol_kw is not None and low_rank_tol_kw is not None \
+                and float(cholesky_tol_kw) != float(low_rank_tol_kw):
+            raise ValueError("cholesky_tol and low_rank_tol aliases disagree.")
+
+        cholesky_max_rank_kw = kwargs.pop('cholesky_max_rank', None)
+        low_rank_max_rank_kw = kwargs.pop('low_rank_max_rank', None)
+        if cholesky_max_rank_kw is not None and low_rank_max_rank_kw is not None \
+                and cholesky_max_rank_kw != low_rank_max_rank_kw:
+            raise ValueError("cholesky_max_rank and low_rank_max_rank aliases disagree.")
+
+        cholesky_jk = bool(
+            False if cholesky_jk_kw is None and low_rank_jk_kw is None
+            else (cholesky_jk_kw if cholesky_jk_kw is not None else low_rank_jk_kw)
+        )
+        cholesky_tol = (
+            1e-8 if cholesky_tol_kw is None and low_rank_tol_kw is None
+            else (cholesky_tol_kw if cholesky_tol_kw is not None else low_rank_tol_kw)
+        )
+        cholesky_max_rank = (
+            None if cholesky_max_rank_kw is None and low_rank_max_rank_kw is None
+            else (cholesky_max_rank_kw if cholesky_max_rank_kw is not None else low_rank_max_rank_kw)
+        )
+
+        if (
+            cholesky_jk_kw is None
+            and low_rank_jk_kw is None
+            and getattr(self.mol, 'eri', None) is None
+            and getattr(self.mol, 'eri_factors', None) is not None
+        ):
+            cholesky_jk = True
+            cholesky_tol = getattr(
+                self.mol, 'builtin_low_rank_tol',
+                getattr(self.mol, 'native_low_rank_tol', cholesky_tol),
+            )
+            cholesky_max_rank = getattr(
+                self.mol, 'builtin_low_rank_max_rank',
+                getattr(self.mol, 'native_low_rank_max_rank', cholesky_max_rank),
+            )
+
+        if density_fit and cholesky_jk:
+            raise ValueError("density_fit and cholesky_jk are mutually exclusive RHF accelerators.")
+
+        if density_fit:
+            self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+                self.vhf, self.dm, self._pyscf_mf = pyscf_density_fit_rhf(
+                    self.mol,
+                    dm0=kwargs.pop('dm0', None),
+                    init_guess=kwargs.pop('init_guess', self.init_guess),
+                    max_cycle=kwargs.pop('max_cycle', 50),
+                    tol=kwargs.pop('tol', 1e-8),
+                    auxbasis=auxbasis,
+                )
+            self.density_fit = True
+            self.auxbasis = auxbasis
+            self.cholesky_jk = False
+            self.cholesky_tol = None
+            self.cholesky_max_rank = None
+            self.low_rank_jk = False
+            self.low_rank_tol = None
+            self.low_rank_max_rank = None
+            self.eri_factors = None
+        else:
+            self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+                self.vhf, self.dm = hartree_fock(
+                    self.mol,
+                    low_rank_jk=cholesky_jk,
+                    low_rank_tol=cholesky_tol,
+                    low_rank_max_rank=cholesky_max_rank,
+                    **kwargs,
+                )
+            self._pyscf_mf = None
+            self.density_fit = False
+            self.auxbasis = None
+            self.cholesky_jk = cholesky_jk
+            self.cholesky_tol = cholesky_tol if cholesky_jk else None
+            self.cholesky_max_rank = cholesky_max_rank if cholesky_jk else None
+            self.low_rank_jk = self.cholesky_jk
+            self.low_rank_tol = self.cholesky_tol
+            self.low_rank_max_rank = self.cholesky_max_rank
+            self.eri_factors = (
+                get_or_build_low_rank_eri_factors(
+                    self.mol,
+                    tol=cholesky_tol,
+                    max_rank=cholesky_max_rank,
+                )
+                if cholesky_jk else None
+            )
         return self
+
+    def as_scanner(self, build_driver=None):
+        """
+        Return a lightweight scanner that reuses the previous density matrix and,
+        when enabled, low-rank ERI factors across nearby geometries.
+        """
+        return RHFScanner(self, build_driver=build_driver)
     
 
     def get_eri(self, representation='mo'):
@@ -177,10 +289,62 @@ class RHF:
             light_speed=light_speed,
         )
 
+    def get_soc_2e_somf_ao(self, dm=None, states=None, with_prefactor=True,
+                           light_speed=None):
+        """
+        Two-electron SOMF SOC operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_soc_2e_somf_ao
+        return get_soc_2e_somf_ao(
+            self,
+            dm=dm,
+            states=states,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_somf_mo(self, mo_coeff=None, dm=None, states=None, include_1e=True,
+                        one_center=True, with_prefactor=True, light_speed=None):
+        """
+        Full SOMF SOC operator in the MO basis.
+        """
+        from pyqed.qchem.soc import get_soc_somf_mo
+        return get_soc_somf_mo(
+            self,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            states=states,
+            include_1e=include_1e,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_somf_so(self, representation='mo', mo_coeff=None, dm=None,
+                        states=None, include_1e=True, one_center=True,
+                        with_prefactor=True, light_speed=None):
+        """
+        Full SOMF SOC Hamiltonian in a spin-orbital basis.
+        """
+        from pyqed.qchem.soc import get_soc_somf_spin_orbital
+        return get_soc_somf_spin_orbital(
+            self,
+            representation=representation,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            states=states,
+            include_1e=include_1e,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
     def make_rdm1(self):
         return make_rdm1(self.mo_coeff, self.mo_occ)
 
     def get_ovlp(self):
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_ovlp()
         return self.mol.overlap
 
     def get_fock(self, dm=None):
@@ -194,14 +358,25 @@ class RHF:
         return hcore + veff
 
     def get_veff(self, dm):
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_veff(dm=dm)
+        if self.eri_factors is not None:
+            return get_veff(self.mol, dm, eri_factors=self.eri_factors)
         return get_veff(self.mol, dm)
 
     def get_j(self):
-        return get_jk(self.mol, self.dm, with_k=False)[0]
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_j(dm=self.dm)
+        if self.eri_factors is not None:
+            return get_jk(self.mol, self.dm, eri_factors=self.eri_factors)[0]
+        return get_jk(self.mol, self.dm)[0]
     
     def get_jk(self):
-
-        return get_jk(self.mol, self.dm, with_k=True)
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_jk(dm=self.dm)
+        if self.eri_factors is not None:
+            return get_jk(self.mol, self.dm, eri_factors=self.eri_factors)
+        return get_jk(self.mol, self.dm)
 
     def get_hcore(self):
         """
@@ -214,6 +389,8 @@ class RHF:
 
         """
         # return get_hcore(self.mol)
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_hcore()
         return self.mol.hcore
 
     def get_hcore_mo(self, mo_coeff=None):
@@ -354,7 +531,8 @@ class RHF:
 #     return h
 
 
-def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
+def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
+             eri_factors=None):
     '''Unrestricted Hartree-Fock potential matrix for the given density matrix
 
     .. math::
@@ -399,11 +577,11 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
     True
     '''
     if dm_last is None:
-        vj, vk = get_jk(mol, np.asarray(dm))
+        vj, vk = get_jk(mol, np.asarray(dm), eri_factors=eri_factors)
         return vj - vk * .5
     else:
         ddm = np.asarray(dm) - np.asarray(dm_last)
-        vj, vk = get_jk(mol, ddm, hermi, vhfopt)
+        vj, vk = get_jk(mol, ddm, eri_factors=eri_factors)
         return vj - vk * .5 + np.asarray(vhf_last)
 
 
@@ -479,7 +657,178 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
 #     return vj, vk
 
 
-def get_jk(mol, dm):
+def pivoted_cholesky_eri(eri, tol=1e-8, max_rank=None, init_pivots=None, return_pivots=False):
+    """
+    Pivoted-Cholesky factorization of the AO ERI pair matrix.
+
+    The ERI tensor ``(ij|kl)`` is reshaped to the full AO-pair space and
+    approximated as ``(ij|kl) ~= sum_P L_P[i,j] L_P[k,l]``.
+    ``init_pivots`` may be supplied to warm-start nearby geometries.
+    """
+    eri = np.asarray(eri)
+    nao = eri.shape[0]
+    npair = nao * nao
+    pair_mat = eri.reshape(npair, npair)
+
+    if max_rank is None:
+        max_rank = npair
+    max_rank = min(int(max_rank), npair)
+
+    diag = np.real(np.diag(pair_mat)).copy()
+    chol = np.zeros((npair, max_rank), dtype=eri.dtype)
+    rank = 0
+    pivots = []
+
+    if init_pivots is not None:
+        used = set()
+        for pivot in init_pivots:
+            if rank >= max_rank:
+                break
+            pivot = int(pivot)
+            if pivot < 0 or pivot >= npair or pivot in used:
+                continue
+            used.add(pivot)
+
+            delta = float(diag[pivot])
+            if delta <= tol:
+                continue
+
+            col = np.array(pair_mat[:, pivot], copy=True)
+            if rank > 0:
+                col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+
+            delta = float(np.real(col[pivot]))
+            if delta <= tol:
+                diag[pivot] = 0.0
+                continue
+
+            chol[:, rank] = col / np.sqrt(delta)
+            diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+            diag = np.maximum(diag, 0.0)
+            pivots.append(pivot)
+            rank += 1
+
+    for _ in range(rank, max_rank):
+        pivot = int(np.argmax(diag))
+        delta = float(diag[pivot])
+        if delta <= tol:
+            break
+
+        col = np.array(pair_mat[:, pivot], copy=True)
+        if rank > 0:
+            col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+
+        delta = float(np.real(col[pivot]))
+        if delta <= tol:
+            diag[pivot] = 0.0
+            continue
+
+        chol[:, rank] = col / np.sqrt(delta)
+        diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+        diag = np.maximum(diag, 0.0)
+        pivots.append(pivot)
+        rank += 1
+
+    factors = chol[:, :rank].T.reshape(rank, nao, nao)
+    if return_pivots:
+        return factors, tuple(pivots)
+    return factors
+
+
+def _low_rank_cache_family_key(mol):
+    return (
+        tuple(mol.atom_symbols()),
+        repr(mol.basis),
+        int(mol.charge),
+        int(mol.spin),
+        getattr(mol, '_build_driver', None),
+        int(mol.nao),
+    )
+
+
+def _low_rank_cache_geometry_key(mol):
+    return (
+        _low_rank_cache_family_key(mol),
+        mol.geometry_hash() if hasattr(mol, 'geometry_hash') else None,
+        tuple(np.asarray(mol.atom_coords(), dtype=float).shape),
+    )
+
+
+def get_or_build_low_rank_eri_factors(mol, tol=1e-8, max_rank=None, warm_start=True):
+    """
+    Return cached pivoted-Cholesky AO ERI factors for the requested settings.
+
+    The cache is geometry-aware. Repeated calls at the same geometry reuse the
+    exact factors, while nearby geometries can warm-start from the most recent
+    entry in the same molecular/basis family.
+    """
+    existing = getattr(mol, 'eri_factors', None)
+    if getattr(mol, 'eri', None) is None:
+        if existing is not None:
+            return existing
+        raise ValueError("mol.eri or mol.eri_factors is required for the builtin low-rank J/K path.")
+
+    cache = getattr(mol, '_low_rank_eri_cache', None)
+    if cache is None:
+        cache = {}
+        setattr(mol, '_low_rank_eri_cache', cache)
+
+    settings_key = (float(tol), None if max_rank is None else int(max_rank))
+    family_key = _low_rank_cache_family_key(mol)
+    geom_key = _low_rank_cache_geometry_key(mol)
+    key = (settings_key, family_key)
+
+    bucket = cache.get(key)
+    if bucket is None:
+        bucket = {'entries': {}, 'recent_geom_key': None}
+        cache[key] = bucket
+
+    entries = bucket['entries']
+    if geom_key in entries:
+        bucket['recent_geom_key'] = geom_key
+        mol._low_rank_eri_last_info = {
+            'mode': 'exact',
+            'settings_key': settings_key,
+            'geometry_key': geom_key,
+            'rank': entries[geom_key]['factors'].shape[0],
+        }
+        return entries[geom_key]['factors']
+
+    init_pivots = None
+    if warm_start and entries:
+        recent_geom_key = bucket.get('recent_geom_key')
+        if recent_geom_key is not None and recent_geom_key in entries:
+            init_pivots = entries[recent_geom_key].get('pivots')
+        else:
+            init_pivots = next(reversed(entries.values())).get('pivots')
+
+    factors, pivots = pivoted_cholesky_eri(
+        mol.eri,
+        tol=tol,
+        max_rank=max_rank,
+        init_pivots=init_pivots,
+        return_pivots=True,
+    )
+    entries[geom_key] = {'factors': factors, 'pivots': pivots}
+    bucket['recent_geom_key'] = geom_key
+
+    # Keep a short per-family history so geometry scans do not grow forever.
+    while len(entries) > 8:
+        oldest_key = next(iter(entries))
+        if oldest_key == geom_key:
+            break
+        del entries[oldest_key]
+
+    mol._low_rank_eri_last_info = {
+        'mode': 'warm' if init_pivots is not None else 'cold',
+        'settings_key': settings_key,
+        'geometry_key': geom_key,
+        'rank': factors.shape[0],
+    }
+    return factors
+
+
+def get_jk(mol, dm, eri_factors=None):
     """
     get the Colomb and exchange terms in the Fock matrix
 
@@ -502,6 +851,12 @@ def get_jk(mol, dm):
         DESCRIPTION.
 
     """
+    if eri_factors is not None:
+        coeff = np.einsum('pkl,kl->p', eri_factors, dm, optimize=True)
+        vj = np.einsum('p,pij->ij', coeff, eri_factors, optimize=True)
+        vk = np.einsum('pil,kl,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
+        return vj, vk
+
     eri = mol.eri
 
     vj = contract('kl, ijkl -> ij', dm, eri)
@@ -575,7 +930,8 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 
 
 
-def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
+def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
+                 low_rank_jk=False, low_rank_tol=1e-8, low_rank_max_rank=None):
 
     #calculate the overlap matrix S
     #the matrix should be symmetric with diagonal entries equal to one
@@ -758,11 +1114,19 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
 
     logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
 
+    eri_factors = None
+    if low_rank_jk:
+        eri_factors = get_or_build_low_rank_eri_factors(
+            mol,
+            tol=low_rank_tol,
+            max_rank=low_rank_max_rank,
+        )
+
     conv = False
     for scf_iter in range(max_cycle):
 
         # calculate the two electron part of the Fock matrix
-        vhf = get_veff(mol, dm)
+        vhf = get_veff(mol, dm, eri_factors=eri_factors)
         F = hcore + vhf
 
         # obtain better (interpolated) fock matrix through diis accelleration
@@ -815,6 +1179,100 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
         dm
     # else:
     # return C, Hcore, nuclear_energy, two_electron
+
+
+def pyscf_density_fit_rhf(mol, dm0=None, init_guess='hcore', max_cycle=50,
+                          tol=1e-8, auxbasis=None):
+    """
+    Run a PySCF-backed density-fitted RHF calculation and return pyqed-style
+    SCF data plus the underlying PySCF mean-field object.
+    """
+    from pyscf import scf
+
+    pmol = mol.topyscf()
+    pmol.build(verbose=0)
+
+    mf = scf.RHF(pmol).density_fit(auxbasis=auxbasis)
+    mf.max_cycle = max_cycle
+    mf.conv_tol = tol
+
+    if dm0 is None:
+        key = {'hcore': '1e', 'h1e': '1e'}.get(str(init_guess).lower(), init_guess)
+        dm0 = mf.get_init_guess(key=key)
+
+    total_energy = mf.kernel(dm0=dm0)
+    if not mf.converged:
+        raise RuntimeError("PySCF density-fitted RHF did not converge.")
+
+    dm = mf.make_rdm1()
+    hcore = mf.get_hcore()
+    vhf = mf.get_veff(dm=dm)
+
+    mol.nao = pmol.nao
+    mol.nmo = pmol.nao
+    mol.nbas = pmol.nbas
+    mol.hcore = hcore
+    mol.overlap = mf.get_ovlp()
+    mol.cart = pmol.cart
+    mol._atm = pmol._atm
+    mol._bas = pmol._bas
+    mol._env = pmol._env
+
+    return (
+        total_energy,
+        pmol.energy_nuc(),
+        mf.mo_energy,
+        mf.mo_coeff,
+        mf.mo_occ,
+        hcore,
+        vhf,
+        dm,
+        mf,
+    )
+
+
+class RHFScanner:
+    """
+    Minimal scanner wrapper for repeated RHF evaluations on nearby geometries.
+    """
+
+    def __init__(self, mf, build_driver=None):
+        self.mf = mf
+        self.mol = mf.mol
+        self.build_driver = build_driver or getattr(self.mol, '_build_driver', None) or 'gbasis'
+
+    def __call__(self, mol_or_geom):
+        if isinstance(mol_or_geom, np.ndarray):
+            mol = self.mol
+            mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+            mol.build(driver=self.build_driver)
+        else:
+            mol = mol_or_geom
+            if getattr(mol, 'eri', None) is None or getattr(mol, 'hcore', None) is None:
+                driver = getattr(mol, '_build_driver', None) or self.build_driver
+                mol.build(driver=driver)
+
+        run_kwargs = {
+            'dm0': None if self.mf.dm is None else np.array(self.mf.dm, copy=True),
+            'init_guess': 'hcore',
+            'max_cycle': self.mf.max_cycle,
+        }
+
+        if self.mf.density_fit:
+            run_kwargs['density_fit'] = True
+            run_kwargs['auxbasis'] = self.mf.auxbasis
+        elif self.mf.cholesky_jk:
+            run_kwargs['cholesky_jk'] = True
+            run_kwargs['cholesky_tol'] = self.mf.cholesky_tol
+            run_kwargs['cholesky_max_rank'] = self.mf.cholesky_max_rank
+
+        new_mf = RHF(mol, init_guess=self.mf.init_guess)
+        new_mf.max_cycle = self.mf.max_cycle
+        new_mf.run(**run_kwargs)
+
+        self.mf = new_mf
+        self.mol = mol
+        return new_mf.e_tot
 
 
 def ao2mo(op, C):

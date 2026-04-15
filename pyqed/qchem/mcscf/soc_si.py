@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Post-CASCI one-electron spin-orbit state interaction helpers.
+Post-CASCI spin-orbit state interaction helpers.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
-from pyqed.qchem.soc import get_soc_1e_spin_orbital
+from pyqed.qchem.soc import get_soc_1e_spin_orbital, get_soc_somf_spin_orbital
 
 
 @dataclass
@@ -58,16 +58,16 @@ def _validate_compatible_states(states):
 
 def soc_state_interaction(states, hso=None, one_center=True,
                           with_prefactor=True, light_speed=None,
-                          order='grouped'):
+                          order='grouped', soc_model='1e', dm=None):
     """
-    Build and diagonalize a post-CASCI one-electron SOC state-interaction Hamiltonian.
+    Build and diagonalize a post-CASCI SOC state-interaction Hamiltonian.
 
     Parameters
     ----------
     states : sequence
         Sequence of CASCI objects or ``(casci, state_id)`` pairs.
     hso : ndarray, optional
-        Active-space one-electron SOC operator in a spin-orbital basis.  If
+        Active-space SOC operator in a spin-orbital basis.  If
         omitted, it is built from the active orbitals of the first CASCI state.
     one_center : bool
         Use the one-center approximation when building ``hso`` internally.
@@ -83,15 +83,31 @@ def soc_state_interaction(states, hso=None, one_center=True,
     ref_casci = _validate_compatible_states(states)
 
     if hso is None:
-        hso = get_soc_1e_spin_orbital(
-            ref_casci.mf,
-            representation='mo',
-            mo_coeff=ref_casci.mo_cas,
-            one_center=one_center,
-            with_prefactor=with_prefactor,
-            light_speed=light_speed,
-            order=order,
-        )
+        model = soc_model.lower()
+        if model == '1e':
+            hso = get_soc_1e_spin_orbital(
+                ref_casci.mf,
+                representation='mo',
+                mo_coeff=ref_casci.mo_cas,
+                one_center=one_center,
+                with_prefactor=with_prefactor,
+                light_speed=light_speed,
+                order=order,
+            )
+        elif model == 'somf':
+            hso = get_soc_somf_spin_orbital(
+                ref_casci.mf,
+                representation='mo',
+                mo_coeff=ref_casci.mo_cas,
+                states=states,
+                dm=dm,
+                one_center=one_center,
+                with_prefactor=with_prefactor,
+                light_speed=light_speed,
+                order=order,
+            )
+        else:
+            raise ValueError("soc_model must be '1e' or 'somf'.")
     else:
         hso = np.asarray(hso)
 

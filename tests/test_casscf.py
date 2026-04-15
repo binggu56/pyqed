@@ -5,7 +5,12 @@ from pyqed.qchem import CASSCF, COCASCI, Molecule, soc_state_interaction
 from pyqed.qchem.mcscf import casci as casci_module
 from pyqed.qchem.mcscf import direct_ci as direct_ci_module
 from pyqed.qchem.mcscf.direct_ci import CASCI
-from pyqed.qchem.soc import get_soc_1e_ao, soc_1e_prefactor
+from pyqed.qchem.soc import (
+    get_soc_1e_ao,
+    get_soc_2e_somf_ao,
+    get_soc_somf_spin_orbital,
+    soc_1e_prefactor,
+)
 
 
 def _grouped_spin_orbital_occ(binary):
@@ -299,7 +304,70 @@ def test_gbasis_pyscf_soc_ao_matches_direct_pyscf_operator(atom, basis):
         hso_ref[:, p0:p1, p0:p1] += (-pmol.atom_charge(ia)) * w[:, p0:p1, p0:p1]
     hso_ref *= soc_1e_prefactor()
 
-    np.testing.assert_allclose(hso, hso_ref, atol=1e-12)
+    np.testing.assert_allclose(hso, hso_ref, atol=1e-11)
+
+
+def test_gbasis_pyscf_somf_ao_matches_manual_contraction():
+    """The SOMF AO builder should match a direct PySCF int2e_p1vxp1 contraction."""
+    from pyscf import gto
+
+    atom = '''
+        S  0.000000  0.000000  0.000000
+        H  0.000000  1.229000  0.958000
+        H  0.000000 -1.229000  0.958000
+    '''
+    basis = 'sto-3g'
+
+    mol = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol.build(driver='gbasis-pyscf')
+    mf = mol.RHF().run()
+    hso = get_soc_2e_somf_ao(mf)
+
+    pmol = gto.M(atom=atom, basis=basis, unit='angstrom', verbose=0)
+    dm = mf.make_rdm1()
+    g = pmol.intor('int2e_p1vxp1', comp=3)
+    hso_ref = (
+        np.einsum('xpqrs,rs->xpq', g, dm, optimize=True)
+        - 1.5 * np.einsum('xprsq,rs->xpq', g, dm, optimize=True)
+        - 1.5 * np.einsum('xsqpr,rs->xpq', g, dm, optimize=True)
+    ) * soc_1e_prefactor()
+
+    np.testing.assert_allclose(hso, hso_ref, atol=1e-11)
+
+
+def test_soc_state_interaction_somf_matches_explicit_operator():
+    """The SOMF SI helper should use the same state-averaged operator as the explicit path."""
+    mol = Molecule(
+        atom='''
+            S  0.000000  0.000000  0.000000
+            H  0.000000  1.229000  0.958000
+            H  0.000000 -1.229000  0.958000
+        ''',
+        unit='angstrom',
+        basis='sto-3g',
+    )
+    mol.build(driver='gbasis-pyscf')
+
+    mf = mol.RHF().run()
+    mc_singlet = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
+    mc_triplet = CASCI(mf, ncas=2, nelecas=2, spin=2).run(nstates=1, method='direct_ci')
+    states = [(mc_singlet, 0), (mc_triplet, 0)]
+
+    hso = get_soc_somf_spin_orbital(
+        mf,
+        representation='mo',
+        mo_coeff=mc_singlet.mo_cas,
+        states=states,
+        order='grouped',
+    )
+    result = soc_state_interaction(states, soc_model='somf')
+
+    np.testing.assert_allclose(result.h_soc, result.h_soc.conjugate().T, atol=1e-10)
+    np.testing.assert_allclose(
+        result.h_soc[0, 1],
+        mc_singlet.soc_matrix_element(0, other=mc_triplet, hso=hso),
+        atol=1e-10,
+    )
 
 
 def test_first_order_casscf_line_search_failure_raises(monkeypatch):

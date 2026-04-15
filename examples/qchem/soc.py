@@ -23,5 +23,10 @@ mf = mol.RHF().run()
 mc_s = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
 mc_t = CASCI(mf, ncas=2, nelecas=2, spin=2).run(nstates=1, method='direct_ci')
 
-res = soc_state_interaction([(mc_s, 0), (mc_t, 0)])
+res = soc_state_interaction([(mc_s, 0), (mc_t, 0)], soc_model='1e')
 print(res.h_soc[0, 1] * au2ev)
+
+
+res = soc_state_interaction([(mc_s, 0), (mc_t, 0)], soc_model='somf')
+print(res.h_soc[0, 1] * au2ev)
+# print(res.eigenvalues)
