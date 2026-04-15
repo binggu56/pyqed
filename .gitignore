@@ -44,3 +44,5 @@ Checkpoints
 Miniforge3-MacOSX-arm64.sh
 Scan_Results_Nz_32
 .vscode
+examples/qchem/local_test
+pyqed/qchem/gdvr/hf_recontraction_along_z/

@@ -87,27 +87,29 @@ class GDVRTDMPS(TDMPS):
         for i in range(2 * self.Nz):
             z_i = self.z_grid[i // 2]
             
-            # Phase for a single electron at this site
             phase = z_i * E_t * delta_t
             
-            # Local unitary for d=2 spin-orbital basis
+            # spin orbital weare using
             U_local = np.diag([
-                1.0,                   # Empty state
-                np.exp(-1j * phase)    # Occupied state
+                1.0,                   # empty 
+                np.exp(-1j * phase)    # occupied
             ])
             
-            # Shape (LeftBond, RightBond, PhysOut, PhysIn)
+            # Shape (Left, Right, Out, In)
             W = np.zeros((1, 1, 2, 2), dtype=complex)
             W[0, 0, :, :] = U_local
             mpo_tensors.append(W)
 
         return MPO(mpo_tensors)
 
-    def run(self, dt, steps, e_ops=[], interval=10, flush_interval=10, save_dir="dynamics_data", order =2):
+
+    def run(self, dt, steps, e_ops=[], interval=10, flush_interval=10,
+            save_dir="dynamics_data", order=2):
         """
         Executes Strang-split dense time-evolution.
-        
+
         Measures local density EVERY step.
+        Measures dipole EVERY step.
         Measures global e_ops every `interval` steps.
         Dynamically saves to disk every `flush_interval` steps to prevent data loss.
         """
@@ -119,71 +121,102 @@ class GDVRTDMPS(TDMPS):
             logger.info(f"Data will be dynamically flushed to: {save_dir}/")
 
         self.build_propagator(dt, order=order)
-        
+
         logger.info(f"Starting TD-DMRG: {steps} steps, dt={dt}...")
-        
-        # Track time and density every step
-        self.times = np.arange(steps) * dt
-        spatial_densities = np.zeros((steps, self.Nz))
-        
-        # Track energy every interval step
+
+        # Measurements are taken AFTER each full step
+        self.times = (np.arange(steps) + 1) * dt
+
+        # Track density and dipole every step
+        spatial_densities = np.zeros((steps, self.Nz), dtype=float)
+        dipoles = np.zeros(steps, dtype=float)
+
+        # Track energy / other observables every interval
         num_obs_steps = steps // interval
-        obs_times = np.zeros(num_obs_steps)
+        obs_times = np.zeros(num_obs_steps, dtype=float)
         observables = np.zeros((num_obs_steps, len(e_ops)), dtype=complex)
-        
-        n_op = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=complex)
-            
-        psi = self.psi_gs
+
+        psi = self.psi_gs.copy()
         current_time = 0.0
 
         for step_idx in range(steps):
-            # Half-step TD
             U_TD_half_start = self._get_U_TD_mpo(current_time, dt / 2)
-            psi = U_TD_half_start @ psi 
-            # Full-step Static with SVD
-            psi = self.step(psi) 
-            current_time += dt 
-            # Half-step TD again
+            psi = U_TD_half_start @ psi
+
+            psi = self.step(psi)
+
+            current_time += dt
+
             U_TD_half_end = self._get_U_TD_mpo(current_time, dt / 2)
             psi = U_TD_half_end @ psi
-            current_norm = psi.norm() 
-            # print(current_norm)
-            psi.factors[0] = psi.factors[0] / current_norm
-            
-            # measure Local Density Every Step
-            site_rdms = psi._calc_local_site_rdms()
-            site_pops = np.array([np.real(site_rdms[j][1, 1]) for j in range(2 * self.Nz)])
-            spatial_densities[step_idx] = site_pops[0::2] + site_pops[1::2]
-            total_electrons = np.sum(site_pops)
-            logger.info(f"Step {step_idx + 1} (t={current_time:.3f}): Total Electrons = {total_electrons:.8f}")
 
-            # measure energy every 'interval'
+            # Normalize explicitly
+            current_norm = psi.norm()
+            psi.factors[0] = psi.factors[0] / current_norm
+
+            # local density every step 
+            site_rdms = psi._calc_local_site_rdms()
+            site_pops = np.array(
+                [np.real(site_rdms[j][1, 1]) for j in range(2 * self.Nz)],
+                dtype=float
+            )
+
+            # Sum spin-up + spin-down at each z-slice
+            slice_density = site_pops[0::2] + site_pops[1::2]
+            spatial_densities[step_idx] = slice_density
+
+            total_electrons = np.sum(site_pops)
+
+            # dipole every step
+            dipole_t = float(np.dot(self.z_grid, slice_density))
+            dipoles[step_idx] = dipole_t
+
+            logger.info(
+                f"Step {step_idx + 1} (t={current_time:.3f}): "
+                f"Total Electrons = {total_electrons:.8f}, "
+                f"Dipole = {dipole_t:.12f}"
+            )
+
+            # global observables every interval
             if (step_idx + 1) % interval == 0:
                 obs_idx = (step_idx + 1) // interval - 1
                 obs_times[obs_idx] = current_time
-                observables[obs_idx] = [expect_mps(psi.factors, e.factors) for e in e_ops]
-                print(observables)
+                observables[obs_idx] = [
+                    expect_mps(psi.factors, e.factors) for e in e_ops
+                ]
 
+                if len(e_ops) > 0:
+                    obs_str = ", ".join(
+                        [f"Obs[{k}]={observables[obs_idx, k]}" for k in range(len(e_ops))]
+                    )
+                    logger.info(f"  Observable snapshot: {obs_str}")
+
+            # flush to disk
             if save_dir and (step_idx + 1) % flush_interval == 0:
-                # Update the density data file (Overwrites single file)
                 data_file = os.path.join(save_dir, "density_evolution.npz")
-                np.savez(data_file, 
-                         times=self.times[:step_idx+1], 
-                         densities=spatial_densities[:step_idx+1],
-                         z_grid=self.z_grid,
-                         obs_times=obs_times[:(step_idx + 1) // interval],
-                         observables=observables[:(step_idx + 1) // interval])
-                
-                # Overwrite the latest wavefunction backup
+                np.savez(
+                    data_file,
+                    times=self.times[:step_idx + 1],
+                    densities=spatial_densities[:step_idx + 1],
+                    dipoles=dipoles[:step_idx + 1],
+                    z_grid=self.z_grid,
+                    obs_times=obs_times[:(step_idx + 1) // interval],
+                    observables=observables[:(step_idx + 1) // interval],
+                )
+
                 state_file = os.path.join(save_dir, "psi_latest.npz")
                 np.savez_compressed(state_file, *psi.factors)
-                
-                logger.info(f"  -> Flushed to disk at step {step_idx + 1} (t={current_time:.3f})")
-            
+
+                logger.info(
+                    f"  -> Flushed to disk at step {step_idx + 1} (t={current_time:.3f})"
+                )
+
         self.observables = observables
         self.densities = spatial_densities
+        self.dipoles = dipoles
+        self.final_state = psi
         return self
-    
+
 def diagnose_dipole_coupling(H1, z):
     Z = np.diag(z)
     comm = Z @ H1 - H1 @ Z
@@ -197,13 +230,14 @@ if __name__ == "__main__":
     from pyqed.qchem.gdvr.gdvr_mean_field import Molecule
     S_EXPS = [18.73113696, 2.825394365, 0.6401216923, 0.1612777588]
     basis_cfg = {'s': S_EXPS}
-    charges = [1.0]*4
-    coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
-    mol = Molecule(charges, coords, nelec=4, spin = 0)
+    charges = [1.0]*2
+    # coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
+    coords = [[0.0, 0.0, -2],[0.0, 0.0, 2]]
+    mol = Molecule(charges, coords, nelec=2, spin = 0)
 
     def electric_field(t):
         # return 0
-        return 0.5 * t
+        return 2* np.sin(0.5 * t)
 
     td_solver = GDVRTDMPS(
         mol=mol, Lz=6.0, Nz=16, basis_cfg=basis_cfg, 
@@ -214,4 +248,4 @@ if __name__ == "__main__":
     print(f"Ground state found: {E_gs}")
     H1 = td_solver.dmrg_obj.Hcore
     diagnose_dipole_coupling(H1, td_solver.z_grid)
-    # td_solver.run(dt=0.005, steps=100, e_ops=[td_solver.H], interval=2)
+    td_solver.run(dt=0.01, steps=100, e_ops=[td_solver.H], interval=2)
