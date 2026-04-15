@@ -9,3 +9,4 @@ Users Guide
 
 	guide_spectroscopy.rst
 	guide_open_dynamics.rst
+	guide_qchem_mcscf.rst

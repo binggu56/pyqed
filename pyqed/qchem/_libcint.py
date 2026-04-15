@@ -138,6 +138,33 @@ def normalized_coeffs(shell):
     return np.einsum("km,m->km", cs, ss)
 
 
+def _resolve_shell_icenter(shell, atom_coords, tol=1e-10):
+    """
+    Resolve the atom-center index for a shell.
+
+    ``gbasis`` shells created through ``from_pyscf`` may carry ``icenter=None``
+    even though the shell coordinate matches one of the molecular centers.
+    Recovering the center index here lets the libcint wrapper operate on both
+    native gbasis shells and the PySCF-backed wrapper path.
+    """
+    icenter = getattr(shell, "icenter", None)
+    if icenter is not None:
+        return int(icenter)
+
+    coord = np.asarray(getattr(shell, "coord", None), dtype=float)
+    if coord.shape != (3,):
+        raise ValueError(
+            "Shell center could not be determined: missing icenter and invalid coord."
+        )
+
+    matches = np.where(np.all(np.isclose(atom_coords, coord, atol=tol, rtol=0.0), axis=1))[0]
+    if matches.size != 1:
+        raise ValueError(
+            "Shell center could not be determined uniquely from shell.coord."
+        )
+    return int(matches[0])
+
+
 class CBasis1e:
     """
     Minimal shell/basis buffer for one-electron libcint calls.
@@ -171,10 +198,13 @@ class CBasis1e:
         nenv = 20 + 4 * natm
         offs = []
         atom_ao_offsets = np.zeros(natm + 1, dtype=int)
+        shell_icenters = []
 
         for shell in self.basis:
+            icenter = _resolve_shell_icenter(shell, self.atom_coords)
+            shell_icenters.append(icenter)
             offs.extend([num_angmom(shell)] * shell.num_seg_cont)
-            atom_ao_offsets[shell.icenter + 1] += num_angmom(shell) * shell.num_seg_cont
+            atom_ao_offsets[icenter + 1] += num_angmom(shell) * shell.num_seg_cont
             nbas += shell.num_seg_cont
             nbfn += num_angmom(shell) * shell.num_seg_cont
             nenv += shell.exps.size + shell.coeffs.size
@@ -203,7 +233,7 @@ class CBasis1e:
             atm_row[4:6] = 0
 
         ibas = 0
-        for shell in self.basis:
+        for shell, icenter in zip(self.basis, shell_icenters):
             nprim = shell.coeffs.shape[0]
             iexp = ienv
             ienv += shell.exps.size
@@ -213,7 +243,7 @@ class CBasis1e:
             env[icoef:ienv] = normalized_coeffs(shell).reshape(-1, order="F")
 
             for iprim in range(icoef, icoef + shell.coeffs.size, nprim):
-                bas[ibas, 0] = shell.icenter
+                bas[ibas, 0] = icenter
                 bas[ibas, 1] = shell.angmom
                 bas[ibas, 2] = nprim
                 bas[ibas, 3] = 1

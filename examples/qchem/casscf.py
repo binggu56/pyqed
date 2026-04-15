@@ -1,45 +1,30 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Dec  3 10:36:15 2025
+"""Minimal H2 CASSCF example using the current pyqed API."""
 
-@author: Bing Gu (gubing@westlake.edu.cn)
-"""
+from pyqed.qchem import CASSCF, Molecule
+from pyscf import mcscf
 
-from pyqed import Molecule
-from pyqed.qchem.mcscf.casscf import CASSCF
 
-mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='631g')
-mol.build()
+mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+mol.build(driver="gbasis")
 mf = mol.RHF().run()
 
-
-
-ncas, nelecas = 4, 4
+ncas, nelecas = 2, 2
 
 mc = CASSCF(mf, ncas, nelecas)
 mc.run()
 
+print("pyqed RHF energy:", mf.e_tot)
+print("pyqed CASSCF energy:", mc.e_tot[0])
+print("pyqed converged:", mc.converged)
+print("pyqed macro cycles:", len(mc.history))
+
 ####### PYSCF ########
 
-mol = mol.topyscf()
-mf = mol.RHF().run()
+pyscf_mol = mol.topyscf()
+pyscf_mf = pyscf_mol.RHF().run()
+pyscf_mc = mcscf.CASSCF(pyscf_mf, ncas, nelecas)
+pyscf_mc.kernel()
 
-
-from pyscf.mcscf import CASSCF
-from pyscf import mcscf
-
-# mc = CASSCF(mf, ncas=4, nelecas=4)
-# mc.verbose = 4
-# weights = [0.5, 0.5]
-# mc.state_average(weights)
-
-
-mc = mcscf.CASSCF(mf, ncas, nelecas)
-mc.kernel()
-
-# mc = mcscf.CASSCF(mf, ncas, nelecas).state_average_(weights=(1/3,1/3,1/3))
-# mc.fix_spin_(ss=0, shift=0.2)
-# mc.kernel()
-
-# mc.run()
+print("PySCF RHF energy:", pyscf_mf.e_tot)
+print("PySCF CASSCF energy:", pyscf_mc.e_tot)

@@ -75,11 +75,23 @@ def get_pvxp_ao(mol, one_center=True):
     if one_center:
         for ia, coord in enumerate(atom_coords):
             p0, p1 = cbasis.ao_slice_by_atom(ia)
-            w = -atom_charges[ia] * cbasis.int1e('int1e_prinvxp', components=(3,), inv_origin=coord)
+            # ``int1e_prinvxp`` is not shell-Hermitian, so we need the full
+            # shell-pair evaluation instead of mirroring the lower triangle.
+            w = -atom_charges[ia] * cbasis.int1e(
+                'int1e_prinvxp',
+                components=(3,),
+                inv_origin=coord,
+                hermi=False,
+            )
             mat[:, p0:p1, p0:p1] = np.moveaxis(w[p0:p1, p0:p1], -1, 0)
     else:
         for ia, coord in enumerate(atom_coords):
-            w = -atom_charges[ia] * cbasis.int1e('int1e_prinvxp', components=(3,), inv_origin=coord)
+            w = -atom_charges[ia] * cbasis.int1e(
+                'int1e_prinvxp',
+                components=(3,),
+                inv_origin=coord,
+                hermi=False,
+            )
             mat += np.moveaxis(w, -1, 0)
 
     return mat
@@ -122,7 +134,41 @@ def get_soc_1e_mo(mf, mo_coeff=None, one_center=True, with_prefactor=True,
     return contract('xpq,pi,qj->xij', hso_ao, mo_coeff.conj(), mo_coeff)
 
 
-def spatial_soc_to_spin_orbital(hso_xyz):
+def reorder_spin_orbital_matrix(mat, source='interleaved', target='grouped'):
+    """
+    Reorder a spin-orbital matrix between interleaved and grouped layouts.
+
+    Parameters
+    ----------
+    mat : ndarray
+        Square matrix with shape ``(2*n, 2*n)``.
+    source : {'interleaved', 'grouped'}
+        Current spin-orbital ordering of ``mat``.
+    target : {'interleaved', 'grouped'}
+        Requested spin-orbital ordering.
+    """
+    source = source.lower()
+    target = target.lower()
+    if source == target:
+        return mat
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1] or mat.shape[0] % 2 != 0:
+        raise ValueError("mat must be a square (2*n, 2*n) spin-orbital matrix.")
+    if source not in {'interleaved', 'grouped'} or target not in {'interleaved', 'grouped'}:
+        raise ValueError("source and target must be 'interleaved' or 'grouped'.")
+
+    norb = mat.shape[0] // 2
+    interleaved_from_grouped = np.empty(2 * norb, dtype=int)
+    interleaved_from_grouped[0::2] = np.arange(norb)
+    interleaved_from_grouped[1::2] = norb + np.arange(norb)
+
+    if source == 'grouped' and target == 'interleaved':
+        perm = interleaved_from_grouped
+    else:
+        perm = np.argsort(interleaved_from_grouped)
+    return mat[np.ix_(perm, perm)]
+
+
+def spatial_soc_to_spin_orbital(hso_xyz, order='interleaved'):
     """
     Expand a 3-component spatial SOC operator to a 2-spinor matrix.
 
@@ -130,12 +176,14 @@ def spatial_soc_to_spin_orbital(hso_xyz):
     ----------
     hso_xyz : ndarray
         Array of shape ``(3, n, n)``.
+    order : {'interleaved', 'grouped'}
+        Spin-orbital ordering of the returned matrix.
 
     Returns
     -------
     ndarray
         Complex Hermitian matrix of shape ``(2*n, 2*n)`` in the spin-orbital
-        basis ordered as ``(alpha_0, beta_0, alpha_1, beta_1, ...)``.
+        basis.
     """
     pauli = 1j * np.asarray([
         [[0.0, 1.0], [1.0, 0.0]],
@@ -143,12 +191,13 @@ def spatial_soc_to_spin_orbital(hso_xyz):
         [[1.0, 0.0], [0.0, -1.0]],
     ], dtype=complex)
     n = hso_xyz.shape[-1]
-    return np.einsum('sxy,spq->xpyq', pauli, hso_xyz).reshape(2 * n, 2 * n)
+    mat = np.einsum('sxy,spq->xpyq', pauli, hso_xyz).reshape(2 * n, 2 * n)
+    return reorder_spin_orbital_matrix(mat, source='interleaved', target=order)
 
 
 def get_soc_1e_spin_orbital(mf, representation='mo', mo_coeff=None,
                             one_center=True, with_prefactor=True,
-                            light_speed=None):
+                            light_speed=None, order='interleaved'):
     """
     One-electron SOC Hamiltonian in a spin-orbital basis.
 
@@ -178,4 +227,4 @@ def get_soc_1e_spin_orbital(mf, representation='mo', mo_coeff=None,
     else:
         raise ValueError("representation must be 'ao' or 'mo'.")
 
-    return spatial_soc_to_spin_orbital(hso_xyz)
+    return spatial_soc_to_spin_orbital(hso_xyz, order=order)

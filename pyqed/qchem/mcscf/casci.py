@@ -28,6 +28,7 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
 
 
 from pyqed.qchem.hf.rhf import ao2mo
+from pyqed.qchem.soc import get_soc_1e_spin_orbital, reorder_spin_orbital_matrix
 
 def cistring(norb, nelec, sz=0):
     """
@@ -158,6 +159,15 @@ def _spin_occupations(mo_occ, ncore, ncas):
     return [occ_a, occ_b]
 
 
+def _reference_active_occupations(nelecas_spin, ncas):
+    na, nb = nelecas_spin
+    occ_a = np.zeros(ncas, dtype=np.int8)
+    occ_b = np.zeros(ncas, dtype=np.int8)
+    occ_a[:na] = 1
+    occ_b[:nb] = 1
+    return [occ_a, occ_b]
+
+
 def _slice_active_orbitals(mo_coeff, ncore, ncas):
     if _is_uhf_reference(mo_coeff):
         core = (
@@ -198,6 +208,91 @@ def _transform_1e_operator_ao_to_mo(h1e, mo_coeff):
     if h1b is h1a:
         return out
     return (out, ao2mo(h1b, mo_coeff))
+
+
+def _validate_matching_active_spaces(cibra_obj, ciket_obj):
+    if cibra_obj.ncas != ciket_obj.ncas:
+        raise ValueError(
+            f"CASCI objects must have the same ncas for spin-orbital TDMs: "
+            f"{cibra_obj.ncas} != {ciket_obj.ncas}."
+        )
+    if cibra_obj.mo_cas is None or ciket_obj.mo_cas is None:
+        raise ValueError("Run CASCI before requesting spin-orbital transition densities.")
+
+    bra_mo = np.asarray(cibra_obj.mo_cas)
+    ket_mo = np.asarray(ciket_obj.mo_cas)
+    if bra_mo.shape != ket_mo.shape or not np.allclose(bra_mo, ket_mo):
+        raise ValueError(
+            "CASCI objects must share the same active orbitals for spin-orbital "
+            "transition densities."
+        )
+
+
+def _binary_to_grouped_spin_orbital_occ(binary):
+    binary = np.asarray(binary, dtype=np.int8)
+    return np.concatenate((binary[0], binary[1])).astype(np.int8, copy=False)
+
+
+def make_tdm1_spin_orbital(cibra, ciket, binary_bra, binary_ket, order='grouped'):
+    """
+    One-particle transition density matrix in a full spin-orbital basis.
+
+    The returned matrix follows the convention
+
+    ``D[u, v] = <Psi_bra | a_u^\dagger a_v | Psi_ket>``.
+
+    Parameters
+    ----------
+    cibra, ciket : ndarray
+        CI coefficient vectors in determinant bases ``binary_bra`` and
+        ``binary_ket``.
+    binary_bra, binary_ket : ndarray
+        Determinant occupations with shape ``(ndet, 2, norb)``.
+    order : {'grouped', 'interleaved'}
+        Spin-orbital ordering of the returned matrix.
+    """
+    cibra = np.asarray(cibra)
+    ciket = np.asarray(ciket)
+    binary_bra = np.asarray(binary_bra, dtype=np.int8)
+    binary_ket = np.asarray(binary_ket, dtype=np.int8)
+    if binary_bra.ndim != 3 or binary_ket.ndim != 3 or binary_bra.shape[1] != 2 or binary_ket.shape[1] != 2:
+        raise ValueError("binary_bra and binary_ket must have shape (ndet, 2, norb).")
+    if binary_bra.shape[2] != binary_ket.shape[2]:
+        raise ValueError("binary_bra and binary_ket must have the same number of spatial orbitals.")
+
+    nso = 2 * binary_bra.shape[2]
+    dtype = np.result_type(cibra, ciket, complex)
+    tdm = np.zeros((nso, nso), dtype=dtype)
+
+    bra_occ = [_binary_to_grouped_spin_orbital_occ(det) for det in binary_bra]
+    ket_occ = [_binary_to_grouped_spin_orbital_occ(det) for det in binary_ket]
+    bra_lookup = {occ.tobytes(): idx for idx, occ in enumerate(bra_occ)}
+
+    for j, occ in enumerate(ket_occ):
+        coeff_ket = ciket[j]
+        if coeff_ket == 0:
+            continue
+        occupied = np.flatnonzero(occ)
+        for v in occupied:
+            sign_ann = -1 if int(np.sum(occ[:v])) % 2 else 1
+            occ_after_ann = occ.copy()
+            occ_after_ann[v] = 0
+            unoccupied = np.flatnonzero(1 - occ_after_ann)
+            for u in unoccupied:
+                sign_cre = -1 if int(np.sum(occ_after_ann[:u])) % 2 else 1
+                occ_final = occ_after_ann.copy()
+                occ_final[u] = 1
+                i = bra_lookup.get(occ_final.tobytes())
+                if i is None:
+                    continue
+                tdm[u, v] += cibra[i].conj() * coeff_ket * (sign_ann * sign_cre)
+
+    order = order.lower()
+    if order == 'grouped':
+        return tdm
+    if order == 'interleaved':
+        return reorder_spin_orbital_matrix(tdm, source='grouped', target='interleaved')
+    raise ValueError("order must be 'grouped' or 'interleaved'.")
 
 
 
@@ -753,7 +848,7 @@ class CASCI:
 
 
         if self.binary is None:
-            mo_occ = _spin_occupations(self.mf.mo_occ, ncore, ncas)
+            mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
         else:
@@ -1107,6 +1202,90 @@ class CASCI:
         ciket = self.ci[ket_id]
 
         return make_tdm1s(cibra, ciket, self.binary, self.SC1)
+
+    def make_tdm1_spin_orbital(self, bra_id, ket_id=0, other=None, order='grouped'):
+        """
+        One-particle transition density matrix in a full spin-orbital basis.
+
+        Parameters
+        ----------
+        bra_id : int
+            Bra-state index on ``self``.
+        ket_id : int, optional
+            Ket-state index on ``other``. Defaults to ``0``.
+        other : CASCI, optional
+            Ket-side CASCI object. Defaults to ``self``.
+        order : {'grouped', 'interleaved'}
+            Spin-orbital ordering of the returned matrix.
+        """
+        if other is None:
+            other = self
+        _validate_matching_active_spaces(self, other)
+        return make_tdm1_spin_orbital(
+            self.ci[bra_id],
+            other.ci[ket_id],
+            self.binary,
+            other.binary,
+            order=order,
+        )
+
+    def contract_with_tdm1_spin_orbital(self, bra_id, ket_id=0, h1e=None, other=None,
+                                        order='grouped'):
+        """
+        Contract a spin-orbital one-body operator with a CASCI transition density.
+
+        Parameters
+        ----------
+        bra_id : int
+            Bra-state index on ``self``.
+        ket_id : int, optional
+            Ket-state index on ``other``. Defaults to ``0``.
+        h1e : ndarray
+            One-body operator in the active spin-orbital basis.
+        other : CASCI, optional
+            Ket-side CASCI object. Defaults to ``self``.
+        order : {'grouped', 'interleaved'}
+            Ordering shared by ``h1e`` and the returned TDM.
+        """
+        if h1e is None:
+            raise ValueError("h1e is required for spin-orbital contractions.")
+        tdm = self.make_tdm1_spin_orbital(bra_id, ket_id=ket_id, other=other, order=order)
+        h1e = np.asarray(h1e)
+        if h1e.shape != tdm.shape:
+            raise ValueError(
+                f"h1e shape {h1e.shape} is incompatible with spin-orbital TDM shape {tdm.shape}."
+            )
+        return np.einsum('uv,uv->', h1e, tdm, optimize=True)
+
+    def soc_matrix_element(self, bra_id, ket_id=0, other=None, hso=None,
+                           one_center=True, with_prefactor=True,
+                           light_speed=None, order='grouped'):
+        """
+        One-electron SOC matrix element between CASCI states.
+
+        If ``hso`` is not provided, the active-space SOC operator is built from
+        the current active orbitals.
+        """
+        if other is None:
+            other = self
+        _validate_matching_active_spaces(self, other)
+        if hso is None:
+            hso = get_soc_1e_spin_orbital(
+                self.mf,
+                representation='mo',
+                mo_coeff=self.mo_cas,
+                one_center=one_center,
+                with_prefactor=with_prefactor,
+                light_speed=light_speed,
+                order=order,
+            )
+        return self.contract_with_tdm1_spin_orbital(
+            bra_id,
+            ket_id=ket_id,
+            h1e=hso,
+            other=other,
+            order=order,
+        )
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
@@ -1582,51 +1761,67 @@ def overlap(cibra, ciket, s=None):
 
     # overlap matrix between MOs at different geometries
     if s is None:
-
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        try:
+            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+            s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        except (ImportError, AttributeError, TypeError):
+            from pyscf import gto
+            mol_bra = cibra.mol.topyscf()
+            mol_ket = ciket.mol.topyscf()
+            mol_bra.build()
+            mol_ket.build()
+            s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
         s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
 
 
     nsd_bra = cibra.binary.shape[0]
     nsd_ket = ciket.binary.shape[0]
-    S = np.zeros((nsd_bra, nsd_ket)) # overlap between determinants
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype) # overlap between determinants
 
     ncore_bra = cibra.ncore
     ncore_ket = ciket.ncore
+    if ncore_bra != ncore_ket:
+        raise ValueError(
+            "Different numbers of core orbitals are not supported in overlap: "
+            f"{ncore_bra} != {ncore_ket}."
+        )
 
     scc = s[:ncore_bra, :ncore_ket]
     sca = s[:ncore_bra, ncore_ket:]
     sac = s[ncore_bra:, :ncore_ket]
     saa = s[ncore_bra:, ncore_ket:]
 
-    scc_det = np.linalg.det(scc)
-    scc_inv = np.linalg.inv(scc)
+    if ncore_bra == 0:
+        core_factor = dtype.type(1)
+        saa_eff = saa
+    else:
+        scc_det = np.linalg.det(scc)
+        core_factor = scc_det * scc_det
+        saa_eff = saa - sac @ np.linalg.solve(scc, sca)
+
+    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
+    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
+    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
+    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
 
     for I in range(nsd_bra):
-        occidx1_a  = [i for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-        occidx1_b  = [i for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
+        occidx1_a = occ_bra_a[I]
+        occidx1_b = occ_bra_b[I]
 
         for J in range(nsd_ket):
-            occidx2_a  =  [i for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-            occidx2_b  =  [i for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
+            occidx2_a = occ_ket_a[J]
+            occidx2_b = occ_ket_b[J]
 
             # print('b', occidx2_a, occidx2_b)
             # print(ciket.binary[J])
 
     # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-            saa_occ_a = saa[np.ix_(occidx1_a, occidx2_a)]
-            sca_occ_a = sca[:, occidx2_a]
-            sac_occ_a = sac[occidx1_a, :]
-
-            saa_occ_b = saa[np.ix_(occidx1_b, occidx2_b)]
-            sca_occ_b = sca[:, occidx2_b]
-            sac_occ_b = sac[occidx1_b, :]
-
-
-            S[I, J] = scc_det**2 * np.linalg.det(saa_occ_a - sac_occ_a @ scc_inv @ sca_occ_a)*\
-                np.linalg.det(saa_occ_b - sac_occ_b @ scc_inv @ sca_occ_b)
+            S[I, J] = (
+                core_factor
+                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
+                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
+            )
 
 
 

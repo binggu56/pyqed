@@ -1206,60 +1206,8 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-        self.ncas = ncas # number of MOs in active space
-        self.nelecas = nelecas
-
-        ncore = mf.nelec//2 - self.nelecas//2 # core orbs
-        assert(ncore >= 0)
-
-        self.ncore = ncore
-
-        if ncas > 10:
-            warnings.warn('Active space with {} orbitals is probably too big.'.format(ncas))
-
-        self.nstates = None
-        # if nelecas is None:
-        #     nelecas = mf.mol.nelec
-
-        # if nelecas <= 2:
-        #     print('Electrons < 2. Use CIS or CISD instead.')
-
-
-        self.mo_core = None
-        self.mo_cas = None
-
-        if spin is None:
-            spin = mf.mol.spin
-        self.spin = spin
-        self.shift = None
-        self.ss = None
-
-        self.mf = mf
-        # self.chemical_potential = mu
-
-        self.mol = mf.mol
-
-        ###
-        self.e_tot = None
-        self.e_core = None # core energy
-        self.ci = None # CI coefficients
-        self.H = None
-
-
-        self.hcore = self.h1e_cas = None # effective 1e CAS Hamiltonian including the influence of frozen orbitals
-        self.Nu = None
-        self.Nd = None
-        self.binary = None
-        self.SC1 = None # SlaterCondon rule 1
-        self.SC2 = None # SlaterCondon rule 2
+        super().__init__(mf, ncas, nelecas, ncore=ncore, spin=spin)
         self.direct_connectivity = None
-        self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
-
-        self.spin_purification = False
-
-        # effective CAS Hamiltonian
-        self.h1e = None
-        self.h2e = None
         
         self.tol = tol
         self.direct_ci_dense_fallback_ndets = DIRECT_CI_DENSE_FALLBACK_NDETS
@@ -1674,7 +1622,7 @@ class CASCI(mcscf.casci.CASCI):
 
             # FCI solver, more efficient than the JW solver
 
-            mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
+            mo_occ = mcscf.casci._reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
 
@@ -1750,7 +1698,7 @@ class CASCI(mcscf.casci.CASCI):
 
             # FCI solver, more efficient than the JW solver
             if self.binary is None:
-                mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
+                mo_occ = mcscf.casci._reference_active_occupations(self.nelecas_spin, ncas)
                 binary = get_fci_combos(mo_occ = mo_occ)
                 self.binary = binary
                 self.direct_connectivity = build_direct_connectivity(binary)
@@ -2019,8 +1967,9 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-
-        raise NotImplementedError()
+        ci = self.ci[state_id]
+        self.ensure_slater_condon_cache()
+        return mcscf.casci.make_rdm1s(ci, self.binary, self.SC1)
 
     def make_rdm2(self, state_id=0, with_core=False, with_vir=False):
         """
@@ -2051,9 +2000,10 @@ class CASCI(mcscf.casci.CASCI):
             # nmo = self.mf.nmo
             nmo = ncore + ncas
 
-            D = np.zeros((nmo, nmo, nmo, nmo))
+            if ncore == 0:
+                return make_rdm2(ci, self.binary, self.SC1, self.SC2)
 
-            assert ncore > 0
+            D = np.zeros((nmo, nmo, nmo, nmo))
 
             # cccc block
             I = np.eye(ncore)
@@ -2693,51 +2643,67 @@ def overlap(cibra, ciket, s=None):
 
     # overlap matrix between MOs at different geometries
     if s is None:
-
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        try:
+            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+            s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        except (ImportError, AttributeError, TypeError):
+            from pyscf import gto
+            mol_bra = cibra.mol.topyscf()
+            mol_ket = ciket.mol.topyscf()
+            mol_bra.build()
+            mol_ket.build()
+            s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
         s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
 
 
     nsd_bra = cibra.binary.shape[0]
     nsd_ket = ciket.binary.shape[0]
-    S = np.zeros((nsd_bra, nsd_ket)) # overlap between determinants
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype) # overlap between determinants
 
     ncore_bra = cibra.ncore
     ncore_ket = ciket.ncore
+    if ncore_bra != ncore_ket:
+        raise ValueError(
+            "Different numbers of core orbitals are not supported in overlap: "
+            f"{ncore_bra} != {ncore_ket}."
+        )
 
     scc = s[:ncore_bra, :ncore_ket]
     sca = s[:ncore_bra, ncore_ket:]
     sac = s[ncore_bra:, :ncore_ket]
     saa = s[ncore_bra:, ncore_ket:]
 
-    scc_det = np.linalg.det(scc)
-    scc_inv = np.linalg.inv(scc)
+    if ncore_bra == 0:
+        core_factor = dtype.type(1)
+        saa_eff = saa
+    else:
+        scc_det = np.linalg.det(scc)
+        core_factor = scc_det * scc_det
+        saa_eff = saa - sac @ np.linalg.solve(scc, sca)
+
+    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
+    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
+    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
+    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
 
     for I in range(nsd_bra):
-        occidx1_a  = [i for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-        occidx1_b  = [i for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
+        occidx1_a = occ_bra_a[I]
+        occidx1_b = occ_bra_b[I]
 
         for J in range(nsd_ket):
-            occidx2_a  =  [i for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-            occidx2_b  =  [i for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
+            occidx2_a = occ_ket_a[J]
+            occidx2_b = occ_ket_b[J]
 
             # print('b', occidx2_a, occidx2_b)
             # print(ciket.binary[J])
 
     # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-            saa_occ_a = saa[np.ix_(occidx1_a, occidx2_a)]
-            sca_occ_a = sca[:, occidx2_a]
-            sac_occ_a = sac[occidx1_a, :]
-
-            saa_occ_b = saa[np.ix_(occidx1_b, occidx2_b)]
-            sca_occ_b = sca[:, occidx2_b]
-            sac_occ_b = sac[occidx1_b, :]
-
-
-            S[I, J] = scc_det**2 * np.linalg.det(saa_occ_a - sac_occ_a @ scc_inv @ sca_occ_a)*\
-                np.linalg.det(saa_occ_b - sac_occ_b @ scc_inv @ sca_occ_b)
+            S[I, J] = (
+                core_factor
+                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
+                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
+            )
 
 
 
