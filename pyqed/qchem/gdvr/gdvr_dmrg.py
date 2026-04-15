@@ -561,13 +561,12 @@ def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, 
     with open(f"{filename}_meta.pkl", "wb") as f:
         pickle.dump(meta, f)
 
-def run_gdvr_dmrg_loop(
+def run_gdvr_dmrg(
     mol, Lz, Nz, basis_cfg,
     pre_opt_cycles=10,      
-    dmrg_cycles=3,          
+    dmrg_cycles=1,          
     dmrg_bond_dim=20,
     dmrg_sweeps=10,
-    post_dmrg_opt_cycles=5,
     abelian_symmetry = True,
     checkpoint_dir = "."
 ):
@@ -606,8 +605,6 @@ def run_gdvr_dmrg_loop(
     """
     logger.info("="*60)
     logger.info(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
-    logger.info(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
-    logger.info("="*60)
     
     energy_log = {"hf_initial": None, "hf_pre_opt": [], "dmrg_cycles": [], "final_overlap": None}
     run_params = {"Lz": Lz, "Nz": Nz, "basis": basis_cfg}
@@ -658,7 +655,7 @@ def run_gdvr_dmrg_loop(
             ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
             Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore_curr, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
             energy_log["hf_pre_opt"].append(Etot)
-            logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
+            if (pcyc + 1) % 2 == 0: logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
 
     save_checkpoint("02_HF_NewtonOpt", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
 
@@ -773,34 +770,13 @@ def run_gdvr_dmrg_loop(
         if cycle == 0:
             save_checkpoint("03_DMRG_FirstIter", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
 
-        if cycle < dmrg_cycles - 1: 
-            logger.info("  4. Re-optimizing AOs using DMRG 1-RDM...")
-            d_stack = gdvr_dmrg_scf.dmrg_ao_optimization_step(
-                mol, d_stack, sym_mgr, S_prim, ERIop, h1_nm_func,
-                z, Kz_grid, T_prim, alphas, centers, labels, K_h, Kx_h, 
-                solver=solver, Enuc=Enuc, n_cycles=post_dmrg_opt_cycles, verbose=True
-            )
-            energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": True})
-        else:
-            energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": False})
-            logger.info("  4. Calculating final RHF solution for Overlap analysis...")
-            ERI_J_fin, ERI_K_fin = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
-            _, _, final_Cmo, _, _ = scf_rhf_method2(Hcore_curr, ERI_J_fin, ERI_K_fin, Nz, 1, mol.nelec, Enuc, verbose=False)
+    solver.Hcore = Hcore_curr  # The final one-body matrix
+    solver.V_coul = V_coul     # The final two-body interaction matrix
 
-    final_overlap = 0.0
-    try:
-        if final_Cmo is not None and last_mps_tensors is not None:
-            logger.info("\n" + "-"*30)
-            logger.info("Calculating Final Overlap...")
-            final_overlap = calculate_overlap_with_hf_robust(last_mps_tensors, final_Cmo, range(mol.nelec // 2), Nz)
-            logger.info(f"Overlap |S|^2 : {abs(final_overlap)**2:.6f}")
-    except Exception as e:
-        logger.info(f"Overlap calculation failed (returning 0.0): {e}")
-        final_overlap = 0.0
-    
-    energy_log["final_overlap"] = final_overlap
-    save_checkpoint("04_DMRG_Final", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
-    return final_dmrg_energy, final_overlap
+    return final_dmrg_energy, solver, z, site_qn_maps, mpo_dmrg
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -814,19 +790,18 @@ if __name__ == "__main__":
     S_EXPS = [18.73113696, 2.825394365, 0.6401216923, 0.1612777588]
     basis_cfg = {'s': S_EXPS}
     charges = [1.0]*4
-    # coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
-    coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -1], [0.0, 0.0, 1], [0.0, 0.0, 3.6]]
+    coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
     mol = Molecule(charges, coords, nelec=4, spin = 0)
     
     master_dir = f"Scan_Results_Nz_{Nz}"
     checkpoint_path = os.path.join(master_dir)
     
-    E, S = run_gdvr_dmrg_loop(
+    E, dmrg_obj, _, _, _ = run_gdvr_dmrg(
         mol, Lz=6.0, Nz=128, basis_cfg=basis_cfg,
-        pre_opt_cycles=50, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
+        pre_opt_cycles=10, dmrg_cycles=1, dmrg_bond_dim=40, dmrg_sweeps=10,
         abelian_symmetry=True, checkpoint_dir=checkpoint_path
     )
     
-    result_file = os.path.join(master_dir, f"result_idx_{idx:02d}.npz")
-    np.savez(result_file, Energy=E, Overlap=S)
-    logger.info(f"Done. Saved to {result_file}")
+    # result_file = os.path.join(master_dir, f"result_idx_{idx:02d}.npz")
+    # np.savez(result_file, Energy=E, Overlap=S)
+    # logger.info(f"Done. Saved to {result_file}")

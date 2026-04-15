@@ -9,7 +9,7 @@ class TDMPS:
         Time-Dependent MPS Solver (Layout Agnostic).
 
         Args:
-            psi0 (MPS): Initial state, MPS class object
+            psi0 (MPS): Initial state, MPS class object (Lv, P, Rv)
             H_mpo (MPO): Hamiltonian. (Lv, Rv, P_oout, P_in)
             dt (complex): Time step.
             bond_dim (int): Max bond dimension.
@@ -55,8 +55,8 @@ class TDMPS:
 
         logging.info(f"Build propagator (dt={dt}, order={order})...")
         constant = -1j * dt
-
-        self.U = expmpo(self.H, constant=constant, D=self.D,
+        print(self.D)
+        self.U = expmpo(self.H, constant=constant,
                         method='taylor', order=order, scale=scale)
 
         return self.U
