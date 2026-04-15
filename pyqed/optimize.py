@@ -42,11 +42,13 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
     """
 
+
     n, p = X0.shape
 
     Q0 = 1
     k = 0
     C = f(X0, *args)
+    v = C
     Id = np.identity(n)
 
     X = X0

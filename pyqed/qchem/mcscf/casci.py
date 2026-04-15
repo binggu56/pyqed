@@ -12,7 +12,7 @@ import logging
 from functools import reduce
 import numpy as np
 from scipy.linalg import eigh
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, LinearOperator
 
 import sys
 from opt_einsum import contract
@@ -29,6 +29,7 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
 
 
 from pyqed.qchem.hf.rhf import ao2mo
+
 
 def cistring(norb, nelec, sz=0):
     """
@@ -195,7 +196,8 @@ def get_combos(mo_occ, space='fci', ncore=None, ncas=None, nvir=None):
 #     #     return H1, H2
 #     return H1, H2
 
-def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
+def h1e_for_cas(self, mo_coeff=None):
+
     '''CAS space effective one-electron hamiltonian
 
     Args:
@@ -205,13 +207,15 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
         A tuple, the first is the effective one-electron hamiltonian defined in CAS space,
         the second is the electronic energy from core.
     '''
+    mf, ncas, ncore = self.mf, self.ncas, self.ncore
     if mo_coeff is None: mo_coeff = mf.mo_coeff
     # if ncas is None: ncas = .ncas
     # if ncore is None: ncore = casci.ncore
     mo_core = mo_coeff[:,:ncore]
     mo_cas = mo_coeff[:,ncore:ncore+ncas]
 
-    hcore = mf.get_hcore()
+    # hcore = mf.get_hcore()
+    hcore = self.get_hcore()
     energy_core = mf.energy_nuc()
     if mo_core.size == 0:
         corevhf = 0
@@ -224,6 +228,38 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
     h1eff = reduce(np.dot, (mo_cas.conj().T, hcore+corevhf, mo_cas))
     return h1eff, energy_core
 
+
+def add_electric_field(mol, electric_field=np.array([0,0,0])):
+    """add external electric field interaction term
+    math::
+    V_{int} = - \hat{\mu} \cdot E
+    where mu is electric dipole, E is electric field
+
+    Parameters
+    ----------
+    mol : _type_
+        _description_
+    electric_field : electric_field=np.array([Ex, Ey, Ez])
+        _description_, by default np.array([0,0,0])
+
+    Returns
+    -------
+    _type_
+        _description_
+    """    
+    hcore_with_field =  np.einsum('ijk,i -> jk', mol.ao_dip, electric_field)
+
+    return hcore_with_field
+
+def add_vector_potential(mol, vector_potential=np.array([0,0,0])):
+
+    A = vector_potential
+    print('A^2', np.dot(A, A))
+    hcore_with_vector_potential = -np.einsum('ijk,i -> jk', mol.ao_moment, vector_potential).astype(complex) \
+        + 0.5 * np.dot(A, A) * mol.overlap
+
+
+    return hcore_with_vector_potential
 
 class CASCI:
     def __init__(self, mf, ncas, nelecas, ncore=None, spin=None):
@@ -306,12 +342,32 @@ class CASCI:
         self.Nd = None
         self.binary = None
         self.SC1 = None # SlaterCondon rule 1
+        self.SC2 = None # SlaterCondon rule 2
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
 
 
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
+
+        self.electric_dipole = None
+        self.magnetic_dipole = None
+
+        hcore = mf.get_hcore()
+        self.dtype = hcore.dtype
+        # print('hcore', hcore.dtype)
+        if hcore.dtype == complex:
+            self.dtype = np.complex128
+        else:
+            self.dtype = np.float64
+
+        self.v_solvent = None   # AO PCM potential
+
+        # print('self.add_electric',self.add_electric)
+        # print('self.electric_field',self.electric_field)
+
+    def get_hcore(self):
+        return self.mf.get_hcore()
 
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
@@ -333,8 +389,7 @@ class CASCI:
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
-                                     mo_coeff=self.mo_coeff)
+        H, energy_core = self.h1e_for_cas()
 
         self.e_core = energy_core
 
@@ -400,6 +455,8 @@ class CASCI:
         #     return H1, H2
         return H1, H2
 
+
+
     def natural_orbitals(self, dm, nco=None):
         natural_orb_occ, natural_orb_coeff = np.linalg.eigh(dm)
 
@@ -421,7 +478,7 @@ class CASCI:
             Ca = mf.mo_coeff[:, self.ncore:self.ncore + self.ncas]
             # hcore_mo = contract('ia, ij, jb -> ab', Ca.conj(), mf.hcore, Ca)
 
-            h1eff, e_core = h1e_for_cas(self.mf, ncas=self.ncas, ncore=self.ncore)
+            h1eff, e_core = self.h1e_for_cas()
 
             self.e_core = e_core
 
@@ -583,6 +640,8 @@ class CASCI:
             # second-order spin penalty
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
+    def h1e_for_cas(self):
+        return h1e_for_cas(self, self.mo_coeff)
 
     def run(self, nstates=1, mo_coeff=None, method='ci', ci0=None):
         """
@@ -692,6 +751,11 @@ class CASCI:
         H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
         E, X = eigsh(H_CI, k=nstates, which='SA')
 
+        sort_idx = np.argsort(E)
+        E = E[sort_idx]
+        X = X[:, sort_idx]
+        # print('E = ', E)
+
 
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
@@ -767,6 +831,7 @@ class CASCI:
         """
 
         ci = self.ci[state_id]
+        # print('rdm1 ci dtype', ci.dtype)
         # if representation.lower() == 'ao':
         #     C = self.mf.mo_coeff
         #     h1e = ao2mo(h1e, C)
@@ -780,9 +845,10 @@ class CASCI:
         # else:
         #     c_core = 0
         if with_core and not with_vir:
+            # print('casci rdm1')
 
             norb = ncas + ncore
-            D = np.zeros((norb, norb), dtype=float)
+            D = np.zeros((norb, norb), dtype=self.dtype)
 
             if ncore > 0: 
                 for i in range(ncore): 
@@ -793,7 +859,7 @@ class CASCI:
 
         if with_core and with_vir:
 
-            D = np.zeros((nmo, nmo), dtype=float)
+            D = np.zeros((nmo, nmo), dtype=self.dtype)
             if ncore > 0: 
                 for i in range(ncore): 
                     D[i, i] = 2
@@ -848,7 +914,7 @@ class CASCI:
             # nmo = self.mf.nmo
             nmo = ncore + ncas
 
-            D = np.zeros((nmo, nmo, nmo, nmo))
+            D = np.zeros((nmo, nmo, nmo, nmo), dtype=self.dtype)
 
             assert ncore > 0
 
@@ -976,6 +1042,59 @@ class CASCI:
 
         return make_tdm1(cibra, ciket, self.binary, self.SC1)
 
+    # def make_tdm1_tmp(self, bra_id, ket_id=0, with_core=False, with_vir=False):
+    #     """
+    #     TDM
+
+    #     Parameters
+    #     ----------
+    #     bra_id : TYPE
+    #         DESCRIPTION.
+    #     ket_id : TYPE, optional
+    #         DESCRIPTION. The default is 0.
+
+    #     Returns
+    #     -------
+    #     None.
+
+    #     """
+    #     cibra = self.ci[bra_id]
+    #     ciket = self.ci[ket_id]
+    #     ncore = self.ncore
+    #     ncas = self.ncas
+    #     nmo = self.mf.nmo
+
+    #     # if ncore > 0:
+    #     #     c_core = 2 * np.trace(h1e[:ncore,:ncore])
+    #     # else:
+    #     #     c_core = 0
+    #     if with_core and not with_vir:
+
+    #         norb = ncas + ncore
+    #         D = np.zeros((norb, norb), dtype=float)
+
+    #         if ncore > 0: 
+    #             # for i in range(ncore): 
+    #             #     D[i, i] = 2
+    #             if bra_id == ket_id:
+    #                 D = self.make_rdm1(bra_id, with_core)
+    #             else:
+    #                 D[ncore:ncore+ncas, ncore:ncore+ncas] = make_tdm1(cibra, ciket, self.binary, self.SC1)
+
+    #         return D
+
+    #     if with_core and with_vir:
+
+    #         D = np.zeros((nmo, nmo), dtype=float)
+    #         if ncore > 0: 
+    #             for i in range(ncore): 
+    #                 D[i, i] = 2
+    #         D[ncore:ncore+ncas, ncore:ncore+ncas] = make_tdm1(cibra, ciket, self.binary, self.SC1)
+
+    #         return D
+    #     else:
+    #         return make_tdm1(cibra, ciket, self.binary, self.SC1)
+
     def make_tdm2(self, bra_id, ket_id=0):
         """
         spin-traced 1e transition density matrix in MO
@@ -988,6 +1107,131 @@ class CASCI:
         """
         raise NotImplementedError('TDM not implemented')
 
+    def get_electric_dip(self, initial_state, final_state, unit, **kwargs):
+
+
+        tdm1 = self.make_tdm1(final_state, initial_state)
+        # print('tdm',tdm1)
+        # tdm1 = self.make_tdm1(final_state, initial_state)
+
+        mo_coeff = self.mo_coeff[:, self.ncore:self.ncas + self.ncore]
+
+
+
+        dip = electric_dipole(self.mol, tdm1, mo_coeff, unit)
+
+        self.electric_dipole = dip
+        print('initial state : {}; final state {}; transitoion electric dipole : {} {}'.format(initial_state, final_state, dip, unit))
+
+
+
+        # D = 2*np.eye(self.ncore)
+        # print(D)
+        # print('*'*100)
+        # orbcas = self.mo_coeff[:, 0:self.ncore]
+        # t_dm1_ao = reduce(np.dot, (orbcas, D, orbcas.T))
+        # ao_dip = mol2.ao_dip
+        # print("$$$", np.einsum('xij,ji->x', ao_dip, t_dm1_ao))
+
+        return dip
+
+    def get_magnetic_dip(self, initial_state, final_state, **kwargs):
+
+        tdm1 = self.make_tdm1(final_state, initial_state)
+        mo_coeff = self.mo_coeff[:, self.ncore:self.ncas + self.ncore]
+        mag_dip = orbital_magnetic_dipole(self.mol, tdm1, mo_coeff)
+
+        self.magnetic_dipole = mag_dip
+        print('initial state : {}; final state {}; transitoion magnetic dipole : {}'.format(initial_state, final_state, mag_dip))
+        return mag_dip
+
+def electric_dipole(mol, tdm1, mo_coeff, unit='Debye', **kwargs):
+
+    # from pyscf.gto.moleintor import getints
+    """dipole moment calculation
+
+    math:
+        x^hat = \sum_{p,q} x_{p,q} a_p^dagger a_q
+        y^hat = \sum_{p,q}yx_{p,q} a_p^dagger a_q
+        z^hat = \sum_{p,q} z_{p,q} a_p^dagger a_q
+
+        dip_x = -\sum_{p,q} x_{p,q} dm1_pq + \sum_A Q_A X_A
+        dip_y = -\sum_{p,q} y_{p,q} dm1_pq + \sum_A Q_A Y_A
+        dip_z = -\sum_{p,q} z_{p,q} dm1_pq + \sum_A Q_A Z_A
+        
+    Parameters
+    ----------
+    mol : _type_
+        _description_
+    tdm1 : _type_
+        one body transition density matrix 
+    ao_dip : _type_
+        x_{p,q}
+    """    
+
+    # charges = mol.atom_charges()
+    # coords = mol.atom_coords()
+
+
+    # print('tdm', tdm1)
+    # print('coeff',mo_coeff)
+    
+    # nuc_charge_center = np.einsum('z,zx->x', charges, coords) / charges.sum()
+    # mol.build
+
+    
+    ao_dip = mol.ao_dip
+    # ao_dip = getints('int1e_r', atm= , bas= , comp=3, env=nuc_charge_center)
+    # print('ao_dip', ao_dip)
+    # print('ao_dip shape', np.shape(ao_dip))
+    mo_dip = np.einsum('ik, xkl, lj -> xij', mo_coeff.T, ao_dip, mo_coeff)
+    # print('mo_dip shape', np.shape(mo_dip))
+
+    el_dip = np.einsum('xji, ij -> x', mo_dip, tdm1).real
+
+    # nucl_dip = np.einsum('i, ix -> x', charges, coords)
+    # nucl_dip = 0
+    # mol_dip = nucl_dip - el_dip
+
+
+
+
+    if unit == 'Debye':
+        el_dip *= 2.541746231
+        logging.info('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *el_dip)
+        # print('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *mol_dip)
+    else:
+        logging.info('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *el_dip)
+        # print('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *mol_dip)
+    
+    return el_dip
+
+def magnetic_dipole():
+
+    pass
+
+def spin_magnetic_dipole():
+    """spin magnetic dipole calculation
+
+    math:
+
+    """    
+    pass
+
+def orbital_magnetic_dipole(mol, tdm1, mo_coeff, **kwargs):
+    """orbital magnetic dipole calculation
+
+    math:
+        mu = - e / 2m * L
+        L = r × p
+        magnetic_dip = -0.5 * \sum_{i,j} (r × p)_{i,j} dm1_{i,j}
+    """    
+    ao_mag_dip = mol.ao_magnetic_dip
+    mo_mag_dip = np.einsum('ik, xkl, lj -> xij', mo_coeff.T, ao_mag_dip, mo_coeff)
+    mol_mag_dip = -0.5 * np.einsum('xji, ij -> x', mo_mag_dip, tdm1).real
+    logging.info('magnetic dipole moment(X, Y, Z): %8.5f, %8.5f, %8.5f', *mol_mag_dip)
+    
+    return mo_mag_dip
 
 # def get_SO_matrix(mo_coeff, eri, spin_flip=False, H1=None, H2=None):
 #     """
@@ -1389,7 +1633,7 @@ def make_rdm2(ci, Binary, SC1, SC2):
     H_CI = np.zeros((nsd, nsd, nmo, nmo, nmo, nmo)) # slow implementation
 
     # diagonal elements
-    D = np.einsum("I, ISp, ITr, pq, rs -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
+    D = np.einsum("I, ISp, ITr, pq, rs -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True).astype(ci.dtype)
     D -= np.einsum("I, ISp, ISr, ps, rq -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
 
     ## Rule 1
@@ -1569,26 +1813,115 @@ if __name__ == "__main__":
     #     casci.e_tot
 
     #### test overlap
-    mol2 = Molecule(atom = [
-    ['Li' , (0. , 0. , 0)],
-    ['Li' , (0. , 0. , 1.4)], ])
-    mol2.basis = '631g'
+    # mol2 = Molecule(atom = [
+    # ['Li' , (0. , 0. , 0)],
+    # ['H' , (0. , 0. , 1.4)], ])
+    # mol2.basis = 'sto6g'
 
+    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='sto3g')
     # mol.unit = 'b'
-    mol2.build()
+    mol.build()
+    mol.molecular_frame()
+    nstates = 4
 
-    mf2 = mol2.RHF().run()
+    mf = mol.RHF().run()
 
-
-    ncas, nelecas = (4,2)
-    mc = CASCI(mf2, ncas, nelecas)
-    mc.run(5)
-
-    print('Fix spin by penalty')
-
-    # mc = CASCI(mf2, ncas, nelecas)
+    ncas, nelecas = (6,6)
+    mc = CASCI(mf, ncas, nelecas)
     mc.fix_spin(ss=0, shift=0.2)
-    mc.run(5)
+    mc.run(nstates)
+
+    # rdm1 = mc.make_rdm1(state_id=0, with_core=True)
+    # print('rdm1', rdm1.shape)
+
+    # C = mc.mo_coeff[:, :mc.ncore+ mc.ncas]
+    # print('c', C.shape)
+
+    # print('e_tot', mc.e_tot[0])
+
+    # # C0 = mf.mo_coeff
+
+    # hcore0 = mf.get_hcore()
+    # # print('hcore ===',hcore0.all() == mol2.hcore.all())
+    # # print('hcore0', hcore0)
+
+
+
+    # # add electric field or vector potential
+    # E_vec=np.array([0,0,0.1])
+    # # A_vec=np.array([0.0,0,0.01])
+    # hcore_electric_field = add_electric_field(mol, electric_field=E_vec)
+    # # hcore_vector_potential = add_vector_potential(mol2, vector_potential=A_vec)
+    # # print('hcore_vector_potential', hcore_vector_potential)
+
+    # # mol2.hcore = hcore0 - hcore_electric_field + hcore_vector_potential
+    # mol.hcore = hcore0 - hcore_electric_field
+    # mf2 = mol.RHF().run()
+    # # CA = mf2.mo_coeff
+
+
+
+    # s0 = mol2.overlap
+    # coords = -mol2.ao_dip # <mu | r | nu>
+    # A_dot_r = np.einsum('i,imn->mn', A_vec, coords)
+    # # S_exp = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r)
+    # # S_exp = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r) + 1j/6 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r @ np.linalg.inv(s0) @ A_dot_r)
+
+    # s, U = eigh(mol2.overlap)
+    # # building transformation matrix S^{-1/2}
+    # X = U.dot(np.diagflat(s**(-0.5)).dot(U.conj().T))
+    # C0_p = np.linalg.inv(X) @ C0
+    # CA_p = np.linalg.inv(X) @ CA
+    # overlap = C0.conj().T @ CA
+    # phase = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ s0 @ A_dot_r)
+    # print('-'*100)
+    # print('hcore+A', mf2.get_hcore())
+    # print('fock', mf2.get_fock())
+    # h0000 = mf2.get_fock()
+
+    # print('CA',CA)
+    # print('exp(-iAr)C0', S_exp @ C0)
+    # print('phase', CA[:,0] - S_exp @ C0[:,0])
+
+    # S_prime = C0.conj().T @ S_exp @ CA
+    # print('s0',s0)
+    # print('S_prime', S_prime)
+    # print('overlap', np.einsum('ii->', S_prime)- np.sum(S_prime.diagonal())) 
+
+    # print(f"{'MO Index':<10} | {'|Overlap|':<12} ")
+    # print("-" * 30)
+    # for i in range(mol2.nelec // 2):
+    #     overlap = S_prime[i, i]
+    #     print(f"{i:<10} | {np.abs(overlap):<12.6f} ")
+
+    # # CASCI 
+    # wavefunction_2 = mf2.mo_coeff
+    # ncas, nelecas = (2,2)
+    # nstates = 4
+    # mc = CASCI(mf2, ncas, nelecas)
+    # # mc.run(nstates=nstates, method='ci')
+
+    # print('Fix spin by penalty')
+
+    # # mc = CASCI(mf2, ncas, nelecas)
+    # mc.fix_spin(ss=0, shift=0.2)
+    # mc.run(nstates=nstates)
+    # for state_id in range(nstates):
+    #     mc.get_electric_dip(initial_state=0, final_state=state_id, unit='au')
+
+
+
+
+
+
+
+
+
+    # print("dip",mol2.ao_dip)
+    # print('pyqed casci electric dip', mc.electric_dipole)
+
+    # mc.get_magnetic_dip(initial_state=0, final_state=1)
+    # print('pyqed casci magnetic dip', mc.magnetic_dipole)
 
     # casci.run()
     # S = overlap(casci, casci2)

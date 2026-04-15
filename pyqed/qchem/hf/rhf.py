@@ -45,7 +45,10 @@ class RHF:
         self.e_ne = None
         self.e_j = None
         self.e_k = None
+        self.dipole_moment = None
 
+        self.atom_coords = self.mol.atom_coords()
+        self.atom_charges = self.mol.atom_charges()
 
 
 
@@ -61,9 +64,16 @@ class RHF:
 
     def run(self, **kwargs):
         self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
-            self.vhf, self.dm = hartree_fock(self.mol, **kwargs)
+            self.vhf, self.dm = hartree_fock(self, **kwargs)
         return self
     
+    def get_nelec(self):
+        nelec = self.nelec
+        return nelec
+
+    def get_nao(self):
+        nao = self.nao
+        return nao
 
     def get_eri(self, representation='mo'):
         """
@@ -219,12 +229,14 @@ class RHF:
 
 
     def energy_elec(self,dm=None):
+
         if dm is None:
             dm = self.make_rdm1()
 
         return energy_elec(dm, self.hcore, self.vhf)
 
     def energy_nuc(self):
+        self.e_nuc = energy_nuc(self.atom_coords, self.atom_charges)
         return self.e_nuc
 
     def eri_asymm(self):
@@ -248,6 +260,11 @@ class RHF:
         eri = self.get_eri_mo(notation='phys')
         return eri - np.transpose(eri, (0,1,3,2))
 
+    def get_dipole_moment(self, unit):
+
+        self.dipole_moment = dip_moment(self.mol, self.dm, unit)
+
+        return  self.dipole_moment
 
 # def get_hcore(mol):
 #     '''Core Hamiltonian
@@ -274,6 +291,12 @@ class RHF:
 #         h += mol.intor_symmetric('ECPscalar')
 #     return h
 
+def energy_nuc(atcoords, atnums):
+    # Compute Nucleus-Nucleus repulsion
+    rab = np.triu(np.linalg.norm(atcoords[:, None]- atcoords, axis=-1))
+    at_charges = np.triu(atnums[:, None] * atnums)[np.where(rab > 0)]
+    nn_e = np.sum(at_charges / rab[rab > 0])
+    return nn_e
 
 def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
     '''Unrestricted Hartree-Fock potential matrix for the given density matrix
@@ -493,17 +516,54 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 # array and modifications to DM array may be ignored.
     return np.dot(mocc*mo_occ[mo_occ>0], mocc.conj().T)
 
+def dip_moment(mol, dm, unit='Debye', **kwargs):
+    r''' Dipole moment calculation
+
+    .. math::
+
+        \mu_x = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|x|\mu) + \sum_A Q_A X_A\\
+        \mu_y = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|y|\mu) + \sum_A Q_A Y_A\\
+        \mu_z = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|z|\mu) + \sum_A Q_A Z_A
+
+    where :math:`\mu_x, \mu_y, \mu_z` are the x, y and z components of dipole
+    moment
+
+    Args:
+         mol: an instance of :class:`Mole`
+         dm : a 2D ndarrays density matrices
+
+    Return:
+        A list: the dipole moment on x, y and z component
+    '''
+    charges = mol.atom_charges()
+    coords = mol.atom_coords()
+
+    ao_dip = mol.ao_dip
+    el_dip = np.einsum('xji, ij -> x', ao_dip, dm).real
+    nucl_dip = np.einsum('i, ix -> x', charges, coords)
+    mol_dip = nucl_dip - el_dip
+
+    if unit == 'Debye':
+        mol_dip *= 2.541746231
+        logging.info('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *mol_dip)
+    else:
+        logging.info('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *mol_dip)
+    
+    return mol_dip
+
+def magnetic_dipole(mol, dm, **kwargs):
+
+    pass
 
 
-
-def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
-
+def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
+    
     #calculate the overlap matrix S
     #the matrix should be symmetric with diagonal entries equal to one
     logging.info("building overlap matrix")
 
     # S = mol.intor_symmetric('int1e_ovlp')
-    S = mol.overlap
+    S = mf.get_ovlp()
 
     # for i in range(len(phi)):
     #     for j in range( (i+1),len(phi)):
@@ -544,8 +604,12 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
 
     # hcore = get_hcore(mol)
 
-    hcore = mol.hcore
+    # hcore = mol.hcore
+    hcore = mf.hcore = mf.get_hcore()
+    # print('hcore', hcore)
 
+    nao = mf.get_nao()
+    
     # print("Hcore: ", Hcore)
 
     #diagonalize overlap matrix to get transformation matrix X
@@ -583,9 +647,13 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
     old_energy = 0.0
     electronic_energy = 0.0
 
-    nocc = mol.nelec // 2
-    mo_occ = np.zeros(mol.nao)
+    # nocc = mol.nelec // 2
+    nocc = mf.get_nelec() // 2
+    # mo_occ = np.zeros(mol.nao)
+    mo_occ = np.zeros(nao)
     mo_occ[:nocc] = 2
+
+
 
     # dm = init_guess_by_hcore(hcore)
     def init_guess_by_h1e(h):
@@ -602,9 +670,10 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
     else:
         raise ValueError('Invalid init_guess.')
 
-
     ### DIIS
-    nbas = mol.nao
+    # nbas = mol.nao
+    nbas = nao
+    print('nbas = ', nbas)
 
     # diis storage
     maxdiis = 6
@@ -655,8 +724,23 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
         for b1 in range(bsize):
             for b2 in range(bsize):
                 bmat[b1, b2] = np.trace(diis_error_matrices[b1].dot(diis_error_matrices[b2]))
-        C =  np.linalg.solve(bmat, rhs)
-
+        
+        # C =  np.linalg.solve(bmat, rhs)
+        try:
+            C = np.linalg.solve(bmat, rhs)
+        except np.linalg.LinAlgError:
+            print("DIIS: singular B matrix, trying regularization")
+            try:
+                bmat[:-1, :-1] += np.eye(bsize) * 1.0e-10
+                C = np.linalg.solve(bmat, rhs)
+            except np.linalg.LinAlgError:
+                print("DIIS: regularized solve failed, trying lstsq")
+                try:
+                    C, *_ = np.linalg.lstsq(bmat, rhs, rcond=None)
+                except np.linalg.LinAlgError:
+                    print("DIIS: lstsq failed, skipping DIIS this iteration")
+                    return fock, diis_error
+        
         # form new interpolated diis fock matrix
         for i, k in enumerate(C[:-1]):
             diis_fock += k*diis_fock_matrices[i]
@@ -670,7 +754,8 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
     #     for B in range(A+1,len(Z)):
     #         nuclear_energy += Z[A]*Z[B]/abs(R[A]-R[B])
 
-    nuclear_energy = mol.energy_nuc()
+    # nuclear_energy = mol.energy_nuc()
+    nuclear_energy = mf.energy_nuc()
 
     print("E_nclr = ", nuclear_energy)
 
@@ -680,8 +765,11 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
     for scf_iter in range(max_cycle):
 
         # calculate the two electron part of the Fock matrix
-        vhf = get_veff(mol, dm)
-        F = hcore + vhf
+        # vhf = get_veff(mol, dm)
+        vhf = mf.vhf = mf.get_veff(dm=dm)
+
+        # F = hcore + vhf
+        F = mf.get_fock(dm=dm)
 
         # obtain better (interpolated) fock matrix through diis accelleration
 
@@ -689,7 +777,8 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8):
         F, diis_error = diis(F, dm, S, X, scf_iter)
 
 
-        electronic_energy = energy_elec(dm, hcore, vhf)
+        # electronic_energy = energy_elec(dm, hcore, vhf)
+        electronic_energy = mf.energy_elec(dm=dm)
 
         #print("E_elec = ", electronic_energy)
 
@@ -755,15 +844,39 @@ def ao2mo(op, C):
     return dag(C) @ op @ C
 
 if __name__ == '__main__':
+
+
+    from pyqed import Molecule
+    mol = Molecule(atom='Li 0.6 2 0; F 0 0 1.4', unit='b', basis='sto6g')
+    # mol.build(driver = 'gbasis')
+    mol.build(driver = 'pyscf')
+    
+    # hartree_fock(mol)
+    hf = RHF(mol)
+    hf.run()
+    print(hf.energy_elec() + hf.energy_nuc())
+    # hf.get_dipole_moment(unit='au')
+    # print('pyqed dipole moment', hf.dipole_moment)
+
+    
+
+
+    # '''compare with pyscf'''
+    from pyscf import gto, scf
+
+    # Create molecule
+    mol = gto.M(atom='Li 0.6 2 0;F 0 0 1.4', unit='b', basis='sto6g')
+
+    # Run SCF calculation
+    mf = scf.RHF(mol).run()
+
+    # # Calculate dipole moment
+    # dipole = mf.dip_moment(unit='au')  # or 'au'
+    # print(f"pyscf Dipole moment: {dipole} ")
+
+
     # from pyscf import gto, scf
     # mol = gto.M(atom='H 0 0 0; H 0 0 1.1', unit='b', basis='631g')
     # conv, e, mo_e, mo, mo_occ = scf.hf.kernel(scf.hf.SCF(mol), dm0=np.eye(mol.nao_nr()))
     # print('conv = %s, E(HF) = %.12f' % (conv, e))
     # conv = True, E(HF) = -1.081170784378
-
-    from pyqed import Molecule
-    mol = Molecule(atom='H 0 0 0; H 0 0 1.1', unit='a', basis='6311g**')
-    mol.build()
-    # hartree_fock(mol)
-    hf = RHF(mol)
-    hf.run()

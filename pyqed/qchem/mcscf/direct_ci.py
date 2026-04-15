@@ -19,6 +19,7 @@ from opt_einsum import contract
 
 from pyqed import tensor
 from itertools import combinations
+import itertools
 import warnings
 
 from pyqed.qchem import get_veff
@@ -323,8 +324,10 @@ class CASCI(mcscf.casci.CASCI):
         if spin is None:
             spin = mf.mol.spin
         self.spin = spin
-        self.shift = None
         self.ss = None
+        self.shift = None
+        self.spin_purification = False
+
 
         self.mf = mf
         # self.chemical_potential = mu
@@ -346,11 +349,29 @@ class CASCI(mcscf.casci.CASCI):
         self.SC2 = None # SlaterCondon rule 2
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
 
-        self.spin_purification = False
 
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
+
+        self.electric_dipole = None
+        self.magnetic_dipole = None
+
+        hcore = mf.get_hcore()
+        self.dtype = hcore.dtype
+        # print('hcore', hcore.dtype)
+        if hcore.dtype == complex:
+            self.dtype = np.complex128
+        else:
+            self.dtype = np.float64
+
+        self.v_solvent = None   # AO PCM potential
+
+        # print('self.add_electric',self.add_electric)
+        # print('self.electric_field',self.electric_field)
+
+    def get_hcore(self):
+        return self.mf.get_hcore()
 
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
@@ -372,8 +393,7 @@ class CASCI(mcscf.casci.CASCI):
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
-                                     mo_coeff=self.mo_coeff)
+        H, energy_core = self.h1e_for_cas()
 
         self.e_core = energy_core
 
@@ -388,14 +408,10 @@ class CASCI(mcscf.casci.CASCI):
 
         # nmo = Ca.shape[1] # n
 
-        eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
+        eri = mf.eri  # (pq||rs) = (pq|rs) - (ps|qr) 1^* 1 2^* 2
 
-        ### compute SO ERIs (MO)
+        ### compute SO antisymmetrized ERIs (MO)
         eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-
-        # physicts notation <pq|rs>
-        # eri_aa = contract('ip, jq, ij, ir, js -> pqrs', Ca.conj(), Ca.conj(), eri, Ca, Ca)
-
         # eri_aa -= eri_aa.swapaxes(1,3)
 
         eri_bb = eri_aa.copy()
@@ -444,6 +460,7 @@ class CASCI(mcscf.casci.CASCI):
         return H1, H2
 
 
+
     def natural_orbitals(self, dm, nco=None):
         natural_orb_occ, natural_orb_coeff = np.linalg.eigh(dm)
 
@@ -465,7 +482,7 @@ class CASCI(mcscf.casci.CASCI):
             Ca = mf.mo_coeff[:, self.ncore:self.ncore + self.ncas]
             # hcore_mo = contract('ia, ij, jb -> ab', Ca.conj(), mf.hcore, Ca)
 
-            h1eff, e_core = h1e_for_cas(self.mf, ncas=self.ncas, ncore=self.ncore)
+            h1eff, e_core = self.h1e_for_cas()
 
             self.e_core = e_core
 
@@ -581,7 +598,7 @@ class CASCI(mcscf.casci.CASCI):
         s : TYPE, optional
             DESCRIPTION. The default is None.
         ss : TYPE, optional
-            DESCRIPTION. The default is 0.
+            DESCRIPTION. The default is None.
         shift : TYPE, optional
             DESCRIPTION. The default is 0.2.
 
@@ -598,15 +615,27 @@ class CASCI(mcscf.casci.CASCI):
             if ss is None:
                 ss = s * (s+1)
             else:
-                raise ValueError('s and ss cannot be specified simulaneously.')
+                # assert ss == s * (s+1)
+
+                raise ValueError('s and ss cannot be specified simultaneously.')
 
         if ss == 0:
             # first-order spin penalty J. Phys. Chem. A 2022, 126, 12, 2050–2060
             # H' = H + J \hat{S}^2
+            # norb = h1e[0].shape[0]
 
-            self.ss = ss
-            self.shift = shift
+            # ncas = self.ncas
+
+            # h1e = [h + 3./4 * shift * np.eye(ncas) for h in h1e]
+
+            # for p in range(ncas):
+            #     for q in range(ncas):
+            #         h2e[:, :, p, q, q, p] -= 0.5 * shift
+            #         h2e[:, :, p, p, q, q] -= 1./4 * shift
+
             self.spin_purification = True
+            self.ss = 0
+            self.shift = shift
 
             return self
 
@@ -615,6 +644,8 @@ class CASCI(mcscf.casci.CASCI):
             # second-order spin penalty
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
+    def h1e_for_cas(self):
+        return h1e_for_cas(self, self.mo_coeff)
 
     def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None):
         """
@@ -719,6 +750,7 @@ class CASCI(mcscf.casci.CASCI):
             E, X = eigsh(H_CI, k=nstates, which='SA')
 
         elif method == 'direct_ci':
+            print('method = direct ci')
 
             # define the core and active space orbitals
             if mo_coeff is None:
