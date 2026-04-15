@@ -658,7 +658,7 @@ def run_gdvr_dmrg_loop(
             ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
             Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore_curr, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
             energy_log["hf_pre_opt"].append(Etot)
-            logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
+            if (pcyc + 1) % 2 == 0: logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
 
     save_checkpoint("02_HF_NewtonOpt", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
 
@@ -814,8 +814,7 @@ if __name__ == "__main__":
     S_EXPS = [18.73113696, 2.825394365, 0.6401216923, 0.1612777588]
     basis_cfg = {'s': S_EXPS}
     charges = [1.0]*4
-    # coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
-    coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -1], [0.0, 0.0, 1], [0.0, 0.0, 3.6]]
+    coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
     mol = Molecule(charges, coords, nelec=4, spin = 0)
     
     master_dir = f"Scan_Results_Nz_{Nz}"
@@ -823,7 +822,7 @@ if __name__ == "__main__":
     
     E, S = run_gdvr_dmrg_loop(
         mol, Lz=6.0, Nz=128, basis_cfg=basis_cfg,
-        pre_opt_cycles=50, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
+        pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
         abelian_symmetry=True, checkpoint_dir=checkpoint_path
     )
     
