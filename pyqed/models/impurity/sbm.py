@@ -287,7 +287,7 @@ class SBM:
 
     # def to_wilson_chain(self):
     #     pass
-    def build_H_mpo(self):
+    def build_H_mpo(self, nb=6):
         
         N = self.nmodes
         # 1. Discretize
@@ -463,8 +463,10 @@ class SBM:
         
         return vals[0]
     
-    def TDDMRG(self, D=40):
+    def TDDMRG(self, D=40, nb=6):
         from pyqed.mps import TDMPS 
+        if self.H is None:
+            self.build_H_mpo(nb=nb)
         return TDMPS(self.H, D)
     
     def build_product_state(self):

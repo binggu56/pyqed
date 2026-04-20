@@ -1,7 +1,8 @@
-#from .direct_ci import CASCI
+from .casci import CASCI
 try:
-    from .cocasci import COCASCI
+    from .cocasci import COCAS, COCASCI
 except ImportError:
+    COCAS = None
     COCASCI = None
 
 from .casscf import CASSCF, FirstOrderCASSCF

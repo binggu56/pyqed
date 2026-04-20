@@ -1,0 +1,214 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+
+\title{Analytic Born--Oppenheimer Hamiltonian Derivatives}
+\author{pyqed notes}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Born--Oppenheimer Hamiltonian}
+
+The electronic Born--Oppenheimer Hamiltonian is
+\begin{equation}
+\hat H_{\mathrm{BO}}(\bm r; \bm R)
+=
+\hat T_e + \hat V_{ee} + \hat V_{en}(\bm R) + V_{nn}(\bm R),
+\end{equation}
+with
+\begin{equation}
+\hat V_{en}(\bm R)= -\sum_{iA}\frac{Z_A}{|\bm r_i-\bm R_A|}
+\end{equation}
+and
+\begin{equation}
+V_{nn}(\bm R)=\sum_{A<B}\frac{Z_A Z_B}{|\bm R_A-\bm R_B|}.
+\end{equation}
+
+Since only $\hat V_{en}$ and $V_{nn}$ depend explicitly on nuclear coordinates,
+\begin{equation}
+\hat F_k
+=
+\frac{\partial \hat H_{\mathrm{BO}}}{\partial Q_k}
+=
+\frac{\partial \hat V_{en}}{\partial Q_k}
++
+\frac{\partial V_{nn}}{\partial Q_k}\hat I,
+\end{equation}
+and
+\begin{equation}
+\hat G_{kl}
+=
+\frac{\partial^2 \hat H_{\mathrm{BO}}}{\partial Q_k \partial Q_l}
+=
+\frac{\partial^2 \hat V_{en}}{\partial Q_k \partial Q_l}
++
+\frac{\partial^2 V_{nn}}{\partial Q_k \partial Q_l}\hat I.
+\end{equation}
+
+\section*{Cartesian Nuclear Derivatives}
+
+Using Cartesian nuclear coordinates $R_{A\alpha}$, with atom index $A$ and
+Cartesian component $\alpha \in \{x,y,z\}$,
+\begin{equation}
+\hat F_{A\alpha}
+=
+\frac{\partial \hat H_{\mathrm{BO}}}{\partial R_{A\alpha}},
+\qquad
+\hat G_{A\alpha,B\beta}
+=
+\frac{\partial^2 \hat H_{\mathrm{BO}}}
+{\partial R_{A\alpha}\partial R_{B\beta}}.
+\end{equation}
+
+Let
+\begin{equation}
+\bm x = \bm r - \bm R_A,
+\qquad
+x_\alpha = r_\alpha - R_{A\alpha},
+\qquad
+\rho = |\bm x|.
+\end{equation}
+Then
+\begin{equation}
+\frac{1}{|\bm r-\bm R_A|} = \frac{1}{\rho},
+\qquad
+\frac{\partial}{\partial R_{A\alpha}} = -\frac{\partial}{\partial x_\alpha}.
+\end{equation}
+
+Therefore, the first derivative is
+\begin{equation}
+\frac{\partial}{\partial R_{A\alpha}} \frac{1}{\rho}
+=
+\frac{x_\alpha}{\rho^3}
+=
+\frac{r_\alpha - R_{A\alpha}}{|\bm r-\bm R_A|^3}.
+\end{equation}
+
+For the electron--nuclear operator,
+\begin{equation}
+\frac{\partial \hat V_{en}}{\partial R_{A\alpha}}
+=
+- Z_A \sum_i \frac{r_{i\alpha}-R_{A\alpha}}{|\bm r_i-\bm R_A|^3}.
+\end{equation}
+
+The second derivative is
+\begin{equation}
+\frac{\partial^2}{\partial R_{A\alpha}\partial R_{A\beta}} \frac{1}{\rho}
+=
+-\frac{\delta_{\alpha\beta}}{\rho^3}
++
+\frac{3 x_\alpha x_\beta}{\rho^5},
+\end{equation}
+or equivalently,
+\begin{equation}
+\frac{\partial^2}{\partial R_{A\alpha}\partial R_{A\beta}}
+\frac{1}{|\bm r-\bm R_A|}
+=
+-\frac{\delta_{\alpha\beta}}{|\bm r-\bm R_A|^3}
++
+\frac{3(r_\alpha-R_{A\alpha})(r_\beta-R_{A\beta})}{|\bm r-\bm R_A|^5}.
+\end{equation}
+
+Thus,
+\begin{equation}
+\frac{\partial^2 \hat V_{en}}
+{\partial R_{A\alpha}\partial R_{A\beta}}
+=
+- Z_A \sum_i
+\left[
+-\frac{\delta_{\alpha\beta}}{|\bm r_i-\bm R_A|^3}
++
+\frac{3(r_{i\alpha}-R_{A\alpha})(r_{i\beta}-R_{A\beta})}
+{|\bm r_i-\bm R_A|^5}
+\right].
+\end{equation}
+
+For different nuclei,
+\begin{equation}
+\frac{\partial^2 \hat V_{en}}
+{\partial R_{A\alpha}\partial R_{B\beta}} = 0,
+\qquad A \ne B.
+\end{equation}
+
+\section*{AO Matrix Elements}
+
+In an AO basis $\{\mu,\nu\}$, define
+\begin{equation}
+h^{(1)}_{A\alpha,\mu\nu}
+=
+\left\langle \mu \left|
+\frac{\partial \hat V_{en}}{\partial R_{A\alpha}}
+\right| \nu \right\rangle
+\end{equation}
+and
+\begin{equation}
+h^{(2)}_{A\alpha,B\beta,\mu\nu}
+=
+\left\langle \mu \left|
+\frac{\partial^2 \hat V_{en}}
+{\partial R_{A\alpha}\partial R_{B\beta}}
+\right| \nu \right\rangle.
+\end{equation}
+
+\section*{State-Basis Matrix Elements}
+
+Let the spin-traced one-particle transition density matrix be
+\begin{equation}
+\gamma^{\beta\alpha'}_{\nu\mu}
+=
+\langle \Phi_\beta | a_\mu^\dagger a_\nu | \Phi_{\alpha'} \rangle.
+\end{equation}
+Then
+\begin{equation}
+F_{A\alpha}^{\beta\alpha'}
+=
+\langle \Phi_\beta | \hat F_{A\alpha} | \Phi_{\alpha'} \rangle
+=
+\sum_{\mu\nu}
+\gamma^{\beta\alpha'}_{\nu\mu}\,
+h^{(1)}_{A\alpha,\mu\nu}
++
+\delta_{\beta\alpha'}
+\frac{\partial V_{nn}}{\partial R_{A\alpha}},
+\end{equation}
+and
+\begin{equation}
+G_{A\alpha,B\beta}^{\beta\alpha'}
+=
+\langle \Phi_\beta | \hat G_{A\alpha,B\beta} | \Phi_{\alpha'} \rangle
+=
+\sum_{\mu\nu}
+\gamma^{\beta\alpha'}_{\nu\mu}\,
+h^{(2)}_{A\alpha,B\beta,\mu\nu}
++
+\delta_{\beta\alpha'}
+\frac{\partial^2 V_{nn}}
+{\partial R_{A\alpha}\partial R_{B\beta}}.
+\end{equation}
+
+\section*{Projection to Normal Coordinates}
+
+For a linear coordinate transform
+\begin{equation}
+Q_k = \sum_{A\alpha} L_{k,A\alpha} R_{A\alpha},
+\end{equation}
+the projected first- and second-order derivative matrices are
+\begin{equation}
+F_k^{\beta\alpha'}
+=
+\sum_{A\alpha} L_{k,A\alpha}\,
+F_{A\alpha}^{\beta\alpha'},
+\end{equation}
+and
+\begin{equation}
+G_{kl}^{\beta\alpha'}
+=
+\sum_{A\alpha,B\beta}
+L_{k,A\alpha}L_{l,B\beta}\,
+G_{A\alpha,B\beta}^{\beta\alpha'}.
+\end{equation}
+
+\end{document}

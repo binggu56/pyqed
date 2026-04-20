@@ -1,13 +1,35 @@
 import numpy as np
 
 from pyqed.qchem import Molecule
+from pyqed.qchem.basis import (
+    _basis_cy,
+    _basis_signature,
+    _cart_shell_blocks,
+    _compute_cartesian_shell_quartet_block_cython,
+    _compute_dense_eri_serial,
+    _compute_dense_eri_serial_aopairs,
+    _compute_dense_eri_serial_cython_blocked,
+    _compute_one_electron_shellblocked,
+    _compute_one_electron_shellblocked_cython,
+    _compute_pair_bounds,
+    _shell,
+    make_contractions,
+    parse_gbs,
+    _basis_path,
+)
+
+try:
+    from pyscf import gto, scf
+except ImportError:  # pragma: no cover - optional dependency in some envs
+    gto = None
+    scf = None
 
 
 def test_native_build_is_default_and_produces_ao_tensors():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build()
 
-    assert mol._build_driver == 'native'
+    assert mol._build_driver in {'native', 'builtin'}
     assert mol.nao == 2
     assert mol.overlap.shape == (2, 2)
     assert mol.hcore.shape == (2, 2)
@@ -21,3 +43,174 @@ def test_native_build_runs_rhf_without_external_integral_backends():
 
     mf = mol.RHF().run(max_cycle=60)
     assert np.isfinite(mf.e_tot)
+
+
+def test_native_shell_generator_includes_f_cartesian_components():
+    assert _shell(2) == [
+        (2, 0, 0),
+        (1, 1, 0),
+        (1, 0, 1),
+        (0, 2, 0),
+        (0, 1, 1),
+        (0, 0, 2),
+    ]
+    assert len(_shell(3)) == 10
+    assert _shell(3)[0] == (3, 0, 0)
+    assert _shell(3)[-1] == (0, 0, 3)
+
+
+def test_native_build_supports_d_shells_in_cartesian_basis():
+    if gto is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    basis = '6-31g(d,p)'
+
+    mol = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol.build(driver='builtin')
+    mf = mol.RHF().run(max_cycle=80)
+
+    ref = scf.RHF(gto.M(atom=atom, basis=basis, unit='angstrom', cart=True)).run(conv_tol=1e-12)
+
+    assert mol.nao == ref.mol.nao
+    assert np.isfinite(mf.e_tot)
+    np.testing.assert_allclose(mf.e_tot, ref.e_tot, atol=1e-8, rtol=1e-8)
+
+
+def test_shell_blocked_dense_eri_matches_legacy_aopair_builder():
+    atom = 'H 0 0 0; H 0 0 1.4'
+    mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    basis_dict = parse_gbs(_basis_path(mol.basis))
+    basis = make_contractions(basis_dict, mol.atom_symbols(), np.asarray(mol.atom_coords(), dtype=float), coord_types='p')
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    pair_bounds = _compute_pair_bounds(signatures)
+
+    eri_shell, computed_shell, skipped_shell = _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
+    eri_pair, computed_pair, skipped_pair = _compute_dense_eri_serial_aopairs(signatures, pair_bounds, 0.0)
+
+    np.testing.assert_allclose(eri_shell, eri_pair, atol=1e-12, rtol=1e-12)
+    assert computed_shell == computed_pair
+    assert skipped_shell == skipped_pair == 0
+
+
+def test_cython_dense_eri_matches_legacy_aopair_builder_for_d_shell_case():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
+    mol.build(driver='builtin', options={'eri_representation': 'dense'})
+    signatures = tuple(_basis_signature(fn) for fn in mol._bas)
+    pair_bounds = _compute_pair_bounds(signatures)
+
+    eri_compiled, computed_compiled, skipped_compiled = _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
+    eri_pair, computed_pair, skipped_pair = _compute_dense_eri_serial_aopairs(signatures, pair_bounds, 0.0)
+
+    np.testing.assert_allclose(eri_compiled, eri_pair, atol=1e-9, rtol=1e-9)
+    assert computed_compiled >= computed_pair
+    assert skipped_compiled == skipped_pair == 0
+
+
+def test_cython_blocked_dense_eri_matches_legacy_aopair_builder_for_d_shell_case():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
+    mol.build(driver='builtin', options={'eri_representation': 'dense'})
+    signatures = tuple(_basis_signature(fn) for fn in mol._bas)
+    pair_bounds = _compute_pair_bounds(signatures)
+
+    blocked = _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, 0.0)
+    assert blocked is not None
+    eri_blocked, computed_blocked, skipped_blocked = blocked
+    eri_pair, computed_pair, skipped_pair = _compute_dense_eri_serial_aopairs(signatures, pair_bounds, 0.0)
+
+    np.testing.assert_allclose(eri_blocked, eri_pair, atol=1e-9, rtol=1e-9)
+    assert computed_blocked >= computed_pair
+    assert skipped_blocked == skipped_pair == 0
+
+
+def test_cython_cartesian_shell_quartet_block_matches_dense_slice():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
+    mol.build(driver='builtin', options={'eri_representation': 'dense'})
+    signatures = tuple(_basis_signature(fn) for fn in mol._bas)
+    shell_blocks = _cart_shell_blocks(mol._bas)
+
+    # Choose a nontrivial quartet that includes the d-shell block on F.
+    a0, a1, _ = shell_blocks[1]
+    b0, b1, _ = shell_blocks[2]
+    c0, c1, _ = shell_blocks[-2]
+    d0, d1, _ = shell_blocks[-1]
+    block = _compute_cartesian_shell_quartet_block_cython(
+        signatures, (a0, a1, b0, b1, c0, c1, d0, d1)
+    )
+    if block is None:
+        return
+
+    pair_bounds = _compute_pair_bounds(signatures)
+    eri_dense, _, _ = _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
+    ref = eri_dense[a0:a1, b0:b1, c0:c1, d0:d1]
+    np.testing.assert_allclose(block, ref, atol=1e-9, rtol=1e-9)
+
+
+def test_cython_one_electron_matches_python_builder():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
+    basis_dict = parse_gbs(_basis_path(mol.basis))
+    basis = make_contractions(
+        basis_dict,
+        mol.atom_symbols(),
+        np.asarray(mol.atom_coords(), dtype=float),
+        coord_types='c',
+    )
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    py_overlap, py_kinetic, py_vnuc = _compute_one_electron_shellblocked(
+        basis,
+        np.asarray(mol.atom_coords(), dtype=float),
+        np.asarray(mol.atom_charges(), dtype=float),
+    )
+    cy_result = _compute_one_electron_shellblocked_cython(
+        signatures,
+        np.asarray(mol.atom_coords(), dtype=float),
+        np.asarray(mol.atom_charges(), dtype=float),
+    )
+    assert cy_result is not None
+    cy_overlap, cy_kinetic, cy_vnuc = cy_result
+    np.testing.assert_allclose(cy_overlap, py_overlap, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(cy_kinetic, py_kinetic, atol=1e-9, rtol=1e-9)
+    np.testing.assert_allclose(cy_vnuc, py_vnuc, atol=1e-9, rtol=1e-9)
+
+
+def test_factor_only_builtin_d_shell_matches_dense_plus_factors():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    basis = '6-31g(d,p)'
+
+    mol_dense = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol_dense.build(
+        driver='builtin',
+        options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
+    )
+    mf_dense = mol_dense.RHF().run(cholesky_jk=True, cholesky_tol=1e-10, max_cycle=80)
+
+    mol_fact = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol_fact.build(
+        driver='builtin',
+        options={'eri_representation': 'factors', 'low_rank_tol': 1e-10},
+    )
+    mf_fact = mol_fact.RHF().run(cholesky_jk=True, cholesky_tol=1e-10, max_cycle=80)
+
+    assert mol_fact.eri is None
+    assert mol_fact.eri_factors is not None
+    assert mol_fact._builtin_build_info['factor_builder'] in {'cython-kernel', 'cython-kernel-blocked'}
+    np.testing.assert_allclose(mf_fact.e_tot, mf_dense.e_tot, atol=1e-8, rtol=1e-8)

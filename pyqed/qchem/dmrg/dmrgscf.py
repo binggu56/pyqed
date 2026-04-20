@@ -8,12 +8,12 @@ DMRGSCF
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
 # TODO: so since we are sharing CASSCF optimization code, currently after the DMRGSCF, final print get E(CASSCF) = xxxxxxx, it might be better if we fix that.
-from pyqed.qchem import QCDMRG, CASSCF
+from pyqed.qchem import DMRG, CASSCF
 from pyqed.qchem.mcscf.casscf import kernel, kernel_state_average
 import numpy as np
 
 
-class DMRGSCF(QCDMRG):
+class DMRGSCF(DMRG):
     def __init__(self, mf, ncas, nelecas, D=20, max_cycles=30, **kwargs):
        
         super().__init__(mf, ncas, nelecas, D, **kwargs)
@@ -48,7 +48,7 @@ class DMRGSCF(QCDMRG):
         nelecas = self.nelecas
         ncore = self.ncore
 
-        mc = QCDMRG(mf, ncas=ncas, nelecas=nelecas, D=self.D)
+        mc = DMRG(mf, ncas=ncas, nelecas=nelecas, D=self.D)
 
         # spin
         mc.spin_purification = self.spin_purification

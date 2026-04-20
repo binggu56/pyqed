@@ -10,6 +10,11 @@ from scipy.linalg import eigh
 # from pyqed.qchem.mcscf.casci import CASCI
 from opt_einsum import contract
 from pyqed.qchem.mcscf.direct_ci import CASCI
+from pyqed.qchem.mcscf.casci import (
+    _get_mf_cholesky_factors,
+    _resolve_use_cholesky_integrals,
+    transform_eri_factors_to_mo_pair,
+)
 # from pyqed.qchem.mcscf.casci import CASCI
 
 
@@ -130,10 +135,15 @@ def _fresh_casci_like(source):
     mc.direct_ci_max_cycle = source.direct_ci_max_cycle
     mc.direct_ci_max_subspace = source.direct_ci_max_subspace
     mc.direct_ci_reuse_guess = source.direct_ci_reuse_guess
+    mc.use_cholesky_integrals = getattr(source, 'use_cholesky_integrals', False)
+    mc.binary = getattr(source, 'binary', None)
+    mc.direct_connectivity = getattr(source, 'direct_connectivity', None)
+    mc.SC1 = getattr(source, 'SC1', None)
+    mc.SC2 = getattr(source, 'SC2', None)
     return mc
 
 
-class COCASCI(CASCI):
+class COCAS(CASCI):
     """
 
     Using the OptOrbFCI algorithm to optimize orbitals
@@ -145,7 +155,9 @@ class COCASCI(CASCI):
     def __init__(self, mf, ncas, nelecas, max_cycles=30,
                  optimizer='RCG', optimizer_history=7,
                  diis=True, diis_space=6, diis_start=2,
-                 ci_method='direct_ci', **kwargs):
+                 ci_method='direct_ci', direct_ci_dense_fallback_ndets=0,
+                 use_cholesky=None,
+                 **kwargs):
         super().__init__(mf, ncas, nelecas, **kwargs)
 
         self.max_cycles = max_cycles # macroiterations
@@ -160,6 +172,12 @@ class COCASCI(CASCI):
         self.diis_space = diis_space
         self.diis_start = diis_start
         self.ci_method = ci_method
+        self.use_cholesky = use_cholesky
+        self.use_cholesky_integrals = False
+        # Keep a consistent CI backend across macroiterations; switching
+        # between dense and direct solvers changes the effective orbital
+        # objective enough to confuse convergence comparisons.
+        self.direct_ci_dense_fallback_ndets = direct_ci_dense_fallback_ndets
 
 
         self.weights = None
@@ -167,7 +185,7 @@ class COCASCI(CASCI):
         self.e_history = []
 
 
-    def run(self, nstates= None, weights = None):
+    def run(self, nstates= None, weights = None, use_cholesky=None):
         mf = self.mf
 
         # canonical molecular orbs
@@ -187,25 +205,23 @@ class COCASCI(CASCI):
         nelecas = self.nelecas
         ncore = self.ncore
 
-        mc = CASCI(mf, ncas=ncas, nelecas=nelecas)
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky
+        if use_cholesky is None:
+            use_cholesky = bool(getattr(mf, "cholesky_jk", False))
+        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(mf, use_cholesky)
+
+        mc = _fresh_casci_like(self)
         # spin
-        mc.spin_purification = self.spin_purification
-        mc.ss = self.ss
-        mc.shift = self.shift
-
-        # shift = self.shift
-        # purify_spin = self.spin_purification
-
-
-        # if self.spin_purification:
-        #     mc.fix_spin(ss=self.ss, shift=self.shift)
-
-        mc.run(nstates, method=self.ci_method)
+        mc.run(nstates, method=self.ci_method, use_cholesky=self.use_cholesky_integrals)
 
 
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo()
-        eri = mf.get_eri_mo()
+        if self.use_cholesky_integrals:
+            eri = transform_eri_factors_to_mo_pair(_get_mf_cholesky_factors(mf), C0)
+        else:
+            eri = mf.get_eri_mo()
 
         U0 = np.zeros((nmo, ncas+ncore))
         for i in range(ncas+ncore):
@@ -221,6 +237,7 @@ class COCASCI(CASCI):
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
                 ci_method=self.ci_method,
+                use_cholesky=self.use_cholesky_integrals,
             )
 
         elif nstates > 1:
@@ -238,6 +255,7 @@ class COCASCI(CASCI):
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
                 ci_method=self.ci_method,
+                use_cholesky=self.use_cholesky_integrals,
             )
 
         self.mo_coeff = C
@@ -246,16 +264,16 @@ class COCASCI(CASCI):
         self.e_history = getattr(mc, 'e_history', [self.e_tot])
         self.e_core = mc.e_core
         self.hcore = mc.hcore
-        self.h1e = mc.h1e
-        self.h2e = mc.h2e
-        self.h2e_cas = mc.h2e_cas
-        self.eri_so = mc.eri_so
-        self.binary = mc.binary
-        self.SC1 = mc.SC1
-        self.SC2 = mc.SC2
-        self.direct_connectivity = mc.direct_connectivity
-        self.mo_core = mc.mo_core
-        self.mo_cas = mc.mo_cas
+        self.h1e = getattr(mc, 'h1e', None)
+        self.h2e = getattr(mc, 'h2e', None)
+        self.h2e_cas = getattr(mc, 'h2e_cas', None)
+        self.eri_so = getattr(mc, 'eri_so', None)
+        self.binary = getattr(mc, 'binary', None)
+        self.SC1 = getattr(mc, 'SC1', None)
+        self.SC2 = getattr(mc, 'SC2', None)
+        self.direct_connectivity = getattr(mc, 'direct_connectivity', None)
+        self.mo_core = getattr(mc, 'mo_core', None)
+        self.mo_cas = getattr(mc, 'mo_cas', None)
         self.nstates = mc.nstates
         self.solver_backend = getattr(mc, 'solver_backend', None)
 
@@ -290,9 +308,12 @@ def energy(U, h1e, eri, dm1, dm2):
         DESCRIPTION.
 
     """
-
     e = contract('pq, pa, qb, ab ->', h1e, U, U, dm1)
-    e += 0.5 * (contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U, U, U, U, dm2))
+    if np.ndim(eri) == 3:
+        transformed = contract('Ppq,pa,qb->Pab', eri, U, U)
+        e += 0.5 * contract('Pab,Pcd,abcd->', transformed, transformed, dm2)
+    else:
+        e += 0.5 * (contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U, U, U, U, dm2))
     return e
 
 
@@ -588,7 +609,7 @@ def gradient(U, h1e, h2e, dm1, dm2):
 
 
 
-class CASPT2(COCASCI):
+class CASPT2(COCAS):
     """
     CASSCF
     """
@@ -606,7 +627,7 @@ if __name__=='__main__':
 
     mf = mol.RHF().run()
 
-    mc = COCASCI(mf, ncas=6, nelecas=6, max_cycles=50)
+    mc = COCAS(mf, ncas=6, nelecas=6, max_cycles=50)
 
     nstates = 2
     mc.state_average(weights = np.ones(nstates)/nstates)
@@ -619,3 +640,7 @@ if __name__=='__main__':
     print(mc.e_tot[1]) #fitst excited state
     print([list(h) for h in mc.e_history]) #whole energy log in list
     print(mc.e_history) #whole energy log in array
+
+
+# Backward-compatible alias for older imports.
+COCASCI = COCAS

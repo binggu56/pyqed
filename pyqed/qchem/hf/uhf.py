@@ -15,6 +15,31 @@ from scipy.linalg import eigh
 from pyqed import dag, dagger
 
 
+_AUFBAU_ORDER = (
+    (1, 0, 2),
+    (2, 0, 2),
+    (2, 1, 6),
+    (3, 0, 2),
+    (3, 1, 6),
+    (4, 0, 2),
+    (3, 2, 10),
+    (4, 1, 6),
+    (5, 0, 2),
+    (4, 2, 10),
+    (5, 1, 6),
+    (6, 0, 2),
+    (4, 3, 14),
+    (5, 2, 10),
+    (6, 1, 6),
+    (7, 0, 2),
+)
+
+_AUFBAU_EXCEPTIONS = {
+    24: {(4, 0): 1, (3, 2): 5},
+    29: {(4, 0): 1, (3, 2): 10},
+}
+
+
 def _split_nelec(nelec, spin):
     spin = int(round(spin))
     nelec = int(round(nelec))
@@ -40,6 +65,7 @@ class UHF:
         self.conv_tol = 1e-8
         self.conv_tol_dm = 1e-6
         self.damping = 0.0
+        self.mom = False
 
         self.na = None
         self.nb = None
@@ -67,6 +93,8 @@ class UHF:
             self.mol,
             dm0=dm0,
             init_guess=kwargs.get('init_guess', self.init_guess),
+            mo_occ0=kwargs.get('mo_occ0', None),
+            mom=kwargs.get('mom', self.mom),
             max_cycle=kwargs.get('max_cycle', self.max_cycle),
             tol=kwargs.get('tol', kwargs.get('conv_tol', self.conv_tol)),
             d_tol=kwargs.get('d_tol', kwargs.get('conv_tol_dm', self.conv_tol_dm)),
@@ -266,11 +294,208 @@ def _diagonalize(fock, orth):
     return mo_energy, mo_coeff
 
 
-def _initial_guess(hcore, orth, na, nb, dm0=None, init_guess='h1e'):
-    mo_occ_a = np.zeros(hcore.shape[0])
-    mo_occ_b = np.zeros(hcore.shape[0])
-    mo_occ_a[:na] = 1.0
-    mo_occ_b[:nb] = 1.0
+def _validate_occ_vector(name, occ, nmo, nelec):
+    occ = np.asarray(occ, dtype=float)
+    if occ.shape != (nmo,):
+        raise ValueError(f"{name} must have shape ({nmo},), got {occ.shape}.")
+    if not np.allclose(occ, np.round(occ), atol=1e-12):
+        raise ValueError(f"{name} must contain integer occupations.")
+    if np.any(occ < 0.0) or np.any(occ > 1.0):
+        raise ValueError(f"{name} occupations must lie in [0, 1].")
+    if int(round(np.sum(occ))) != int(nelec):
+        raise ValueError(
+            f"{name} must sum to {nelec}, got {np.sum(occ)!r}."
+        )
+    return occ
+
+
+def _resolve_initial_occ(hcore, na, nb, mo_occ0=None):
+    if mo_occ0 is None:
+        mo_occ_a = np.zeros(hcore.shape[0])
+        mo_occ_b = np.zeros(hcore.shape[0])
+        mo_occ_a[:na] = 1.0
+        mo_occ_b[:nb] = 1.0
+        return mo_occ_a, mo_occ_b
+
+    try:
+        occ_a, occ_b = mo_occ0
+    except (TypeError, ValueError):
+        raise ValueError("mo_occ0 must be a 2-tuple of (occ_a, occ_b).") from None
+
+    mo_occ_a = _validate_occ_vector('mo_occ0[0]', occ_a, hcore.shape[0], na)
+    mo_occ_b = _validate_occ_vector('mo_occ0[1]', occ_b, hcore.shape[0], nb)
+    return mo_occ_a, mo_occ_b
+
+
+def _subshell_total_occupations(nelec):
+    remaining = int(nelec)
+    occ = {}
+    for n, l, capacity in _AUFBAU_ORDER:
+        if remaining <= 0:
+            break
+        fill = min(remaining, capacity)
+        occ[(n, l)] = fill
+        remaining -= fill
+    if remaining != 0:
+        raise ValueError(f"atom_config does not support nelec={nelec}.")
+    if int(nelec) in _AUFBAU_EXCEPTIONS:
+        for key, value in _AUFBAU_EXCEPTIONS[int(nelec)].items():
+            occ[key] = value
+    return occ
+
+
+def _subshell_spin_occupations(total_occ):
+    spin_occ = {}
+    for (n, l), occ in total_occ.items():
+        degeneracy = 2 * l + 1
+        na = min(occ, degeneracy)
+        nb = max(0, occ - degeneracy)
+        spin_occ[(n, l)] = (na, nb)
+    return spin_occ
+
+
+def _adjust_spin_occupations(spin_occ, na_target, nb_target):
+    na_current = sum(na for na, _ in spin_occ.values())
+    nb_current = sum(nb for _, nb in spin_occ.values())
+    delta_a = int(na_target - na_current)
+    delta_b = int(nb_target - nb_current)
+    if delta_a != -delta_b:
+        raise ValueError("Inconsistent target spin occupations.")
+    if delta_a == 0:
+        return spin_occ
+
+    # Work from outer shells inward when changing spin pairing.
+    keys = sorted(spin_occ, reverse=True)
+    updated = dict(spin_occ)
+    if delta_a > 0:
+        for key in keys:
+            na, nb = updated[key]
+            move = min(delta_a, nb)
+            if move:
+                updated[key] = (na + move, nb - move)
+                delta_a -= move
+            if delta_a == 0:
+                break
+    else:
+        delta_a = -delta_a
+        for key in keys:
+            na, nb = updated[key]
+            singly_occupied_alpha = max(0, na - nb)
+            move = min(delta_a, singly_occupied_alpha)
+            if move:
+                updated[key] = (na - move, nb + move)
+                delta_a -= move
+            if delta_a == 0:
+                break
+    if delta_a != 0:
+        raise ValueError("Unable to match requested spin with atom_config guess.")
+    return updated
+
+
+def _builtin_orientation_groups(mol):
+    if getattr(mol, '_build_driver', None) != 'builtin':
+        raise ValueError("init_guess='atom_config' currently requires driver='builtin'.")
+    if getattr(mol, '_bas', None) is None:
+        raise ValueError("Molecule basis is not built.")
+    if getattr(mol, 'natom', 0) != 1:
+        raise ValueError("init_guess='atom_config' currently supports single atoms only.")
+
+    groups = {}
+    for idx, bf in enumerate(mol._bas):
+        l = int(sum(bf.shell))
+        key = (
+            l,
+            tuple(int(x) for x in bf.shell),
+        )
+        if key not in groups:
+            groups[key] = {
+                'indices': [],
+                'l': l,
+            }
+        groups[key]['indices'].append(idx)
+
+    by_l = {}
+    for info in groups.values():
+        by_l.setdefault(info['l'], []).append(info)
+    for l in by_l:
+        by_l[l].sort(key=lambda item: item['indices'][0])
+    return by_l
+
+
+def _atom_config_density(mol, overlap, na, nb):
+    by_l = _builtin_orientation_groups(mol)
+    spin_occ = _subshell_spin_occupations(_subshell_total_occupations(mol.nelec))
+    spin_occ = _adjust_spin_occupations(spin_occ, na, nb)
+
+    subshells_by_l = {}
+    for (n, l), occ in spin_occ.items():
+        subshells_by_l.setdefault(l, []).append((n - l - 1, occ))
+    for l in subshells_by_l:
+        subshells_by_l[l].sort()
+
+    def build_dm_from_fock(fock_a, fock_b):
+        dm_a = np.zeros_like(overlap)
+        dm_b = np.zeros_like(overlap)
+        for l, shell_entries in subshells_by_l.items():
+            orientation_groups = by_l.get(l, [])
+            if not orientation_groups:
+                raise ValueError(
+                    f"Basis does not provide any l={l} functions for atom_config."
+                )
+
+            nradial = len(orientation_groups[0]['indices'])
+            norient = len(orientation_groups)
+            s_avg = np.zeros((nradial, nradial), dtype=float)
+            f_avg_a = np.zeros((nradial, nradial), dtype=float)
+            f_avg_b = np.zeros((nradial, nradial), dtype=float)
+            for orient in orientation_groups:
+                idx = orient['indices']
+                block = np.ix_(idx, idx)
+                s_avg += overlap[block]
+                f_avg_a += fock_a[block]
+                f_avg_b += fock_b[block]
+            s_avg /= norient
+            f_avg_a /= norient
+            f_avg_b /= norient
+
+            _, coeff_a = eigh(f_avg_a, s_avg)
+            _, coeff_b = eigh(f_avg_b, s_avg)
+
+            for shell_index, (nalpha_shell, nbeta_shell) in shell_entries:
+                if shell_index < 0 or shell_index >= nradial:
+                    raise ValueError(
+                        f"Basis does not provide enough l={l} shells for atom_config."
+                    )
+                occ_a_per_orient = nalpha_shell / norient
+                occ_b_per_orient = nbeta_shell / norient
+                vec_a = coeff_a[:, shell_index:shell_index + 1]
+                vec_b = coeff_b[:, shell_index:shell_index + 1]
+                proj_a = vec_a @ vec_a.conj().T
+                proj_b = vec_b @ vec_b.conj().T
+                for orient in orientation_groups:
+                    idx = orient['indices']
+                    block = np.ix_(idx, idx)
+                    if occ_a_per_orient:
+                        dm_a[block] += occ_a_per_orient * proj_a
+                    if occ_b_per_orient:
+                        dm_b[block] += occ_b_per_orient * proj_b
+        return np.array((dm_a, dm_b))
+
+    dm = build_dm_from_fock(mol.hcore, mol.hcore)
+    for _ in range(12):
+        vhf = get_veff(mol, dm)
+        fock_a = mol.hcore + vhf[0]
+        fock_b = mol.hcore + vhf[1]
+        dm_new = build_dm_from_fock(fock_a, fock_b)
+        if np.linalg.norm(dm_new - dm) < 1e-10:
+            dm = dm_new
+            break
+        dm = 0.7 * dm_new + 0.3 * dm
+    return dm
+
+
+def _initial_guess(mol, hcore, overlap, orth, na, nb, dm0=None, init_guess='h1e', mo_occ0=None):
+    mo_occ_a, mo_occ_b = _resolve_initial_occ(hcore, na, nb, mo_occ0=mo_occ0)
 
     if dm0 is not None:
         dm = np.asarray(dm0, dtype=float)
@@ -278,13 +503,38 @@ def _initial_guess(hcore, orth, na, nb, dm0=None, init_guess='h1e'):
             raise ValueError("dm0 must have shape (2, nao, nao).")
         return dm, (mo_occ_a, mo_occ_b)
 
-    if init_guess not in ('h1e', 'hcore'):
-        raise ValueError("Only init_guess='h1e'/'hcore' is currently supported.")
+    if init_guess not in ('h1e', 'hcore', 'atom_config'):
+        raise ValueError(
+            "Only init_guess='h1e'/'hcore'/'atom_config' is currently supported."
+        )
+
+    if init_guess == 'atom_config':
+        dm = _atom_config_density(mol=mol, overlap=overlap, na=na, nb=nb)
+        return dm, (mo_occ_a, mo_occ_b)
 
     mo_energy, mo_coeff = _diagonalize(hcore, orth)
     dm_a = make_rdm1(mo_coeff, mo_occ_a)
     dm_b = make_rdm1(mo_coeff, mo_occ_b)
     return np.array((dm_a, dm_b)), (mo_occ_a, mo_occ_b)
+
+
+def _occupied_subspace_from_density(dm_spin, overlap, nocc):
+    occ_vals, coeff = eigh(dm_spin, overlap)
+    order = np.argsort(occ_vals)[::-1]
+    if nocc == 0:
+        return coeff[:, :0]
+    return coeff[:, order[:nocc]]
+
+
+def _mom_select_occupations(mo_coeff, prev_occ_coeff, overlap, nocc):
+    if nocc == 0:
+        return np.zeros(mo_coeff.shape[1], dtype=float), mo_coeff[:, :0]
+    proj = prev_occ_coeff.conj().T @ overlap @ mo_coeff
+    scores = np.sum(np.abs(proj) ** 2, axis=0)
+    occ_idx = np.argsort(scores)[::-1][:nocc]
+    occ = np.zeros(mo_coeff.shape[1], dtype=float)
+    occ[occ_idx] = 1.0
+    return occ, mo_coeff[:, occ_idx]
 
 
 def _make_diis_extrapolator(max_diis=6):
@@ -357,6 +607,8 @@ def unrestricted_hartree_fock(
     mol,
     dm0=None,
     init_guess='h1e',
+    mo_occ0=None,
+    mom=False,
     max_cycle=50,
     tol=1e-8,
     d_tol=1e-6,
@@ -369,7 +621,21 @@ def unrestricted_hartree_fock(
     orth = _orthogonalizer(overlap)
     na, nb = _split_nelec(mol.nelec, getattr(mol, 'spin', 0))
 
-    dm, mo_occ = _initial_guess(hcore, orth, na, nb, dm0=dm0, init_guess=init_guess)
+    dm, mo_occ = _initial_guess(
+        mol,
+        hcore,
+        overlap,
+        orth,
+        na,
+        nb,
+        dm0=dm0,
+        init_guess=init_guess,
+        mo_occ0=mo_occ0,
+    )
+    prev_occ_coeff = (
+        _occupied_subspace_from_density(dm[0], overlap, na),
+        _occupied_subspace_from_density(dm[1], overlap, nb),
+    )
     diis = _make_diis_extrapolator()
 
     e_last = None
@@ -389,6 +655,21 @@ def unrestricted_hartree_fock(
 
         mo_energy_a, mo_coeff_a = _diagonalize(fock[0], orth)
         mo_energy_b, mo_coeff_b = _diagonalize(fock[1], orth)
+
+        if mom:
+            mo_occ_a, occ_coeff_a = _mom_select_occupations(
+                mo_coeff_a, prev_occ_coeff[0], overlap, na
+            )
+            mo_occ_b, occ_coeff_b = _mom_select_occupations(
+                mo_coeff_b, prev_occ_coeff[1], overlap, nb
+            )
+            mo_occ = (mo_occ_a, mo_occ_b)
+            prev_occ_coeff = (occ_coeff_a, occ_coeff_b)
+        else:
+            prev_occ_coeff = (
+                mo_coeff_a[:, mo_occ[0] > 0],
+                mo_coeff_b[:, mo_occ[1] > 0],
+            )
 
         dm_new = np.array((
             make_rdm1(mo_coeff_a, mo_occ[0]),

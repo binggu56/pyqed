@@ -10,6 +10,25 @@ import numpy as np
 from opt_einsum import contract
 
 
+def _factorized_two_electron_energy(U, pair_factors, dm2):
+    """Two-electron orbital objective from Cholesky pair factors."""
+    transformed = contract('Ppq,pa,qb->Pab', pair_factors, U, U)
+    return 0.5 * contract('Pab,Pcd,abcd->', transformed, transformed, dm2)
+
+
+def _factorized_two_electron_gradient(U, pair_factors, dm2):
+    """Two-electron orbital gradient from Cholesky pair factors."""
+    transformed = contract('Ppq,pa,qb->Pab', pair_factors, U, U)
+    left = contract('Pcd,abcd->Pab', transformed, dm2)
+    right = contract('Pab,abcd->Pcd', transformed, dm2)
+    return 0.5 * (
+        contract('Ppq,qb,Pab->pa', pair_factors, U, left)
+        + contract('Ppq,pa,Pab->qb', pair_factors, U, left)
+        + contract('Prs,sd,Pcd->rc', pair_factors, U, right)
+        + contract('Prs,rc,Pcd->sd', pair_factors, U, right)
+    )
+
+
 def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
              history_size=7):
@@ -372,40 +391,25 @@ def inner(a, b):
 
 def gradient(U, h1e, h2e, dm1, dm2):
     g = h1e @ U @ dm1.T + h1e.T @ U @ dm1  # these two terms are probably the same
-    g += 0.5 * (contract('pqrs, qb, rc, sd, abcd -> pa', h2e, U, U, U, dm2) + \
-        contract('pqrs, pa, rc, sd, abcd -> qb', h2e, U, U, U, dm2) + \
-        contract('pqrs, pa, qb, sd, abcd -> rc', h2e, U, U, U, dm2) + \
-        contract('pqrs, pa, qb, rc, abcd -> sd', h2e, U, U, U, dm2) )
+    if np.ndim(h2e) == 3:
+        g += _factorized_two_electron_gradient(U, h2e, dm2)
+    else:
+        g += 0.5 * (contract('pqrs, qb, rc, sd, abcd -> pa', h2e, U, U, U, dm2) + \
+            contract('pqrs, pa, rc, sd, abcd -> qb', h2e, U, U, U, dm2) + \
+            contract('pqrs, pa, qb, sd, abcd -> rc', h2e, U, U, U, dm2) + \
+            contract('pqrs, pa, qb, rc, abcd -> sd', h2e, U, U, U, dm2) )
     return g
 
 
 def energy(U, h1e, eri, dm1, dm2):
-    """
-    electronic energy
-
-    Parameters
-    ----------
-    U : ndarray of (n, p < n/2)
-        transformation matrix
-    h1e : TYPE
-        core Hamiltonian in canonical MO
-    eri : TYPE
-        DESCRIPTION.
-    dm1 : TYPE
-        DESCRIPTION.
-    dm2 : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    e : TYPE
-        DESCRIPTION.
-
-    """
-
+    """Orbital objective supporting dense ERIs or factorized pair factors."""
     e = contract('pq, pa, qb, ab ->', h1e, U, U, dm1)
-    e += 0.5 * (contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U, U, U, U, dm2))
+    if np.ndim(eri) == 3:
+        e += _factorized_two_electron_energy(U, eri, dm2)
+    else:
+        e += 0.5 * contract('pqrs, pa, qb, rc, sd, abcd ->', eri, U, U, U, U, dm2)
     return e
+
 
 def kernel(mf, U0, max_steps=50, tol=1e-6):
     """

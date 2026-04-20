@@ -39,6 +39,12 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
 from pyqed.qchem.hf.rhf import ao2mo
 
 from pyqed.qchem.mcscf.casci import (
+    _as_spin_tuple,
+    _is_uhf_reference,
+    _normalize_spin_1e_operator,
+    _reference_active_occupations,
+    _slice_active_orbitals,
+    _factorized_ci_overlap as overlap,
     h1e_for_cas,
     size_of_cas,
     spin_square as spin_square_from_rdm,
@@ -53,6 +59,8 @@ from numba import njit, prange
 
 
 DIRECT_CI_DENSE_FALLBACK_NDETS = 256
+DIRECT_CI_AUTO_EIGSH_NDETS = 10000
+DIRECT_CI_ROOT_CUSHION = 2
 
 
 @dataclass
@@ -148,7 +156,6 @@ def _build_davidson_guess(diag, nroots, guess=None):
 
     return _orthonormalize_columns(np.column_stack(cols))
 
-
 def _select_direct_ci_guess(casci, nstates, ci0=None):
     """
     Choose the starting vectors for the direct-CI eigensolver.
@@ -190,10 +197,10 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
         raise ValueError('nroots must be between 1 and the CI dimension.')
 
     if max_subspace is None:
-        # A modest subspace is usually enough for low-root CASCI while keeping
-        # the Rayleigh-Ritz diagonalization cheap.  This default works better
-        # for the current direct-CI benchmarks than the larger initial choice.
-        max_subspace = min(n, max(16, 6 * nroots))
+        # Keep a meaningfully larger default subspace than the first lightweight
+        # implementation. Medium-size CASCI problems often need more than a
+        # handful of vectors before the diagonal preconditioner becomes useful.
+        max_subspace = min(n, max(32, 20 * nroots))
 
     V = _build_davidson_guess(diag, nroots, guess=guess)
     AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
@@ -235,10 +242,17 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
             return theta, ritz
 
         if V.shape[1] + len(new_vecs) > max_subspace:
-            # Restart from the current Ritz vectors.  This keeps the subspace
-            # size bounded without losing the best approximation accumulated so
-            # far.
-            V = _orthonormalize_columns(ritz)
+            # Use a thick restart rather than collapsing all the way back to
+            # the target roots. This preserves nearby Ritz information that is
+            # often essential for correlated CI Hamiltonians.
+            extra_block = np.column_stack(new_vecs) if new_vecs else None
+            restart_cols = []
+            keep = min(alpha_all.shape[1], max(2 * nroots + 2, nroots + 1))
+            for i in range(keep):
+                restart_cols.append(V @ alpha_all[:, i])
+            if extra_block is not None:
+                restart_cols.extend(extra_block[:, i] for i in range(extra_block.shape[1]))
+            V = _orthonormalize_columns(np.column_stack(restart_cols))
             AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
         else:
             new_block = np.column_stack(new_vecs)
@@ -295,6 +309,28 @@ def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore, use_chol
     only needs the spatial integrals plus the spin-resolved occupation patterns.
     """
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
+    if _is_uhf_reference(mo_coeff):
+        mo_cas_a = mo_coeff[0][:, ncore:ncore+ncas]
+        mo_cas_b = mo_coeff[1][:, ncore:ncore+ncas]
+        eri_factors = _get_mf_cholesky_factors(mf) if use_cholesky else None
+        eri_aa = transform_spatial_eri_to_mo(
+            mf, mo_cas_a, mo_cas_a, mo_cas_a, mo_cas_a,
+            use_cholesky=use_cholesky, eri_factors=eri_factors,
+        )
+        eri_ab = transform_spatial_eri_to_mo(
+            mf, mo_cas_a, mo_cas_a, mo_cas_b, mo_cas_b,
+            use_cholesky=use_cholesky, eri_factors=eri_factors,
+        )
+        eri_ba = transform_spatial_eri_to_mo(
+            mf, mo_cas_b, mo_cas_b, mo_cas_a, mo_cas_a,
+            use_cholesky=use_cholesky, eri_factors=eri_factors,
+        )
+        eri_bb = transform_spatial_eri_to_mo(
+            mf, mo_cas_b, mo_cas_b, mo_cas_b, mo_cas_b,
+            use_cholesky=use_cholesky, eri_factors=eri_factors,
+        )
+        return h1, (eri_aa, eri_ab, eri_ba, eri_bb), energy_core
+
     mo_cas = mo_coeff[:, ncore:ncore+ncas]
     eri_spatial = transform_spatial_eri_to_mo(
         mf,
@@ -313,9 +349,19 @@ def transform_active_space_pair_factors(mf, mo_coeff, ncas, ncore, eri_factors=N
     Build active-space MO-pair Cholesky factors for the direct-CI solver.
     """
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
-    mo_cas = mo_coeff[:, ncore:ncore+ncas]
     if eri_factors is None:
         eri_factors = _get_mf_cholesky_factors(mf)
+
+    if _is_uhf_reference(mo_coeff):
+        mo_cas_a = mo_coeff[0][:, ncore:ncore+ncas]
+        mo_cas_b = mo_coeff[1][:, ncore:ncore+ncas]
+        pair_factors = (
+            transform_eri_factors_to_mo_pair(eri_factors, mo_cas_a, mo_cas_a),
+            transform_eri_factors_to_mo_pair(eri_factors, mo_cas_b, mo_cas_b),
+        )
+        return h1, pair_factors, energy_core
+
+    mo_cas = mo_coeff[:, ncore:ncore+ncas]
     pair_factors = transform_eri_factors_to_mo_pair(eri_factors, mo_cas, mo_cas)
     return h1, pair_factors, energy_core
 
@@ -706,6 +752,14 @@ def _factor_coulomb(pair_factors, p, q, r, s):
     return val
 
 
+@njit(nogil=True, cache=True, fastmath=True)
+def _factor_coulomb_mixed(pair_factors_left, pair_factors_right, p, q, r, s):
+    val = 0.0
+    for t in range(pair_factors_left.shape[0]):
+        val += pair_factors_left[t, p, q] * pair_factors_right[t, r, s]
+    return val
+
+
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_diag_compact_factors(h1, pair_factors, Binary):
     """
@@ -740,6 +794,46 @@ def _compute_diag_compact_factors(h1, pair_factors, Binary):
                         H_diag[i] += 0.5 * (coul - exch)
                     if Binary[i, 0, q]:
                         H_diag[i] += 0.5 * coul
+
+    return H_diag
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_diag_compact_factors_uhf(h1a, h1b, pair_factors_a, pair_factors_b, Binary):
+    n_dets, _, n_mo = Binary.shape
+    h1a_diag = np.diag(h1a)
+    h1b_diag = np.diag(h1b)
+    H_diag = np.zeros(n_dets)
+
+    for i in prange(n_dets):
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                H_diag[i] += h1a_diag[p]
+            if Binary[i, 1, p]:
+                H_diag[i] += h1b_diag[p]
+
+        for p in range(n_mo):
+            if Binary[i, 0, p]:
+                for q in range(n_mo):
+                    if Binary[i, 0, q]:
+                        coul = _factor_coulomb(pair_factors_a, p, p, q, q)
+                        exch = _factor_coulomb(pair_factors_a, p, q, q, p)
+                        H_diag[i] += 0.5 * (coul - exch)
+                    if Binary[i, 1, q]:
+                        H_diag[i] += 0.5 * _factor_coulomb_mixed(
+                            pair_factors_a, pair_factors_b, p, p, q, q
+                        )
+
+            if Binary[i, 1, p]:
+                for q in range(n_mo):
+                    if Binary[i, 1, q]:
+                        coul = _factor_coulomb(pair_factors_b, p, p, q, q)
+                        exch = _factor_coulomb(pair_factors_b, p, q, q, p)
+                        H_diag[i] += 0.5 * (coul - exch)
+                    if Binary[i, 0, q]:
+                        H_diag[i] += 0.5 * _factor_coulomb_mixed(
+                            pair_factors_b, pair_factors_a, p, p, q, q
+                        )
 
     return H_diag
 
@@ -1226,6 +1320,36 @@ def _compute_single_values_from_factors(J, p_idx, q_idx, phase, h1, pair_factors
 
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_single_values_from_factors_uhf(
+    J, p_idx, q_idx, phase, h1_spin, pair_factors_spin, pair_factors_other, Binary, spin
+):
+    n_exc = len(J)
+    n_mo = h1_spin.shape[0]
+    values = np.zeros(n_exc)
+
+    for k in prange(n_exc):
+        p = p_idx[k]
+        q = q_idx[k]
+        sign = phase[k]
+        j = J[k]
+
+        val = -sign * h1_spin[p, q]
+        for r in range(n_mo):
+            coul = _factor_coulomb(pair_factors_spin, p, q, r, r)
+            if Binary[j, spin, r] and r != q:
+                exch = _factor_coulomb(pair_factors_spin, p, r, r, q)
+                val -= sign * (coul - exch)
+            if Binary[j, 1 - spin, r]:
+                val -= sign * _factor_coulomb_mixed(
+                    pair_factors_spin, pair_factors_other, p, q, r, r
+                )
+
+        values[k] = val
+
+    return values
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_double_same_values_from_factors(p_idx, q_idx, r_idx, s_idx, phase, pair_factors):
     n_exc = len(p_idx)
     values = np.zeros(n_exc)
@@ -1247,6 +1371,21 @@ def _compute_double_cross_values_from_factors(p_idx, q_idx, r_idx, s_idx, phase,
     for k in prange(n_exc):
         values[k] = phase[k] * _factor_coulomb(
             pair_factors, p_idx[k], q_idx[k], r_idx[k], s_idx[k]
+        )
+
+    return values
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _compute_double_cross_values_from_mixed_factors(
+    p_idx, q_idx, r_idx, s_idx, phase, pair_factors_left, pair_factors_right
+):
+    n_exc = len(p_idx)
+    values = np.zeros(n_exc)
+
+    for k in prange(n_exc):
+        values[k] = phase[k] * _factor_coulomb_mixed(
+            pair_factors_left, pair_factors_right, p_idx[k], q_idx[k], r_idx[k], s_idx[k]
         )
 
     return values
@@ -1360,6 +1499,8 @@ class CASCI(mcscf.casci.CASCI):
         self.direct_ci_dense_fallback_ndets = DIRECT_CI_DENSE_FALLBACK_NDETS
         self.solver_backend = None
         self.direct_ci_eigensolver = 'davidson'
+        self.direct_ci_auto_eigsh_ndets = DIRECT_CI_AUTO_EIGSH_NDETS
+        self.direct_ci_root_cushion = DIRECT_CI_ROOT_CUSHION
         self.direct_ci_max_cycle = 100
         self.direct_ci_max_subspace = None
         self.direct_ci_reuse_guess = True
@@ -1417,7 +1558,7 @@ class CASCI(mcscf.casci.CASCI):
         use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
 
         # molecular orbitals
-        Ca, Cb = [self.mo_cas, ] * 2
+        Ca, Cb = _as_spin_tuple(self.mo_cas)
 
         H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
                                      mo_coeff=self.mo_coeff)
@@ -1495,7 +1636,8 @@ class CASCI(mcscf.casci.CASCI):
 
         # H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca),
                          # np.einsum("AB, Ap, Bq -> pq", H, Cb, Cb)])
-        H1 = [H, H]
+        h1a, h1b = _normalize_spin_1e_operator(H)
+        H1 = [np.asarray(h1a), np.asarray(h1b)]
 
         if spin_flip:
             raise NotImplementedError('Spin-flip matrix elements not implemented yet')
@@ -1642,22 +1784,47 @@ class CASCI(mcscf.casci.CASCI):
                 energy_core,
             )
 
-        self._direct_factor_H_diag = _compute_diag_compact_factors(h1, pair_factors, binary)
-        self._direct_factor_H_A = _compute_single_values_from_factors(
-            conn.J_A, conn.p_A, conn.q_A, conn.phase_A, h1, pair_factors, binary, 0
-        )
-        self._direct_factor_H_B = _compute_single_values_from_factors(
-            conn.J_B, conn.p_B, conn.q_B, conn.phase_B, h1, pair_factors, binary, 1
-        )
-        self._direct_factor_H_AA = _compute_double_same_values_from_factors(
-            conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA, pair_factors
-        )
-        self._direct_factor_H_BB = _compute_double_same_values_from_factors(
-            conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB, pair_factors
-        )
-        self._direct_factor_H_AB = _compute_double_cross_values_from_factors(
-            conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB, pair_factors
-        )
+        if _is_uhf_reference(pair_factors):
+            pair_factors_a, pair_factors_b = pair_factors
+            h1a, h1b = _normalize_spin_1e_operator(h1)
+            self._direct_factor_H_diag = _compute_diag_compact_factors_uhf(
+                h1a, h1b, pair_factors_a, pair_factors_b, binary
+            )
+            self._direct_factor_H_A = _compute_single_values_from_factors_uhf(
+                conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                np.asarray(h1a), pair_factors_a, pair_factors_b, binary, 0
+            )
+            self._direct_factor_H_B = _compute_single_values_from_factors_uhf(
+                conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                np.asarray(h1b), pair_factors_b, pair_factors_a, binary, 1
+            )
+            self._direct_factor_H_AA = _compute_double_same_values_from_factors(
+                conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA, pair_factors_a
+            )
+            self._direct_factor_H_BB = _compute_double_same_values_from_factors(
+                conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB, pair_factors_b
+            )
+            self._direct_factor_H_AB = _compute_double_cross_values_from_mixed_factors(
+                conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
+                pair_factors_a, pair_factors_b
+            )
+        else:
+            self._direct_factor_H_diag = _compute_diag_compact_factors(h1, pair_factors, binary)
+            self._direct_factor_H_A = _compute_single_values_from_factors(
+                conn.J_A, conn.p_A, conn.q_A, conn.phase_A, h1, pair_factors, binary, 0
+            )
+            self._direct_factor_H_B = _compute_single_values_from_factors(
+                conn.J_B, conn.p_B, conn.q_B, conn.phase_B, h1, pair_factors, binary, 1
+            )
+            self._direct_factor_H_AA = _compute_double_same_values_from_factors(
+                conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA, pair_factors
+            )
+            self._direct_factor_H_BB = _compute_double_same_values_from_factors(
+                conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB, pair_factors
+            )
+            self._direct_factor_H_AB = _compute_double_cross_values_from_factors(
+                conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB, pair_factors
+            )
 
         return (
             h1,
@@ -1859,7 +2026,7 @@ class CASCI(mcscf.casci.CASCI):
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=False):
+    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=None):
         """
         solve the full CI in the active space
 
@@ -1889,27 +2056,29 @@ class CASCI(mcscf.casci.CASCI):
         # print("             CASCI              ")
         # print('------------------------------\n')
         self.nstates = nstates
+        requested_nstates = nstates
         self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
         use_cholesky = self.use_cholesky_integrals
+
+        if mo_coeff is None:
+            self.mo_coeff = self.mf.mo_coeff  # use HF MOs
+        else:
+            self.mo_coeff = mo_coeff
+
+        uhf_reference = _is_uhf_reference(self.mo_coeff)
 
         if method == 'ci':
             self.solver_backend = 'ci'
 
             # define the core and active space orbitals
-            if mo_coeff is None:
-                self.mo_coeff = self.mf.mo_coeff # use HF MOs
-            else:
-                self.mo_coeff = mo_coeff
-
             ncore = self.ncore
             ncas = self.ncas
 
-            self.mo_core = self.mo_coeff[:,:ncore]
-            self.mo_cas = self.mo_coeff[:,ncore:ncore+ncas]
+            self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
 
             # FCI solver, more efficient than the JW solver
 
-            mo_occ = mcscf.casci._reference_active_occupations(self.nelecas_spin, ncas)
+            mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
 
@@ -1971,21 +2140,14 @@ class CASCI(mcscf.casci.CASCI):
 
         elif method == 'direct_ci':
 
-            # define the core and active space orbitals
-            if mo_coeff is None:
-                self.mo_coeff = self.mf.mo_coeff # use HF MOs
-            else:
-                self.mo_coeff = mo_coeff
-
             ncore = self.ncore
             ncas = self.ncas
 
-            self.mo_core = self.mo_coeff[:,:ncore]
-            self.mo_cas = self.mo_coeff[:,ncore:ncore+ncas]
+            self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
 
             # FCI solver, more efficient than the JW solver
             if self.binary is None:
-                mo_occ = mcscf.casci._reference_active_occupations(self.nelecas_spin, ncas)
+                mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
                 binary = get_fci_combos(mo_occ = mo_occ)
                 self.binary = binary
                 self.direct_connectivity = build_direct_connectivity(binary)
@@ -2004,6 +2166,8 @@ class CASCI(mcscf.casci.CASCI):
                 h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
                 h1e = np.asarray(h1e)
                 spatial_h1 = None
+                same_spin_eri = None
+                cross_spin_eri = None
                 spatial_eri = None
             else:
                 factor_data = self.get_direct_factor_hamiltonian(binary, use_cholesky=use_cholesky)
@@ -2022,14 +2186,23 @@ class CASCI(mcscf.casci.CASCI):
                     same_spin_eri = None
                     cross_spin_eri = None
                     spatial_eri = None
-                    h1e = np.asarray([spatial_h1, spatial_h1])
+                    h1a, h1b = _normalize_spin_1e_operator(spatial_h1)
+                    h1e = np.asarray([h1a, h1b])
                     h2e = None
+                elif uhf_reference:
+                    h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
+                    h1e = np.asarray(h1e)
+                    spatial_h1 = None
+                    same_spin_eri = None
+                    cross_spin_eri = None
+                    spatial_eri = None
                 else:
                     spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals(
                         use_cholesky=use_cholesky
                     )
                     spatial_eri = cross_spin_eri
-                    h1e = np.asarray([spatial_h1, spatial_h1])
+                    h1a, h1b = _normalize_spin_1e_operator(spatial_h1)
+                    h1e = np.asarray([h1a, h1b])
                     h2e = None
 
             if self.spin_purification:
@@ -2058,6 +2231,8 @@ class CASCI(mcscf.casci.CASCI):
             if (
                 factor_data is None
                 and
+                not uhf_reference
+                and
                 self.direct_ci_dense_fallback_ndets is not None
                 and self.direct_ci_dense_fallback_ndets > 0
                 and binary.shape[0] <= self.direct_ci_dense_fallback_ndets
@@ -2079,9 +2254,14 @@ class CASCI(mcscf.casci.CASCI):
                 E, X = eigsh(H_CI, k=nstates, which='SA')
             else:
                 if factor_data is not None:
-                    self.solver_backend = 'direct_ci_factor_conn'
+                    self.solver_backend = 'direct_ci_factor_conn_uhf' if uhf_reference else 'direct_ci_factor_conn'
                 else:
                     self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
+                extra_roots = 0
+                if requested_nstates > 1:
+                    extra_roots = max(0, int(getattr(self, 'direct_ci_root_cushion', 0)))
+                    extra_roots = min(extra_roots, max(0, binary.shape[0] - requested_nstates))
+                solve_nstates = requested_nstates + extra_roots
                 # The diagonal is reused in every matvec, so it is worth
                 # computing once up front even in the matrix-free solver.
                 if factor_data is not None:
@@ -2141,7 +2321,19 @@ class CASCI(mcscf.casci.CASCI):
                         I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
                         I_AB, J_AB, ab_t, ab, ba_t, ba)
 
-                if self.direct_ci_eigensolver == 'davidson':
+                eigensolver = self.direct_ci_eigensolver
+                if eigensolver == 'auto':
+                    auto_eigsh_ndets = self.direct_ci_auto_eigsh_ndets
+                    if (
+                        auto_eigsh_ndets is not None
+                        and auto_eigsh_ndets > 0
+                        and binary.shape[0] <= auto_eigsh_ndets
+                    ):
+                        eigensolver = 'eigsh'
+                    else:
+                        eigensolver = 'davidson'
+
+                if eigensolver == 'davidson':
                     # Use a CI-specific Davidson iteration by default.  The
                     # direct-CI backend already has a cheap diagonal
                     # preconditioner and only needs a few low roots, which is
@@ -2155,21 +2347,25 @@ class CASCI(mcscf.casci.CASCI):
                     E, X = davidson_lowest(
                         mv,
                         H_diag,
-                        nroots=nstates,
+                        nroots=solve_nstates,
                         tol=self.tol if self.tol > 0 else 1e-8,
                         max_cycle=self.direct_ci_max_cycle,
                         max_subspace=self.direct_ci_max_subspace,
                         guess=guess,
                     )
-                elif self.direct_ci_eigensolver == 'eigsh':
+                elif eigensolver == 'eigsh':
                     H = LinearOperator((binary.shape[0], binary.shape[0]), matvec=mv)
-                    E, X = eigsh(H, k=nstates, which='SA', tol=self.tol)
+                    E, X = eigsh(H, k=solve_nstates, which='SA', tol=self.tol)
                 else:
                     raise ValueError(
-                        "Unknown direct_ci eigensolver '{}'. Use 'davidson' or 'eigsh'.".format(
-                            self.direct_ci_eigensolver
+                        "Unknown direct_ci eigensolver '{}'. Use 'auto', 'davidson' or 'eigsh'.".format(
+                            eigensolver
                         )
                     )
+                if solve_nstates != requested_nstates:
+                    order = np.argsort(E)[:requested_nstates]
+                    E = np.asarray(E)[order]
+                    X = np.asarray(X)[:, order]
             
 
 
@@ -2188,9 +2384,9 @@ class CASCI(mcscf.casci.CASCI):
 
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
-        self.ci = [X[:, n] for n in range(nstates)]
+        self.ci = [X[:, n] for n in range(requested_nstates)]
 
-        for i in range(nstates):
+        for i in range(requested_nstates):
             ss = self.spin_square(i)
             print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
@@ -2934,135 +3130,6 @@ def make_rdm2(ci, Binary, SC1, SC2):
     D += contract('I, IJpqrs, J -> pqrs', ci.conj(), H_CI, ci)
 
     return D
-
-def overlap(cibra, ciket, s=None):
-    """
-    CASCI electronic overlap matrix
-
-    The MO overlap is a block matrix
-
-    for Restricted calculation only! (spin unpolarized.)
-
-    TODO: unrestricted HF.
-
-    S = [S_CC, S_CA]
-        [S_AC, S_AA]
-
-
-
-    Compute the overlap between Slater determinants first
-    and contract with CI coefficients
-
-    Parameters
-    ----------
-    cibra : TYPE
-        DESCRIPTION.
-    binary1 : TYPE
-        DESCRIPTION.
-    ciket : TYPE
-        DESCRIPTION.
-    binary2 : TYPE
-        DESCRIPTION.
-    s : TYPE
-        AO overlap.
-
-    Returns
-    -------
-    None.
-
-    """
-    # nstates = len(cibra) + 1
-
-    # overlap matrix between MOs at different geometries
-    if s is None:
-        try:
-            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-            s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
-        except (ImportError, AttributeError, TypeError):
-            from pyscf import gto
-            mol_bra = cibra.mol.topyscf()
-            mol_ket = ciket.mol.topyscf()
-            mol_bra.build()
-            mol_ket.build()
-            s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
-        s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
-
-
-    nsd_bra = cibra.binary.shape[0]
-    nsd_ket = ciket.binary.shape[0]
-    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
-    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype) # overlap between determinants
-
-    ncore_bra = cibra.ncore
-    ncore_ket = ciket.ncore
-    if ncore_bra != ncore_ket:
-        raise ValueError(
-            "Different numbers of core orbitals are not supported in overlap: "
-            f"{ncore_bra} != {ncore_ket}."
-        )
-
-    scc = s[:ncore_bra, :ncore_ket]
-    sca = s[:ncore_bra, ncore_ket:]
-    sac = s[ncore_bra:, :ncore_ket]
-    saa = s[ncore_bra:, ncore_ket:]
-
-    if ncore_bra == 0:
-        core_factor = dtype.type(1)
-        saa_eff = saa
-    else:
-        scc_det = np.linalg.det(scc)
-        core_factor = scc_det * scc_det
-        saa_eff = saa - sac @ np.linalg.solve(scc, sca)
-
-    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
-    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
-    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
-    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
-
-    for I in range(nsd_bra):
-        occidx1_a = occ_bra_a[I]
-        occidx1_b = occ_bra_b[I]
-
-        for J in range(nsd_ket):
-            occidx2_a = occ_ket_a[J]
-            occidx2_b = occ_ket_b[J]
-
-            # print('b', occidx2_a, occidx2_b)
-            # print(ciket.binary[J])
-
-    # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-            S[I, J] = (
-                core_factor
-                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
-                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
-            )
-
-
-
-    # core_bra = list(range(cibra.ncore))
-    # core_ket = list(range(ciket.ncore))
-
-
-
-
-    # for I in range(nsd_bra):
-    #     occidx1_a  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-    #     occidx1_b  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
-
-    #     for J in range(nsd_ket):
-    #         occidx2_a  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-    #         occidx2_b  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
-
-    #         # print('b', occidx2_a, occidx2_b)
-    #         # print(ciket.binary[J])
-
-    # # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-
-    #         S[I, J] = np.linalg.det(s[np.ix_(occidx1_a, occidx2_a)]) * \
-    #                   np.linalg.det(s[np.ix_(occidx1_b, occidx2_b)])
-
-
-    return contract('BI, IJ, AJ -> BA', np.array(cibra.ci).conj(), S, np.array(ciket.ci))
 
 if __name__ == "__main__":
     from pyqed import Molecule

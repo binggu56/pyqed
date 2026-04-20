@@ -13,6 +13,7 @@ Quantum Chemitry DMRG with U(1) particle number Symmetry Support
 
 import numpy as np
 import scipy.constants as const
+import hashlib
 
 from scipy.sparse.linalg import eigsh
 
@@ -37,8 +38,14 @@ from collections import namedtuple
 from scipy.sparse import identity, kron, csr_matrix, diags
 
 # from pyqed import Molecule
-from pyqed.qchem.mcscf.casci import CASCI
-from pyqed.mps import DMRG, MPS, dense_to_symmetric_mpo
+from pyqed.qchem.mcscf.casci import (
+    CASCI,
+    _get_mf_cholesky_factors,
+    _resolve_use_cholesky_integrals,
+    transform_eri_factors_to_mo_pair,
+)
+from pyqed.mps import DMRG as TensorDMRG, MPS, MPO as TensorMPO, dense_to_symmetric_mpo
+from pyqed.mps.decompose import compress
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
@@ -54,6 +61,258 @@ from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _combine_operator_terms(terms, tol=1e-14):
+    """Combine duplicate symbolic operator terms before MPO construction."""
+    combined = {}
+    order = []
+    for term in terms:
+        qn_key = tuple(tuple(int(x) for x in np.asarray(qn).reshape(-1)) for qn in term.qn_list)
+        key = (term.symbol, tuple(term.dofs), qn_key)
+        if key not in combined:
+            combined[key] = complex(term.factor)
+            order.append((key, term))
+        else:
+            combined[key] += complex(term.factor)
+
+    merged = []
+    for key, template in order:
+        factor = combined[key]
+        if abs(factor) <= tol:
+            continue
+        qn = [np.array(q, dtype=int) for q in key[2]]
+        merged.append(Op(template.symbol, list(template.dofs), factor=factor, qn=qn))
+    return merged
+
+
+def _array_digest(arr):
+    """Return a stable content digest for a NumPy array."""
+    arr = np.ascontiguousarray(arr)
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(arr.shape).encode("ascii"))
+    h.update(str(arr.dtype).encode("ascii"))
+    h.update(arr.view(np.uint8))
+    return h.hexdigest()
+
+
+def _active_hamiltonian_cache_key(h1e, eri, *, spin_purification=False, shift=None):
+    """Build a cache key for the active-space Hamiltonian MPO."""
+    shift_key = None if shift is None else float(shift)
+    return (
+        _array_digest(h1e),
+        _array_digest(eri),
+        bool(spin_purification),
+        shift_key,
+    )
+
+
+def _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=1e-14):
+    """Accumulate a symbolic operator term without instantiating `Op` eagerly."""
+    if abs(factor) <= tol:
+        return
+    key = (symbol, tuple(dofs))
+    term_map[key] = term_map.get(key, 0.0) + complex(factor)
+    if abs(term_map[key]) <= tol:
+        term_map.pop(key, None)
+
+
+def _materialize_symbolic_terms(term_map, tol=1e-14):
+    """Convert accumulated symbolic terms into `Op` objects once."""
+    terms = []
+    for (symbol, dofs), factor in term_map.items():
+        if abs(factor) <= tol:
+            continue
+        terms.append(Op(symbol, list(dofs), factor=factor))
+    return terms
+
+
+def _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, *, cutoff=1e-14):
+    """Build a dense MPO from symbolic terms and wrap it in the high-level MPO class."""
+    terms = _materialize_symbolic_terms(term_map, tol=cutoff)
+    model = Model(basis=basis_sites, ham_terms=terms)
+    mpo = Mpo(model, algo="qr")
+    factors = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
+    return TensorMPO(factors, homogenous=False), len(terms)
+
+
+def _build_one_body_tensor_mpo(basis_sites, spatial_matrix, *, cutoff=1e-14):
+    """Build the spin-summed one-body MPO O = sum_pqσ M_pq a†_{pσ} a_{qσ}."""
+    ncas = spatial_matrix.shape[0]
+    term_map = {}
+    for p, q in np.argwhere(np.abs(spatial_matrix) > cutoff):
+        val = spatial_matrix[p, q]
+        symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2 * p, 2 * q], val)
+        _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+        symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2 * p + 1, 2 * q + 1], val)
+        _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+    return _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, cutoff=cutoff)
+
+
+def _compress_tensor_mpo(tensor_mpo, chi_max=None):
+    """Compress a dense MPO by reshaping it to an MPS-like chain and SVD-compressing bonds."""
+    if chi_max is None:
+        return tensor_mpo
+    if max(tensor_mpo.bond_orders()) <= chi_max:
+        return tensor_mpo
+
+    mps_factors = []
+    phys_dims = []
+    for W in tensor_mpo.factors:
+        phys_dims.append((W.shape[2], W.shape[3]))
+        W_ready = W.reshape(W.shape[0], W.shape[1], W.shape[2] * W.shape[3]).transpose(0, 2, 1)
+        mps_factors.append(W_ready)
+
+    compressed_factors = compress(mps_factors, chi_max)
+    final_factors = []
+    for B, (d_up, d_down) in zip(compressed_factors, phys_dims):
+        B_transposed = B.transpose(0, 2, 1)
+        final_factors.append(B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down))
+    return TensorMPO(final_factors, homogenous=False)
+
+
+def _maybe_compress_tensor_mpo(tensor_mpo, *, chi_max=None, trigger_bond=None):
+    """Compress only when the MPO bond dimension exceeds a trigger."""
+    if chi_max is None:
+        return tensor_mpo
+    max_bond = max(tensor_mpo.bond_orders())
+    if trigger_bond is None:
+        trigger_bond = chi_max
+    if max_bond <= trigger_bond:
+        return tensor_mpo
+    return _compress_tensor_mpo(tensor_mpo, chi_max=chi_max)
+
+
+def _build_spin_purification_term_map(ncas, shift, *, cutoff=1e-10):
+    """Build symbolic terms for the first-order spin-purification penalty."""
+    term_map = {}
+    # On-site terms
+    for p in range(ncas):
+        _accumulate_symbolic_term(term_map, "n", [2 * p], 0.75 * shift, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n", [2 * p + 1], 0.75 * shift, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * p + 1], -1.5 * shift, tol=cutoff)
+
+    # Cross-site terms
+    for p in range(ncas):
+        for q in range(ncas):
+            if p == q:
+                continue
+            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q], 0.25 * shift, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q + 1], 0.25 * shift, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q + 1], -0.25 * shift, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q], -0.25 * shift, tol=cutoff)
+            symbol, dofs, factor = get_jw_term_spec(
+                [r"a^\dagger", "a", r"a^\dagger", "a"],
+                [2 * p, 2 * p + 1, 2 * q + 1, 2 * q],
+                shift,
+            )
+            _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+    return term_map
+
+
+def _build_low_rank_hamiltonian_tensor_mpo(
+    basis_sites,
+    h1_spatial,
+    pair_factors,
+    *,
+    cutoff=1e-10,
+    chi_max=None,
+    trigger_bond=None,
+    batch_size=4,
+):
+    """
+    Build the electronic Hamiltonian MPO from Cholesky/low-rank pair factors
+    without reconstructing the full active-space pqrs tensor.
+
+    Using (pq|rs) = sum_P L_P[pq]^* L_P[rs], the spin-free two-electron term is
+
+        1/2 sum_P [A_P B_P - C_P]
+
+    where
+        A_P = sum_pq L_P[pq]^* E_pq
+        B_P = sum_rs L_P[rs]   E_rs
+        C_P = sum_ps (L_P^* L_P)_{ps} E_ps
+
+    and E_pq = sum_sigma a†_{pσ} a_{qσ}.
+    The one-body correction sum_P C_P is folded into the base one-body MPO.
+    """
+    correction = np.einsum("Ppq,Pqs->ps", pair_factors.conj(), pair_factors, optimize=True)
+    total_mpo, base_terms = _build_one_body_tensor_mpo(
+        basis_sites,
+        h1_spatial - 0.5 * correction,
+        cutoff=cutoff,
+    )
+    total_mpo = _maybe_compress_tensor_mpo(
+        total_mpo,
+        chi_max=chi_max,
+        trigger_bond=trigger_bond,
+    )
+
+    max_bond = max(total_mpo.bond_orders())
+    factor_term_counts = []
+    batch_mpo = None
+    batch_terms = 0
+
+    def _flush_batch(total_mpo, batch_mpo):
+        if batch_mpo is None:
+            return total_mpo, None
+        total_mpo = total_mpo + batch_mpo
+        total_mpo = _maybe_compress_tensor_mpo(
+            total_mpo,
+            chi_max=chi_max,
+            trigger_bond=trigger_bond,
+        )
+        return total_mpo, None
+
+    for pair_factor in pair_factors:
+        left_mpo, left_terms = _build_one_body_tensor_mpo(
+            basis_sites,
+            pair_factor.conj(),
+            cutoff=cutoff,
+        )
+        right_mpo, right_terms = _build_one_body_tensor_mpo(
+            basis_sites,
+            pair_factor,
+            cutoff=cutoff,
+        )
+        product_mpo = left_mpo.matmul(right_mpo)
+        product_mpo = _maybe_compress_tensor_mpo(
+            product_mpo,
+            chi_max=chi_max,
+            trigger_bond=trigger_bond,
+        )
+        product_mpo = product_mpo * 0.5
+
+        if batch_mpo is None:
+            batch_mpo = product_mpo
+        else:
+            batch_mpo = batch_mpo + product_mpo
+
+        batch_terms += 1
+        batch_mpo = _maybe_compress_tensor_mpo(
+            batch_mpo,
+            chi_max=chi_max,
+            trigger_bond=trigger_bond,
+        )
+
+        if batch_terms >= batch_size:
+            total_mpo, batch_mpo = _flush_batch(total_mpo, batch_mpo)
+            batch_terms = 0
+
+        max_bond = max(max_bond, max(total_mpo.bond_orders()), max(batch_mpo.bond_orders()) if batch_mpo is not None else 0)
+        factor_term_counts.append((left_terms, right_terms))
+
+    total_mpo, batch_mpo = _flush_batch(total_mpo, batch_mpo)
+
+    info = {
+        "representation": "low_rank_mpo",
+        "aux_rank": int(pair_factors.shape[0]),
+        "base_one_body_terms": int(base_terms),
+        "factor_one_body_terms_max": int(max((max(x) for x in factor_term_counts), default=0)),
+        "mpo_max_bond": int(max_bond),
+        "batch_size": int(batch_size),
+    }
+    return total_mpo, info
 
 #  Fermionic Logic patch adding JW chain
 def get_jw_term_robust(op_str_list, indices, factor):
@@ -104,6 +363,49 @@ def get_jw_term_robust(op_str_list, indices, factor):
 
     final_op_string = " ".join(final_ops_str)
     return Op(final_op_string, final_indices, factor=factor * ((-1) ** swaps) * extra_sign)
+
+
+def get_jw_term_spec(op_str_list, indices, factor):
+    """Return the symbolic specification for a JW term without building `Op`."""
+    chain = list(zip(indices, op_str_list))
+    n = len(chain)
+    swaps = 0
+    for i in range(n):
+        for j in range(0, n - i - 1):
+            if chain[j][0] > chain[j + 1][0]:
+                chain[j], chain[j + 1] = chain[j + 1], chain[j]
+                swaps += 1
+
+    sorted_indices = [x[0] for x in chain]
+    sorted_ops = [x[1] for x in chain]
+
+    final_indices = []
+    final_ops_str = []
+    parity = 0
+    extra_sign = 1
+
+    for k in range(n):
+        site = sorted_indices[k]
+        op_sym = sorted_ops[k]
+
+        if k > 0:
+            prev_site = sorted_indices[k - 1]
+            if parity % 2 == 1:
+                for z_site in range(prev_site + 1, site):
+                    final_indices.append(z_site)
+                    final_ops_str.append("sigma_z")
+
+        ops_to_right = n - 1 - k
+        if (op_sym == "a") and (ops_to_right % 2 == 1):
+            extra_sign *= -1
+
+        final_indices.append(site)
+        final_ops_str.append(op_sym)
+        parity += 1
+
+    final_op_string = " ".join(final_ops_str)
+    final_factor = factor * ((-1) ** swaps) * extra_sign
+    return final_op_string, final_indices, final_factor
 
 
 class SymmetryManager:
@@ -366,12 +668,13 @@ def graphic(sys_block, env_block, sys_label="l"):
 
 
 
-class QCDMRG(CASCI):
+class DMRG(CASCI):
     """
     ab initio DRMG quantum chemistry calculation
     """
     def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
-                 spin=None, tol=1e-6):
+                 spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
+                 low_rank_mpo_batch_size=4):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -457,6 +760,10 @@ class QCDMRG(CASCI):
         self.ci = None # CI coefficients
         self.H = None
         self.H_raw = None
+        self._hamiltonian_mpo_cache_key = None
+        self._symmetric_mpo_cache = {}
+        self._s2_mpo_cache = {}
+        self._active_integral_build_info = None
 
 
         self.hcore = self.h1e_cas = None # effective 1e CAS Hamiltonian including the influence of frozen orbitals
@@ -467,8 +774,27 @@ class QCDMRG(CASCI):
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
+        self.h2e_factors = None
 
         self.init_guess = init_guess
+        self.low_rank_mpo = bool(low_rank_mpo)
+        self.low_rank_mpo_bond = low_rank_mpo_bond
+        self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
+
+    def export_initial_guess(self, state=0, dense=False):
+        """Return a reusable copy of a converged DMRG state."""
+        if not hasattr(self, 'dmrg') or self.dmrg is None or self.dmrg.states is None:
+            raise ValueError("No converged DMRG state available. Run DMRG first.")
+        guess = self.dmrg.states[state].copy()
+        if dense and hasattr(guess.factors[0], 'qns'):
+            from pyqed.mps.mps import symmetric_to_dense
+            guess = symmetric_to_dense(guess)
+        return guess.copy()
+
+    def reuse_guess_from(self, other, state=0, dense=False):
+        """Adopt a converged MPS from another DMRG object as the next guess."""
+        self.init_guess = other.export_initial_guess(state=state, dense=dense)
+        return self
         
 
     def get_initial_guess_symmetric(self, method='cid'):
@@ -507,6 +833,35 @@ class QCDMRG(CASCI):
 
     def get_initial_guess_dense(self, noise=1e-3):
         return get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=noise)
+
+    def _resolve_initial_guess(self, use_symmetry):
+        guess = self.init_guess
+        if isinstance(guess, MPS):
+            print("  Reusing MPS initial guess.")
+            return guess.copy()
+
+        if isinstance(guess, str) and guess.lower() == 'previous':
+            if hasattr(self, 'dmrg') and self.dmrg is not None and self.dmrg.ground_state is not None:
+                print("  Reusing previous DMRG state as initial guess.")
+                return self.dmrg.ground_state.copy()
+            print("  [Warning] previous initial guess requested, but no prior DMRG state exists. Falling back to CID.")
+            guess = 'cid'
+
+        if use_symmetry:
+            if not isinstance(guess, str):
+                raise TypeError(f"Unsupported symmetric initial guess type: {type(guess)}")
+            print(f"  Generating Initial Guess ({guess})...")
+            return self.get_initial_guess_symmetric(method=guess.lower())
+
+        if isinstance(guess, str):
+            print(f"  Generating Initial Guess ({guess})...")
+            if guess.lower() == 'hf':
+                return self.get_initial_guess_dense(noise=1e-3)
+            if guess.lower() in {'cid', 'cisd', 'random', 'previous'}:
+                return self.get_initial_guess_dense(noise=1e-3)
+            raise ValueError(f"Unsupported dense initial guess string: {guess}")
+
+        raise TypeError(f"Unsupported initial guess type: {type(guess)}")
 
     def fix_nelec(self, shift):
         """
@@ -598,7 +953,12 @@ class QCDMRG(CASCI):
             # second-order spin penalty
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
-    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
+    def get_SO_matrix(
+        self,
+        spin_flip=False,
+        H1=None,
+        H2=None,
+    ):
         """
         Given a rhf object get Spin-Orbit Matrices
 
@@ -613,6 +973,7 @@ class QCDMRG(CASCI):
         # from pyscf import ao2mo
 
         mf = self.mf
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
 
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
@@ -632,20 +993,32 @@ class QCDMRG(CASCI):
 
         # nmo = Ca.shape[1] # n
 
-        eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
-
-        ### compute SO ERIs (MO)
-        eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+        if use_cholesky:
+            eri_factors = _get_mf_cholesky_factors(mf)
+            pair_factors = transform_eri_factors_to_mo_pair(eri_factors, Ca)
+            flat_pair_factors = pair_factors.reshape(pair_factors.shape[0], -1)
+            eri_aa = (flat_pair_factors.conj().T @ flat_pair_factors).reshape(self.ncas, self.ncas, self.ncas, self.ncas)
+            build_mode = 'cholesky'
+            aux_rank = int(pair_factors.shape[0])
+        else:
+            eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
+            if eri is None:
+                raise ValueError(
+                    "DMRG dense active-integral build requires mf.eri. "
+                    "Enable cholesky on the mean-field reference when running "
+                    "on factor-only RHF references."
+                )
+            eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
+            build_mode = 'dense'
+            aux_rank = None
 
         # physicts notation <pq|rs>
         # eri_aa = contract('ip, jq, ij, ir, js -> pqrs', Ca.conj(), Ca.conj(), eri, Ca, Ca)
 
         # eri_aa -= eri_aa.swapaxes(1,3)
-
         eri_bb = eri_aa.copy()
-
-        eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-        eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
+        eri_ab = eri_aa.copy()
+        eri_ba = eri_aa.copy()
 
 
 
@@ -666,6 +1039,11 @@ class QCDMRG(CASCI):
         # compact=False)).reshape((n,n,n,n), order="C")
 
         H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
+        self._active_integral_build_info = {
+            'mode': build_mode,
+            'aux_rank': aux_rank,
+            'ncas': self.ncas,
+        }
 
         # H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca),
                          # np.einsum("AB, Ap, Bq -> pq", H, Cb, Cb)])
@@ -686,6 +1064,50 @@ class QCDMRG(CASCI):
         # else:
         #     return H1, H2
         return H1, H2
+
+    def _get_active_hamiltonian_inputs(self):
+        """
+        Return the active-space one-body Hamiltonian together with either the
+        dense active ERI tensor or Cholesky pair factors.
+        """
+        mf = self.mf
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
+
+        H, energy_core = h1e_for_cas(
+            mf,
+            ncas=self.ncas,
+            ncore=self.ncore,
+            mo_coeff=self.mo_coeff,
+        )
+        self.e_core = energy_core
+
+        if use_cholesky:
+            pair_factors = transform_eri_factors_to_mo_pair(
+                _get_mf_cholesky_factors(mf),
+                self.mo_cas,
+            )
+            self._active_integral_build_info = {
+                "mode": "cholesky",
+                "aux_rank": int(pair_factors.shape[0]),
+                "ncas": self.ncas,
+            }
+            return [H, H], None, pair_factors
+
+        eri = mf.eri
+        if eri is None:
+            raise ValueError(
+                "DMRG dense active-integral build requires mf.eri. "
+                "Enable cholesky on the mean-field reference when running "
+                "on factor-only RHF references."
+            )
+        eri_aa = contract("ip, jq, ijkl, kr, ls -> pqrs", self.mo_cas.conj(), self.mo_cas, eri, self.mo_cas.conj(), self.mo_cas)
+        H2 = np.stack((np.stack((eri_aa, eri_aa.copy())), np.stack((eri_aa.copy(), eri_aa.copy()))))
+        self._active_integral_build_info = {
+            "mode": "dense",
+            "aux_rank": None,
+            "ncas": self.ncas,
+        }
+        return [H, H], H2, None
 
     def build(self, mo_coeff=None):
 
@@ -716,7 +1138,24 @@ class QCDMRG(CASCI):
 
 
         # effective H for CAS
-        h1e, eri = self.get_SO_matrix()
+        h1e, eri, pair_factors = self._get_active_hamiltonian_inputs()
+        use_low_rank_mpo = bool(self.low_rank_mpo)
+        if eri is None and pair_factors is not None and not use_low_rank_mpo:
+            flat_pair_factors = pair_factors.reshape(pair_factors.shape[0], -1)
+            eri_aa = (flat_pair_factors.conj().T @ flat_pair_factors).reshape(self.ncas, self.ncas, self.ncas, self.ncas)
+            eri = np.stack((np.stack((eri_aa, eri_aa.copy())), np.stack((eri_aa.copy(), eri_aa.copy()))))
+        self.h1e = h1e
+        self.h2e = eri
+        self.h2e_factors = pair_factors
+        cache_key = _active_hamiltonian_cache_key(
+            h1e,
+            eri if pair_factors is None else pair_factors,
+            spin_purification=self.spin_purification,
+            shift=self.shift,
+        ) + (use_low_rank_mpo, self.low_rank_mpo_bond, self.low_rank_mpo_batch_size)
+        if cache_key == self._hamiltonian_mpo_cache_key and self.H is not None and self.H_raw is not None:
+            print("  Reusing Hamiltonian MPO cache.")
+            return self
         
 
 
@@ -730,86 +1169,91 @@ class QCDMRG(CASCI):
 
         # 2. Build Hamiltonian (Using Robust JW Builder)
         print("  Building Hamiltonian MPO...")
-        ham_terms = []
         cutoff = 1e-10
-        # --- One-Body Terms: h_pq a+_p a_q ---
-        for p in range(ncas):
-            for q in range(ncas):
-                val = h1e[0][p, q]
-                if abs(val) > cutoff:
-                    # Spin Up (Indices 2p, 2q)
-                    ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p, 2*q], val))
-                    # Spin Down (Indices 2p+1, 2q+1)
-                    ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p+1, 2*q+1], val))
-
-        # --- Two-Body Terms: 0.5 * (pq|rs) a+_p a+_r a_s a_q ---
-        for p in range(ncas):
-            for q in range(ncas):
-                for r in range(ncas):
-                    for s in range(ncas):
-                        val = 0.5 * eri[0, 0, p, q, r, s]
-                        if abs(val) < cutoff: continue
-
-                        # p,r creation; s,q annihilation
-
-                        # Same Spin (Pauli Exclusion p!=r)
-                        if p != r and s != q:
-                            # Up-Up
-                            ham_terms.append(get_jw_term_robust(
-                                [r"a^\dagger", r"a^\dagger", "a", "a"],
-                                [2*p, 2*r, 2*s, 2*q], val
-                            ))
-                            # Dn-Dn
-                            ham_terms.append(get_jw_term_robust(
-                                [r"a^\dagger", r"a^\dagger", "a", "a"],
-                                [2*p+1, 2*r+1, 2*s+1, 2*q+1], val
-                            ))
-
-                        # Mixed Spin (No Pauli restriction on spatial indices)
-                        # Up-Dn (p Up, r Dn, s Dn, q Up)
-                        ham_terms.append(get_jw_term_robust(
-                            [r"a^\dagger", r"a^\dagger", "a", "a"],
-                            [2*p, 2*r+1, 2*s+1, 2*q], val
-                        ))
-                        # Dn-Up (p Dn, r Up, s Up, q Dn)
-                        ham_terms.append(get_jw_term_robust(
-                            [r"a^\dagger", r"a^\dagger", "a", "a"],
-                            [2*p+1, 2*r, 2*s, 2*q+1], val
-                        ))
-        if self.spin_purification:
-            J = self.shift
-            
-            # On-site terms (p == q)
-            for p in range(ncas):
-                # 3/4 J * (n_{p, up} + n_{p, dn})
-                ham_terms.append(Op("n", 2*p) * (0.75 * J))
-                ham_terms.append(Op("n", 2*p+1) * (0.75 * J))
-                # -3/2 J * n_{p, up} n_{p, dn}
-                ham_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5 * J))
-                
-            # Cross-site terms (p != q)
-            for p in range(ncas):
-                for q in range(ncas):
-                    if p == q: continue
-                    # S_z^2 
-                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q) * (0.25 * J))
-                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * (0.25 * J))
-                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25 * J))
-                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25 * J))
-                    # S_+ S_- (Spin Flip)
-                    # 1.0 * J * a^+_{p, up} a_{p, dn} a^+_{q, dn} a_{q, up}
-                    ham_terms.append(get_jw_term_robust(
-                        [r"a^\dagger", "a", r"a^\dagger", "a"],
-                        [2*p, 2*p+1, 2*q+1, 2*q], J
-                    ))
         basis_sites = [BasisSimpleElectron(i) for i in range(nso)]
-        model = Model(basis=basis_sites, ham_terms=ham_terms)
-        mpo = Mpo(model, algo="qr")
+        if pair_factors is not None and use_low_rank_mpo:
+            low_rank_chi_max = self.low_rank_mpo_bond
+            if low_rank_chi_max is None:
+                low_rank_chi_max = max(4 * int(self.D), 64)
+            low_rank_trigger_bond = max(2 * int(low_rank_chi_max), int(low_rank_chi_max))
+            tensor_mpo, low_rank_info = _build_low_rank_hamiltonian_tensor_mpo(
+                basis_sites,
+                np.asarray(h1e[0]),
+                np.asarray(pair_factors),
+                cutoff=cutoff,
+                chi_max=low_rank_chi_max,
+                trigger_bond=low_rank_trigger_bond,
+                batch_size=self.low_rank_mpo_batch_size,
+            )
+            self._active_integral_build_info.update(low_rank_info)
+            self._active_integral_build_info["compression_bond"] = int(low_rank_chi_max)
+            self._active_integral_build_info["compression_trigger_bond"] = int(low_rank_trigger_bond)
+        else:
+            ham_term_map = {}
+            # --- One-Body Terms: h_pq a+_p a_q ---
+            for p, q in np.argwhere(np.abs(h1e[0]) > cutoff):
+                val = h1e[0][p, q]
+                symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2*p, 2*q], val)
+                _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
+                symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2*p+1, 2*q+1], val)
+                _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
 
-        # get it transposed for solver in PyQED: (L, R, P, P) -> (L, P, R, P)
-        self.H_raw = mpo.matrices
-        H = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-        self.H = H
+            # --- Two-Body Terms: 0.5 * (pq|rs) a+_p a+_r a_s a_q ---
+            eri_spatial = 0.5 * eri[0, 0]
+            for p, q, r, s in np.argwhere(np.abs(eri_spatial) > cutoff):
+                val = eri_spatial[p, q, r, s]
+
+                if p != r and s != q:
+                    symbol, dofs, factor = get_jw_term_spec(
+                        [r"a^\dagger", r"a^\dagger", "a", "a"],
+                        [2*p, 2*r, 2*s, 2*q], val
+                    )
+                    _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
+                    symbol, dofs, factor = get_jw_term_spec(
+                        [r"a^\dagger", r"a^\dagger", "a", "a"],
+                        [2*p+1, 2*r+1, 2*s+1, 2*q+1], val
+                    )
+                    _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
+
+                symbol, dofs, factor = get_jw_term_spec(
+                    [r"a^\dagger", r"a^\dagger", "a", "a"],
+                    [2*p, 2*r+1, 2*s+1, 2*q], val
+                )
+                _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
+                symbol, dofs, factor = get_jw_term_spec(
+                    [r"a^\dagger", r"a^\dagger", "a", "a"],
+                    [2*p+1, 2*r, 2*s, 2*q+1], val
+                )
+                _accumulate_symbolic_term(ham_term_map, symbol, dofs, factor, tol=cutoff)
+
+            tensor_mpo, dense_term_count = _build_tensor_mpo_from_symbolic_terms(
+                basis_sites,
+                ham_term_map,
+                cutoff=cutoff,
+            )
+            representation = "dense_term_mpo" if pair_factors is None else "cholesky_dense_active_mpo"
+            self._active_integral_build_info.update(
+                {
+                    "representation": representation,
+                    "symbolic_terms": int(dense_term_count),
+                    "mpo_max_bond": int(max(tensor_mpo.bond_orders())),
+                }
+            )
+
+        if self.spin_purification:
+            spin_term_map = _build_spin_purification_term_map(ncas, self.shift, cutoff=cutoff)
+            spin_mpo, spin_term_count = _build_tensor_mpo_from_symbolic_terms(
+                basis_sites,
+                spin_term_map,
+                cutoff=cutoff,
+            )
+            tensor_mpo = tensor_mpo + spin_mpo
+            self._active_integral_build_info["spin_penalty_terms"] = int(spin_term_count)
+
+        self.H_raw = tensor_mpo.factors
+        self.H = tensor_mpo.factors
+        self._hamiltonian_mpo_cache_key = cache_key
+        self._symmetric_mpo_cache = {}
 
         return self
 
@@ -828,31 +1272,37 @@ class QCDMRG(CASCI):
         import pyqed.mps.mps as mps_lib
         
         ncas = self.ncas
-        s2_terms = []
+        s2_term_map = {}
         
         # On-site terms
         for p in range(ncas):
-            s2_terms.append(Op("n", 2*p) * 0.75)
-            s2_terms.append(Op("n", 2*p+1) * 0.75)
-            s2_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5))
+            _accumulate_symbolic_term(s2_term_map, "n", [2*p], 0.75)
+            _accumulate_symbolic_term(s2_term_map, "n", [2*p+1], 0.75)
+            _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*p+1], -1.5)
             
         # Cross-site terms
         for p in range(ncas):
             for q in range(ncas):
                 if p == q: continue
-                s2_terms.append(Op("n", 2*p) * Op("n", 2*q) * 0.25)
-                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * 0.25)
-                s2_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25))
-                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25))
-                s2_terms.append(get_jw_term_robust(
+                _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*q], 0.25)
+                _accumulate_symbolic_term(s2_term_map, "n n", [2*p+1, 2*q+1], 0.25)
+                _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*q+1], -0.25)
+                _accumulate_symbolic_term(s2_term_map, "n n", [2*p+1, 2*q], -0.25)
+                symbol, dofs, factor = get_jw_term_spec(
                     [r"a^\dagger", "a", r"a^\dagger", "a"],
                     [2*p, 2*p+1, 2*q+1, 2*q], 1.0
-                ))
+                )
+                _accumulate_symbolic_term(s2_term_map, symbol, dofs, factor)
                 
-        basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
-        model = Model(basis=basis_sites, ham_terms=s2_terms)
-        mpo = Mpo(model, algo="qr")
-        mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
+        s2_cache_key = int(ncas)
+        mpo_dense = self._s2_mpo_cache.get(s2_cache_key)
+        if mpo_dense is None:
+            basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+            s2_terms = _materialize_symbolic_terms(s2_term_map)
+            model = Model(basis=basis_sites, ham_terms=s2_terms)
+            mpo = Mpo(model, algo="qr")
+            mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
+            self._s2_mpo_cache[s2_cache_key] = mpo_dense
         
         states_to_eval = self.dmrg.states 
         if (hasattr(self.dmrg, 'states') and self.dmrg.states is not None):
@@ -873,7 +1323,183 @@ class QCDMRG(CASCI):
             
         return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
 
-    def run(self, nstates=1, weights=None, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff = None, **kwargs):
+    def overlap(self, other, bra_state_ids=None, ket_state_ids=None, s=None):
+        from pyqed.qchem.dmrg.overlap import overlap as dmrg_overlap
+
+        return dmrg_overlap(
+            self,
+            other,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+        )
+
+    def overlap_unitary(
+        self,
+        other,
+        bra_state_ids=None,
+        ket_state_ids=None,
+        orbital_transform=None,
+        s=None,
+        use_polar=False,
+        unitary_tol=1e-8,
+        chi_max=None,
+        mpo_bond_dim=None,
+        order=8,
+        scale=2,
+    ):
+        from pyqed.qchem.dmrg.overlap import unitary_overlap
+
+        return unitary_overlap(
+            self,
+            other,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            orbital_transform=orbital_transform,
+            s=s,
+            use_polar=use_polar,
+            unitary_tol=unitary_tol,
+            chi_max=chi_max,
+            mpo_bond_dim=mpo_bond_dim,
+            order=order,
+            scale=scale,
+        )
+
+    def overlap_biorthogonal(
+        self,
+        other,
+        bra_state_ids=None,
+        ket_state_ids=None,
+        s=None,
+        chi_max=None,
+        mpo_bond_dim=None,
+        order=4,
+        scale=1,
+        identity_tol=1e-10,
+        phase_align_tol=1e-14,
+        backend="structured",
+    ):
+        from pyqed.qchem.dmrg.overlap import biorthogonal_overlap
+
+        return biorthogonal_overlap(
+            self,
+            other,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+            chi_max=chi_max,
+            mpo_bond_dim=mpo_bond_dim,
+            order=order,
+            scale=scale,
+            identity_tol=identity_tol,
+            phase_align_tol=phase_align_tol,
+            backend=backend,
+        )
+
+    def overlap_auto(
+        self,
+        other,
+        bra_state_ids=None,
+        ket_state_ids=None,
+        s=None,
+        unitary_tol=1e-8,
+        chi_max=None,
+        mpo_bond_dim=None,
+        order=8,
+        scale=2,
+        return_info=False,
+    ):
+        from pyqed.qchem.dmrg.overlap import automatic_overlap
+
+        return automatic_overlap(
+            self,
+            other,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+            unitary_tol=unitary_tol,
+            chi_max=chi_max,
+            mpo_bond_dim=mpo_bond_dim,
+            order=order,
+            scale=scale,
+            return_info=return_info,
+        )
+
+    def overlap_biorthogonal_diagnostics(
+        self,
+        other,
+        bra_state_ids=None,
+        ket_state_ids=None,
+        s=None,
+        chi_max=None,
+        mpo_bond_dim=None,
+        order=4,
+        scale=1,
+        identity_tol=1e-10,
+        phase_align_tol=1e-14,
+    ):
+        from pyqed.qchem.dmrg.overlap import biorthogonal_overlap_diagnostics
+
+        return biorthogonal_overlap_diagnostics(
+            self,
+            other,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+            chi_max=chi_max,
+            mpo_bond_dim=mpo_bond_dim,
+            order=order,
+            scale=scale,
+            identity_tol=identity_tol,
+            phase_align_tol=phase_align_tol,
+        )
+
+    @staticmethod
+    def _normalize_dmrg_schedule(D, nsweeps, D_schedule=None, nsweeps_schedule=None):
+        if D_schedule is None:
+            d_list = [int(D)]
+        else:
+            d_list = [int(x) for x in D_schedule]
+            if not d_list:
+                raise ValueError("D_schedule must contain at least one stage.")
+
+        if nsweeps_schedule is None:
+            total_sweeps = int(nsweeps)
+            if len(d_list) == 1:
+                sweep_list = [total_sweeps]
+            else:
+                if total_sweeps < len(d_list):
+                    raise ValueError(
+                        "Total nsweeps is smaller than the number of D_schedule stages. "
+                        "Increase nsweeps or provide nsweeps_schedule explicitly."
+                    )
+                base = total_sweeps // len(d_list)
+                rem = total_sweeps % len(d_list)
+                sweep_list = [base] * len(d_list)
+                for i in range(rem):
+                    sweep_list[-(i + 1)] += 1
+        elif np.isscalar(nsweeps_schedule):
+            sweep_list = [int(nsweeps_schedule)] * len(d_list)
+        else:
+            sweep_list = [int(x) for x in nsweeps_schedule]
+            if len(sweep_list) != len(d_list):
+                raise ValueError("nsweeps_schedule must match D_schedule length.")
+
+        return list(zip(d_list, sweep_list))
+
+    def run(
+        self,
+        nstates=1,
+        weights=None,
+        symmetry_list=None,
+        nsweeps=50,
+        D_schedule=None,
+        nsweeps_schedule=None,
+        initial_guess=None,
+        mo_coeff=None,
+        compute_s2=False,
+        **kwargs,
+    ):
         """
         Parameters
         ----------
@@ -915,30 +1541,53 @@ class QCDMRG(CASCI):
                 }
                 site_qn_maps.append(map_dn)
             # get MPO in symmetric form with QN index
-            print("  Converting MPO to BlockTensors...")
-            final_H = dense_to_symmetric_mpo(self.H, site_qn_maps)
-            print(f"  MPO Converted. Sites: {len(final_H)}")
+            sym_cache_key = tuple(self.sym_mgr.sym_types)
+            final_H = self._symmetric_mpo_cache.get(sym_cache_key)
+            if final_H is None:
+                print("  Converting MPO to BlockTensors...")
+                final_H = dense_to_symmetric_mpo(self.H, site_qn_maps)
+                self._symmetric_mpo_cache[sym_cache_key] = final_H
+                print(f"  MPO Converted. Sites: {len(final_H)}")
+            else:
+                print("  Reusing symmetric MPO cache.")
             # Calculate Target QN
             target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
             print(f"  Target QN set to: {target_qn}")
-            # get Initial Guess
-            print(f"  Generating Initial Guess ({self.init_guess})...")
-            mps0 = self.get_initial_guess_symmetric(method=self.init_guess.lower())
             use_symmetry = True
         else: # dense branch without U(1) symmetry
             final_H = self.H
-            mps0 = self.get_initial_guess_dense(noise=1e-3)
             target_qn = None
             use_symmetry = False
             self.sym_mgr = None
+        mps0 = self._resolve_initial_guess(use_symmetry=use_symmetry)
+        schedule = self._normalize_dmrg_schedule(self.D, nsweeps, D_schedule=D_schedule, nsweeps_schedule=nsweeps_schedule)
         t0 = time.time()
-        print(f"  Starting Sweeps (D={self.D})...")
-        dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False, nstates=self.nstates, weights=self.weights)
-        dmrg.run()
+        current_guess = mps0
+        for stage_idx, (stage_D, stage_sweeps) in enumerate(schedule, start=1):
+            if len(schedule) == 1:
+                print(f"  Starting Sweeps (D={stage_D})...")
+            else:
+                print(f"  Starting Sweeps Stage {stage_idx}/{len(schedule)} (D={stage_D}, nsweeps={stage_sweeps})...")
+            dmrg = TensorDMRG(
+                final_H,
+                D=stage_D,
+                nsweeps=stage_sweeps,
+                init_guess=current_guess,
+                symmetry=use_symmetry,
+                target_qn=target_qn,
+                sym_mgr=self.sym_mgr,
+                not_conv_err=False,
+                nstates=self.nstates,
+                weights=self.weights,
+            )
+            dmrg.run()
+            current_guess = dmrg.ground_state.copy()
         self.dmrg = dmrg
         # Report
         e_dmrg_total = dmrg.e_tot + self.e_core
-        s2_val = self.calc_spin_square()
+        if self.spin_purification:
+            compute_s2 = True
+        s2_val = self.calc_spin_square() if compute_s2 else None
         if self.spin_purification:
             e_dmrg_total -= self.shift * s2_val
         self.e_tot = e_dmrg_total
@@ -946,11 +1595,13 @@ class QCDMRG(CASCI):
         if self.nstates == 1:
             print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
             print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
-            print(f"  <S^2> =             {s2_val:.6f}")
+            if s2_val is not None:
+                print(f"  <S^2> =             {s2_val:.6f}")
         else:
             for i in range(self.nstates):
                 print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha")
-                print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha, <S^2> = {s2_val[i]:.6f}")
+                if s2_val is not None:
+                    print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha, <S^2> = {s2_val[i]:.6f}")
         print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry:
             self.check_abelian_symmetry()
@@ -1247,7 +1898,7 @@ class QCDMRG(CASCI):
         return self.dmrg.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
 
-class DMRGSCF(QCDMRG):
+class DMRGSCF(DMRG):
     """
     optimize the orbitals
     """
@@ -1274,8 +1925,11 @@ if __name__=='__main__':
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=10, nelecas=6, D=40) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg = DMRG(mf, ncas=10, nelecas=6, D=40) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
     dmrg.build().run(symmetry_list=['charge','sz'], initial_guess='cid')
+
+
+QCDMRG = DMRG
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
     # mc.run()

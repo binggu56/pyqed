@@ -87,8 +87,11 @@ class DMRG:
         # Standardize MPS to ['lv', 'p', 'rv']
         # but currently we are not using the initial guess as MPS objects a lot, but i do think that is the better option. so need to fix initial guess in dmrg.py. remve this TODO when fixed.
         if isinstance(self.init_guess, MPS):
-            mps_list = self.init_guess.to_order(['lv', 'p', 'rv']).factors
-            # mps_list = self.init_guess.factors
+            if self.symmetry and hasattr(self.init_guess.factors[0], 'qns'):
+                # U(1) branch still uses (L, R, P) BlockTensor convention.
+                mps_list = self.init_guess.to_order(['lv', 'rv', 'p']).factors
+            else:
+                mps_list = self.init_guess.to_order(['lv', 'p', 'rv']).factors
         else:
             # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
             mps_list = self.init_guess
@@ -96,7 +99,7 @@ class DMRG:
         mpo_list = self.H.factors if isinstance(self.H, MPO) else self.H
 
         if self.symmetry and not isinstance(mps_list[0], BlockTensor):
-            mps_list = dense_to_symmetric(mps_list, sym_mgr=self.sym_mgr)
+            mps_list = dense_to_symmetric(mps_list)
 
         if self.opt == '1site':
 

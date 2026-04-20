@@ -760,6 +760,7 @@ class Molecule(qchem.Molecule):
 
         if isinstance(self.basis, str):
 
+            basis_label = self.basis
             basis_dict = parse_gbs(basis_dir + '/' + ALIAS[self.basis.replace('-','').lower()])
             basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
         else:
@@ -768,6 +769,8 @@ class Molecule(qchem.Molecule):
 
         s, t, v, eri = build(basis, atcoords, self.atom_charges())
 
+        self.basis_label = basis_label
+        self.basis = basis
         self.nao = len(basis)
         self.overlap = s
         self.hcore = t + v
@@ -1145,7 +1148,7 @@ def point_charge_gto(coord, charge, alpha, Ra, beta, Rb):
 
 def nuclear_attraction_integral(Rc, b1, b2, gradient=None, argnums=0):
     """
-    b1, b2 : STO orbitals
+    b1, b2 : ContractedGaussian orbitals
     """
 
     Rc = jnp.array(Rc)
@@ -1153,14 +1156,20 @@ def nuclear_attraction_integral(Rc, b1, b2, gradient=None, argnums=0):
     if gradient is None:
         total = 0.0
 
-        for p  in range(b1.n):
-            for q in range(b2.n):
-                d1 = b1.d[p]
-                d2 = b2.d[q]
-                total += d1*d2 * nuclear_attraction_gto(Rc, b1.g[p].alpha, b1.g[p].center, b2.g[p].alpha, b2.g[p].center)
+        for p in range(len(b1.coefs)):
+            for q in range(len(b2.coefs)):
+                d1 = b1.coefs[p] * b1.norm[p]
+                d2 = b2.coefs[q] * b2.norm[q]
+                total += d1 * d2 * nuclear_attraction_gto(
+                    Rc,
+                    b1.exps[p],
+                    b1.origin,
+                    b2.exps[q],
+                    b2.origin,
+                )
 
 
-        return total
+        return np.asarray(total).reshape(())
 
     else:
 
@@ -1172,12 +1181,13 @@ def nuclear_attraction_integral(Rc, b1, b2, gradient=None, argnums=0):
 
         argnums = 0
 
-        for p  in range(b1.n):
-            for q in range(b2.n):
-                d1 = b1.d[p]
-                d2 = b2.d[q]
+        for p in range(len(b1.coefs)):
+            for q in range(len(b2.coefs)):
+                d1 = b1.coefs[p] * b1.norm[p]
+                d2 = b2.coefs[q] * b2.norm[q]
 
-                alpha, Ra, beta, Rb = b1.g[p].alpha, b1.g[p].center, b2.g[p].alpha, b2.g[p].center
+                alpha, Ra = b1.exps[p], b1.origin
+                beta, Rb = b2.exps[q], b2.origin
 
                 e, f = value_and_grad(nuclear_attraction_gto)(Rc, alpha, Ra, beta, Rb)
 
@@ -1207,7 +1217,11 @@ def nuclear_attraction_integral(Rc, b1, b2, gradient=None, argnums=0):
         # print((total1 - total)/0.005)
 
 
-        return total, first_order_diff, second_order_diff
+        return (
+            np.asarray(total).reshape(()),
+            np.asarray(first_order_diff),
+            np.asarray(second_order_diff),
+        )
 
 def kinetic_energy_gto(alpha, Ra, beta, Rb):
 

@@ -126,16 +126,62 @@ def normalized_coeffs(shell):
     """
     Normalize contraction coefficients in the libcint/PySCF convention.
     """
+    angmom = _shell_angmom(shell)
+    coeffs = _shell_coeff_matrix(shell)
+
     def gaussian_int(l, a):
         return 0.5 * factorial(0.5 * l - 0.5) * a ** (-0.5 * l - 0.5)
 
     def gto_norm(l, a):
         return 1.0 / np.sqrt(gaussian_int(2 * l + 2, 2 * a))
 
-    cs = np.einsum("km,k->km", shell.coeffs, gto_norm(shell.angmom, shell.exps))
-    es = gaussian_int(2 * shell.angmom + 2, shell.exps[:, None] + shell.exps[None, :])
+    cs = np.einsum("km,k->km", coeffs, gto_norm(angmom, shell.exps))
+    es = gaussian_int(2 * angmom + 2, shell.exps[:, None] + shell.exps[None, :])
     ss = 1.0 / np.sqrt(np.einsum("km,kl,lm->m", cs, es, cs))
     return np.einsum("km,m->km", cs, ss)
+
+
+def _shell_coeff_matrix(shell):
+    coeffs = getattr(shell, "coeffs", None)
+    if coeffs is None:
+        coeffs = getattr(shell, "coefs", None)
+    coeffs = np.asarray(coeffs, dtype=float)
+    if coeffs.ndim == 1:
+        coeffs = coeffs[:, None]
+    if coeffs.ndim != 2:
+        raise ValueError("Shell contraction coefficients must be 1D or 2D.")
+    return coeffs
+
+
+def _shell_angmom(shell):
+    angmom = getattr(shell, "angmom", None)
+    if angmom is not None:
+        return int(angmom)
+    shell_tuple = getattr(shell, "shell", None)
+    if shell_tuple is not None:
+        return int(np.sum(shell_tuple))
+    raise ValueError("Shell angular momentum could not be determined.")
+
+
+def _shell_num_seg_cont(shell):
+    num_seg = getattr(shell, "num_seg_cont", None)
+    if num_seg is not None:
+        return int(num_seg)
+    return int(_shell_coeff_matrix(shell).shape[1])
+
+
+def _shell_num_angmom(shell, coord_type):
+    if coord_type == 'spherical':
+        num_sph = getattr(shell, "num_sph", None)
+        if num_sph is not None:
+            return int(num_sph)
+        angmom = _shell_angmom(shell)
+        return 2 * angmom + 1
+
+    num_cart = getattr(shell, "num_cart", None)
+    if num_cart is not None:
+        return int(num_cart)
+    return 1
 
 
 def _resolve_shell_icenter(shell, atom_coords, tol=1e-10):
@@ -151,16 +197,19 @@ def _resolve_shell_icenter(shell, atom_coords, tol=1e-10):
     if icenter is not None:
         return int(icenter)
 
-    coord = np.asarray(getattr(shell, "coord", None), dtype=float)
+    coord = getattr(shell, "coord", None)
+    if coord is None:
+        coord = getattr(shell, "origin", None)
+    coord = np.asarray(coord, dtype=float)
     if coord.shape != (3,):
         raise ValueError(
-            "Shell center could not be determined: missing icenter and invalid coord."
+            "Shell center could not be determined: missing icenter and invalid coord/origin."
         )
 
     matches = np.where(np.all(np.isclose(atom_coords, coord, atol=tol, rtol=0.0), axis=1))[0]
     if matches.size != 1:
         raise ValueError(
-            "Shell center could not be determined uniquely from shell.coord."
+            "Shell center could not be determined uniquely from shell.coord/origin."
         )
     return int(matches[0])
 
@@ -181,10 +230,8 @@ class CBasis1e:
         self.atom_coords = np.asarray(atom_coords, dtype=float)
 
         if coord_type == 'spherical':
-            num_angmom = lambda shell: shell.num_sph
             suffix = '_sph'
         else:
-            num_angmom = lambda shell: shell.num_cart
             suffix = '_cart'
         self._suffix = suffix
 
@@ -203,11 +250,14 @@ class CBasis1e:
         for shell in self.basis:
             icenter = _resolve_shell_icenter(shell, self.atom_coords)
             shell_icenters.append(icenter)
-            offs.extend([num_angmom(shell)] * shell.num_seg_cont)
-            atom_ao_offsets[icenter + 1] += num_angmom(shell) * shell.num_seg_cont
-            nbas += shell.num_seg_cont
-            nbfn += num_angmom(shell) * shell.num_seg_cont
-            nenv += shell.exps.size + shell.coeffs.size
+            shell_num_angmom = _shell_num_angmom(shell, coord_type)
+            shell_num_seg = _shell_num_seg_cont(shell)
+            shell_coeffs = _shell_coeff_matrix(shell)
+            offs.extend([shell_num_angmom] * shell_num_seg)
+            atom_ao_offsets[icenter + 1] += shell_num_angmom * shell_num_seg
+            nbas += shell_num_seg
+            nbfn += shell_num_angmom * shell_num_seg
+            nenv += shell.exps.size + shell_coeffs.size
 
         self.natm = natm
         self.nbas = nbas
@@ -234,17 +284,18 @@ class CBasis1e:
 
         ibas = 0
         for shell, icenter in zip(self.basis, shell_icenters):
-            nprim = shell.coeffs.shape[0]
+            shell_coeffs = _shell_coeff_matrix(shell)
+            nprim = shell_coeffs.shape[0]
             iexp = ienv
             ienv += shell.exps.size
             env[iexp:ienv] = shell.exps
             icoef = ienv
-            ienv += shell.coeffs.size
+            ienv += shell_coeffs.size
             env[icoef:ienv] = normalized_coeffs(shell).reshape(-1, order="F")
 
-            for iprim in range(icoef, icoef + shell.coeffs.size, nprim):
+            for iprim in range(icoef, icoef + shell_coeffs.size, nprim):
                 bas[ibas, 0] = icenter
-                bas[ibas, 1] = shell.angmom
+                bas[ibas, 1] = _shell_angmom(shell)
                 bas[ibas, 2] = nprim
                 bas[ibas, 3] = 1
                 bas[ibas, 4] = 0

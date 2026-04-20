@@ -9,13 +9,17 @@ import numpy as np
 from scipy.linalg import eigh, sqrtm
 import scipy
 import pyscf
-from pyscf import scf
-
-from pyqed import is_positive_def
-from pyqed.units import au2ev
+from pyscf import ao2mo, scf
 
 from functools import reduce
 import logging
+
+au2ev = 27.211386245988
+
+
+def is_positive_def(a):
+    vals = np.linalg.eigvalsh(np.asarray(a))
+    return np.all(vals > 0)
 
 
 def eig_asymm(h):
@@ -75,39 +79,70 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
             return np.sqrt(esq), t
 
 
-def get_ab(gw, method='TDH'):
-    '''Compute the RPA A and B matrices, using TDH, TDHF, or TDDFT.
-    '''
-    assert method in ('TDH','TDHF','TDDFT')
-    nso = gw.nso
-    nocc = gw.nocc
-    nvir = nso - nocc
+def _ov_blocks(gw):
+    mo_energy = np.asarray(gw._scf.mo_energy)
+    mo_coeff = np.asarray(gw._scf.mo_coeff)
+    mo_occ = np.asarray(gw._scf.mo_occ)
 
-    dim_rpa = nocc*nvir
+    occidx = np.where(mo_occ > 0)[0]
+    viridx = np.where(mo_occ == 0)[0]
+
+    orbo = mo_coeff[:, occidx]
+    orbv = mo_coeff[:, viridx]
+    return mo_energy, occidx, viridx, orbo, orbv
+
+
+def get_ab(gw, method='TDH', singlet=True):
+    '''Compute restricted RHF A/B matrices in the occupied/virtual response space.'''
+    assert method in ('TDH', 'TDHF', 'TDDFT')
+    if method == 'TDDFT':
+        raise NotImplementedError('TDDFT is not implemented in this legacy TDHF module.')
+
+    mo_energy, occidx, viridx, orbo, orbv = _ov_blocks(gw)
+    nocc = len(occidx)
+    nvir = len(viridx)
+    dim_rpa = nocc * nvir
     logging.info('dim of AB matrices = {}'.format(dim_rpa))
 
-    A = np.zeros((dim_rpa, dim_rpa))
-    B = np.zeros((dim_rpa, dim_rpa))
+    e_ia = mo_energy[viridx] - mo_energy[occidx, None]
+    a = np.diag(e_ia.ravel()).reshape(nocc, nvir, nocc, nvir)
+    b = np.zeros_like(a)
 
-    ai = 0
-    for i in range(nocc):
-        for a in range(nocc,nso):
-            A[ai,ai] = gw.e_mf[a] - gw.e_mf[i]
-            bj = 0
-            for j in range(nocc):
-                for b in range(nocc,nso):
-                    A[ai,bj] += gw.eri[a,i,j,b]
-                    B[ai,bj] += gw.eri[a,i,b,j]
-                    if method == 'TDHF':
-                        A[ai,bj] -= gw.eri[a,b,j,i]
-                        B[ai,bj] -= gw.eri[a,j,b,i]
-                    bj += 1
-            ai += 1
+    # Coulomb block J_{ia,jb} = (ia|jb)
+    eri_iajb = ao2mo.general(
+        gw.mol,
+        (orbo, orbv, orbo, orbv),
+        compact=False,
+    ).reshape(nocc, nvir, nocc, nvir)
 
-    assert np.allclose(A, A.transpose())
-    assert np.allclose(B, B.transpose())
+    # Exchange blocks written in occupied/virtual order.
+    eri_ijab = ao2mo.general(
+        gw.mol,
+        (orbo, orbo, orbv, orbv),
+        compact=False,
+    ).reshape(nocc, nocc, nvir, nvir)
+    k_a = np.transpose(eri_ijab, (0, 2, 1, 3))
 
-    return A, B
+    eri_jaib = ao2mo.general(
+        gw.mol,
+        (orbo, orbv, orbo, orbv),
+        compact=False,
+    ).reshape(nocc, nvir, nocc, nvir)
+    k_b = np.transpose(eri_jaib, (2, 1, 0, 3))
+
+    if singlet:
+        a += 2.0 * eri_iajb
+        b += 2.0 * eri_iajb
+
+    if method == 'TDHF':
+        a -= k_a
+        b -= k_b
+
+    a = a.reshape(dim_rpa, dim_rpa)
+    b = b.reshape(dim_rpa, dim_rpa)
+    assert np.allclose(a, a.transpose())
+    assert np.allclose(b, b.transpose())
+    return a, b
 
 class TDH:
     '''
@@ -125,57 +160,19 @@ class TDHF:
         self.stdout = self.mol.stdout
         self.max_memory = mf.max_memory
         self.spin = 0
-
-        self.nocc = self.mol.nelectron # spin-polarized
+        self.singlet = True
 
         self._a = None
         self._b = None
+        self.e = None
+        self.xy = None
 
-        # HF
-        v_mf = -mf.get_k()
-
-        # if mf.mo_occ[0] == 2:
         if isinstance(mf, scf.rhf.RHF):
-            # RHF, convert to spin-orbitals
-            nso = 2*len(mf.mo_energy)
-            self.nso = nso
-            self.e_mf = np.zeros(nso)
-            self.e_mf[0::2] = self.e_mf[1::2] = mf.mo_energy
-            
-            b = np.zeros((nso//2, nso)) # nao, nso
-            b[:,0::2] = b[:,1::2] = mf.mo_coeff
-            
-            self.v_mf = 0.5 * reduce(np.dot, (b.T, v_mf, b))
-            self.v_mf[::2,1::2] = self.v_mf[1::2,::2] = 0
-
-            # electron repulsion integral
-            ao2mofn = pyscf.ao2mo.outcore.general_iofree
-            eri = ao2mofn(mf.mol, (b,b,b,b),
-                          compact=False).reshape(nso,nso,nso,nso)
-
-            eri[::2,1::2] = eri[1::2,::2] = eri[:,:,::2,1::2] = eri[:,:,1::2,::2] = 0
-            # Integrals are in "chemist's notation"
-            # eri[i,j,k,l] = (ij|kl) = \int i(1) j(1) 1/r12 k(r2) l(r2)
-            
-            print("Imag part of ERIs =", np.linalg.norm(eri.imag))
-            self.eri = eri.real
-
+            self.e_mf = np.asarray(mf.mo_energy)
+            self.nocc = self.mol.nelectron // 2
+            self.nso = len(self.e_mf)
         else:
-            # ROHF or UHF, these are already spin-orbitals
             raise NotImplementedError("\n*** Only supporting restricted calculations right now! ***\n")
-
-            nso = len(mf.mo_energy)
-            self.nso = nso
-            self.e_mf = mf.mo_energy
-            b = mf.mo_coeff
-            self.v_mf = reduce(np.dot, (b.T, v_mf, b))
-            eri = ao2mofn(mf.mol, (b,b,b,b),
-                          compact=False).reshape(nso,nso,nso,nso)
-            self.eri = eri
-
-        print("There are %d spin-orbitals"%(self.nso))
-
-        # self.eta = eta
         self._M = None
 
     # def run(self):
@@ -198,7 +195,7 @@ class TDHF:
     # def get_m_rpa(self, e_rpa, t_rpa):
     #     return get_m_rpa(self, e_rpa, t_rpa)
 
-    def run(self, nstates=None, using_tda=False, using_casida=True, method='TDHF'):
+    def run(self, nstates=None, using_tda=False, using_casida=True, method='TDHF', singlet=None):
         '''Get the RPA eigenvalues and eigenvectors.
 
         The RPA computation is required to construct the dielectric function, i.e. screened
@@ -216,18 +213,16 @@ class TDHF:
         See, e.g. Stratmann, Scuseria, and Frisch,
                   J. Chem. Phys., 109, 8218 (1998)
         '''
-        A, B = self.get_ab(method=method)
+        if singlet is None:
+            singlet = self.singlet
+
+        A, B = self.get_ab(method=method, singlet=singlet)
 
         if using_tda:
-
             logging.info('Using TDA approximation')
-            ham_rpa = A
-            e, x = eig(ham_rpa)
-            
-            if nstates is not None:
-                e, x = scipy.sparse.linalg.eigsh(ham_rpa, k=nstates)
-            else:
-                e, x = eigh(ham_rpa)
+            e, x = eig(A, k=nstates, which='SA' if isinstance(nstates, int) else None)
+            self.e = e
+            self.xy = x
             return e, x
         
         else:
@@ -236,22 +231,33 @@ class TDHF:
                 sqrt_A_minus_B = sqrtm(A-B)
                 ham_rpa = np.dot(sqrt_A_minus_B, np.dot((A+B),sqrt_A_minus_B))
 
-                esq, t = eig(ham_rpa, k=nstates, which='SM')
+                if nstates is not None:
+                    esq, t = eig(ham_rpa, k=nstates, which='SA')
+                else:
+                    esq, t = eigh(ham_rpa)
                 e = np.sqrt(esq)
-                print('Roots (eV) = ', e*au2ev)
+                self.e = e
+                self.xy = t
                 return e, t
 
             else:
                 ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-                assert is_positive_def(ham_rpa)
                 e, xy = eig_asymm(ham_rpa)
+                e = e[e > 1e-8]
+                if nstates is not None:
+                    e = e[:nstates]
+                    xy = xy[:, :nstates]
+                self.e = e
+                self.xy = xy
                 return e, xy
 
 
 
 
-    def get_ab(self, method='TDHF'):
-        a, b = get_ab(self, method=method)
+    def get_ab(self, method='TDHF', singlet=None):
+        if singlet is None:
+            singlet = self.singlet
+        a, b = get_ab(self, method=method, singlet=singlet)
         self._a = a
         self._b = b
         return a, b
@@ -282,15 +288,6 @@ def eig(a, k=None, **kwargs):
     else:
         e, x = eigh(a)
     return e, x
-
-
-class RTTDHF(TDHF):
-    """
-    real-time TDHF 
-    """
-    def run(self):
-        pass
-
 
 
 if __name__ == '__main__':

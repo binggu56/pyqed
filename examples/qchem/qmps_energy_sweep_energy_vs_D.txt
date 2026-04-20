@@ -1,0 +1,11 @@
+# D e_dmrg abs_err success message
+   2 nan nan 0 DMRG did not converge within the given number of sweeps, if you wish to disable this error, set not_conv_err = False. or you should increase the number of sweeps.
+   4 -4.4179061533666211e+00 4.440892e-15 1 ok
+   6 -4.4179061533666264e+00 8.881784e-16 1 ok
+   8 -4.4179061533666264e+00 8.881784e-16 1 ok
+  12 -4.4179061533666264e+00 8.881784e-16 1 ok
+  16 -4.4179061533666264e+00 8.881784e-16 1 ok
+  24 -4.4179061533666264e+00 8.881784e-16 1 ok
+  32 -4.4179061533666264e+00 8.881784e-16 1 ok
+  48 -4.4179061533666264e+00 8.881784e-16 1 ok
+  64 -4.4179061533666264e+00 8.881784e-16 1 ok

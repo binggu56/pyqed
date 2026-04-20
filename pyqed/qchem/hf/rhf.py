@@ -106,7 +106,6 @@ class RHF:
         if (
             cholesky_jk_kw is None
             and low_rank_jk_kw is None
-            and getattr(self.mol, 'eri', None) is None
             and getattr(self.mol, 'eri_factors', None) is not None
         ):
             cholesky_jk = True
@@ -202,6 +201,45 @@ class RHF:
             eri = contract('abcd, ap, br, cs, dq -> pqrs', self.eri, C.conj(), C, C.conj(), C)
                                     
             return eri
+
+    def dipole(self, center=None, basis='ao'):
+        """
+        Electric-dipole operator integrals from the current RHF reference.
+
+        Parameters
+        ----------
+        center : array_like, optional
+            Dipole origin. Defaults to the nuclear center of mass.
+        basis : {'ao', 'mo'}, optional
+            Basis for the returned operator blocks.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(3, nao, nao)`` for ``basis='ao'`` or ``(3, nmo, nmo)`` for
+            ``basis='mo'``. The returned operator is the electronic dipole
+            operator ``mu = -r``, not the position operator ``r``.
+        """
+        if center is None:
+            center = self.mol.center_of_mass()
+        op = -np.asarray(self.mol.moment_integral(center=center), dtype=float)
+        if op.ndim != 3:
+            raise ValueError("moment_integral() must return a rank-3 array.")
+        if op.shape[0] != 3:
+            if op.shape[-1] == 3:
+                op = np.moveaxis(op, -1, 0)
+            else:
+                raise ValueError("dipole() expects shape (3, nao, nao) or (nao, nao, 3).")
+
+        key = basis.lower()
+        if key == 'ao':
+            return op
+        if key == 'mo':
+            if self.mo_coeff is None:
+                raise ValueError("Run RHF before requesting dipole operators in the MO basis.")
+            coeff = np.asarray(self.mo_coeff)
+            return contract('xij,ip,jq->xpq', op, coeff.conj(), coeff, optimize=True)
+        raise ValueError("basis must be 'ao' or 'mo'.")
 
     def get_eri_so(self):
         """
@@ -430,13 +468,29 @@ class RHF:
         else:
             C = mo_coeff
 
+        if self.eri is not None:
+            if notation == 'chem':
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', self.eri, C.conj(), C, C.conj(), C)
+            elif notation == 'phys':
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', self.eri, C.conj(), C, C.conj(), C)
+            else:
+                raise ValueError("notation must be 'chem' or 'phys'.")
+            return eri_mo
+
+        eri_factors = getattr(self, 'eri_factors', None)
+        if eri_factors is None:
+            eri_factors = getattr(self.mol, 'eri_factors', None)
+        if eri_factors is None:
+            raise ValueError("RHF.get_eri_mo() requires either dense eri or eri_factors.")
+
+        pair_factors = contract('Pmn,mp,nq->Ppq', eri_factors, C.conj(), C)
+        eri_mo = contract('Ppq,Prs->pqrs', pair_factors, pair_factors)
+
         if notation == 'chem':
-            eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', self.eri, C.conj(), C, C.conj(), C)
-
-        elif notation == 'phys':
-            eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', self.eri, C.conj(), C, C.conj(), C)
-
-        return eri_mo
+            return eri_mo
+        if notation == 'phys':
+            return eri_mo.transpose(0, 2, 1, 3)
+        raise ValueError("notation must be 'chem' or 'phys'.")
 
     def to_uhf(self):
         # transform a RHF to UHF format with spin orbitals
@@ -852,15 +906,15 @@ def get_jk(mol, dm, eri_factors=None):
 
     """
     if eri_factors is not None:
-        coeff = np.einsum('pkl,kl->p', eri_factors, dm, optimize=True)
+        coeff = np.einsum('pkl,lk->p', eri_factors, dm, optimize=True)
         vj = np.einsum('p,pij->ij', coeff, eri_factors, optimize=True)
-        vk = np.einsum('pil,kl,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
+        vk = np.einsum('pil,lk,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
         return vj, vk
 
     eri = mol.eri
 
-    vj = contract('kl, ijkl -> ij', dm, eri)
-    vk = contract('kl, ilkj -> ij', dm, eri)
+    vj = contract('lk, ijkl -> ij', dm, eri)
+    vk = contract('lk, ilkj -> ij', dm, eri)
     return vj, vk
 
 

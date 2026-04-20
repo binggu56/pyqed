@@ -81,6 +81,7 @@ BAS_SLOTS  = 8
 
 
 _BUILTIN_OPTION_SPECS = (
+    ("coord_type", "builtin_coord_type", "native_coord_type", str, "cartesian"),
     ("parallel", "builtin_parallel", "native_parallel", bool, False),
     ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
@@ -1020,6 +1021,8 @@ class Molecule:
         self.nmo = None
         self.unit = unit
         self._bas = None
+        self._bas_cart = None
+        self._ao_cart2sph = None
         self._build_driver = None
         builtin_options = _pop_builtin_options(kwargs)
         self._set_builtin_options(builtin_options)
@@ -1226,7 +1229,12 @@ class Molecule:
         if orders is None:
             orders = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
-        return moment_integral(self._bas, moment_coord=center, moment_orders=orders)
+        basis = self._bas_cart if self._bas_cart is not None else self._bas
+        ints = moment_integral(basis, moment_coord=center, moment_orders=orders)
+        transform = getattr(self, "_ao_cart2sph", None)
+        if transform is not None:
+            ints = np.einsum('pi,xpq,qj->xij', transform, ints, transform, optimize=True)
+        return ints
 
     def momentum_integral(self, orders=(1,0,0), center=(0,0,0)):
 
@@ -1328,6 +1336,8 @@ class Molecule:
         self.nao = None
         self.nmo = None
         self._bas = None
+        self._bas_cart = None
+        self._ao_cart2sph = None
         for attr in ('ao_moment', 'ao_dip', 'ao_magnetic_dip', '_atm', '_env'):
             if hasattr(self, attr):
                 setattr(self, attr, None)

@@ -66,6 +66,24 @@ def test_rhf_cholesky_jk_matches_direct_energy():
     assert mf_lr.eri_factors.shape[0] <= mol.nao * mol.nao
 
 
+def test_rhf_auto_prefers_prebuilt_dense_plus_factors():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(
+        driver='builtin',
+        options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
+    )
+
+    mf_auto = RHF(mol).run()
+    mf_explicit = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
+
+    assert mol.eri is not None
+    assert mol.eri_factors is not None
+    assert mf_auto.cholesky_jk
+    assert mf_auto.low_rank_jk
+    np.testing.assert_allclose(mf_auto.e_tot, mf_explicit.e_tot, atol=1e-10)
+    np.testing.assert_allclose(mf_auto.dm, mf_explicit.dm, atol=1e-8)
+
+
 def test_low_rank_aliases_match_cholesky_options():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
     mol.build(driver='gbasis-pyscf')

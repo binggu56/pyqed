@@ -23,11 +23,35 @@ def _axis_to_index(axis):
     return int(axis)
 
 
-def gaussian_pulse(amplitude, center, width, frequency=0.0, phase=0.0,
+def gaussian_pulse(amplitude, center, width, omega=None, frequency=None, phase=0.0,
                    polarization=(1.0, 0.0, 0.0)):
     """
     Build a Gaussian-envelope electric field callable.
+
+    Parameters
+    ----------
+    amplitude : float
+        Peak field amplitude.
+    center : float
+        Pulse center time.
+    width : float
+        Gaussian width.
+    omega : float, optional
+        Carrier angular frequency in atomic units.
+    frequency : float, optional
+        Backward-compatible alias for ``omega``.
+    phase : float, optional
+        Carrier-envelope phase.
+    polarization : array_like, optional
+        Field polarization vector.
     """
+    if omega is None:
+        omega = 0.0 if frequency is None else float(frequency)
+    elif frequency is not None and not np.isclose(float(omega), float(frequency)):
+        raise ValueError("Pass either omega or frequency, or make them equal.")
+    else:
+        omega = float(omega)
+
     polarization = np.asarray(polarization, dtype=float)
     norm = np.linalg.norm(polarization)
     if norm == 0.0:
@@ -36,8 +60,16 @@ def gaussian_pulse(amplitude, center, width, frequency=0.0, phase=0.0,
 
     def field(time):
         env = amplitude * np.exp(-((time - center) ** 2) / (2.0 * width ** 2))
-        carrier = np.cos(frequency * (time - center) + phase)
+        carrier = np.cos(omega * (time - center) + phase)
         return env * carrier * polarization
+
+    field.polarization = polarization.copy()
+    field.amplitude = float(amplitude)
+    field.center = float(center)
+    field.width = float(width)
+    field.omega = omega
+    field.frequency = omega
+    field.phase = float(phase)
 
     return field
 
@@ -50,9 +82,10 @@ class RTTDHF:
     -----
     The propagation is carried out in a Löwdin-orthogonalized AO basis using a
     midpoint unitary step.  When an external field is supplied, the AO
-    interaction operator is taken to be the position operator by default:
+    interaction operator is taken to be the electronic dipole operator by
+    default:
 
-        F(t) = F_HF[D(t)] - E(t) . r
+        F(t) = F_HF[D(t)] - E(t) . mu
     """
 
     def __init__(self, mf, interaction_ao=None, field=None, s_thresh=1e-12):
@@ -119,17 +152,7 @@ class RTTDHF:
         AO representation of the external-field interaction operator.
         """
         if self.interaction_ao is None:
-            op = np.asarray(self.mol.moment_integral(), dtype=float)
-            if op.ndim != 3:
-                raise ValueError("moment_integral() must return a rank-3 array.")
-            if op.shape[0] == 3:
-                self.interaction_ao = op
-            elif op.shape[-1] == 3:
-                self.interaction_ao = np.moveaxis(op, -1, 0)
-            else:
-                raise ValueError(
-                    "interaction_ao must have shape (3, nao, nao) or (nao, nao, 3)."
-                )
+            self.interaction_ao = np.asarray(self._scf.dipole(basis='ao'), dtype=float)
         return self.interaction_ao
 
     def field_vector(self, time, field=None):
@@ -183,7 +206,7 @@ class RTTDHF:
 
     def dipole_moment(self, dm=None):
         """
-        Expectation value of the AO position operator.
+        Expectation value of the AO electronic dipole operator.
         """
         if dm is None:
             dm = self.dm

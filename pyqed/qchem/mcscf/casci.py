@@ -21,6 +21,7 @@ from pyqed import tensor
 from itertools import combinations
 import itertools
 import warnings
+from dataclasses import dataclass
 
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
@@ -234,13 +235,18 @@ def _get_mf_cholesky_factors(mf):
     return eri_factors
 
 
-def _resolve_use_cholesky_integrals(mf, use_cholesky=False):
+def _resolve_use_cholesky_integrals(mf, use_cholesky=None):
     """
     Enable the factor/Cholesky CASCI path automatically for factor-only RHF.
     """
+    if use_cholesky is None:
+        use_cholesky = bool(getattr(mf, 'cholesky_jk', False))
     if use_cholesky:
         return True
-    return getattr(mf, 'eri', None) is None and getattr(mf, 'eri_factors', None) is not None
+    return (
+        getattr(mf, 'eri_factors', None) is not None
+        or getattr(getattr(mf, 'mol', None), 'eri_factors', None) is not None
+    )
 
 
 def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
@@ -916,7 +922,7 @@ class CASCI:
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='ci', ci0=None, use_cholesky=False):
+    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=None):
         """
         solve the full CI in the active space, more efficient than the JW solver
 
@@ -928,9 +934,10 @@ class CASCI:
             Default is canonical MOs.
         method : TYPE, optional
             choose which solver to use.
-            'ci' is the standard CI solver.
+            'direct_ci' is the default matrix-free direct-CI backend.
+            'ci' is the standard dense CI solver.
             'jw' is the exact diagonalizaion by Jordan-Wigner transformation.
-            The default is 'ci'.
+            The default is 'direct_ci'.
 
         TODO: spin
 
@@ -972,7 +979,9 @@ class CASCI:
         else:
             binary = self.binary
 
-        if method == 'ci' and self.use_cholesky_integrals and not self.spin_purification:
+        if method == 'direct_ci' or (
+            method == 'ci' and self.use_cholesky_integrals and not self.spin_purification
+        ):
             from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
 
             direct_solver = DirectCASCI(
@@ -1891,6 +1900,382 @@ def make_rdm2(ci, Binary, SC1, SC2):
 
     return D
 
+
+def _compute_ci_mo_overlap(cibra, ciket, s=None):
+    if s is not None:
+        return s
+
+    try:
+        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+    except (ImportError, AttributeError, TypeError):
+        from pyscf import gto
+        mol_bra = cibra.mol.topyscf()
+        mol_ket = ciket.mol.topyscf()
+        mol_bra.build()
+        mol_ket.build()
+        s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
+    return reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
+
+
+def _as_state_ci_matrix(ci, ndet):
+    ci_arr = np.asarray(ci)
+    if ci_arr.ndim == 1:
+        if ci_arr.shape[0] != ndet:
+            raise ValueError(f"CI vector length {ci_arr.shape[0]} does not match ndet={ndet}.")
+        return ci_arr.reshape(1, ndet)
+    if ci_arr.ndim == 2 and ci_arr.shape[1] == ndet:
+        return ci_arr
+    raise ValueError(f"Unsupported CI coefficient shape {ci_arr.shape}; expected (*, {ndet}).")
+
+
+def _unique_rows_first(rows):
+    rows = np.asarray(rows, dtype=np.int8)
+    if rows.shape[0] == 0:
+        return rows
+    _, first_idx = np.unique(rows, axis=0, return_index=True)
+    return rows[np.sort(first_idx)]
+
+
+def _occupation_lists(strings):
+    return [np.flatnonzero(row) for row in strings]
+
+
+def _string_overlap_matrix(saa_eff, bra_occ, ket_occ, dtype):
+    out = np.empty((len(bra_occ), len(ket_occ)), dtype=dtype)
+    for i, occ_i in enumerate(bra_occ):
+        for j, occ_j in enumerate(ket_occ):
+            out[i, j] = np.linalg.det(saa_eff[np.ix_(occ_i, occ_j)])
+    return out
+
+
+def _string_transform_matrix(orbital_transform, occ_strings, dtype):
+    """Induced determinant-space transform for an active-orbital rotation."""
+    occ_lists = _occupation_lists(occ_strings)
+    nstr = len(occ_lists)
+    out = np.empty((nstr, nstr), dtype=dtype)
+    for i, occ_i in enumerate(occ_lists):
+        for j, occ_j in enumerate(occ_lists):
+            out[i, j] = np.linalg.det(orbital_transform[np.ix_(occ_i, occ_j)])
+    return out
+
+
+def _string_singular_weights(sigma, occ_strings):
+    """Diagonal singular-value weights in the determinant/string representation."""
+    occ_lists = _occupation_lists(occ_strings)
+    if len(occ_lists) == 0:
+        return np.empty((0,), dtype=sigma.dtype)
+    out = np.empty((len(occ_lists),), dtype=sigma.dtype)
+    for i, occ in enumerate(occ_lists):
+        out[i] = np.prod(sigma[occ]) if len(occ) > 0 else 1.0
+    return out
+
+
+def _reconstruct_string_overlap_from_svd(u, sigma, right_vh, occ_strings, dtype):
+    """Exact determinant-space reconstruction from the orbital-space SVD.
+
+    For a fixed-electron string basis built from all combinations of occupied
+    orbitals in a given one-particle space, Cauchy-Binet gives
+
+    ``W(S) = W(U) @ diag(w(sigma)) @ W(Vh)``
+
+    where ``S = U diag(sigma) Vh`` and ``W`` denotes the induced transform in
+    determinant/string space. The right factor must be passed in ``Vh``
+    orientation; using ``V`` instead gives the wrong determinant-space map.
+    """
+    left = _string_transform_matrix(u, occ_strings, dtype)
+    right = _string_transform_matrix(right_vh, occ_strings, dtype)
+    weights = np.diag(_string_singular_weights(sigma, occ_strings))
+    return left @ weights @ right
+
+
+def _biorthogonalize_active_overlap(saa_eff):
+    """Balanced SVD biorthogonalization of the active-space overlap block."""
+    u, sigma, vh = np.linalg.svd(saa_eff, full_matrices=False)
+    if sigma.size == 0:
+        return u, sigma, vh, saa_eff.copy(), saa_eff.copy()
+    tol = np.finfo(sigma.dtype).eps * max(saa_eff.shape) * sigma.max()
+    if np.min(sigma) <= tol:
+        raise np.linalg.LinAlgError(
+            "Active-space overlap is numerically singular and cannot be biorthogonalized "
+            f"(min sigma={sigma.min():.3e}, tol={tol:.3e})."
+        )
+    sigma_inv_sqrt = sigma ** -0.5
+    x_left = u * sigma_inv_sqrt[np.newaxis, :]
+    x_right = vh.conj().T * sigma_inv_sqrt[np.newaxis, :]
+    return u, sigma, vh, x_left, x_right
+
+
+@dataclass
+class _BiorthogonalOverlapPrep:
+    s_mo: np.ndarray
+    core_factor: complex
+    saa_eff: np.ndarray
+    scc: np.ndarray
+    scc_u: np.ndarray
+    scc_sigma: np.ndarray
+    scc_vh: np.ndarray
+    saa_u: np.ndarray
+    saa_sigma: np.ndarray
+    saa_vh: np.ndarray
+    x_left: np.ndarray
+    x_right: np.ndarray
+
+
+def _svd_inverse(matrix, *, tol=None):
+    """SVD-based inverse used as the first exact biorthogonalization step."""
+    u, sigma, vh = np.linalg.svd(matrix, full_matrices=False)
+    if sigma.size == 0:
+        return u, sigma, vh, matrix.copy()
+    if tol is None:
+        tol = np.finfo(sigma.dtype).eps * max(matrix.shape) * sigma.max()
+    if np.min(sigma) <= tol:
+        raise np.linalg.LinAlgError(
+            "Overlap block is numerically singular and cannot be biorthogonalized "
+            f"(min sigma={sigma.min():.3e}, tol={tol:.3e})."
+        )
+    inv = (vh.conj().T / sigma) @ u.conj().T
+    return u, sigma, vh, inv
+
+
+def _active_orbital_slices(ncore_bra, ncore_ket, ncas_bra, ncas_ket):
+    bra_active = slice(ncore_bra, ncore_bra + ncas_bra)
+    ket_active = slice(ncore_ket, ncore_ket + ncas_ket)
+    return bra_active, ket_active
+
+
+def _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, dtype):
+    """Prepare exact overlap data with SVD-based core biorthogonalization."""
+    if ncore_bra != ncore_ket:
+        raise ValueError(
+            "Different numbers of core orbitals are not supported in overlap: "
+            f"{ncore_bra} != {ncore_ket}."
+        )
+
+    bra_active, ket_active = _active_orbital_slices(ncore_bra, ncore_ket, ncas_bra, ncas_ket)
+    scc = np.asarray(s[:ncore_bra, :ncore_ket], dtype=dtype)
+    sca = np.asarray(s[:ncore_bra, ket_active], dtype=dtype)
+    sac = np.asarray(s[bra_active, :ncore_ket], dtype=dtype)
+    saa = np.asarray(s[bra_active, ket_active], dtype=dtype)
+
+    if ncore_bra == 0:
+        saa_u, saa_sigma, saa_vh, x_left, x_right = _biorthogonalize_active_overlap(saa)
+        return _BiorthogonalOverlapPrep(
+            s_mo=np.asarray(s, dtype=dtype),
+            core_factor=dtype.type(1),
+            saa_eff=saa,
+            scc=scc,
+            scc_u=np.empty((0, 0), dtype=dtype),
+            scc_sigma=np.empty((0,), dtype=float),
+            scc_vh=np.empty((0, 0), dtype=dtype),
+            saa_u=saa_u,
+            saa_sigma=saa_sigma,
+            saa_vh=saa_vh,
+            x_left=x_left,
+            x_right=x_right,
+        )
+
+    scc_u, scc_sigma, scc_vh, scc_inv = _svd_inverse(scc)
+    saa_eff = saa - sac @ scc_inv @ sca
+    saa_u, saa_sigma, saa_vh, x_left, x_right = _biorthogonalize_active_overlap(saa_eff)
+
+    return _BiorthogonalOverlapPrep(
+        s_mo=np.asarray(s, dtype=dtype),
+        core_factor=np.linalg.det(scc) ** 2,
+        saa_eff=saa_eff,
+        scc=scc,
+        scc_u=scc_u,
+        scc_sigma=scc_sigma,
+        scc_vh=scc_vh,
+        saa_u=saa_u,
+        saa_sigma=saa_sigma,
+        saa_vh=saa_vh,
+        x_left=x_left,
+        x_right=x_right,
+    )
+
+
+def _effective_active_overlap(
+    s,
+    ncore_bra,
+    ncore_ket,
+    ncas_bra,
+    ncas_ket,
+    dtype,
+):
+    prep = _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, dtype)
+    return prep.core_factor, prep.saa_eff
+
+
+def _overlap_slow_from_mo_overlap(
+    cibra,
+    ciket,
+    s,
+):
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype)
+
+    ncore_bra = cibra.ncore
+    ncore_ket = ciket.ncore
+    core_factor, saa_eff = _effective_active_overlap(
+        s,
+        ncore_bra,
+        ncore_ket,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+
+    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
+    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
+    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
+    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
+
+    for I in range(nsd_bra):
+        occidx1_a = occ_bra_a[I]
+        occidx1_b = occ_bra_b[I]
+        for J in range(nsd_ket):
+            occidx2_a = occ_ket_a[J]
+            occidx2_b = occ_ket_b[J]
+            S[I, J] = (
+                core_factor
+                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
+                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
+            )
+
+    return contract(
+        'BI, IJ, AJ -> BA',
+        _as_state_ci_matrix(cibra.ci, nsd_bra).conj(),
+        S,
+        _as_state_ci_matrix(ciket.ci, nsd_ket),
+    )
+
+
+def _factorized_ci_overlap(
+    cibra,
+    ciket,
+    s=None,
+):
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+
+    ncore_bra = cibra.ncore
+    ncore_ket = ciket.ncore
+    prep = _prepare_biorthogonal_overlap(
+        s,
+        ncore_bra,
+        ncore_ket,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+
+    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
+    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
+    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
+    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+
+    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
+    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
+
+    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
+        return _overlap_slow_from_mo_overlap(
+            cibra,
+            ciket,
+            s,
+        )
+
+    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
+        return _overlap_slow_from_mo_overlap(
+            cibra,
+            ciket,
+            s,
+        )
+
+    try:
+        return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
+    except (np.linalg.LinAlgError, ValueError):
+        ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
+        ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
+
+        overlap_alpha = _string_overlap_matrix(
+            prep.saa_eff, _occupation_lists(bra_alpha), _occupation_lists(ket_alpha), dtype
+        )
+        overlap_beta = _string_overlap_matrix(
+            prep.saa_eff, _occupation_lists(bra_beta), _occupation_lists(ket_beta), dtype
+        )
+
+        return prep.core_factor * contract(
+            'Xab,ac,bd,Ycd->XY',
+            ci_bra.conj(),
+            overlap_alpha,
+            overlap_beta,
+            ci_ket,
+        )
+
+
+def _transform_ci_tensors_to_biorthogonal_basis(ci_tensors, alpha_transform, beta_transform):
+    """Apply inverse determinant-space transforms to CI tensors state by state."""
+    out = np.empty(ci_tensors.shape, dtype=np.result_type(ci_tensors, alpha_transform, beta_transform))
+    for i, ci in enumerate(ci_tensors):
+        alpha_rot = np.linalg.solve(alpha_transform, ci)
+        out[i] = np.linalg.solve(beta_transform, alpha_rot.T).T
+    return out
+
+
+def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
+    """Biorthogonal CI overlap from precomputed active-space overlap prep."""
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
+    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
+    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
+    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+
+    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
+    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
+
+    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
+        raise ValueError("Biorthogonal overlap candidate requires separable alpha/beta determinant grids.")
+    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
+        raise ValueError("Biorthogonal overlap candidate requires matching alpha and beta string bases.")
+
+    ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
+    ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
+
+    g_left_alpha = _string_transform_matrix(prep.x_left, bra_alpha, dtype)
+    g_left_beta = _string_transform_matrix(prep.x_left, bra_beta, dtype)
+    g_right_alpha = _string_transform_matrix(prep.x_right, ket_alpha, dtype)
+    g_right_beta = _string_transform_matrix(prep.x_right, ket_beta, dtype)
+
+    ci_bra_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_bra, g_left_alpha, g_left_beta)
+    ci_ket_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_ket, g_right_alpha, g_right_beta)
+
+    return prep.core_factor * contract('Xab,Yab->XY', ci_bra_bio.conj(), ci_ket_bio)
+
+
+def _biorthogonal_ci_overlap_candidate(cibra, ciket, s=None):
+    """Private candidate overlap using active-space biorthogonal CI transforms."""
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+
+    prep = _prepare_biorthogonal_overlap(
+        s,
+        cibra.ncore,
+        ciket.ncore,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+    return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
+
 def overlap(cibra, ciket, s=None):
     """
     CASCI electronic overlap matrix
@@ -1927,98 +2312,11 @@ def overlap(cibra, ciket, s=None):
     None.
 
     """
-    # nstates = len(cibra) + 1
-
-    # overlap matrix between MOs at different geometries
-    if s is None:
-        try:
-            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-            s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
-        except (ImportError, AttributeError, TypeError):
-            from pyscf import gto
-            mol_bra = cibra.mol.topyscf()
-            mol_ket = ciket.mol.topyscf()
-            mol_bra.build()
-            mol_ket.build()
-            s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
-        s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
-
-
-    nsd_bra = cibra.binary.shape[0]
-    nsd_ket = ciket.binary.shape[0]
-    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
-    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype) # overlap between determinants
-
-    ncore_bra = cibra.ncore
-    ncore_ket = ciket.ncore
-    if ncore_bra != ncore_ket:
-        raise ValueError(
-            "Different numbers of core orbitals are not supported in overlap: "
-            f"{ncore_bra} != {ncore_ket}."
-        )
-
-    scc = s[:ncore_bra, :ncore_ket]
-    sca = s[:ncore_bra, ncore_ket:]
-    sac = s[ncore_bra:, :ncore_ket]
-    saa = s[ncore_bra:, ncore_ket:]
-
-    if ncore_bra == 0:
-        core_factor = dtype.type(1)
-        saa_eff = saa
-    else:
-        scc_det = np.linalg.det(scc)
-        core_factor = scc_det * scc_det
-        saa_eff = saa - sac @ np.linalg.solve(scc, sca)
-
-    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
-    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
-    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
-    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
-
-    for I in range(nsd_bra):
-        occidx1_a = occ_bra_a[I]
-        occidx1_b = occ_bra_b[I]
-
-        for J in range(nsd_ket):
-            occidx2_a = occ_ket_a[J]
-            occidx2_b = occ_ket_b[J]
-
-            # print('b', occidx2_a, occidx2_b)
-            # print(ciket.binary[J])
-
-    # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-            S[I, J] = (
-                core_factor
-                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
-                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
-            )
-
-
-
-    # core_bra = list(range(cibra.ncore))
-    # core_ket = list(range(ciket.ncore))
-
-
-
-
-    # for I in range(nsd_bra):
-    #     occidx1_a  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-    #     occidx1_b  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
-
-    #     for J in range(nsd_ket):
-    #         occidx2_a  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-    #         occidx2_b  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
-
-    #         # print('b', occidx2_a, occidx2_b)
-    #         # print(ciket.binary[J])
-
-    # # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-
-    #         S[I, J] = np.linalg.det(s[np.ix_(occidx1_a, occidx2_a)]) * \
-    #                   np.linalg.det(s[np.ix_(occidx1_b, occidx2_b)])
-
-
-    return contract('BI, IJ, AJ -> BA', np.array(cibra.ci).conj(), S, np.array(ciket.ci))
+    return _factorized_ci_overlap(
+        cibra,
+        ciket,
+        s=s,
+    )
 
 if __name__ == "__main__":
     from pyqed import Molecule
