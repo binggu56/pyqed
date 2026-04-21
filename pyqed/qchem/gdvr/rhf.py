@@ -7,7 +7,6 @@ import scipy
 from scipy.sparse.linalg import eigsh
 
 #import proplot as plt
-import matplotlib.pyplot as plt
 
 import jax.numpy as jnp
 from jax.scipy.special import erf, erfc

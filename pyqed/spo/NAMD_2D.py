@@ -11,7 +11,6 @@ energy surfaces in 2-dimensional nuclear space
 
 import numpy as np
 import scipy
-import matplotlib.pyplot as plt
 
 from numba import jit 
 from scipy.fftpack import fft2, ifft2, fftfreq

@@ -28,7 +28,6 @@ Todo
 """
 
 import numpy as np
-from matplotlib import pyplot as plt
 # from matplotlib import animation
 from scipy.fftpack import fft,ifft,fftshift
 # from scipy.linalg import expm, sinm, cosm

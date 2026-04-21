@@ -16,7 +16,6 @@ Prony decomposition of time-series data
 import math
 from numpy import linalg as LA
 import numpy as np
-import matplotlib.pyplot as plt
 
 
 def fit_J(w, res, expn, etal, sigma):

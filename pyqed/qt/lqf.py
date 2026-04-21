@@ -17,7 +17,6 @@ import sys
 import math 
 
 from pyqed import Result
-import matplotlib.pyplot as plt
 
 
 

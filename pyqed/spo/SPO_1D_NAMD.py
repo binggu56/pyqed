@@ -17,8 +17,6 @@ Several possible improvements:
 """
 
 import numpy as np
-from matplotlib import pyplot as pl
-from matplotlib import animation
 from scipy.fftpack import fft,ifft,fftshift
 from scipy.linalg import expm, sinm, cosm
 import scipy

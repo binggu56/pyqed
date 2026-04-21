@@ -34,7 +34,17 @@ from pyqed.mps.decompose import decompose, compress
 import logging
 logger = logging.getLogger(__name__)
 try:
-    from pyqed.mps.symmetry import BlockTensor, tensordot, solve_davidson, solve_davidson_block, QN, SymmetryManager
+    from pyqed.mps.symmetry import (
+        BlockTensor,
+        tensordot,
+        solve_davidson,
+        solve_davidson_block,
+        QN,
+        Sector,
+        SymmetryManager,
+        is_sector_like,
+        zero_like_sector,
+    )
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
@@ -287,8 +297,7 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
     sym_H = []
     # Determine Zero QN type
     first_val = list(site_qn_maps[0].values())[0]
-    # Ensure zero_qn is of the same type as the map values (QN)
-    zero_qn = first_val * 0 if isinstance(first_val, tuple) else 0
+    zero_qn = zero_like_sector(first_val)
     # Track allowed Right-Bond QNs. Start with Vacuum (Left=0).
     # Store (Dense_Index, QN_Value)
     current_nodes = {(0, zero_qn)}
@@ -318,9 +327,10 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
             # Q_Right = Q_Left - (Q_Out - Q_In)
             flux = q_out - q_in
             for q_l in valid_incoming[l]:
-                # Ensure q_l is a QN (tuple), not an int
-                if not isinstance(q_l, tuple):
-                    raise TypeError(f"Site {site_idx}: q_l became {type(q_l)} ({q_l})! Expected QN/tuple.")
+                if not is_sector_like(q_l):
+                    raise TypeError(
+                        f"Site {site_idx}: q_l became {type(q_l)} ({q_l})! Expected sector-like symmetry label."
+                    )
                 q_r = q_l - flux
                 next_nodes.add((r, q_r))
                 # Construct Key: Must be (QN, QN, QN, QN)
@@ -352,8 +362,8 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
         # Verify generated keys for first site (debug use)
         if site_idx == 0 and len(final_blocks) > 0:
             sample_key = next(iter(final_blocks.keys()))
-            if not isinstance(sample_key[0], tuple):
-                 print(f"  [ERROR] Site 0 generated INTEGER keys: {sample_key}. Expected QNs.")
+            if not is_sector_like(sample_key[0]):
+                 print(f"  [ERROR] Site 0 generated invalid sector keys: {sample_key}.")
         current_nodes = next_nodes
     return sym_H
 
@@ -2815,10 +2825,7 @@ def initial_E(W):
     """
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
         sample_qn = W.qns[0][0] if len(W.qns[0]) > 0 else 0
-        if isinstance(sample_qn, tuple):
-            zero_qn = sample_qn * 0 # e.g. QN(0,0)
-        else:
-            zero_qn = 0
+        zero_qn = zero_like_sector(sample_qn)
 
         # MPO (In), Bra (In), Ket (In) -> Need Out (+1)
         # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)
@@ -2865,10 +2872,7 @@ def initial_F(W, target_qn=0):
     if SYMMETRY_AVAILABLE and isinstance(W, BlockTensor):
         sample_qn = W.qns[1][0] if len(W.qns[1]) > 0 else 0
 
-        if isinstance(sample_qn, tuple):
-            zero_qn = sample_qn * 0
-        else:
-            zero_qn = 0
+        zero_qn = zero_like_sector(sample_qn)
 
         # MPO (In), Bra (Out), Ket (In) -> Need [In, Out, In] = [-1, 1, -1]
         # Key format: (MPO_Bond, Bra_Bond, Ket_Bond)

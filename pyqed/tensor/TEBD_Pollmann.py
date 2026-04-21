@@ -13,7 +13,6 @@ Ref: SciPost Phys. Lect. Notes 5 (2018) · published 8 October 2018
 """
 
 import numpy as np
-import pylab as pl
 from scipy.linalg import expm
 
 

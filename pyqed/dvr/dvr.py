@@ -6,7 +6,6 @@ A good general introduction to DVR methods is
 Light and Carrington, Adv. Chem. Phys. 114, 263 (2000)
 """
 
-from matplotlib import pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import scipy.sparse.linalg as sla

@@ -3,8 +3,6 @@ import scipy.linalg as la
 from scipy.special import i0e as I0e
 import time
 import warnings
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 import datetime
 import os
 

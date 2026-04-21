@@ -1,7 +1,6 @@
 #!/usr/bin/python
 
 import numpy as np
-import pylab as plt
 
 #with open("traj.dat") as f:
 #    data = f.read()

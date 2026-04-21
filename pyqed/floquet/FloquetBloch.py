@@ -8,7 +8,6 @@ Floquet theory for periodic Hamiltonian
 """
 
 import numpy as np 
-import matplotlib.pyplot as plt 
 
 # from pyqed import 
 

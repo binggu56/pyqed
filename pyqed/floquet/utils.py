@@ -4,7 +4,6 @@ import numpy as np
 import h5py
 import os
 from scipy import linalg
-import matplotlib.pyplot as plt
 from scipy.special import jv
 
 def save_data_to_hdf5(filename, band_energy, band_eigenstates):

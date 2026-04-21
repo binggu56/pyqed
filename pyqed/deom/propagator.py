@@ -13,7 +13,6 @@ import sympy as sp
 import numpy as np
 from scipy import linalg as la
 
-import matplotlib.pyplot as plt
 from pyqed import wavenumber2hartree, au2k, au2wn, au2fs
 
 

@@ -185,28 +185,49 @@ def _maybe_compress_tensor_mpo(tensor_mpo, *, chi_max=None, trigger_bond=None):
 
 def _build_spin_purification_term_map(ncas, shift, *, cutoff=1e-10):
     """Build symbolic terms for the first-order spin-purification penalty."""
+    return _build_s2_term_map(ncas, scale=shift, cutoff=cutoff)
+
+
+def _build_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
+    """
+    Build symbolic spin-orbital terms for the total-spin operator ``S^2``.
+
+    The active-space sites are interleaved spin orbitals:
+    ``2*p -> alpha`` and ``2*p+1 -> beta`` for spatial orbital ``p``.
+
+    In this basis,
+
+    ``S^2 = S_z^2 + 1/2 (S_+ S_- + S_- S_+)``
+
+    expands to the same on-site, density-density, and spin-flip exchange terms
+    used by the direct-CI spin diagnostics. Keeping that algebra in one helper
+    makes the DMRG spin-penalty MPO and the diagnostic ``<S^2>`` operator share
+    exactly the same definition.
+    """
     term_map = {}
+
     # On-site terms
     for p in range(ncas):
-        _accumulate_symbolic_term(term_map, "n", [2 * p], 0.75 * shift, tol=cutoff)
-        _accumulate_symbolic_term(term_map, "n", [2 * p + 1], 0.75 * shift, tol=cutoff)
-        _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * p + 1], -1.5 * shift, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n", [2 * p], 0.75 * scale, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n", [2 * p + 1], 0.75 * scale, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * p + 1], -1.5 * scale, tol=cutoff)
 
     # Cross-site terms
     for p in range(ncas):
         for q in range(ncas):
             if p == q:
                 continue
-            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q], 0.25 * shift, tol=cutoff)
-            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q + 1], 0.25 * shift, tol=cutoff)
-            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q + 1], -0.25 * shift, tol=cutoff)
-            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q], -0.25 * shift, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q], 0.25 * scale, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q + 1], 0.25 * scale, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p, 2 * q + 1], -0.25 * scale, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n n", [2 * p + 1, 2 * q], -0.25 * scale, tol=cutoff)
             symbol, dofs, factor = get_jw_term_spec(
                 [r"a^\dagger", "a", r"a^\dagger", "a"],
                 [2 * p, 2 * p + 1, 2 * q + 1, 2 * q],
-                shift,
+                scale,
             )
             _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+
     return term_map
 
 
@@ -909,11 +930,11 @@ class DMRG(CASCI):
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
         """
-        fix the spin by energy penalty
+        Bias the DMRG optimization toward spin-pure states with a linear ``S^2`` penalty.
 
         .. math::
 
-            H = H + \mu (\hat{S}^2 - S(S+1))
+            H' = H + \mu \hat{S}^2
 
         Parameters
         ----------
@@ -937,21 +958,30 @@ class DMRG(CASCI):
                 ss = s * (s+1)
             else:
                 raise ValueError('s and ss cannot be specified simultaneously.')
+        ss = float(ss)
+        shift = float(shift)
 
-        if ss == 0:
-            # first-order spin penalty J. Phys. Chem. A 2022, 126, 12, 2050–2060
-            # H' = H + J \hat{S}^2
+        ms = abs(float(self.spin)) / 2.0
+        min_ss = ms * (ms + 1.0)
+        if not np.isclose(ss, min_ss):
+            warnings.warn(
+                "The current DMRG spin-purification path adds a linear +shift*S^2 penalty. "
+                "With fixed Sz symmetry this biases toward the lowest-S state in the selected "
+                "Sz sector, but it is not an exact projector onto an arbitrary target S(S+1).",
+                RuntimeWarning,
+            )
 
-            self.ss = ss
-            self.shift = shift
-            self.spin_purification = True
+        # First-order spin penalty J. Phys. Chem. A 2022, 126, 12, 2050-2060:
+        # H' = H + J \hat{S}^2
+        #
+        # The target ``ss`` is still stored for reporting/diagnostics, but the
+        # linear penalty itself only depends on S^2.  Any constant target shift
+        # would not change the optimized wavefunction.
+        self.ss = ss
+        self.shift = shift
+        self.spin_purification = True
 
-            return self
-
-
-        else:
-            # second-order spin penalty
-            raise NotImplementedError('Second-order spin panelty not implemented.')
+        return self
 
     def get_SO_matrix(
         self,
@@ -1272,27 +1302,7 @@ class DMRG(CASCI):
         import pyqed.mps.mps as mps_lib
         
         ncas = self.ncas
-        s2_term_map = {}
-        
-        # On-site terms
-        for p in range(ncas):
-            _accumulate_symbolic_term(s2_term_map, "n", [2*p], 0.75)
-            _accumulate_symbolic_term(s2_term_map, "n", [2*p+1], 0.75)
-            _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*p+1], -1.5)
-            
-        # Cross-site terms
-        for p in range(ncas):
-            for q in range(ncas):
-                if p == q: continue
-                _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*q], 0.25)
-                _accumulate_symbolic_term(s2_term_map, "n n", [2*p+1, 2*q+1], 0.25)
-                _accumulate_symbolic_term(s2_term_map, "n n", [2*p, 2*q+1], -0.25)
-                _accumulate_symbolic_term(s2_term_map, "n n", [2*p+1, 2*q], -0.25)
-                symbol, dofs, factor = get_jw_term_spec(
-                    [r"a^\dagger", "a", r"a^\dagger", "a"],
-                    [2*p, 2*p+1, 2*q+1, 2*q], 1.0
-                )
-                _accumulate_symbolic_term(s2_term_map, symbol, dofs, factor)
+        s2_term_map = _build_s2_term_map(ncas, scale=1.0)
                 
         s2_cache_key = int(ncas)
         mpo_dense = self._s2_mpo_cache.get(s2_cache_key)
@@ -1597,11 +1607,15 @@ class DMRG(CASCI):
             print(f"  Correlation Energy = {e_dmrg_total - self.mf.e_tot:.8f} Ha")
             if s2_val is not None:
                 print(f"  <S^2> =             {s2_val:.6f}")
+                if self.ss is not None:
+                    print(f"  Target <S^2> =      {self.ss:.6f}")
         else:
             for i in range(self.nstates):
                 print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha")
                 if s2_val is not None:
                     print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha, <S^2> = {s2_val[i]:.6f}")
+                    if self.ss is not None:
+                        print(f"  Root {i} target <S^2> = {self.ss:.6f}")
         print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry:
             self.check_abelian_symmetry()
