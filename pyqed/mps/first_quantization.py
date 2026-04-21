@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Generic 1D finite-dimensional lattice model helpers.
+Generic 1D first-quantized finite-dimensional lattice model helpers.
 
 This module provides a reusable class for constructing 1D Hamiltonians in
 sum-of-product form, then converting to MPO via AutoMPO.
@@ -76,7 +76,7 @@ class FiniteDimLocalBasis(BasisSet):
         return self.__class__(new_dof, self.nbas, operator_mats=self._operator_mats)
 
 
-class OneDProblem:
+class Chain:
     """
     Generic 1D finite-lattice model builder.
 
@@ -198,3 +198,7 @@ class OneDProblem:
             a[0, ii, 0] = 1.0
             factors.append(a)
         return MPS(factors, labels=["lv", "p", "rv"])
+
+
+# Backward-compatible alias for older imports.
+LatticeModel1D = Chain

@@ -112,6 +112,70 @@ def test_casscf_lih_diis_matches_non_diis_energy():
     np.testing.assert_allclose(mc_diis.e_tot, mc_plain.e_tot, atol=1e-6)
 
 
+def test_stiefel_minimize_respects_max_iterations_cap():
+    """The inner Stiefel optimizer should support a hard iteration cap."""
+    U0 = np.array([[1.0], [0.0]])
+    h1e = np.array([[0.0, 0.0], [0.0, -1.0]])
+    eri = np.zeros((2, 2, 2, 2))
+    dm1 = np.array([[1.0]])
+    dm2 = np.zeros((1, 1, 1, 1))
+
+    X, value = optimize_module.minimize(
+        optimize_module.energy,
+        U0,
+        args=(h1e, eri, dm1, dm2),
+        max_iterations=0,
+    )
+
+    np.testing.assert_allclose(X, U0)
+    np.testing.assert_allclose(value, optimize_module.energy(U0, h1e, eri, dm1, dm2))
+
+
+def test_stiefel_minimize_clips_large_tangent_steps():
+    """The inner Stiefel optimizer should respect a hard tangent-step cap."""
+    U0 = np.array([[1.0], [0.0]])
+    h1e = np.array([[0.0, -1.0], [-1.0, 0.0]])
+    eri = np.zeros((2, 2, 2, 2))
+    dm1 = np.array([[1.0]])
+    dm2 = np.zeros((1, 1, 1, 1))
+
+    X, _ = optimize_module.minimize(
+        optimize_module.energy,
+        U0,
+        args=(h1e, eri, dm1, dm2),
+        tau=10.0,
+        max_iterations=1,
+        max_step_norm=0.25,
+    )
+
+    G = optimize_module.gradient(U0, h1e, eri, dm1, dm2)
+    df = optimize_module.grad(U0, G)
+    expected_step = 0.25 / optimize_module.norm(df)
+    expected = optimize_module.retract(U0, -expected_step * df)
+
+    np.testing.assert_allclose(X, expected)
+
+
+def test_cocasci_accepts_inner_optimizer_tolerance():
+    """COCASCI should expose configurable inner manifold optimizer controls."""
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = mol.RHF().run()
+    mc = COCASCI(
+        mf,
+        ncas=2,
+        nelecas=2,
+        optimizer_tol=5.0e-4,
+        optimizer_max_steps=12,
+        optimizer_max_step_norm=0.3,
+    )
+
+    assert mc.optimizer_tol == pytest.approx(5.0e-4)
+    assert mc.optimizer_max_steps == 12
+    assert mc.optimizer_max_step_norm == pytest.approx(0.3)
+
+
 def test_first_order_casscf_lih_lowers_initial_casci_energy():
     """The public CASSCF class should improve on the initial CASCI reference."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')

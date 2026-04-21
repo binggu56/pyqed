@@ -26,6 +26,7 @@ class CI:
         self.mol = mf.mol
         self.mo_energy = mf.mo_energy
         self.mo_coeff = mf.mo_coeff
+        self.mo_occ = mf.mo_occ
 
         # self.nstates = nstates
 
@@ -34,12 +35,24 @@ class CI:
         self.nao = mf.mol.nao
         self.nmo = self.nao
 
-        self.nocc = mf.mol.nelec//2
-        self.nvir = self.nmo - self.nocc
+        mo_occ = np.asarray(self.mo_occ)
+        if mo_occ.ndim == 1:
+            self.nocc = int(np.count_nonzero(mo_occ > 0))
+            self.nvir = self.nmo - self.nocc
+            self.nalpha = self.nocc
+            self.nbeta = self.nocc
+        elif mo_occ.ndim == 2 and mo_occ.shape[0] == 2:
+            self.nalpha = int(np.count_nonzero(mo_occ[0] > 0))
+            self.nbeta = int(np.count_nonzero(mo_occ[1] > 0))
+            self.nocc = (self.nalpha, self.nbeta)
+            self.nvir = (self.nmo - self.nalpha, self.nmo - self.nbeta)
+        else:
+            raise ValueError(f"Unsupported mo_occ shape for CI: {mo_occ.shape}")
 
         self.max_cycle = max_cycle
 
         self.nso = self.nmo * 2
+        self.frozen = frozen
 
 
         # self.mo_energy = np.zeros(self.nso)

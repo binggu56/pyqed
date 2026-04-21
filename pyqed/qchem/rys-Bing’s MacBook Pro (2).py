@@ -251,15 +251,6 @@ _P_SHELL_TO_AXIS = {
     (0, 0, 1): 2,
 }
 
-_D_SHELL_TO_AXES = {
-    (2, 0, 0): (0, 0),
-    (0, 2, 0): (1, 1),
-    (0, 0, 2): (2, 2),
-    (1, 1, 0): (0, 1),
-    (1, 0, 1): (0, 2),
-    (0, 1, 1): (1, 2),
-}
-
 _VEC_NAME_TO_ID = {"AB": 0, "CD": 1, "PQ": 2}
 
 
@@ -268,17 +259,6 @@ def _p_axis(shell) -> int:
     if shell not in _P_SHELL_TO_AXIS:
         raise NotImplementedError("Standalone Rys prototype currently supports only Cartesian p shells.")
     return _P_SHELL_TO_AXIS[shell]
-
-
-def _shell_axes(shell) -> tuple[int, ...]:
-    shell = tuple(int(x) for x in shell)
-    if shell == (0, 0, 0):
-        return ()
-    if shell in _P_SHELL_TO_AXIS:
-        return (_P_SHELL_TO_AXIS[shell],)
-    if shell in _D_SHELL_TO_AXES:
-        return _D_SHELL_TO_AXES[shell]
-    raise NotImplementedError("Standalone Rys prototype currently supports only Cartesian s/p/d shells.")
 
 
 def _primitive_ssss_common(a: float, A, b: float, B, c: float, C, d: float, D):
@@ -328,168 +308,6 @@ def _primitive_ssss_common(a: float, A, b: float, B, c: float, C, d: float, D):
         "T": T,
         "pref": pref,
     }
-
-
-def _basis_signature(basis) -> tuple:
-    return (
-        tuple(int(x) for x in basis.shell),
-        tuple(float(x) for x in basis.origin),
-        tuple(float(x) for x in basis.exps),
-        tuple(float(x) for x in basis.prim_weights),
-    )
-
-
-def _basis_from_signature(sig):
-    shell, origin, exps, prim_weights = sig
-    return {
-        "shell": tuple(int(x) for x in shell),
-        "origin": np.asarray(origin, dtype=float),
-        "exps": tuple(float(x) for x in exps),
-        "prim_weights": tuple(float(x) for x in prim_weights),
-    }
-
-
-def _canonical_scalar_pair(sig_left, sig_right):
-    if sig_right < sig_left:
-        return sig_right, sig_left
-    return sig_left, sig_right
-
-
-def _canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d):
-    left = _canonical_scalar_pair(sig_a, sig_b)
-    right = _canonical_scalar_pair(sig_c, sig_d)
-    if right < left:
-        return right[0], right[1], left[0], left[1]
-    return left[0], left[1], right[0], right[1]
-
-
-def _is_s_shell_signature(sig) -> bool:
-    return tuple(int(x) for x in sig[0]) == (0, 0, 0)
-
-
-def _is_p_shell_signature(sig) -> bool:
-    return tuple(int(x) for x in sig[0]) in _P_SHELL_TO_AXIS
-
-
-def _is_d_shell_signature(sig) -> bool:
-    return tuple(int(x) for x in sig[0]) in _D_SHELL_TO_AXES
-
-
-def _is_supported_shell_signature(sig) -> bool:
-    return _is_s_shell_signature(sig) or _is_p_shell_signature(sig) or _is_d_shell_signature(sig)
-
-
-def supports_signature_quartet_rys(sig_a, sig_b, sig_c, sig_d) -> bool:
-    sigs = (sig_a, sig_b, sig_c, sig_d)
-    return all(_is_supported_shell_signature(sig) for sig in sigs)
-
-
-def contracted_eri_from_signatures_rys(sig_a, sig_b, sig_c, sig_d):
-    if not supports_signature_quartet_rys(sig_a, sig_b, sig_c, sig_d):
-        raise NotImplementedError("Rys signature dispatcher currently supports only s/p/d shell quartets.")
-
-    sigs = (sig_a, sig_b, sig_c, sig_d)
-    p_idx = [idx for idx, sig in enumerate(sigs) if _is_p_shell_signature(sig)]
-    np_shells = len(p_idx)
-    if any(_is_d_shell_signature(sig) for sig in sigs):
-        return _contracted_eri_cartesian_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-    if np_shells == 0:
-        return _contracted_eri_ssss_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-    if np_shells == 1:
-        idx = p_idx[0]
-        if idx == 0:
-            a, b, c, d = sig_a, sig_b, sig_c, sig_d
-        elif idx == 1:
-            a, b, c, d = sig_b, sig_a, sig_c, sig_d
-        elif idx == 2:
-            a, b, c, d = sig_c, sig_d, sig_a, sig_b
-        else:
-            a, b, c, d = sig_d, sig_c, sig_a, sig_b
-        c, d = _canonical_scalar_pair(c, d)
-        return _contracted_eri_psss_rys_cached(a, b, c, d)
-
-    if np_shells == 2:
-        pset = set(p_idx)
-        if pset in ({0, 1}, {2, 3}):
-            if pset == {0, 1}:
-                a, b, c, d = sig_a, sig_b, sig_c, sig_d
-            else:
-                a, b, c, d = sig_c, sig_d, sig_a, sig_b
-            a, b = _canonical_scalar_pair(a, b)
-            c, d = _canonical_scalar_pair(c, d)
-            return _contracted_eri_ppss_rys_cached(a, b, c, d)
-
-        if pset == {0, 2}:
-            a, b, c, d = sig_a, sig_b, sig_c, sig_d
-        elif pset == {0, 3}:
-            a, b, c, d = sig_a, sig_b, sig_d, sig_c
-        elif pset == {1, 2}:
-            a, b, c, d = sig_b, sig_a, sig_c, sig_d
-        else:  # {1, 3}
-            a, b, c, d = sig_b, sig_a, sig_d, sig_c
-        left = (a, b)
-        right = (c, d)
-        if right < left:
-            a, b, c, d = c, d, a, b
-        return _contracted_eri_psps_rys_cached(a, b, c, d)
-
-    if np_shells == 3:
-        s_idx = next(idx for idx, sig in enumerate(sigs) if _is_s_shell_signature(sig))
-        if s_idx == 0:
-            a, b, c, d = sig_c, sig_d, sig_b, sig_a
-        elif s_idx == 1:
-            a, b, c, d = sig_c, sig_d, sig_a, sig_b
-        elif s_idx == 2:
-            a, b, c, d = sig_a, sig_b, sig_d, sig_c
-        else:
-            a, b, c, d = sig_a, sig_b, sig_c, sig_d
-        a, b = _canonical_scalar_pair(a, b)
-        return _contracted_eri_ppps_rys_cached(a, b, c, d)
-
-    return _contracted_eri_pppp_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-
-def contracted_eri_cartesian_rys(a, b, c, d):
-    """
-    Generic contracted Cartesian scalar ERI for supported Rys shells.
-
-    Currently supports Cartesian ``s/p/d`` shells.
-    """
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    if not supports_signature_quartet_rys(sig_a, sig_b, sig_c, sig_d):
-        raise NotImplementedError("Standalone Rys prototype currently supports only Cartesian s/p/d shells.")
-    return _contracted_eri_cartesian_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_cartesian_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
-                    eri += (
-                        wa
-                        * wb
-                        * wc
-                        * wd
-                        * _primitive_cartesian_scalar_rys(
-                            a["shell"], a["exps"][ia], a["origin"],
-                            b["shell"], b["exps"][ib], b["origin"],
-                            c["shell"], c["exps"][ic], c["origin"],
-                            d["shell"], d["exps"][id_], d["origin"],
-                        )
-                    )
-    return eri
 
 
 def _base_ssss_terms():
@@ -690,9 +508,9 @@ def _evaluate_block_dispatch(rank, terms_by_order, params):
 _TERM_TABLE_CACHE = {}
 
 
-def _evaluate_promoted_block_dispatch(centers, params, exponents, force_python=False):
+def _evaluate_promoted_block_dispatch(centers, params, exponents):
     rank = len(centers)
-    if force_python or _rys_cy is None or rank > 4:
+    if _rys_cy is None:
         terms = _base_ssss_terms()
         for axis, center in enumerate(centers):
             terms = _promote_terms(terms, center, params, exponents, axis)
@@ -717,76 +535,6 @@ def _evaluate_promoted_block_dispatch(centers, params, exponents, force_python=F
         np.asarray(params["CD"], dtype=float),
         np.asarray(params["PQ"], dtype=float),
     )
-
-
-def _shell_derivative_terms(shell, exponent):
-    shell = tuple(int(x) for x in shell)
-    if shell == (0, 0, 0):
-        return [(1.0, ())]
-    if shell in _P_SHELL_TO_AXIS:
-        return [(1.0, (_P_SHELL_TO_AXIS[shell],))]
-    if shell in _D_SHELL_TO_AXES:
-        ax1, ax2 = _D_SHELL_TO_AXES[shell]
-        if ax1 == ax2:
-            return [
-                (1.0, (ax1, ax2)),
-                (1.0 / (2.0 * exponent), ()),
-            ]
-        return [(1.0, (ax1, ax2))]
-    raise NotImplementedError("Standalone Rys prototype currently supports only Cartesian s/p/d shells.")
-
-
-def _primitive_cartesian_scalar_rys(
-    shell_a,
-    a: float,
-    A,
-    shell_b,
-    b: float,
-    B,
-    shell_c,
-    c: float,
-    C,
-    shell_d,
-    d: float,
-    D,
-):
-    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
-    force_python = (
-        tuple(int(x) for x in shell_a) in _D_SHELL_TO_AXES
-        or tuple(int(x) for x in shell_b) in _D_SHELL_TO_AXES
-        or tuple(int(x) for x in shell_c) in _D_SHELL_TO_AXES
-        or tuple(int(x) for x in shell_d) in _D_SHELL_TO_AXES
-    )
-    term_lists = (
-        ("A", _shell_derivative_terms(shell_a, a)),
-        ("B", _shell_derivative_terms(shell_b, b)),
-        ("C", _shell_derivative_terms(shell_c, c)),
-        ("D", _shell_derivative_terms(shell_d, d)),
-    )
-    total = 0.0
-    for coeff_a, axes_a in term_lists[0][1]:
-        for coeff_b, axes_b in term_lists[1][1]:
-            for coeff_c, axes_c in term_lists[2][1]:
-                for coeff_d, axes_d in term_lists[3][1]:
-                    coeff = coeff_a * coeff_b * coeff_c * coeff_d
-                    deriv_axes = axes_a + axes_b + axes_c + axes_d
-                    if not deriv_axes:
-                        total += coeff * params["pref"] * boys(0, params["T"])
-                        continue
-                    centers = (
-                        ("A",) * len(axes_a)
-                        + ("B",) * len(axes_b)
-                        + ("C",) * len(axes_c)
-                        + ("D",) * len(axes_d)
-                    )
-                    block = _evaluate_promoted_block_dispatch(
-                        centers,
-                        params,
-                        {"A": a, "B": b, "C": c, "D": d},
-                        force_python=force_python,
-                    )
-                    total += coeff * float(block[deriv_axes])
-    return total
 
 
 def primitive_eri_psss_block_rys(
@@ -818,33 +566,6 @@ def primitive_eri_psss_block_rys(
     return params["pref"] * (-params["mu_ab"] * params["AB"] * boys(0, params["T"]) - params["alpha"] * params["lam_a"] * params["PQ"] * boys(1, params["T"])) / a
 
 
-@lru_cache(maxsize=131072)
-def _primitive_psss_block_rys_cached(
-    a: float,
-    Ax: float,
-    Ay: float,
-    Az: float,
-    b: float,
-    Bx: float,
-    By: float,
-    Bz: float,
-    c: float,
-    Cx: float,
-    Cy: float,
-    Cz: float,
-    d: float,
-    Dx: float,
-    Dy: float,
-    Dz: float,
-):
-    return primitive_eri_psss_block_rys(
-        float(a), (float(Ax), float(Ay), float(Az)),
-        float(b), (float(Bx), float(By), float(Bz)),
-        float(c), (float(Cx), float(Cy), float(Cz)),
-        float(d), (float(Dx), float(Dy), float(Dz)),
-    )
-
-
 def primitive_eri_psss_rys(
     shell_a,
     a: float,
@@ -860,6 +581,20 @@ def primitive_eri_psss_rys(
     Primitive Cartesian ``(p s|s s)`` scalar integral selected by ``shell_a``.
     """
     axis = _p_axis(shell_a)
+    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"])], dtype=float)
+        return _rys_cy.evaluate_psss_scalar(
+            float(params["pref"]),
+            float(params["mu_ab"]),
+            float(params["alpha"]),
+            float(params["lam_a"]),
+            float(a),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+            int(axis),
+        )
     return primitive_eri_psss_block_rys(a, A, b, B, c, C, d, D)[axis]
 
 
@@ -905,33 +640,6 @@ def primitive_eri_ppss_block_rys(
     return params["pref"] * (term0 + term1 + term2) / (4.0 * a * b)
 
 
-@lru_cache(maxsize=131072)
-def _primitive_ppss_block_rys_cached(
-    a: float,
-    Ax: float,
-    Ay: float,
-    Az: float,
-    b: float,
-    Bx: float,
-    By: float,
-    Bz: float,
-    c: float,
-    Cx: float,
-    Cy: float,
-    Cz: float,
-    d: float,
-    Dx: float,
-    Dy: float,
-    Dz: float,
-):
-    return primitive_eri_ppss_block_rys(
-        float(a), (float(Ax), float(Ay), float(Az)),
-        float(b), (float(Bx), float(By), float(Bz)),
-        float(c), (float(Cx), float(Cy), float(Cz)),
-        float(d), (float(Dx), float(Dy), float(Dz)),
-    )
-
-
 def primitive_eri_ppss_rys(
     shell_a,
     a: float,
@@ -950,6 +658,23 @@ def primitive_eri_ppss_rys(
     """
     ia = _p_axis(shell_a)
     ib = _p_axis(shell_b)
+    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"])], dtype=float)
+        return _rys_cy.evaluate_ppss_scalar(
+            float(params["pref"]),
+            float(params["mu_ab"]),
+            float(params["alpha"]),
+            float(params["lam_a"]),
+            float(params["lam_b"]),
+            float(a),
+            float(b),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+            int(ia),
+            int(ib),
+        )
     return primitive_eri_ppss_block_rys(a, A, b, B, c, C, d, D)[ia, ib]
 
 
@@ -997,33 +722,6 @@ def primitive_eri_psps_block_rys(
     return params["pref"] * (term0 + term1 + term2) / (a * c)
 
 
-@lru_cache(maxsize=131072)
-def _primitive_psps_block_rys_cached(
-    a: float,
-    Ax: float,
-    Ay: float,
-    Az: float,
-    b: float,
-    Bx: float,
-    By: float,
-    Bz: float,
-    c: float,
-    Cx: float,
-    Cy: float,
-    Cz: float,
-    d: float,
-    Dx: float,
-    Dy: float,
-    Dz: float,
-):
-    return primitive_eri_psps_block_rys(
-        float(a), (float(Ax), float(Ay), float(Az)),
-        float(b), (float(Bx), float(By), float(Bz)),
-        float(c), (float(Cx), float(Cy), float(Cz)),
-        float(d), (float(Dx), float(Dy), float(Dz)),
-    )
-
-
 def primitive_eri_psps_rys(
     shell_a,
     a: float,
@@ -1042,6 +740,25 @@ def primitive_eri_psps_rys(
     """
     ia = _p_axis(shell_a)
     ic = _p_axis(shell_c)
+    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"])], dtype=float)
+        return _rys_cy.evaluate_psps_scalar(
+            float(params["pref"]),
+            float(params["mu_ab"]),
+            float(params["mu_cd"]),
+            float(params["alpha"]),
+            float(params["lam_a"]),
+            float(params["lam_c"]),
+            float(a),
+            float(c),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["CD"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+            int(ia),
+            int(ic),
+        )
     return primitive_eri_psps_block_rys(a, A, b, B, c, C, d, D)[ia, ic]
 
 
@@ -1059,34 +776,26 @@ def primitive_eri_ppps_block_rys(
     Primitive Cartesian ``(p p|p s)`` block on centers ``A``, ``B``, ``C``.
     """
     params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"]), boys(3, params["T"])], dtype=float)
+        return _rys_cy.evaluate_ppps_specialized(
+            float(params["pref"]),
+            float(params["alpha"]),
+            float(params["mu_ab"]),
+            float(params["mu_cd"]),
+            float(params["lam_a"]),
+            float(params["lam_b"]),
+            float(params["lam_c"]),
+            float(params["lam_d"]),
+            float(a),
+            float(b),
+            float(c),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["CD"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+        )
     return _evaluate_promoted_block_dispatch(("A", "B", "C"), params, {"A": a, "B": b, "C": c, "D": d})
-
-
-@lru_cache(maxsize=131072)
-def _primitive_ppps_block_rys_cached(
-    a: float,
-    Ax: float,
-    Ay: float,
-    Az: float,
-    b: float,
-    Bx: float,
-    By: float,
-    Bz: float,
-    c: float,
-    Cx: float,
-    Cy: float,
-    Cz: float,
-    d: float,
-    Dx: float,
-    Dy: float,
-    Dz: float,
-):
-    return primitive_eri_ppps_block_rys(
-        float(a), (float(Ax), float(Ay), float(Az)),
-        float(b), (float(Bx), float(By), float(Bz)),
-        float(c), (float(Cx), float(Cy), float(Cz)),
-        float(d), (float(Dx), float(Dy), float(Dz)),
-    )
 
 
 def primitive_eri_ppps_rys(
@@ -1105,6 +814,29 @@ def primitive_eri_ppps_rys(
     ia = _p_axis(shell_a)
     ib = _p_axis(shell_b)
     ic = _p_axis(shell_c)
+    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"]), boys(3, params["T"])], dtype=float)
+        return _rys_cy.evaluate_ppps_scalar(
+            float(params["pref"]),
+            float(params["alpha"]),
+            float(params["mu_ab"]),
+            float(params["mu_cd"]),
+            float(params["lam_a"]),
+            float(params["lam_b"]),
+            float(params["lam_c"]),
+            float(params["lam_d"]),
+            float(a),
+            float(b),
+            float(c),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["CD"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+            int(ia),
+            int(ib),
+            int(ic),
+        )
     return primitive_eri_ppps_block_rys(a, A, b, B, c, C, d, D)[ia, ib, ic]
 
 
@@ -1122,34 +854,27 @@ def primitive_eri_pppp_block_rys(
     Primitive Cartesian ``(p p|p p)`` block on centers ``A``, ``B``, ``C``, ``D``.
     """
     params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"]), boys(3, params["T"]), boys(4, params["T"])], dtype=float)
+        return _rys_cy.evaluate_pppp_specialized(
+            float(params["pref"]),
+            float(params["alpha"]),
+            float(params["mu_ab"]),
+            float(params["mu_cd"]),
+            float(params["lam_a"]),
+            float(params["lam_b"]),
+            float(params["lam_c"]),
+            float(params["lam_d"]),
+            float(a),
+            float(b),
+            float(c),
+            float(d),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["CD"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+        )
     return _evaluate_promoted_block_dispatch(("A", "B", "C", "D"), params, {"A": a, "B": b, "C": c, "D": d})
-
-
-@lru_cache(maxsize=131072)
-def _primitive_pppp_block_rys_cached(
-    a: float,
-    Ax: float,
-    Ay: float,
-    Az: float,
-    b: float,
-    Bx: float,
-    By: float,
-    Bz: float,
-    c: float,
-    Cx: float,
-    Cy: float,
-    Cz: float,
-    d: float,
-    Dx: float,
-    Dy: float,
-    Dz: float,
-):
-    return primitive_eri_pppp_block_rys(
-        float(a), (float(Ax), float(Ay), float(Az)),
-        float(b), (float(Bx), float(By), float(Bz)),
-        float(c), (float(Cx), float(Cy), float(Cz)),
-        float(d), (float(Dx), float(Dy), float(Dz)),
-    )
 
 
 def primitive_eri_pppp_rys(
@@ -1170,6 +895,31 @@ def primitive_eri_pppp_rys(
     ib = _p_axis(shell_b)
     ic = _p_axis(shell_c)
     id_ = _p_axis(shell_d)
+    params = _primitive_ssss_common(a, A, b, B, c, C, d, D)
+    if _rys_cy is not None:
+        boys_values = np.asarray([boys(0, params["T"]), boys(1, params["T"]), boys(2, params["T"]), boys(3, params["T"]), boys(4, params["T"])], dtype=float)
+        return _rys_cy.evaluate_pppp_scalar(
+            float(params["pref"]),
+            float(params["alpha"]),
+            float(params["mu_ab"]),
+            float(params["mu_cd"]),
+            float(params["lam_a"]),
+            float(params["lam_b"]),
+            float(params["lam_c"]),
+            float(params["lam_d"]),
+            float(a),
+            float(b),
+            float(c),
+            float(d),
+            boys_values,
+            np.asarray(params["AB"], dtype=float),
+            np.asarray(params["CD"], dtype=float),
+            np.asarray(params["PQ"], dtype=float),
+            int(ia),
+            int(ib),
+            int(ic),
+            int(id_),
+        )
     return primitive_eri_pppp_block_rys(a, A, b, B, c, C, d, D)[ia, ib, ic, id_]
 
 
@@ -1183,49 +933,25 @@ def contracted_eri_ssss_rys(a, b, c, d):
     if tuple(a.shell) != (0, 0, 0) or tuple(b.shell) != (0, 0, 0) or tuple(c.shell) != (0, 0, 0) or tuple(d.shell) != (0, 0, 0):
         raise NotImplementedError("Standalone Rys prototype currently supports only s shells.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    return _contracted_eri_ssss_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_ssss_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    if _rys_cy is not None:
-        return _rys_cy.contracted_ssss(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
                         * primitive_eri_ssss_rys(
-                            a["exps"][ia], a["origin"],
-                            b["exps"][ib], b["origin"],
-                            c["exps"][ic], c["origin"],
-                            d["exps"][id_], d["origin"],
+                            a.exps[ia],
+                            a.origin,
+                            b.exps[ib],
+                            b.origin,
+                            c.exps[ic],
+                            c.origin,
+                            d.exps[id_],
+                            d.origin,
                         )
                     )
     return eri
@@ -1238,53 +964,27 @@ def contracted_eri_psss_rys(a, b, c, d):
     if sum(a.shell) != 1 or tuple(b.shell) != (0, 0, 0) or tuple(c.shell) != (0, 0, 0) or tuple(d.shell) != (0, 0, 0):
         raise NotImplementedError("Standalone Rys prototype currently supports only (p s|s s) for this wrapper.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    sig_c, sig_d = _canonical_scalar_pair(sig_c, sig_d)
-    return _contracted_eri_psss_rys_cached(sig_a, sig_b, sig_c, sig_d)
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_psss_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    axis = _p_axis(a["shell"])
-    if _rys_cy is not None:
-        return _rys_cy.contracted_psss(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-            int(axis),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
-                        * _primitive_psss_block_rys_cached(
-                            a["exps"][ia], *a["origin"],
-                            b["exps"][ib], *b["origin"],
-                            c["exps"][ic], *c["origin"],
-                            d["exps"][id_], *d["origin"],
-                        )[axis]
+                        * primitive_eri_psss_rys(
+                            a.shell,
+                            a.exps[ia],
+                            a.origin,
+                            b.exps[ib],
+                            b.origin,
+                            c.exps[ic],
+                            c.origin,
+                            d.exps[id_],
+                            d.origin,
+                        )
                     )
     return eri
 
@@ -1296,56 +996,28 @@ def contracted_eri_ppss_rys(a, b, c, d):
     if sum(a.shell) != 1 or sum(b.shell) != 1 or tuple(c.shell) != (0, 0, 0) or tuple(d.shell) != (0, 0, 0):
         raise NotImplementedError("Standalone Rys prototype currently supports only (p p|s s) for this wrapper.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    sig_a, sig_b = _canonical_scalar_pair(sig_a, sig_b)
-    sig_c, sig_d = _canonical_scalar_pair(sig_c, sig_d)
-    return _contracted_eri_ppss_rys_cached(sig_a, sig_b, sig_c, sig_d)
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_ppss_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    iaxis = _p_axis(a["shell"])
-    jaxis = _p_axis(b["shell"])
-    if _rys_cy is not None:
-        return _rys_cy.contracted_ppss(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-            int(iaxis),
-            int(jaxis),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
-                        * _primitive_ppss_block_rys_cached(
-                            a["exps"][ia], *a["origin"],
-                            b["exps"][ib], *b["origin"],
-                            c["exps"][ic], *c["origin"],
-                            d["exps"][id_], *d["origin"],
-                        )[iaxis, jaxis]
+                        * primitive_eri_ppss_rys(
+                            a.shell,
+                            a.exps[ia],
+                            a.origin,
+                            b.shell,
+                            b.exps[ib],
+                            b.origin,
+                            c.exps[ic],
+                            c.origin,
+                            d.exps[id_],
+                            d.origin,
+                        )
                     )
     return eri
 
@@ -1357,58 +1029,28 @@ def contracted_eri_psps_rys(a, b, c, d):
     if sum(a.shell) != 1 or tuple(b.shell) != (0, 0, 0) or sum(c.shell) != 1 or tuple(d.shell) != (0, 0, 0):
         raise NotImplementedError("Standalone Rys prototype currently supports only (p s|p s) for this wrapper.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    left = (sig_a, sig_b)
-    right = (sig_c, sig_d)
-    if right < left:
-        sig_a, sig_b, sig_c, sig_d = sig_c, sig_d, sig_a, sig_b
-    return _contracted_eri_psps_rys_cached(sig_a, sig_b, sig_c, sig_d)
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_psps_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    iaxis = _p_axis(a["shell"])
-    kaxis = _p_axis(c["shell"])
-    if _rys_cy is not None:
-        return _rys_cy.contracted_psps(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-            int(iaxis),
-            int(kaxis),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
-                        * _primitive_psps_block_rys_cached(
-                            a["exps"][ia], *a["origin"],
-                            b["exps"][ib], *b["origin"],
-                            c["exps"][ic], *c["origin"],
-                            d["exps"][id_], *d["origin"],
-                        )[iaxis, kaxis]
+                        * primitive_eri_psps_rys(
+                            a.shell,
+                            a.exps[ia],
+                            a.origin,
+                            b.exps[ib],
+                            b.origin,
+                            c.shell,
+                            c.exps[ic],
+                            c.origin,
+                            d.exps[id_],
+                            d.origin,
+                        )
                     )
     return eri
 
@@ -1420,57 +1062,29 @@ def contracted_eri_ppps_rys(a, b, c, d):
     if sum(a.shell) != 1 or sum(b.shell) != 1 or sum(c.shell) != 1 or tuple(d.shell) != (0, 0, 0):
         raise NotImplementedError("Standalone Rys prototype currently supports only (p p|p s) for this wrapper.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    sig_a, sig_b = _canonical_scalar_pair(sig_a, sig_b)
-    return _contracted_eri_ppps_rys_cached(sig_a, sig_b, sig_c, sig_d)
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_ppps_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    iaxis = _p_axis(a["shell"])
-    jaxis = _p_axis(b["shell"])
-    kaxis = _p_axis(c["shell"])
-    if _rys_cy is not None:
-        return _rys_cy.contracted_ppps(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-            int(iaxis),
-            int(jaxis),
-            int(kaxis),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
-                        * _primitive_ppps_block_rys_cached(
-                            a["exps"][ia], *a["origin"],
-                            b["exps"][ib], *b["origin"],
-                            c["exps"][ic], *c["origin"],
-                            d["exps"][id_], *d["origin"],
-                        )[iaxis, jaxis, kaxis]
+                        * primitive_eri_ppps_rys(
+                            a.shell,
+                            a.exps[ia],
+                            a.origin,
+                            b.shell,
+                            b.exps[ib],
+                            b.origin,
+                            c.shell,
+                            c.exps[ic],
+                            c.origin,
+                            d.exps[id_],
+                            d.origin,
+                        )
                     )
     return eri
 
@@ -1482,57 +1096,29 @@ def contracted_eri_pppp_rys(a, b, c, d):
     if sum(a.shell) != 1 or sum(b.shell) != 1 or sum(c.shell) != 1 or sum(d.shell) != 1:
         raise NotImplementedError("Standalone Rys prototype currently supports only (p p|p p) for this wrapper.")
 
-    sig_a = _basis_signature(a)
-    sig_b = _basis_signature(b)
-    sig_c = _basis_signature(c)
-    sig_d = _basis_signature(d)
-    return _contracted_eri_pppp_rys_cached(*_canonical_scalar_quartet(sig_a, sig_b, sig_c, sig_d))
-
-
-@lru_cache(maxsize=32768)
-def _contracted_eri_pppp_rys_cached(sig_a, sig_b, sig_c, sig_d):
-    a = _basis_from_signature(sig_a)
-    b = _basis_from_signature(sig_b)
-    c = _basis_from_signature(sig_c)
-    d = _basis_from_signature(sig_d)
-    iaxis = _p_axis(a["shell"])
-    jaxis = _p_axis(b["shell"])
-    kaxis = _p_axis(c["shell"])
-    laxis = _p_axis(d["shell"])
-    if _rys_cy is not None:
-        return _rys_cy.contracted_pppp(
-            np.asarray(a["exps"], dtype=float),
-            np.asarray(a["prim_weights"], dtype=float),
-            np.asarray(a["origin"], dtype=float),
-            np.asarray(b["exps"], dtype=float),
-            np.asarray(b["prim_weights"], dtype=float),
-            np.asarray(b["origin"], dtype=float),
-            np.asarray(c["exps"], dtype=float),
-            np.asarray(c["prim_weights"], dtype=float),
-            np.asarray(c["origin"], dtype=float),
-            np.asarray(d["exps"], dtype=float),
-            np.asarray(d["prim_weights"], dtype=float),
-            np.asarray(d["origin"], dtype=float),
-            int(iaxis),
-            int(jaxis),
-            int(kaxis),
-            int(laxis),
-        )
     eri = 0.0
-    for ia, wa in enumerate(a["prim_weights"]):
-        for ib, wb in enumerate(b["prim_weights"]):
-            for ic, wc in enumerate(c["prim_weights"]):
-                for id_, wd in enumerate(d["prim_weights"]):
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                for id_, wd in enumerate(d.prim_weights):
                     eri += (
                         wa
                         * wb
                         * wc
                         * wd
-                        * _primitive_pppp_block_rys_cached(
-                            a["exps"][ia], *a["origin"],
-                            b["exps"][ib], *b["origin"],
-                            c["exps"][ic], *c["origin"],
-                            d["exps"][id_], *d["origin"],
-                        )[iaxis, jaxis, kaxis, laxis]
+                        * primitive_eri_pppp_rys(
+                            a.shell,
+                            a.exps[ia],
+                            a.origin,
+                            b.shell,
+                            b.exps[ib],
+                            b.origin,
+                            c.shell,
+                            c.exps[ic],
+                            c.origin,
+                            d.shell,
+                            d.exps[id_],
+                            d.origin,
+                        )
                     )
     return eri

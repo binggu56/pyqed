@@ -39,6 +39,10 @@ try:
     from . import _basis_cy
 except Exception:  # pragma: no cover - optional accelerator
     _basis_cy = None
+try:
+    from . import _rys_cy
+except Exception:  # pragma: no cover - optional accelerator
+    _rys_cy = None
 
 
 def _load_basis_accel():
@@ -488,6 +492,41 @@ def _canonical_quartet_signature(sig_a, sig_b, sig_c, sig_d):
     if pair_ab <= pair_cd:
         return pair_ab + pair_cd
     return pair_cd + pair_ab
+
+
+def _signatures_are_sp_only(signatures):
+    for shell, _origin, _exps, _weights in signatures:
+        shell = tuple(int(x) for x in shell)
+        if shell == (0, 0, 0):
+            continue
+        if shell in {(1, 0, 0), (0, 1, 0), (0, 0, 1)}:
+            continue
+        return False
+    return True
+
+
+def _signatures_are_spd_fast_rys(signatures):
+    total_l = 0
+    nd = 0
+    for shell, _origin, _exps, _weights in signatures:
+        shell = tuple(int(x) for x in shell)
+        l = sum(shell)
+        if l > 2:
+            return False
+        total_l += l
+        if l == 2:
+            nd += 1
+    return total_l <= 4 and nd <= 1
+
+
+def _default_dense_builder_name():
+    if _basis_cy is not None:
+        return "cython-kernel"
+    if _load_basis_accel():
+        return "c-serial"
+    if _NUMBA_AVAILABLE and _NUMBA_DENSE_ERI_ENABLED:
+        return "numba-serial"
+    return "python-serial"
 
 
 @lru_cache(maxsize=262144)
@@ -1120,7 +1159,7 @@ def _shell_pair_blocks_from_signatures(signatures, pair_bounds):
 
             pair_block_bounds = pair_bounds[p_idx, q_idx]
             pair_indices = np.asarray(
-                [pair_to_index[(int(p), int(q))] for p, q in zip(p_idx, q_idx)],
+                [pair_to_index[(max(int(p), int(q)), min(int(p), int(q)))] for p, q in zip(p_idx, q_idx)],
                 dtype=np.int32,
             )
             pair_blocks.append(
@@ -1262,6 +1301,105 @@ def _compute_dense_eri_serial_shellblocked(signatures, pair_bounds, screen_tol):
                     np.asarray(s_keep, dtype=np.intp),
                     np.asarray(values_keep, dtype=float),
                 )
+
+    return eri, computed, skipped
+
+
+def _compute_dense_eri_serial_shellblocked_rys(signatures, pair_bounds, screen_tol):
+    from .rys import contracted_eri_from_signatures_rys, supports_signature_quartet_rys
+
+    nao = len(signatures)
+    eri = np.zeros((nao, nao, nao, nao), dtype=float)
+    shell_blocks = _contiguous_shell_blocks_from_signatures(signatures)
+    nshell = len(shell_blocks)
+    skipped = 0
+    computed = 0
+    shell_pair_bounds = np.zeros((nshell, nshell), dtype=float)
+    for ish, (p0, p1) in enumerate(shell_blocks):
+        for jsh, (q0, q1) in enumerate(shell_blocks):
+            shell_pair_bounds[ish, jsh] = float(np.max(pair_bounds[p0:p1, q0:q1]))
+
+    shells = origins = exps = weights = nprim = None
+    if _rys_cy is not None:
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        shells = np.ascontiguousarray(shells, dtype=np.int64)
+        origins = np.ascontiguousarray(origins, dtype=np.float64)
+        exps = np.ascontiguousarray(exps, dtype=np.float64)
+        weights = np.ascontiguousarray(weights, dtype=np.float64)
+        nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+
+    for ish, (p0, p1) in enumerate(shell_blocks):
+        np_ = p1 - p0
+        sig_p = signatures[p0]
+        for jsh, (q0, q1) in enumerate(shell_blocks[: ish + 1]):
+            nq_ = q1 - q0
+            sig_q = signatures[q0]
+            bound_pq = shell_pair_bounds[ish, jsh]
+            for ksh, (r0, r1) in enumerate(shell_blocks[: ish + 1]):
+                nr_ = r1 - r0
+                sig_r = signatures[r0]
+                lsh_max = jsh if ksh == ish else ksh
+                for lsh, (s0, s1) in enumerate(shell_blocks[: lsh_max + 1]):
+                    ns_ = s1 - s0
+                    sig_s = signatures[s0]
+                    bound_rs = shell_pair_bounds[ksh, lsh]
+                    if screen_tol > 0.0 and bound_pq * bound_rs < screen_tol:
+                        npair_pq = (np_ * (np_ + 1)) // 2 if ish == jsh else np_ * nq_
+                        npair_rs = (nr_ * (nr_ + 1)) // 2 if ksh == lsh else nr_ * ns_
+                        skipped += (npair_pq * (npair_pq + 1)) // 2 if (ish == ksh and jsh == lsh) else npair_pq * npair_rs
+                        continue
+
+                    shell_block = (p0, p1, q0, q1, r0, r1, s0, s1)
+                    block = None
+                    use_rys_block = (
+                        _rys_cy is not None
+                        and _signatures_are_sp_only((sig_p, sig_q, sig_r, sig_s))
+                        and supports_signature_quartet_rys(sig_p, sig_q, sig_r, sig_s)
+                    )
+                    if use_rys_block:
+                        block = _rys_cy.compute_cartesian_shell_quartet_block_rys(
+                            shells, origins, exps, weights, nprim, p0, p1, q0, q1, r0, r1, s0, s1
+                        )
+                        block = np.asarray(block, dtype=float)
+                    else:
+                        block = _compute_cartesian_shell_quartet_block_cython(signatures, shell_block)
+
+                    if block is None:
+                        block = np.empty((np_, nq_, nr_, ns_), dtype=float)
+                        for ip, p in enumerate(range(p0, p1)):
+                            for iq, q in enumerate(range(q0, q1)):
+                                for ir, r in enumerate(range(r0, r1)):
+                                    for is_, s in enumerate(range(s0, s1)):
+                                        if _signatures_are_sp_only((signatures[p], signatures[q], signatures[r], signatures[s])) and supports_signature_quartet_rys(signatures[p], signatures[q], signatures[r], signatures[s]):
+                                            block[ip, iq, ir, is_] = float(
+                                                contracted_eri_from_signatures_rys(
+                                                    signatures[p], signatures[q], signatures[r], signatures[s]
+                                                )
+                                            )
+                                        else:
+                                            block[ip, iq, ir, is_] = float(
+                                                _contracted_eri_from_signatures(
+                                                    signatures[p], signatures[q], signatures[r], signatures[s]
+                                                )
+                                            )
+
+                    if screen_tol > 0.0:
+                        small = np.abs(block) < screen_tol
+                        skipped += int(np.count_nonzero(small))
+                        block = np.where(small, 0.0, block)
+
+                    eri[p0:p1, q0:q1, r0:r1, s0:s1] = block
+                    eri[q0:q1, p0:p1, r0:r1, s0:s1] = block.transpose(1, 0, 2, 3)
+                    eri[p0:p1, q0:q1, s0:s1, r0:r1] = block.transpose(0, 1, 3, 2)
+                    eri[q0:q1, p0:p1, s0:s1, r0:r1] = block.transpose(1, 0, 3, 2)
+                    eri[r0:r1, s0:s1, p0:p1, q0:q1] = block.transpose(2, 3, 0, 1)
+                    eri[s0:s1, r0:r1, p0:p1, q0:q1] = block.transpose(3, 2, 0, 1)
+                    eri[r0:r1, s0:s1, q0:q1, p0:p1] = block.transpose(2, 3, 1, 0)
+                    eri[s0:s1, r0:r1, q0:q1, p0:p1] = block.transpose(3, 2, 1, 0)
+
+                    npair_pq = (np_ * (np_ + 1)) // 2 if ish == jsh else np_ * nq_
+                    npair_rs = (nr_ * (nr_ + 1)) // 2 if ksh == lsh else nr_ * ns_
+                    computed += (npair_pq * (npair_pq + 1)) // 2 if (ish == ksh and jsh == lsh) else npair_pq * npair_rs
 
     return eri, computed, skipped
 
@@ -1541,6 +1679,28 @@ def _reset_builtin_integral_caches():
     _nuclear_attraction_cached.cache_clear()
     _electron_repulsion_cached.cache_clear()
     _contracted_eri_from_signatures_cached.cache_clear()
+    try:
+        from . import rys as _rys_mod
+    except Exception:
+        _rys_mod = None
+    if _rys_mod is not None:
+        for name in (
+            "_primitive_eri_ssss_rys_cached",
+            "_primitive_psss_block_rys_cached",
+            "_primitive_ppss_block_rys_cached",
+            "_primitive_psps_block_rys_cached",
+            "_primitive_ppps_block_rys_cached",
+            "_primitive_pppp_block_rys_cached",
+            "_contracted_eri_ssss_rys_cached",
+            "_contracted_eri_psss_rys_cached",
+            "_contracted_eri_ppss_rys_cached",
+            "_contracted_eri_psps_rys_cached",
+            "_contracted_eri_ppps_rys_cached",
+            "_contracted_eri_pppp_rys_cached",
+        ):
+            fn = getattr(_rys_mod, name, None)
+            if fn is not None and hasattr(fn, "cache_clear"):
+                fn.cache_clear()
 
 
 def _builtin_worker_count(mol, nao):
@@ -1583,6 +1743,11 @@ def build_builtin(mol):
     screen_tol = float(
         getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 0.0)) or 0.0
     )
+    eri_backend = str(
+        getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
+    ).lower()
+    if eri_backend not in {"auto", "rys"}:
+        raise ValueError("builtin_eri_backend/native_eri_backend must be 'auto' or 'rys'.")
     pair_bounds = _compute_pair_bounds(signatures)
     eri_representation = getattr(
         mol,
@@ -1613,7 +1778,39 @@ def build_builtin(mol):
     factor_builder = None
 
     if eri_representation in {"dense", "dense+factors"}:
-        if workers > 1:
+        if eri_backend == "rys":
+            if _rys_cy is not None and _signatures_are_sp_only(signatures):
+                shell_blocks = _cart_shell_blocks(basis_cart)
+                shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
+                shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+                shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+                try:
+                    eri, computed, skipped = _rys_cy.compute_dense_eri_blocked_rys(
+                        np.ascontiguousarray(shells, dtype=np.int64),
+                        np.ascontiguousarray(origins, dtype=np.float64),
+                        np.ascontiguousarray(exps, dtype=np.float64),
+                        np.ascontiguousarray(weights, dtype=np.float64),
+                        np.ascontiguousarray(nprim, dtype=np.int64),
+                        np.ascontiguousarray(pair_bounds, dtype=np.float64),
+                        shell_starts,
+                        shell_stops,
+                        float(screen_tol),
+                    )
+                    dense_builder = "rys-cython-blocked"
+                except Exception:
+                    eri, computed, skipped = _compute_dense_eri_serial_shellblocked_rys(
+                        signatures, pair_bounds, screen_tol
+                    )
+                    dense_builder = "rys-screened-mixed"
+            else:
+                # The current blocked Rys production path is only a win for pure s/p
+                # bases. For mixed d-shell cases, the exact compiled dense builder is
+                # faster than the Python-level hybrid Rys dispatcher.
+                eri, computed, skipped = _compute_dense_eri_serial(
+                    signatures, pair_bounds, screen_tol
+                )
+                dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
+        elif workers > 1:
             eri, computed, skipped = _compute_dense_eri_parallel(
                 signatures, pair_bounds, screen_tol, workers
             )
@@ -1622,19 +1819,7 @@ def build_builtin(mol):
             eri, computed, skipped = _compute_dense_eri_serial(
                 signatures, pair_bounds, screen_tol
             )
-            dense_builder = (
-                "cython-kernel"
-                if _basis_cy is not None
-                else (
-                "c-serial"
-                if _load_basis_accel()
-                else (
-                "numba-serial"
-                if (_NUMBA_AVAILABLE and _NUMBA_DENSE_ERI_ENABLED)
-                else "python-serial"
-                )
-                )
-            )
+            dense_builder = _default_dense_builder_name()
 
         if eri_representation == "dense+factors" or bool(
             getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False))
@@ -1729,6 +1914,7 @@ def build_builtin(mol):
     mol._builtin_build_info = {
         "coord_type": coord_type,
         "representation": eri_representation,
+        "eri_backend": eri_backend,
         "workers": workers,
         "screen_tol": screen_tol,
         "quartets_computed": int(computed),

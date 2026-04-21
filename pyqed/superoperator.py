@@ -13,7 +13,6 @@ Possible improvements:
     1. merge the Qobj class with QUTIP
 """
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.sparse import kron, identity, issparse
 from scipy.sparse.linalg import eigs
 import scipy

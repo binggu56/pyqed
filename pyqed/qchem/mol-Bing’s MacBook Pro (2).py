@@ -86,7 +86,6 @@ _BUILTIN_OPTION_SPECS = (
     ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 0.0),
-    ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "dense"),
     ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
@@ -1058,11 +1057,11 @@ class Molecule:
         Apply builtin backend options and keep legacy aliases in sync.
         """
         self.builtin_options = dict(options)
+        self.builtin_coord_type = self.builtin_options["coord_type"]
         self.builtin_parallel = self.builtin_options["parallel"]
         self.builtin_eri_workers = self.builtin_options["eri_workers"]
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
-        self.builtin_eri_backend = self.builtin_options["eri_backend"]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
         self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
         self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
@@ -1074,7 +1073,6 @@ class Molecule:
         self.native_eri_workers = self.builtin_eri_workers
         self.native_parallel_min_nao = self.builtin_parallel_min_nao
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
-        self.native_eri_backend = self.builtin_eri_backend
         self.native_eri_representation = self.builtin_eri_representation
         self.native_low_rank_tol = self.builtin_low_rank_tol
         self.native_low_rank_max_rank = self.builtin_low_rank_max_rank

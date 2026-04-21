@@ -51,7 +51,6 @@ Modified by Bing 10/06/2022
 
 # import numpy as np
 
-from matplotlib import rcParams
 import numpy as np
 from numpy import cos, linspace, shape, sin, zeros, meshgrid, exp, sqrt, pi
 from math import factorial

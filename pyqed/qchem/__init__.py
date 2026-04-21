@@ -10,6 +10,7 @@ from .soc import *
 from .geometric import BOHamiltonianDerivatives, GeometricFGTerms, bo_hamiltonian_derivatives
 from .ci.cisd import *
 from .ci.fci import *
+from .mp.mp2 import COMP2, MP2, UMP2
 
 # Optional modules can be temporarily unavailable while adjacent APIs evolve.
 try:

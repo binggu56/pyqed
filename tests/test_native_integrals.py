@@ -3,6 +3,7 @@ import numpy as np
 from pyqed.qchem import Molecule
 from pyqed.qchem.basis import (
     _basis_cy,
+    _rys_cy,
     _basis_signature,
     _cart_shell_blocks,
     _compute_cartesian_shell_quartet_block_cython,
@@ -75,6 +76,52 @@ def test_native_build_supports_d_shells_in_cartesian_basis():
     assert mol.nao == ref.mol.nao
     assert np.isfinite(mf.e_tot)
     np.testing.assert_allclose(mf.e_tot, ref.e_tot, atol=1e-8, rtol=1e-8)
+
+
+def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
+    atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
+    basis = 'sto-3g'
+
+    mol_default = Molecule(atom=atom, unit='bohr', basis=basis)
+    mol_default.build(driver='builtin', options={'eri_representation': 'dense'})
+
+    mol_rys = Molecule(atom=atom, unit='bohr', basis=basis)
+    mol_rys.build(driver='builtin', options={'eri_representation': 'dense', 'eri_backend': 'rys'})
+
+    np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-11, rtol=1e-11)
+    expected_builder = 'rys-cython-blocked' if _rys_cy is not None else 'rys-screened-mixed'
+    assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
+
+    e_default = mol_default.RHF().run(max_cycle=80).e_tot
+    e_rys = mol_rys.RHF().run(max_cycle=80).e_tot
+    np.testing.assert_allclose(e_rys, e_default, atol=1e-10, rtol=1e-10)
+
+
+def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
+    atom = 'H 0 0 0; F 0 0 0.9'
+    basis = '6-31g(d,p)'
+
+    mol_default = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol_default.build(driver='builtin', options={'eri_representation': 'dense'})
+
+    mol_rys = Molecule(atom=atom, unit='angstrom', basis=basis)
+    mol_rys.build(driver='builtin', options={'eri_representation': 'dense', 'eri_backend': 'rys'})
+
+    np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-9, rtol=1e-9)
+    expected_builder = (
+        'cython-kernel-mixed-d-fallback'
+        if _basis_cy is not None
+        else 'python-serial-mixed-d-fallback'
+    )
+    assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
+
+    e_default = mol_default.RHF().run(max_cycle=80).e_tot
+    e_rys = mol_rys.RHF().run(max_cycle=80).e_tot
+    np.testing.assert_allclose(e_rys, e_default, atol=1e-9, rtol=1e-9)
 
 
 def test_shell_blocked_dense_eri_matches_legacy_aopair_builder():

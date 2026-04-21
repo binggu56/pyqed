@@ -44,3 +44,6 @@ Checkpoints
 Miniforge3-MacOSX-arm64.sh
 Scan_Results_Nz_32
 .vscode
+*.png
+*.csv
+*.png

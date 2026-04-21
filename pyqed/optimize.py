@@ -31,7 +31,7 @@ def _factorized_two_electron_gradient(U, pair_factors, dm2):
 
 def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
-             history_size=7):
+             history_size=7, max_iterations=200, max_step_norm=None):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -66,6 +66,13 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Optimization algorithm on the Stiefel manifold.
     history_size : int, optional
         Number of secant pairs kept by the limited-memory BFGS backend.
+    max_iterations : int or None, optional
+        Maximum number of inner manifold iterations. ``None`` disables the
+        cap and restores the original unbounded behavior.
+    max_step_norm : float or None, optional
+        Hard cap on the norm of the tangent-space step ``tau * direction``.
+        This is useful when the non-monotone line search accepts a descent
+        step that is still too aggressive for the outer CASSCF macroiteration.
 
     Returns
     -------
@@ -99,7 +106,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     lbfgs_s = []
     lbfgs_y = []
 
-    while norm(df) > epsilon:
+    while norm(df) > epsilon and (max_iterations is None or k < int(max_iterations)):
         if algorithm == 'LBFGS':
             direction = -lbfgs_direction(df, lbfgs_s, lbfgs_y)
 
@@ -111,6 +118,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
             directional_derivative = -np.real(inner(df, df))
 
         step = max(min(tau, tauM), taum)
+        step = clip_step_size(direction, step, max_step_norm)
         Y = retract(X, step * direction)
         trial_value = f(Y, *args)
 
@@ -128,6 +136,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
             trial_value = f(Y, *args)
 
         Xnew = Y
+        accepted_step = step * direction
         Qnew = eta * Q + 1.0
         v = trial_value
         Cnew = (eta * Q * C + v) / Qnew
@@ -142,12 +151,20 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
             transported_dir = transport(Xnew, direction)
             direction = -df_new + beta * transported_dir
         elif algorithm == 'LBFGS':
-            update_lbfgs_history(lbfgs_s, lbfgs_y, Xnew, Xnew - X, df_new - transported_grad, history_size)
+            update_lbfgs_history(
+                lbfgs_s,
+                lbfgs_y,
+                Xnew,
+                accepted_step,
+                df_new - transported_grad,
+                history_size,
+            )
             direction = -lbfgs_direction(df_new, lbfgs_s, lbfgs_y)
         else:
             direction = -df_new
 
-        tau = safe_stepsize(k + 1, Xnew - X, df_new - transported_grad, step)
+        transported_step = transport(Xnew, accepted_step)
+        tau = safe_stepsize(k + 1, transported_step, df_new - transported_grad, step)
         tau = max(min(tau, tauM), taum)
 
         k += 1
@@ -318,6 +335,18 @@ def safe_stepsize(k, dU, dG, fallback):
     if not np.isfinite(tau) or tau <= 0:
         return fallback
     return tau
+
+
+def clip_step_size(direction, step, max_step_norm):
+    """Limit the tangent-step norm without changing the search direction."""
+    if max_step_norm is None:
+        return step
+
+    direction_norm = norm(direction)
+    if direction_norm < 1e-16:
+        return 0.0
+
+    return min(step, float(max_step_norm) / direction_norm)
 
 
 def lbfgs_direction(grad_vec, s_history, y_history):

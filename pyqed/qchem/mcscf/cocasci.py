@@ -156,6 +156,9 @@ class COCAS(CASCI):
                  optimizer='RCG', optimizer_history=7,
                  diis=True, diis_space=6, diis_start=2,
                  ci_method='direct_ci', direct_ci_dense_fallback_ndets=0,
+                 optimizer_tol=1.0e-4,
+                 optimizer_max_steps=200,
+                 optimizer_max_step_norm=None,
                  use_cholesky=None,
                  **kwargs):
         super().__init__(mf, ncas, nelecas, **kwargs)
@@ -166,6 +169,13 @@ class COCAS(CASCI):
         # Orbital optimization backend for the U-matrix formulation.
         self.optimizer = optimizer.upper()
         self.optimizer_history = optimizer_history
+        self.optimizer_tol = float(optimizer_tol)
+        self.optimizer_max_steps = (
+            None if optimizer_max_steps is None else int(optimizer_max_steps)
+        )
+        self.optimizer_max_step_norm = (
+            None if optimizer_max_step_norm is None else float(optimizer_max_step_norm)
+        )
         # Optional DIIS mixing over the optimized U matrices.  This mirrors the
         # main-branch accelerator while keeping it configurable on bg.
         self.diis = diis
@@ -233,6 +243,9 @@ class COCAS(CASCI):
                 max_cycles=self.max_cycles,
                 optimizer=self.optimizer,
                 optimizer_history=self.optimizer_history,
+                optimizer_tol=self.optimizer_tol,
+                optimizer_max_steps=self.optimizer_max_steps,
+                optimizer_max_step_norm=self.optimizer_max_step_norm,
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
@@ -251,6 +264,9 @@ class COCAS(CASCI):
                 C0=C0, h1e=h1e, eri=eri,
                 optimizer=self.optimizer,
                 optimizer_history=self.optimizer_history,
+                optimizer_tol=self.optimizer_tol,
+                optimizer_max_steps=self.optimizer_max_steps,
+                optimizer_max_step_norm=self.optimizer_max_step_norm,
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
@@ -319,7 +335,9 @@ def energy(U, h1e, eri, dm1, dm2):
 
 
 def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
-           optimizer='RCG', optimizer_history=7, diis=True,
+           optimizer='RCG', optimizer_history=7, optimizer_tol=1.0e-4,
+           optimizer_max_steps=200, optimizer_max_step_norm=None,
+           diis=True,
            diis_space=6, diis_start=2, ci_method='direct_ci', **kwargs):
     """
     complete active space orbital optimization with orthonomality constraint
@@ -380,6 +398,9 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     U, E = minimize(
         energy, U0, args=(h1e, eri, dm1, dm2),
         algorithm=optimizer, history_size=optimizer_history,
+        epsilon=optimizer_tol,
+        max_iterations=optimizer_max_steps,
+        max_step_norm=optimizer_max_step_norm,
     )
     U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
 
@@ -414,6 +435,9 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         U, E = minimize(
             energy, U, args=(h1e, eri, dm1, dm2), tau=1,
             algorithm=optimizer, history_size=optimizer_history,
+            epsilon=optimizer_tol,
+            max_iterations=optimizer_max_steps,
+            max_step_norm=optimizer_max_step_norm,
         )
         U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
         # print(E + mol.energy_nuc())
@@ -443,7 +467,10 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
 
 def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                          max_cycles=50, tol=1e-6, optimizer='RCG',
-                         optimizer_history=7, diis=True, diis_space=6,
+                         optimizer_history=7, optimizer_tol=1.0e-4,
+                         optimizer_max_steps=200,
+                         optimizer_max_step_norm=None,
+                         diis=True, diis_space=6,
                          diis_start=2, ci_method='direct_ci', **kwargs):
 
     if mc.ncore > 0:
@@ -471,6 +498,9 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     U, E = minimize(
         energy, U0, args=(h1e, eri, dm1, dm2),
         algorithm=optimizer, history_size=optimizer_history,
+        epsilon=optimizer_tol,
+        max_iterations=optimizer_max_steps,
+        max_step_norm=optimizer_max_step_norm,
     )
     U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
 
@@ -509,10 +539,16 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             dm1 += _dm1 * weights[n]
             dm2 += _dm2 * weights[n]
 
-
+        # Reuse the more conservative restart step from the state-specific
+        # kernel.  The state-averaged surface is typically flatter, so jumping
+        # back to the global default ``tau=2`` every macroiteration is often
+        # too aggressive.
         U, E = minimize(
-            energy, U, args=(h1e, eri, dm1, dm2),
+            energy, U, args=(h1e, eri, dm1, dm2), tau=1,
             algorithm=optimizer, history_size=optimizer_history,
+            epsilon=optimizer_tol,
+            max_iterations=optimizer_max_steps,
+            max_step_norm=optimizer_max_step_norm,
         )
         U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
         # print(E + mol.energy_nuc())
