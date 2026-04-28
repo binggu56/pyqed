@@ -66,7 +66,7 @@ class DMRGSCF(QCDMRG):
             U0[i, i] = 1.
 
         if nstates == 1: # ground state only
-            C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
+            C, mc, _, _, _, _ = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
 
         elif nstates > 1:
             if self.weights is None:
@@ -92,7 +92,6 @@ class DMRGSCF(QCDMRG):
 if __name__=='__main__':
 
     from pyqed import Molecule
-    # from pyqed.qchem.mcscf.direct_ci import CASCI
 
     mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
     mol.build(driver='pyscf')
@@ -103,7 +102,7 @@ if __name__=='__main__':
 
     mc.fix_spin(ss=0, shift=0.2)
     mc.run(
-        nstates=2,
+        nstates=1,
         symmetry_list=['charge', 'sz'], 
         initial_guess='cid'
     )

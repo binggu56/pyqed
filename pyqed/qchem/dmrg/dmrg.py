@@ -25,7 +25,6 @@ from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom
 
 from pyqed.qchem.ci.fci import SpinOuterProduct, givenΛgetB
-from pyqed.qchem.mcscf.casci import h1e_for_cas
 
 from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
@@ -37,7 +36,7 @@ from collections import namedtuple
 from scipy.sparse import identity, kron, csr_matrix, diags
 
 # from pyqed import Molecule
-from pyqed.qchem.mcscf.casci import CASCI
+from pyqed.qchem.mcscf.casci import CASCI, h1e_for_cas
 from pyqed.mps import DMRG, MPS, dense_to_symmetric_mpo
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
@@ -617,7 +616,7 @@ class QCDMRG(CASCI):
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
 
-        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, mo_coeff=self.mo_coeff)
+        H, energy_core = h1e_for_cas(self, mo_coeff=self.mo_coeff)
 
         self.e_core = energy_core
 
