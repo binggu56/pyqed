@@ -1121,6 +1121,12 @@ class MPS:
                 rho /= tr
             rdm[i] = rho
         return rdm
+    
+    def make_local_site_rdm(self, idx=None):
+        """
+        Wrapper for local one-site reduced density matrices.
+        """
+        return self._calc_local_site_rdms(idx=idx)
 
     def make_diagonal_rdm2(self, idx_pairs=None):
         """
