@@ -18,5 +18,4 @@ mc.run(
 # energy logs for you to use
 print(mc.e_tot) #ground state energy
 # print(mc.e_tot[1]) #fitst excited state
-print([list(h) for h in mc.e_history]) #whole energy log in list
 print(mc.e_history) #whole energy log in array
