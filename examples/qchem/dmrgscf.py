@@ -10,7 +10,7 @@ mc = DMRGSCF(mf, ncas=2, nelecas=2, D=60, max_cycles=50)
 
 mc.fix_spin(ss=0, shift=0.2)
 mc.run(
-    nstates=2,
+    nstates=1,
     symmetry_list=['charge', 'sz'], 
     initial_guess='cid'
 )
