@@ -24,6 +24,18 @@ from pyqed.qchem.mcscf.casci import (
     transform_spatial_eri_to_mo,
 )
 from pyqed.qchem.mcscf import direct_ci
+from pyqed.qchem.mcscf.orbopt import (
+    embed_rdm2,
+    generalized_fock,
+    orbital_gradient,
+    pack_nonredundant,
+)
+from pyqed.qchem.mcscf.reduced_ci import (
+    ReducedCISubspace,
+    ci_rotation_gradient,
+    ci_rotation_hessian,
+    orbital_ci_coupling,
+)
 
 
 def test_casci_accepts_closed_shell_uhf_reference():
@@ -126,6 +138,255 @@ def test_casci_make_tdm1s_sum_to_spin_traced_tdm():
 
     np.testing.assert_allclose(tdm1a + tdm1b, mc.make_tdm1(1, 0), atol=1e-10)
     np.testing.assert_allclose(sum(mc.make_rdm1s(0)), mc.make_rdm1(0), atol=1e-10)
+
+
+def test_casci_make_tdm2_diagonal_matches_rdm2():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+    mc_direct = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(
+        nstates=2,
+        method='direct_ci',
+    )
+
+    np.testing.assert_allclose(mc.make_tdm2(0, 0), mc.make_rdm2(0), atol=1e-10)
+    np.testing.assert_allclose(mc.make_tdm2(1, 1), mc.make_rdm2(1), atol=1e-10)
+    np.testing.assert_allclose(
+        mc_direct.make_tdm2(0, 0),
+        mc_direct.make_rdm2(0),
+        atol=1e-10,
+    )
+
+
+def test_casci_rdm2_reconstructs_active_space_energy():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+
+    for cls, method in ((CASCI, 'ci'), (direct_ci.CASCI, 'direct_ci')):
+        mc = cls(mf, ncas=4, nelecas=4).run(nstates=1, method=method)
+        dm1, dm2 = mc.make_rdm12(0)
+        hcore = np.asarray(mc.hcore)
+        h1e = hcore[0] if hcore.ndim == 3 else hcore
+        eri = getattr(mc, 'h2e_cas', None)
+        if eri is None:
+            ncore, ncas = mc.ncore, mc.ncas
+            active = slice(ncore, ncore + ncas)
+            eri = mf.get_eri_mo(mf.mo_coeff, notation='chem')[
+                active, active, active, active
+            ]
+        eri = np.asarray(eri)
+        eri = eri[0, 0] if eri.ndim == 6 else eri
+
+        e_reconstructed = (
+            mc.e_core
+            + np.einsum('pq,pq', h1e, dm1)
+            + 0.5 * np.einsum('pqrs,pqrs', eri, dm2)
+        )
+
+        np.testing.assert_allclose(e_reconstructed, mc.e_tot[0], atol=1e-10)
+
+
+def test_reduced_ci_subspace_projects_casci_roots():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
+
+    subspace = ReducedCISubspace.from_casci(mc, root_ids=[0, 1])
+    energies, ci = subspace.diagonalize(nroots=2)
+    residuals = subspace.residuals(mc, ci, energies)
+
+    assert subspace.nvec == 2
+    np.testing.assert_allclose(energies, mc.e_tot[:2], atol=1e-10)
+    np.testing.assert_allclose(subspace.basis.T @ subspace.basis, np.eye(2), atol=1e-10)
+    np.testing.assert_allclose(residuals, np.zeros_like(residuals), atol=1e-8)
+
+
+def test_direct_ci_sigma_matches_ci_roots():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
+
+    for root, energy in zip(mc.ci, mc.e_tot):
+        sigma = mc.ci_sigma(root)
+        np.testing.assert_allclose(sigma, (energy - mc.e_core) * root, atol=1e-8)
+    hdiag = mc.ci_diagonal()
+    assert hdiag.shape == (len(mc.ci[0]),)
+    assert np.all(np.isfinite(hdiag))
+
+
+def test_factorized_direct_ci_sigma_matches_ci_root():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(
+        nstates=1,
+        method='direct_ci',
+        use_cholesky=True,
+    )
+
+    sigma = mc.ci_sigma(mc.ci[0])
+    np.testing.assert_allclose(sigma, (mc.e_tot[0] - mc.e_core) * mc.ci[0], atol=1e-8)
+
+
+def test_reduced_ci_full_subspace_reproduces_dense_casci():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
+
+    identity = np.eye(len(mc.ci[0]))
+    subspace = ReducedCISubspace.from_casci(
+        mc,
+        root_ids=[],
+        extra_vectors=identity,
+    )
+    energies, ci = subspace.diagonalize(nroots=2)
+    residuals = subspace.residuals(mc, ci, energies)
+
+    assert subspace.nvec == identity.shape[0]
+    np.testing.assert_allclose(energies, mc.e_tot[:2], atol=1e-10)
+    np.testing.assert_allclose(residuals, np.zeros_like(residuals), atol=1e-8)
+
+
+def test_reduced_ci_rotation_block_for_root_plus_external_vector():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
+
+    extra = np.eye(len(mc.ci[0]))[:, 0]
+    subspace = ReducedCISubspace.from_casci(mc, root_ids=[0], extra_vectors=extra)
+    grad, grad_pairs = subspace.rotation_gradient(nstates=1)
+    hess, hess_pairs = subspace.rotation_hessian(nstates=1)
+    grad_func, grad_pairs_func = ci_rotation_gradient(subspace.hamiltonian, nstates=1)
+    hess_func, hess_pairs_func = ci_rotation_hessian(subspace.hamiltonian, nstates=1)
+
+    assert grad_pairs == hess_pairs
+    assert grad_pairs == grad_pairs_func
+    assert hess_pairs == hess_pairs_func
+    assert grad.shape == (subspace.nvec - 1,)
+    assert hess.shape == (subspace.nvec - 1, subspace.nvec - 1)
+    np.testing.assert_allclose(grad, grad_func, atol=1e-12)
+    np.testing.assert_allclose(hess, hess_func, atol=1e-12)
+    np.testing.assert_allclose(grad, np.zeros_like(grad), atol=1e-8)
+    np.testing.assert_allclose(hess, hess.T, atol=1e-12)
+
+    rotated = subspace.rotated_state_vectors(np.zeros(len(grad_pairs)), grad_pairs)
+    np.testing.assert_allclose(rotated[:, 0], subspace.basis[:, 0], atol=1e-12)
+
+    step = np.zeros(len(grad_pairs))
+    step[0] = 0.1
+    rotated = subspace.rotated_state_vectors(step, grad_pairs)
+    assert rotated.shape == (subspace.ndet, 1)
+    np.testing.assert_allclose(rotated.T @ rotated, np.eye(1), atol=1e-12)
+
+
+def test_reduced_ci_expands_with_preconditioned_residual():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=4, nelecas=4).run(nstates=1, method='direct_ci')
+
+    subspace = ReducedCISubspace.from_casci(mc, root_ids=[0])
+    trial = mc.ci[0].copy()
+    trial += 0.1 * np.eye(len(trial))[:, 0]
+    trial /= np.linalg.norm(trial)
+    energy = subspace.rayleigh_energies(mc, trial)[0]
+    expanded, n_added = subspace.expand_with_residuals(
+        mc,
+        trial,
+        np.array([energy]),
+        max_vectors=1,
+    )
+
+    assert n_added == 1
+    assert expanded.nvec == subspace.nvec + 1
+    np.testing.assert_allclose(expanded.basis.T @ expanded.basis, np.eye(expanded.nvec), atol=1e-10)
+
+
+def test_orbital_ci_coupling_matches_ci_finite_difference():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
+
+    extra = np.eye(len(mc.ci[0]))[:, 0]
+    subspace = ReducedCISubspace.from_casci(mc, root_ids=[0], extra_vectors=extra)
+    coupling, pairs = subspace.orbital_coupling(
+        mc,
+        mf.get_hcore_mo(mf.mo_coeff),
+        mf.get_eri_mo(mf.mo_coeff, notation='chem'),
+        nstates=1,
+        nmo=mf.nmo,
+    )
+    coupling_func, pairs_func = orbital_ci_coupling(
+        mc,
+        subspace,
+        mf.get_hcore_mo(mf.mo_coeff),
+        mf.get_eri_mo(mf.mo_coeff, notation='chem'),
+        nstates=1,
+        nmo=mf.nmo,
+    )
+    assert coupling.shape[1] == len(pairs)
+    assert pairs == pairs_func
+    np.testing.assert_allclose(coupling, coupling_func, atol=1e-12)
+
+    p, m = pairs[0]
+    eps = 1.0e-5
+    c0 = subspace.basis[:, m]
+    cp = subspace.basis[:, p]
+    c_plus = c0 + eps * cp
+    c_plus /= np.linalg.norm(c_plus)
+    c_minus = c0 - eps * cp
+    c_minus /= np.linalg.norm(c_minus)
+    ci_saved = mc.ci
+    try:
+        mc.ci = [c_plus]
+        dm1_plus = mc.make_rdm1(0, with_core=True, with_vir=True)
+        dm2_plus = embed_rdm2(mc.make_rdm2(0, with_core=True), mf.nmo)
+        grad_plus = orbital_gradient(
+            generalized_fock(
+                mf.get_hcore_mo(mf.mo_coeff),
+                mf.get_eri_mo(mf.mo_coeff, notation='chem'),
+                dm1_plus,
+                dm2_plus,
+            )
+        )
+
+        mc.ci = [c_minus]
+        dm1_minus = mc.make_rdm1(0, with_core=True, with_vir=True)
+        dm2_minus = embed_rdm2(mc.make_rdm2(0, with_core=True), mf.nmo)
+        grad_minus = orbital_gradient(
+            generalized_fock(
+                mf.get_hcore_mo(mf.mo_coeff),
+                mf.get_eri_mo(mf.mo_coeff, notation='chem'),
+                dm1_minus,
+                dm2_minus,
+            )
+        )
+    finally:
+        mc.ci = ci_saved
+
+    fd_col = pack_nonredundant(
+        (grad_plus - grad_minus) / (2.0 * eps),
+        mc.ncore,
+        mc.ncas,
+        mf.nmo,
+    )
+    np.testing.assert_allclose(coupling[:, 0], fd_col, atol=1e-5, rtol=1e-5)
 
 
 def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan the LiF potential-energy curve with state-averaged COCASCI."""
+"""Scan the LiF potential-energy curve with state-averaged COCAS."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from contextlib import redirect_stdout
 
 import numpy as np
 
-from pyqed.qchem import COCASCI, Molecule
+from pyqed.qchem import COCAS, Molecule
 
 
 def run_point(mf, r_bohr: float, basis: str, ncas: int, nelecas: int, nstates: int):
     sink = io.StringIO()
     with redirect_stdout(sink):
-        mc = COCASCI(
+        mc = COCAS(
             mf,
             ncas=ncas,
             nelecas=nelecas,

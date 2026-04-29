@@ -192,7 +192,109 @@ class Cell:
                         e += za * zb / dist
         return 0.5 * e
 
-    def RHF(self, kpts=None, **kwargs):
-        from .hf import RHF
+    def ewald_nuclear_repulsion(
+        self,
+        eta=None,
+        real_cut=4,
+        recip_cut=8,
+        neutralizing_background=True,
+    ):
+        if not self._built:
+            self.build()
 
-        return RHF(self, kpts=kpts, **kwargs)
+        from .ewald import ewald_nuclear_repulsion
+
+        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        coords = np.asarray(self._atom_coords, dtype=float)
+        return ewald_nuclear_repulsion(
+            charges,
+            coords,
+            self.lattice_vectors,
+            eta=eta,
+            real_cut=real_cut,
+            recip_cut=recip_cut,
+            neutralizing_background=neutralizing_background,
+        )
+
+    def reciprocal_nuclear_attraction_matrix(self, recip_cut=8, eta=None):
+        if not self._built:
+            self.build()
+
+        from .ewald import reciprocal_nuclear_attraction_matrix_s
+
+        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        coords = np.asarray(self._atom_coords, dtype=float)
+        return reciprocal_nuclear_attraction_matrix_s(
+            charges,
+            coords,
+            self._unit_mol._bas,
+            self.lattice_vectors,
+            recip_cut=recip_cut,
+            eta=eta,
+        )
+
+    def short_range_nuclear_attraction_matrix(self, eta, real_cut=4):
+        if not self._built:
+            self.build()
+
+        from .ewald import short_range_nuclear_attraction_matrix_s
+
+        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        coords = np.asarray(self._atom_coords, dtype=float)
+        return short_range_nuclear_attraction_matrix_s(
+            charges,
+            coords,
+            self._unit_mol._bas,
+            self.lattice_vectors,
+            eta=eta,
+            real_cut=real_cut,
+        )
+
+    def reciprocal_hartree_matrix(self, dm, recip_cut=8, eta=None):
+        if not self._built:
+            self.build()
+
+        from .ewald import reciprocal_hartree_matrix_s
+
+        return reciprocal_hartree_matrix_s(
+            dm,
+            self._unit_mol._bas,
+            self.lattice_vectors,
+            recip_cut=recip_cut,
+            eta=eta,
+        )
+
+    def short_range_eri_tensor(self, eta):
+        if not self._built:
+            self.build()
+
+        from .ewald import short_range_eri_tensor_s
+
+        return short_range_eri_tensor_s(self._unit_mol._bas, eta=eta)
+
+    def reciprocal_eri_tensor(self, recip_cut=8, eta=None):
+        if not self._built:
+            self.build()
+
+        from .ewald import reciprocal_eri_tensor_s
+
+        return reciprocal_eri_tensor_s(
+            self._unit_mol._bas,
+            self.lattice_vectors,
+            recip_cut=recip_cut,
+            eta=eta,
+        )
+
+    def RHF(self, kpts=None, nk=None, method="finite_image", **kwargs):
+        method = str(method).lower()
+        if method in ("finite_image", "finite-image", "image", "native"):
+            from .hf import RHF
+
+            return RHF(self, kpts=kpts, nk=nk, **kwargs)
+        if method in ("ewald", "aft"):
+            if kpts is not None or nk is not None:
+                raise NotImplementedError("method='ewald' currently supports gamma point only.")
+            from .hf import EwaldRHF
+
+            return EwaldRHF(self, **kwargs)
+        raise ValueError("method must be 'finite_image' or 'ewald'.")

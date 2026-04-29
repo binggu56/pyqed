@@ -325,7 +325,14 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
             q_out = phys_qns[out_s]
             q_in = phys_qns[in_s]
             # Q_Right = Q_Left - (Q_Out - Q_In)
-            flux = q_out - q_in
+            try:
+                flux = q_out - q_in
+            except TypeError as exc:
+                raise TypeError(
+                    "dense_to_symmetric_mpo currently requires Abelian sector differences on physical legs. "
+                    "The new symmetry layer can host U(1)xSU(2) sectors, but non-Abelian MPO conversion "
+                    "still needs a reduced-tensor implementation."
+                ) from exc
             for q_l in valid_incoming[l]:
                 if not is_sector_like(q_l):
                     raise TypeError(
@@ -3343,7 +3350,7 @@ class HamiltonianMultiply(sparse.linalg.LinearOperator):
         self.E = E
         self.W = W # MPO: (Left, Right, Out, In) -> (L, R, P_bra, P_ket)
         self.F = F
-        self.dtype = np.dtype('d')
+        self.dtype = np.result_type(E, W, F, np.complex128)
 
         # Determine shapes
         # E: (MPO, Bra_L, Ket_L)
@@ -3763,7 +3770,8 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
         return E[0], A, B, trunc, m
 
 def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
-                  not_conv_err=True, sym_mgr=None, nstates=1, weights=None):
+                  not_conv_err=True, sym_mgr=None, nstates=1, weights=None,
+                  verbose=0):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -3785,7 +3793,8 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         DESCRIPTION.
 
     """
-    if weights is None: 
+    verbose = int(verbose)
+    if weights is None:
         weights = [1.0/nstates] * nstates
     weights = np.array(weights)
     MPS = mps 
@@ -3799,6 +3808,34 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     Eold = 0.0
     converged = False
     gauge = None
+
+    if len(MPS) == 2:
+        if nstates > 1:
+            Energy, MPS[0], MPS[1], trunc, states, last_AA_list = optimize_two_sites(
+                MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
+                U1=U1, sym_mgr=sym_mgr, nstates=nstates, weights=weights,
+            )
+            final_states = []
+            for k in range(nstates):
+                MPS_k = [B.copy() for B in MPS]
+                if U1:
+                    U, V, S_dict, _, _ = svd_symmetric(last_AA_list[k], m_max=None)
+                    A_US = multiply_U_S(U, S_dict)
+                    MPS_k[0] = A_US.transpose(0, 2, 1)
+                    MPS_k[1] = V
+                else:
+                    # Dense state-average root reconstruction is handled by
+                    # the generic multi-site path; keep the averaged state as
+                    # a conservative fallback for the two-site shortcut.
+                    pass
+                final_states.append(MPS_k)
+            return Energy, final_states, "Right", True
+        else:
+            Energy, MPS[0], MPS[1], trunc, states = optimize_two_sites(
+                MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
+                U1=U1, sym_mgr=sym_mgr,
+            )
+        return Energy, MPS, "Right", True
     
     last_i = 0
     last_AA_list = None
@@ -3822,12 +3859,14 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             last_i = i
 
         if nstates > 1:
-            print(Energy)
+            if verbose >= 1:
+                print(Energy)
             e_avg = np.sum(weights * Energy) 
         else:
             e_avg = Energy
         if abs(e_avg - Eold) < conv:
-            print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
+            if verbose >= 1:
+                print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
             converged = True
             gauge = "Left"
             break
@@ -3854,7 +3893,8 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         else:
             e_avg = Energy
         if abs(e_avg - Eold) < conv:
-            print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
+            if verbose >= 1:
+                print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
             converged = True
             gauge = "Right"
             break
@@ -3866,7 +3906,8 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             raise ValueError("DMRG did not converge within the given number of sweeps, if you wish to disable this error, set not_conv_err = False. or you should increase the number of sweeps.")
     else:
         if converged == False:
-            print("DMRG did not converge within {sweeps} sweeps, returning the last result.")
+            if verbose >= 1:
+                print("DMRG did not converge within {sweeps} sweeps, returning the last result.")
     if gauge == None:
         gauge = "Right"
 

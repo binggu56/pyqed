@@ -15,6 +15,7 @@ from scipy.linalg import eigh
 # from pyscf.scf import _vhf
 # from pyscf import ao2mo
 import sys
+import re
 
 from pyqed import dagger, dag
 from opt_einsum import contract
@@ -23,11 +24,76 @@ from functools import reduce
 import math
 
 
+_AO_LABEL_RE = re.compile(r"^(?P<n>\d+)(?P<l>[a-z])(?P<comp>.*)$", re.IGNORECASE)
+
+
+def _parse_ao_label(label):
+    parts = str(label).split()
+    if len(parts) < 3:
+        raise ValueError(f"Unable to parse AO label '{label}'.")
+    atom_index = int(parts[0])
+    symbol = parts[1]
+    orbital = parts[2]
+    match = _AO_LABEL_RE.match(orbital)
+    if match is None:
+        raise ValueError(f"Unable to parse shell information from AO label '{label}'.")
+    shell = f"{match.group('n')}{match.group('l')}"
+    component = match.group('comp')
+    return {
+        'atom_index': atom_index,
+        'symbol': symbol,
+        'shell': shell,
+        'component': component,
+        'label': str(label),
+    }
+
+
+def _group_ao_indices_by_atom(ao_labels, natom):
+    groups = [[] for _ in range(natom)]
+    for ao_idx, label in enumerate(ao_labels):
+        atom_idx = _parse_ao_label(label)['atom_index']
+        groups[atom_idx].append(ao_idx)
+    return [np.asarray(group, dtype=int) for group in groups]
+
+
+def _cross_ao_overlap_matrix(mol_bra, mol_ket):
+    basis_bra = mol_bra._bas_cart if getattr(mol_bra, "_bas_cart", None) is not None else mol_bra._bas
+    basis_ket = mol_ket._bas_cart if getattr(mol_ket, "_bas_cart", None) is not None else mol_ket._bas
+    if basis_bra is None or basis_ket is None:
+        raise ValueError("Build both molecules before requesting cross AO overlaps.")
+
+    try:
+        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+
+        s12 = np.asarray(overlap_integral_asymmetric(basis_bra, basis_ket), dtype=float)
+    except Exception:
+        from pyqed.qchem.mol import intor_cross
+
+        s12 = np.asarray(intor_cross('int1e_ovlp', mol_bra.topyscf(), mol_ket.topyscf()), dtype=float)
+
+    transform_bra = getattr(mol_bra, "_ao_cart2sph", None)
+    transform_ket = getattr(mol_ket, "_ao_cart2sph", None)
+    if transform_bra is not None:
+        s12 = np.einsum('pi,pq->iq', transform_bra, s12, optimize=True)
+    if transform_ket is not None:
+        s12 = np.einsum('pq,qj->pj', s12, transform_ket, optimize=True)
+    return s12
+
+
+def _lowdin_sqrt_overlap(overlap, thresh=1e-12):
+    eigvals, eigvecs = eigh(np.asarray(overlap, dtype=float))
+    if np.any(eigvals < -thresh):
+        raise ValueError("AO overlap matrix is not positive semidefinite.")
+    eigvals = np.clip(eigvals, 0.0, None)
+    return (eigvecs * np.sqrt(eigvals)) @ eigvecs.T
+
+
 class RHF:
-    def __init__(self, mol, init_guess='h1e'):
+    def __init__(self, mol, init_guess='h1e', verbose=0):
         self.mol = mol
         self.max_cycle = 100
         self.init_guess = init_guess
+        self.verbose = int(verbose)
 
         self.nocc = self.mol.nelec//2
 
@@ -70,6 +136,8 @@ class RHF:
         self.eri_factors = None
 
     def run(self, **kwargs):
+        verbose = int(kwargs.pop('verbose', self.verbose))
+        self.verbose = verbose
         density_fit = bool(kwargs.pop('density_fit', False))
         auxbasis = kwargs.pop('auxbasis', None)
         cholesky_jk_kw = kwargs.pop('cholesky_jk', None)
@@ -130,6 +198,7 @@ class RHF:
                     max_cycle=kwargs.pop('max_cycle', 50),
                     tol=kwargs.pop('tol', 1e-8),
                     auxbasis=auxbasis,
+                    verbose=verbose,
                 )
             self.density_fit = True
             self.auxbasis = auxbasis
@@ -147,6 +216,7 @@ class RHF:
                     low_rank_jk=cholesky_jk,
                     low_rank_tol=cholesky_tol,
                     low_rank_max_rank=cholesky_max_rank,
+                    verbose=verbose,
                     **kwargs,
                 )
             self._pyscf_mf = None
@@ -384,6 +454,382 @@ class RHF:
         if self._pyscf_mf is not None:
             return self._pyscf_mf.get_ovlp()
         return self.mol.overlap
+
+    def analyze(self):
+        from .analysis import RHFAnalysis
+        return RHFAnalysis(self)
+
+    def mo_components(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().mo_components(
+            mo_indices=mo_indices,
+            metric=metric,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def print_mo_components(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().print_mo_components(
+            mo_indices=mo_indices,
+            metric=metric,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def mulliken_charges(self, dm=None):
+        return self.analyze().mulliken_charges(dm=dm)
+
+    def print_mulliken_charges(self, dm=None):
+        return self.analyze().print_mulliken_charges(dm=dm)
+
+    def lowdin_charges(self, dm=None):
+        return self.analyze().lowdin_charges(dm=dm)
+
+    def print_lowdin_charges(self, dm=None):
+        return self.analyze().print_lowdin_charges(dm=dm)
+
+    def mayer_bond_orders(self, dm=None):
+        return self.analyze().mayer_bond_orders(dm=dm)
+
+    def print_mayer_bond_orders(self, dm=None, min_bond_order=0.0):
+        return self.analyze().print_mayer_bond_orders(dm=dm, min_bond_order=min_bond_order)
+
+    def wiberg_bond_orders(self, dm=None):
+        return self.analyze().wiberg_bond_orders(dm=dm)
+
+    def print_wiberg_bond_orders(self, dm=None, min_bond_order=0.0):
+        return self.analyze().print_wiberg_bond_orders(dm=dm, min_bond_order=min_bond_order)
+
+    def mo_composition(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        group_by='atom+shell',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().mo_composition(
+            mo_indices=mo_indices,
+            metric=metric,
+            group_by=group_by,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def print_mo_composition(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        group_by='atom+shell',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().print_mo_composition(
+            mo_indices=mo_indices,
+            metric=metric,
+            group_by=group_by,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def mo_overlap(self, other, mo_indices=None, other_mo_indices=None):
+        return self.analyze().mo_overlap(
+            other,
+            mo_indices=mo_indices,
+            other_mo_indices=other_mo_indices,
+        )
+
+    def sample_mo(self, mo_index, coords, screen_basis=True, tol_screen=1e-8):
+        return self.analyze().sample_mo(
+            mo_index,
+            coords,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def sample_mo_grid(
+        self,
+        mo_index,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+    ):
+        return self.analyze().sample_mo_grid(
+            mo_index,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def sample_density_grid(
+        self,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        dm=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+    ):
+        return self.analyze().sample_density_grid(
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            dm=dm,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def orbital_cube(
+        self,
+        orbital_index,
+        filename,
+        coeff=None,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        comment=None,
+    ):
+        return self.analyze().orbital_cube(
+            orbital_index,
+            filename,
+            coeff=coeff,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            comment=comment,
+        )
+
+    def density_cube(
+        self,
+        filename,
+        dm=None,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        comment=None,
+    ):
+        from pyqed.qchem.tools import cubegen
+
+        return cubegen.density(
+            self,
+            filename,
+            dm=dm,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            comment=comment,
+        )
+
+    def plot_mo_3d(
+        self,
+        mo_index,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        isovalue=None,
+        isovalue_fraction=0.2,
+        positive_color='#1f77b4',
+        negative_color='#d62728',
+        alpha=0.45,
+        atom_size=60.0,
+        show_atoms=True,
+        show_bonds=None,
+        bond_scale=1.25,
+        bond_color='#555555',
+        bond_linewidth=1.6,
+        atom_colors=None,
+        atom_render='sphere',
+        atom_alpha=None,
+        sphere_quality=20,
+        label_atoms=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        ax=None,
+        figsize=(7.0, 6.0),
+        elev=20.0,
+        azim=-60.0,
+        clean_axes=None,
+        axis_off=None,
+        style='default',
+        title=None,
+        title_fontsize=None,
+        title_pad=None,
+        backend='matplotlib',
+        save=None,
+    ):
+        return self.analyze().plot_mo_3d(
+            mo_index,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            isovalue=isovalue,
+            isovalue_fraction=isovalue_fraction,
+            positive_color=positive_color,
+            negative_color=negative_color,
+            alpha=alpha,
+            atom_size=atom_size,
+            show_atoms=show_atoms,
+            show_bonds=show_bonds,
+            bond_scale=bond_scale,
+            bond_color=bond_color,
+            bond_linewidth=bond_linewidth,
+            atom_colors=atom_colors,
+            atom_render=atom_render,
+            atom_alpha=atom_alpha,
+            sphere_quality=sphere_quality,
+            label_atoms=label_atoms,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            ax=ax,
+            figsize=figsize,
+            elev=elev,
+            azim=azim,
+            clean_axes=clean_axes,
+            axis_off=axis_off,
+            style=style,
+            title=title,
+            title_fontsize=title_fontsize,
+            title_pad=title_pad,
+            backend=backend,
+            save=save,
+        )
+
+    def plot_frontier_mos_3d(self, mo_indices=None, figsize=(12.0, 5.5), save=None, **kwargs):
+        return self.analyze().plot_frontier_mos_3d(
+            mo_indices=mo_indices,
+            figsize=figsize,
+            save=save,
+            **kwargs,
+        )
+
+    def plot_density_3d(
+        self,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        dm=None,
+        isovalue=None,
+        isovalues=None,
+        isovalue_fraction=0.2,
+        isovalue_fractions=(0.01, 0.03, 0.08),
+        color='#4c78a8',
+        colors=None,
+        alpha=0.40,
+        alphas=None,
+        atom_size=60.0,
+        show_atoms=True,
+        show_bonds=None,
+        bond_scale=1.25,
+        bond_color='#555555',
+        bond_linewidth=1.6,
+        atom_colors=None,
+        atom_render='sphere',
+        atom_alpha=None,
+        sphere_quality=20,
+        label_atoms=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        ax=None,
+        figsize=(7.0, 6.0),
+        elev=20.0,
+        azim=-60.0,
+        clean_axes=None,
+        axis_off=None,
+        style='default',
+        title='Electron Density',
+        title_fontsize=None,
+        title_pad=None,
+        smooth_sigma=None,
+        backend='matplotlib',
+        save=None,
+    ):
+        return self.analyze().plot_density_3d(
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            dm=dm,
+            isovalue=isovalue,
+            isovalues=isovalues,
+            isovalue_fraction=isovalue_fraction,
+            isovalue_fractions=isovalue_fractions,
+            color=color,
+            colors=colors,
+            alpha=alpha,
+            alphas=alphas,
+            atom_size=atom_size,
+            show_atoms=show_atoms,
+            show_bonds=show_bonds,
+            bond_scale=bond_scale,
+            bond_color=bond_color,
+            bond_linewidth=bond_linewidth,
+            atom_colors=atom_colors,
+            atom_render=atom_render,
+            atom_alpha=atom_alpha,
+            sphere_quality=sphere_quality,
+            label_atoms=label_atoms,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            ax=ax,
+            figsize=figsize,
+            elev=elev,
+            azim=azim,
+            clean_axes=clean_axes,
+            axis_off=axis_off,
+            style=style,
+            title=title,
+            title_fontsize=title_fontsize,
+            title_pad=title_pad,
+            smooth_sigma=smooth_sigma,
+            backend=backend,
+            save=save,
+        )
 
     def get_fock(self, dm=None):
         
@@ -985,7 +1431,9 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 
 
 def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
-                 low_rank_jk=False, low_rank_tol=1e-8, low_rank_max_rank=None):
+                 low_rank_jk=False, low_rank_tol=1e-8, low_rank_max_rank=None,
+                 verbose=0):
+    verbose = int(verbose)
 
     #calculate the overlap matrix S
     #the matrix should be symmetric with diagonal entries equal to one
@@ -1164,9 +1612,11 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
 
     nuclear_energy = mol.energy_nuc()
 
-    print("E_nclr = ", nuclear_energy)
+    if verbose >= 1:
+        print("E_nclr = ", nuclear_energy)
 
-    logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
+    if verbose >= 2:
+        logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
 
     eri_factors = None
     if low_rank_jk:
@@ -1195,8 +1645,9 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
 
         total_energy = electronic_energy + nuclear_energy
 
-        logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
-               total_energy - old_energy))
+        if verbose >= 2:
+            logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
+                   total_energy - old_energy))
 
         if scf_iter > 2 and abs(old_energy - total_energy) < tol:
             conv = True
@@ -1224,7 +1675,8 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
 
     if not conv: sys.exit('SCF not converged.')
 
-    print('E(HF) = ', total_energy)
+    if verbose >= 1:
+        print('E(HF) = ', total_energy)
 
     # check if this hartree-fock calculation is for configuration interaction
     # or not, if yes, output the essential information
@@ -1236,7 +1688,7 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
 
 
 def pyscf_density_fit_rhf(mol, dm0=None, init_guess='hcore', max_cycle=50,
-                          tol=1e-8, auxbasis=None):
+                          tol=1e-8, auxbasis=None, verbose=0):
     """
     Run a PySCF-backed density-fitted RHF calculation and return pyqed-style
     SCF data plus the underlying PySCF mean-field object.
@@ -1249,6 +1701,7 @@ def pyscf_density_fit_rhf(mol, dm0=None, init_guess='hcore', max_cycle=50,
     mf = scf.RHF(pmol).density_fit(auxbasis=auxbasis)
     mf.max_cycle = max_cycle
     mf.conv_tol = tol
+    mf.verbose = int(verbose)
 
     if dm0 is None:
         key = {'hcore': '1e', 'h1e': '1e'}.get(str(init_guess).lower(), init_guess)

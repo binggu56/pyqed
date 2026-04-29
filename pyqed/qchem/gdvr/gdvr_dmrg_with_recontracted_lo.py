@@ -8,7 +8,7 @@ import numpy as np
 # ============================================================
 # GDVR / HF imports
 # ============================================================
-from pyqed.qchem.gdvr.gdvr_mean_field import (
+from pyqed.qchem.gdvr.rhf import (
     Molecule,
     sine_dvr_1d,
     make_xy_spd_primitive_basis,

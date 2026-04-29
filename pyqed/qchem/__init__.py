@@ -3,7 +3,7 @@ from .mol import *
 # from .fci import *
 from .dft import *
 from .hf import *
-from .lrtddft import *
+from .tddft import *
 from .rttdhf import *
 from .rttddft import *
 from .soc import *
@@ -36,11 +36,11 @@ except ImportError:
     dmrg_automatic_overlap = None
 
 try:
-    from .mcscf.cocasci import COCAS, COCASCI
+    from .mcscf.cocas import COCAS, COCASCI
 except ImportError:
     COCAS = None
     COCASCI = None
 
 from .mcscf.casci import CASCI
-from .mcscf.casscf import CASSCF, FirstOrderCASSCF
+from .mcscf.casscf import CASSCF, FirstOrderCASSCF, SecondOrderCASSCF
 from .mcscf.soc_si import SOCStateInteractionResult, soc_state_interaction

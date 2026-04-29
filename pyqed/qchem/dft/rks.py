@@ -210,12 +210,12 @@ class RKS:
         """
         Convenience constructor for linear-response TDA.
         """
-        from pyqed.qchem.lrtddft import TDA
+        from pyqed.qchem.tddft import TDA
         return TDA(self)
 
     def TDDFT(self):
         """
         Convenience constructor for linear-response TDDFT.
         """
-        from pyqed.qchem.lrtddft import TDDFT
+        from pyqed.qchem.tddft import TDDFT
         return TDDFT(self)

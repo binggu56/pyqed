@@ -4,7 +4,7 @@ import logging
 
 
 class TDMPS:
-    def __init__(self, H_mpo, D=40, interaction_mpo=None, field=None):
+    def __init__(self, H_mpo, D=40, interaction_mpo=None, field=None, interaction_propagator_builder=None):
         """
         Time-Dependent MPS Solver (Layout Agnostic).
 
@@ -19,6 +19,7 @@ class TDMPS:
         self.H = H_mpo
         self.interaction_mpo = interaction_mpo
         self.field = field
+        self.interaction_propagator_builder = interaction_propagator_builder
         # self.dt = dt
         self.bond_dim = self.D = D
         # self.order = order
@@ -158,6 +159,15 @@ class TDMPS:
         return self.U_static, self.U_static_half
 
     def build_interaction_propagator(self, dt, time=0.0, field=None, order=2, scale=0):
+        if self.interaction_propagator_builder is not None:
+            return self.interaction_propagator_builder(
+                dt,
+                time=time,
+                field=self.field if field is None else field,
+                order=order,
+                scale=scale,
+            )
+
         h_int = self.interaction_hamiltonian(time=time, field=field)
         if h_int is None:
             return None

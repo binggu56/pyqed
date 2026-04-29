@@ -6,9 +6,12 @@ import warnings
 import datetime
 import os
 
-from pyqed.qchem.gdvr.newton_helper import CollocatedERIOp, NewtonHelper
+from .newton import CollocatedERIOp, NewtonHelper
+from pyqed.qchem.atomic_data import slater_radii
 
-from pyqed.qchem.gdvr.gdvr_integrals import (
+from .integrals import (
+    STO6_EXPS_H,
+    STO6_EXPS_He,
     make_xy_spd_primitive_basis,
     V_en_sp_total_at_z,
     build_h1_nm,
@@ -18,10 +21,76 @@ from pyqed.qchem.gdvr.gdvr_integrals import (
 )
 
 
-#  Basic molecule holder
-class Molecule:
-    def __init__(self, charges, coords, nelec=None, spin = None):
-        self.charges = np.asarray(charges, float).reshape(-1)
+DEFAULT_H_S_EXPS = np.asarray(STO6_EXPS_H, float).copy()
+DEFAULT_HE_S_EXPS = np.asarray(STO6_EXPS_He, float).copy()
+DEFAULT_P_EXPS = np.array([], float)
+DEFAULT_D_EXPS = np.array([], float)
+
+
+_ELEMENT_TO_Z = {
+    "H": 1.0,
+    "He": 2.0,
+    "Li": 3.0,
+    "Be": 4.0,
+    "B": 5.0,
+    "C": 6.0,
+    "N": 7.0,
+    "O": 8.0,
+    "F": 9.0,
+    "Ne": 10.0,
+    "Na": 11.0,
+    "Mg": 12.0,
+    "Al": 13.0,
+    "Si": 14.0,
+    "P": 15.0,
+    "S": 16.0,
+    "Cl": 17.0,
+    "Ar": 18.0,
+}
+
+
+def _canonicalize_element(symbol):
+    text = str(symbol).strip()
+    if not text:
+        raise ValueError("Empty element label is not allowed.")
+    return text[0].upper() + text[1:].lower()
+
+
+def _elements_to_charges(elements):
+    charges = []
+    normalized = []
+    for elem in elements:
+        sym = _canonicalize_element(elem)
+        if sym not in _ELEMENT_TO_Z:
+            raise ValueError(f"Unsupported element label for GDVR AtomicChain: {elem!r}")
+        normalized.append(sym)
+        charges.append(_ELEMENT_TO_Z[sym])
+    return normalized, np.asarray(charges, float)
+
+
+def _default_transverse_basis(elements):
+    if all(sym == "H" for sym in elements):
+        return (
+            DEFAULT_H_S_EXPS.copy(),
+            DEFAULT_P_EXPS.copy(),
+            DEFAULT_D_EXPS.copy(),
+        )
+    if all(sym == "He" for sym in elements):
+        return (
+            DEFAULT_HE_S_EXPS.copy(),
+            DEFAULT_P_EXPS.copy(),
+            DEFAULT_D_EXPS.copy(),
+        )
+    raise ValueError(
+        "No default GDVR transverse basis is defined for this chain. "
+        "Please provide s_exps explicitly."
+    )
+
+
+#  Basic atomic chain holder
+class AtomicChain:
+    def __init__(self, elements, coords, nelec=None, spin = None):
+        self.elements, self.charges = _elements_to_charges(elements)
         self.coords  = np.asarray(coords,  float).reshape(-1, 3)
         assert self.charges.shape[0] == self.coords.shape[0]
 
@@ -31,6 +100,16 @@ class Molecule:
             self.nelec = int(nelec)
 
         self.spin = spin
+        self.hcore = None
+        self.eri_j = None
+        self.eri_k = None
+        self.z = None
+        self.dz = None
+        self.e_slices = None
+        self.c_list = None
+        self.shapes = None
+        self.gdvr_options = None
+        self._newton_context = None
 
     def to_tuples(self):
         return [(float(Z), float(x), float(y), float(z))
@@ -45,6 +124,67 @@ class Molecule:
                 dR = R[i] - R[j]
                 E += Z[i] * Z[j] / float(np.linalg.norm(dR))
         return E
+
+    def build(
+        self,
+        Lz=18.0,
+        Nz=121,
+        M=1,
+        s_exps=None,
+        p_exps=None,
+        d_exps=None,
+        max_offset=None,
+        auto_cut=False,
+        cut_eps=1e-6,
+        verbose=True,
+        dvr_method='sine',
+    ):
+        if s_exps is None:
+            s_exps, default_p_exps, default_d_exps = _default_transverse_basis(self.elements)
+            if p_exps is None:
+                p_exps = default_p_exps
+            if d_exps is None:
+                d_exps = default_d_exps
+        Hcore, z, dz, E_slices, C_list, ERI_J, ERI_K, shapes = build_method2(
+            self,
+            Lz=Lz,
+            Nz=Nz,
+            M=M,
+            s_exps=s_exps,
+            p_exps=p_exps,
+            d_exps=d_exps,
+            max_offset=max_offset,
+            auto_cut=auto_cut,
+            cut_eps=cut_eps,
+            verbose=verbose,
+            dvr_method=dvr_method,
+        )
+        self.hcore = Hcore
+        self.eri_j = ERI_J
+        self.eri_k = ERI_K
+        self.z = z
+        self.dz = dz
+        self.e_slices = E_slices
+        self.c_list = C_list
+        self.shapes = shapes
+        self.gdvr_options = {
+            'Lz': float(Lz),
+            'Nz': int(Nz),
+            'M': int(M),
+            's_exps': None if s_exps is None else np.asarray(s_exps, float).copy(),
+            'p_exps': None if p_exps is None else np.asarray(p_exps, float).copy(),
+            'd_exps': None if d_exps is None else np.asarray(d_exps, float).copy(),
+            'max_offset': None if max_offset is None else int(max_offset),
+            'auto_cut': bool(auto_cut),
+            'cut_eps': float(cut_eps),
+            'verbose': bool(verbose),
+            'dvr_method': str(dvr_method),
+        }
+        self._newton_context = None
+        return self
+
+    def RHF(self):
+        return RHF(self)
 
 
 
@@ -253,20 +393,13 @@ def fock_2e_slice_collocated(P, ERI_J, ERI_K, Nz, M, k_scale=1.0):
 
 #  Build Method II (core + ERIs) and SCF TODO: remove the naming of Method II, i used to think and tried Method I as globally share one set of optimized AO but that is a lot less efficient, already removed
 def build_method2(
-    mol: Molecule,
+    mol: AtomicChain,
     Lz=18.0, Nz=121, M=1,
     s_exps=None, p_exps=None, d_exps=None,
     max_offset=None, auto_cut=False, cut_eps=1e-6, verbose=True, dvr_method='sine'
 ):
     t0 = time.time()
-    if dvr_method == 'sine':
-        z, Kz, dz = sine_dvr_1d(-Lz, Lz, Nz)
-    elif dvr_method == 'exp':
-        z, Kz, dz = Exponential_dvr_1d(-Lz, Lz, Nz)
-    elif dvr_method == 'sinc':
-        z, Kz, dz = sinc_dvr_1d(-Lz, Lz, Nz)
-    else:
-        raise NotImplementedError('use sine or exp for not')
+    z, Kz, dz = _gdvr_dvr_grid(Lz, Nz, dvr_method)
     nuclei = mol.to_tuples()
 
     if verbose:
@@ -359,17 +492,127 @@ class PulayCDIIS:
         return Fmix
 
 
+def _initial_density_guess(
+    Hcore,
+    nelec,
+    guess="hcore",
+    e_slices=None,
+    z_grid=None,
+    atom_z=None,
+    atom_charges=None,
+    atom_symbols=None,
+    sad_sigma=None,
+):
+    N = Hcore.shape[0]
+    nocc = nelec // 2
+    mode = str(guess).lower()
+
+    if mode == "slice":
+        if e_slices is None:
+            raise ValueError("e_slices is required for guess='slice'.")
+        eps0 = np.asarray(e_slices, float).reshape(-1)
+        if eps0.size != N:
+            raise ValueError("Slice-energy guess has incompatible size.")
+        occ_idx = np.argsort(eps0)[:nocc]
+        P = np.zeros((N, N), float)
+        P[occ_idx, occ_idx] = 2.0
+        return P
+
+    if mode == "sad":
+        if e_slices is None or z_grid is None or atom_z is None or atom_charges is None or atom_symbols is None:
+            raise ValueError("e_slices, z_grid, atom_z, atom_charges, and atom_symbols are required for guess='sad'.")
+
+        e_slices = np.asarray(e_slices, float)
+        z_grid = np.asarray(z_grid, float).reshape(-1)
+        atom_z = np.asarray(atom_z, float).reshape(-1)
+        atom_charges = np.asarray(atom_charges, float).reshape(-1)
+        atom_symbols = [str(sym) for sym in atom_symbols]
+
+        if e_slices.ndim != 2:
+            raise ValueError("e_slices must have shape (Nz, M) for guess='sad'.")
+        Nz, M = e_slices.shape
+        if Nz * M != N:
+            raise ValueError("Slice-energy guess has incompatible size.")
+
+        if atom_z.size != atom_charges.size:
+            raise ValueError("atom_z and atom_charges must have the same length.")
+
+        if atom_charges.size == 0:
+            return np.zeros((N, N), float)
+
+        dz = float(abs(z_grid[1] - z_grid[0])) if z_grid.size > 1 else 1.0
+        scale = 0.0 if np.sum(atom_charges) <= 0.0 else float(nelec) / float(np.sum(atom_charges))
+
+        occ = np.zeros((Nz, M), float)
+        orbital_order = np.argsort(np.mean(e_slices, axis=0))
+        if sad_sigma is None:
+            sigma_values = [max(2.0 * dz, 0.35)] * atom_z.size
+        elif isinstance(sad_sigma, str):
+            if sad_sigma.lower() != "atomic":
+                raise ValueError("String sad_sigma must be 'atomic'.")
+            sigma_values = []
+            for sym in atom_symbols:
+                sigma_values.append(max(2.0 * dz, float(slater_radii.get(sym.lower(), 0.7))))
+        else:
+            sigma_arr = np.asarray(sad_sigma, float)
+            if sigma_arr.ndim == 0:
+                sigma_values = [float(sigma_arr)] * atom_z.size
+            else:
+                sigma_values = sigma_arr.reshape(-1).tolist()
+                if len(sigma_values) != atom_z.size:
+                    raise ValueError("sad_sigma must be a scalar or one value per atom.")
+
+        for zA, ZA, sigma in zip(atom_z, atom_charges, sigma_values):
+            electrons = float(ZA) * scale
+            if electrons <= 0.0:
+                continue
+            w = np.exp(-0.5 * ((z_grid - float(zA)) / sigma) ** 2)
+            wsum = float(np.sum(w))
+            if wsum <= 0.0:
+                w = np.zeros_like(z_grid)
+                w[int(np.argmin(np.abs(z_grid - float(zA))))] = 1.0
+            else:
+                w /= wsum
+
+            remaining = electrons
+            for a in orbital_order:
+                if remaining <= 1e-14:
+                    break
+                occ_a = min(2.0, remaining)
+                occ[:, a] += occ_a * w
+                remaining -= occ_a
+
+        return np.diag(occ.reshape(-1))
+
+    if mode != "hcore":
+        raise ValueError(f"Unsupported GDVR RHF initial guess: {guess!r}")
+
+    eps, Cmo = la.eigh(Hcore)
+    Cocc = Cmo[:, :nocc]
+    return 2.0 * (Cocc @ Cocc.T)
+
+
 def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
                     conv=1e-7, max_iter=50, verbose=True,
                     damp=0.20, diis_start=3, diis_space=8,
-                    level_shift=0.5, shift_decay=0.75, k_ramp_iters=8):
+                    level_shift=0.5, shift_decay=0.75, k_ramp_iters=8,
+                    guess="hcore", e_slices=None, z_grid=None,
+                    atom_z=None, atom_charges=None, atom_symbols=None, sad_sigma=None):
     N = Nz * M
     nocc = nelec // 2
     I = np.eye(N)
 
-    eps, Cmo = la.eigh(Hcore)
-    Cocc = Cmo[:, :nocc]
-    P = 2.0 * (Cocc @ Cocc.T)
+    P = _initial_density_guess(
+        Hcore,
+        nelec,
+        guess=guess,
+        e_slices=e_slices,
+        z_grid=z_grid,
+        atom_z=atom_z,
+        atom_charges=atom_charges,
+        atom_symbols=atom_symbols,
+        sad_sigma=sad_sigma,
+    )
 
     E_last = np.inf
     P_prev = P.copy()
@@ -435,6 +678,557 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
 
     info = {"iter": it, "dE": dE, "rnorm": rnorm, "damp": damp, "level_shift": beta, "k_scale": k_scale}
     return Etot, eps, Cmo, P, info
+
+
+def _gdvr_dvr_grid(Lz, Nz, dvr_method):
+    method = str(dvr_method).lower()
+    if method == 'sine':
+        return sine_dvr_1d(-Lz, Lz, Nz)
+    if method == 'exp':
+        return Exponential_dvr_1d(-Lz, Lz, Nz)
+    if method == 'sinc':
+        return sinc_dvr_1d(-Lz, Lz, Nz)
+    raise NotImplementedError("dvr_method must be 'sine', 'exp', or 'sinc'.")
+
+
+def _build_eri_kernels(alphas, centers, labels, z_grid, max_offset=None, auto_cut=False, cut_eps=1e-8):
+    z_grid = np.asarray(z_grid, float)
+    Nz = int(z_grid.size)
+    if Nz < 1:
+        raise ValueError("Cannot build GDVR ERI kernels for an empty z grid.")
+    dz = float(abs(z_grid[1] - z_grid[0])) if Nz > 1 else 0.0
+    n_ao = len(alphas)
+
+    if max_offset is None or max_offset > (Nz - 1):
+        max_offset = Nz - 1
+    max_offset = int(max_offset)
+
+    K_h = [np.zeros((n_ao * n_ao, n_ao * n_ao), float) for _ in range(Nz)]
+    Kx_h = [np.zeros((n_ao * n_ao, n_ao * n_ao), float) for _ in range(Nz)]
+
+    norm0 = None
+    h_max = max_offset
+    for h in range(0, max_offset + 1):
+        delta_z = abs(h * dz)
+        eri_tensor = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z=delta_z)
+        if auto_cut:
+            nh = float(np.linalg.norm(eri_tensor.reshape(-1)))
+            if h == 0:
+                norm0 = max(nh, 1e-16)
+            else:
+                if norm0 is None:
+                    norm0 = max(nh, 1e-16)
+                ratio = nh / norm0
+                if ratio < float(cut_eps):
+                    h_max = h
+                    break
+
+        K_h[h] = eri_tensor.reshape(n_ao * n_ao, n_ao * n_ao)
+        Kx_h[h] = eri_tensor.transpose(0, 2, 1, 3).reshape(n_ao * n_ao, n_ao * n_ao)
+
+    return K_h, Kx_h, h_max
+
+
+def _build_newton_context(mol):
+    opts = mol.gdvr_options
+    if opts is None:
+        raise ValueError("Build the GDVR molecule first before constructing Newton helpers.")
+
+    Lz = float(opts["Lz"])
+    Nz = int(opts["Nz"])
+    dvr_method = str(opts["dvr_method"])
+    s_exps = np.asarray(opts["s_exps"], float)
+    p_exps = np.asarray(opts["p_exps"], float)
+    d_exps = np.asarray(opts["d_exps"], float)
+    max_offset = opts["max_offset"]
+    auto_cut = bool(opts["auto_cut"])
+    cut_eps = float(opts["cut_eps"])
+    nuclei = mol.to_tuples()
+
+    alphas, centers, labels = make_xy_spd_primitive_basis(
+        nuclei,
+        exps_s=s_exps,
+        exps_p=p_exps,
+        exps_d=d_exps,
+    )
+    S_prim = overlap_2d_cartesian(alphas, centers, labels)
+    T_prim = kinetic_2d_cartesian(alphas, centers, labels)
+    z, Kz, dz = _gdvr_dvr_grid(Lz, Nz, dvr_method)
+    h1_nm = build_h1_nm(
+        Kz,
+        S_prim,
+        T_prim,
+        z,
+        lambda zz: V_en_sp_total_at_z(alphas, centers, labels, nuclei, zz),
+    )
+
+    K_h, Kx_h, h_max = _build_eri_kernels(
+        alphas,
+        centers,
+        labels,
+        z,
+        max_offset=max_offset,
+        auto_cut=auto_cut,
+        cut_eps=cut_eps,
+    )
+
+    eri_op = CollocatedERIOp.from_kernels(N=S_prim.shape[0], Nz=Nz, dz=dz, K_h=K_h, Kx_h=Kx_h)
+    nh_sweep = SweepNewtonHelper(h1_nm, S_prim, eri_op)
+
+    return {
+        "alphas": alphas,
+        "centers": centers,
+        "labels": labels,
+        "S_prim": S_prim,
+        "T_prim": T_prim,
+        "z": z,
+        "Kz": Kz,
+        "dz": dz,
+        "K_h": K_h,
+        "Kx_h": Kx_h,
+        "eri_op": eri_op,
+        "nh_sweep": nh_sweep,
+        "nuclei": nuclei,
+        "h_max": h_max,
+    }
+
+
+def _get_newton_context(mol):
+    if getattr(mol, "_newton_context", None) is None:
+        mol._newton_context = _build_newton_context(mol)
+    return mol._newton_context
+
+
+class RHF:
+    def __init__(self, mol):
+        self.mol = mol
+        self.e_tot = None
+        self.mo_energy = None
+        self.mo_coeff = None
+        self.dm = None
+        self.info = None
+
+    def run(
+        self,
+        conv=1e-7,
+        max_iter=50,
+        verbose=True,
+        damp=0.20,
+        diis_start=3,
+        diis_space=8,
+        level_shift=0.5,
+        shift_decay=0.75,
+        k_ramp_iters=8,
+        guess="hcore",
+        sad_sigma=None,
+    ):
+        if self.mol.hcore is None or self.mol.eri_j is None or self.mol.eri_k is None or self.mol.shapes is None:
+            raise ValueError(
+                "Build the GDVR molecule first with mol.build(...) before calling mol.RHF().run()."
+            )
+
+        Etot, eps, Cmo, P, info = scf_rhf_method2(
+            self.mol.hcore,
+            self.mol.eri_j,
+            self.mol.eri_k,
+            Nz=self.mol.shapes["Nz"],
+            M=self.mol.shapes["M"],
+            nelec=self.mol.nelec,
+            Enuc=self.mol.nuclear_repulsion_energy(),
+            conv=conv,
+            max_iter=max_iter,
+            verbose=verbose,
+            damp=damp,
+            diis_start=diis_start,
+            diis_space=diis_space,
+            level_shift=level_shift,
+            shift_decay=shift_decay,
+            k_ramp_iters=k_ramp_iters,
+            guess=guess,
+            e_slices=self.mol.e_slices,
+            z_grid=self.mol.z,
+            atom_z=self.mol.coords[:, 2],
+            atom_charges=self.mol.charges,
+            atom_symbols=self.mol.elements,
+            sad_sigma=sad_sigma,
+        )
+
+        self.e_tot = float(Etot)
+        self.mo_energy = np.asarray(eps, float)
+        self.mo_coeff = np.asarray(Cmo, float)
+        self.dm = np.asarray(P, float)
+        self.info = dict(info)
+        return self
+
+    def make_rdm1(self):
+        if self.dm is None:
+            raise ValueError("Run GDVR RHF before requesting the density matrix.")
+        return np.asarray(self.dm, float)
+
+    @staticmethod
+    def _normalize_d_stack(d_stack, S_prim):
+        out = np.asarray(d_stack, float).copy()
+        for n in range(out.shape[0]):
+            dn = out[n]
+            out[n] = dn / np.sqrt(float(dn.T @ (S_prim @ dn)))
+        return out
+
+    @staticmethod
+    def _project_gradient_stack(nh_sweep, d_stack, P_slice, S_prim):
+        grads = []
+        for n in range(d_stack.shape[0]):
+            g_n = np.asarray(nh_sweep.get_gradient_slice_onthefly(n, d_stack, P_slice), float)
+            dn = np.asarray(d_stack[n], float)
+            coeff = float(dn.T @ (S_prim @ g_n))
+            g_proj = g_n - coeff * dn
+            grads.append(g_proj)
+        return np.vstack(grads)
+
+    @staticmethod
+    def _flatten_stack(d_stack):
+        return np.asarray(d_stack, float).reshape(-1)
+
+    @staticmethod
+    def _reshape_stack(vec, template):
+        return np.asarray(vec, float).reshape(template.shape)
+
+    @staticmethod
+    def _lbfgs_direction(g_vec, s_hist, y_hist, rho_hist):
+        q = np.asarray(g_vec, float).copy()
+        if not s_hist:
+            return -q
+
+        alpha = []
+        for s_vec, y_vec, rho in zip(reversed(s_hist), reversed(y_hist), reversed(rho_hist)):
+            a = rho * float(np.dot(s_vec, q))
+            alpha.append(a)
+            q -= a * y_vec
+
+        y_last = y_hist[-1]
+        s_last = s_hist[-1]
+        ys = float(np.dot(y_last, s_last))
+        yy = float(np.dot(y_last, y_last))
+        gamma = 1.0 if yy <= 1e-16 else max(1e-8, ys / yy)
+        r = gamma * q
+
+        for s_vec, y_vec, rho, a in zip(s_hist, y_hist, rho_hist, reversed(alpha)):
+            beta = rho * float(np.dot(y_vec, r))
+            r += s_vec * (a - beta)
+
+        return -r
+
+    def newton(
+        self,
+        alt_cycles=6,
+        sweep_iterations=4,
+        ridge=0.5,
+        trust_step=1.0,
+        trust_radius=2.0,
+        scf_conv=1e-8,
+        scf_max_iter=80,
+        max_backtrack=3,
+        verbose=True,
+    ):
+        if self.mol.hcore is None or self.mol.shapes is None or self.mol.gdvr_options is None:
+            raise ValueError(
+                "Build the GDVR molecule first with mol.build(...) before calling newton()."
+            )
+        if self.dm is None:
+            self.run(conv=scf_conv, max_iter=scf_max_iter, verbose=verbose)
+        if int(self.mol.shapes["M"]) != 1:
+            raise NotImplementedError("newton() currently supports only M=1.")
+
+        ctx = _get_newton_context(self.mol)
+        S_prim = ctx["S_prim"]
+        T_prim = ctx["T_prim"]
+        z = ctx["z"]
+        Kz = ctx["Kz"]
+        dz = ctx["dz"]
+        alphas = ctx["alphas"]
+        centers = ctx["centers"]
+        labels = ctx["labels"]
+        K_h = ctx["K_h"]
+        Kx_h = ctx["Kx_h"]
+        nh_sweep = ctx["nh_sweep"]
+        nuclei = ctx["nuclei"]
+        Nz = int(self.mol.shapes["Nz"])
+
+        if self.mol.z is not None and len(self.mol.z) == len(z):
+            if not np.allclose(self.mol.z, z):
+                raise ValueError("Stored GDVR grid does not match the requested Newton sweep grid.")
+
+        d_stack = np.vstack([np.asarray(self.mol.c_list[n][:, 0], float) for n in range(Nz)])
+        for n in range(Nz):
+            dn = d_stack[n]
+            d_stack[n] = dn / np.sqrt(float(dn.T @ (S_prim @ dn)))
+
+        E_history = [float(self.e_tot)]
+        Enuc = self.mol.nuclear_repulsion_energy()
+
+        for cyc in range(1, int(alt_cycles) + 1):
+            P_slice = self.dm.reshape(Nz, 1, Nz, 1)[:, 0, :, 0].copy()
+            d_stack, sweep_stats = sweep_optimize_driver(
+                nh_sweep,
+                d_stack,
+                P_slice,
+                S_prim,
+                n_cycles=int(sweep_iterations),
+                ridge=float(ridge),
+                trust_step=float(trust_step),
+                trust_radius=float(trust_radius),
+                verbose=verbose,
+                return_stats=True,
+            )
+
+            C_list = [d_stack[n].reshape(-1, 1) for n in range(Nz)]
+            Hcore = rebuild_Hcore_from_d(
+                d_stack,
+                z,
+                Kz,
+                S_prim,
+                T_prim,
+                alphas,
+                centers,
+                labels,
+                nuclei,
+            )
+            ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list, K_h, Kx_h)
+            Etot, eps, Cmo, P, info = scf_rhf_method2(
+                Hcore,
+                ERI_J,
+                ERI_K,
+                Nz,
+                1,
+                nelec=self.mol.nelec,
+                Enuc=Enuc,
+                conv=scf_conv,
+                max_iter=scf_max_iter,
+                verbose=False,
+            )
+
+            self.mol.hcore = Hcore
+            self.mol.eri_j = ERI_J
+            self.mol.eri_k = ERI_K
+            self.mol.c_list = C_list
+            self.mol.z = z
+            self.mol.dz = dz
+
+            self.e_tot = float(Etot)
+            self.mo_energy = np.asarray(eps, float)
+            self.mo_coeff = np.asarray(Cmo, float)
+            self.dm = np.asarray(P, float)
+            self.info = dict(info)
+            E_history.append(self.e_tot)
+
+            if verbose:
+                print(
+                    f"[Newton {cyc}] E = {self.e_tot:.12f} Ha  "
+                    f"dE={E_history[-1] - E_history[-2]:+.3e}  "
+                    f"max|g|={0.0 if sweep_stats is None else sweep_stats['max_grad']:.3e}  "
+                    f"maxΔ={0.0 if sweep_stats is None else sweep_stats['max_delta']:.3e}"
+                )
+
+            if abs(E_history[-1] - E_history[-2]) < scf_conv:
+                break
+
+        self.info = dict(self.info)
+        self.info["newton_cycles"] = len(E_history) - 1
+        self.info["newton_energy_history"] = tuple(float(v) for v in E_history)
+        return self
+
+    def run_newton_sweep(self, *args, **kwargs):
+        return self.newton(*args, **kwargs)
+
+    def quasinewton(
+        self,
+        alt_cycles=6,
+        micro_cycles=4,
+        initial_step=0.5,
+        min_step=1e-3,
+        scf_conv=1e-8,
+        scf_max_iter=80,
+        history_reset_curvature=1e-10,
+        history_size=6,
+        verbose=True,
+    ):
+        if self.mol.hcore is None or self.mol.shapes is None or self.mol.gdvr_options is None:
+            raise ValueError(
+                "Build the GDVR molecule first with mol.build(...) before calling quasinewton()."
+            )
+        if self.dm is None:
+            self.run(conv=scf_conv, max_iter=scf_max_iter, verbose=verbose)
+        if int(self.mol.shapes["M"]) != 1:
+            raise NotImplementedError("quasinewton() currently supports only M=1.")
+
+        ctx = _get_newton_context(self.mol)
+        S_prim = ctx["S_prim"]
+        T_prim = ctx["T_prim"]
+        z = ctx["z"]
+        Kz = ctx["Kz"]
+        dz = ctx["dz"]
+        alphas = ctx["alphas"]
+        centers = ctx["centers"]
+        labels = ctx["labels"]
+        K_h = ctx["K_h"]
+        Kx_h = ctx["Kx_h"]
+        nh_sweep = ctx["nh_sweep"]
+        nuclei = ctx["nuclei"]
+        Nz = int(self.mol.shapes["Nz"])
+
+        d_stack = np.vstack([np.asarray(self.mol.c_list[n][:, 0], float) for n in range(Nz)])
+        d_stack = self._normalize_d_stack(d_stack, S_prim)
+        E_history = [float(self.e_tot)]
+        Enuc = self.mol.nuclear_repulsion_energy()
+        s_hist = []
+        y_hist = []
+        rho_hist = []
+        step_guess = float(initial_step)
+        converged = False
+
+        for cyc in range(1, int(alt_cycles) + 1):
+            cycle_energy_start = E_history[-1]
+            cycle_accepts = 0
+            accepted_stats = None
+            cycle_failed = False
+
+            for micro in range(int(micro_cycles)):
+                P_slice = self.dm.reshape(Nz, 1, Nz, 1)[:, 0, :, 0].copy()
+                g_stack = self._project_gradient_stack(nh_sweep, d_stack, P_slice, S_prim)
+                g_vec = self._flatten_stack(g_stack)
+                gnorm = float(np.linalg.norm(g_vec))
+                if verbose:
+                    print(f"[QNewton {cyc}.{micro + 1}] |g| = {gnorm:.6e}")
+                if gnorm < scf_conv:
+                    converged = True
+                    break
+
+                direction = self._lbfgs_direction(g_vec, s_hist, y_hist, rho_hist)
+                if float(np.dot(direction, g_vec)) >= 0.0:
+                    direction = -g_vec.copy()
+                    s_hist = []
+                    y_hist = []
+                    rho_hist = []
+
+                accepted_micro = False
+                step = max(float(min_step), float(step_guess))
+                while step >= float(min_step):
+                    d_trial = self._reshape_stack(self._flatten_stack(d_stack) + step * direction, d_stack)
+                    d_trial = self._normalize_d_stack(d_trial, S_prim)
+
+                    C_list = [d_trial[n].reshape(-1, 1) for n in range(Nz)]
+                    Hcore = rebuild_Hcore_from_d(
+                        d_trial,
+                        z,
+                        Kz,
+                        S_prim,
+                        T_prim,
+                        alphas,
+                        centers,
+                        labels,
+                        nuclei,
+                    )
+                    ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list, K_h, Kx_h)
+                    Etot, eps, Cmo, P, info = scf_rhf_method2(
+                        Hcore,
+                        ERI_J,
+                        ERI_K,
+                        Nz,
+                        1,
+                        nelec=self.mol.nelec,
+                        Enuc=Enuc,
+                        conv=scf_conv,
+                        max_iter=scf_max_iter,
+                        verbose=False,
+                    )
+
+                    dE = float(Etot - E_history[-1])
+                    if dE <= max(10.0 * scf_conv, 1e-10):
+                        P_trial_slice = np.asarray(P, float).reshape(Nz, 1, Nz, 1)[:, 0, :, 0].copy()
+                        g_trial_stack = self._project_gradient_stack(
+                            nh_sweep, d_trial, P_trial_slice, S_prim
+                        )
+                        s_vec = self._flatten_stack(d_trial - d_stack)
+                        y_vec = self._flatten_stack(g_trial_stack - g_stack)
+                        ys = float(np.dot(y_vec, s_vec))
+                        if ys > float(history_reset_curvature):
+                            s_hist.append(s_vec)
+                            y_hist.append(y_vec)
+                            rho_hist.append(1.0 / ys)
+                            if len(s_hist) > int(history_size):
+                                s_hist.pop(0)
+                                y_hist.pop(0)
+                                rho_hist.pop(0)
+                        else:
+                            s_hist = []
+                            y_hist = []
+                            rho_hist = []
+
+                        d_stack = d_trial
+                        self.mol.hcore = Hcore
+                        self.mol.eri_j = ERI_J
+                        self.mol.eri_k = ERI_K
+                        self.mol.c_list = C_list
+                        self.mol.z = z
+                        self.mol.dz = dz
+
+                        self.e_tot = float(Etot)
+                        self.mo_energy = np.asarray(eps, float)
+                        self.mo_coeff = np.asarray(Cmo, float)
+                        self.dm = np.asarray(P, float)
+                        self.info = dict(info)
+                        E_history.append(self.e_tot)
+                        accepted_micro = True
+                        cycle_accepts += 1
+                        step_guess = min(2.0, max(float(min_step), step * 1.35))
+                        accepted_stats = {
+                            "micro_cycle": micro + 1,
+                            "step": step,
+                            "dE": dE,
+                            "grad_norm": gnorm,
+                        }
+                        break
+
+                    step *= 0.5
+
+                if accepted_micro:
+                    if abs(E_history[-1] - E_history[-2]) < scf_conv:
+                        converged = True
+                        break
+                    continue
+
+                step_guess = max(float(min_step), 0.5 * step_guess)
+                cycle_failed = True
+                if verbose:
+                    print(
+                        f"[QNewton {cyc}.{micro + 1}] no acceptable step found; "
+                        f"reducing step guess to {step_guess:.3e}."
+                    )
+                    break
+
+            if verbose:
+                if cycle_accepts and accepted_stats is not None:
+                    print(
+                        f"[QNewton {cyc}] E = {self.e_tot:.12f} Ha  "
+                        f"dE_cycle={E_history[-1] - cycle_energy_start:+.3e}  "
+                        f"last_step={accepted_stats['step']:.3f}  "
+                        f"accepted={cycle_accepts}"
+                    )
+                else:
+                    print(f"[QNewton {cyc}] no acceptable step found; stopping.")
+
+            if converged:
+                break
+            if cycle_accepts == 0:
+                break
+            if cycle_failed and cycle_accepts < int(micro_cycles):
+                continue
+            if abs(E_history[-1] - cycle_energy_start) < scf_conv:
+                break
+
+        self.info = dict(self.info)
+        self.info["quasinewton_cycles"] = len(E_history) - 1
+        self.info["quasinewton_energy_history"] = tuple(float(v) for v in E_history)
+        return self
 
 
 def s_norm(v, S):
@@ -715,7 +1509,8 @@ def sweep_optimize_driver(
     ridge=1,          # large default ridge for stability
     trust_step=1.0,     # Full Newton step
     trust_radius=2.0,   # decides how large a step could be, decides convergence speed vs. monotonic decrement stability
-    verbose=True
+    verbose=True,
+    return_stats=False,
 ):
     """
     Performs Symmetric Gauss-Seidel optimization (Forward + Backward).
@@ -728,6 +1523,7 @@ def sweep_optimize_driver(
     backward = list(range(Nz-2, -1, -1))
     symmetric_order = forward + backward
     
+    cycle_stats = []
     for cyc in range(n_cycles):
         max_delta = 0.0
         max_grad  = 0.0
@@ -765,14 +1561,22 @@ def sweep_optimize_driver(
             
         if verbose:
             print(f"  [Sweep {cyc+1}] Max |g|: {max_grad:.4e}, Max d-change: {max_delta:.6f}")
+        cycle_stats.append({"cycle": cyc + 1, "max_grad": float(max_grad), "max_delta": float(max_delta)})
             
+    if return_stats:
+        stats = {
+            "cycles": tuple(cycle_stats),
+            "max_grad": 0.0 if not cycle_stats else max(item["max_grad"] for item in cycle_stats),
+            "max_delta": 0.0 if not cycle_stats else max(item["max_delta"] for item in cycle_stats),
+        }
+        return d_current, stats
     return d_current
 
 if __name__ == "__main__":
     stime = time.time()
 
     # charges = np.array([1.0, 1.0, 1.0, 1.0], float)
-    charges = np.array([1.0, 1.0], float)
+    elements = ["H", "H"]
     # charges = np.array([1.0, 2.0], float)
     coords  = np.array([
         [0.0, 0.0,  0.7 ],
@@ -790,7 +1594,7 @@ if __name__ == "__main__":
     # coords = np.linspace(-19, 19, 20, dtype=float)
     # charges = np.ones_like(coords, dtype=float)
     # coords = np.stack([np.zeros_like(coords), np.zeros_like(coords), coords], axis=1)
-    mol = Molecule(charges, coords, nelec=2)
+    mol = AtomicChain(elements, coords, nelec=2)
     NELEC = mol.nelec
     Enuc  = mol.nuclear_repulsion_energy()
     print("=== Newton Sweep test (s+p+d 2D basis) ===")

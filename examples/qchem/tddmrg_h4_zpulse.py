@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TDDMRG example: H4 driven by a z-polarized Gaussian pulse.
+Compare H4 TDDMRG and RTTDHF under the same z-polarized Gaussian pulse.
 """
 
 import numpy as np
 import ultraplot as uplt
 
-from pyqed.qchem import Molecule, gaussian_pulse
+from pyqed.qchem import Molecule, RTTDHF, gaussian_pulse
 from pyqed.qchem.hf import RHF
 from pyqed.qchem.dmrg import TDDMRG
 from pyqed.mps.mps import expect_mps
@@ -34,10 +34,10 @@ def main():
         polarization=(0.0, 0.0, 1.0),
     )
 
-    td = TDDMRG(mf, ncas=4, nelecas=4, D=8, td_bond_dim=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=4, nelecas=4, D=12, td_bond_dim=12, init_guess="cid").build()
     td.optimize_ground_state(
         nstates=1,
-        nsweeps=2,
+        nsweeps=4,
         symmetry_list=["charge", "sz"],
         compute_s2=False,
     )
@@ -55,15 +55,25 @@ def main():
     )
 
     times = np.concatenate(([0.0], np.asarray(td.times, dtype=float)))
-    electronic_mu_z = np.concatenate(([mu0_electronic], np.real(td.observables[:, 0])))
-    mu_z = nuclear_mu_z + electronic_mu_z
+    electronic_mu_z_dmrg = np.concatenate(([mu0_electronic], np.real(td.observables[:, 0])))
+    mu_z_dmrg = nuclear_mu_z + electronic_mu_z_dmrg
     field_z = np.concatenate(([td._field_vector(0.0, pulse)[2]], np.asarray(td.fields[:, 2], dtype=float)))
+
+    rt = RTTDHF(mf, field=pulse).run(
+        dt=0.05,
+        nsteps=10,
+        store_dm=False,
+    )
+    mu_z_rttdhf = nuclear_mu_z + np.asarray(rt.dipoles[:, 2], dtype=float)
 
     print(f"Computed {len(times)} time samples.")
     print(f"omega = {omega:.6f} a.u.")
-    print(f"mu_z(t=0) = {mu_z[0]:.6e} a.u.")
+    print("TDDMRG settings: D=12, td_bond_dim=12, nsweeps=4")
+    print(f"mu_z^DMRG(t=0) = {mu_z_dmrg[0]:.6e} a.u.")
+    print(f"mu_z^RTTDHF(t=0) = {mu_z_rttdhf[0]:.6e} a.u.")
     print(f"max |E_z(t)| = {np.max(np.abs(field_z)):.6e} a.u.")
-    print(f"max |mu_z(t) - mu_z(0)| = {np.max(np.abs(mu_z - mu_z[0])):.6e} a.u.")
+    print(f"max |mu_z^DMRG(t) - mu_z^DMRG(0)| = {np.max(np.abs(mu_z_dmrg - mu_z_dmrg[0])):.6e} a.u.")
+    print(f"max |mu_z^RTTDHF(t) - mu_z^RTTDHF(0)| = {np.max(np.abs(mu_z_rttdhf - mu_z_rttdhf[0])):.6e} a.u.")
     print(f"Saved figure to: {out}")
 
     fig, axes = uplt.subplots(nrows=2, ncols=1, sharex=True, figsize=(7, 6))
@@ -71,12 +81,13 @@ def main():
     axes[0].set_ylabel("Field (a.u.)")
     axes[0].legend(loc="best", frame=False)
 
-    axes[1].plot(times, mu_z, lw=2.0, marker="o", ms=4, color="tab:blue", label=r"$\mu_z(t)$")
+    axes[1].plot(times, mu_z_dmrg, lw=2.0, marker="o", ms=4, color="tab:blue", label=r"$\mu_z^{\mathrm{DMRG}}(t)$")
+    axes[1].plot(rt.times, mu_z_rttdhf, lw=1.8, ls="--", color="tab:green", label=r"$\mu_z^{\mathrm{RTTDHF}}(t)$")
     axes[1].set_xlabel("Time (a.u.)")
     axes[1].set_ylabel(r"$\mu_z(t)$ (a.u.)")
     axes[1].legend(loc="best", frame=False)
 
-    fig.format(suptitle=rf"TDDMRG H4 response to a z-polarized Gaussian pulse ($\omega={omega:.2f}$ a.u.)")
+    fig.format(suptitle=rf"H4 response to a z-polarized Gaussian pulse ($\omega={omega:.2f}$ a.u.)")
     fig.savefig(out, dpi=200)
 
 

@@ -8,12 +8,12 @@ DMRGSCF
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
 # TODO: so since we are sharing CASSCF optimization code, currently after the DMRGSCF, final print get E(CASSCF) = xxxxxxx, it might be better if we fix that.
-from pyqed.qchem import DMRG, CASSCF
-from pyqed.qchem.mcscf.casscf import kernel, kernel_state_average
+from pyqed.qchem import QCDMRG, CASSCF
+from pyqed.qchem.mcscf.cocas import kernel, kernel_state_average
 import numpy as np
 
 
-class DMRGSCF(DMRG):
+class DMRGSCF(QCDMRG):
     def __init__(self, mf, ncas, nelecas, D=20, max_cycles=30, **kwargs):
        
         super().__init__(mf, ncas, nelecas, D, **kwargs)
@@ -48,7 +48,14 @@ class DMRGSCF(DMRG):
         nelecas = self.nelecas
         ncore = self.ncore
 
-        mc = DMRG(mf, ncas=ncas, nelecas=nelecas, D=self.D)
+        mc = QCDMRG(
+            mf,
+            ncas=ncas,
+            nelecas=nelecas,
+            D=self.D,
+            site=getattr(self, "site", getattr(self, "site_basis", "spin_orbital")),
+            verbose=getattr(self, "verbose", 0),
+        )
 
         # spin
         mc.spin_purification = self.spin_purification
@@ -92,7 +99,6 @@ class DMRGSCF(DMRG):
 if __name__=='__main__':
 
     from pyqed import Molecule
-    # from pyqed.qchem.mcscf.direct_ci import CASCI
 
     mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
     mol.build(driver='pyscf')
@@ -103,7 +109,7 @@ if __name__=='__main__':
 
     mc.fix_spin(ss=0, shift=0.2)
     mc.run(
-        nstates=2,
+        nstates=1,
         symmetry_list=['charge', 'sz'], 
         initial_guess='cid'
     )

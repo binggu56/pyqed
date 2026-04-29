@@ -6,8 +6,8 @@ import time
 import collections
 import argparse
 
-from pyqed.qchem.gdvr.gdvr_mean_field import (
-    Molecule, build_method2, make_xy_spd_primitive_basis, 
+from pyqed.qchem.gdvr.rhf import (
+    AtomicChain, build_method2, make_xy_spd_primitive_basis, 
     overlap_2d_cartesian, kinetic_2d_cartesian, eri_2d_cartesian_with_p,
     scf_rhf_method2, sine_dvr_1d, eri_JK_from_kernels_M1,
     build_h1_nm, V_en_sp_total_at_z, CollocatedERIOp, rebuild_Hcore_from_d,
@@ -813,9 +813,9 @@ if __name__ == "__main__":
 
     S_EXPS = [18.73113696, 2.825394365, 0.6401216923, 0.1612777588]
     basis_cfg = {'s': S_EXPS}
-    charges = [1.0]*4
+    elements = ["H"] * 4
     coords = [[0.0, 0.0, -3.6], [0.0, 0.0, -0.91], [0.0, 0.0, 0.91], [0.0, 0.0, 3.6]]
-    mol = Molecule(charges, coords, nelec=4, spin = 0)
+    mol = AtomicChain(elements, coords, nelec=4, spin = 0)
     
     master_dir = f"Scan_Results_Nz_{Nz}"
     checkpoint_path = os.path.join(master_dir)

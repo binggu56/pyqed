@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot the LiF state-averaged COCASCI scan from a CSV file."""
+"""Plot the LiF state-averaged COCAS scan from a CSV file."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def main():
 
     ax.set_xlabel("Li-F distance (bohr)")
     ax.set_ylabel("Energy (Hartree)")
-    ax.set_title("LiF COCASCI PEC (6-31g, SA-2, CAS(2e,2o))")
+    ax.set_title("LiF COCAS PEC (6-31g, SA-2, CAS(2e,2o))")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()

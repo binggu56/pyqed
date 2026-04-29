@@ -111,14 +111,15 @@ def _resolve_diag(A, diag, n):
 def _build_guess(diag, neigen, guess=None):
     n = diag.size
     cols = []
+    dtype = complex if guess is not None and np.iscomplexobj(guess) else float
     if guess is not None:
-        guess_arr = np.asarray(guess, dtype=float)
+        guess_arr = np.asarray(guess, dtype=dtype)
         if guess_arr.ndim == 1:
             cols.append(guess_arr.reshape(n))
         else:
             cols.extend(guess_arr[:, i].reshape(n) for i in range(guess_arr.shape[1]))
     for idx in np.argsort(diag):
-        e = np.zeros(n, dtype=float)
+        e = np.zeros(n, dtype=dtype)
         e[idx] = 1.0
         cols.append(e)
         if len(cols) >= max(2 * neigen, neigen):
@@ -173,15 +174,15 @@ def _resolve_preconditioner(A, diag, jacobi=False, precond=None):
 
 
 def _build_projected_matrix(V, AV):
-    return V.T @ AV
+    return V.conj().T @ AV
 
 
 def _expand_projected_matrix(T, V, AV, new_block, AV_new):
     if T.size == 0:
-        return new_block.T @ AV_new
-    cross = V.T @ AV_new
-    lower = new_block.T @ AV
-    diag_block = new_block.T @ AV_new
+        return new_block.conj().T @ AV_new
+    cross = V.conj().T @ AV_new
+    lower = new_block.conj().T @ AV
+    diag_block = new_block.conj().T @ AV_new
     top = np.hstack((T, cross))
     bottom = np.hstack((lower, diag_block))
     return np.vstack((top, bottom))
@@ -305,10 +306,11 @@ def davidson(
             if locked[root]:
                 continue
 
-            corr = np.asarray(precondition(resid[:, root], theta[root], ritz[:, root]), dtype=float)
-            corr -= V @ (V.T @ corr)
+            corr_raw = np.asarray(precondition(resid[:, root], theta[root], ritz[:, root]))
+            corr = np.asarray(corr_raw, dtype=np.result_type(V.dtype, corr_raw.dtype, resid.dtype))
+            corr -= V @ (V.conj().T @ corr)
             for prev in new_vecs:
-                corr -= prev * np.dot(prev, corr)
+                corr -= prev * np.vdot(prev, corr)
 
             norm = np.linalg.norm(corr)
             if norm > lindep:

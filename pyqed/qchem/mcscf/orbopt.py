@@ -265,6 +265,74 @@ def limit_step_norm(step_vec, max_step):
     return step_vec * (max_step / peak)
 
 
+def limit_step_trust_radius(step_vec, trust_radius):
+    """Uniformly rescale a packed step to an Euclidean trust radius."""
+    step_vec = np.asarray(step_vec, dtype=float)
+    if trust_radius is None or step_vec.size == 0:
+        return step_vec
+    radius = float(trust_radius)
+    if radius <= 0.0:
+        return np.zeros_like(step_vec)
+    norm = float(np.linalg.norm(step_vec))
+    if norm <= radius or norm == 0.0:
+        return step_vec
+    return step_vec * (radius / norm)
+
+
+def shifted_hessian_trust_step(
+    grad_vec,
+    hess_diag,
+    trust_radius=None,
+    regularization=1.0e-10,
+):
+    """
+    Solve a diagonal shifted-Hessian trust-radius step.
+
+    The step is ``-(H + lambda I)^-1 g`` with ``lambda >= 0`` chosen by
+    bisection so the Euclidean step norm is inside ``trust_radius``.  This is
+    the diagonal analogue of the AH damping/trust-radius control used in
+    second-order CASSCF algorithms.
+    """
+    grad_vec = np.asarray(grad_vec, dtype=float)
+    hess_diag = np.asarray(hess_diag, dtype=float)
+    if grad_vec.ndim != 1 or hess_diag.ndim != 1:
+        raise ValueError("grad_vec and hess_diag must be 1D arrays.")
+    if grad_vec.shape != hess_diag.shape:
+        raise ValueError("grad_vec and hess_diag must have the same shape.")
+    if grad_vec.size == 0:
+        return np.zeros(0, dtype=float), 0.0
+
+    hess_model = np.maximum(np.abs(hess_diag), float(regularization))
+    step = -grad_vec / hess_model
+    if trust_radius is None:
+        return step, 0.0
+
+    radius = float(trust_radius)
+    if radius <= 0.0:
+        return np.zeros_like(step), np.inf
+    if np.linalg.norm(step) <= radius:
+        return step, 0.0
+
+    lo = 0.0
+    hi = max(1.0, float(np.max(hess_model)))
+    for _ in range(80):
+        step_hi = -grad_vec / (hess_model + hi)
+        if np.linalg.norm(step_hi) <= radius:
+            break
+        hi *= 2.0
+
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        step_mid = -grad_vec / (hess_model + mid)
+        if np.linalg.norm(step_mid) <= radius:
+            hi = mid
+        else:
+            lo = mid
+
+    shift = hi
+    return -grad_vec / (hess_model + shift), float(shift)
+
+
 def lbfgs_direction(grad_vec, s_history, y_history, h0_diag=None):
     """Standard two-loop recursion for limited-memory BFGS in Euclidean coordinates."""
     grad_vec = np.asarray(grad_vec, dtype=float)
@@ -432,6 +500,7 @@ def davidson_augmented_hessian_direction(
     tol=1.0e-4,
     guess=None,
     fallback_step=None,
+    return_info=False,
 ):
     """
     Solve the orbital augmented-Hessian eigenproblem with a Davidson microiteration.
@@ -452,7 +521,17 @@ def davidson_augmented_hessian_direction(
     if grad_vec.shape != hess_diag.shape:
         raise ValueError("grad_vec and hess_diag must have the same shape.")
     if grad_vec.size == 0:
-        return np.zeros(0, dtype=float)
+        step = np.zeros(0, dtype=float)
+        info = {
+            "converged": True,
+            "iterations": 0,
+            "residual_norm": 0.0,
+            "eigenvalue": 0.0,
+            "model": 0.0,
+            "subspace_dim": 0,
+            "used_fallback": False,
+        }
+        return (step, info) if return_info else step
 
     hess_model = np.maximum(np.abs(hess_diag), float(regularization))
     guess_cols = []
@@ -484,8 +563,17 @@ def davidson_augmented_hessian_direction(
     W = np.column_stack([np.asarray(matvec(V[:, i]), dtype=float) for i in range(V.shape[1])])
 
     best = None
+    info = {
+        "converged": False,
+        "iterations": 0,
+        "residual_norm": np.inf,
+        "eigenvalue": np.nan,
+        "model": np.nan,
+        "subspace_dim": int(V.shape[1]),
+        "used_fallback": False,
+    }
 
-    for _ in range(max_cycle):
+    for cycle in range(max_cycle):
         h_proj = 0.5 * (V.T @ W + (V.T @ W).T)
         g_proj = V.T @ grad_vec
         ah_proj = np.zeros((V.shape[1] + 1, V.shape[1] + 1), dtype=float)
@@ -531,10 +619,12 @@ def davidson_augmented_hessian_direction(
                 "eigenvalue": float(eigvals[root]),
                 "step": step,
                 "orbital_residual": orbital_residual,
+                "subspace_dim": int(V.shape[1]),
             }
             break
 
         if candidate is None:
+            info["iterations"] = cycle + 1
             break
 
         if (
@@ -547,8 +637,20 @@ def davidson_augmented_hessian_direction(
         ):
             best = candidate
 
+        info.update(
+            {
+                "iterations": cycle + 1,
+                "residual_norm": float(candidate["residual_norm"]),
+                "eigenvalue": float(candidate["eigenvalue"]),
+                "model": float(candidate["model"]),
+                "subspace_dim": int(candidate["subspace_dim"]),
+            }
+        )
+
         if candidate["residual_norm"] < tol:
-            return np.asarray(candidate["step"], dtype=float)
+            info["converged"] = True
+            step = np.asarray(candidate["step"], dtype=float)
+            return (step, info) if return_info else step
 
         denom = hess_model - candidate["eigenvalue"]
         safe = np.where(
@@ -576,15 +678,27 @@ def davidson_augmented_hessian_direction(
         W = np.column_stack((W, np.asarray(matvec(correction), dtype=float).reshape(-1, 1)))
 
     if best is not None:
-        return np.asarray(best["step"], dtype=float)
+        info.update(
+            {
+                "residual_norm": float(best["residual_norm"]),
+                "eigenvalue": float(best["eigenvalue"]),
+                "model": float(best["model"]),
+                "subspace_dim": int(best["subspace_dim"]),
+            }
+        )
+        step = np.asarray(best["step"], dtype=float)
+        return (step, info) if return_info else step
 
-    return augmented_hessian_direction(
+    step = augmented_hessian_direction(
         grad_vec,
         hess_diag,
         max_step=max_step,
         regularization=regularization,
         fallback_step=fallback_step,
     )
+    info["used_fallback"] = True
+    info["iterations"] = max(info["iterations"], int(max_cycle))
+    return (step, info) if return_info else step
 
 
 def orbital_step(

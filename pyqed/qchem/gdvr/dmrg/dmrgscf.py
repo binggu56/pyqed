@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.linalg as la
 import time
-from pyqed.qchem.gdvr.gdvr_mean_field import (
+from pyqed.qchem.gdvr.rhf import (
     SweepNewtonHelper, sweep_optimize_driver, 
     rebuild_Hcore_from_d, eri_JK_from_kernels_M1,
     CollocatedERIOp

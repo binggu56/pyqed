@@ -22,12 +22,13 @@ def main():
     )
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
+    omega = 0.8
 
     pulse = gaussian_pulse(
         amplitude=5e-3,
         center=2.0,
         width=0.5,
-        frequency=0.0,
+        omega=omega,
         phase=0.0,
         polarization=(0.0, 0.0, 1.0),
     )
@@ -54,6 +55,7 @@ def main():
     energies = np.real(td.observables[:, 0]) + td.e_core
 
     print(f"Computed {len(times)} time samples.")
+    print(f"omega = {omega:.6f} a.u.")
     print(f"max |E_z(t)| = {np.max(np.abs(field_z)):.6e} a.u.")
     print(f"max |Delta mu_z(t)| = {np.max(np.abs(polarization_z)):.6e} a.u.")
     print(f"max |E(t) - E(0)| = {np.max(np.abs(energies - energies[0])):.6e} Ha")

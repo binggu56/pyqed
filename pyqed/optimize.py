@@ -29,9 +29,34 @@ def _factorized_two_electron_gradient(U, pair_factors, dm2):
     )
 
 
+def _factorized_two_electron_gradient_action(U, D, pair_factors, dm2):
+    """Directional derivative of the factorized two-electron gradient."""
+    transformed = contract('Ppq,pa,qb->Pab', pair_factors, U, U)
+    dtransformed = (
+        contract('Ppq,pa,qb->Pab', pair_factors, D, U)
+        + contract('Ppq,pa,qb->Pab', pair_factors, U, D)
+    )
+    left = contract('Pcd,abcd->Pab', transformed, dm2)
+    right = contract('Pab,abcd->Pcd', transformed, dm2)
+    dleft = contract('Pcd,abcd->Pab', dtransformed, dm2)
+    dright = contract('Pab,abcd->Pcd', dtransformed, dm2)
+    return 0.5 * (
+        contract('Ppq,qb,Pab->pa', pair_factors, D, left)
+        + contract('Ppq,qb,Pab->pa', pair_factors, U, dleft)
+        + contract('Ppq,pa,Pab->qb', pair_factors, D, left)
+        + contract('Ppq,pa,Pab->qb', pair_factors, U, dleft)
+        + contract('Prs,sd,Pcd->rc', pair_factors, D, right)
+        + contract('Prs,sd,Pcd->rc', pair_factors, U, dright)
+        + contract('Prs,rc,Pcd->sd', pair_factors, D, right)
+        + contract('Prs,rc,Pcd->sd', pair_factors, U, dright)
+    )
+
+
 def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
-             history_size=7, max_iterations=200, max_step_norm=None):
+             history_size=7, max_iterations=200, max_step_norm=None,
+             newton_shift=1e-4, newton_max_cycle=6,
+             newton_max_subspace=12, newton_tol=1e-4):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -62,7 +87,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Backtracking reduction factor.
     epsilon : float, optional
         Convergence threshold on the Riemannian gradient norm.
-    algorithm : {'RCG', 'SD', 'LBFGS'}, optional
+    algorithm : {'RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'}, optional
         Optimization algorithm on the Stiefel manifold.
     history_size : int, optional
         Number of secant pairs kept by the limited-memory BFGS backend.
@@ -85,10 +110,12 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     ----------
     Optimization Lett. 2022, 16:1773
     """
-    algorithm = algorithm.upper()
-    if algorithm not in ('RCG', 'SD', 'LBFGS'):
+    algorithm = algorithm.upper().replace('-', '_')
+    if algorithm == 'AUGMENTED_HESSIAN':
+        algorithm = 'AH'
+    if algorithm not in ('RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'):
         raise ValueError(
-            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG', 'SD' or 'LBFGS'.".format(
+            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG', 'SD', 'LBFGS', 'NEWTON' or 'AH'.".format(
                 algorithm
             )
         )
@@ -109,6 +136,17 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     while norm(df) > epsilon and (max_iterations is None or k < int(max_iterations)):
         if algorithm == 'LBFGS':
             direction = -lbfgs_direction(df, lbfgs_s, lbfgs_y)
+        elif algorithm in ('NEWTON', 'AH'):
+            direction = matrix_free_newton_direction(
+                X,
+                df,
+                lambda D: riemannian_hessian_action(X, D, G, *args),
+                shift=newton_shift,
+                max_cycle=newton_max_cycle,
+                max_subspace=newton_max_subspace,
+                tol=newton_tol,
+                max_step=max_step_norm,
+            )
 
         directional_derivative = np.real(inner(df, direction))
         if directional_derivative >= 0:
@@ -119,21 +157,24 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
         step = max(min(tau, tauM), taum)
         step = clip_step_size(direction, step, max_step_norm)
-        Y = retract(X, step * direction)
-        trial_value = f(Y, *args)
 
         # Non-monotone Armijo backtracking: use the weighted reference energy
         # ``C`` so the optimizer can occasionally accept small uphill moves
         # while still converging more aggressively than strict monotone descent.
-        while trial_value > C + rho1 * step * directional_derivative:
-            step *= delta
-            if step < taum:
-                step = taum
-                Y = retract(X, step * direction)
-                trial_value = f(Y, *args)
-                break
+        accepted = False
+        while True:
             Y = retract(X, step * direction)
             trial_value = f(Y, *args)
+            if trial_value <= C + rho1 * step * directional_derivative:
+                accepted = True
+                break
+            next_step = step * delta
+            if next_step < taum:
+                break
+            step = next_step
+
+        if not accepted:
+            break
 
         Xnew = Y
         accepted_step = step * direction
@@ -179,7 +220,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
 
 def norm(A):
-    """
+    r"""
     Frobenius norm of matrix
     .. math::
 
@@ -218,8 +259,22 @@ def transport(X, Z):
     """
     return tangent_projection(X, Z)
 
+def _polar_project(V, eps_rel=1e-12):
+    V = np.asarray(V)
+    gram = sym(V.T.conj() @ V)
+    w, Q = np.linalg.eigh(gram)
+    if w.size == 0:
+        raise ValueError("Cannot project an empty matrix onto the Stiefel manifold.")
+    wmax = float(np.max(w))
+    if wmax <= 0.0:
+        raise ValueError("Cannot project a rank-deficient matrix onto the Stiefel manifold.")
+    if np.any(w <= eps_rel * wmax):
+        raise ValueError("Cannot project a numerically rank-deficient matrix onto the Stiefel manifold.")
+    return V @ Q @ np.diag(1 / np.sqrt(w)) @ Q.T.conj()
+
+
 def project(V):
-    """
+    r"""
     Project ``V`` onto the Stiefel manifold by polar orthonormalization.
 
     .. math::
@@ -243,8 +298,7 @@ def project(V):
         DESCRIPTION.
 
     """
-    w, Q = np.linalg.eigh(V.T @ V)
-    return V @ Q @ np.diag(1/np.sqrt(w)) @ Q.T
+    return _polar_project(V)
 
 
 def retract(X, D):
@@ -257,7 +311,7 @@ def retract(X, D):
     return project(X + D)
 
 def orth(V):
-    """
+    r"""
     projection to Siefel manifold by orthonormalization
 
     .. math::
@@ -281,8 +335,7 @@ def orth(V):
         DESCRIPTION.
 
     """
-    w, Q = np.linalg.eigh(V.T @ V)
-    return V @ Q @ np.diag(1/np.sqrt(w))
+    return _polar_project(V)
 
 def stepsize(k, dU, dG):
     """
@@ -347,6 +400,125 @@ def clip_step_size(direction, step, max_step_norm):
         return 0.0
 
     return min(step, float(max_step_norm) / direction_norm)
+
+
+def tangent_basis(X):
+    """Return an orthonormal basis for the Stiefel tangent space at ``X``."""
+    basis = []
+    n, p = X.shape
+    for i in range(n):
+        for j in range(p):
+            E = np.zeros_like(X)
+            E[i, j] = 1.0
+            T = tangent_projection(X, E)
+            for B in basis:
+                T = T - np.real(inner(B, T)) * B
+            nrm = norm(T)
+            if nrm > 1e-10:
+                basis.append(T / nrm)
+    return basis
+
+
+def newton_direction(X, grad_tangent, hess_action, shift=1e-4):
+    """
+    Dense analytic Newton direction in tangent coordinates.
+
+    This is intended for the small active-space orbital optimizer. If the
+    Hessian solve is ill-conditioned or produces a non-descent direction, the
+    caller's descent restart logic falls back to steepest descent.
+    """
+    basis = tangent_basis(X)
+    if not basis:
+        return np.zeros_like(X)
+
+    g = np.array([np.real(inner(B, grad_tangent)) for B in basis], float)
+    H = np.zeros((len(basis), len(basis)), float)
+    for j, B in enumerate(basis):
+        hvp = hess_action(B)
+        H[:, j] = [np.real(inner(Bi, hvp)) for Bi in basis]
+
+    H = sym(H).real
+    H += float(shift) * np.eye(H.shape[0])
+    try:
+        coeff = -np.linalg.solve(H, g)
+    except np.linalg.LinAlgError:
+        coeff = -np.linalg.lstsq(H, g, rcond=None)[0]
+
+    direction = np.zeros_like(X)
+    for c, B in zip(coeff, basis):
+        direction += c * B
+    return tangent_projection(X, direction)
+
+
+def matrix_free_newton_direction(
+    X,
+    grad_tangent,
+    hess_action,
+    shift=1e-4,
+    max_cycle=6,
+    max_subspace=12,
+    tol=1e-4,
+    max_step=None,
+):
+    """
+    Davidson augmented-Hessian Newton step without building the tangent Hessian.
+
+    The Krylov vectors live in the ambient rectangular ``U`` coordinates, but
+    every vector is projected onto the Stiefel tangent space before applying the
+    analytic Hessian-vector product. This avoids the expensive dense tangent
+    basis construction used by the reference ``newton_direction`` helper.
+    """
+    from pyqed.qchem.mcscf.orbopt import davidson_augmented_hessian_direction
+
+    shape = X.shape
+
+    def pack(matrix):
+        return tangent_projection(X, matrix).reshape(-1).real
+
+    def unpack(vector):
+        return tangent_projection(X, np.asarray(vector, dtype=float).reshape(shape))
+
+    grad_vec = pack(grad_tangent)
+    if grad_vec.size == 0 or np.linalg.norm(grad_vec) <= 1.0e-14:
+        return np.zeros_like(X)
+
+    regularization = max(float(shift), 1.0e-12)
+    hess_diag = np.full(grad_vec.shape, regularization, dtype=float)
+
+    def matvec(vector):
+        tangent_vec = unpack(vector)
+        hvp = hess_action(tangent_vec)
+        return pack(hvp) + regularization * np.asarray(vector, dtype=float)
+
+    fallback = -grad_vec / hess_diag
+    step_vec = davidson_augmented_hessian_direction(
+        grad_vec,
+        hess_diag,
+        matvec=matvec,
+        max_step=max_step,
+        regularization=regularization,
+        max_cycle=max_cycle,
+        max_subspace=max_subspace,
+        tol=tol,
+        fallback_step=fallback,
+    )
+    direction = unpack(step_vec)
+    return tangent_projection(X, direction)
+
+
+def riemannian_hessian_action(X, direction, euclidean_grad, h1e, h2e, dm1, dm2):
+    """
+    Analytic action of the projected-gradient derivative on a tangent vector.
+
+    The objective uses a rectangular orbital matrix ``U`` constrained by
+    ``U.T @ U = I``.  This differentiates the Euclidean orbital gradient and
+    the Stiefel tangent projection at the current point.
+    """
+    D = tangent_projection(X, direction)
+    dG = gradient_directional_derivative(X, D, h1e, h2e, dm1, dm2)
+    A = sym(X.T.conj() @ euclidean_grad)
+    dA = sym(D.T.conj() @ euclidean_grad + X.T.conj() @ dG)
+    return tangent_projection(X, dG - D @ A - X @ dA)
 
 
 def lbfgs_direction(grad_vec, s_history, y_history):
@@ -418,6 +590,30 @@ def update_lbfgs_history(s_history, y_history, Xnew, raw_step, raw_grad_diff, hi
 def inner(a, b):
     return np.trace(a.T.conj() @ b)
 
+
+def gradient_directional_derivative(U, D, h1e, h2e, dm1, dm2):
+    """Analytic directional derivative of ``gradient`` along ``D``."""
+    dG = h1e @ D @ dm1.T + h1e.T @ D @ dm1
+    if np.ndim(h2e) == 3:
+        dG += _factorized_two_electron_gradient_action(U, D, h2e, dm2)
+    else:
+        dG += 0.5 * (
+            contract('pqrs,qb,rc,sd,abcd -> pa', h2e, D, U, U, dm2)
+            + contract('pqrs,qb,rc,sd,abcd -> pa', h2e, U, D, U, dm2)
+            + contract('pqrs,qb,rc,sd,abcd -> pa', h2e, U, U, D, dm2)
+            + contract('pqrs,pa,rc,sd,abcd -> qb', h2e, D, U, U, dm2)
+            + contract('pqrs,pa,rc,sd,abcd -> qb', h2e, U, D, U, dm2)
+            + contract('pqrs,pa,rc,sd,abcd -> qb', h2e, U, U, D, dm2)
+            + contract('pqrs,pa,qb,sd,abcd -> rc', h2e, D, U, U, dm2)
+            + contract('pqrs,pa,qb,sd,abcd -> rc', h2e, U, D, U, dm2)
+            + contract('pqrs,pa,qb,sd,abcd -> rc', h2e, U, U, D, dm2)
+            + contract('pqrs,pa,qb,rc,abcd -> sd', h2e, D, U, U, dm2)
+            + contract('pqrs,pa,qb,rc,abcd -> sd', h2e, U, D, U, dm2)
+            + contract('pqrs,pa,qb,rc,abcd -> sd', h2e, U, U, D, dm2)
+        )
+    return dG
+
+
 def gradient(U, h1e, h2e, dm1, dm2):
     g = h1e @ U @ dm1.T + h1e.T @ U @ dm1  # these two terms are probably the same
     if np.ndim(h2e) == 3:
@@ -441,7 +637,7 @@ def energy(U, h1e, eri, dm1, dm2):
 
 
 def kernel(mf, U0, max_steps=50, tol=1e-6):
-    """
+    r"""
     complete active space orbital optimization with orthonomality constraint
 
     .. math::
@@ -476,6 +672,8 @@ def kernel(mf, U0, max_steps=50, tol=1e-6):
 
     """
 
+    from pyqed.qchem.mcscf import CASCI
+
     k = 0
     U = U0 # initial guess for U0
 
@@ -484,16 +682,7 @@ def kernel(mf, U0, max_steps=50, tol=1e-6):
     mc.run(U)
     e_old = mc.e_tot
 
-
     while k < max_steps:
-
-        # update CI coeff
-        mc.run(U)
-
-        if abs(mc.e_tot - e_old) < tol:
-            print("E(CASSCF) = {}".format(mc.e_tot))
-            break
-
         dm1, dm2 = mc.make_rdm12(0)
         h1e = mc.hcore
         eri = mc.eri_so[0, 0] # for spin-restricted calculation
@@ -502,6 +691,11 @@ def kernel(mf, U0, max_steps=50, tol=1e-6):
         U, E = minimize(energy, U, args=(h1e, eri, dm1, dm2))
 
         k += 1
+        mc.run(U)
+        if abs(mc.e_tot - e_old) < tol:
+            print("E(CASSCF) = {}".format(mc.e_tot))
+            break
+        e_old = mc.e_tot
 
     return mc
 

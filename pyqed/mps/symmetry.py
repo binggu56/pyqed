@@ -4,7 +4,7 @@ from collections import defaultdict
 import time
 from scipy.sparse.linalg import LinearOperator, eigsh
 import copy
-from pyqed.mps.su2 import SU2Irrep, ChargeSpinSector, fuse_irreps, fuse_charge_spin_sectors
+from pyqed.mps.su2 import SU2Irrep, SpinChargeSector, fuse_irreps, fuse_charge_spin_sectors
 
 
 U1_LABELS = {'u1', 'charge', 'n', 'particle'}
@@ -30,8 +30,8 @@ def _is_abelian_label(label):
 def _component_sort_key(value):
     if isinstance(value, SU2Irrep):
         return ('su2', value.two_j)
-    if isinstance(value, ChargeSpinSector):
-        return ('charge_spin', value.charge, value.two_j, value.multiplicity)
+    if isinstance(value, SpinChargeSector):
+        return ('charge_spin', value.charge, value.two_j)
     if isinstance(value, np.generic):
         return ('scalar', value.item())
     return (type(value).__name__, value)
@@ -39,8 +39,8 @@ def _component_sort_key(value):
 
 def _zero_component(label, value):
     label = _normalize_sym_label(label)
-    if isinstance(value, ChargeSpinSector):
-        return ChargeSpinSector(0, SU2Irrep(0))
+    if isinstance(value, SpinChargeSector):
+        return SpinChargeSector(0, SU2Irrep(0))
     if isinstance(value, SU2Irrep) or label == 'su2':
         return SU2Irrep(0)
     return type(value)(0) if isinstance(value, np.generic) else 0
@@ -76,7 +76,7 @@ def _mul_component(label, value, scalar):
 
 def _fuse_component(label, left, right):
     label = _normalize_sym_label(label)
-    if isinstance(left, ChargeSpinSector) and isinstance(right, ChargeSpinSector):
+    if isinstance(left, SpinChargeSector) and isinstance(right, SpinChargeSector):
         return fuse_charge_spin_sectors(left, right)
     if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
         return fuse_irreps(left, right)

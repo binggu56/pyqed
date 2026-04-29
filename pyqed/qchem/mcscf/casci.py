@@ -9,7 +9,7 @@ complete active space configuration interaction
 """
 
 import logging
-from functools import reduce
+from functools import lru_cache, reduce
 import numpy as np
 from scipy.linalg import eigh
 from scipy.sparse.linalg import eigsh
@@ -22,6 +22,7 @@ from itertools import combinations
 import itertools
 import warnings
 from dataclasses import dataclass
+from numba import njit
 
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
@@ -521,7 +522,7 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
 
 
 class CASCI:
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None):
+    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, verbose=0):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -555,6 +556,7 @@ class CASCI:
 
         """
         self.ncas = ncas # number of MOs in active space
+        self.verbose = int(verbose)
 
         if spin is None:
             spin = mf.mol.spin
@@ -991,6 +993,7 @@ class CASCI:
                 ncore=self.ncore,
                 spin=self.spin,
                 tol=getattr(self, 'tol', 0),
+                verbose=self.verbose,
             )
             direct_solver.binary = binary
             direct_solver.run(
@@ -1073,9 +1076,10 @@ class CASCI:
         self.e_tot = E + self.e_core
         self.ci = [X[:, n] for n in range(nstates)]
 
-        for i in range(nstates):
-            ss = spin_square(*self.make_rdm12(i))
-            print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
+        if self.verbose >= 1:
+            for i in range(nstates):
+                ss = spin_square(*self.make_rdm12(i))
+                print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
         return self
 
@@ -1468,15 +1472,18 @@ class CASCI:
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
-        spin-traced 1e transition density matrix in MO
+        Spin-traced two-particle transition density matrix in MO basis.
 
         .. math::
 
-            \gamma_{pq}^{\beta \alpha} = <\Psi_\beta | \hat{E}_{qp} | \Psi_\alpha >
-
-        E_{qp} = q_alpha^\dagger p_alpha + q_beta^\dagger p_beta
+            \Gamma_{pqrs}^{\beta \alpha}
+            = \sum_{\sigma\tau}<\Psi_\beta|
+              p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
+              |\Psi_\alpha>
         """
-        raise NotImplementedError('TDM not implemented')
+        cibra = self.ci[bra_id]
+        ciket = self.ci[ket_id]
+        return make_tdm2(cibra, ciket, self.binary, self.SC1, self.SC2)
 
 
 # def get_SO_matrix(mo_coeff, eri, spin_flip=False, H1=None, H2=None):
@@ -1726,10 +1733,7 @@ def make_rdm1s(ci, binary, SC1):
     """
     Make spin-resolved 1e RDMs in MO basis.
     """
-    H_a, H_b = _build_spin_rdm1_operators(binary, SC1)
-    dm1a = np.einsum('I, IJpq, J -> pq', ci.conj(), H_a, ci).T
-    dm1b = np.einsum('I, IJpq, J -> pq', ci.conj(), H_b, ci).T
-    return dm1a, dm1b
+    return _make_tdm1s_link_contractions(ci, ci, binary)
 
 
 def make_rdm1(ci, binary, SC1):
@@ -1768,10 +1772,7 @@ def make_tdm1s(cibra, ciket, binary, SC1):
     """
     Make spin-resolved 1e TDMs in MO basis.
     """
-    H_a, H_b = _build_spin_rdm1_operators(binary, SC1)
-    tdm1a = np.einsum('I, IJpq, J -> pq', cibra.conj(), H_a, ciket)
-    tdm1b = np.einsum('I, IJpq, J -> pq', cibra.conj(), H_b, ciket)
-    return tdm1a, tdm1b
+    return _make_tdm1s_link_contractions(cibra, ciket, binary)
 
 def make_tdm1(cibra, ciket, binary, SC1):
     """
@@ -1844,6 +1845,399 @@ def contract_with_rdm2(ci, H2, Binary, SC1, SC2):
 
     return np.einsum('I, IJ, J -> ', ci.conj(), H_CI, ci)
 
+def _annihilate_bit(bits, idx):
+    if not ((bits >> idx) & 1):
+        return None, 0
+    phase = -1 if (bits & ((1 << idx) - 1)).bit_count() % 2 else 1
+    return bits ^ (1 << idx), phase
+
+
+def _create_bit(bits, idx):
+    if (bits >> idx) & 1:
+        return None, 0
+    phase = -1 if (bits & ((1 << idx) - 1)).bit_count() % 2 else 1
+    return bits | (1 << idx), phase
+
+
+def _determinant_bits_from_binary(binary):
+    """Encode PyQED alpha/beta occupation strings as ordered spin-orbitals."""
+    bits = []
+    _, _, nmo = binary.shape
+    for occ in binary:
+        det_bits = 0
+        for spin in range(2):
+            for orb in range(nmo):
+                if occ[spin, orb]:
+                    det_bits |= 1 << (spin * nmo + orb)
+        bits.append(det_bits)
+    return bits
+
+
+def _spin_string_bits(strings):
+    bits = []
+    for occ in strings:
+        det_bits = 0
+        for orb, occupied in enumerate(occ):
+            if occupied:
+                det_bits |= 1 << orb
+        bits.append(det_bits)
+    return bits
+
+
+def _unique_spin_strings_from_binary(binary, spin):
+    strings = []
+    seen = set()
+    for occ in binary[:, spin, :]:
+        key = tuple(int(x) for x in occ)
+        if key not in seen:
+            seen.add(key)
+            strings.append(key)
+    return np.asarray(strings, dtype=np.int8)
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_basis(shape, data):
+    binary = np.frombuffer(data, dtype=np.int8).reshape(shape)
+    alpha = _unique_spin_strings_from_binary(binary, 0)
+    beta = _unique_spin_strings_from_binary(binary, 1)
+    alpha_index = {tuple(row): idx for idx, row in enumerate(alpha)}
+    beta_index = {tuple(row): idx for idx, row in enumerate(beta)}
+    alpha_det = np.empty(shape[0], dtype=np.int64)
+    beta_det = np.empty(shape[0], dtype=np.int64)
+
+    for det_id, occ in enumerate(binary):
+        alpha_det[det_id] = alpha_index[tuple(int(x) for x in occ[0])]
+        beta_det[det_id] = beta_index[tuple(int(x) for x in occ[1])]
+
+    return alpha, beta, alpha_det, beta_det
+
+
+def _ci_to_spin_string_matrix(ci, binary):
+    alpha, beta, alpha_det, beta_det = _cached_spin_string_basis(
+        tuple(binary.shape),
+        np.ascontiguousarray(binary, dtype=np.int8).tobytes(),
+    )
+    coeff = np.zeros((len(alpha), len(beta)), dtype=np.asarray(ci).dtype)
+    coeff[alpha_det, beta_det] = ci
+
+    return alpha, beta, coeff
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_ops(bit_tuple, nmo):
+    bits = list(bit_tuple)
+    nstr = len(bits)
+    bit_index = {bits_i: idx for idx, bits_i in enumerate(bits)}
+
+    one = np.zeros((nmo, nmo, nstr, nstr))
+    two = np.zeros((nmo, nmo, nmo, nmo, nstr, nstr))
+
+    for ket, bits0 in enumerate(bits):
+        for q in range(nmo):
+            bits1, phase1 = _annihilate_bit(bits0, q)
+            if phase1 == 0:
+                continue
+            for p in range(nmo):
+                bits2, phase2 = _create_bit(bits1, p)
+                if phase2 == 0:
+                    continue
+                bra = bit_index.get(bits2)
+                if bra is not None:
+                    one[p, q, bra, ket] += phase1 * phase2
+
+            for s in range(nmo):
+                bits2, phase2 = _annihilate_bit(bits1, s)
+                if phase2 == 0:
+                    continue
+                phase12 = phase1 * phase2
+                for r in range(nmo):
+                    bits3, phase3 = _create_bit(bits2, r)
+                    if phase3 == 0:
+                        continue
+                    phase123 = phase12 * phase3
+                    for p in range(nmo):
+                        bits4, phase4 = _create_bit(bits3, p)
+                        if phase4 == 0:
+                            continue
+                        bra = bit_index.get(bits4)
+                        if bra is not None:
+                            two[p, q, r, s, bra, ket] += phase123 * phase4
+
+    return one, two
+
+
+def _spin_string_ops(strings):
+    _, nmo = strings.shape
+    bits = tuple(_spin_string_bits(strings))
+    return _cached_spin_string_ops(bits, nmo)
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_links(bit_tuple, nmo):
+    bits = list(bit_tuple)
+    bit_index = {bits_i: idx for idx, bits_i in enumerate(bits)}
+    one_links = []
+    two_links = []
+
+    for ket, bits0 in enumerate(bits):
+        for q in range(nmo):
+            bits1, phase1 = _annihilate_bit(bits0, q)
+            if phase1 == 0:
+                continue
+            for p in range(nmo):
+                bits2, phase2 = _create_bit(bits1, p)
+                if phase2 == 0:
+                    continue
+                bra = bit_index.get(bits2)
+                if bra is not None:
+                    one_links.append((p, q, bra, ket, phase1 * phase2))
+
+            for s in range(nmo):
+                bits2, phase2 = _annihilate_bit(bits1, s)
+                if phase2 == 0:
+                    continue
+                phase12 = phase1 * phase2
+                for r in range(nmo):
+                    bits3, phase3 = _create_bit(bits2, r)
+                    if phase3 == 0:
+                        continue
+                    phase123 = phase12 * phase3
+                    for p in range(nmo):
+                        bits4, phase4 = _create_bit(bits3, p)
+                        if phase4 == 0:
+                            continue
+                        bra = bit_index.get(bits4)
+                        if bra is not None:
+                            two_links.append((p, q, r, s, bra, ket, phase123 * phase4))
+
+    if one_links:
+        one = tuple(np.asarray(col, dtype=np.int64) for col in zip(*one_links))
+    else:
+        one = tuple(np.asarray([], dtype=np.int64) for _ in range(5))
+    if two_links:
+        two = tuple(np.asarray(col, dtype=np.int64) for col in zip(*two_links))
+    else:
+        two = tuple(np.asarray([], dtype=np.int64) for _ in range(7))
+    return one, two
+
+
+def _spin_string_links(strings):
+    _, nmo = strings.shape
+    bits = tuple(_spin_string_bits(strings))
+    return _cached_spin_string_links(bits, nmo)
+
+
+@njit
+def _scatter_same_spin_rdm2_numba(dm2, p, q, r, s, bra, ket, phase, overlap):
+    for link in range(p.shape[0]):
+        dm2[p[link], q[link], r[link], s[link]] += (
+            phase[link] * overlap[bra[link], ket[link]]
+        )
+
+
+@njit
+def _scatter_spin_rdm1_numba(dm1, p, q, bra, ket, phase, overlap):
+    for link in range(p.shape[0]):
+        dm1[p[link], q[link]] += phase[link] * overlap[bra[link], ket[link]]
+
+
+@njit
+def _scatter_opposite_spin_rdm2_numba(
+    dm2,
+    pa,
+    qa,
+    bra_a,
+    ket_a,
+    phase_a,
+    rb,
+    sb,
+    bra_b,
+    ket_b,
+    phase_b,
+    cbra,
+    cket,
+):
+    for la in range(pa.shape[0]):
+        for lb in range(rb.shape[0]):
+            dm2[pa[la], qa[la], rb[lb], sb[lb]] += (
+                phase_a[la]
+                * phase_b[lb]
+                * cbra[bra_a[la], bra_b[lb]]
+                * cket[ket_a[la], ket_b[lb]]
+            )
+
+
+def _scatter_same_spin_rdm2(dm2, links, overlap):
+    p, q, r, s, bra, ket, phase = links
+    if len(p) == 0:
+        return
+    _scatter_same_spin_rdm2_numba(dm2, p, q, r, s, bra, ket, phase, overlap)
+
+
+def _scatter_spin_rdm1(dm1, links, overlap):
+    p, q, bra, ket, phase = links
+    if len(p) == 0:
+        return
+    _scatter_spin_rdm1_numba(dm1, p, q, bra, ket, phase, overlap)
+
+
+def _scatter_opposite_spin_rdm2(dm2, alpha_links, beta_links, cbra, cket):
+    pa, qa, bra_a, ket_a, phase_a = alpha_links
+    rb, sb, bra_b, ket_b, phase_b = beta_links
+    if len(pa) == 0 or len(rb) == 0:
+        return
+    _scatter_opposite_spin_rdm2_numba(
+        dm2,
+        pa,
+        qa,
+        bra_a,
+        ket_a,
+        phase_a,
+        rb,
+        sb,
+        bra_b,
+        ket_b,
+        phase_b,
+        cbra,
+        cket,
+    )
+
+
+def _make_tdm1s_link_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, _ = _spin_string_links(alpha_bra)
+    beta_one, _ = _spin_string_links(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    nmo = binary.shape[2]
+    dm1a = np.zeros((nmo, nmo), dtype=dtype)
+    dm1b = np.zeros((nmo, nmo), dtype=dtype)
+
+    _scatter_spin_rdm1(dm1a, alpha_one, cbra @ cket.T)
+    _scatter_spin_rdm1(dm1b, beta_one, cbra.T @ cket)
+
+    return dm1a, dm1b
+
+
+def _make_tdm2_link_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, alpha_two = _spin_string_links(alpha_bra)
+    beta_one, beta_two = _spin_string_links(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    dm2 = np.zeros((binary.shape[2],) * 4, dtype=dtype)
+
+    _scatter_same_spin_rdm2(dm2, alpha_two, cbra @ cket.T)
+    _scatter_same_spin_rdm2(dm2, beta_two, cbra.T @ cket)
+
+    _scatter_opposite_spin_rdm2(dm2, alpha_one, beta_one, cbra, cket)
+    _scatter_opposite_spin_rdm2(dm2, beta_one, alpha_one, cbra.T, cket.T)
+
+    return dm2
+
+
+def _make_tdm2_string_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, alpha_two = _spin_string_ops(alpha_bra)
+    beta_one, beta_two = _spin_string_ops(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    dm2 = np.zeros((binary.shape[2],) * 4, dtype=dtype)
+
+    # Same-spin blocks: spectator spin is contracted out first.
+    alpha_overlap = np.einsum('ai,bi->ab', cbra, cket, optimize=True)
+    beta_overlap = np.einsum('ai,aj->ij', cbra, cket, optimize=True)
+    dm2 += np.einsum('pqrsab,ab->pqrs', alpha_two, alpha_overlap, optimize=True)
+    dm2 += np.einsum('pqrsij,ij->pqrs', beta_two, beta_overlap, optimize=True)
+
+    # Opposite-spin blocks factor into alpha and beta one-body string operators.
+    alpha_projected = np.einsum('ai,pqab,bj->pqij', cbra, alpha_one, cket, optimize=True)
+    dm2 += np.einsum('pqij,rsij->pqrs', alpha_projected, beta_one, optimize=True)
+
+    beta_projected = np.einsum('ai,pqij,bj->pqab', cbra, beta_one, cket, optimize=True)
+    dm2 += np.einsum('pqab,rsab->pqrs', beta_projected, alpha_one, optimize=True)
+
+    return dm2
+
+
+def _make_tdm2_explicit(cibra, ciket, binary):
+    cibra = np.asarray(cibra)
+    ciket = np.asarray(ciket)
+    _, _, nmo = binary.shape
+    det_bits = _determinant_bits_from_binary(binary)
+    det_index = {bits: idx for idx, bits in enumerate(det_bits)}
+    dtype = np.result_type(cibra, ciket, float)
+    dm2 = np.zeros((nmo, nmo, nmo, nmo), dtype=dtype)
+
+    for ket, bits0 in enumerate(det_bits):
+        ket_coeff = ciket[ket]
+        if ket_coeff == 0:
+            continue
+
+        for sigma in range(2):
+            spin_offset_sigma = sigma * nmo
+            for tau in range(2):
+                spin_offset_tau = tau * nmo
+
+                for q in range(nmo):
+                    bits1, phase1 = _annihilate_bit(bits0, spin_offset_sigma + q)
+                    if phase1 == 0:
+                        continue
+                    for s in range(nmo):
+                        bits2, phase2 = _annihilate_bit(bits1, spin_offset_tau + s)
+                        if phase2 == 0:
+                            continue
+                        phase12 = phase1 * phase2
+
+                        for r in range(nmo):
+                            bits3, phase3 = _create_bit(bits2, spin_offset_tau + r)
+                            if phase3 == 0:
+                                continue
+                            phase123 = phase12 * phase3
+                            for p in range(nmo):
+                                bits4, phase4 = _create_bit(bits3, spin_offset_sigma + p)
+                                if phase4 == 0:
+                                    continue
+                                bra = det_index.get(bits4)
+                                if bra is None:
+                                    continue
+                                dm2[p, q, r, s] += (
+                                    cibra[bra].conj()
+                                    * ket_coeff
+                                    * phase123
+                                    * phase4
+                                )
+
+    return dm2
+
+
 def make_rdm2(ci, Binary, SC1, SC2):
     """
     build the spin-traced 2-particle operator with the 2e RDM
@@ -1851,8 +2245,6 @@ def make_rdm2(ci, Binary, SC1, SC2):
     .. math::
 
         \Gamma_{pqrs} = \sum_{\sigma, \tau} p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
-
-    TODO: fix it
 
     Params
     ------
@@ -1864,41 +2256,18 @@ def make_rdm2(ci, Binary, SC1, SC2):
     J. Chem. Theory Comput. 2022, 18, 6690−6699
 
     """
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
+    return _make_tdm2_link_contractions(ci, ci, Binary)
 
-    nsd, _, nmo = Binary.shape
-    I = np.eye(nmo)
 
-    H_CI = np.zeros((nsd, nsd, nmo, nmo, nmo, nmo)) # slow implementation
+def make_tdm2(cibra, ciket, Binary, SC1, SC2):
+    """
+    Build the spin-traced two-particle transition density matrix.
 
-    # diagonal elements
-    D = np.einsum("I, ISp, ITr, pq, rs -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
-    D -= np.einsum("I, ISp, ISr, ps, rq -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
+    The convention matches ``make_rdm2``:
 
-    ## Rule 1
-    H_CI[I_A , J_A ] = -2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs",  a_t, a, ca, I, optimize=True)
-    H_CI[I_A , J_A ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", a_t, a, Binary[I_A,1], I, optimize=True)
-
-    H_CI[I_B , J_B ] -= 2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, cb, I, optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, Binary[I_B,0], I, optimize=True)
-
-    ## Rule 2
-    if len(I_AA) > 0:
-
-        H_CI[I_AA, J_AA] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", aa_t[0], aa[0],
-        aa_t[1], aa[1], optimize=True)
-
-    if len(I_BB) > 0:
-        H_CI[I_BB, J_BB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", bb_t[0], bb[0],
-        bb_t[1], bb[1], optimize=True)
-
-    H_CI[I_AB, J_AB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", ab_t, ab, ba_t, ba,
-        optimize=True)
-
-    D += contract('I, IJpqrs, J -> pqrs', ci.conj(), H_CI, ci)
-
-    return D
+    ``Gamma[p,q,r,s] = sum_{sigma,tau} <bra| p^+_sigma r^+_tau s_tau q_sigma |ket>``.
+    """
+    return _make_tdm2_link_contractions(cibra, ciket, Binary)
 
 
 def _compute_ci_mo_overlap(cibra, ciket, s=None):

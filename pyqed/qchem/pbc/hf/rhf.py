@@ -32,14 +32,23 @@ class RHF:
     Native 1D periodic RHF reference implementation.
 
     This uses image-summed molecular integrals from the builtin molecular stack.
-    It is intended as a clean, dependency-free first milestone, not a production
-    fast periodic HF engine.
+    The image cutoff ``nimages`` truncates the real-space lattice sum and is not
+    equivalent to an Ewald/DF periodic Coulomb treatment such as PySCF PBC.
+    For practical finite-image calculations, pair the cutoff with a k-mesh,
+    e.g. ``nk=2*nimages+1``; gamma-only real-space truncation can be strongly
+    cutoff-sensitive.
     """
 
-    def __init__(self, cell, kpts=None, nimages=1, damping=0.5):
+    def __init__(self, cell, kpts=None, nimages=1, damping=0.5, nk=None):
         self.cell = cell
-        self.kpts = _normalize_kpts(kpts)
         self.nimages = int(nimages)
+        if kpts is not None and nk is not None:
+            raise ValueError("Specify either kpts or nk, not both.")
+        if nk is not None:
+            if not self.cell.built:
+                self.cell.build()
+            kpts = self.cell.make_kpts(nk)
+        self.kpts = _normalize_kpts(kpts)
         self.damping = float(damping)
 
         self.e_tot = None
@@ -231,7 +240,7 @@ class RHF:
         self.mo_occ = mo_occ[0] if self.nkpts == 1 else mo_occ
         self.dm = dm_k[0] if self.nkpts == 1 else dm_k
         self.fock = f_k[0] if self.nkpts == 1 else f_k
-        self.converged = bool(converged or self.nkpts == 1)
+        self.converged = bool(converged)
         return self
 
     def kernel(self, **kwargs):

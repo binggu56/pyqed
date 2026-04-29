@@ -528,7 +528,7 @@ def CI_H(Binary, H1, H2, SC1, SC2):
     I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
 
     # sum of MO energies I: configuration index, S: spin index, p: MO index
-    dtype = np.result_type(H1, H2)
+    dtype = np.result_type(np.asarray(H1), H2)
     H_CI = np.asarray(np.einsum("Spp, ISp -> I", H1, Binary, optimize=True), dtype=dtype)
 
     # ERI

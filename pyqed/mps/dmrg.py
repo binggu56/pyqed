@@ -25,7 +25,7 @@ class DMRG:
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
                 symmetry=False, charge=None, spin = None,\
                 target_qn = None, sym_mgr = None, not_conv_err=True,
-                nstates=1, weights=None):
+                nstates=1, weights=None, verbose=0):
         """
         Parameters
         ----------
@@ -78,6 +78,7 @@ class DMRG:
         self.states = None       # Holds list of all Roots
         self.not_conv_err = not_conv_err
         self.converged = False
+        self.verbose = int(verbose)
 
     def run(self):
 
@@ -110,7 +111,8 @@ class DMRG:
                 mps_list, mpo_list, self.D, self.nsweeps, 
                 U1=self.U1, target_qn=self.target_qn, 
                 not_conv_err=self.not_conv_err, sym_mgr=self.sym_mgr,
-                nstates=self.nstates, weights=self.weights
+                nstates=self.nstates, weights=self.weights,
+                verbose=self.verbose,
             )
             e_elec, mps_out, self.gauge, self.converged = res
 

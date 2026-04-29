@@ -46,6 +46,7 @@ from pyqed.qchem.mcscf.casci import (
     _slice_active_orbitals,
     _factorized_ci_overlap as overlap,
     h1e_for_cas,
+    make_tdm2 as _make_tdm2_dense,
     size_of_cas,
     spin_square as spin_square_from_rdm,
     transform_spatial_eri_to_mo,
@@ -1458,7 +1459,7 @@ def sigma_on_the_fly(Binary, SC1, SC2, H1, H2, H_diag, c):
 
 
 class CASCI(mcscf.casci.CASCI):
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, tol=0):
+    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, tol=0, verbose=0):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -1492,7 +1493,7 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-        super().__init__(mf, ncas, nelecas, ncore=ncore, spin=spin)
+        super().__init__(mf, ncas, nelecas, ncore=ncore, spin=spin, verbose=verbose)
         self.direct_connectivity = None
         
         self.tol = tol
@@ -1852,6 +1853,184 @@ class CASCI(mcscf.casci.CASCI):
         if self.SC1 is None or self.SC2 is None:
             self.SC1, self.SC2 = SlaterCondon(self.binary)
         return self.SC1, self.SC2
+
+    def ci_sigma(self, c):
+        """
+        Apply the active-space CI Hamiltonian to a determinant-space vector.
+
+        The returned vector excludes the scalar core energy, matching the CI
+        eigenvalues stored internally before ``e_core`` is added to ``e_tot``.
+        This method exposes the matrix-free direct-CI action used by ``run()``
+        so reduced CI subspace solvers do not need to build dense Hamiltonians.
+        """
+        if self.binary is None:
+            raise ValueError("Run CASCI before requesting a CI sigma vector.")
+        c = np.asarray(c)
+        if c.ndim != 1 or c.shape[0] != self.binary.shape[0]:
+            raise ValueError(
+                "CI vector shape {} is incompatible with ndet={}.".format(
+                    c.shape,
+                    self.binary.shape[0],
+                )
+            )
+        if self.direct_connectivity is None:
+            self.direct_connectivity = build_direct_connectivity(self.binary)
+        conn = self.direct_connectivity
+
+        factor_ready = all(
+            x is not None
+            for x in (
+                self._direct_factor_H_diag,
+                self._direct_factor_H_A,
+                self._direct_factor_H_B,
+                self._direct_factor_H_AA,
+                self._direct_factor_H_BB,
+                self._direct_factor_H_AB,
+            )
+        )
+        if factor_ready:
+            return _sigma_values_conn_numba(
+                self._direct_factor_H_diag,
+                self._direct_factor_H_A,
+                self._direct_factor_H_B,
+                self._direct_factor_H_AA,
+                self._direct_factor_H_BB,
+                self._direct_factor_H_AB,
+                c,
+                conn.I_A,
+                conn.J_A,
+                conn.I_B,
+                conn.J_B,
+                conn.I_AA,
+                conn.J_AA,
+                conn.I_BB,
+                conn.J_BB,
+                conn.I_AB,
+                conn.J_AB,
+            )
+
+        if self.h2e_cas is not None:
+            hcore = np.asarray(self.hcore)
+            if hcore.ndim == 3:
+                if not np.allclose(hcore[0], hcore[1], atol=1.0e-12):
+                    if self.eri_so is None:
+                        raise NotImplementedError(
+                            "Spin-dependent compact CI sigma needs eri_so fallback."
+                        )
+                spatial_h1 = hcore[0]
+            else:
+                spatial_h1 = hcore
+            spatial_eri = np.asarray(self.h2e_cas)
+            same_spin_eri = (
+                self._direct_same_spin_eri
+                if self._direct_same_spin_eri is not None
+                else spatial_eri - spatial_eri.swapaxes(1, 3)
+            )
+            cross_spin_eri = (
+                self._direct_cross_spin_eri
+                if self._direct_cross_spin_eri is not None
+                else spatial_eri
+            )
+            h_diag = _compute_diag_compact(
+                spatial_h1,
+                same_spin_eri,
+                cross_spin_eri,
+                self.binary,
+            )
+            return _sigma_compact_conn_numba(
+                spatial_h1,
+                same_spin_eri,
+                cross_spin_eri,
+                h_diag,
+                c,
+                self.binary,
+                conn.I_A,
+                conn.J_A,
+                conn.p_A,
+                conn.q_A,
+                conn.phase_A,
+                conn.I_B,
+                conn.J_B,
+                conn.p_B,
+                conn.q_B,
+                conn.phase_B,
+                conn.I_AA,
+                conn.J_AA,
+                conn.p_AA,
+                conn.q_AA,
+                conn.r_AA,
+                conn.s_AA,
+                conn.phase_AA,
+                conn.I_BB,
+                conn.J_BB,
+                conn.p_BB,
+                conn.q_BB,
+                conn.r_BB,
+                conn.s_BB,
+                conn.phase_BB,
+                conn.I_AB,
+                conn.J_AB,
+                conn.p_AB,
+                conn.q_AB,
+                conn.r_AB,
+                conn.s_AB,
+                conn.phase_AB,
+            )
+
+        if self.eri_so is None or self.hcore is None:
+            raise ValueError("CASCI Hamiltonian data are not available for sigma.")
+        h1e = np.asarray(self.hcore)
+        h2e = np.asarray(self.eri_so)
+        h_diag = _compute_diag(h1e, h2e, self.binary)
+        sc1, sc2 = self.ensure_slater_condon_cache()
+        return sigma_on_the_fly(self.binary, sc1, sc2, h1e, h2e, h_diag, c)
+
+    def ci_diagonal(self):
+        """
+        Return the determinant-space active CI Hamiltonian diagonal.
+
+        The diagonal excludes ``e_core`` and is suitable for Davidson/Q-space
+        residual preconditioning.
+        """
+        if self.binary is None:
+            raise ValueError("Run CASCI before requesting a CI Hamiltonian diagonal.")
+
+        factor_ready = self._direct_factor_H_diag is not None
+        if factor_ready:
+            return np.asarray(self._direct_factor_H_diag)
+
+        if self.h2e_cas is not None:
+            hcore = np.asarray(self.hcore)
+            if hcore.ndim == 3:
+                if not np.allclose(hcore[0], hcore[1], atol=1.0e-12):
+                    if self.eri_so is None:
+                        raise NotImplementedError(
+                            "Spin-dependent compact CI diagonal needs eri_so fallback."
+                        )
+                spatial_h1 = hcore[0]
+            else:
+                spatial_h1 = hcore
+            spatial_eri = np.asarray(self.h2e_cas)
+            same_spin_eri = (
+                self._direct_same_spin_eri
+                if self._direct_same_spin_eri is not None
+                else spatial_eri - spatial_eri.swapaxes(1, 3)
+            )
+            cross_spin_eri = (
+                self._direct_cross_spin_eri
+                if self._direct_cross_spin_eri is not None
+                else spatial_eri
+            )
+            return _compute_diag_compact(
+                spatial_h1,
+                same_spin_eri,
+                cross_spin_eri,
+                self.binary,
+            )
+
+        if self.eri_so is None or self.hcore is None:
+            raise ValueError("CASCI Hamiltonian data are not available for diagonal.")
+        return _compute_diag(np.asarray(self.hcore), np.asarray(self.eri_so), self.binary)
 
 
     def natural_orbitals(self, dm, nco=None):
@@ -2354,7 +2533,11 @@ class CASCI(mcscf.casci.CASCI):
                         guess=guess,
                     )
                 elif eigensolver == 'eigsh':
-                    H = LinearOperator((binary.shape[0], binary.shape[0]), matvec=mv)
+                    H = LinearOperator(
+                        (binary.shape[0], binary.shape[0]),
+                        matvec=mv,
+                        dtype=np.complex128,
+                    )
                     E, X = eigsh(H, k=solve_nstates, which='SA', tol=self.tol)
                 else:
                     raise ValueError(
@@ -2386,9 +2569,10 @@ class CASCI(mcscf.casci.CASCI):
         self.e_tot = E + self.e_core
         self.ci = [X[:, n] for n in range(requested_nstates)]
 
-        for i in range(requested_nstates):
-            ss = self.spin_square(i)
-            print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
+        if self.verbose >= 1:
+            for i in range(requested_nstates):
+                ss = self.spin_square(i)
+                print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
         return self
 
@@ -2647,7 +2831,8 @@ class CASCI(mcscf.casci.CASCI):
         self.ensure_slater_condon_cache()
         if bra_id == ket_id:
 
-            print("CI ket and bra are the same. Computing 1e RDM instead.")
+            if self.verbose >= 1:
+                print("CI ket and bra are the same. Computing 1e RDM instead.")
             return self.make_rdm1(ket_id, h1e)
 
         else:
@@ -2695,15 +2880,19 @@ class CASCI(mcscf.casci.CASCI):
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
-        spin-traced 1e transition density matrix in MO
+        Spin-traced two-particle transition density matrix in MO basis.
 
         .. math::
 
-            \gamma_{pq}^{\beta \alpha} = <\Psi_\beta | \hat{E}_{qp} | \Psi_\alpha >
-
-        E_{qp} = q_alpha^\dagger p_alpha + q_beta^\dagger p_beta
+            \Gamma_{pqrs}^{\beta \alpha}
+            = \sum_{\sigma\tau}<\Psi_\beta|
+              p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
+              |\Psi_\alpha>
         """
-        raise NotImplementedError('TDM not implemented')
+        self.ensure_slater_condon_cache()
+        cibra = self.ci[bra_id]
+        ciket = self.ci[ket_id]
+        return _make_tdm2_dense(cibra, ciket, self.binary, self.SC1, self.SC2)
 
 
 
@@ -2961,27 +3150,7 @@ def make_rdm1(ci, binary, SC1):
     """
 
 
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', ci.conj(), H, ci).T
+    return mcscf.casci.make_rdm1(ci, binary, SC1)
 
 def make_tdm1(cibra, ciket, binary, SC1):
     """
@@ -3013,27 +3182,7 @@ def make_tdm1(cibra, ciket, binary, SC1):
     """
 
 
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', cibra.conj(), H, ciket)
+    return mcscf.casci.make_tdm1(cibra, ciket, binary, SC1)
 
 
 
@@ -3083,8 +3232,6 @@ def make_rdm2(ci, Binary, SC1, SC2):
 
         \Gamma_{pqrs} = \sum_{\sigma, \tau} p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
 
-    TODO: fix it
-
     Params
     ------
     Binary: binary string (I, s, p)
@@ -3095,41 +3242,7 @@ def make_rdm2(ci, Binary, SC1, SC2):
     J. Chem. Theory Comput. 2022, 18, 6690−6699
 
     """
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
-
-    nsd, _, nmo = Binary.shape
-    I = np.eye(nmo)
-
-    H_CI = np.zeros((nsd, nsd, nmo, nmo, nmo, nmo)) # slow implementation
-
-    # diagonal elements
-    D = np.einsum("I, ISp, ITr, pq, rs -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
-    D -= np.einsum("I, ISp, ISr, ps, rq -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
-
-    ## Rule 1
-    H_CI[I_A , J_A ] = -2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs",  a_t, a, ca, I, optimize=True)
-    H_CI[I_A , J_A ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", a_t, a, Binary[I_A,1], I, optimize=True)
-
-    H_CI[I_B , J_B ] -= 2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, cb, I, optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, Binary[I_B,0], I, optimize=True)
-
-    ## Rule 2
-    if len(I_AA) > 0:
-
-        H_CI[I_AA, J_AA] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", aa_t[0], aa[0],
-        aa_t[1], aa[1], optimize=True)
-
-    if len(I_BB) > 0:
-        H_CI[I_BB, J_BB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", bb_t[0], bb[0],
-        bb_t[1], bb[1], optimize=True)
-
-    H_CI[I_AB, J_AB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", ab_t, ab, ba_t, ba,
-        optimize=True)
-
-    D += contract('I, IJpqrs, J -> pqrs', ci.conj(), H_CI, ci)
-
-    return D
+    return _make_tdm2_dense(ci, ci, Binary, SC1, SC2)
 
 if __name__ == "__main__":
     from pyqed import Molecule

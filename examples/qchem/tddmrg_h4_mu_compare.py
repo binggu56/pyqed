@@ -26,12 +26,13 @@ def main():
     )
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
+    omega = 0.6
 
     pulse = gaussian_pulse(
         amplitude=2e-3,
         center=0.5,
         width=0.2,
-        frequency=0.0,
+        omega=omega,
         phase=0.0,
         polarization=(0.0, 0.0, 1.0),
     )

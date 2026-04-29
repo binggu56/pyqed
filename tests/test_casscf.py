@@ -2,9 +2,15 @@ import pytest
 import numpy as np
 
 from pyqed import optimize as optimize_module
-from pyqed.qchem import CASSCF, COCASCI, Molecule, soc_state_interaction
+from pyqed.qchem import (
+    CASSCF,
+    COCASCI,
+    FirstOrderCASSCF,
+    Molecule,
+    soc_state_interaction,
+)
 from pyqed.qchem.mcscf import casci as casci_module
-from pyqed.qchem.mcscf import cocasci as cocasci_module
+from pyqed.qchem.mcscf import cocas as cocas_module
 from pyqed.qchem.mcscf import direct_ci as direct_ci_module
 from pyqed.qchem.mcscf.casci import (
     _get_mf_cholesky_factors,
@@ -82,6 +88,22 @@ def test_casscf_lih_lowers_the_initial_casci_energy():
     assert np.isfinite(mc.e_tot[0])
 
 
+def test_casci_verbose_zero_is_clean_and_verbose_one_reports_roots(capsys):
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = mol.RHF().run()
+    capsys.readouterr()
+
+    CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
+    quiet = capsys.readouterr()
+    assert "CASCI Root" not in quiet.out
+
+    CASCI(mf, ncas=2, nelecas=2, verbose=1).run(nstates=1, method='direct_ci')
+    verbose = capsys.readouterr()
+    assert "CASCI Root 0" in verbose.out
+
+
 def test_casscf_lih_lbfgs_matches_rcg_energy():
     """The alternative orbital optimizer should reach the same LiH minimum."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
@@ -156,6 +178,192 @@ def test_stiefel_minimize_clips_large_tangent_steps():
     np.testing.assert_allclose(X, expected)
 
 
+def test_stiefel_minimize_accepts_newton_algorithm():
+    """The analytic Newton backend should improve a simple objective."""
+    U0 = np.array([[1.0], [0.0]])
+    h1e = np.array([[0.0, -0.2], [-0.2, -1.0]])
+    eri = np.zeros((2, 2, 2, 2))
+    dm1 = np.array([[1.0]])
+    dm2 = np.zeros((1, 1, 1, 1))
+
+    X, value = optimize_module.minimize(
+        optimize_module.energy,
+        U0,
+        args=(h1e, eri, dm1, dm2),
+        algorithm="NEWTON",
+        tau=1.0,
+        max_iterations=5,
+    )
+
+    assert value < optimize_module.energy(U0, h1e, eri, dm1, dm2)
+    np.testing.assert_allclose(X.T @ X, np.eye(1), atol=1e-10)
+
+
+def test_stiefel_newton_uses_matrix_free_hessian_action(monkeypatch):
+    """The production Newton path should not build a dense tangent basis."""
+    U0 = np.array([[1.0], [0.0], [0.0]])
+    h1e = np.array(
+        [
+            [0.0, -0.2, 0.1],
+            [-0.2, -1.0, 0.0],
+            [0.1, 0.0, 0.5],
+        ]
+    )
+    eri = np.zeros((3, 3, 3, 3))
+    dm1 = np.array([[1.0]])
+    dm2 = np.zeros((1, 1, 1, 1))
+
+    def dense_basis_is_not_allowed(_):
+        raise AssertionError("dense tangent basis should not be used by NEWTON")
+
+    monkeypatch.setattr(optimize_module, "tangent_basis", dense_basis_is_not_allowed)
+
+    X, value = optimize_module.minimize(
+        optimize_module.energy,
+        U0,
+        args=(h1e, eri, dm1, dm2),
+        algorithm="NEWTON",
+        tau=1.0,
+        max_iterations=4,
+        newton_max_cycle=2,
+        newton_max_subspace=4,
+    )
+
+    assert value < optimize_module.energy(U0, h1e, eri, dm1, dm2)
+    np.testing.assert_allclose(X.T @ X, np.eye(1), atol=1e-10)
+
+
+def test_stiefel_minimize_accepts_ah_alias():
+    """AH should be accepted as the Davidson augmented-Hessian optimizer name."""
+    U0 = np.array([[1.0], [0.0]])
+    h1e = np.array([[0.0, -0.2], [-0.2, -1.0]])
+    eri = np.zeros((2, 2, 2, 2))
+    dm1 = np.array([[1.0]])
+    dm2 = np.zeros((1, 1, 1, 1))
+
+    X, value = optimize_module.minimize(
+        optimize_module.energy,
+        U0,
+        args=(h1e, eri, dm1, dm2),
+        algorithm="AH",
+        tau=1.0,
+        max_iterations=5,
+    )
+
+    assert value < optimize_module.energy(U0, h1e, eri, dm1, dm2)
+    np.testing.assert_allclose(X.T @ X, np.eye(1), atol=1e-10)
+
+
+def test_orbital_gradient_action_matches_dense_finite_difference():
+    """Analytic dense-integral gradient action should match finite difference."""
+    U = np.array([[1.0], [0.0]])
+    D = np.array([[0.0], [1.0]])
+    h1e = np.array([[0.2, -0.3], [-0.3, -0.7]])
+    eri = np.arange(16, dtype=float).reshape(2, 2, 2, 2) / 100.0
+    dm1 = np.array([[1.2]])
+    dm2 = np.array([[[[0.4]]]])
+
+    analytic = optimize_module.gradient_directional_derivative(U, D, h1e, eri, dm1, dm2)
+    h = 1.0e-6
+    numeric = (
+        optimize_module.gradient(U + h * D, h1e, eri, dm1, dm2)
+        - optimize_module.gradient(U - h * D, h1e, eri, dm1, dm2)
+    ) / (2.0 * h)
+
+    np.testing.assert_allclose(analytic, numeric, atol=1e-8, rtol=1e-8)
+
+
+def test_orbital_gradient_action_matches_factorized_finite_difference():
+    """Analytic Cholesky-factor gradient action should match finite difference."""
+    U = np.array([[1.0], [0.0]])
+    D = np.array([[0.0], [1.0]])
+    h1e = np.array([[0.2, -0.3], [-0.3, -0.7]])
+    pair_factors = np.array(
+        [
+            [[0.4, 0.1], [0.1, 0.2]],
+            [[0.0, 0.3], [0.3, -0.1]],
+        ]
+    )
+    dm1 = np.array([[1.2]])
+    dm2 = np.array([[[[0.4]]]])
+
+    analytic = optimize_module.gradient_directional_derivative(
+        U, D, h1e, pair_factors, dm1, dm2
+    )
+    h = 1.0e-6
+    numeric = (
+        optimize_module.gradient(U + h * D, h1e, pair_factors, dm1, dm2)
+        - optimize_module.gradient(U - h * D, h1e, pair_factors, dm1, dm2)
+    ) / (2.0 * h)
+
+    np.testing.assert_allclose(analytic, numeric, atol=1e-8, rtol=1e-8)
+
+
+def test_stiefel_minimize_rejects_failed_line_search(monkeypatch):
+    """The inner optimizer should not accept a trial step that fails Armijo."""
+    U0 = np.array([[1.0], [0.0]])
+
+    def flat_objective(X):
+        return 1.0
+
+    def fixed_gradient(X):
+        return np.array([[0.0], [-1.0]])
+
+    monkeypatch.setattr(optimize_module, "gradient", fixed_gradient)
+
+    X, value = optimize_module.minimize(
+        flat_objective,
+        U0,
+        tau=1.0,
+        taum=1e-3,
+        delta=0.5,
+        max_iterations=1,
+    )
+
+    np.testing.assert_allclose(X, U0)
+    assert value == pytest.approx(1.0)
+
+
+def test_stiefel_project_rejects_rank_deficient_input():
+    """Polar projection should fail clearly instead of producing NaNs."""
+    with pytest.raises(ValueError, match="rank-deficient"):
+        optimize_module.project(np.zeros((2, 1)))
+
+
+def test_legacy_kernel_runs_orbital_update_before_convergence_check(monkeypatch):
+    """The legacy optimizer kernel should not stop before one orbital update."""
+    import pyqed.qchem.mcscf as mcscf_pkg
+
+    calls = {"minimize": 0}
+
+    class FakeCASCI:
+        def __init__(self, mf, ncas, nelecas):
+            self.hcore = np.zeros((1, 1))
+            self.eri_so = np.zeros((1, 1, 1, 1, 1, 1))
+            self.e_tot = None
+            self.run_count = 0
+
+        def run(self, U):
+            self.run_count += 1
+            self.e_tot = 0.0
+            return self
+
+        def make_rdm12(self, state):
+            return np.ones((1, 1)), np.zeros((1, 1, 1, 1))
+
+    def fake_minimize(func, U, args=(), **kwargs):
+        calls["minimize"] += 1
+        return U.copy(), 0.0
+
+    monkeypatch.setattr(mcscf_pkg, "CASCI", FakeCASCI)
+    monkeypatch.setattr(optimize_module, "minimize", fake_minimize)
+
+    mc = optimize_module.kernel(object(), np.ones((1, 1)), max_steps=3, tol=1e-12)
+
+    assert calls["minimize"] == 1
+    assert mc.run_count == 2
+
+
 def test_cocasci_accepts_inner_optimizer_tolerance():
     """COCASCI should expose configurable inner manifold optimizer controls."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
@@ -184,7 +392,7 @@ def test_first_order_casscf_lih_lowers_initial_casci_energy():
     mf = mol.RHF().run()
 
     mc0 = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
-    mc = CASSCF(
+    mc = FirstOrderCASSCF(
         mf,
         ncas=2,
         nelecas=2,
@@ -204,7 +412,7 @@ def test_first_order_casscf_accepts_max_cycles_alias():
 
     mf = mol.RHF().run()
 
-    mc = CASSCF(
+    mc = FirstOrderCASSCF(
         mf,
         ncas=2,
         nelecas=2,
@@ -222,7 +430,7 @@ def test_first_order_casscf_repeated_run_resets_history():
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    mc = CASSCF(
+    mc = FirstOrderCASSCF(
         mf,
         ncas=2,
         nelecas=2,
@@ -233,10 +441,14 @@ def test_first_order_casscf_repeated_run_resets_history():
     mc.run()
     history_len = len(mc.history)
     assert history_len > 0
+    assert history_len <= mc.max_cycle
+    assert mc.history[0]["cycle"] == 1
     assert "step_norm" in mc.history[-1]
 
     mc.run()
-    assert len(mc.history) == history_len
+    assert len(mc.history) > 0
+    assert len(mc.history) <= mc.max_cycle
+    assert mc.history[0]["cycle"] == 1
     assert mc.converged
 
 
@@ -247,7 +459,7 @@ def test_cocasci_lih_4e4o_matches_first_order_casscf():
 
     mf = mol.RHF().run()
 
-    mc_ref = CASSCF(
+    mc_ref = FirstOrderCASSCF(
         mf,
         ncas=4,
         nelecas=4,
@@ -272,7 +484,7 @@ def test_first_order_casscf_state_average_two_roots():
 
     mf = mol.RHF().run()
 
-    mc = CASSCF(
+    mc = FirstOrderCASSCF(
         mf,
         ncas=4,
         nelecas=4,
@@ -300,7 +512,7 @@ def test_first_order_casscf_cholesky_matches_pyscf():
     mol.build(driver='gbasis-pyscf')
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
-    mc = CASSCF(
+    mc = FirstOrderCASSCF(
         mf,
         ncas=4,
         nelecas=4,
@@ -360,7 +572,7 @@ def test_first_order_casscf_factorized_evaluate_avoids_dense_mo_eri(monkeypatch)
     mol.build(driver='gbasis-pyscf')
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
-    casscf = CASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
+    casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
     casscf.use_cholesky_integrals = casscf._resolve_use_cholesky(True)
 
     def fail_get_eri_mo(*args, **kwargs):
@@ -380,7 +592,7 @@ def test_first_order_casscf_reuses_direct_ci_setup_cache(monkeypatch):
     mol.build(driver='gbasis-pyscf')
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
-    casscf = CASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
+    casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
     casscf.use_cholesky_integrals = casscf._resolve_use_cholesky(True)
 
     mc0 = casscf._make_casci(mf.mo_coeff, 1)
@@ -422,7 +634,7 @@ def test_cocas_fresh_casci_reuses_direct_ci_setup_cache(monkeypatch):
     monkeypatch.setattr(direct_ci_module, "build_direct_connectivity", fail_build_direct_connectivity)
     monkeypatch.setattr(direct_ci_module, "SlaterCondon", fail_slater_condon)
 
-    mc1 = cocasci_module._fresh_casci_like(mc0)
+    mc1 = cocas_module._fresh_casci_like(mc0)
     mc1.run(
         nstates=1,
         mo_coeff=mf.mo_coeff,
@@ -454,8 +666,8 @@ def test_cocas_factorized_objective_and_gradient_match_dense():
     nocc_like = mc.ncore + mc.ncas
     U = np.eye(mf.nmo, nocc_like)
 
-    e_dense = cocasci_module.energy(U, h1e, eri_dense, dm1, dm2)
-    e_factor = cocasci_module.energy(U, h1e, eri_factors, dm1, dm2)
+    e_dense = cocas_module.energy(U, h1e, eri_dense, dm1, dm2)
+    e_factor = cocas_module.energy(U, h1e, eri_factors, dm1, dm2)
     np.testing.assert_allclose(e_factor, e_dense, atol=1e-10)
 
     g_dense = optimize_module.gradient(U, h1e, eri_dense, dm1, dm2)
@@ -657,7 +869,7 @@ def test_first_order_casscf_line_search_failure_raises(monkeypatch):
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    mc = CASSCF(mf, ncas=2, nelecas=2, max_cycle=4, ci_method='direct_ci')
+    mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, max_cycle=4, ci_method='direct_ci')
 
     def fail_line_search(*args, **kwargs):
         return False, args[0], float("inf"), 0.0, None
@@ -674,7 +886,7 @@ def test_first_order_casscf_stall_message_includes_diagnostics():
     mol.build(driver='pyscf')
 
     mf = mol.RHF().run()
-    mc = CASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
+    mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
     mc.state_average([0.5, 0.5])
     mc.history = [
         {"cycle": 1, "energy": -7.80, "gradient_norm": 1.0e-2, "step_norm": None},
@@ -695,7 +907,7 @@ def test_first_order_casscf_line_search_fallback_generates_smaller_steps():
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    mc = CASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
+    mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
 
     step_vec = np.array([0.05, -0.03, 0.01])
     grad_vec = np.array([1.2, -0.8, 0.4])
@@ -713,7 +925,7 @@ def test_augmented_hessian_direction_is_a_descent_step():
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    mc = CASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
+    mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
     casci, fock, grad = mc._evaluate(mf.mo_coeff, 1, 0)
     grad_vec = pack_nonredundant(grad, casci.ncore, casci.ncas, mf.nmo)
     diag_step = diagonal_preconditioned_vector(
@@ -826,7 +1038,7 @@ def test_analytic_hessian_action_reuses_reference_cache(monkeypatch):
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    solver = CASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')
+    solver = FirstOrderCASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
 
     calls = {"rdms": 0, "integrals": 0}
@@ -877,7 +1089,7 @@ def test_evaluate_populates_analytic_hessian_cache_for_state_average(monkeypatch
     mol.build(driver='gbasis')
 
     mf = mol.RHF().run()
-    solver = CASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')
+    solver = FirstOrderCASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')
     solver.state_average(np.array([0.6, 0.4]))
     solver.nstates = 2
     solver.state_id = 0
