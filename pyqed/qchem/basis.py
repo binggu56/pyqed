@@ -32,6 +32,8 @@ _NATIVE_PAR_SIGNATURES = None
 _NATIVE_PAR_PAIRS = None
 _NATIVE_PAR_PAIR_BOUNDS = None
 _NATIVE_PAR_SCREEN_TOL = 0.0
+_NATIVE_RI_AO_SIGNATURES = None
+_NATIVE_RI_AUX_SIGNATURES = None
 _NUMBA_AVAILABLE = njit is not None
 _NUMBA_DENSE_ERI_ENABLED = False
 _BASIS_ACCEL = None
@@ -477,6 +479,145 @@ def ERI(a,b,c,d):
     return eri
 
 
+@lru_cache(maxsize=262144)
+def _single_gaussian_coulomb_cached(
+    a,l1,m1,n1,Ax,Ay,Az,
+    b,l2,m2,n2,Bx,By,Bz,
+):
+    p = a
+    q = b
+    alpha = p * q / (p + q)
+    dx = Ax - Bx
+    dy = Ay - By
+    dz = Az - Bz
+    rab = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    val = 0.0
+    for t in range(l1 + 1):
+        ex_a = E(l1, 0, t, 0.0, a, 0.0)
+        for u in range(m1 + 1):
+            exy_a = ex_a * E(m1, 0, u, 0.0, a, 0.0)
+            for v in range(n1 + 1):
+                xyz_a = exy_a * E(n1, 0, v, 0.0, a, 0.0)
+                for tau in range(l2 + 1):
+                    ex_b = E(l2, 0, tau, 0.0, b, 0.0)
+                    for nu in range(m2 + 1):
+                        exy_b = ex_b * E(m2, 0, nu, 0.0, b, 0.0)
+                        for phi in range(n2 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            val += (
+                                xyz_a
+                                * exy_b
+                                * E(n2, 0, phi, 0.0, b, 0.0)
+                                * sign
+                                * R(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rab)
+                            )
+
+    return val * (ERI_PREFAC / (p * q * math.sqrt(p + q)))
+
+
+def single_gaussian_coulomb(a, lmn1, A, b, lmn2, B):
+    """Coulomb integral between two primitive Cartesian Gaussians."""
+    l1, m1, n1 = lmn1
+    l2, m2, n2 = lmn2
+    return _single_gaussian_coulomb_cached(
+        a, l1, m1, n1, A[0], A[1], A[2],
+        b, l2, m2, n2, B[0], B[1], B[2],
+    )
+
+
+@lru_cache(maxsize=262144)
+def _three_center_coulomb_cached(
+    a,l1,m1,n1,Ax,Ay,Az,
+    b,l2,m2,n2,Bx,By,Bz,
+    c,l3,m3,n3,Cx,Cy,Cz,
+):
+    p = a + b
+    q = c
+    alpha = p * q / (p + q)
+    px = (a * Ax + b * Bx) / p
+    py = (a * Ay + b * By) / p
+    pz = (a * Az + b * Bz) / p
+    dx = px - Cx
+    dy = py - Cy
+    dz = pz - Cz
+    rpc = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    abx = Ax - Bx
+    aby = Ay - By
+    abz = Az - Bz
+
+    val = 0.0
+    for t in range(l1 + l2 + 1):
+        ex_ab = E(l1, l2, t, abx, a, b)
+        for u in range(m1 + m2 + 1):
+            exy_ab = ex_ab * E(m1, m2, u, aby, a, b)
+            for v in range(n1 + n2 + 1):
+                xyz_ab = exy_ab * E(n1, n2, v, abz, a, b)
+                for tau in range(l3 + 1):
+                    ex_c = E(l3, 0, tau, 0.0, c, 0.0)
+                    for nu in range(m3 + 1):
+                        exy_c = ex_c * E(m3, 0, nu, 0.0, c, 0.0)
+                        for phi in range(n3 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            val += (
+                                xyz_ab
+                                * exy_c
+                                * E(n3, 0, phi, 0.0, c, 0.0)
+                                * sign
+                                * R(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rpc)
+                            )
+
+    return val * (ERI_PREFAC / (p * q * math.sqrt(p + q)))
+
+
+def three_center_coulomb(a, lmn1, A, b, lmn2, B, c, lmn3, C):
+    """Primitive three-center Coulomb integral ``(ab|c)``."""
+    l1, m1, n1 = lmn1
+    l2, m2, n2 = lmn2
+    l3, m3, n3 = lmn3
+    return _three_center_coulomb_cached(
+        a, l1, m1, n1, A[0], A[1], A[2],
+        b, l2, m2, n2, B[0], B[1], B[2],
+        c, l3, m3, n3, C[0], C[1], C[2],
+    )
+
+
+def two_center_coulomb(a, b):
+    """Contracted auxiliary Coulomb metric element ``(a|b)``."""
+    val = 0.0
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            val += (
+                wa
+                * wb
+                * single_gaussian_coulomb(
+                    a.exps[ia], a.shell, a.origin,
+                    b.exps[ib], b.shell, b.origin,
+                )
+            )
+    return val
+
+
+def three_center_eri(a, b, c):
+    """Contracted three-center Coulomb integral ``(ab|c)``."""
+    val = 0.0
+    for ia, wa in enumerate(a.prim_weights):
+        for ib, wb in enumerate(b.prim_weights):
+            for ic, wc in enumerate(c.prim_weights):
+                val += (
+                    wa
+                    * wb
+                    * wc
+                    * three_center_coulomb(
+                        a.exps[ia], a.shell, a.origin,
+                        b.exps[ib], b.shell, b.origin,
+                        c.exps[ic], c.shell, c.origin,
+                    )
+                )
+    return val
+
+
 def _basis_signature(basis_fn):
     return (
         tuple(int(x) for x in basis_fn.shell),
@@ -554,6 +695,51 @@ def _contracted_eri_from_signatures(sig_a, sig_b, sig_c, sig_d):
     return _contracted_eri_from_signatures_cached(
         *_canonical_quartet_signature(sig_a, sig_b, sig_c, sig_d)
     )
+
+
+@lru_cache(maxsize=262144)
+def _contracted_two_center_coulomb_from_signatures_cached(sig_a, sig_b):
+    shell_a, origin_a, exps_a, weights_a = sig_a
+    shell_b, origin_b, exps_b, weights_b = sig_b
+
+    val = 0.0
+    for ia, wa in enumerate(weights_a):
+        for ib, wb in enumerate(weights_b):
+            val += wa * wb * _single_gaussian_coulomb_cached(
+                exps_a[ia], shell_a[0], shell_a[1], shell_a[2], origin_a[0], origin_a[1], origin_a[2],
+                exps_b[ib], shell_b[0], shell_b[1], shell_b[2], origin_b[0], origin_b[1], origin_b[2],
+            )
+    return val
+
+
+def _contracted_two_center_coulomb_from_signatures(sig_a, sig_b):
+    if sig_b < sig_a:
+        sig_a, sig_b = sig_b, sig_a
+    return _contracted_two_center_coulomb_from_signatures_cached(sig_a, sig_b)
+
+
+@lru_cache(maxsize=524288)
+def _contracted_three_center_from_signatures_cached(sig_a, sig_b, sig_c):
+    shell_a, origin_a, exps_a, weights_a = sig_a
+    shell_b, origin_b, exps_b, weights_b = sig_b
+    shell_c, origin_c, exps_c, weights_c = sig_c
+
+    val = 0.0
+    for ia, wa in enumerate(weights_a):
+        for ib, wb in enumerate(weights_b):
+            for ic, wc in enumerate(weights_c):
+                val += wa * wb * wc * _three_center_coulomb_cached(
+                    exps_a[ia], shell_a[0], shell_a[1], shell_a[2], origin_a[0], origin_a[1], origin_a[2],
+                    exps_b[ib], shell_b[0], shell_b[1], shell_b[2], origin_b[0], origin_b[1], origin_b[2],
+                    exps_c[ic], shell_c[0], shell_c[1], shell_c[2], origin_c[0], origin_c[1], origin_c[2],
+                )
+    return val
+
+
+def _contracted_three_center_from_signatures(sig_a, sig_b, sig_c):
+    if sig_b < sig_a:
+        sig_a, sig_b = sig_b, sig_a
+    return _contracted_three_center_from_signatures_cached(sig_a, sig_b, sig_c)
 
 
 def _pack_signatures_for_numba(signatures):
@@ -1666,6 +1852,206 @@ def _basis_path(basis_name):
     return os.path.join(basis_dir, sorted(candidates, key=_basis_sort_key)[0])
 
 
+def _default_auxbasis_name(primary_basis):
+    basis = str(primary_basis)
+    lower = basis.lower()
+    if lower.startswith("6-311"):
+        try:
+            _basis_path("cc-pvtz-jkfit")
+            return "cc-pvtz-jkfit"
+        except ValueError:
+            pass
+    if lower.startswith("6-31"):
+        try:
+            _basis_path("cc-pvdz-jkfit")
+            return "cc-pvdz-jkfit"
+        except ValueError:
+            pass
+    candidates = (
+        f"{basis}-rifit",
+        f"{basis}-jkfit",
+        f"{basis}-j",
+        f"{basis}_st_-rifit",
+        f"{basis}_st_-j",
+    )
+    for candidate in candidates:
+        try:
+            _basis_path(candidate)
+        except ValueError:
+            continue
+        return candidate
+    raise ValueError(
+        "Native RI requires an auxiliary basis. Pass options={'auxbasis': '...'} "
+        f"or use a primary basis with a bundled RI/J-fit partner; no default was found for {basis!r}."
+    )
+
+
+def _compute_aux_coulomb_metric(aux_signatures):
+    naux = len(aux_signatures)
+    metric = np.zeros((naux, naux), dtype=float)
+    for p in range(naux):
+        for q in range(p + 1):
+            value = _contracted_two_center_coulomb_from_signatures(
+                aux_signatures[p], aux_signatures[q]
+            )
+            metric[p, q] = value
+            metric[q, p] = value
+    return metric
+
+
+def _compute_native_ri_tensors_cython(signatures, aux_signatures):
+    if _basis_cy is None:
+        return None
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    try:
+        metric, j3 = _basis_cy.compute_ri_tensors(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(aux_shells, dtype=np.int64),
+            np.ascontiguousarray(aux_origins, dtype=np.float64),
+            np.ascontiguousarray(aux_exps, dtype=np.float64),
+            np.ascontiguousarray(aux_weights, dtype=np.float64),
+            np.ascontiguousarray(aux_nprim, dtype=np.int64),
+        )
+    except Exception:
+        return None
+    return np.asarray(metric, dtype=np.float64), np.asarray(j3, dtype=np.float64)
+
+
+def _compute_three_center_tensor_from_signatures(signatures, aux_signatures):
+    naux = len(aux_signatures)
+    nao = len(signatures)
+    j3 = np.zeros((naux, nao, nao), dtype=float)
+    for p, aux_sig in enumerate(aux_signatures):
+        for i in range(nao):
+            for j in range(i + 1):
+                value = _contracted_three_center_from_signatures(
+                    signatures[i], signatures[j], aux_sig
+                )
+                j3[p, i, j] = value
+                j3[p, j, i] = value
+    return j3
+
+
+def _init_builtin_ri_worker(signatures, aux_signatures):
+    global _NATIVE_RI_AO_SIGNATURES, _NATIVE_RI_AUX_SIGNATURES
+    _NATIVE_RI_AO_SIGNATURES = signatures
+    _NATIVE_RI_AUX_SIGNATURES = aux_signatures
+
+
+def _ri_three_center_chunk_worker(task):
+    start, stop = task
+    signatures = _NATIVE_RI_AO_SIGNATURES
+    aux_signatures = _NATIVE_RI_AUX_SIGNATURES
+    nao = len(signatures)
+    block = np.zeros((stop - start, nao, nao), dtype=float)
+    for local_p, p in enumerate(range(start, stop)):
+        aux_sig = aux_signatures[p]
+        for i in range(nao):
+            sig_i = signatures[i]
+            for j in range(i + 1):
+                value = _contracted_three_center_from_signatures(sig_i, signatures[j], aux_sig)
+                block[local_p, i, j] = value
+                block[local_p, j, i] = value
+    return start, block
+
+
+def _compute_three_center_tensor_parallel(signatures, aux_signatures, workers):
+    naux = len(aux_signatures)
+    nao = len(signatures)
+    if workers <= 1 or naux == 0:
+        return _compute_three_center_tensor_from_signatures(signatures, aux_signatures)
+
+    chunk = max(1, naux // max(workers * 4, 1))
+    tasks = [(start, min(start + chunk, naux)) for start in range(0, naux, chunk)]
+    j3 = np.zeros((naux, nao, nao), dtype=float)
+
+    start_methods = mp.get_all_start_methods()
+    ctx = mp.get_context("fork") if "fork" in start_methods else None
+    executor_kwargs = {}
+    if ctx is not None:
+        executor_kwargs["mp_context"] = ctx
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_builtin_ri_worker,
+            initargs=(signatures, aux_signatures),
+            **executor_kwargs,
+        ) as pool:
+            for start, block in pool.map(_ri_three_center_chunk_worker, tasks):
+                j3[start:start + block.shape[0]] = block
+    except (PermissionError, OSError):
+        return _compute_three_center_tensor_from_signatures(signatures, aux_signatures)
+
+    return j3
+
+
+def _builtin_ri_worker_count(mol, nao, naux):
+    requested = getattr(mol, "builtin_eri_workers", getattr(mol, "native_eri_workers", None))
+    if requested is not None:
+        return max(1, int(requested))
+    workers = _builtin_worker_count(mol, nao)
+    if workers > 1:
+        return workers
+    work_size = int(nao) * int(nao) * int(naux)
+    if work_size < 50000:
+        return 1
+    return min(4, max(1, os.cpu_count() or 1))
+
+
+def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
+    auxbasis = getattr(mol, "builtin_auxbasis", getattr(mol, "native_auxbasis", None))
+    if auxbasis is None:
+        auxbasis = _default_auxbasis_name(mol.basis)
+
+    aux_dict = parse_gbs(_basis_path(auxbasis))
+    try:
+        aux_cart = make_contractions(aux_dict, atoms, atcoords, coord_types='c')
+    except KeyError as exc:
+        raise ValueError(
+            f"Auxiliary basis {auxbasis!r} does not define element {exc.args[0]!r} "
+            "needed by this molecule."
+        ) from exc
+
+    signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+    aux_signatures = tuple(_basis_signature(fn) for fn in aux_cart)
+    cy_tensors = _compute_native_ri_tensors_cython(signatures, aux_signatures)
+    if cy_tensors is None:
+        metric = _compute_aux_coulomb_metric(aux_signatures)
+        workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_cart))
+        j3 = _compute_three_center_tensor_parallel(signatures, aux_signatures, workers)
+        tensor_builder = "python"
+    else:
+        metric, j3 = cy_tensors
+        workers = 1
+        tensor_builder = "cython-kernel"
+    evals, evecs = np.linalg.eigh(metric)
+    tol = float(getattr(mol, "builtin_ri_metric_tol", getattr(mol, "native_ri_metric_tol", 1e-10)))
+    keep = evals > tol
+    if not np.any(keep):
+        raise ValueError(
+            f"Auxiliary Coulomb metric for {auxbasis!r} has no eigenvalues above ri_metric_tol={tol:g}."
+        )
+
+    invsqrt = (evecs[:, keep] / np.sqrt(evals[keep])) @ evecs[:, keep].T
+    factors = np.einsum('pq,qij->pij', invsqrt, j3, optimize=True)
+    info = {
+        "auxbasis": auxbasis,
+        "naux": len(aux_cart),
+        "metric_rank": int(np.count_nonzero(keep)),
+        "metric_min_eig": float(np.min(evals)),
+        "metric_max_eig": float(np.max(evals)),
+        "workers": int(workers),
+        "tensor_builder": tensor_builder,
+    }
+    return factors, info
+
+
 def _reset_builtin_integral_caches():
     """
     Clear recurrence caches before building a fresh builtin AO integral set.
@@ -1678,7 +2064,11 @@ def _reset_builtin_integral_caches():
     R.cache_clear()
     _nuclear_attraction_cached.cache_clear()
     _electron_repulsion_cached.cache_clear()
+    _single_gaussian_coulomb_cached.cache_clear()
+    _three_center_coulomb_cached.cache_clear()
     _contracted_eri_from_signatures_cached.cache_clear()
+    _contracted_two_center_coulomb_from_signatures_cached.cache_clear()
+    _contracted_three_center_from_signatures_cached.cache_clear()
     try:
         from . import rys as _rys_mod
     except Exception:
@@ -1754,9 +2144,9 @@ def build_builtin(mol):
         "builtin_eri_representation",
         getattr(mol, "native_eri_representation", "dense"),
     )
-    if eri_representation not in {"dense", "dense+factors", "factors"}:
+    if eri_representation not in {"dense", "dense+factors", "factors", "ri", "dense+ri"}:
         raise ValueError(
-            "builtin_eri_representation must be 'dense', 'dense+factors', or 'factors'."
+            "builtin_eri_representation must be 'dense', 'dense+factors', 'factors', 'ri', or 'dense+ri'."
         )
 
     coord_type = str(
@@ -1776,8 +2166,9 @@ def build_builtin(mol):
     factors = None
     dense_builder = None
     factor_builder = None
+    ri_info = None
 
-    if eri_representation in {"dense", "dense+factors"}:
+    if eri_representation in {"dense", "dense+factors", "dense+ri"}:
         if eri_backend == "rys":
             if _rys_cy is not None and _signatures_are_sp_only(signatures):
                 shell_blocks = _cart_shell_blocks(basis_cart)
@@ -1821,7 +2212,10 @@ def build_builtin(mol):
             )
             dense_builder = _default_dense_builder_name()
 
-        if eri_representation == "dense+factors" or bool(
+        if eri_representation == "dense+ri":
+            factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+            factor_builder = "native-ri"
+        elif eri_representation == "dense+factors" or bool(
             getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False))
         ):
             from pyqed.qchem.hf.rhf import pivoted_cholesky_eri
@@ -1837,6 +2231,10 @@ def build_builtin(mol):
                     getattr(mol, "native_low_rank_max_rank", None),
                 ),
             )
+            factor_builder = "pivoted-cholesky-dense"
+    elif eri_representation == "ri":
+        factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+        factor_builder = "native-ri"
     else:
         shell_blocks = _cart_shell_blocks(basis_cart)
         shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
@@ -1922,6 +2320,7 @@ def build_builtin(mol):
         "factor_rank": None if factors is None else int(factors.shape[0]),
         "dense_builder": dense_builder,
         "factor_builder": factor_builder,
+        "ri": ri_info,
     }
     mol._native_build_info = mol._builtin_build_info
     return

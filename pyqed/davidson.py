@@ -201,6 +201,7 @@ def davidson(
     tol_residual=None,
     lindep=1e-12,
     return_info=False,
+    return_partial=False,
 ):
     """
     Compute the lowest ``neigen`` eigenpairs of a Hermitian problem.
@@ -233,6 +234,9 @@ def davidson(
         Linear-dependence threshold for orthogonalized correction vectors.
     return_info : bool, optional
         When true, also return a diagnostics dict.
+    return_partial : bool, optional
+        When true, return the best Ritz pairs found after ``itermax`` instead
+        of raising. The returned diagnostics keep ``converged=False``.
     """
     if neigen < 1:
         raise ValueError("neigen must be positive.")
@@ -339,6 +343,12 @@ def davidson(
 
         prev_theta = theta.copy()
 
+    if return_partial:
+        info["converged"] = False
+        info["max_iterations_reached"] = True
+        if return_info:
+            return theta, ritz, info
+        return theta, ritz
     raise RuntimeError("Davidson solver did not converge within itermax iterations.")
 
 

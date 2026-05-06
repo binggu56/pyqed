@@ -62,6 +62,155 @@ def test_rhf_density_fit_matches_conventional_energy_and_jk():
     assert mf_df._pyscf_mf is not None
 
 
+def test_rhf_localize_orbitals_ibo_occ():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    c_ibo, occ_idx, info = mf.localize_orbitals(
+        method='ibo',
+        space='occ',
+        return_indices=True,
+        return_info=True,
+    )
+
+    expected_idx = np.flatnonzero(mf.mo_occ > 0.5)
+    np.testing.assert_array_equal(occ_idx, expected_idx)
+    assert c_ibo.shape == (mol.nao, mf.nocc)
+    assert info['method'] == 'ibo'
+    assert info['backend'] == 'native'
+    assert info['final_objective'] >= info['initial_objective'] - 1e-10
+
+    s = mf.get_ovlp()
+    np.testing.assert_allclose(c_ibo.T @ s @ c_ibo, np.eye(mf.nocc), atol=1e-8)
+
+
+def test_rhf_localize_orbitals_rejects_unsupported_space():
+    mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    with pytest.raises(ValueError, match="space='occ'"):
+        mf.localize_orbitals(method='ibo', space='vir')
+
+
+def test_rhf_localize_orbitals_ibo_custom_coeff_native_gbasis():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    coeff = mf.mo_coeff[:, :mf.nocc]
+
+    c_ibo, info = mf.localize_orbitals(
+        method='ibo',
+        mo_coeff=coeff,
+        return_info=True,
+    )
+
+    assert c_ibo.shape == coeff.shape
+    assert info['backend'] == 'native'
+    assert info['final_objective'] >= info['initial_objective'] - 1e-10
+
+    s = mf.get_ovlp()
+    np.testing.assert_allclose(c_ibo.T @ s @ c_ibo, np.eye(mf.nocc), atol=1e-8)
+
+
+def test_rhf_localize_orbitals_lm_custom_coeff_native_gbasis():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    coeff = mf.mo_coeff[:, :mf.nocc]
+
+    c_lm, info = mf.localize_orbitals(
+        method='lm',
+        mo_coeff=coeff,
+        return_info=True,
+    )
+
+    assert c_lm.shape == coeff.shape
+    assert info['method'] == 'lm'
+    assert info['backend'] == 'native'
+    assert info['population_metric'] == 'lowdin'
+    assert info['final_objective'] >= info['initial_objective'] - 1e-10
+
+    s = mf.get_ovlp()
+    np.testing.assert_allclose(c_lm.T @ s @ c_lm, np.eye(mf.nocc), atol=1e-8)
+
+
+def test_rhf_localize_orbitals_pm_custom_coeff_native_gbasis():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    coeff = mf.mo_coeff[:, :mf.nocc]
+
+    c_pm, info = mf.localize_orbitals(
+        method='pm',
+        mo_coeff=coeff,
+        return_info=True,
+    )
+
+    assert c_pm.shape == coeff.shape
+    assert info['method'] == 'pm'
+    assert info['backend'] == 'native'
+    assert info['population_metric'] == 'mulliken'
+    assert info['final_objective'] >= info['initial_objective'] - 1e-10
+
+    s = mf.get_ovlp()
+    np.testing.assert_allclose(c_pm.T @ s @ c_pm, np.eye(mf.nocc), atol=1e-8)
+
+
+def test_rhf_localize_orbitals_pipek_mezey_alias_native_gbasis():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    coeff = mf.mo_coeff[:, :mf.nocc]
+
+    c_pm, info = mf.localize_orbitals(
+        method='pipek-mezey',
+        mo_coeff=coeff,
+        return_info=True,
+    )
+
+    assert c_pm.shape == coeff.shape
+    assert info['method'] == 'pm'
+    assert info['population_metric'] == 'mulliken'
+
+
+def test_rhf_localize_orbitals_boys_custom_coeff_native_gbasis():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    coeff = mf.mo_coeff[:, :mf.nocc]
+
+    c_boys, info = mf.localize_orbitals(
+        method='boys',
+        mo_coeff=coeff,
+        return_info=True,
+    )
+
+    assert c_boys.shape == coeff.shape
+    assert info['method'] == 'boys'
+    assert info['final_objective'] >= info['initial_objective'] - 1e-10
+
+    s = mf.get_ovlp()
+    np.testing.assert_allclose(c_boys.T @ s @ c_boys, np.eye(mf.nocc), atol=1e-8)
+
+    r_ao = mol.moment_integral(center=np.zeros(3))
+    if r_ao.shape[-1] == 3:
+        r_ao = np.moveaxis(r_ao, -1, 0)
+    r_before = np.einsum('xij,ip,jq->xpq', r_ao, coeff, coeff, optimize=True)
+    r_after = np.einsum('xij,ip,jq->xpq', r_ao, c_boys, c_boys, optimize=True)
+    centers_before = np.diagonal(r_before, axis1=1, axis2=2).T
+    centers_after = np.diagonal(r_after, axis1=1, axis2=2).T
+    obj_before = np.sum(centers_before * centers_before)
+    obj_after = np.sum(centers_after * centers_after)
+    assert obj_after >= obj_before - 1e-10
+
+
 def test_cholesky_jk_factors_reproduce_dense_jk_for_tight_tolerance():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
     mol.build(driver='gbasis-pyscf')

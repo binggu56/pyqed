@@ -97,6 +97,13 @@ class DMRG:
             # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
             mps_list = self.init_guess
 
+        if not (self.symmetry and hasattr(mps_list[0], "qns")):
+            # The two-site sweep assumes environments are built from a
+            # canonical state.  Put dense initial guesses in right-canonical
+            # form so the first left-to-right local problem has an identity
+            # norm on the right block, matching the non-Abelian sweep contract.
+            mps_list = MPS(mps_list, labels=["lv", "p", "rv"]).right_canonicalize().factors
+
         mpo_list = self.H.factors if isinstance(self.H, MPO) else self.H
 
         if self.symmetry and not isinstance(mps_list[0], BlockTensor):

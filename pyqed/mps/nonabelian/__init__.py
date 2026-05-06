@@ -14,6 +14,15 @@ Short names are preferred inside this package.
 """
 
 from .tensor import FusionLeg, FusionEdge, FusionPipe, FusionPipeEntry, NonabelianTensor
+from .basis import (
+    BasisBlock,
+    SymmetryBasis,
+    SiteBasis,
+    BondBasis,
+    LocalLayoutEntry,
+    MetricOrthonormalization,
+    TwoSiteBasis,
+)
 from .mps import MPS
 from .coupling import (
     CouplingChannel,
@@ -36,28 +45,42 @@ from .mpo import (
     IrreducibleMPO,
     RankCoupledChannelTerm,
     RankCoupledMPO,
+    as_rank_coupled_mpo,
+    direct_sum_rank_coupled_mpo,
+    sum_mpo_chains,
 )
 from .builder import AutoMPO, identity_operator
 from .operators import (
     AdjointReducedTensorOperator,
+    CoupledReducedTensorProductOperator,
     ReducedTensorOperator,
+    TimeReversedReducedTensorOperator,
     compose_site_operators,
+    coupled_reduced_tensor_product,
     physical_leg_from_spatial_orbital,
     spatial_identity,
     spatial_number,
     spatial_number_up,
     spatial_number_down,
     spatial_double_occupancy,
+    spatial_pair_creation,
+    spatial_pair_annihilation,
     spatial_spin_square,
     spatial_projector,
     spatial_parity,
     reduced_spatial_fermion_annihilation,
+    time_reversed_reduced_operator,
     spatial_annihilate_up,
     spatial_create_up,
     spatial_annihilate_down,
     spatial_create_down,
 )
 from .models import (
+    SpatialSpinFreeERIBuilder,
+    add_spatial_one_body_terms,
+    build_spatial_one_body_reduced_mpo,
+    add_spatial_spinfree_eri_terms,
+    build_spatial_spinfree_eri_mpo,
     add_spatial_density_terms,
     build_spatial_density_mpo,
     add_spatial_hubbard_terms,
@@ -65,10 +88,13 @@ from .models import (
     build_spatial_hubbard_mpo,
 )
 from .states import (
+    FullyReducedSpatialOrbitalSite,
     spatial_target_sector,
     half_filled_singlet_sector,
     build_random_spatial_mps,
+    build_random_reduced_spatial_mps,
     build_product_spatial_mps,
+    build_reduced_product_spatial_mps,
     build_product_state,
     build_spin_spatial_mps,
 )
@@ -91,6 +117,7 @@ from .linalg import (
 )
 from .decompose import (
     svd_two_site,
+    state_averaged_svd_two_site,
 )
 from .canonical import (
     left_canonical_error,
@@ -107,12 +134,48 @@ from .solver import (
     ReducedDiagonalPreconditioner,
     PackedBlockPreconditioner,
     pack_two_site_state,
+    two_site_state_basis,
     unpack_two_site_state,
     solve_local_two_site,
+)
+from .local_operator import (
+    CompiledFactorizedBlock,
+    CompiledFactorizedTerms,
+    CompiledLocalActions,
+    CompiledPackedBlock,
+    CompiledPackedTransitions,
+    PackedOutputSegment,
+    apply_compiled_transition_reduced,
+    apply_compiled_packed_transitions,
+    apply_factorized_packed_terms,
+    apply_packed_transitions,
+    apply_transition_reduced,
+    apply_transition_tensor,
+    build_identity_mpo_local_actions,
+    compile_factorized_terms,
+    compile_packed_transitions,
+    diagonal_from_factorized_terms,
+    identity_env_to_matrix,
+    identity_mpo_transitions,
+    materialize_packed_csr,
+    materialize_packed_matrix,
+    transitions_are_identity_operator,
+)
+from .effective import (
+    EffectiveBlockOperator,
+)
+from .renormalized import (
+    RenormalizedBlockStack,
+    SymbolicMPOTransition,
+    SymbolicRenormalizedOperatorTable,
+    SymbolicRenormalizedOperatorTerm,
+    symbolic_mpo_core_transitions,
 )
 from .environment import (
     DenseEnvironmentChain,
     DenseEnvironmentSweep,
+    LeftBlock,
+    RightBlock,
     BlockSparseEnvironmentChain,
     BlockSparseEnvironmentSweep,
     build_dense_bond_operator,

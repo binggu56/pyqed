@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .basis import BondBasis
 from .contraction import split_legs
 from .coupling import normalize_coupling_scheme, reduced_bond_space
 from .linalg import (
@@ -17,6 +18,23 @@ from .linalg import (
     truncate_reduced_svds,
 )
 from .tensor import FusionLeg, FusionPipe, FusionPipeEntry, NonabelianTensor
+
+
+def _bond_basis_from_singular_values(singular_values, *, direction, name=None):
+    sectors = tuple(sorted(singular_values))
+    dims = {}
+    for sector in sectors:
+        values = np.asarray(singular_values[sector])
+        if values.ndim == 0:
+            dim = 1
+        else:
+            dim = int(values.shape[0])
+        if dim > 0:
+            dims[sector] = dim
+    sectors = tuple(sector for sector in sectors if sector in dims)
+    if not sectors:
+        raise ValueError("Cannot build a bond basis from an empty singular-value layout.")
+    return BondBasis(sectors=sectors, dims=dims, direction=direction, name=name)
 
 
 def _apply_singular_values_left(U_tensor, singular_values):
@@ -296,6 +314,16 @@ def svd_two_site(
     }
 
     singular_values = truncation.singular_values_by_sector()
+    right_bond_basis = _bond_basis_from_singular_values(
+        singular_values,
+        direction=1,
+        name="svd-right-bond",
+    )
+    left_bond_basis = _bond_basis_from_singular_values(
+        singular_values,
+        direction=-1,
+        name="svd-left-bond",
+    )
     bond_qns = truncation.bond_qns
     right_split_basis_map = {}
 
@@ -437,6 +465,7 @@ def svd_two_site(
             "svd_role": "left",
             "source": "svd_two_site",
             "bond_layouts": {2: left_output_layouts},
+            "bond_bases": {2: right_bond_basis},
         },
     )
     B_tensor = NonabelianTensor(
@@ -448,6 +477,7 @@ def svd_two_site(
             "svd_role": "right",
             "source": "svd_two_site",
             "bond_layouts": {0: right_output_layouts},
+            "bond_bases": {0: left_bond_basis},
         },
     )
 
@@ -494,13 +524,25 @@ def state_averaged_svd_two_site(
         raise ValueError("absorb must be 'left' or 'right'.")
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
 
-    ref_blocks_by_mid = {}
-    bond_entries = dict(_internal_bond_entries(ref))
-    for key, block in ref.data.items():
-        q_mid = bond_entries.get(key)
-        if q_mid is None:
-            raise ValueError(f"Missing contracted bond sector for key {key!r}.")
-        ref_blocks_by_mid.setdefault(q_mid, []).append((key, block))
+    blocks_by_mid = {}
+    mid_by_key = {}
+    for root in roots:
+        bond_entries = dict(_internal_bond_entries(root))
+        for key, block in root.data.items():
+            q_mid = bond_entries.get(key)
+            if q_mid is None:
+                raise ValueError(f"Missing contracted bond sector for key {key!r}.")
+            previous_mid = mid_by_key.setdefault(key, q_mid)
+            if previous_mid != q_mid:
+                raise ValueError(
+                    f"State-average roots assign key {key!r} to inconsistent bond sectors."
+                )
+            entries = blocks_by_mid.setdefault(q_mid, {})
+            if key in entries and entries[key].shape != block.shape:
+                raise ValueError(
+                    f"State-average roots use inconsistent block shapes for key {key!r}."
+                )
+            entries.setdefault(key, block)
 
     sector_svds = {}
     root_matrices_by_sector = {}
@@ -510,7 +552,8 @@ def state_averaged_svd_two_site(
     right_output_layouts = {}
     bond_coupling = normalize_coupling_scheme(bond_coupling, default="left")
 
-    for q_mid, ref_entries in ref_blocks_by_mid.items():
+    for q_mid, block_map in blocks_by_mid.items():
+        ref_entries = list(block_map.items())
         left_pipe, left_basis_map, left_channel_map = _build_side_pipe(
             ref_entries,
             q_mid,
@@ -597,6 +640,16 @@ def state_averaged_svd_two_site(
     kept = {q_mid: list(idxs) for q_mid, idxs in truncation.kept_indices_by_sector.items()}
 
     singular_values = truncation.singular_values_by_sector()
+    right_bond_basis = _bond_basis_from_singular_values(
+        singular_values,
+        direction=1,
+        name="state-averaged-svd-right-bond",
+    )
+    left_bond_basis = _bond_basis_from_singular_values(
+        singular_values,
+        direction=-1,
+        name="state-averaged-svd-left-bond",
+    )
     bond_qns = truncation.bond_qns
     right_split_basis_map = {}
 
@@ -728,6 +781,7 @@ def state_averaged_svd_two_site(
                 "svd_role": "left",
                 "source": source,
                 "bond_layouts": {2: left_output_layouts},
+                "bond_bases": {2: right_bond_basis},
             },
         )
         B_tensor = NonabelianTensor(
@@ -739,6 +793,7 @@ def state_averaged_svd_two_site(
                 "svd_role": "right",
                 "source": source,
                 "bond_layouts": {0: right_output_layouts},
+                "bond_bases": {0: left_bond_basis},
             },
         )
         return A_tensor, B_tensor

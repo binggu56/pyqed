@@ -84,12 +84,11 @@ def ci_hamiltonian_matrix(mc):
     if getattr(mc, "hcore", None) is None:
         raise ValueError("CASCI one-electron active Hamiltonian is not available.")
 
-    if hasattr(mc, "ensure_slater_condon_cache"):
-        sc1, sc2 = mc.ensure_slater_condon_cache()
-    else:
-        sc1, sc2 = mc.SC1, mc.SC2
-    if sc1 is None or sc2 is None:
-        raise ValueError("CASCI Slater-Condon cache is not initialized.")
+    # The active TDM builders use cached spin-string links and do not need the
+    # legacy all-pairs Slater-Condon tables.  Avoid constructing those tables in
+    # the coupled CASSCF path, where transition RDMs are evaluated repeatedly.
+    sc1 = getattr(mc, "SC1", None)
+    sc2 = getattr(mc, "SC2", None)
 
     h1e = np.asarray(mc.hcore)
     h2e = getattr(mc, "eri_so", None)
@@ -192,12 +191,11 @@ def _transition_rdms_with_core(mc, cibra, ciket, nmo=None):
     """
     Build transition 1/2-RDMs including inactive-core response blocks.
     """
-    if hasattr(mc, "ensure_slater_condon_cache"):
-        sc1, sc2 = mc.ensure_slater_condon_cache()
-    else:
-        sc1, sc2 = mc.SC1, mc.SC2
-    if sc1 is None or sc2 is None:
-        raise ValueError("CASCI Slater-Condon cache is not initialized.")
+    # These TDM builders use spin-string link contractions and do not require
+    # the legacy all-pairs Slater-Condon tables. Avoid building them in the
+    # coupled CASSCF response path.
+    sc1 = getattr(mc, "SC1", None)
+    sc2 = getattr(mc, "SC2", None)
 
     ncore = int(mc.ncore)
     ncas = int(mc.ncas)

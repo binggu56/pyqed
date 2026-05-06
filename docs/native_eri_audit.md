@@ -92,10 +92,10 @@ builtin AO builder must provide `mol.eri`.
 
 - `pyqed/qchem/tdscf/tdhf.py:151-161`
   Uses PySCF `ao2mo` to form full spin-orbital ERIs.
-- `pyqed/qchem/gw/G0W0.py:286-306`
+- `pyqed/gw/gw.py:286-306`
   Uses PySCF `ao2mo` to form full MO/spin-orbital ERIs.
-- `pyqed/qchem/gw/GW_BSE.py:68-75`
-  Same pattern as `G0W0.py`.
+- `pyqed/gw/bse.py:68-75`
+  Same pattern as `gw.py`.
 
 These are downstream full-integral consumers, but they are not blocked on
 the builtin `mol.build(driver="builtin")` path producing `mol.eri` specifically.

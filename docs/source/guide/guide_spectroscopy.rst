@@ -3,7 +3,7 @@ Nonlinear molecular spectroscopy
 
 
 Sum-of-states (SOS) for multilevel system
--------------------
+-----------------------------------------
 
 Computationally cheap and intuitive.
 

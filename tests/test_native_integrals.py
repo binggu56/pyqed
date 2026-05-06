@@ -46,6 +46,19 @@ def test_native_build_runs_rhf_without_external_integral_backends():
     assert np.isfinite(mf.e_tot)
 
 
+def test_builtin_build_accepts_short_eri_keyword_for_factors():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin', eri='factors')
+
+    assert mol.builtin_eri_representation == 'factors'
+    assert mol.eri is None
+    assert mol.eri_factors is not None
+
+    mf = mol.RHF().run()
+    assert mf.cholesky_jk
+    assert mf.eri_factors is not None
+
+
 def test_native_shell_generator_includes_f_cartesian_components():
     assert _shell(2) == [
         (2, 0, 0),

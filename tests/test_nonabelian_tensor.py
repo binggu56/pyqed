@@ -6,8 +6,10 @@ import pyqed.mps.nonabelian.solver as solver_mod
 import pyqed.mps.nonabelian.sweep as sweep_mod
 import pyqed.mps.nonabelian.update as update_mod
 from pyqed.mps.nonabelian import (
+    FullyReducedSpatialOrbitalSite,
     MPO,
     PhysicalLeg,
+    RankCoupledMPO,
     SiteOperator,
     AutoMPO,
     identity_operator,
@@ -17,11 +19,16 @@ from pyqed.mps.nonabelian import (
     FusionPipe,
     FusionPipeEntry,
     NonabelianTensor,
+    BondBasis,
+    SiteBasis,
+    MetricOrthonormalization,
+    TwoSiteBasis,
     tensordot,
     merge_mps_sites,
     combine_legs,
     split_legs,
     svd_two_site,
+    state_averaged_svd_two_site,
     left_canonicalize_sites,
     left_canonical_error,
     mixed_canonicalize_sites,
@@ -33,22 +40,32 @@ from pyqed.mps.nonabelian import (
     TwoSiteEffectiveH,
     ReducedStateLayout,
     ReducedStateVector,
+    ReducedDiagonalPreconditioner,
     PackedBlockPreconditioner,
     pack_two_site_state,
+    two_site_state_basis,
     unpack_two_site_state,
     solve_local_two_site,
     DenseEnvironmentChain,
     DenseEnvironmentSweep,
+    LeftBlock,
+    RightBlock,
+    CompiledLocalActions,
+    EffectiveBlockOperator,
     BlockSparseEnvironmentChain,
     BlockSparseEnvironmentSweep,
     build_dense_bond_operator,
     build_block_sparse_bond_operator,
     build_random_spatial_mps,
+    build_random_reduced_spatial_mps,
+    build_reduced_product_spatial_mps,
     build_product_state,
     build_product_spatial_mps,
+    build_spatial_one_body_reduced_mpo,
     build_spatial_hubbard_mpo,
     contract_chain_expectation,
     half_filled_singlet_sector,
+    physical_leg_from_spatial_orbital,
     spatial_identity,
     spatial_number,
     two_site_update,
@@ -82,6 +99,250 @@ def test_nonabelian_tensor_accepts_charge_su2_sector_labels():
     assert tensor.shape == (1, 1)
     assert tensor.has_nonabelian_symmetry is True
     assert (vac, dbl) in tensor.data
+
+
+def test_explicit_basis_descriptors_recover_tensor_axis_layouts():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    tensor = NonabelianTensor(
+        data={
+            (vac, spin): np.ones((2, 3)),
+            (spin, vac): np.ones((1, 4)),
+        },
+        qns=[[vac, vac, spin], [spin, vac]],
+        dirs=[-1, 1],
+    )
+
+    left = BondBasis.from_tensor_axis(tensor, 0, name="left")
+    phys = SiteBasis.from_tensor_axis(tensor, 1, name="phys")
+
+    assert left.sectors == (vac, spin)
+    assert left.dims == {vac: 2, spin: 1}
+    assert left.direction == -1
+    assert left.slices()[vac] == slice(0, 2)
+    assert phys.as_physical_leg().dim(spin) == 3
+    assert phys.as_physical_leg().dim(vac) == 4
+
+
+def test_two_site_basis_wraps_current_packed_layout_exactly():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    two_site = NonabelianTensor(
+        data={
+            (vac, spin, spin, vac): np.ones((1, 1, 1, 1)),
+            (spin, vac, spin, spin): np.ones((2, 1, 1, 2)),
+        },
+        qns=[[vac, spin], [spin, vac], [spin], [vac, spin, spin]],
+        dirs=[-1, 1, 1, 1],
+    )
+    vec, layout = pack_two_site_state(two_site)
+
+    basis = TwoSiteBasis.from_tensor_and_layout(two_site, layout)
+
+    assert basis.size == vec.size
+    assert basis.compatible_with_layout(layout)
+    assert basis.left.dims == {vac: 1, spin: 2}
+    assert basis.right.dims == {vac: 1, spin: 2}
+    assert basis.entry_for_key((spin, vac, spin, spin)).size == 4
+    assert basis.entry_index((spin, vac, spin, spin)) == 1
+    assert basis.index_by_key()[(vac, spin, spin, vac)] == 0
+    assert basis.slices()[(spin, vac, spin, spin)] == slice(1, 5)
+    assert basis.out_entries == tuple((entry.key, entry.shape) for entry in layout)
+    key, block = basis.basis_block(2, dtype=float)
+    assert key == (spin, vac, spin, spin)
+    assert block.shape == (2, 1, 1, 2)
+    assert block.reshape(-1).tolist() == [0.0, 1.0, 0.0, 0.0]
+    blocks = basis.blocks_from_packed(vec, drop_zeros=False)
+    np.testing.assert_allclose(basis.blocks_to_packed(blocks), vec)
+    accumulated = np.zeros_like(vec)
+    basis.add_packed_block(accumulated, (vac, spin, spin, vac), np.ones((1, 1, 1, 1)))
+    basis.add_packed_block(accumulated, basis.entry_for_key((spin, vac, spin, spin)), np.ones((2, 1, 1, 2)))
+    np.testing.assert_allclose(accumulated, vec)
+    tensor_blocks = basis.blocks_from_tensor_data(two_site.data, drop_zeros=False)
+    np.testing.assert_allclose(basis.blocks_to_packed(tensor_blocks), vec)
+    restored_data = basis.tensor_data_from_blocks({(vac, spin, spin, vac): np.ones((1, 1, 1, 1))})
+    assert set(restored_data) == {entry.key for entry in basis}
+    np.testing.assert_allclose(restored_data[(spin, vac, spin, spin)], np.zeros((2, 1, 1, 2)))
+    assert basis.metric_is_identity(np.eye(basis.size))
+
+
+def test_two_site_basis_metric_orthonormalization_transforms_dense_problem():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    two_site = NonabelianTensor(
+        data={
+            (vac, spin, spin, vac): np.ones((1, 1, 1, 1)),
+            (spin, vac, spin, spin): np.ones((2, 1, 1, 2)),
+        },
+        qns=[[vac, spin], [spin, vac], [spin], [vac, spin, spin]],
+        dirs=[-1, 1, 1, 1],
+    )
+    _vec, layout = pack_two_site_state(two_site)
+    basis = TwoSiteBasis.from_tensor_and_layout(two_site, layout)
+    rng = np.random.default_rng(12)
+    raw = rng.normal(size=(basis.size, basis.size))
+    metric = raw.T @ raw + 0.5 * np.eye(basis.size)
+    h_raw = rng.normal(size=(basis.size, basis.size))
+    h = 0.5 * (h_raw + h_raw.T)
+
+    orth = basis.metric_orthonormalization(metric)
+
+    assert isinstance(orth, MetricOrthonormalization)
+    np.testing.assert_allclose(
+        orth.transform.conj().T @ metric @ orth.transform,
+        np.eye(orth.size),
+        atol=1.0e-11,
+    )
+    h_orth = orth.operator_to_orthonormal(h)
+    y = rng.normal(size=orth.size)
+    x = orth.from_orthonormal_vector(y)
+    np.testing.assert_allclose(orth.to_orthonormal_vector(x), y, atol=1.0e-11)
+    np.testing.assert_allclose(
+        np.vdot(y, h_orth @ y),
+        np.vdot(x, h @ x),
+        atol=1.0e-11,
+    )
+
+
+def test_mps_exposes_bond_and_local_two_site_basis_objects():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    left_site = NonabelianTensor(
+        data={(vac, spin, spin): np.ones((1, 1, 2))},
+        qns=[[vac], [spin], [spin, spin]],
+        dirs=[-1, 1, 1],
+    )
+    right_site = NonabelianTensor(
+        data={(spin, vac, vac): np.ones((2, 1, 1))},
+        qns=[[spin, spin], [vac], [vac]],
+        dirs=[-1, 1, 1],
+    )
+    mps = MPS([left_site, right_site])
+
+    bond_basis = mps.bond_basis(0)
+    local_basis = mps.local_two_site_basis(0)
+
+    assert isinstance(bond_basis, BondBasis)
+    assert bond_basis.dims == {spin: 2}
+    assert local_basis.left.dims == {vac: 1}
+    assert local_basis.right.dims == {vac: 1}
+    assert local_basis.phys1.dims == {spin: 1}
+    assert local_basis.phys2.dims == {vac: 1}
+
+
+def test_reduced_state_layout_carries_explicit_two_site_basis():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    two_site = NonabelianTensor(
+        data={
+            (vac, spin, spin, vac): np.ones((1, 1, 1, 1)),
+            (spin, vac, spin, spin): np.ones((2, 1, 1, 2)),
+        },
+        qns=[[vac, spin], [spin, vac], [spin], [vac, spin, spin]],
+        dirs=[-1, 1, 1, 1],
+    )
+    vec, layout = pack_two_site_state(two_site)
+    basis = two_site_state_basis(two_site, layout=layout)
+
+    state_layout = ReducedStateLayout(tuple(layout), basis=basis)
+    state = state_layout.from_packed(vec)
+
+    assert state.layout.basis is basis
+    assert state.layout.basis.compatible_with_layout(layout)
+    assert state.layout.basis.size == vec.size
+    np.testing.assert_allclose(state.to_packed(), vec)
+    basis_state = state_layout.basis_vector(2, dtype=float)
+    assert basis_state.layout is state_layout
+    assert next(iter(basis_state.blocks)) == (spin, vac, spin, spin)
+    iterated = list(basis.iter_packed_blocks(vec, drop_zeros=False))
+    assert [entry.key for entry, _block in iterated] == [entry.key for entry in basis]
+    np.testing.assert_allclose(iterated[1][1], two_site.data[(spin, vac, spin, spin)])
+    rewritten = np.zeros_like(vec)
+    basis.write_packed_block(rewritten, iterated[1][0], iterated[1][1])
+    np.testing.assert_allclose(rewritten, np.array([0.0, 1.0, 1.0, 1.0, 1.0]))
+
+
+def test_compiled_reduced_transition_uses_basis_metadata():
+    vac = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    two_site = NonabelianTensor(
+        data={
+            (vac, spin, spin, vac): np.ones((1, 1, 1, 1)),
+            (spin, vac, spin, spin): np.ones((2, 1, 1, 2)),
+        },
+        qns=[[vac, spin], [spin, vac], [spin], [vac, spin, spin]],
+        dirs=[-1, 1, 1, 1],
+    )
+    vec, layout = pack_two_site_state(two_site)
+    basis = two_site_state_basis(two_site, layout=layout)
+    transitions = {
+        (vac, spin, spin, vac): ((0, np.eye(1)),),
+        (spin, vac, spin, spin): ((1, 2.0 * np.eye(4)),),
+    }
+
+    compiled = env_mod._compile_packed_transitions(transitions, basis)
+    state_layout = ReducedStateLayout(tuple(layout), basis=basis)
+    state = state_layout.from_packed(vec)
+    out = env_mod._apply_two_site_block_env_reduced_compiled(
+        compiled,
+        state,
+        base_dtype=float,
+    )
+
+    assert compiled.basis is basis
+    assert compiled.out_entries == basis.out_entries
+    assert compiled.items[0].input_entry is basis[0]
+    assert compiled.items[0].output_segments[0].offset == basis[0].offset
+    assert compiled.block_matrices[0].shape == (1, 1)
+    assert compiled.block_matrix_for(basis[1]).shape == (4, 4)
+    provider_preconditioner = PackedBlockPreconditioner.from_layout_blocks(basis, compiled)
+    assert provider_preconditioner.layout is basis
+    assert provider_preconditioner.h_blocks[1].shape == (4, 4)
+    assert out.layout is state_layout
+    np.testing.assert_allclose(out.to_packed(), np.array([1.0, 2.0, 2.0, 2.0, 2.0]))
+    np.testing.assert_allclose(compiled.apply_packed(vec, base_dtype=float), out.to_packed())
+    np.testing.assert_allclose(compiled.materialize_dense() @ vec, out.to_packed())
+    tensor_out = compiled.apply_tensor(two_site, base_dtype=float)
+    tensor_out_packed, _ = pack_two_site_state(tensor_out, layout=basis)
+    np.testing.assert_allclose(tensor_out_packed, out.to_packed())
+    packed_matvec = compiled.packed_matvec(base_dtype=float)
+    assert packed_matvec.backend == "compiled"
+    assert not hasattr(packed_matvec, "matrix")
+    assert packed_matvec.compiled_transitions is compiled
+    assert packed_matvec.block_matrices is compiled
+    np.testing.assert_allclose(packed_matvec(vec), out.to_packed())
+
+
+def test_fully_reduced_spatial_site_uses_multiplicity_only_local_dims():
+    site = FullyReducedSpatialOrbitalSite()
+    assert site.degeneracy == (1, 1, 1)
+
+    tensors = build_reduced_product_spatial_mps(["empty", "single", "double"])
+    assert all(tensor.metadata.get("physical_basis") == "fully_reduced_su2" for tensor in tensors)
+    assert all(tensor.data[next(iter(tensor.data))].shape[1] == 1 for tensor in tensors)
+
+
+def test_fully_reduced_random_spatial_mps_targets_boundary_sector():
+    target = half_filled_singlet_sector(4)
+    tensors = build_random_reduced_spatial_mps(4, target_sector=target, seed=11)
+
+    assert tensors[0].qns[0] == [physical_leg_from_spatial_orbital().sectors[0]]
+    assert tensors[-1].qns[2] == [target]
+    assert all(tensor.metadata.get("physical_basis") == "fully_reduced_su2" for tensor in tensors)
+    assert all(block.shape[1] == 1 for tensor in tensors for block in tensor.data.values())
+
+
+def test_fully_reduced_spatial_one_body_mpo_builds_with_reduced_leg():
+    leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    factors = build_spatial_one_body_reduced_mpo([leg, leg], np.diag([0.2, -0.1]))
+
+    assert len(factors) == 2
+    assert all(core.phys_out_leg == leg and core.phys_in_leg == leg for core in factors)
+
+
+def test_fully_reduced_spatial_product_rejects_spin_projection_labels():
+    with pytest.raises(ValueError, match="Fully reduced product MPS labels"):
+        build_reduced_product_spatial_mps(["up", "down"])
 
 
 def test_fusion_leg_exposes_richer_per_leg_metadata():
@@ -328,6 +589,10 @@ def test_merge_and_svd_two_site_nonabelian_round_trip():
     assert bond in singular_values
     assert A_new.fusion_legs[2].pipe is not None
     assert B_new.fusion_legs[0].pipe is not None
+    assert isinstance(A_new.metadata["bond_bases"][2], BondBasis)
+    assert isinstance(B_new.metadata["bond_bases"][0], BondBasis)
+    assert A_new.metadata["bond_bases"][2].dual_compatible_with(B_new.metadata["bond_bases"][0])
+    assert MPS([A_new, B_new]).bond_basis(0) is A_new.metadata["bond_bases"][2]
     np.testing.assert_allclose(
         AA_rebuilt.data[(left, phys_left, phys_right, right)],
         AA.data[(left, phys_left, phys_right, right)],
@@ -360,6 +625,65 @@ def test_svd_two_site_respects_requested_bond_coupling():
 
     assert A_new.fusion_legs[2].pipe.coupling == "right"
     assert B_new.fusion_legs[0].pipe.coupling == "right"
+
+
+def test_state_averaged_svd_keeps_sectors_present_only_in_excited_roots():
+    left = _charge_spin_sector(0, 0)
+    bond_a = _charge_spin_sector(1, 1)
+    bond_b = _charge_spin_sector(1, 3)
+    right = _charge_spin_sector(2, 0)
+    phys_a = _charge_spin_sector(1, 1)
+    phys_b = _charge_spin_sector(1, 3)
+    phys_right = _charge_spin_sector(1, 1)
+    bond_leg = FusionLeg(child_legs=(0, 2))
+
+    A = NonabelianTensor(
+        data={
+            (left, bond_a, phys_a): np.ones((1, 1, 1)),
+            (left, bond_b, phys_b): np.ones((1, 1, 1)),
+        },
+        qns=[[left], [bond_a, bond_b], [phys_a, phys_b]],
+        dirs=[-1, 1, 1],
+        fusion_legs=[None, bond_leg, None],
+    )
+    B = NonabelianTensor(
+        data={
+            (bond_a, right, phys_right): np.ones((1, 1, 1)),
+            (bond_b, right, phys_right): np.ones((1, 1, 1)),
+        },
+        qns=[[bond_a, bond_b], [right], [phys_right]],
+        dirs=[-1, 1, 1],
+        fusion_legs=[bond_leg, None, None],
+    )
+    merged = merge_mps_sites(A, B)
+    key_a = (left, phys_a, phys_right, right)
+    key_b = (left, phys_b, phys_right, right)
+    root_a = NonabelianTensor(
+        {key_a: merged.data[key_a]},
+        [leg[:] for leg in merged.qns],
+        merged.dirs[:],
+        fusion_legs=merged.fusion_legs[:],
+        metadata=merged.metadata.copy(),
+    )
+    root_b = NonabelianTensor(
+        {key_b: merged.data[key_b]},
+        [leg[:] for leg in merged.qns],
+        merged.dirs[:],
+        fusion_legs=merged.fusion_legs[:],
+        metadata=merged.metadata.copy(),
+    )
+
+    _, _, singular_values, _, kept, root_pairs = state_averaged_svd_two_site(
+        [root_a, root_b],
+        [0.5, 0.5],
+        max_bond=8,
+        cutoff=0.0,
+    )
+
+    assert bond_a in singular_values
+    assert bond_b in singular_values
+    assert kept == 2
+    assert len(root_pairs) == 2
 
 
 def test_svd_two_site_handles_multi_channel_reduced_bases(monkeypatch):
@@ -681,13 +1005,19 @@ def test_two_site_update_can_prefer_aux_reduced_local_operator():
 
     merged = merge_mps_sites(A, B)
     vec, layout = pack_two_site_state(merged)
+    basis = two_site_state_basis(merged, layout=layout)
     diagonal = np.arange(vec.size, dtype=float)
     state_layout = ReducedStateLayout(tuple(layout))
+    seen_basis = []
 
     def tensor_matvec(_tensor):
         raise AssertionError("tensor_matvec should not be used when prefer_reduced_local_operator=True")
 
     def reduced_matvec(state):
+        assert isinstance(state.layout.basis, TwoSiteBasis)
+        assert state.layout.basis is basis
+        assert state.layout.basis.compatible_with_layout(layout)
+        seen_basis.append(state.layout.basis)
         return ReducedStateVector(
             layout=state.layout,
             blocks={
@@ -700,6 +1030,7 @@ def test_two_site_update_can_prefer_aux_reduced_local_operator():
     operator = LocalOperator(
         tensor_matvec=tensor_matvec,
         aux_reduced_matvec=reduced_matvec,
+        basis=basis,
         diag=diagonal,
         name="diag-with-aux-reduced",
     )
@@ -715,6 +1046,7 @@ def test_two_site_update_can_prefer_aux_reduced_local_operator():
 
     assert update["local_objective"]["energy"] == pytest.approx(0.0)
     assert update["local_objective"]["operator_representation"] == "reduced"
+    assert seen_basis
 
 
 def test_solve_local_two_site_coupled_auto_can_use_aux_reduced_operator():
@@ -927,6 +1259,147 @@ def test_packed_block_preconditioner_solves_per_block_systems():
     expected1 = np.linalg.solve(theta * np.array([[2.0]]) - np.array([[3.0]]) + 1e-10 * np.eye(1), resid[2:])
     np.testing.assert_allclose(corrected[:2], expected0)
     np.testing.assert_allclose(corrected[2:], expected1)
+
+
+def test_packed_block_preconditioner_lazily_queries_block_provider():
+    layout = (
+        solver_mod.PackedEntry(("a",), (2,), 0, 2),
+        solver_mod.PackedEntry(("b",), (1,), 2, 1),
+    )
+
+    class Provider:
+        def __init__(self):
+            self.calls = []
+
+        def block_matrix_for(self, entry):
+            self.calls.append(entry.key)
+            return np.eye(entry.size)
+
+    provider = Provider()
+    preconditioner = PackedBlockPreconditioner.from_layout_blocks(
+        layout,
+        h_blocks=provider,
+    )
+
+    assert provider.calls == []
+    np.testing.assert_allclose(
+        preconditioner.apply(np.array([0.0, 0.0, 2.0]), theta=3.0),
+        np.array([0.0, 0.0, 1.0]),
+    )
+    assert provider.calls == [("b",)]
+
+
+def test_target_projector_skips_large_approximation_without_explicit_dimension():
+    layout = (
+        solver_mod.PackedEntry(("a",), (2,), 0, 2),
+        solver_mod.PackedEntry(("b",), (1,), 2, 1),
+    )
+    operator = solver_mod.LocalOperator(
+        matrix=np.diag([0.0, 0.0, 2.0]),
+    )
+
+    basis, values = solver_mod._target_projector_basis(
+        operator,
+        None,
+        layout,
+        target_value=0.0,
+        target_tol=1.0e-8,
+        min_dim=2,
+        target_dim=None,
+        dense_dim=1,
+    )
+
+    assert basis is None
+    assert values is None
+
+
+def test_block_target_projector_extracts_target_sector_exactly():
+    layout = (
+        solver_mod.PackedEntry(("singlets",), (2,), 0, 2),
+        solver_mod.PackedEntry(("triplet",), (1,), 2, 1),
+    )
+    operator = solver_mod.LocalOperator(
+        matrix=np.diag([0.0, 0.0, 2.0]),
+    )
+
+    basis, values = solver_mod._target_projector_basis_by_blocks(
+        operator,
+        None,
+        layout,
+        target_value=0.0,
+        target_tol=1.0e-8,
+        min_dim=2,
+        max_block_size=2,
+    )
+
+    assert basis.shape == (3, 2)
+    np.testing.assert_allclose(values, np.array([0.0, 0.0]))
+    np.testing.assert_allclose(basis.conj().T @ basis, np.eye(2))
+    np.testing.assert_allclose(basis[2], np.zeros(2))
+
+
+def test_block_target_projector_rejects_cross_sector_coupling():
+    layout = (
+        solver_mod.PackedEntry(("a",), (1,), 0, 1),
+        solver_mod.PackedEntry(("b",), (1,), 1, 1),
+    )
+    operator = solver_mod.LocalOperator(
+        matrix=np.array([[0.0, 1.0], [1.0, 0.0]]),
+    )
+
+    basis, values = solver_mod._target_projector_basis_by_blocks(
+        operator,
+        None,
+        layout,
+        target_value=0.0,
+        target_tol=1.0e-8,
+        min_dim=1,
+        max_block_size=1,
+        offdiag_tol=1.0e-12,
+    )
+
+    assert basis is None
+    assert values is None
+
+
+def test_preconditioners_accept_two_site_basis_layout():
+    left = _charge_spin_sector(0, 0)
+    spin = _charge_spin_sector(1, 1)
+    right = _charge_spin_sector(2, 0)
+    two_site = NonabelianTensor(
+        data={
+            (left, spin, spin, right): np.zeros((2, 1, 1, 1)),
+            (spin, left, spin, spin): np.zeros((1, 1, 1, 1)),
+        },
+        qns=[[left, spin], [spin, left], [spin], [right, spin]],
+        dirs=[-1, 1, 1, 1],
+    )
+    _vec, layout = pack_two_site_state(two_site)
+    basis = two_site_state_basis(two_site, layout=layout)
+    h_diag = np.array([2.0, 1.0, 3.0])
+    n_diag = np.array([1.0, 1.0, 2.0])
+
+    state_layout = ReducedStateLayout(basis.entries, basis=basis)
+    reduced = ReducedDiagonalPreconditioner.from_packed_diagonals(
+        basis,
+        h_diag,
+        n_diag=n_diag,
+    )
+    resid = state_layout.from_packed(np.array([1.0, -2.0, 4.0]))
+    corrected = reduced.apply(resid, theta=5.0).to_packed()
+
+    np.testing.assert_allclose(corrected, np.array([1.0 / 3.0, -2.0 / 4.0, 4.0 / 7.0]))
+
+    packed = PackedBlockPreconditioner.from_layout_blocks(
+        basis,
+        h_blocks=(np.diag([2.0, 1.0]), np.array([[3.0]])),
+        n_blocks=(np.eye(2), np.array([[2.0]])),
+    )
+    assert packed.layout is basis
+    np.testing.assert_allclose(
+        packed.apply(np.array([1.0, -2.0, 4.0]), theta=5.0),
+        np.array([1.0 / (3.0 + 1e-10), -2.0 / (4.0 + 1e-10), 4.0 / (7.0 + 1e-10)]),
+    )
 
 
 def test_solve_local_two_site_accepts_reduced_local_operator():
@@ -1637,6 +2110,38 @@ def test_block_sparse_identity_norm_operator_can_be_marked_canonical():
     assert operator.identity_like is True
 
 
+def test_block_sparse_environment_chain_uses_explicit_block_objects():
+    sites = build_product_spatial_mps(["full", "empty", "full", "empty"])
+    mpo = build_spatial_hubbard_mpo(
+        sites,
+        hopping_t=1.0,
+        onsite_u=4.0,
+        chemical_potential=2.0,
+    )
+
+    env = BlockSparseEnvironmentChain.build(sites, mpo)
+    sweep = env.start_sweep("lr")
+    merged = merge_mps_sites(sites[1], sites[2])
+    effective = env.effective_block_operator(1, merged)
+    compiled = effective.compile_actions()
+    operator = effective.to_local_operator()
+
+    assert isinstance(env.left_envs[0], LeftBlock)
+    assert isinstance(env.right_envs[-1], RightBlock)
+    assert isinstance(sweep.current_env, LeftBlock)
+    assert isinstance(effective, EffectiveBlockOperator)
+    assert isinstance(compiled, CompiledLocalActions)
+    assert effective.left_block is env.left_envs[1]
+    assert effective.right_block is env.right_envs[2]
+    assert compiled.basis is effective.basis
+    assert compiled.to_local_operator().basis is effective.basis
+    assert operator.basis is effective.basis
+    np.testing.assert_allclose(operator.diag, effective.diagonal())
+    np.testing.assert_allclose(compiled.diag, operator.diag)
+    assert sweep.current_env.rank_coupled is env.rank_coupled
+    assert sweep.current_env.copy().expectation() == pytest.approx(sweep.current_env.expectation())
+
+
 def test_right_canonicalize_sites_preserves_state_energy_and_gauge():
     sites = build_product_spatial_mps(["full", "empty", "full", "empty"])
     mpo = build_spatial_hubbard_mpo(
@@ -1823,6 +2328,7 @@ def test_small_coupled_norm_problem_can_use_orthonormalized_dense_path():
 
     assert objective_ortho["effective_local_problem"] == "orthonormalized_dense"
     assert objective_ortho["coupled_physical_used"] is True
+    assert objective_ortho["orthonormal_basis"] == "TwoSiteBasis"
     assert objective_ortho["energy"] == pytest.approx(objective_generalized["energy"])
     _assert_same_tensor(optimized_ortho, optimized_generalized)
 
@@ -1894,6 +2400,63 @@ def test_mixed_canonical_interior_bond_can_use_uncoupled_orthonormalized_dense_p
             optimized_gen.data[key],
             atol=1e-6,
             rtol=1e-6,
+        )
+
+
+def test_uncoupled_orthonormalized_dense_path_uses_two_site_basis_metric_transform():
+    left = _charge_spin_sector(0, 0)
+    phys_left = _charge_spin_sector(1, 1)
+    phys_right = _charge_spin_sector(1, 1)
+    right = _charge_spin_sector(0, 0)
+    initial = np.array([0.1, 0.5, -0.3, 0.2])
+    merged = NonabelianTensor(
+        data={(left, phys_left, phys_right, right): initial.reshape(1, 2, 2, 1)},
+        qns=[[left], [phys_left], [phys_right], [right]],
+        dirs=[-1, 1, 1, 1],
+    )
+    rng = np.random.default_rng(16)
+    raw_norm = rng.normal(size=(4, 4))
+    norm_operator = raw_norm.T @ raw_norm + 0.4 * np.eye(4)
+    raw_h = rng.normal(size=(4, 4))
+    operator = 0.5 * (raw_h + raw_h.T)
+
+    optimized_gen, objective_gen = solve_local_two_site(
+        merged,
+        operator,
+        norm_operator=norm_operator,
+        couple_physical=False,
+        tol=1e-10,
+        itermax=50,
+        dense_fallback_dim=64,
+        orthonormalized_dense_dim=1,
+    )
+    optimized_ortho, objective_ortho = solve_local_two_site(
+        merged,
+        operator,
+        norm_operator=norm_operator,
+        couple_physical=False,
+        tol=1e-10,
+        itermax=50,
+        dense_fallback_dim=512,
+        orthonormalized_dense_dim=2048,
+        orthonormalize_generalized_dim=2048,
+    )
+
+    assert objective_gen["effective_local_problem"] == "generalized"
+    assert objective_ortho["effective_local_problem"] == "orthonormalized_dense"
+    assert objective_ortho["orthonormal_basis"] == "TwoSiteBasis"
+    assert objective_ortho["coupled_physical_skipped"] == "metric_orthonormalized_generalized_path"
+    assert objective_ortho["energy"] == pytest.approx(objective_gen["energy"])
+    assert optimized_ortho.qns == optimized_gen.qns
+    assert optimized_ortho.dirs == optimized_gen.dirs
+    assert optimized_ortho.fusion_legs == optimized_gen.fusion_legs
+    assert set(optimized_ortho.data) == set(optimized_gen.data)
+    for key in optimized_ortho.data:
+        np.testing.assert_allclose(
+            optimized_ortho.data[key],
+            optimized_gen.data[key],
+            atol=1e-8,
+            rtol=1e-8,
         )
 
 
@@ -2029,7 +2592,23 @@ def test_block_sparse_hubbard_compiled_packed_backend_matches_dense_reference():
     op_dense = DenseEnvironmentChain.build(sites, mpo).bond_operator(1, merged)
     packed, layout = pack_two_site_state(merged)
 
-    assert getattr(op_sparse.aux_packed_matvec, "backend", None) in {"compiled", "compiled-dense", "compiled-csr"}
+    assert isinstance(op_sparse.basis, TwoSiteBasis)
+    assert isinstance(op_dense.basis, TwoSiteBasis)
+    assert op_sparse.basis.compatible_with_layout(layout)
+    assert getattr(op_sparse.aux_packed_matvec, "basis", None) is op_sparse.basis
+    compiled = (
+        getattr(op_sparse.aux_packed_matvec, "compiled_transitions", None)
+        or getattr(op_sparse.aux_packed_matvec, "compiled_factorized_terms", None)
+    )
+    assert getattr(compiled, "basis", None) is op_sparse.basis
+    packed_from_basis, _ = pack_two_site_state(merged, layout=op_sparse.basis)
+    np.testing.assert_allclose(packed_from_basis, packed)
+    assert getattr(op_sparse.aux_packed_matvec, "backend", None) in {
+        "compiled",
+        "compiled-dense",
+        "compiled-csr",
+        "rank-coupled-factorized-batched",
+    }
     dense_ref, _ = pack_two_site_state(
         op_dense.tensor_matvec(unpack_two_site_state(packed, merged, layout=layout)),
         layout=layout,
@@ -2056,11 +2635,51 @@ def test_block_sparse_hubbard_packed_backend_matches_dense_reference(monkeypatch
     op_dense = DenseEnvironmentChain.build(sites, mpo).bond_operator(1, merged)
     packed, layout = pack_two_site_state(merged)
 
-    assert getattr(op_sparse.aux_packed_matvec, "backend", None) == "factorized-batched"
+    assert getattr(op_sparse.aux_packed_matvec, "backend", None) == "rank-coupled-factorized-batched"
     dense_ref, _ = pack_two_site_state(
         op_dense.tensor_matvec(unpack_two_site_state(packed, merged, layout=layout)),
         layout=layout,
     )
+    np.testing.assert_allclose(
+        op_sparse.aux_packed_matvec(packed),
+        dense_ref,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_rank_coupled_block_sparse_local_operator_avoids_dense_virtual_expansion(monkeypatch):
+    sites = build_random_spatial_mps(4, seed=7, bond_multiplicity=4)
+    mpo = build_spatial_hubbard_mpo(
+        sites,
+        hopping_t=1.0,
+        onsite_u=4.0,
+        chemical_potential=0.0,
+    )
+    merged = merge_mps_sites(sites[1], sites[2])
+    packed, layout = pack_two_site_state(merged)
+    op_dense = DenseEnvironmentChain.build(sites, mpo).bond_operator(1, merged)
+    dense_ref, _ = pack_two_site_state(
+        op_dense.tensor_matvec(unpack_two_site_state(packed, merged, layout=layout)),
+        layout=layout,
+    )
+
+    def fail_block(self, phys_out, phys_in):
+        raise AssertionError("RankCoupledMPO.block should not be used by the rank-coupled local path")
+
+    monkeypatch.setattr(RankCoupledMPO, "block", fail_block)
+    op_sparse = BlockSparseEnvironmentChain.build(sites, mpo).bond_operator(1, merged)
+
+    assert getattr(op_sparse.aux_packed_matvec, "backend", "") == "rank-coupled-factorized-batched"
+    compiled = getattr(op_sparse.aux_packed_matvec, "compiled_factorized_terms", None)
+    first_term = next(term for terms in compiled.items for term in terms)
+    assert first_term.output_entry in op_sparse.basis.entries
+    assert first_term.output_shape == first_term.output_entry.shape
+    assert compiled.packed_matvec(
+        base_dtype=float,
+        backend="rank-coupled-factorized-batched",
+        out_entries=op_sparse.aux_packed_matvec.out_entries,
+    ).compiled_factorized_terms is compiled
     np.testing.assert_allclose(
         op_sparse.aux_packed_matvec(packed),
         dense_ref,
@@ -2791,6 +3410,10 @@ def test_mpo_sweep_product_state_uses_canonical_gauge_from_start():
     updates = sweep["updates"]
     assert updates[0]["local_objective"]["effective_local_problem"] == "standard"
     assert updates[1]["local_objective"]["effective_local_problem"] == "standard"
+    assert updates[1]["local_objective"]["operator_representation"] == "reduced"
+    assert updates[1]["local_objective"]["dense_fallback"] is False
+    assert updates[1]["local_objective"]["block_preconditioner"] is True
+    assert updates[1]["local_objective"]["packed_matvec_backend"] == "rank-coupled-factorized-batched"
     assert updates[0]["local_objective"]["post_update_energy"] == pytest.approx(0.0)
     assert updates[1]["local_objective"]["post_update_energy"] == pytest.approx(
         -0.8284271247461902
@@ -3030,11 +3653,65 @@ def test_reduced_truncation_helper_uses_shared_su2_state_budget():
         max_bond=1,
         mode="states",
     )
+    per_sector = truncate_reduced_svds(
+        {singlet: singlet_svd, doublet: doublet_svd},
+        max_bond=1,
+        mode="per_sector",
+    )
 
     assert reduced.kept == 1
     assert states.kept == 1
+    assert per_sector.kept == 2
     assert tuple(reduced.singular_values_by_sector()) == (doublet,)
     assert tuple(states.singular_values_by_sector()) == (singlet,)
+    assert tuple(per_sector.singular_values_by_sector()) == (singlet, doublet)
+
+
+def test_reduced_truncation_ranks_multiplets_by_weighted_norm():
+    singlet = _charge_spin_sector(0, 0)
+    triplet = _charge_spin_sector(2, 2)
+
+    def _single_channel_projection(sector, value):
+        key = ((sector,), (1,), 0)
+        pipe = FusionPipe.from_entries(
+            child_legs=(0,),
+            child_sector_lists=((sector,),),
+            child_dirs=(1,),
+            fused_sectors=(sector,),
+            entries=(
+                FusionPipeEntry(
+                    child_sectors=(sector,),
+                    fused_sector=sector,
+                    slot=0,
+                    offset=0,
+                    local_dim=1,
+                    selected_shape=(1,),
+                ),
+            ),
+            orientation=1,
+            coupling="left",
+        )
+        return ReducedProjectedSector(
+            sector=sector,
+            left_pipe=pipe,
+            right_pipe=pipe,
+            left_basis_map={key: np.eye(1)},
+            right_basis_map={key: np.eye(1)},
+            blocks={(key, key): np.array([[value]])},
+            dtype=float,
+        )
+
+    singlet_svd = _single_channel_projection(singlet, 1.0).svd(full_matrices=False)
+    triplet_svd = _single_channel_projection(triplet, 0.7).svd(full_matrices=False)
+
+    truncation = truncate_reduced_svds(
+        {singlet: singlet_svd, triplet: triplet_svd},
+        max_bond=1,
+        mode="reduced",
+    )
+
+    assert tuple(truncation.singular_values_by_sector()) == (triplet,)
+    assert truncation.trunc_err == pytest.approx(1.0 / (1.0 + 3.0 * 0.7**2))
 
 
 def test_combine_and_split_legs_round_trip():

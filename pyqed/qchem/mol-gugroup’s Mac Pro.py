@@ -86,6 +86,7 @@ _BUILTIN_OPTION_SPECS = (
     ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 0.0),
+    ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "dense"),
     ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
@@ -146,6 +147,71 @@ def _normalize_builtin_options(options, strict=False):
         unknown = ", ".join(sorted(tmp))
         raise ValueError(f"Unknown builtin build option(s): {unknown}")
     return normalized
+
+
+_ANGULAR_LETTERS = "spdfghijklmno"
+
+
+def _basis_shell_signature(basis_fn):
+    return (
+        tuple(int(x) for x in getattr(basis_fn, "shell")),
+        tuple(float(x) for x in np.asarray(getattr(basis_fn, "origin"), dtype=float)),
+        tuple(float(x) for x in getattr(basis_fn, "exps")),
+    )
+
+
+def _basis_contracted_shell_signature(basis_fn):
+    shell = tuple(int(x) for x in getattr(basis_fn, "shell"))
+    return (
+        sum(shell),
+        tuple(float(x) for x in np.asarray(getattr(basis_fn, "origin"), dtype=float)),
+        tuple(float(x) for x in getattr(basis_fn, "exps")),
+    )
+
+
+def _cartesian_component_label(shell):
+    lx, ly, lz = (int(x) for x in shell)
+    l = lx + ly + lz
+    if l == 0:
+        return ""
+
+    parts = []
+    if lx:
+        parts.append("x" if lx == 1 else f"x{lx}")
+    if ly:
+        parts.append("y" if ly == 1 else f"y{ly}")
+    if lz:
+        parts.append("z" if lz == 1 else f"z{lz}")
+    return "".join(parts)
+
+
+def _spherical_component_labels(l):
+    if l == 0:
+        return [""]
+    if l == 1:
+        return ["x", "y", "z"]
+    if l == 2:
+        return ["xy", "yz", "z2", "xz", "x2-y2"]
+    if l == 3:
+        return ["m-3", "m-2", "m-1", "m0", "m+1", "m+2", "m+3"]
+    return [f"m{m:+d}" if m != 0 else "m0" for m in range(-l, l + 1)]
+
+
+def _angular_shell_name(l, shell_count):
+    if l >= len(_ANGULAR_LETTERS):
+        raise ValueError(f"Angular momentum l={l} is not supported for AO labeling.")
+    return f"{shell_count + l}{_ANGULAR_LETTERS[l]}"
+
+
+def _match_atom_index_from_origin(atom_coords, origin, tol=1e-8):
+    deltas = atom_coords - origin[None, :]
+    idx = int(np.argmin(np.linalg.norm(deltas, axis=1)))
+    if not np.allclose(atom_coords[idx], origin, atol=tol, rtol=0.0):
+        raise ValueError(
+            "Failed to match a basis-function center to an atom. "
+            "AO labeling requires atom-centered Gaussian basis functions."
+        )
+    return idx
 # pointer to env
 PTR_EXPCUTOFF   = 0
 PTR_COMMON_ORIG = 1
@@ -1062,6 +1128,7 @@ class Molecule:
         self.builtin_eri_workers = self.builtin_options["eri_workers"]
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
+        self.builtin_eri_backend = self.builtin_options["eri_backend"]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
         self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
         self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
@@ -1069,10 +1136,12 @@ class Molecule:
 
         # Backward-compatible aliases for the older native_* API.
         self.native_options = self.builtin_options
+        self.native_coord_type = self.builtin_coord_type
         self.native_parallel = self.builtin_parallel
         self.native_eri_workers = self.builtin_eri_workers
         self.native_parallel_min_nao = self.builtin_parallel_min_nao
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
+        self.native_eri_backend = self.builtin_eri_backend
         self.native_eri_representation = self.builtin_eri_representation
         self.native_low_rank_tol = self.builtin_low_rank_tol
         self.native_low_rank_max_rank = self.builtin_low_rank_max_rank
@@ -1242,6 +1311,113 @@ class Molecule:
         from gbasis.integrals.momentum import momentum_integral
 
         return momentum_integral(self.basis)
+
+    def ao_labels(self):
+        """
+        Native AO labels derived from the built basis metadata.
+
+        Returns
+        -------
+        list[str]
+            One label per AO in the current `mol.nao` ordering.
+        """
+        basis = self._bas
+        if basis is None:
+            raise ValueError("Build molecular integrals before requesting AO labels.")
+
+        atom_coords = np.asarray(self.atom_coords(), dtype=float)
+        atom_symbols = self.atom_symbols()
+        labels = []
+
+        if len(basis) > 0 and hasattr(basis[0], 'angmom') and not hasattr(basis[0], 'shell'):
+            shell_counts = {}
+            shell_labels = {}
+            for basis_shell in basis:
+                l = int(basis_shell.angmom)
+                atom_idx = getattr(basis_shell, 'icenter', None)
+                if atom_idx is None:
+                    atom_idx = _match_atom_index_from_origin(
+                        atom_coords, np.asarray(basis_shell.coord, dtype=float)
+                    )
+                else:
+                    atom_idx = int(atom_idx)
+
+                shell_key = (
+                    atom_idx,
+                    l,
+                    tuple(float(x) for x in np.asarray(basis_shell.coord, dtype=float)),
+                    tuple(float(x) for x in np.asarray(basis_shell.exps, dtype=float)),
+                )
+                if shell_key not in shell_labels:
+                    shell_counts[(atom_idx, l)] = shell_counts.get((atom_idx, l), 0) + 1
+                    shell_labels[shell_key] = _angular_shell_name(l, shell_counts[(atom_idx, l)])
+                shell_name = shell_labels[shell_key]
+
+                coord_type = str(getattr(basis_shell, 'coord_type', 'spherical')).lower()
+                if coord_type.startswith('cart'):
+                    components = [
+                        _cartesian_component_label(shell)
+                        for shell in np.asarray(basis_shell.angmom_components_cart, dtype=int)
+                    ]
+                else:
+                    components = _spherical_component_labels(l)
+
+                for component in components:
+                    labels.append(f"{atom_idx} {atom_symbols[atom_idx]} {shell_name}{component}")
+
+            if len(labels) != self.nao:
+                raise ValueError("AO label count does not match mol.nao.")
+            return labels
+
+        if getattr(self, 'cart', False) or self._ao_cart2sph is None or len(basis) == self.nao:
+            shell_counts = {}
+            shell_labels = {}
+            for basis_fn in basis:
+                shell = tuple(int(x) for x in basis_fn.shell)
+                l = sum(shell)
+                atom_idx = _match_atom_index_from_origin(
+                    atom_coords, np.asarray(basis_fn.origin, dtype=float)
+                )
+                shell_key = (atom_idx, l, _basis_contracted_shell_signature(basis_fn))
+                if shell_key not in shell_labels:
+                    shell_counts[(atom_idx, l)] = shell_counts.get((atom_idx, l), 0) + 1
+                    shell_labels[shell_key] = _angular_shell_name(l, shell_counts[(atom_idx, l)])
+                shell_name = shell_labels[shell_key]
+                component = _cartesian_component_label(shell)
+                labels.append(f"{atom_idx} {atom_symbols[atom_idx]} {shell_name}{component}")
+            if len(labels) != self.nao:
+                raise ValueError("AO label count does not match mol.nao.")
+            return labels
+
+        shell_counts = {}
+        shell_labels = {}
+        start = 0
+        nao_cart = len(basis)
+        while start < nao_cart:
+            basis_fn = basis[start]
+            sig = _basis_shell_signature(basis_fn)
+            shell = tuple(int(x) for x in basis_fn.shell)
+            l = sum(shell)
+            ncart = (l + 1) * (l + 2) // 2
+            stop = start + ncart
+            if stop > nao_cart or any(_basis_shell_signature(basis[k]) != sig for k in range(start, stop)):
+                raise ValueError("Invalid Cartesian shell ordering while building AO labels.")
+
+            atom_idx = _match_atom_index_from_origin(
+                atom_coords, np.asarray(basis_fn.origin, dtype=float)
+            )
+            shell_key = (atom_idx, l, _basis_contracted_shell_signature(basis_fn))
+            if shell_key not in shell_labels:
+                shell_counts[(atom_idx, l)] = shell_counts.get((atom_idx, l), 0) + 1
+                shell_labels[shell_key] = _angular_shell_name(l, shell_counts[(atom_idx, l)])
+            shell_name = shell_labels[shell_key]
+            for component in _spherical_component_labels(l):
+                labels.append(f"{atom_idx} {atom_symbols[atom_idx]} {shell_name}{component}")
+            start = stop
+
+        if len(labels) != self.nao:
+            raise ValueError("AO label count does not match spherical mol.nao.")
+        return labels
 
 
     def topyscf(self):
@@ -1557,8 +1733,8 @@ class Molecule:
     def tofile(self,fname):
         pass
 
-    def RHF(self):
-        return RHF(self)
+    def RHF(self, verbose=0):
+        return RHF(self, verbose=verbose)
 
     def UHF(self):
         return UHF(self)

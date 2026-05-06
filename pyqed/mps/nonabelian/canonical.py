@@ -29,6 +29,79 @@ def _site_dense_matrix(site, *, mode):
     return grouped
 
 
+def _site_full_dense_matrix(site, *, mode):
+    if not isinstance(site, NonabelianTensor) or site.rank != 3:
+        raise ValueError("_site_full_dense_matrix expects a rank-3 NonabelianTensor site tensor.")
+    if mode not in {"left", "right"}:
+        raise ValueError("mode must be 'left' or 'right'.")
+
+    left_sectors = tuple(dict.fromkeys(site.qns[0]))
+    phys_sectors = tuple(dict.fromkeys(site.qns[1]))
+    right_sectors = tuple(dict.fromkeys(site.qns[2]))
+    left_dims = {
+        sector: max(
+            [np.asarray(block).shape[0] for key, block in site.data.items() if key[0] == sector]
+            or [sum(1 for item in site.qns[0] if item == sector)]
+        )
+        for sector in left_sectors
+    }
+    phys_dims = {
+        sector: max(
+            [np.asarray(block).shape[1] for key, block in site.data.items() if key[1] == sector]
+            or [getattr(sector, "dim", sum(1 for item in site.qns[1] if item == sector))]
+        )
+        for sector in phys_sectors
+    }
+    right_dims = {
+        sector: max(
+            [np.asarray(block).shape[2] for key, block in site.data.items() if key[2] == sector]
+            or [sum(1 for item in site.qns[2] if item == sector)]
+        )
+        for sector in right_sectors
+    }
+
+    if mode == "left":
+        row_offsets = {}
+        offset = 0
+        for q_left in left_sectors:
+            for q_phys in phys_sectors:
+                row_offsets[(q_left, q_phys)] = offset
+                offset += left_dims[q_left] * phys_dims[q_phys]
+        col_offsets = {}
+        col_offset = 0
+        for q_right in right_sectors:
+            col_offsets[q_right] = col_offset
+            col_offset += right_dims[q_right]
+        matrix = np.zeros((offset, col_offset), dtype=np.result_type(*[np.asarray(block).dtype for block in site.data.values()], float))
+        for (q_left, q_phys, q_right), block in site.data.items():
+            arr = np.asarray(block)
+            row0 = row_offsets[(q_left, q_phys)]
+            col0 = col_offsets[q_right]
+            rows = arr.shape[0] * arr.shape[1]
+            matrix[row0:row0 + rows, col0:col0 + arr.shape[2]] = arr.reshape(rows, arr.shape[2])
+        return matrix
+
+    row_offsets = {}
+    offset = 0
+    for q_left in left_sectors:
+        row_offsets[q_left] = offset
+        offset += left_dims[q_left]
+    col_offsets = {}
+    col_offset = 0
+    for q_phys in phys_sectors:
+        for q_right in right_sectors:
+            col_offsets[(q_phys, q_right)] = col_offset
+            col_offset += phys_dims[q_phys] * right_dims[q_right]
+    matrix = np.zeros((offset, col_offset), dtype=np.result_type(*[np.asarray(block).dtype for block in site.data.values()], float))
+    for (q_left, q_phys, q_right), block in site.data.items():
+        arr = np.asarray(block)
+        row0 = row_offsets[q_left]
+        col0 = col_offsets[(q_phys, q_right)]
+        cols = arr.shape[1] * arr.shape[2]
+        matrix[row0:row0 + arr.shape[0], col0:col0 + cols] = arr.reshape(arr.shape[0], cols)
+    return matrix
+
+
 def left_canonical_error(site):
     """
     Return the maximum isometry error for a left-canonical site tensor.
@@ -42,6 +115,19 @@ def left_canonical_error(site):
     return err
 
 
+def left_identity_metric_error(site):
+    """
+    Return the full explicit-basis left-isometry error.
+
+    Unlike :func:`left_canonical_error`, this includes cross-sector overlaps.
+    It is the diagnostic relevant to whether an identity-MPO environment will
+    expose an identity local norm in the current explicit/reduced mixed basis.
+    """
+    matrix = _site_full_dense_matrix(site, mode="left")
+    gram = matrix.conj().T @ matrix
+    return float(np.linalg.norm(gram - np.eye(gram.shape[0], dtype=gram.dtype)))
+
+
 def right_canonical_error(site):
     """
     Return the maximum isometry error for a right-canonical site tensor.
@@ -53,6 +139,28 @@ def right_canonical_error(site):
         gram = M @ M.conj().T
         err = max(err, float(np.linalg.norm(gram - np.eye(gram.shape[0], dtype=gram.dtype))))
     return err
+
+
+def right_identity_metric_error(site):
+    """
+    Return the full explicit-basis right-isometry error including cross sectors.
+    """
+    matrix = _site_full_dense_matrix(site, mode="right")
+    gram = matrix @ matrix.conj().T
+    return float(np.linalg.norm(gram - np.eye(gram.shape[0], dtype=gram.dtype)))
+
+
+def mixed_identity_metric_errors(sites, center):
+    if not 0 <= int(center) < len(sites):
+        raise IndexError(f"Center {center} out of range for chain length {len(sites)}.")
+    left_err = 0.0
+    right_err = 0.0
+    for i, site in enumerate(sites):
+        if i < int(center):
+            left_err = max(left_err, left_identity_metric_error(site))
+        elif i > int(center):
+            right_err = max(right_err, right_identity_metric_error(site))
+    return left_err, right_err
 
 
 def left_canonicalize_sites(

@@ -28,6 +28,24 @@ from pyqed import au2ev, au2angstrom
 from pyqed.qchem.ci.fci import SpinOuterProduct, givenΛgetB
 from pyqed.qchem.mcscf.casci import h1e_for_cas
 
+
+_GLOBAL_HAMILTONIAN_MPO_CACHE = {}
+_GLOBAL_HAMILTONIAN_MPO_CACHE_MAXSIZE = 8
+
+
+def _store_global_hamiltonian_mpo_cache(cache_key, *, factors, info, hamiltonian=None):
+    """Store one process-local Hamiltonian MPO cache entry with FIFO eviction."""
+
+    if cache_key in _GLOBAL_HAMILTONIAN_MPO_CACHE:
+        _GLOBAL_HAMILTONIAN_MPO_CACHE.pop(cache_key)
+    elif len(_GLOBAL_HAMILTONIAN_MPO_CACHE) >= _GLOBAL_HAMILTONIAN_MPO_CACHE_MAXSIZE:
+        _GLOBAL_HAMILTONIAN_MPO_CACHE.pop(next(iter(_GLOBAL_HAMILTONIAN_MPO_CACHE)))
+    _GLOBAL_HAMILTONIAN_MPO_CACHE[cache_key] = {
+        "factors": factors,
+        "info": dict(info),
+        "hamiltonian": hamiltonian,
+    }
+
 from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
 # from numba import vectorize, float64, jit
@@ -49,8 +67,15 @@ from pyqed.mps.mps import MPO as TensorMPO
 from pyqed.mps.decompose import compress
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSet, BasisSimpleElectron
+from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.qchem.dmrg.spatial_terms import (
+    BasisSpatialFermion,
+    accumulate_spatial_jw_term as _accumulate_spatial_jw_term,
+    merge_term_maps as _merge_spatial_term_maps,
+    spatial_one_body_term_map as _spatial_one_body_term_map,
+    spatial_two_body_term_map as _spatial_two_body_term_map,
+)
 try:
     import pyqed.mps.symmetry as sym_module
     from pyqed.mps.symmetry import BlockTensor, tensordot, QN, SymmetryManager as BaseSymmetryManager
@@ -277,108 +302,6 @@ def _mps_to_dense_vector(state):
     return np.squeeze(psi, axis=-1).reshape(-1)
 
 
-_SPATIAL_LOCAL_OPS = None
-
-
-def _spatial_local_ops():
-    """Shared local operator table for the spatial d=4 site basis."""
-    global _SPATIAL_LOCAL_OPS
-    if _SPATIAL_LOCAL_OPS is None:
-        ops = {name: np.asarray(op, dtype=complex) for name, op in SpinHalfFermionOperators().items()}
-        _SPATIAL_LOCAL_OPS = {
-            "I": np.eye(4, dtype=complex),
-            "JW": ops["JW"],
-            "cu": ops["Cu"],
-            "cdu": ops["Cdu"],
-            "cd": ops["Cd"],
-            "cdd": ops["Cdd"],
-            "nu": ops["Nu"],
-            "nd": ops["Nd"],
-            "n": ops["Ntot"],
-        }
-    return _SPATIAL_LOCAL_OPS
-
-
-def _canonical_spatial_local_symbol(symbols, *, tol=1e-14):
-    """Collapse an ordered same-site operator product into one local symbol."""
-    aliases = _spatial_local_ops()
-    mat = np.eye(4, dtype=complex)
-    for symbol in symbols:
-        mat = mat @ aliases[symbol]
-
-    if np.linalg.norm(mat) <= tol:
-        return None, 0.0
-
-    for name, ref in aliases.items():
-        if np.allclose(mat, ref, atol=tol, rtol=0.0):
-            return name, 1.0
-        if np.allclose(mat, -ref, atol=tol, rtol=0.0):
-            return name, -1.0
-
-    name = f"spop{len(aliases)}"
-    aliases[name] = mat
-    return name, 1.0
-
-
-class BasisSpatialFermion(BasisSet):
-    """One spatial orbital with local states empty, up, down, double."""
-
-    is_electron = True
-
-    def __init__(self, dof):
-        super().__init__(dof, 4, [(0, 0), (1, 1), (1, -1), (2, 0)])
-        self._op_aliases = _spatial_local_ops()
-
-    def op_mat(self, op):
-        if not isinstance(op, Op):
-            op = Op(op, None)
-        mat = np.eye(4, dtype=complex)
-        for symbol in op.split_symbol:
-            try:
-                mat = mat @ self._op_aliases[symbol]
-            except KeyError as exc:
-                raise ValueError(f"op_symbol:{symbol} is not supported for BasisSpatialFermion") from exc
-        return mat * op.factor
-
-    def copy(self, new_dof):
-        return BasisSpatialFermion(new_dof)
-
-
-def _spatial_jw_term_spec(local_symbols, sites, factor):
-    """
-    Convert products of global spatial fermion operators into site-local symbols.
-
-    Each global fermion operator contributes a site-level parity string on all
-    earlier spatial orbitals and a local d=4 creation/annihilation operator on
-    its own orbital.
-    """
-    grouped = defaultdict(list)
-    for symbol, site in zip(local_symbols, sites):
-        site = int(site)
-        for k in range(site):
-            grouped[k].append("JW")
-        grouped[site].append(symbol)
-
-    final_symbols = []
-    final_sites = []
-    final_factor = factor
-    for site in sorted(grouped):
-        symbol, local_factor = _canonical_spatial_local_symbol(grouped[site])
-        if symbol is None:
-            return "", [], 0.0
-        if symbol == "I":
-            continue
-        final_symbols.append(symbol)
-        final_sites.append(site)
-        final_factor *= local_factor
-    return " ".join(final_symbols), final_sites, final_factor
-
-
-def _accumulate_spatial_jw_term(term_map, local_symbols, sites, factor, tol=1e-14):
-    symbol, dofs, term_factor = _spatial_jw_term_spec(local_symbols, sites, factor)
-    _accumulate_symbolic_term(term_map, symbol, dofs, term_factor, tol=tol)
-
-
 def _build_spatial_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
     """Build symbolic spatial-site terms for total S^2."""
     term_map = {}
@@ -415,46 +338,13 @@ def _build_spatial_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
 def _build_spatial_hamiltonian_tensor_mpo(h1e, eri, *, spin_purification=False, shift=None, cutoff=1e-10):
     """Build the spatial-orbital Hamiltonian directly as a d=4 symbolic MPO."""
     h_spatial = np.asarray(h1e[0])
-    eri_spatial = 0.5 * np.asarray(eri[0, 0])
+    eri_spatial = np.asarray(eri[0, 0])
     ncas = h_spatial.shape[0]
-    term_map = {}
-
-    for p, q in np.argwhere(np.abs(h_spatial) > cutoff):
-        val = h_spatial[p, q]
-        _accumulate_spatial_jw_term(term_map, ["cdu", "cu"], [p, q], val, tol=cutoff)
-        _accumulate_spatial_jw_term(term_map, ["cdd", "cd"], [p, q], val, tol=cutoff)
-
-    for p, q, r, s in np.argwhere(np.abs(eri_spatial) > cutoff):
-        val = eri_spatial[p, q, r, s]
-        if p != r and s != q:
-            _accumulate_spatial_jw_term(
-                term_map,
-                ["cdu", "cdu", "cu", "cu"],
-                [p, r, s, q],
-                val,
-                tol=cutoff,
-            )
-            _accumulate_spatial_jw_term(
-                term_map,
-                ["cdd", "cdd", "cd", "cd"],
-                [p, r, s, q],
-                val,
-                tol=cutoff,
-            )
-        _accumulate_spatial_jw_term(
-            term_map,
-            ["cdu", "cdd", "cd", "cu"],
-            [p, r, s, q],
-            val,
-            tol=cutoff,
-        )
-        _accumulate_spatial_jw_term(
-            term_map,
-            ["cdd", "cdu", "cu", "cd"],
-            [p, r, s, q],
-            val,
-            tol=cutoff,
-        )
+    term_map = _merge_spatial_term_maps(
+        _spatial_one_body_term_map(h_spatial, cutoff=cutoff),
+        _spatial_two_body_term_map(eri_spatial, cutoff=cutoff),
+        cutoff=cutoff,
+    )
 
     spin_term_count = 0
     if spin_purification:
@@ -895,6 +785,86 @@ class SymmetryManager(BaseSymmetryManager):
     """QC-DMRG compatibility alias for the shared symmetry manager."""
     pass
 
+
+def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
+    """
+    Normalize the public DMRG symmetry selector to symmetry-manager labels.
+
+    ``symmetry`` is the preferred public API.  It intentionally selects both
+    symmetry quantum numbers and the implementation path: ``"su2"`` routes to
+    the non-Abelian backend, while ``"sz"`` uses the Abelian charge/Sz backend.
+
+    :param symmetry: Public selector such as ``None``, ``"charge"``,
+        ``"sz"``, ``"u1"``, ``"su2"``, or an explicit sequence of labels.
+    :param symmetry_list: Backward-compatible explicit symmetry-label list.
+    :returns: ``None`` for dense DMRG or a normalized list of symmetry labels.
+    """
+    spec = symmetry if symmetry is not None else symmetry_list
+    if spec is None or spec is False:
+        return None
+    if spec is True:
+        return ["charge", "sz"]
+
+    aliases = {
+        "none": None,
+        "off": None,
+        "false": None,
+        "dense": None,
+        "charge": ["charge"],
+        "number": ["charge"],
+        "particle": ["charge"],
+        "n": ["charge"],
+        "sz": ["charge", "sz"],
+        "s_z": ["charge", "sz"],
+        "u1": ["charge", "sz"],
+        "abelian": ["charge", "sz"],
+        "su2": ["charge", "su2"],
+        "s2": ["charge", "su2"],
+        "spin": ["charge", "su2"],
+        "nonabelian": ["charge", "su2"],
+        "non-abelian": ["charge", "su2"],
+    }
+    if isinstance(spec, str):
+        key = spec.strip().lower()
+        key = key.replace(" ", "").replace("+", "_")
+        out = aliases.get(key)
+        if key in aliases:
+            return None if out is None else list(out)
+        if key in {"charge_sz", "charge,sz"}:
+            return ["charge", "sz"]
+        if key in {"charge_su2", "charge,su2"}:
+            return ["charge", "su2"]
+        raise ValueError(
+            "Unknown DMRG symmetry {!r}. Use None, 'charge', 'sz', 'u1', or 'su2'.".format(spec)
+        )
+
+    labels = []
+    for item in spec:
+        key = str(item).strip().lower()
+        mapped = aliases.get(key, [key])
+        if mapped is None:
+            continue
+        labels.extend(mapped)
+
+    normalized = []
+    for label in labels:
+        if label == "s2":
+            label = "su2"
+        if label not in {"charge", "sz", "su2"}:
+            raise ValueError(
+                "Unknown DMRG symmetry label {!r}. Use 'charge', 'sz', or 'su2'.".format(label)
+            )
+        if label not in normalized:
+            normalized.append(label)
+    if "su2" in normalized and "charge" not in normalized:
+        normalized.insert(0, "charge")
+    if "sz" in normalized and "charge" not in normalized:
+        normalized.insert(0, "charge")
+    if "su2" in normalized and "sz" in normalized:
+        raise ValueError("DMRG symmetry cannot combine 'su2' and 'sz'.")
+    return normalized or None
+
+
 # Configuration generators helpers for initial guess
 # non-normalized in those configs is fine. it is handeled in build_mps_from_configs.
 def gen_hf_config(nelec, nsites):
@@ -924,10 +894,10 @@ def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
     occ_beta  = [i for i, x in enumerate(hf) if x == 1 and i % 2 == 1]
     vir_alpha = [i for i, x in enumerate(hf) if x == 0 and i % 2 == 0]
     vir_beta  = [i for i, x in enumerate(hf) if x == 0 and i % 2 == 1]
-    
+
     for _ in range(n_states):
         new_cfg = list(hf)
-        
+
         # Determine physically valid excitations based on available electrons/holes
         exc_types = []
         if len(occ_alpha) >= 1 and len(vir_alpha) >= 1: exc_types.append('S_alpha')
@@ -935,50 +905,50 @@ def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
         if len(occ_alpha) >= 2 and len(vir_alpha) >= 2: exc_types.append('D_aa')
         if len(occ_beta) >= 2 and len(vir_beta) >= 2: exc_types.append('D_bb')
         if len(occ_alpha) >= 1 and len(vir_alpha) >= 1 and len(occ_beta) >= 1 and len(vir_beta) >= 1: exc_types.append('D_ab')
-        
+
         if not exc_types:
             break # Active space too small for further excitations
-            
+
         choice = np.random.choice(exc_types)
-        
+
         if choice == 'S_alpha':
             i = np.random.choice(occ_alpha); a = np.random.choice(vir_alpha)
             new_cfg[i] = 0; new_cfg[a] = 1
-            
+
         elif choice == 'S_beta':
             i = np.random.choice(occ_beta); a = np.random.choice(vir_beta)
             new_cfg[i] = 0; new_cfg[a] = 1
-            
+
         elif choice == 'D_aa':
             i, j = np.random.choice(occ_alpha, 2, replace=False)
             a, b = np.random.choice(vir_alpha, 2, replace=False)
             new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
-            
+
         elif choice == 'D_bb':
             i, j = np.random.choice(occ_beta, 2, replace=False)
             a, b = np.random.choice(vir_beta, 2, replace=False)
             new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
-            
+
         elif choice == 'D_ab':
             # The most important correlation for singlet states
             i = np.random.choice(occ_alpha); a = np.random.choice(vir_alpha)
             j = np.random.choice(occ_beta);  b = np.random.choice(vir_beta)
             new_cfg[i] = 0; new_cfg[j] = 0; new_cfg[a] = 1; new_cfg[b] = 1
-            
+
         configs.append((tuple(new_cfg), mixing))
-        
+
     return configs
 
 def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5):
     """
     Constructs an entangled U(1) symmetric MPS from a list of determinant configurations.
-    
+
     Args:
         configs_with_amps: List of tuples (occupation_list, amplitude).
         sym_mgr: SymmetryManager instance.
         nsites: Total number of sites.
         noise_scale: Magnitude of random noise to inject for symmetry breaking.
-        
+
     Returns:
         List[BlockTensor]: The resulting MPS in (Left, Right, Phys) convention.
     """
@@ -999,11 +969,11 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
     mps = []
     # 2. Build Tensors Site by Site
     for i in range(nsites):
-        # Grouping Logic 
+        # Grouping Logic
         # Map QN -> List of configuration indices passing through this sector
         left_groups = defaultdict(list)
         right_groups = defaultdict(list)
-        
+
         for k, _ in enumerate(configs_with_amps):
             qL = trajectories[k][i]
             qR = trajectories[k][i+1]
@@ -1022,14 +992,14 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
             # At i=L-1 (Right Boundary), all configs share col 0.
             row = 0 if i == 0 else left_groups[qL].index(k)
             col = 0 if i == nsites - 1 else right_groups[qR].index(k)
-            
+
             # Initialize Block if missing
             if key not in data:
                 dL = 1 if i == 0 else len(left_groups[qL])
                 dR = 1 if i == nsites - 1 else len(right_groups[qR])
                 # Phys dimension is always 1 per sector for spin-orbitals
                 data[key] = np.zeros((dL, dR, 1), dtype=complex)
-            
+
             # value = Amplitude (only applied at first site) + Noise
             val = amp if i == 0 else 1.0
             noise = (np.random.rand() - 0.5) * noise_scale
@@ -1050,9 +1020,9 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
             final_qns_R = [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
         # Physical QNs (Generic from Manager)
         final_qns_P = [sym_mgr.get_phys_qn(i, 'emp'), sym_mgr.get_phys_qn(i, 'occ')]
-        # Create BlockTensor 
+        # Create BlockTensor
         bt = BlockTensor(data, [final_qns_L, final_qns_R, final_qns_P], [-1, 1, 1])
-        # Normalize 
+        # Normalize
         nrm = bt.norm()
         if nrm > 1e-12:
             bt = bt * (1.0 / nrm)
@@ -1151,13 +1121,13 @@ def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     filled_count = 0
     for i in range(n_spin):
         # (Left=1, Phys=d, Right=1)
-        vec = np.zeros((1, d, 1)) 
+        vec = np.zeros((1, d, 1))
         if filled_count < n_elec:
             vec[0, 1, 0] = 1.0 # Occupied
             filled_count += 1
         else:
             vec[0, 0, 0] = 1.0 # Empty
-        # noise 
+        # noise
         rand_noise = (np.random.rand(1, d, 1) - 0.5) * noise
         vec += rand_noise
         vec /= np.linalg.norm(vec)
@@ -1205,7 +1175,8 @@ class DMRG(CASCI):
     def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
                  low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',
-                 site_basis=None, orbital_layout=None):
+                 site_basis=None, orbital_layout=None, spatial_reduced_mpo=None,
+                 symmetry=None, spatial_site_basis="canonical"):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -1229,16 +1200,25 @@ class DMRG(CASCI):
 
         self.mf = mf
         self.verbose = int(verbose)
+        normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
 
         if site_basis is not None:
             site = site_basis
         if orbital_layout is not None:
             site = orbital_layout
+        if normalized_symmetry is not None and "su2" in normalized_symmetry:
+            site = "spatial"
         self.site = _normalize_site(site)
         self.site_basis = self.site
         self.orbital_layout = self.site
+        spatial_site_basis = str(spatial_site_basis).lower()
+        if spatial_site_basis in {"reduced", "fully-reduced", "fully_reduced_su2"}:
+            spatial_site_basis = "fully_reduced"
+        if spatial_site_basis not in {"canonical", "fully_reduced"}:
+            raise ValueError("spatial_site_basis must be 'canonical' or 'fully_reduced'.")
+        self.spatial_site_basis = spatial_site_basis
 
-        self.d = 4 if self.site == "spatial" else 2
+        self.d = 3 if self.site == "spatial" and self.spatial_site_basis == "fully_reduced" else 4 if self.site == "spatial" else 2
 
         self.nsites = self.L = ncas
 
@@ -1303,6 +1283,7 @@ class DMRG(CASCI):
         self._symmetric_mpo_cache = {}
         self._s2_mpo_cache = {}
         self._spatial_operator_cache = None
+        self._active_hamiltonian = None
         self._active_integral_build_info = None
 
 
@@ -1320,6 +1301,11 @@ class DMRG(CASCI):
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
         self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
+        if spatial_reduced_mpo is None:
+            spatial_reduced_mpo = normalized_symmetry is not None and "su2" in normalized_symmetry
+        self.spatial_reduced_mpo = bool(spatial_reduced_mpo)
+        self.symmetry = normalized_symmetry
+        self.saved_symmetry_list = self.symmetry
 
     def _log(self, message, level=1):
         if self.verbose >= level:
@@ -1339,7 +1325,7 @@ class DMRG(CASCI):
         """Adopt a converged MPS from another DMRG object as the next guess."""
         self.init_guess = other.export_initial_guess(state=state, dense=dense)
         return self
-        
+
 
     def get_initial_guess_symmetric(self, method='cid'):
         """
@@ -1366,24 +1352,24 @@ class DMRG(CASCI):
             return build_spatial_mps_from_configs(configs, self.sym_mgr, self.ncas)
 
         nsites = 2 * self.ncas
-        
+
         # Ensure Manager exists (created in run())
         if not hasattr(self, 'sym_mgr'):
             self.sym_mgr = SymmetryManager(['charge', 'sz']) # Default fallback
-            
+
         self._log(f"  [InitGuess] Generating guess: '{method}' with {self.sym_mgr.sym_types}")
 
         # 1. Generate Configurations (Physics)
         if method == 'hf':
             hf_cfg = gen_hf_config(self.nelecas, nsites)
             configs = [(hf_cfg, 1.0)]
-            
+
         elif method == 'cid':
             configs = gen_cid_configs(self.nelecas, nsites, mixing=0.5)
-            
+
         elif method == 'cisd' or method == 'random':
             configs = gen_random_cisd_configs(self.nelecas, nsites, n_states=20)
-            
+
         else:
             # Fallback to HF
             self._log(f"  [Warning] Method {method} not found. Defaulting to HF.")
@@ -1693,7 +1679,7 @@ class DMRG(CASCI):
         #     eri = mf.get_eri_mo(notation='chem') # (pq|rs)
         # else:
         #     h1e, eri = self.get_SO_matrix()
-        
+
         # self.nstates = nstates
 
         # if method == 'ci':
@@ -1728,23 +1714,74 @@ class DMRG(CASCI):
             eri if pair_factors is None else pair_factors,
             spin_purification=self.spin_purification,
             shift=self.shift,
-        ) + (self.site, use_low_rank_mpo, self.low_rank_mpo_bond, self.low_rank_mpo_batch_size)
+        ) + (
+            self.site,
+            use_low_rank_mpo,
+            self.low_rank_mpo_bond,
+            self.low_rank_mpo_batch_size,
+            self.spatial_reduced_mpo,
+            self.spatial_site_basis,
+        )
         if cache_key == self._hamiltonian_mpo_cache_key and self.H is not None and self.H_raw is not None:
             self._log("  Reusing Hamiltonian MPO cache.")
             return self
-        
+
 
 
         # h2e[0,0] -= h2e[0,0].swapaxes(1,3)
         # h2e[1,1] -= h2e[1,1].swapaxes(1,3)
-        
+
 
         n_spatial = self.ncas
         nso = 2 * n_spatial
         self._log(f"  System: {n_spatial} spatial orbitals, {nso} spin-orbitals")
 
         if self.site == "spatial":
+            if self.spatial_reduced_mpo:
+                if self.spin_purification:
+                    raise NotImplementedError(
+                        "spatial_reduced_mpo does not support spin-purification penalties."
+                    )
+                cached = _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+                if cached is not None:
+                    self._log("  Reusing global spatial reduced Hamiltonian MPO cache.")
+                    self._spatial_operator_cache = None
+                    self._active_hamiltonian = cached.get("hamiltonian")
+                    self.H_raw = cached["factors"]
+                    self.H = cached["factors"]
+                    self._hamiltonian_mpo_cache_key = cache_key
+                    self._symmetric_mpo_cache = {}
+                    self._active_integral_build_info.update(dict(cached["info"]))
+                    return self
+                self._log("  Building spatial-orbital Hamiltonian MPO with reduced SU(2) channels...")
+                from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
+
+                reduced_hamiltonian = build_spatial_reduced_hamiltonian_mpo(
+                    h1e,
+                    eri,
+                    cutoff=1e-10,
+                    fully_reduced=self.spatial_site_basis == "fully_reduced",
+                    n_elec=self.nelecas,
+                    spin=self.spin,
+                    ecore=self.e_core,
+                )
+                self._spatial_operator_cache = None
+                self._active_hamiltonian = reduced_hamiltonian
+                self.H_raw = reduced_hamiltonian.factors
+                self.H = reduced_hamiltonian.factors
+                self._hamiltonian_mpo_cache_key = cache_key
+                self._symmetric_mpo_cache = {}
+                self._active_integral_build_info.update(reduced_hamiltonian.info)
+                _store_global_hamiltonian_mpo_cache(
+                    cache_key,
+                    factors=reduced_hamiltonian.factors,
+                    info=reduced_hamiltonian.info,
+                    hamiltonian=reduced_hamiltonian,
+                )
+                return self
+
             self._log("  Building spatial-orbital Hamiltonian MPO by grouping spin-orbital pairs...")
+            self._active_hamiltonian = None
             spin_tensor_mpo, spin_term_count, spin_penalty_term_count = _build_spin_orbital_dense_hamiltonian_tensor_mpo(
                 h1e,
                 eri,
@@ -1892,12 +1929,12 @@ class DMRG(CASCI):
                 norm = state_for_eval.norm()
                 s2_vals.append(float(np.real(s2 / norm)))
             return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
-            
+
         import pyqed.mps.mps as mps_lib
-        
+
         ncas = self.ncas
         s2_term_map = _build_s2_term_map(ncas, scale=1.0)
-                
+
         s2_cache_key = int(ncas)
         mpo_dense = self._s2_mpo_cache.get(s2_cache_key)
         if mpo_dense is None:
@@ -1907,24 +1944,24 @@ class DMRG(CASCI):
             mpo = Mpo(model, algo="qr")
             mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
             self._s2_mpo_cache[s2_cache_key] = mpo_dense
-        
-        states_to_eval = self.dmrg.states 
+
+        states_to_eval = self.dmrg.states
         if (hasattr(self.dmrg, 'states') and self.dmrg.states is not None):
             states_to_eval = self.dmrg.states
         else:
             states_to_eval = [self.dmrg.ground_state]
         s2_vals = []
-        
+
         for state in states_to_eval:
             if hasattr(state.Bs[0], 'qns'):
                 dense_state = mps_lib.symmetric_to_dense(state)
                 psi_for_eval = dense_state.Bs
             else:
                 psi_for_eval = state.Bs
-                
+
             s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
             s2_vals.append(float(np.real(s2)))
-            
+
         return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
 
     def overlap(self, other, bra_state_ids=None, ket_state_ids=None, s=None):
@@ -2096,6 +2133,7 @@ class DMRG(CASCI):
         nstates=1,
         weights=None,
         symmetry_list=None,
+        symmetry=None,
         nsweeps=50,
         D_schedule=None,
         nsweeps_schedule=None,
@@ -2107,25 +2145,45 @@ class DMRG(CASCI):
         """
         Parameters
         ----------
+        symmetry : str, sequence, bool, or None
+            Preferred public symmetry selector.  Use ``"su2"`` for the
+            non-Abelian spatial-orbital backend, ``"sz"``/``"u1"`` for the
+            Abelian charge/Sz backend, ``"charge"`` for particle-number-only
+            Abelian symmetry, and ``None``/``False`` for dense DMRG.
         symmetry_list : list of strings or bool
-            ['charge', 'sz'] or True/False.
+            Backward-compatible explicit labels such as ``['charge', 'sz']``.
         """
         self.nstates = nstates
         if weights is None:
             self.weights = np.ones(nstates) / nstates
         else:
             self.weights = np.array(weights)
-        if symmetry_list is not None:
+        if symmetry is not None:
+            normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
+            if symmetry_list is not None:
+                legacy_symmetry = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
+                if legacy_symmetry != normalized_symmetry:
+                    raise ValueError(
+                        "Received conflicting DMRG symmetry and symmetry_list arguments."
+                    )
+            symmetry_list = normalized_symmetry
+            self.symmetry = normalized_symmetry
+            self.saved_symmetry_list = normalized_symmetry
+        elif symmetry_list is not None:
+            symmetry_list = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
+            self.symmetry = symmetry_list
             self.saved_symmetry_list = symmetry_list
         else:
             symmetry_list = getattr(self, 'saved_symmetry_list', None)
+            symmetry_list = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
+            self.symmetry = symmetry_list
         if initial_guess is not None:
             self.init_guess = initial_guess
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
         if self.H_raw is None:
             self.build()
-        # Initialize Symmetry 
+        # Initialize Symmetry
         self.sym_mgr = SymmetryManager(symmetry_list)
         if self.sym_mgr.enabled:
             if getattr(self.sym_mgr, "has_nonabelian", False):
@@ -2186,12 +2244,12 @@ class DMRG(CASCI):
             else:
                 for i in range(self.ncas):
                     map_up = {
-                        0: self.sym_mgr.get_phys_qn(2*i, 'emp'), 
+                        0: self.sym_mgr.get_phys_qn(2*i, 'emp'),
                         1: self.sym_mgr.get_phys_qn(2*i, 'occ')
                     }
                     site_qn_maps.append(map_up)
                     map_dn = {
-                        0: self.sym_mgr.get_phys_qn(2*i+1, 'emp'), 
+                        0: self.sym_mgr.get_phys_qn(2*i+1, 'emp'),
                         1: self.sym_mgr.get_phys_qn(2*i+1, 'occ')
                     }
                     site_qn_maps.append(map_dn)
@@ -2206,7 +2264,7 @@ class DMRG(CASCI):
             else:
                 self._log("  Reusing symmetric MPO cache.")
             # Calculate Target QN
-            target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
+            target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.spin)
             self._log(f"  Target QN set to: {target_qn}")
             use_symmetry = True
         else: # dense branch without U(1) symmetry
@@ -2273,12 +2331,12 @@ class DMRG(CASCI):
 
     def check_abelian_symmetry(self):
         """
-        Post-run analysis: Checks conservation of all active symmetries 
+        Post-run analysis: Checks conservation of all active symmetries
         (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
         """
         if self.dmrg.ground_state is None:
-            print("  [Error] No ground state found. Run DMRG first.")
-            return
+            raise RuntimeError("  [Error] No ground state found. Run DMRG first.")
+
         print("\n" + "="*60)
         print("  Symmetry Conservation Check")
         print("="*60)
@@ -2288,10 +2346,11 @@ class DMRG(CASCI):
         except Exception as e:
             print(f"  [Error] Failed to calculate RDM: {e}")
             return
+
         # initialize storage for quantum number
         total_N_calc = 0.0
         total_Sz_calc = 0.0
-        
+
         print(f"{'Orb':<5} {'Spin':<6} {'Occ':<10} {'Sz_local':<10} {'Status'}")
         print("-" * 60)
         # Iterate over Spatial Orbitals (each splits into 2 Spin-Orbitals)
@@ -2300,20 +2359,20 @@ class DMRG(CASCI):
             # Spin Up Site
             idx_up = 2 * i
             rho_up = rdms[idx_up]
-            n_up = rho_up[1, 1].real 
+            n_up = rho_up[1, 1].real
             # Spin Down Site
             idx_dn = 2 * i + 1
             rho_dn = rdms[idx_dn]
             n_dn = rho_dn[1, 1].real
-            
+
             # Charge = N_up + N_dn
             n_local = n_up + n_dn
             # Spin = 1/2 * (N_up - N_dn)
             sz_local = 0.5 * (n_up - n_dn)
-            
+
             total_N_calc += n_local
             total_Sz_calc += sz_local
-            # get print nice looking 
+            # get print nice looking
             def status(n):
                 if n > 0.98: return "Full"
                 if n < 0.02: return "."
@@ -2321,8 +2380,9 @@ class DMRG(CASCI):
             print(f"{i:<5} {'Up':<6} {n_up:<10.5f} {0.5*n_up:<10.5f} {status(n_up)}")
             print(f"{i:<5} {'Down':<6} {n_dn:<10.5f} {-0.5*n_dn:<10.5f} {status(n_dn)}")
         print("-" * 60)
-        # compare with Targets 
-        target_qns = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
+
+        # compare with Targets
+        target_qns = self.sym_mgr.get_target_qn(self.nelecas, self.spin)
         print(f"\n  Global Conservation Summary:")
         # iterate over the active symmetries in the manager
         for idx, sym_type in enumerate(self.sym_mgr.sym_types):
@@ -2332,7 +2392,7 @@ class DMRG(CASCI):
                 diff = abs(measured - target_val)
                 label = "Charge (N)"
             elif sym_type in ['sz', 'spin', 's_z']:
-                measured = total_Sz_calc * 2.0 
+                measured = total_Sz_calc * 2.0
                 diff = abs(measured - target_val)
                 label = "Spin (2Sz)"
             else:
@@ -2467,7 +2527,7 @@ class DMRG(CASCI):
 
     def make_rdm1(self, state_id=0, spatial=False, with_core=False):
         """
-        Calculates the 1-RDM. 
+        Calculates the 1-RDM.
         If spatial=True, spin-traces to the spatial MO basis.
         If with_core=True, re-embeds the frozen core electrons on the diagonal.
         \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
@@ -2494,16 +2554,16 @@ class DMRG(CASCI):
             state = self.dmrg.states[state_id]
         else:
             state = self.dmrg.ground_state
-        
+
         # Get Spin-Orbital RDM
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
+            dense_state.dim = 2
             P_raw = dense_state.make_rdm1()
         else:
             P_raw = state.make_rdm1()
-            
+
         # Convert to Spatial MO basis if requested (or if with_core is True)
         if spatial or with_core:
             ncas = self.ncas
@@ -2525,7 +2585,7 @@ class DMRG(CASCI):
                 np.fill_diagonal(D[:ncore, :ncore], 2.0)
             D[ncore:norb, ncore:norb] = P_out
             return D
-            
+
         return P_out
 
     def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
@@ -2563,16 +2623,16 @@ class DMRG(CASCI):
             state = self.dmrg.states[state_id]
         else:
             state = self.dmrg.ground_state
-        
+
         # Get Spin-Orbital RDM
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
+            dense_state.dim = 2
             G_raw = dense_state.make_rdm2()
         else:
             G_raw = state.make_rdm2()
-            
+
         # Convert to Spatial MO basis if requested
         if spatial or with_core:
             ncas = self.ncas
@@ -2590,8 +2650,8 @@ class DMRG(CASCI):
             G_out = D_spatial
         else:
             G_out = G_raw
-            
-        # Embed Frozen Core 
+
+        # Embed Frozen Core
         if with_core:
             ncore = self.ncore
             norb = ncore + self.ncas
@@ -2599,17 +2659,17 @@ class DMRG(CASCI):
             if ncore > 0:
                 I = np.eye(ncore)
                 D2[:ncore, :ncore, :ncore, :ncore] = 4 * np.einsum('ij,kl->ijkl', I, I) - 2 * np.einsum('ps,rq->pqrs', I, I)
-                
+
                 dm1 = self.make_rdm1(state_id, spatial=True, with_core=False)
                 for i in range(ncore):
                     D2[i, i, ncore:norb, ncore:norb] = 2 * dm1
                     D2[ncore:norb, ncore:norb, i, i] = 2 * dm1
                     D2[i, ncore:norb, i, ncore:norb] = -dm1
                     D2[ncore:norb, i, ncore:norb, i] = -dm1
-                    
+
             D2[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = G_out
             return D2
-            
+
         return G_out
 
     def make_rdm12(self, state_id=0, spatial=True, with_core=False):
@@ -2636,21 +2696,21 @@ class DMRG(CASCI):
         """
         Calculate the local reduced density matrices for individual, isolated spin-orbitals.
 
-        This method traces out the rest of the chain to isolate the internal 
+        This method traces out the rest of the chain to isolate the internal
         quantum state of specific sites.
 
         Parameters
         ----------
         idx : int or list of int, optional
-            The specific site index (or indices) to evaluate. If None, evaluates 
-            the local density matrices for all sites in the active space. 
+            The specific site index (or indices) to evaluate. If None, evaluates
+            the local density matrices for all sites in the active space.
             By default None.
 
         Returns
         -------
         dict
-            A dictionary mapping the requested site indices (int) to their corresponding 
-            local density matrices (numpy.ndarray). For spin-orbitals with a physical 
+            A dictionary mapping the requested site indices (int) to their corresponding
+            local density matrices (numpy.ndarray). For spin-orbitals with a physical
             dimension `d`, the returned matrix shape is `(d, d)`.
 
         Raises
@@ -2666,22 +2726,22 @@ class DMRG(CASCI):
         """
         Calculate the diagonal blocks of the 2-site reduced density matrix.
 
-        Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute 
-        density-density correlations (e.g., :math:`\langle n_i n_j \rangle`) without 
+        Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute
+        density-density correlations (e.g., :math:`\langle n_i n_j \rangle`) without
         evaluating the full :math:`\mathcal{O}(L^4)` global 2-RDM tensor.
 
         Parameters
         ----------
         idx_pairs : list of tuple of int, optional
-            A list of site index pairs `(i, j)` to calculate the 2-site RDM for. 
-            If None, computes RDMs for all possible unique pairs in the active space. 
+            A list of site index pairs `(i, j)` to calculate the 2-site RDM for.
+            If None, computes RDMs for all possible unique pairs in the active space.
             By default None.
 
         Returns
         -------
         dict
-            A dictionary mapping each requested `(i, j)` tuple to its corresponding 
-            dense reduced density matrix (numpy.ndarray). If the physical dimension 
+            A dictionary mapping each requested `(i, j)` tuple to its corresponding
+            dense reduced density matrix (numpy.ndarray). If the physical dimension
             of a single site is `d`, the returned matrix shape is `(d*d, d*d)`.
 
         Raises
@@ -2709,7 +2769,7 @@ if __name__=='__main__':
 
 
     from pyqed.qchem.mol import atomic_chain
-    
+
     natom = 6
     z = np.linspace(-6, 6, natom)
     mol = atomic_chain(natom, z)

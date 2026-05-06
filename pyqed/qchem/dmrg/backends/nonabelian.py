@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import comb
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from pyqed.mps.nonabelian import (
     MPS,
     build_product_spatial_mps,
     build_random_spatial_mps,
+    build_random_reduced_spatial_mps,
     contract_chain_expectation,
     run_sweeps,
     spatial_target_sector,
@@ -38,7 +40,10 @@ class _DenseMPOView:
     """Small adapter for dense MPO contraction helpers."""
 
     def __init__(self, factors):
-        self.factors = [np.asarray(core) for core in factors]
+        self.factors = [
+            core.as_dense() if hasattr(core, "as_dense") else np.asarray(core)
+            for core in factors
+        ]
         self.dims = [int(core.shape[2]) for core in self.factors]
 
 
@@ -76,21 +81,44 @@ def _make_initial_mps(qcdmrg, *, target_sector, initial_guess=None, bond_multipl
         raise TypeError(f"Unsupported non-Abelian initial guess type: {type(guess)}")
 
     method = guess.lower()
+    fully_reduced = getattr(qcdmrg, "spatial_site_basis", "canonical") in {
+        "fully_reduced",
+        "fully_reduced_su2",
+    }
     if method in {"hf", "product"}:
-        sites = build_product_spatial_mps(
-            _hf_spatial_labels(qcdmrg.nelecas, qcdmrg.ncas, qcdmrg.spin),
-            enrich_bond_sectors=True,
-            bond_multiplicity=bond_multiplicity,
-            zero_block_noise_scale=1.0e-5,
-            zero_block_noise_seed=seed,
-        )
+        if fully_reduced:
+            # A fully reduced SU(2) site has no spin-projection product state;
+            # seed the target-sector manifold directly with small random blocks.
+            sites = build_random_reduced_spatial_mps(
+                qcdmrg.ncas,
+                target_sector=target_sector,
+                bond_multiplicity=bond_multiplicity,
+                seed=seed,
+                scale=1.0e-5,
+            )
+        else:
+            sites = build_product_spatial_mps(
+                _hf_spatial_labels(qcdmrg.nelecas, qcdmrg.ncas, qcdmrg.spin),
+                enrich_bond_sectors=True,
+                bond_multiplicity=bond_multiplicity,
+                zero_block_noise_scale=1.0e-5,
+                zero_block_noise_seed=seed,
+            )
     elif method in {"cid", "cisd", "random", "previous"}:
-        sites = build_random_spatial_mps(
-            qcdmrg.ncas,
-            target_sector=target_sector,
-            bond_multiplicity=bond_multiplicity,
-            seed=seed,
-        )
+        if fully_reduced:
+            sites = build_random_reduced_spatial_mps(
+                qcdmrg.ncas,
+                target_sector=target_sector,
+                bond_multiplicity=bond_multiplicity,
+                seed=seed,
+            )
+        else:
+            sites = build_random_spatial_mps(
+                qcdmrg.ncas,
+                target_sector=target_sector,
+                bond_multiplicity=bond_multiplicity,
+                seed=seed,
+            )
     else:
         raise ValueError(f"Unsupported non-Abelian initial guess {guess!r}.")
     return MPS.from_sites(sites, target_sector=target_sector)
@@ -239,6 +267,7 @@ def _run_dense_state_average_qchem(
             "state_average_weights": [float(x) for x in weights],
             "state_s2": [float(x) for x in s2_values],
             "backend": "dense_target_sector_su2",
+            "target_spin_valid": True,
             "converged": True,
         }
     ]
@@ -272,25 +301,108 @@ def _spin_square_mpo_factors(qcdmrg):
     return _build_grouped_spatial_s2_tensor_mpo(qcdmrg.ncas).factors
 
 
-def _finalize_spin_targeted_roots(qcdmrg, root_mps, nstates, *, compute_s2=True):
+def _fixed_charge_spatial_dim(nsites, nelec):
+    """Return the number of spatial occupation strings with ``nelec`` electrons."""
+    nspin = 2 * int(nsites)
+    nelec = int(nelec)
+    if nelec < 0 or nelec > nspin:
+        return 0
+    return int(comb(nspin, nelec))
+
+
+def _finalize_spin_targeted_roots(
+    qcdmrg,
+    root_mps,
+    nstates,
+    *,
+    compute_s2=True,
+    select_by_spin=False,
+    spin_tol=1.0e-6,
+):
+    """
+    Select and report final state-averaged SU(2) roots.
+
+    Parameters
+    ----------
+    qcdmrg
+        Chemistry DMRG driver carrying the active Hamiltonian and spin target.
+    root_mps
+        Candidate root MPSs propagated by the sweep engine.
+    nstates
+        Number of physical roots requested by the caller.
+    compute_s2
+        If True, report ``<S^2>`` for the selected roots.
+    select_by_spin
+        If True, evaluate candidate ``<S^2>`` once at the end and select the
+        lowest-energy roots compatible with the target spin.  This avoids the
+        much more expensive dense local ``<S^2>`` projector on large active
+        spaces while still filtering the candidate root buffer.
+    spin_tol
+        Absolute tolerance for accepting candidate roots by ``<S^2>``.
+
+    Returns
+    -------
+    tuple
+        ``(roots, energies, s2_values, info)`` for the selected roots and
+        diagnostics for all candidate roots.
+    """
     if not root_mps:
-        return root_mps, None, None
-    selected_roots = list(root_mps[: int(nstates)])
-    state_energies = [
+        return root_mps, None, None, {}
+    candidate_roots = list(root_mps)
+    candidate_energies = [
         _expectation_from_nonabelian_mps(state, qcdmrg.H)
-        for state in selected_roots
+        for state in candidate_roots
     ]
-    s2_values = None
-    if compute_s2:
+    need_s2 = bool(compute_s2 or select_by_spin)
+    candidate_s2 = None
+    if need_s2:
         s2_factors = _spin_square_mpo_factors(qcdmrg)
-        s2_values = [
+        candidate_s2 = [
             _expectation_from_nonabelian_mps(state, s2_factors)
-            for state in selected_roots
+            for state in candidate_roots
         ]
+    selected_indices = list(range(min(int(nstates), len(candidate_roots))))
+    root_selection_used = False
+    target_spin_valid = None
+    if select_by_spin and candidate_s2 is not None:
+        target_s = 0.5 * abs(float(qcdmrg.spin))
+        target_s2 = target_s * (target_s + 1.0)
+        matching = [
+            idx
+            for idx, s2 in enumerate(candidate_s2)
+            if abs(float(s2) - target_s2) <= float(spin_tol)
+        ]
+        if len(matching) >= int(nstates):
+            selected_indices = sorted(
+                matching,
+                key=lambda idx: (float(candidate_energies[idx]), idx),
+            )[: int(nstates)]
+            root_selection_used = True
+        target_spin_valid = all(
+            abs(float(candidate_s2[idx]) - target_s2) <= float(spin_tol)
+            for idx in selected_indices
+        )
+    selected_roots = [candidate_roots[idx] for idx in selected_indices]
+    state_energies = [candidate_energies[idx] for idx in selected_indices]
+    s2_values = (
+        None
+        if candidate_s2 is None
+        else [candidate_s2[idx] for idx in selected_indices]
+    )
+    info = {
+        "candidate_state_energies": [float(x) for x in candidate_energies],
+        "candidate_state_s2": (
+            None if candidate_s2 is None else [float(x) for x in candidate_s2]
+        ),
+        "selected_root_indices": [int(x) for x in selected_indices],
+        "final_root_selection_used": bool(root_selection_used),
+        "target_spin_valid": target_spin_valid,
+    }
     return (
         selected_roots,
         [float(x) for x in state_energies],
         None if s2_values is None else [float(x) for x in s2_values],
+        info,
     )
 
 
@@ -322,6 +434,13 @@ def run_spatial_qchem_dmrg(
         raise ValueError("DMRG Hamiltonian MPO is not built. Call build() before the backend.")
     if qcdmrg.spin_purification:
         raise NotImplementedError("Spin-purification penalties are not supported by the SU(2) backend.")
+    active_hamiltonian = getattr(qcdmrg, "_active_hamiltonian", None)
+    mpo_factors = active_hamiltonian.mpo if active_hamiltonian is not None else qcdmrg.H
+    complementary_operator_families = (
+        getattr(active_hamiltonian, "complementary_operators", None)
+        if active_hamiltonian is not None
+        else None
+    )
     nstates = int(nstates)
     if nstates < 1:
         raise ValueError("nstates must be positive.")
@@ -337,15 +456,69 @@ def run_spatial_qchem_dmrg(
     if max_bond is None:
         max_bond = qcdmrg.D
     state_average_backend = str(sweep_kwargs.pop("state_average_backend", "sweep")).lower()
+    state_average_dense_dim = int(sweep_kwargs.pop("state_average_dense_dim", 4096))
+    state_average_fallback_dense = bool(sweep_kwargs.pop("state_average_fallback_dense", False))
     state_average_spin_tol = float(sweep_kwargs.pop("state_average_spin_tol", 1.0e-6))
     state_average_validate_spin = bool(sweep_kwargs.pop("state_average_validate_spin", True))
-    if nstates > 1 and qcdmrg.ncas > 2 and state_average_backend == "dense":
+    state_average_spin_projector = bool(
+        sweep_kwargs.pop("state_average_spin_projector", True)
+    )
+    local_basis_policy = str(
+        sweep_kwargs.pop("local_basis_policy", "mixed_canonical_standard")
+    ).lower().replace("-", "_")
+    if local_basis_policy in {"block2", "block2_like"}:
+        local_basis_policy = "orthonormalized_operator"
+    elif local_basis_policy in {"orthonormalized", "metric_orthonormalized"}:
+        local_basis_policy = "mixed_canonical_standard"
+    if local_basis_policy not in {
+        "mixed_canonical_standard",
+        "orthonormalized_operator",
+        "legacy_generalized",
+    }:
+        raise ValueError(
+            "local_basis_policy must be 'mixed_canonical_standard', "
+            "'orthonormalized_operator', or 'legacy_generalized'."
+        )
+    allow_experimental_block2_state_average = bool(
+        sweep_kwargs.pop("allow_experimental_block2_state_average", False)
+    )
+    if (
+        nstates > 1
+        and local_basis_policy == "orthonormalized_operator"
+        and int(qcdmrg.ncas) > 2
+        and not allow_experimental_block2_state_average
+    ):
+        raise NotImplementedError(
+            "block2_like/orthonormalized_operator state-averaged SU(2) DMRG "
+            "is currently validated only for two-site smoke tests. Use the "
+            "default mixed_canonical_standard SA path for larger active spaces, "
+            "or pass allow_experimental_block2_state_average=True for debugging."
+        )
+    requested_orthonormalize_dim = sweep_kwargs.pop(
+        "orthonormalize_generalized_dim",
+        None,
+    )
+    orthonormalized_operator_dim = int(
+        sweep_kwargs.pop("orthonormalized_operator_dim", 512)
+    )
+    if state_average_backend not in {"auto", "sweep", "dense"}:
+        raise ValueError("state_average_backend must be 'auto', 'sweep', or 'dense'.")
+    dense_sa_dim = _fixed_charge_spatial_dim(qcdmrg.ncas, qcdmrg.nelecas)
+    use_direct_dense_sa = (
+        nstates > 1
+        and qcdmrg.ncas > 4
+        and state_average_backend == "auto"
+        and dense_sa_dim <= state_average_dense_dim
+    )
+    if nstates > 1 and qcdmrg.ncas > 2 and (
+        state_average_backend == "dense" or use_direct_dense_sa
+    ):
         return _run_dense_state_average_qchem(
             qcdmrg,
             nstates=nstates,
             target_sector=target_sector,
             weights=weights,
-            max_dense_dim=sweep_kwargs.pop("state_average_dense_dim", 4096),
+            max_dense_dim=state_average_dense_dim,
             spin_tol=state_average_spin_tol,
         )
 
@@ -356,32 +529,131 @@ def run_spatial_qchem_dmrg(
         bond_multiplicity=bond_multiplicity,
         seed=seed,
     )
-    solver_kwargs = {
-        "tol": 1.0e-10,
-        "itermax": 100,
-        "max_space": 160,
-        "dense_fallback_dim": 512,
-    }
+    if nstates > 1:
+        orthonormalize_generalized_dim = (
+            orthonormalized_operator_dim
+            if local_basis_policy == "orthonormalized_operator"
+            else None
+        )
+        solver_kwargs = {
+            "tol": 1.0e-10,
+            "itermax": 30,
+            "max_space": 96,
+            "dense_fallback_dim": 512,
+            "allow_unconverged_roots": True,
+            "use_block_preconditioner": False,
+            "orthonormalize_generalized_dim": orthonormalize_generalized_dim,
+            "orthonormalize_generalized_operator": (
+                local_basis_policy == "orthonormalized_operator"
+            ),
+        }
+    else:
+        if requested_orthonormalize_dim is not None:
+            orthonormalize_generalized_dim = int(requested_orthonormalize_dim)
+        elif local_basis_policy == "orthonormalized_operator":
+            # Match the block-DMRG local problem structure for small active
+            # bonds by building an explicit metric-orthonormal local basis and
+            # solving a standard Davidson problem in that basis. Larger bonds
+            # stay on the packed metric-Krylov path unless callers raise this
+            # cap explicitly.
+            orthonormalize_generalized_dim = orthonormalized_operator_dim
+        elif local_basis_policy == "mixed_canonical_standard":
+            # The packed Davidson path metric-orthonormalizes its local Krylov
+            # basis when a norm operator is present. That gives the block-DMRG
+            # algorithmic structure without forcing dense metric transforms.
+            orthonormalize_generalized_dim = None
+        else:
+            orthonormalize_generalized_dim = 256 if int(qcdmrg.ncas) >= 6 else None
+        solver_kwargs = {
+            "tol": 1.0e-8 if local_basis_policy == "orthonormalized_operator" else 1.0e-6,
+            "tol_residual": (
+                1.0e-8
+                if local_basis_policy == "orthonormalized_operator"
+                else None
+            ),
+            "itermax": 80 if local_basis_policy == "orthonormalized_operator" else 40,
+            "max_space": 96 if local_basis_policy == "orthonormalized_operator" else 48,
+            "dense_fallback_dim": 512,
+            "orthonormalized_dense_dim": None,
+            "orthonormalize_generalized_dim": orthonormalize_generalized_dim,
+            "orthonormalize_generalized_operator": (
+                local_basis_policy == "orthonormalized_operator"
+            ),
+            "use_block_preconditioner": True,
+        }
     solver_kwargs.update(local_solver_kwargs or {})
+    candidate_nstates = nstates
     if nstates > 1:
         root_selection_buffer = int(sweep_kwargs.pop("state_average_root_buffer", 2))
-        solver_kwargs["nstates"] = nstates
-        solver_kwargs["weights"] = np.ones(nstates, dtype=float) / nstates
+        if not state_average_spin_projector:
+            candidate_nstates = int(
+                sweep_kwargs.pop(
+                    "state_average_candidate_roots",
+                    nstates + max(0, root_selection_buffer),
+                )
+            )
+            candidate_nstates = max(nstates, candidate_nstates)
+        solver_kwargs["nstates"] = candidate_nstates
+        local_weights = np.zeros(candidate_nstates, dtype=float)
+        local_weights[: min(nstates, candidate_nstates)] = weights[: min(nstates, candidate_nstates)]
+        local_weight_sum = float(np.sum(local_weights))
+        if abs(local_weight_sum) <= 1.0e-15:
+            local_weights[: min(nstates, candidate_nstates)] = 1.0
+            local_weight_sum = float(np.sum(local_weights))
+        solver_kwargs["weights"] = local_weights / local_weight_sum
         solver_kwargs.setdefault("couple_physical", True)
+        solver_kwargs.setdefault("filter_coupled_boundary", True)
         target_s = 0.5 * abs(float(qcdmrg.spin))
         solver_kwargs.setdefault("root_target_value", target_s * (target_s + 1.0))
         solver_kwargs.setdefault("root_target_tol", state_average_spin_tol)
         solver_kwargs.setdefault("root_selection_buffer", root_selection_buffer)
-    root_target_mpo_factors = _spin_square_mpo_factors(qcdmrg) if nstates > 1 else None
+        state_average_projector_dim = sweep_kwargs.pop(
+            "state_average_projector_dim",
+            nstates + max(0, root_selection_buffer),
+        )
+        if state_average_projector_dim is not None:
+            solver_kwargs.setdefault("root_projector_dim", int(state_average_projector_dim))
+        solver_kwargs.setdefault(
+            "root_projector_dense_dim",
+            int(sweep_kwargs.pop("state_average_projector_dense_dim", 512)),
+        )
+        solver_kwargs.setdefault(
+            "root_projector_block_dim",
+            int(sweep_kwargs.pop("state_average_projector_block_dim", 512)),
+        )
+        solver_kwargs.setdefault(
+            "root_projector_block_max_columns",
+            int(sweep_kwargs.pop("state_average_projector_block_max_columns", 512)),
+        )
+    root_target_mpo_factors = (
+        _spin_square_mpo_factors(qcdmrg)
+        if nstates > 1 and state_average_spin_projector
+        else None
+    )
+    canonical_local_norm = sweep_kwargs.pop(
+        "canonical_local_norm",
+        False,
+    )
 
     result = run_sweeps(
         mps0,
         nsweeps=int(nsweeps),
-        mpo_factors=qcdmrg.H,
+        mpo_factors=mpo_factors,
         root_target_mpo_factors=root_target_mpo_factors,
         max_bond=int(max_bond),
-        max_bond_mode=sweep_kwargs.pop("max_bond_mode", "states"),
-        canonical_local_norm=sweep_kwargs.pop("canonical_local_norm", False),
+        max_bond_mode=sweep_kwargs.pop("max_bond_mode", "per_sector"),
+        canonical_local_norm=canonical_local_norm,
+        prefer_reduced_local_operator=sweep_kwargs.pop("prefer_reduced_local_operator", True),
+        store_orthonormal_renormalized_operators=(
+            local_basis_policy == "orthonormalized_operator"
+        ),
+        require_block_sparse_renormalized_operator_table=(
+            local_basis_policy == "orthonormalized_operator" and nstates > 1
+        ),
+        require_symbolic_renormalized_operators=(
+            local_basis_policy == "orthonormalized_operator"
+        ),
+        complementary_operator_families=complementary_operator_families,
         warm_start_bonds=sweep_kwargs.pop("warm_start_bonds", True),
         mixer_zero_block_noise_scale=sweep_kwargs.pop("mixer_zero_block_noise_scale", 1.0e-5),
         mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
@@ -392,6 +664,10 @@ def run_spatial_qchem_dmrg(
         verbose=verbose,
         **sweep_kwargs,
     )
+    for entry in result.get("history", []):
+        entry["local_basis_policy"] = local_basis_policy
+        for objective in entry.get("bond_objectives", []) or []:
+            objective.setdefault("local_basis_policy", local_basis_policy)
     energy = result["best_energy"]
     if energy is None:
         energy = result["history"][-1]["energy"]
@@ -407,27 +683,79 @@ def run_spatial_qchem_dmrg(
                 break
     if state_energies is not None:
         state_energies = [float(np.real(x)) for x in state_energies]
+    if active_hamiltonian is not None and result["history"]:
+        result["history"][-1]["hamiltonian_system"] = active_hamiltonian.initialize_system_kwargs()
+        result["history"][-1]["hamiltonian_symmetry"] = active_hamiltonian.symmetry
+        if complementary_operator_families is not None and hasattr(
+            complementary_operator_families,
+            "as_metadata",
+        ):
+            result["history"][-1]["hamiltonian_complementary_operators"] = (
+                complementary_operator_families.as_metadata()
+            )
     ground_state = result["mps"]
     root_mps = result.get("root_mps")
     state_s2 = None
     if nstates > 1 and root_mps is not None:
-        root_mps, state_energies, state_s2 = _finalize_spin_targeted_roots(
+        root_mps, state_energies, state_s2, root_selection_info = _finalize_spin_targeted_roots(
             qcdmrg,
             root_mps,
             nstates,
             compute_s2=state_average_validate_spin,
+            select_by_spin=not state_average_spin_projector,
+            spin_tol=state_average_spin_tol,
         )
         if result["history"]:
             result["history"][-1]["target_state_energies"] = list(state_energies)
             result["history"][-1]["state_energies"] = list(state_energies)
+            result["history"][-1]["state_average_candidate_roots"] = int(candidate_nstates)
+            result["history"][-1].update(root_selection_info)
             if state_s2 is not None:
                 result["history"][-1]["state_s2"] = list(state_s2)
-                target_s = 0.5 * abs(float(qcdmrg.spin))
-                target_s2 = target_s * (target_s + 1.0)
-                result["history"][-1]["target_spin_valid"] = all(
-                    abs(float(x) - target_s2) <= state_average_spin_tol
-                    for x in state_s2
+                if root_selection_info.get("target_spin_valid") is None:
+                    target_s = 0.5 * abs(float(qcdmrg.spin))
+                    target_s2 = target_s * (target_s + 1.0)
+                    result["history"][-1]["target_spin_valid"] = all(
+                        abs(float(x) - target_s2) <= state_average_spin_tol
+                        for x in state_s2
+                    )
+        if (
+            state_average_validate_spin
+            and result["history"]
+            and result["history"][-1].get("target_spin_valid") is False
+        ):
+            if state_average_fallback_dense:
+                try:
+                    dense_result = _run_dense_state_average_qchem(
+                        qcdmrg,
+                        nstates=nstates,
+                        target_sector=target_sector,
+                        weights=weights,
+                        max_dense_dim=state_average_dense_dim,
+                        spin_tol=state_average_spin_tol,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "SU(2) state-averaged sweep did not produce target-spin roots, "
+                        "and the dense target-spin fallback is unavailable. Increase "
+                        "state_average_dense_dim, enable state_average_spin_projector=True "
+                        "for small active spaces, or disable validation explicitly."
+                    ) from exc
+                dense_result.history[0]["backend"] = "dense_target_sector_su2_fallback"
+                dense_result.history[0]["fallback_reason"] = "sweep_target_spin_invalid"
+                dense_result.history[0]["sweep_candidate_state_energies"] = result["history"][-1].get(
+                    "candidate_state_energies"
                 )
+                dense_result.history[0]["sweep_candidate_state_s2"] = result["history"][-1].get(
+                    "candidate_state_s2"
+                )
+                return dense_result
+            raise RuntimeError(
+                "SU(2) state-averaged sweep did not produce target-spin roots. "
+                "Enable state_average_spin_projector=True for a local spin projector, "
+                "use state_average_backend='dense' for small active spaces, or disable "
+                "state_average_validate_spin if contaminated roots are acceptable."
+            )
     active_energy = state_energies if state_energies is not None else energy
     return NonAbelianDMRGResult(
         e_tot=active_energy,

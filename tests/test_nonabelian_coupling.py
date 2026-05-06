@@ -281,3 +281,50 @@ def test_combine_three_doublets_builds_reduced_multiplet_axis_and_recouples():
         tensor.data[(left_boundary, half, half, half, right_boundary)],
         atol=1.0e-12,
     )
+
+
+def test_recouple_fused_leg_handles_multiple_child_sector_tuples_per_fused_sector():
+    left_boundary = _charge_spin_sector(0, 0)
+    right_boundary = _charge_spin_sector(0, 0)
+    vacuum = _charge_spin_sector(0, 0)
+    singlet_pair = _charge_spin_sector(2, 0)
+    doublet = _charge_spin_sector(1, 1)
+    final_doublet = _charge_spin_sector(3, 1)
+
+    tensor = NonabelianTensor(
+        data={
+            (left_boundary, vacuum, doublet, singlet_pair, right_boundary): np.arange(2.0).reshape(1, 1, 2, 1, 1),
+            (left_boundary, singlet_pair, doublet, vacuum, right_boundary): (10.0 + np.arange(2.0)).reshape(1, 1, 2, 1, 1),
+            (left_boundary, doublet, vacuum, singlet_pair, right_boundary): (20.0 + np.arange(2.0)).reshape(1, 2, 1, 1, 1),
+        },
+        qns=[
+            [left_boundary],
+            [vacuum, singlet_pair, doublet],
+            [doublet, vacuum],
+            [singlet_pair, vacuum],
+            [right_boundary],
+        ],
+        dirs=[-1, 1, 1, 1, 1],
+    )
+    left_leg = FusionLeg.from_children(
+        child_legs=(1, 2, 3),
+        child_sector_lists=(
+            (vacuum, singlet_pair, doublet),
+            (doublet, vacuum),
+            (singlet_pair, vacuum),
+        ),
+        child_dirs=(1, 1, 1),
+        orientation=1,
+        coupling="left",
+    )
+
+    combined_left = combine_legs(tensor, (1, 2, 3), fusion_leg=left_leg, use_cg=True)
+    assert (left_boundary, final_doublet, right_boundary) in combined_left.data
+
+    combined_right = recouple_fused_leg(combined_left, 1, "right")
+    assert combined_right.fusion_legs[1].pipe.coupling == "right"
+    recovered_right = split_legs(combined_right, 1)
+
+    assert set(recovered_right.data) == set(tensor.data)
+    for key, block in tensor.data.items():
+        np.testing.assert_allclose(recovered_right.data[key], block, atol=1.0e-12)

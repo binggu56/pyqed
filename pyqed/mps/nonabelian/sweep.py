@@ -7,6 +7,7 @@ Minimal sweep drivers for fixed-layout non-Abelian tensor chains.
 from __future__ import annotations
 
 import inspect
+import time
 import numpy as np
 
 from pyqed.mps.su2 import SpinChargeSector, fuse_charge_spin_sectors
@@ -18,11 +19,23 @@ from .canonical import (
     right_canonicalize_sites,
 )
 from .environment import BlockSparseEnvironmentChain, contract_chain_expectation
-from .contraction import merge_mps_sites
+from .contraction import merge_mps_sites, normalize_site_tensor_layout
+from .decompose import state_averaged_svd_two_site
+from .linalg import sector_state_weight
 from .mps import MPS
-from .solver import TwoSiteEffectiveH
+from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
+from .solver import TwoSiteEffectiveH, solve_local_two_site
+from .solver import (
+    _materialize_local_matrix,
+    _normalize_local_operator,
+    _operator_basis_for_layout,
+    _resolve_davidson_operator,
+    pack_two_site_state,
+    unpack_two_site_state,
+    two_site_state_basis,
+)
 from .tensor import NonabelianTensor
-from .update import two_site_update
+from .update import _expand_two_site_support, two_site_update
 
 
 def _ordered_union_qns(primary, secondary):
@@ -235,6 +248,19 @@ def sweep_once(
     mixer_zero_block_noise_scale=0.0,
     mixer_rng=None,
     record_post_update_energy=False,
+    state_average_root_environments=False,
+    state_average_local_norm=False,
+    store_orthonormal_renormalized_operators=False,
+    renormalized_operator_cache=None,
+    renormalized_operator_cache_max_size=256,
+    renormalized_block_stack=None,
+    norm_renormalized_block_stack=None,
+    target_renormalized_block_stack=None,
+    complementary_operator_families=None,
+    identity_mpo_factors=None,
+    require_block_sparse_renormalized_operator_table=False,
+    require_symbolic_renormalized_operators=False,
+    profile=False,
     verbose=0,
 ):
     """
@@ -289,6 +315,43 @@ def sweep_once(
         If True and ``mpo_factors`` are provided, record the full-chain MPO
         expectation value immediately after each bond update under
         ``update["local_objective"]["post_update_energy"]``.
+    state_average_root_environments
+        If True for multi-root MPO sweeps, rebuild the local effective
+        Hamiltonian from each root MPS before the state-averaged SVD. This is
+        slower than the default shared-environment path, but preserves the
+        root-specific mixed-canonical centers required by sweep-based SA-DMRG.
+    state_average_local_norm
+        If True, build an explicit local norm operator for state-averaged
+        local solves. The default keeps the legacy canonical-norm assumption
+        because the generalized SA path is currently diagnostic.
+    store_orthonormal_renormalized_operators
+        If True, build the local effective Hamiltonian as a standard operator
+        in an orthonormal reduced basis owned by the environment sweep. This is
+        the block-DMRG style path: the norm operator is consumed while building
+        the local renormalized operator, rather than passed to the local solver.
+    renormalized_operator_cache
+        Optional persistent cache for environment-owned orthonormalized
+        renormalized-operator tables. Cache keys include the active
+        environment identity and local-basis signature, so stale tables are not
+        reused after an environment update.
+    renormalized_operator_cache_max_size
+        Maximum number of transformed local operator tables retained in the
+        persistent cache. Oldest entries are pruned first.
+    renormalized_block_stack, norm_renormalized_block_stack, target_renormalized_block_stack
+        Optional persistent left/right boundary-stack owners.  Passing these
+        from the sweep driver makes the renormalized block table a first-class
+        sweep object instead of a per-sweep temporary.
+    complementary_operator_families
+        Optional block2-style complementary Hamiltonian families attached to
+        the Hamiltonian renormalized block stack.
+    identity_mpo_factors
+        Optional prebuilt identity MPO cores used for the norm environment.
+    require_block_sparse_renormalized_operator_table
+        If True, transformed local operators must use the block-sparse
+        renormalized-operator table.
+    require_symbolic_renormalized_operators
+        If True, Hamiltonian local operators must be assembled from symbolic
+        renormalized boundary payloads rather than raw environment maps.
     verbose
         Logging level. ``0`` is silent, ``1`` is sweep-level only, ``2`` also
         prints per-bond updates.
@@ -337,6 +400,9 @@ def sweep_once(
         assert_mixed_canonical_sites(updated_sites, canonical_center)
     local_solver_kwargs = dict(local_solver_kwargs or {})
     nlocal_states = int(local_solver_kwargs.get("nstates", 1))
+    use_root_environment_path = bool(
+        state_average_root_environments and mpo_factors is not None and nlocal_states > 1
+    )
     if initial_root_sites is not None:
         root_sites = [
             [site.copy() for site in root]
@@ -349,6 +415,19 @@ def sweep_once(
         ]
     else:
         root_sites = None
+    if root_sites is not None and mpo_factors is not None:
+        initial_center = min(1, len(updated_sites) - 1) if direction == "lr" else max(0, len(updated_sites) - 2)
+        root_sites = [
+            mixed_canonicalize_sites(
+                sites_for_root,
+                initial_center,
+                max_bond=None,
+                cutoff=0.0,
+                max_bond_mode=max_bond_mode or "states",
+                bond_coupling=bond_coupling,
+            )
+            for sites_for_root in root_sites
+        ]
     local_guess_cache = dict(local_guess_cache or {})
     next_local_guess_cache = {}
     if max_bond_mode is None:
@@ -358,22 +437,87 @@ def sweep_once(
         # basis path for the non-Abelian MPO sweeps in this codebase.
         local_solver_kwargs["couple_physical"] = False
     updates = []
+    if renormalized_operator_cache is None:
+        renormalized_operator_cache = RenormalizedOperatorStack(
+            max_size=renormalized_operator_cache_max_size,
+        )
+    elif isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
+        renormalized_operator_cache.max_size = int(renormalized_operator_cache_max_size)
+    renormalized_operator_cache_max_size = int(renormalized_operator_cache_max_size)
+    if mpo_factors is not None and not use_root_environment_path:
+        if renormalized_block_stack is None:
+            renormalized_block_stack = RenormalizedBlockStack(
+                namespace="hamiltonian",
+                complementary_operator_families=complementary_operator_families,
+            )
+        elif complementary_operator_families is not None:
+            renormalized_block_stack.set_complementary_operator_families(
+                complementary_operator_families
+            )
+        if norm_renormalized_block_stack is None:
+            norm_renormalized_block_stack = RenormalizedBlockStack(namespace="norm")
+    else:
+        renormalized_block_stack = None
+        norm_renormalized_block_stack = None
+    if root_target_mpo_factors is not None and not use_root_environment_path:
+        if target_renormalized_block_stack is None:
+            target_renormalized_block_stack = RenormalizedBlockStack(namespace="target")
+    else:
+        target_renormalized_block_stack = None
     env_sweep = None
     norm_env_sweep = None
     target_env_sweep = None
     force_canonical_local_norm = str(canonical_local_norm).lower() in {"force", "forced", "unsafe"}
-    if mpo_factors is not None:
-        env_sweep = BlockSparseEnvironmentChain.build(updated_sites, mpo_factors).start_sweep(direction)
-        if not force_canonical_local_norm:
+    timing = {
+        "environment_build": 0.0,
+        "bond_operator": 0.0,
+        "two_site_update": 0.0,
+        "environment_advance": 0.0,
+        "post_update_energy": 0.0,
+        "update_merge_expand": 0.0,
+        "update_operator_factory": 0.0,
+        "update_local_solve": 0.0,
+        "update_optimized_expand": 0.0,
+        "update_svd": 0.0,
+        "local_davidson": 0.0,
+        "local_matvec": 0.0,
+        "local_residual": 0.0,
+    } if profile else None
+    sweep_t0 = time.perf_counter() if profile else None
+    if mpo_factors is not None and not use_root_environment_path:
+        t0 = time.perf_counter() if profile else None
+        env_sweep = BlockSparseEnvironmentChain.build(
+            updated_sites,
+            mpo_factors,
+            renormalized_blocks=renormalized_block_stack,
+            require_symbolic_payloads=require_symbolic_renormalized_operators,
+            sweep_direction=direction,
+        ).start_sweep(direction)
+        if not force_canonical_local_norm and (
+            nlocal_states <= 1
+            or state_average_local_norm
+            or store_orthonormal_renormalized_operators
+        ):
+            if identity_mpo_factors is None:
+                identity_mpo_factors = _identity_mpo_factors_for_sites_and_mpo(
+                    updated_sites,
+                    mpo_factors,
+                )
             norm_env_sweep = BlockSparseEnvironmentChain.build(
                 updated_sites,
-                _identity_mpo_factors_for_sites_and_mpo(updated_sites, mpo_factors),
+                identity_mpo_factors,
+                renormalized_blocks=norm_renormalized_block_stack,
+                sweep_direction=direction,
             ).start_sweep(direction)
         if root_target_mpo_factors is not None:
             target_env_sweep = BlockSparseEnvironmentChain.build(
                 updated_sites,
                 root_target_mpo_factors,
+                renormalized_blocks=target_renormalized_block_stack,
+                sweep_direction=direction,
             ).start_sweep(direction)
+        if profile:
+            timing["environment_build"] += time.perf_counter() - t0
     for bond in bonds:
         bond_local_solver_kwargs = dict(local_solver_kwargs)
         guess_source = None
@@ -423,27 +567,52 @@ def sweep_once(
                 force_canonical_local_norm=force_canonical_local_norm,
                 state_averaged_local=int(bond_local_solver_kwargs.get("nstates", 1)) > 1,
             ):
-                operator = env_sweep.bond_operator(bond, merged)
-                norm_operator = (
-                    None
-                    if force_canonical_local_norm
-                    else norm_env_sweep.bond_operator(bond, merged)
-                )
+                t0 = time.perf_counter() if profile else None
+                operator = None
+                norm_operator = None
+                if (
+                    store_orthonormal_renormalized_operators
+                    and not force_canonical_local_norm
+                ):
+                    operator = env_sweep.orthonormal_bond_operator(
+                        bond,
+                        merged,
+                        norm_env_sweep,
+                        tol=float(bond_local_solver_kwargs.get("tol", 1.0e-8)),
+                        max_dim=bond_local_solver_kwargs.get("orthonormalize_generalized_dim"),
+                        cache=renormalized_operator_cache,
+                        require_block_sparse_table=require_block_sparse_renormalized_operator_table,
+                        profile=profile,
+                    )
+                if operator is None:
+                    operator = env_sweep.bond_operator(bond, merged)
+                    norm_operator = (
+                        None
+                        if force_canonical_local_norm or (
+                            state_averaged_local and not state_average_local_norm
+                        )
+                        else norm_env_sweep.bond_operator(bond, merged)
+                    )
                 norm_is_identity = (
                     True
-                    if force_canonical_local_norm
+                    if force_canonical_local_norm or operator is not None and norm_operator is None
                     else getattr(norm_operator, "identity_like", False)
                 )
-                return TwoSiteEffectiveH(
+                result = TwoSiteEffectiveH(
                     operator=operator,
                     norm_operator=norm_operator,
                     canonical_norm=(
                         True
-                        if norm_is_identity or state_averaged_local
+                        if norm_is_identity or (
+                            state_averaged_local and not state_average_local_norm
+                        )
                         else False
                     ),
                     name=f"bond-{bond}-effective-H",
                 )
+                if profile:
+                    timing["bond_operator"] += time.perf_counter() - t0
+                return result
             merged_local_operator._is_local_operator_factory = True
             if target_env_sweep is not None:
                 def merged_root_target_operator(
@@ -458,21 +627,55 @@ def sweep_once(
                     merged_root_target_operator,
                 )
 
-        update = two_site_update(
-            updated_sites[bond],
-            updated_sites[bond + 1],
-            solver=merged_solver,
-            local_operator=merged_local_operator,
-            local_solver_kwargs=bond_local_solver_kwargs,
-            bond_coupling=bond_coupling,
-            max_bond=max_bond,
-            max_bond_mode=max_bond_mode,
-            cutoff=cutoff,
-            absorb=absorb,
-            prefer_reduced_local_operator=prefer_reduced_local_operator,
-            mixer_zero_block_noise_scale=mixer_zero_block_noise_scale,
-            mixer_rng=mixer_rng,
-        )
+        t0 = time.perf_counter() if profile else None
+        if (
+            use_root_environment_path
+            and root_sites is not None
+            and int(bond_local_solver_kwargs.get("nstates", 1)) > 1
+        ):
+            update = _state_average_root_environment_update(
+                root_sites,
+                bond,
+                direction=direction,
+                mpo_factors=mpo_factors,
+                local_solver_kwargs=bond_local_solver_kwargs,
+                bond_coupling=bond_coupling,
+                max_bond=max_bond,
+                max_bond_mode=max_bond_mode,
+                cutoff=cutoff,
+                absorb=absorb,
+                profile=profile,
+            )
+        else:
+            update = two_site_update(
+                updated_sites[bond],
+                updated_sites[bond + 1],
+                solver=merged_solver,
+                local_operator=merged_local_operator,
+                local_solver_kwargs=bond_local_solver_kwargs,
+                bond_coupling=bond_coupling,
+                max_bond=max_bond,
+                max_bond_mode=max_bond_mode,
+                cutoff=cutoff,
+                absorb=absorb,
+                prefer_reduced_local_operator=prefer_reduced_local_operator,
+                mixer_zero_block_noise_scale=mixer_zero_block_noise_scale,
+                mixer_rng=mixer_rng,
+                profile=profile,
+            )
+        if profile:
+            timing["two_site_update"] += time.perf_counter() - t0
+            objective_timing = dict(update.get("local_objective") or {})
+            update_timing = objective_timing.get("update_timing") or {}
+            solver_timing = objective_timing.get("solver_timing") or {}
+            timing["update_merge_expand"] += float(update_timing.get("merge_expand", 0.0))
+            timing["update_operator_factory"] += float(update_timing.get("operator_factory", 0.0))
+            timing["update_local_solve"] += float(update_timing.get("local_solve", 0.0))
+            timing["update_optimized_expand"] += float(update_timing.get("optimized_expand", 0.0))
+            timing["update_svd"] += float(update_timing.get("svd", 0.0))
+            timing["local_davidson"] += float(solver_timing.get("davidson", 0.0))
+            timing["local_matvec"] += float(solver_timing.get("matvec", 0.0))
+            timing["local_residual"] += float(solver_timing.get("residual", 0.0))
         if (
             warm_start_bonds
             and (local_operator is not None or mpo_factors is not None)
@@ -482,6 +685,8 @@ def sweep_once(
         if guess_source is not None and update.get("local_guess_used"):
             update.setdefault("local_objective", {})
             update["local_objective"]["warm_start"] = guess_source
+        update["left"] = normalize_site_tensor_layout(update["left"])
+        update["right"] = normalize_site_tensor_layout(update["right"])
         updated_sites[bond] = update["left"]
         updated_sites[bond + 1] = update["right"]
         if root_sites is not None:
@@ -491,12 +696,13 @@ def sweep_once(
                     root_left, root_right = root_pairs[root_idx]
                 else:
                     root_left, root_right = update["left"], update["right"]
-                sites_for_root[bond] = root_left.copy()
-                sites_for_root[bond + 1] = root_right.copy()
+                sites_for_root[bond] = normalize_site_tensor_layout(root_left).copy()
+                sites_for_root[bond + 1] = normalize_site_tensor_layout(root_right).copy()
         if mpo_factors is not None:
             next_center = bond + 1 if direction == "lr" else bond
             assert_mixed_canonical_sites(updated_sites, next_center)
         if env_sweep is not None:
+            t0 = time.perf_counter() if profile else None
             env_sweep.advance_after_update(
                 bond,
                 update["left"],
@@ -514,15 +720,29 @@ def sweep_once(
                     update["left"],
                     update["right"],
                 )
+            if profile:
+                timing["environment_advance"] += time.perf_counter() - t0
+        if isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
+            renormalized_operator_cache.prune()
+        elif renormalized_operator_cache_max_size > 0:
+            while len(renormalized_operator_cache) > renormalized_operator_cache_max_size:
+                renormalized_operator_cache.pop(next(iter(renormalized_operator_cache)))
         if record_post_update_energy and mpo_factors is not None:
+            t0 = time.perf_counter() if profile else None
             update.setdefault("local_objective", {})
             update["local_objective"]["post_update_energy"] = _compute_state_energy_from_mpo(
                 updated_sites,
                 mpo_factors,
+                identity_mpo_factors=identity_mpo_factors,
             )
+            if profile:
+                timing["post_update_energy"] += time.perf_counter() - t0
         if int(verbose) >= 2:
             _emit_verbose(_format_bond_update_line(bond, update), verbose=verbose)
         updates.append({"bond": bond, **update})
+
+    if profile:
+        timing["total"] = time.perf_counter() - sweep_t0
 
     return {
         "direction": direction,
@@ -531,12 +751,353 @@ def sweep_once(
         "root_sites": root_sites,
         "updates": updates,
         "local_guess_cache": next_local_guess_cache,
+        "renormalized_operator_cache": renormalized_operator_cache,
+        "renormalized_block_stack": renormalized_block_stack,
+        "norm_renormalized_block_stack": norm_renormalized_block_stack,
+        "target_renormalized_block_stack": target_renormalized_block_stack,
+        "renormalized_operator_cache_size": len(renormalized_operator_cache),
+        "renormalized_operator_cache_stats": (
+            renormalized_operator_cache.stats
+            if isinstance(renormalized_operator_cache, RenormalizedOperatorStack)
+            else None
+        ),
+        "renormalized_block_stack_stats": (
+            renormalized_block_stack.stats if renormalized_block_stack is not None else None
+        ),
+        "norm_renormalized_block_stack_stats": (
+            norm_renormalized_block_stack.stats
+            if norm_renormalized_block_stack is not None
+            else None
+        ),
+        "target_renormalized_block_stack_stats": (
+            target_renormalized_block_stack.stats
+            if target_renormalized_block_stack is not None
+            else None
+        ),
         "final_mpo_numerator": (
             env_sweep.final_expectation(updated_sites) if env_sweep is not None else None
         ),
         "final_mpo_denominator": (
             norm_env_sweep.final_expectation(updated_sites) if norm_env_sweep is not None else None
         ),
+        "timing": timing,
+    }
+
+
+def _single_root_solver_kwargs(local_solver_kwargs, *, guess):
+    """
+    Return local solver options for one root-specific SA subproblem.
+
+    Parameters
+    ----------
+    local_solver_kwargs
+        Multi-root solver keyword payload from the sweep driver.
+    guess
+        Active two-site tensor used as the initial local vector.
+
+    Returns
+    -------
+    dict
+        Keyword arguments suitable for :func:`solve_local_two_site` with
+        ``nstates=1``.
+    """
+
+    kwargs = dict(local_solver_kwargs or {})
+    for key in (
+        "nstates",
+        "weights",
+        "root_guesses",
+        "root_target_operator",
+        "root_target_value",
+        "root_target_tol",
+        "root_selection_buffer",
+        "root_projector_dim",
+        "root_projector_dense_dim",
+        "root_projector_block_dim",
+        "root_projector_block_max_columns",
+        "root_projector_block_offdiag_tol",
+        "filter_coupled_boundary",
+    ):
+        kwargs.pop(key, None)
+    kwargs["nstates"] = 1
+    kwargs["guess"] = guess
+    return kwargs
+
+
+def _state_average_weights(local_solver_kwargs, nroots):
+    """
+    Normalize state-average weights for a local SA update.
+
+    Parameters
+    ----------
+    local_solver_kwargs
+        Local solver keyword payload.
+    nroots
+        Number of propagated root MPSs.
+
+    Returns
+    -------
+    numpy.ndarray
+        Normalized weights with length ``nroots``.
+    """
+
+    weights = local_solver_kwargs.get("weights")
+    if weights is None:
+        weights = np.ones(int(nroots), dtype=float)
+    else:
+        weights = np.asarray(weights, dtype=float).reshape(-1)
+        if weights.size < int(nroots):
+            weights = np.pad(weights, (0, int(nroots) - weights.size))
+        elif weights.size > int(nroots):
+            weights = weights[: int(nroots)]
+    total = float(np.sum(weights))
+    if abs(total) <= 1.0e-15:
+        weights = np.ones(int(nroots), dtype=float)
+        total = float(np.sum(weights))
+    return weights / total
+
+
+def _orthonormal_columns(columns, *, dim, tol=1.0e-10):
+    """
+    Build an orthonormal dense column basis from candidate vectors.
+
+    Parameters
+    ----------
+    columns
+        Iterable of one-dimensional candidate vectors.
+    dim
+        Full vector-space dimension.
+    tol
+        Linear-dependence threshold.
+
+    Returns
+    -------
+    numpy.ndarray
+        Matrix with orthonormal columns.
+    """
+
+    basis = []
+    for column in columns:
+        vec = np.asarray(column, dtype=complex).reshape(dim)
+        for prev in basis:
+            vec = vec - prev * np.vdot(prev, vec)
+        norm = float(np.linalg.norm(vec))
+        if norm > float(tol):
+            basis.append(vec / norm)
+    if not basis:
+        return np.zeros((dim, 0), dtype=complex)
+    return np.column_stack(basis)
+
+
+def _dense_deflated_local_root(
+    merged,
+    operator,
+    previous_roots,
+    *,
+    tol=1.0e-10,
+):
+    """
+    Solve one dense local root with orthogonality to previous local roots.
+
+    Parameters
+    ----------
+    merged
+        Active two-site tensor template.
+    operator
+        Local effective Hamiltonian.
+    previous_roots
+        Earlier optimized root tensors to project out in the current local
+        packed basis.
+    tol
+        Numerical threshold for rank decisions.
+
+    Returns
+    -------
+    tuple
+        ``(optimized_tensor, objective)``.
+    """
+
+    op = _normalize_local_operator(operator)
+    vec0, raw_layout = pack_two_site_state(merged)
+    layout = (
+        _operator_basis_for_layout(op, raw_layout)
+        or two_site_state_basis(merged, layout=raw_layout)
+    )
+    vec0, _ = pack_two_site_state(merged, layout=layout)
+    dim = int(np.asarray(vec0).reshape(-1).size)
+    op_resolved, _diag = _resolve_davidson_operator(op, merged, layout)
+    H = (
+        _materialize_local_matrix(op_resolved, dim)
+        if callable(op_resolved)
+        else np.asarray(op_resolved, dtype=complex)
+    )
+    H = 0.5 * (H + H.conj().T)
+
+    packed_previous = []
+    for root in previous_roots:
+        try:
+            root_vec, _ = pack_two_site_state(root, layout=layout)
+        except ValueError:
+            continue
+        packed_previous.append(root_vec)
+    Qprev = _orthonormal_columns(packed_previous, dim=dim, tol=tol)
+    if Qprev.shape[1] > 0:
+        full = np.eye(dim, dtype=complex)
+        candidates = full - Qprev @ Qprev.conj().T
+        Q = _orthonormal_columns(candidates.T, dim=dim, tol=tol)
+    else:
+        Q = np.eye(dim, dtype=complex)
+    if Q.shape[1] <= 0:
+        raise ValueError("Deflated local root subspace is empty.")
+    Hproj = Q.conj().T @ H @ Q
+    evals, evecs = np.linalg.eigh(0.5 * (Hproj + Hproj.conj().T))
+    idx = int(np.argmin(np.real(evals)))
+    vec = Q @ evecs[:, idx]
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1.0e-15:
+        raise ValueError("Dense deflated local root has zero norm.")
+    vec = vec / norm
+    energy = float(np.real(evals[idx]))
+    optimized = unpack_two_site_state(vec, merged, layout=layout)
+    residual = float(np.linalg.norm(H @ vec - energy * vec))
+    return optimized, {
+        "energy": energy,
+        "residual": residual,
+        "dense_deflated": True,
+        "deflated_roots": int(Qprev.shape[1]),
+        "subspace_dim": int(Q.shape[1]),
+        "layout_size": int(dim),
+    }
+
+
+def _state_average_root_environment_update(
+    root_sites,
+    bond,
+    *,
+    direction,
+    mpo_factors,
+    local_solver_kwargs,
+    bond_coupling,
+    max_bond,
+    max_bond_mode,
+    cutoff,
+    absorb,
+    profile=False,
+):
+    """
+    Update one SA bond using root-specific effective Hamiltonians.
+
+    This follows the root-propagating SA-DMRG structure: each root MPS is kept
+    in mixed-canonical gauge at the active bond, each local root is optimized in
+    its own environment, and the averaged density matrix/SVD is built from the
+    optimized root center tensors.
+
+    Parameters
+    ----------
+    root_sites
+        Mutable list of per-root site tensor lists.
+    bond
+        Active left-site index.
+    direction
+        Sweep direction, ``"lr"`` or ``"rl"``.
+    mpo_factors
+        Hamiltonian MPO factors.
+    local_solver_kwargs
+        Multi-root local solver options.
+    bond_coupling, max_bond, max_bond_mode, cutoff, absorb
+        State-averaged SVD options.
+    profile
+        If True, record coarse per-root timing.
+
+    Returns
+    -------
+    dict
+        Update payload compatible with :func:`two_site_update`.
+    """
+
+    nroots = int(local_solver_kwargs.get("nstates", len(root_sites)))
+    nroots = min(nroots, len(root_sites))
+    weights = _state_average_weights(local_solver_kwargs, nroots)
+    center = bond + 1 if direction == "lr" else bond
+    optimized_roots = []
+    root_objectives = []
+    timing = {"canonicalize": 0.0, "environment": 0.0, "solve": 0.0} if profile else None
+
+    for root_idx in range(nroots):
+        canonical_sites = root_sites[root_idx]
+        merged = merge_mps_sites(canonical_sites[bond], canonical_sites[bond + 1])
+        t0 = time.perf_counter() if profile else None
+        operator = BlockSparseEnvironmentChain.build(canonical_sites, mpo_factors).bond_operator(
+            bond,
+            merged,
+        )
+        if profile:
+            timing["environment"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter() if profile else None
+        optimized, objective = _dense_deflated_local_root(
+            merged,
+            operator,
+            optimized_roots,
+            tol=float(local_solver_kwargs.get("tol", 1.0e-10)),
+        )
+        optimized = _expand_two_site_support(
+            canonical_sites[bond],
+            canonical_sites[bond + 1],
+            optimized,
+        )
+        if profile:
+            timing["solve"] += time.perf_counter() - t0
+        optimized_roots.append(optimized)
+        root_objectives.append(dict(objective))
+
+    left, right, singular_values, trunc_err, kept, root_site_pairs = state_averaged_svd_two_site(
+        optimized_roots,
+        weights,
+        bond_coupling=bond_coupling,
+        max_bond=max_bond,
+        max_bond_mode=max_bond_mode,
+        cutoff=cutoff,
+        absorb=absorb,
+    )
+    kept_states = sum(
+        sector_state_weight(q_mid) * int(block.shape[0])
+        for q_mid, block in singular_values.items()
+    )
+    state_energies = [
+        float(obj["energy"])
+        for obj in root_objectives
+        if "energy" in obj
+    ]
+    local_objective = {
+        "effective_local_problem": "state_averaged_root_environment_davidson",
+        "state_averaged_svd": True,
+        "state_average_weights": [float(x) for x in weights],
+        "state_energies": state_energies,
+        "state_average_energy": float(np.dot(weights[: len(state_energies)], state_energies))
+        if len(state_energies) == len(weights)
+        else None,
+        "root_objectives": root_objectives,
+        "trunc_err": float(trunc_err),
+        "kept": {key: list(value) for key, value in kept.items()} if isinstance(kept, dict) else int(kept),
+        "kept_states": int(kept_states),
+    }
+    if timing is not None:
+        local_objective["root_environment_timing"] = timing
+
+    return {
+        "merged": merge_mps_sites(root_sites[0][bond], root_sites[0][bond + 1]),
+        "optimized": optimized_roots[0],
+        "optimized_roots": optimized_roots,
+        "root_site_pairs": root_site_pairs,
+        "left": left,
+        "right": right,
+        "singular_values": singular_values,
+        "trunc_err": trunc_err,
+        "kept": kept,
+        "kept_states": kept_states,
+        "local_objective": local_objective,
+        "local_guess_used": False,
     }
 
 
@@ -552,6 +1113,10 @@ def _summarize_objectives(updates):
     energies = []
     metrics = []
     values = []
+    cache_hits = 0
+    cache_lookups = 0
+    renormalized_operator_storages = set()
+    renormalized_operator_table_kinds = set()
     for update in updates:
         objective = dict(update.get("local_objective") or {})
         if not objective:
@@ -563,6 +1128,17 @@ def _summarize_objectives(updates):
             metrics.append(float(objective["metric"]))
         if "value" in objective:
             values.append(float(objective["value"]))
+        if "renormalized_operator_cache_hit" in objective:
+            cache_lookups += 1
+            if objective.get("renormalized_operator_cache_hit"):
+                cache_hits += 1
+        storage = objective.get("renormalized_operator_storage")
+        if storage is not None:
+            renormalized_operator_storages.add(str(storage))
+        table_stats = objective.get("renormalized_operator_table_stats") or {}
+        table_kind = table_stats.get("kind")
+        if table_kind is not None:
+            renormalized_operator_table_kinds.add(str(table_kind))
 
     summary = {"bond_objectives": bond_objectives}
     if energies:
@@ -571,14 +1147,32 @@ def _summarize_objectives(updates):
         summary["objective_metric"] = sum(metrics) / len(metrics)
     if values:
         summary["objective_value"] = sum(values) / len(values)
+    if cache_lookups:
+        summary["renormalized_operator_cache_hits"] = int(cache_hits)
+        summary["renormalized_operator_cache_lookups"] = int(cache_lookups)
+    if renormalized_operator_storages:
+        summary["renormalized_operator_storages"] = sorted(renormalized_operator_storages)
+    if renormalized_operator_table_kinds:
+        summary["renormalized_operator_table_kinds"] = sorted(renormalized_operator_table_kinds)
     return summary
 
 
-def _compute_state_energy_from_mpo(sites, mpo_factors):
+def _compute_state_energy_from_mpo(sites, mpo_factors, *, identity_mpo_factors=None):
+    """
+    Return the normalized MPO expectation value for one MPS.
+
+    :param sites: MPS site tensors.
+    :param mpo_factors: Hamiltonian MPO cores.
+    :param identity_mpo_factors: Optional prebuilt identity MPO cores.
+    :returns: Real normalized expectation value.
+    """
+
     numerator = contract_chain_expectation(sites, mpo_factors)
+    if identity_mpo_factors is None:
+        identity_mpo_factors = _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors)
     denominator = contract_chain_expectation(
         sites,
-        _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors),
+        identity_mpo_factors,
     )
     denom = float(np.real(denominator))
     if abs(denom) < 1e-15:
@@ -680,6 +1274,15 @@ def run_sweeps(
     mixer_nsweeps=1,
     record_post_update_energy=False,
     evaluate_root_energies_each_sweep=True,
+    state_average_root_environments=False,
+    state_average_local_norm=False,
+    store_orthonormal_renormalized_operators=False,
+    renormalized_operator_cache=None,
+    renormalized_operator_cache_max_size=256,
+    require_block_sparse_renormalized_operator_table=False,
+    require_symbolic_renormalized_operators=False,
+    complementary_operator_families=None,
+    profile=False,
     verbose=0,
 ):
     """
@@ -720,6 +1323,19 @@ def run_sweeps(
     evaluate_root_energies_each_sweep
         If False, skip full root-MPS MPO expectation evaluations during the
         sweep history. The final caller can still evaluate selected roots once.
+    state_average_root_environments
+        If True for multi-root MPO sweeps, use root-specific local Hamiltonian
+        environments before the state-averaged SVD.
+    state_average_local_norm
+        If True, use explicit norm environments for state-averaged local solves.
+    store_orthonormal_renormalized_operators
+        If True, keep persistent renormalized boundary stacks and local
+        orthonormal operator tables across sweeps.
+    complementary_operator_families
+        Optional block2-style complementary Hamiltonian families attached to
+        the persistent Hamiltonian renormalized block stack.
+    profile
+        If True, attach a coarse timing breakdown to each sweep history entry.
     verbose
         Logging level. ``0`` is silent, ``1`` prints one summary line per
         sweep, and ``2`` additionally prints one line per bond update.
@@ -753,9 +1369,44 @@ def run_sweeps(
     last_root_sites = None
     last_state_energies = None
     local_guess_cache = {}
+    renormalized_operator_cache = (
+        renormalized_operator_cache
+        if renormalized_operator_cache is not None
+        else RenormalizedOperatorStack(max_size=renormalized_operator_cache_max_size)
+    )
+    if isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
+        renormalized_operator_cache.max_size = int(renormalized_operator_cache_max_size)
     mixer_zero_block_noise_scale = float(mixer_zero_block_noise_scale)
     mixer_nsweeps = int(mixer_nsweeps)
     mixer_rng = np.random.default_rng(mixer_zero_block_noise_seed)
+    run_uses_root_environment_path = bool(
+        state_average_root_environments
+        and mpo_factors is not None
+        and int((local_solver_kwargs or {}).get("nstates", 1)) > 1
+    )
+    persistent_renormalized_block_stack = (
+        RenormalizedBlockStack(
+            namespace="hamiltonian",
+            complementary_operator_families=complementary_operator_families,
+        )
+        if mpo_factors is not None and not run_uses_root_environment_path
+        else None
+    )
+    persistent_norm_renormalized_block_stack = (
+        RenormalizedBlockStack(namespace="norm")
+        if mpo_factors is not None and not run_uses_root_environment_path
+        else None
+    )
+    persistent_target_renormalized_block_stack = (
+        RenormalizedBlockStack(namespace="target")
+        if root_target_mpo_factors is not None and not run_uses_root_environment_path
+        else None
+    )
+    identity_mpo_factors = (
+        _identity_mpo_factors_for_sites_and_mpo(current_sites, mpo_factors)
+        if mpo_factors is not None
+        else None
+    )
 
     for sweep_idx in range(int(nsweeps)):
         resolved_schedule = _resolve_local_solver_schedule(
@@ -774,6 +1425,7 @@ def run_sweeps(
         else:
             sweep_local_solver_kwargs = dict(local_solver_kwargs or {})
             sweep_local_solver_kwargs.update(resolved_schedule)
+        sweep_nlocal_states = int(sweep_local_solver_kwargs.get("nstates", 1))
         sweep_result = sweep_once(
             current_sites,
             direction=direction,
@@ -796,21 +1448,41 @@ def run_sweeps(
             ),
             mixer_rng=mixer_rng,
             record_post_update_energy=record_post_update_energy,
+            state_average_root_environments=state_average_root_environments,
+            state_average_local_norm=state_average_local_norm,
+            store_orthonormal_renormalized_operators=store_orthonormal_renormalized_operators,
+            renormalized_operator_cache=renormalized_operator_cache,
+            renormalized_operator_cache_max_size=renormalized_operator_cache_max_size,
+            renormalized_block_stack=persistent_renormalized_block_stack,
+            norm_renormalized_block_stack=persistent_norm_renormalized_block_stack,
+            target_renormalized_block_stack=persistent_target_renormalized_block_stack,
+            complementary_operator_families=complementary_operator_families,
+            identity_mpo_factors=identity_mpo_factors,
+            require_block_sparse_renormalized_operator_table=require_block_sparse_renormalized_operator_table,
+            require_symbolic_renormalized_operators=require_symbolic_renormalized_operators,
+            profile=profile,
             verbose=verbose,
         )
-        current_sites = sweep_result["sites"]
         last_root_sites = sweep_result.get("root_sites")
+        if run_uses_root_environment_path and last_root_sites:
+            current_sites = [site.copy() for site in last_root_sites[0]]
+        else:
+            current_sites = sweep_result["sites"]
         local_guess_cache = dict(sweep_result.get("local_guess_cache") or {})
         metric = float(measure_fn(sweep_result))
         objective_summary = _summarize_objectives(sweep_result["updates"])
         if mpo_factors is not None and last_root_sites and evaluate_root_energies_each_sweep:
             last_state_energies = [
-                _compute_state_energy_from_mpo(root, mpo_factors)
+                _compute_state_energy_from_mpo(
+                    root,
+                    mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
+                )
                 for root in last_root_sites
             ]
             objective_summary["state_energies"] = list(last_state_energies)
             objective_summary["energy"] = float(last_state_energies[0])
-        if mpo_factors is not None:
+        if mpo_factors is not None and not run_uses_root_environment_path:
             numerator = sweep_result.get("final_mpo_numerator")
             denominator = sweep_result.get("final_mpo_denominator")
             if "energy" in objective_summary:
@@ -827,7 +1499,23 @@ def run_sweeps(
                 objective_summary["energy"] = _compute_state_energy_from_mpo(
                     current_sites,
                     mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
                 )
+        elif (
+            mpo_factors is not None
+            and run_uses_root_environment_path
+            and last_root_sites
+        ):
+            last_state_energies = [
+                _compute_state_energy_from_mpo(
+                    root,
+                    mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
+                )
+                for root in last_root_sites
+            ]
+            objective_summary["state_energies"] = list(last_state_energies)
+            objective_summary["energy"] = float(last_state_energies[0])
         elif "objective_energy" in objective_summary:
             objective_summary["energy"] = objective_summary["objective_energy"]
         history.append(
@@ -839,12 +1527,26 @@ def run_sweeps(
                 "local_solver_kwargs": sweep_local_solver_kwargs,
                 "warm_start_bonds": bool(warm_start_bonds),
                 "mixer_applied": bool(mixer_zero_block_noise_scale > 0.0 and sweep_idx < mixer_nsweeps),
+                "timing": sweep_result.get("timing"),
+                "renormalized_operator_cache_size": sweep_result.get("renormalized_operator_cache_size"),
+                "renormalized_operator_cache_stats": sweep_result.get("renormalized_operator_cache_stats"),
+                "renormalized_block_stack_stats": sweep_result.get("renormalized_block_stack_stats"),
+                "norm_renormalized_block_stack_stats": sweep_result.get(
+                    "norm_renormalized_block_stack_stats"
+                ),
+                "target_renormalized_block_stack_stats": sweep_result.get(
+                    "target_renormalized_block_stack_stats"
+                ),
                 **objective_summary,
             }
         )
         if int(verbose) >= 1:
             _emit_verbose(_format_sweep_line(sweep_idx, direction, history[-1]), verbose=verbose)
-        if mpo_factors is not None and "energy" in history[-1]:
+        if (
+            mpo_factors is not None
+            and "energy" in history[-1]
+            and not (sweep_nlocal_states > 1 and not evaluate_root_energies_each_sweep)
+        ):
             energy = float(history[-1]["energy"])
             if best_energy is None or energy < best_energy:
                 best_energy = energy

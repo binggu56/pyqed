@@ -1,15 +1,19 @@
 from pyqed import Molecule
 from pyqed.qchem.dmrg import DMRGSCF, DMRG
+from pyqed.qchem import CASCI
 
 from timeit import time
+
 mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='631g')
-mol.build(driver='pyscf')
+mol.build(driver='gbasis')
 
 mf = mol.RHF().run()
 
 print('E(HF) = ', mf.e_tot)
+# mc = CASCI(mf, 8, 8).run()
 
-dmrg = DMRG(mf, ncas=8, nelecas=8, D=40, site='spatial', verbose=2)
+dmrg = DMRG(mf, ncas=2, nelecas=2, D=20, site='spatial', symmetry='sz',
+            spin=0, verbose=2)
 
 # dmrg = DMRG(mf, ncas=8, nelecas=8, D=40, site='spin', verbose=1, init_guess='cid')
 
@@ -17,11 +21,7 @@ dmrg = DMRG(mf, ncas=8, nelecas=8, D=40, site='spatial', verbose=2)
 # dmrg = DMRGSCF(mf, ncas=8, nelecas=8, D=40, verbose=1)
 
 # mc.fix_spin(ss=0, shift=0.2)
-dmrg.run(
-    nstates=1,
-    symmetry_list=['charge', 'sz'],
-    # initial_guess='cid',
-)
+dmrg.run()    # initial_guess='cid'
 
 # energy logs for you to use
 print(dmrg.e_tot) #ground state energy

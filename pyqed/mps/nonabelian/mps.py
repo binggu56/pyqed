@@ -17,6 +17,7 @@ from .canonical import (
     right_canonical_error,
     right_canonicalize_sites,
 )
+from .basis import BondBasis, SiteBasis, TwoSiteBasis
 from .contraction import merge_mps_sites
 from .environment import contract_chain_expectation
 from .tensor import NonabelianTensor
@@ -27,6 +28,13 @@ def _validate_sites(sites):
     if any(not isinstance(site, NonabelianTensor) or site.rank != 3 for site in sites):
         raise ValueError("MPS expects a sequence of rank-3 NonabelianTensor site tensors.")
     return sites
+
+
+def _bond_basis_for_axis(tensor, axis, *, name):
+    basis = (tensor.metadata or {}).get("bond_bases", {}).get(axis)
+    if isinstance(basis, BondBasis):
+        return basis
+    return BondBasis.from_tensor_axis(tensor, axis, name=name)
 
 
 @dataclass
@@ -164,6 +172,41 @@ class MPS:
         if bond < 0 or bond + 1 >= len(self.sites):
             raise IndexError(f"Bond {bond} out of range for chain length {len(self.sites)}.")
         return merge_mps_sites(self.sites[bond], self.sites[bond + 1])
+
+    def site_bases(self, site):
+        """
+        Return explicit ``(left, physical, right)`` bases for one MPS site.
+        """
+        site = int(site)
+        tensor = self.sites[site]
+        return (
+            _bond_basis_for_axis(tensor, 0, name=f"site-{site}-left"),
+            SiteBasis.from_tensor_axis(tensor, 1, name=f"site-{site}-physical"),
+            _bond_basis_for_axis(tensor, 2, name=f"site-{site}-right"),
+        )
+
+    def bond_basis(self, bond):
+        """
+        Return the explicit virtual basis on the bond between ``bond`` and ``bond + 1``.
+        """
+        bond = int(bond)
+        if bond < 0 or bond + 1 >= len(self.sites):
+            raise IndexError(f"Bond {bond} out of range for chain length {len(self.sites)}.")
+        right = self.site_bases(bond)[2]
+        left = self.site_bases(bond + 1)[0]
+        if not right.dual_compatible_with(left):
+            raise ValueError(f"MPS bond {bond} has incompatible right/left basis descriptors.")
+        return right
+
+    def local_two_site_basis(self, bond):
+        """
+        Return the explicit packed two-site basis currently used by the solver.
+        """
+        from .solver import pack_two_site_state
+
+        merged = self.merge_bond(bond)
+        _vec, layout = pack_two_site_state(merged)
+        return TwoSiteBasis.from_tensor_and_layout(merged, layout)
 
     def expectation(self, mpo_factors):
         return contract_chain_expectation(self.sites, mpo_factors)

@@ -88,6 +88,310 @@ def _lowdin_sqrt_overlap(overlap, thresh=1e-12):
     return (eigvecs * np.sqrt(eigvals)) @ eigvecs.T
 
 
+def _as_xyz_operator(op, name):
+    op = np.asarray(op, dtype=float)
+    if op.ndim != 3:
+        raise ValueError(f"{name} must be a rank-3 array.")
+    if op.shape[0] == 3:
+        return op
+    if op.shape[-1] == 3:
+        return np.moveaxis(op, -1, 0)
+    raise ValueError(f"{name} expects shape (3, nao, nao) or (nao, nao, 3).")
+
+
+def _boys_objective_from_position(r_mo):
+    centers = np.diagonal(r_mo, axis1=1, axis2=2).T
+    return float(np.sum(centers * centers))
+
+
+def _boys_localize(
+    mo_coeff,
+    r_ao,
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    info = {
+        'method': 'boys',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': 0.0,
+        'final_objective': 0.0,
+    }
+    if nloc <= 1:
+        r_mo = contract('xij,ip,jq->xpq', r_ao, coeff, coeff, optimize=True)
+        obj = _boys_objective_from_position(r_mo)
+        info['initial_objective'] = obj
+        info['final_objective'] = obj
+        return coeff, info
+
+    r_mo = contract('xij,ip,jq->xpq', r_ao, coeff, coeff, optimize=True)
+    objective = _boys_objective_from_position(r_mo)
+    info['initial_objective'] = objective
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                center_diff = 0.5 * (r_mo[:, p, p] - r_mo[:, q, q])
+                coupling = r_mo[:, p, q]
+                a2 = float(np.dot(center_diff, center_diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(center_diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = center_diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                rp = r_mo[:, :, p].copy()
+                rq = r_mo[:, :, q].copy()
+                r_mo[:, :, p] = c * rp + s * rq
+                r_mo[:, :, q] = -s * rp + c * rq
+
+                rp = r_mo[:, p, :].copy()
+                rq = r_mo[:, q, :].copy()
+                r_mo[:, p, :] = c * rp + s * rq
+                r_mo[:, q, :] = -s * rp + c * rq
+
+                objective = _boys_objective_from_position(r_mo)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
+def _population_objective(y_coeff, atom_groups):
+    objective = 0.0
+    for group in atom_groups:
+        populations = np.sum(y_coeff[group, :] ** 2, axis=0)
+        objective += float(np.dot(populations, populations))
+    return objective
+
+
+def _mulliken_population_objective(coeff, scoeff, atom_groups):
+    objective = 0.0
+    for group in atom_groups:
+        populations = np.sum(coeff[group, :] * scoeff[group, :], axis=0)
+        objective += float(np.dot(populations, populations))
+    return objective
+
+
+def _pipek_mezey_localize(
+    mo_coeff,
+    overlap,
+    atom_groups,
+    method='pm',
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    overlap = np.asarray(overlap, dtype=float)
+    scoeff = overlap @ coeff
+    objective = _mulliken_population_objective(coeff, scoeff, atom_groups)
+    info = {
+        'method': str(method),
+        'backend': 'native',
+        'population_metric': 'mulliken',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': objective,
+        'final_objective': objective,
+    }
+    if nloc <= 1:
+        return coeff, info
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                diff = np.empty(len(atom_groups), dtype=float)
+                coupling = np.empty(len(atom_groups), dtype=float)
+                for atom_idx, group in enumerate(atom_groups):
+                    cp = coeff[group, p]
+                    cq = coeff[group, q]
+                    sp = scoeff[group, p]
+                    sq = scoeff[group, q]
+                    pop_p = float(np.dot(cp, sp))
+                    pop_q = float(np.dot(cq, sq))
+                    cross = 0.5 * (float(np.dot(cp, sq)) + float(np.dot(cq, sp)))
+                    diff[atom_idx] = 0.5 * (pop_p - pop_q)
+                    coupling[atom_idx] = cross
+
+                a2 = float(np.dot(diff, diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                sp = scoeff[:, p].copy()
+                sq = scoeff[:, q].copy()
+                scoeff[:, p] = c * sp + s * sq
+                scoeff[:, q] = -s * sp + c * sq
+
+                objective = _mulliken_population_objective(coeff, scoeff, atom_groups)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
+def _ibo_localize(
+    mo_coeff,
+    overlap,
+    atom_groups,
+    method='ibo',
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    sqrt_overlap = _lowdin_sqrt_overlap(overlap)
+    y_coeff = sqrt_overlap @ coeff
+    objective = _population_objective(y_coeff, atom_groups)
+    info = {
+        'method': str(method),
+        'backend': 'native',
+        'population_metric': 'lowdin',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': objective,
+        'final_objective': objective,
+    }
+    if nloc <= 1:
+        return coeff, info
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                diff = np.empty(len(atom_groups), dtype=float)
+                coupling = np.empty(len(atom_groups), dtype=float)
+                for atom_idx, group in enumerate(atom_groups):
+                    yp = y_coeff[group, p]
+                    yq = y_coeff[group, q]
+                    diff[atom_idx] = 0.5 * (float(np.dot(yp, yp)) - float(np.dot(yq, yq)))
+                    coupling[atom_idx] = float(np.dot(yp, yq))
+
+                a2 = float(np.dot(diff, diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                yp = y_coeff[:, p].copy()
+                yq = y_coeff[:, q].copy()
+                y_coeff[:, p] = c * yp + s * yq
+                y_coeff[:, q] = -s * yp + c * yq
+
+                objective = _population_objective(y_coeff, atom_groups)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
 class RHF:
     def __init__(self, mol, init_guess='h1e', verbose=0):
         self.mol = mol
@@ -454,6 +758,145 @@ class RHF:
         if self._pyscf_mf is not None:
             return self._pyscf_mf.get_ovlp()
         return self.mol.overlap
+
+    def localize_orbitals(
+        self,
+        method='ibo',
+        space='occ',
+        mo_coeff=None,
+        occ_threshold=0.5,
+        return_indices=False,
+        return_info=False,
+        **kwargs,
+    ):
+        """
+        Localize molecular orbitals from the converged RHF solution.
+
+        Examples
+        --------
+        >>> mf = mol.RHF().run()
+        >>> c_ibo = mf.localize_orbitals(method="ibo", space="occ")
+
+        Parameters
+        ----------
+        method : str
+            Localization method. Supports native ``"boys"``, ``"pm"``
+            (Pipek-Mezey), ``"ibo"``, and ``"lm"`` localization.
+        space : str
+            Orbital subspace to localize when ``mo_coeff`` is not supplied.
+            Currently ``"occ"`` is supported.
+        mo_coeff : ndarray, optional
+            MO coefficient block to localize directly. If omitted, orbitals are
+            selected from ``self.mo_coeff`` using ``space``.
+        occ_threshold : float
+            Orbitals with occupation larger than this value are treated as occupied.
+        return_indices : bool
+            If True, return ``(localized_coeff, mo_indices)``.
+        return_info : bool
+            If True, return convergence metadata. With ``return_indices=True``,
+            the return value is ``(localized_coeff, mo_indices, info)``.
+        **kwargs
+            Forwarded to the backend localization routine.
+        """
+        if self.mo_coeff is None or self.mo_occ is None:
+            raise RuntimeError("Run RHF before localizing orbitals.")
+
+        method_key = str(method).lower().replace('-', '_')
+        if method_key in {'intrinsic_bond_orbital', 'intrinsic_bond_orbitals'}:
+            method_key = 'ibo'
+        if method_key in {'lowdin_mulliken', 'lowdin_mulliken_population'}:
+            method_key = 'lm'
+        if method_key in {'pipek_mezey', 'pipek_mezey_population'}:
+            method_key = 'pm'
+        if method_key not in {'ibo', 'boys', 'lm', 'pm'}:
+            raise ValueError("Supported localization methods are 'boys', 'pm', 'ibo', and 'lm'.")
+
+        if mo_coeff is None:
+            space_key = str(space).lower().replace('-', '_')
+            if space_key == 'occupied':
+                space_key = 'occ'
+            if space_key != 'occ':
+                raise ValueError("Only space='occ' is currently supported when mo_coeff is not supplied.")
+
+            coeff = self.mo_coeff
+            occ = np.asarray(self.mo_occ)
+            orb_indices = np.flatnonzero(occ > occ_threshold)
+            if orb_indices.size == 0:
+                raise ValueError("No occupied orbitals found for localization.")
+            orb = coeff[:, orb_indices]
+        else:
+            orb_indices = None
+            orb = mo_coeff
+
+        coeff = np.asarray(orb)
+        if coeff.ndim != 2:
+            raise ValueError("mo_coeff must be a 2D array.")
+        if coeff.shape[0] != self.nao:
+            raise ValueError(f"mo_coeff has {coeff.shape[0]} AO rows, expected {self.nao}.")
+
+        if method_key == 'boys':
+            r_ao = _as_xyz_operator(
+                self.mol.moment_integral(center=np.zeros(3)),
+                'moment_integral()',
+            )
+            max_cycle = kwargs.pop('max_cycle', 100)
+            conv_tol = kwargs.pop('conv_tol', kwargs.pop('tol', 1e-10))
+            rotation_tol = kwargs.pop('rotation_tol', 1e-12)
+            if kwargs:
+                unknown = ', '.join(sorted(kwargs))
+                raise TypeError(f"Unsupported Boys localization keyword(s): {unknown}.")
+            localized, info = _boys_localize(
+                coeff,
+                r_ao,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+            if return_indices and return_info:
+                return localized, orb_indices, info
+            if return_indices:
+                return localized, orb_indices
+            if return_info:
+                return localized, info
+            return localized
+
+        max_cycle = kwargs.pop('max_cycle', 100)
+        conv_tol = kwargs.pop('conv_tol', kwargs.pop('tol', 1e-10))
+        rotation_tol = kwargs.pop('rotation_tol', 1e-12)
+        if kwargs:
+            unknown = ', '.join(sorted(kwargs))
+            raise TypeError(f"Unsupported {method_key.upper()} localization keyword(s): {unknown}.")
+
+        ao_labels = self.mol.ao_labels()
+        atom_groups = _group_ao_indices_by_atom(ao_labels, self.mol.natom)
+        if method_key == 'pm':
+            localized, info = _pipek_mezey_localize(
+                coeff,
+                self.get_ovlp(),
+                atom_groups,
+                method=method_key,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+        else:
+            localized, info = _ibo_localize(
+                coeff,
+                self.get_ovlp(),
+                atom_groups,
+                method=method_key,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+
+        if return_indices and return_info:
+            return localized, orb_indices, info
+        if return_indices:
+            return localized, orb_indices
+        if return_info:
+            return localized, info
+        return localized
 
     def analyze(self):
         from .analysis import RHFAnalysis

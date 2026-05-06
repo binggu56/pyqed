@@ -297,6 +297,143 @@ cdef double primitive_eri(
     return value
 
 
+cdef inline double primitive_two_center_coulomb(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz
+) noexcept nogil:
+    cdef double p = a
+    cdef double q = b
+    cdef double alpha = p * q / (p + q)
+    cdef double dx = Ax - Bx
+    cdef double dy = Ay - By
+    cdef double dz = Az - Bz
+    cdef double rab = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef int tdim_ax = l1 + 2
+    cdef int tdim_ay = m1 + 2
+    cdef int tdim_az = n1 + 2
+    cdef int tdim_bx = l2 + 2
+    cdef int tdim_by = m2 + 2
+    cdef int tdim_bz = n2 + 2
+    cdef size_t size_ax = <size_t>(l1 + 1) * <size_t>tdim_ax
+    cdef size_t size_ay = <size_t>(m1 + 1) * <size_t>tdim_ay
+    cdef size_t size_az = <size_t>(n1 + 1) * <size_t>tdim_az
+    cdef size_t size_bx = <size_t>(l2 + 1) * <size_t>tdim_bx
+    cdef size_t size_by = <size_t>(m2 + 1) * <size_t>tdim_by
+    cdef size_t size_bz = <size_t>(n2 + 1) * <size_t>tdim_bz
+    cdef int tx_max = l1 + l2
+    cdef int uy_max = m1 + m2
+    cdef int vz_max = n1 + n2
+    cdef int nmax = tx_max + uy_max + vz_max + 2
+    cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
+    cdef double* memo_ax = <double*>malloc(size_ax * sizeof(double))
+    cdef double* memo_ay = <double*>malloc(size_ay * sizeof(double))
+    cdef double* memo_az = <double*>malloc(size_az * sizeof(double))
+    cdef double* memo_bx = <double*>malloc(size_bx * sizeof(double))
+    cdef double* memo_by = <double*>malloc(size_by * sizeof(double))
+    cdef double* memo_bz = <double*>malloc(size_bz * sizeof(double))
+    cdef double* memo_r = <double*>malloc(size_r * sizeof(double))
+    cdef size_t i
+    cdef int t, u, v, tau, nu, phi
+    cdef double ex_a, exy_a, xyz_a, ex_b, exy_b, sign, value = 0.0
+    if memo_ax == NULL or memo_ay == NULL or memo_az == NULL or memo_bx == NULL or memo_by == NULL or memo_bz == NULL or memo_r == NULL:
+        free(memo_ax); free(memo_ay); free(memo_az); free(memo_bx); free(memo_by); free(memo_bz); free(memo_r)
+        return 0.0
+    for i in range(size_ax): memo_ax[i] = NAN
+    for i in range(size_ay): memo_ay[i] = NAN
+    for i in range(size_az): memo_az[i] = NAN
+    for i in range(size_bx): memo_bx[i] = NAN
+    for i in range(size_by): memo_by[i] = NAN
+    for i in range(size_bz): memo_bz[i] = NAN
+    for i in range(size_r): memo_r[i] = NAN
+    for t in range(l1 + 1):
+        ex_a = E_rec(l1, 0, t, 0.0, a, 0.0, memo_ax, 1, tdim_ax)
+        for u in range(m1 + 1):
+            exy_a = ex_a * E_rec(m1, 0, u, 0.0, a, 0.0, memo_ay, 1, tdim_ay)
+            for v in range(n1 + 1):
+                xyz_a = exy_a * E_rec(n1, 0, v, 0.0, a, 0.0, memo_az, 1, tdim_az)
+                for tau in range(l2 + 1):
+                    ex_b = E_rec(l2, 0, tau, 0.0, b, 0.0, memo_bx, 1, tdim_bx)
+                    for nu in range(m2 + 1):
+                        exy_b = ex_b * E_rec(m2, 0, nu, 0.0, b, 0.0, memo_by, 1, tdim_by)
+                        for phi in range(n2 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            value += xyz_a * exy_b * E_rec(n2, 0, phi, 0.0, b, 0.0, memo_bz, 1, tdim_bz) * sign * R_rec(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rab, memo_r, uy_max + 1, vz_max + 1, nmax)
+    free(memo_ax); free(memo_ay); free(memo_az); free(memo_bx); free(memo_by); free(memo_bz); free(memo_r)
+    return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
+
+
+cdef inline double primitive_three_center_coulomb(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz,
+    double c, int l3, int m3, int n3, double Cx, double Cy, double Cz
+) noexcept nogil:
+    cdef double p = a + b
+    cdef double q = c
+    cdef double alpha = p * q / (p + q)
+    cdef double px = (a * Ax + b * Bx) / p
+    cdef double py = (a * Ay + b * By) / p
+    cdef double pz = (a * Az + b * Bz) / p
+    cdef double dx = px - Cx
+    cdef double dy = py - Cy
+    cdef double dz = pz - Cz
+    cdef double rpc = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef double abx = Ax - Bx
+    cdef double aby = Ay - By
+    cdef double abz = Az - Bz
+    cdef int tdim_abx = l1 + l2 + 2
+    cdef int tdim_aby = m1 + m2 + 2
+    cdef int tdim_abz = n1 + n2 + 2
+    cdef int tdim_cx = l3 + 2
+    cdef int tdim_cy = m3 + 2
+    cdef int tdim_cz = n3 + 2
+    cdef size_t size_abx = <size_t>(l1 + 1) * <size_t>(l2 + 1) * <size_t>tdim_abx
+    cdef size_t size_aby = <size_t>(m1 + 1) * <size_t>(m2 + 1) * <size_t>tdim_aby
+    cdef size_t size_abz = <size_t>(n1 + 1) * <size_t>(n2 + 1) * <size_t>tdim_abz
+    cdef size_t size_cx = <size_t>(l3 + 1) * <size_t>tdim_cx
+    cdef size_t size_cy = <size_t>(m3 + 1) * <size_t>tdim_cy
+    cdef size_t size_cz = <size_t>(n3 + 1) * <size_t>tdim_cz
+    cdef int tx_max = l1 + l2 + l3
+    cdef int uy_max = m1 + m2 + m3
+    cdef int vz_max = n1 + n2 + n3
+    cdef int nmax = tx_max + uy_max + vz_max + 2
+    cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
+    cdef double* memo_abx = <double*>malloc(size_abx * sizeof(double))
+    cdef double* memo_aby = <double*>malloc(size_aby * sizeof(double))
+    cdef double* memo_abz = <double*>malloc(size_abz * sizeof(double))
+    cdef double* memo_cx = <double*>malloc(size_cx * sizeof(double))
+    cdef double* memo_cy = <double*>malloc(size_cy * sizeof(double))
+    cdef double* memo_cz = <double*>malloc(size_cz * sizeof(double))
+    cdef double* memo_r = <double*>malloc(size_r * sizeof(double))
+    cdef size_t i
+    cdef int t, u, v, tau, nu, phi
+    cdef double ex_ab, exy_ab, xyz_ab, ex_c, exy_c, sign, value = 0.0
+    if memo_abx == NULL or memo_aby == NULL or memo_abz == NULL or memo_cx == NULL or memo_cy == NULL or memo_cz == NULL or memo_r == NULL:
+        free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+        return 0.0
+    for i in range(size_abx): memo_abx[i] = NAN
+    for i in range(size_aby): memo_aby[i] = NAN
+    for i in range(size_abz): memo_abz[i] = NAN
+    for i in range(size_cx): memo_cx[i] = NAN
+    for i in range(size_cy): memo_cy[i] = NAN
+    for i in range(size_cz): memo_cz[i] = NAN
+    for i in range(size_r): memo_r[i] = NAN
+    for t in range(l1 + l2 + 1):
+        ex_ab = E_rec(l1, l2, t, abx, a, b, memo_abx, l2 + 1, tdim_abx)
+        for u in range(m1 + m2 + 1):
+            exy_ab = ex_ab * E_rec(m1, m2, u, aby, a, b, memo_aby, m2 + 1, tdim_aby)
+            for v in range(n1 + n2 + 1):
+                xyz_ab = exy_ab * E_rec(n1, n2, v, abz, a, b, memo_abz, n2 + 1, tdim_abz)
+                for tau in range(l3 + 1):
+                    ex_c = E_rec(l3, 0, tau, 0.0, c, 0.0, memo_cx, 1, tdim_cx)
+                    for nu in range(m3 + 1):
+                        exy_c = ex_c * E_rec(m3, 0, nu, 0.0, c, 0.0, memo_cy, 1, tdim_cy)
+                        for phi in range(n3 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            value += xyz_ab * exy_c * E_rec(n3, 0, phi, 0.0, c, 0.0, memo_cz, 1, tdim_cz) * sign * R_rec(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax)
+    free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+    return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
+
+
 cdef inline double primitive_eri_from_memos(
     int l1, int m1, int n1, int l2, int m2, int n2,
     int l3, int m3, int n3, int l4, int m4, int n4,
@@ -588,6 +725,110 @@ cdef inline double contracted_nuclear_indices(
                     )
                 )
     return value
+
+
+cdef inline double contracted_two_center_coulomb_indices(
+    int p, int q,
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+) noexcept nogil:
+    cdef int ip, iq
+    cdef double value = 0.0
+    for ip in range(nprim_v[p]):
+        for iq in range(nprim_v[q]):
+            value += (
+                weights_v[p, ip] * weights_v[q, iq]
+                * primitive_two_center_coulomb(
+                    exps_v[p, ip], <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2], origins_v[p, 0], origins_v[p, 1], origins_v[p, 2],
+                    exps_v[q, iq], <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2], origins_v[q, 0], origins_v[q, 1], origins_v[q, 2],
+                )
+            )
+    return value
+
+
+cdef inline double contracted_three_center_indices(
+    int p, int q, int a,
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    int64_t[:, ::1] aux_shells_v,
+    double[:, ::1] aux_origins_v,
+    double[:, ::1] aux_exps_v,
+    double[:, ::1] aux_weights_v,
+    int64_t[::1] aux_nprim_v,
+) noexcept nogil:
+    cdef int ip, iq, ia
+    cdef double value = 0.0
+    for ip in range(nprim_v[p]):
+        for iq in range(nprim_v[q]):
+            for ia in range(aux_nprim_v[a]):
+                value += (
+                    weights_v[p, ip] * weights_v[q, iq] * aux_weights_v[a, ia]
+                    * primitive_three_center_coulomb(
+                        exps_v[p, ip], <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2], origins_v[p, 0], origins_v[p, 1], origins_v[p, 2],
+                        exps_v[q, iq], <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2], origins_v[q, 0], origins_v[q, 1], origins_v[q, 2],
+                        aux_exps_v[a, ia], <int>aux_shells_v[a, 0], <int>aux_shells_v[a, 1], <int>aux_shells_v[a, 2], aux_origins_v[a, 0], aux_origins_v[a, 1], aux_origins_v[a, 2],
+                    )
+                )
+    return value
+
+
+cpdef compute_ri_tensors(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef cnp.ndarray[double, ndim=2] metric = np.zeros((naux, naux), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=3] j3 = np.zeros((naux, nao, nao), dtype=np.float64)
+    cdef int p, q, a
+    cdef double value
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] metric_v = metric
+    cdef double[:, :, ::1] j3_v = j3
+
+    for p in range(naux):
+        for q in range(p + 1):
+            value = contracted_two_center_coulomb_indices(
+                p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
+            )
+            metric_v[p, q] = value
+            metric_v[q, p] = value
+
+    for a in range(naux):
+        for p in range(nao):
+            for q in range(p + 1):
+                value = contracted_three_center_indices(
+                    p, q, a,
+                    shells_v, origins_v, exps_v, weights_v, nprim_v,
+                    aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v,
+                )
+                j3_v[a, p, q] = value
+                j3_v[a, q, p] = value
+
+    return metric, j3
 
 
 cpdef compute_dense_eri(

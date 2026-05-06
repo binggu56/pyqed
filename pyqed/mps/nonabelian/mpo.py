@@ -13,7 +13,7 @@ import numpy as np
 from pyqed.mps.su2 import SU2Irrep
 from pyqed.mps.symmetry import Sector
 
-from .coupling import ordered_two_m_values
+from .coupling import clebsch_gordan, left_or_right_fusion, ordered_two_m_values
 
 
 @dataclass(frozen=True)
@@ -228,6 +228,7 @@ class MPO:
     blocks: dict[tuple[Sector, Sector], np.ndarray]
     phys_out_leg: PhysicalLeg
     phys_in_leg: PhysicalLeg
+    symbolic_transitions: tuple = ()
 
     def __post_init__(self):
         phys_out_leg = self.phys_out_leg
@@ -280,6 +281,7 @@ class MPO:
         object.__setattr__(self, "blocks", blocks)
         object.__setattr__(self, "phys_out_leg", phys_out_leg)
         object.__setattr__(self, "phys_in_leg", phys_in_leg)
+        object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
 
     @property
     def phys_out_sectors(self):
@@ -554,6 +556,7 @@ class IrreducibleMPO:
     phys_in_leg: PhysicalLeg
     scalar_blocks: dict[tuple[Sector, Sector], np.ndarray] | None = None
     reduced_terms: tuple[IrreducibleChannelTerm, ...] = ()
+    symbolic_transitions: tuple = ()
     _block_cache: dict[tuple[Sector, Sector], np.ndarray | None] = field(
         default_factory=dict,
         init=False,
@@ -610,6 +613,7 @@ class IrreducibleMPO:
                 raise ValueError("All IrreducibleMPO contributions must share the same virtual dimensions.")
         object.__setattr__(self, "scalar_blocks", scalar_blocks)
         object.__setattr__(self, "reduced_terms", reduced_terms)
+        object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
 
     @property
     def left_dim(self):
@@ -677,6 +681,7 @@ class RankCoupledChannelTerm:
 
     reduced_operator: object
     visible_virtual_block: np.ndarray
+    use_cg_coupling: bool = False
 
     def __post_init__(self):
         if not hasattr(self.reduced_operator, "component_block") or not hasattr(
@@ -691,6 +696,7 @@ class RankCoupledChannelTerm:
                 f"RankCoupledChannelTerm visible_virtual_block must be rank-2, got {block.shape!r}."
             )
         object.__setattr__(self, "visible_virtual_block", block)
+        object.__setattr__(self, "use_cg_coupling", bool(self.use_cg_coupling))
 
     @property
     def dtype(self):
@@ -716,6 +722,7 @@ class RankCoupledMPO:
     left_channel_irreps: tuple[SU2Irrep, ...]
     right_channel_irreps: tuple[SU2Irrep, ...]
     reduced_terms: tuple[RankCoupledChannelTerm, ...] = ()
+    symbolic_transitions: tuple = ()
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
         default_factory=dict,
         init=False,
@@ -724,6 +731,12 @@ class RankCoupledMPO:
     )
     _block_cache: dict[tuple[Sector, Sector], np.ndarray | None] = field(
         default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _reduced_action_cache: tuple[tuple[object, int, int, int, int, int, object], ...] | None = field(
+        default=None,
         init=False,
         repr=False,
         compare=False,
@@ -789,6 +802,7 @@ class RankCoupledMPO:
         object.__setattr__(self, "left_channel_irreps", left_channel_irreps)
         object.__setattr__(self, "right_channel_irreps", right_channel_irreps)
         object.__setattr__(self, "reduced_terms", reduced_terms)
+        object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
 
     @property
     def left_dim(self):
@@ -820,6 +834,57 @@ class RankCoupledMPO:
             offset += irrep.dim
         return tuple(out)
 
+    def _reduced_actions(self):
+        """Return cached channel/component actions for reduced block expansion."""
+        cached = self._reduced_action_cache
+        if cached is not None:
+            return cached
+
+        actions = []
+        for term in self.reduced_terms:
+            coeffs = term.visible_virtual_block
+            rank_irrep = None
+            if term.use_cg_coupling:
+                rank_irrep = (
+                    term.reduced_operator.base_operator.rank_irrep
+                    if hasattr(term.reduced_operator, "base_operator")
+                    else term.reduced_operator.rank_irrep
+                )
+            for i, left_irrep in enumerate(self.left_channel_irreps):
+                left_ms = ordered_two_m_values(left_irrep)
+                for j, right_irrep in enumerate(self.right_channel_irreps):
+                    coeff = coeffs[i, j]
+                    if coeff == 0:
+                        continue
+                    if term.use_cg_coupling and right_irrep not in left_or_right_fusion(left_irrep, rank_irrep):
+                        continue
+                    right_ms = ordered_two_m_values(right_irrep)
+                    for row, two_m_left in enumerate(left_ms):
+                        for col, two_m_right in enumerate(right_ms):
+                            cg_coeff = 1.0
+                            if term.use_cg_coupling:
+                                component = two_m_right - two_m_left
+                                cg_coeff = clebsch_gordan(
+                                    left_irrep,
+                                    rank_irrep,
+                                    right_irrep,
+                                    two_m_left,
+                                    component,
+                                    two_m_right,
+                                )
+                                if not cg_coeff:
+                                    continue
+                            elif left_irrep.two_j == 0 and right_irrep.two_j != 0:
+                                component = two_m_right
+                            elif right_irrep.two_j == 0 and left_irrep.two_j != 0:
+                                component = two_m_left
+                            else:
+                                component = two_m_right - two_m_left
+                            actions.append((term.reduced_operator, i, j, row, col, int(component), coeff * cg_coeff))
+        cached = tuple(actions)
+        object.__setattr__(self, "_reduced_action_cache", cached)
+        return cached
+
     def reduced_block(self, phys_out, phys_in):
         key = (phys_out, phys_in)
         if key in self._reduced_block_cache:
@@ -828,58 +893,41 @@ class RankCoupledMPO:
         reduced = {}
         dense_block = self.dense_blocks.get(key)
         if dense_block is not None:
-            for i, left_irrep in enumerate(self.left_channel_irreps):
-                for j, right_irrep in enumerate(self.right_channel_irreps):
-                    local = np.asarray(dense_block[i, j])
-                    if not np.any(local):
-                        continue
-                    if left_irrep != right_irrep:
-                        raise ValueError(
-                            f"RankCoupledMPO dense block {key!r} connects incompatible reduced channels {left_irrep!r} and {right_irrep!r}."
-                        )
-                    reduced[(i, j)] = (
-                        np.eye(left_irrep.dim, dtype=self.dtype)[:, :, None, None]
-                        * local[None, None, :, :]
+            dense_block = np.asarray(dense_block)
+            nonzero_channels = np.any(dense_block != 0, axis=(2, 3))
+            for i, j in zip(*np.nonzero(nonzero_channels)):
+                left_irrep = self.left_channel_irreps[int(i)]
+                right_irrep = self.right_channel_irreps[int(j)]
+                if left_irrep != right_irrep:
+                    raise ValueError(
+                        f"RankCoupledMPO dense block {key!r} connects incompatible reduced channels {left_irrep!r} and {right_irrep!r}."
                     )
+                local = dense_block[int(i), int(j)]
+                reduced[(int(i), int(j))] = (
+                    np.eye(left_irrep.dim, dtype=self.dtype)[:, :, None, None]
+                    * local[None, None, :, :]
+                )
 
-        for term in self.reduced_terms:
-            coeffs = term.visible_virtual_block
-            for i, left_irrep in enumerate(self.left_channel_irreps):
-                for j, right_irrep in enumerate(self.right_channel_irreps):
-                    coeff = coeffs[i, j]
-                    if coeff == 0:
-                        continue
-                    local = reduced.get(
-                        (i, j),
-                        np.zeros(
-                            (
-                                left_irrep.dim,
-                                right_irrep.dim,
-                                self.phys_out_leg.dim(phys_out),
-                                self.phys_in_leg.dim(phys_in),
-                            ),
-                            dtype=self.dtype,
-                        ),
-                    )
-                    left_ms = ordered_two_m_values(left_irrep)
-                    right_ms = ordered_two_m_values(right_irrep)
-                    for row, two_m_left in enumerate(left_ms):
-                        for col, two_m_right in enumerate(right_ms):
-                            if left_irrep.two_j == 0 and right_irrep.two_j != 0:
-                                component = two_m_right
-                            elif right_irrep.two_j == 0 and left_irrep.two_j != 0:
-                                component = two_m_left
-                            else:
-                                component = two_m_right - two_m_left
-                            op_block = term.reduced_operator.component_block(component, phys_out, phys_in)
-                            if op_block is None:
-                                continue
-                            local[row, col] += np.asarray(coeff, dtype=self.dtype) * np.asarray(
-                                op_block,
-                                dtype=self.dtype,
-                            )
-                    if np.any(local):
-                        reduced[(i, j)] = local
+        for operator, i, j, row, col, component, coeff in self._reduced_actions():
+            op_block = operator.component_block(component, phys_out, phys_in)
+            if op_block is None:
+                continue
+            local = reduced.get((i, j))
+            if local is None:
+                local = np.zeros(
+                    (
+                        self.left_channel_irreps[i].dim,
+                        self.right_channel_irreps[j].dim,
+                        self.phys_out_leg.dim(phys_out),
+                        self.phys_in_leg.dim(phys_in),
+                    ),
+                    dtype=self.dtype,
+                )
+                reduced[(i, j)] = local
+            local[row, col] += np.asarray(coeff, dtype=self.dtype) * np.asarray(
+                op_block,
+                dtype=self.dtype,
+            )
 
         self._reduced_block_cache[key] = reduced
         return reduced
@@ -921,3 +969,173 @@ class RankCoupledMPO:
                     continue
                 dense[:, :, phys_out_slices[q_out], phys_in_slices[q_in]] = block
         return dense
+
+
+def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
+    """
+    Return ``core`` as a :class:`RankCoupledMPO`.
+
+    Ordinary scalar MPO cores are embedded with spin-scalar visible virtual
+    channels. Dense rank-4 arrays require ``phys_leg`` so the physical block
+    structure is explicit.
+    """
+    if isinstance(core, RankCoupledMPO):
+        return core
+    if isinstance(core, MPO):
+        scalar_irreps_left = tuple(SU2Irrep(0) for _ in range(core.left_dim))
+        scalar_irreps_right = tuple(SU2Irrep(0) for _ in range(core.right_dim))
+        return RankCoupledMPO(
+            dense_blocks=core.blocks,
+            phys_out_leg=core.phys_out_leg,
+            phys_in_leg=core.phys_in_leg,
+            left_channel_irreps=scalar_irreps_left,
+            right_channel_irreps=scalar_irreps_right,
+        )
+    dense = np.asarray(core)
+    if dense.ndim != 4:
+        raise TypeError(
+            "as_rank_coupled_mpo expects a RankCoupledMPO, MPO, or rank-4 dense core."
+        )
+    if phys_leg is None:
+        raise ValueError("phys_leg is required when embedding a dense MPO core.")
+    scalar_mpo = MPO.from_dense(
+        dense,
+        phys_out_leg=phys_leg,
+        phys_in_leg=phys_leg,
+        tol=cutoff,
+    )
+    return as_rank_coupled_mpo(scalar_mpo)
+
+
+def _pad_visible_virtual_block(block, shape, *, row_offset=0, col_offset=0, dtype):
+    out = np.zeros(shape, dtype=dtype)
+    arr = np.asarray(block, dtype=dtype)
+    out[
+        row_offset: row_offset + arr.shape[0],
+        col_offset: col_offset + arr.shape[1],
+    ] = arr
+    return out
+
+
+def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg=None, cutoff=0.0):
+    """
+    Direct-sum two MPO cores while preserving reduced virtual-channel metadata.
+
+    This is the reduced-MPO analogue of summing two finite-state MPOs: boundary
+    channels are shared at the chain ends and virtual channels are direct-summed
+    in the bulk.
+    """
+    left_core = as_rank_coupled_mpo(left_core, phys_leg=phys_leg, cutoff=cutoff)
+    right_core = as_rank_coupled_mpo(right_core, phys_leg=phys_leg, cutoff=cutoff)
+    if left_core.phys_out_leg != right_core.phys_out_leg or left_core.phys_in_leg != right_core.phys_in_leg:
+        raise ValueError("Cannot sum MPO cores with different physical legs.")
+
+    dtype = np.result_type(left_core.dtype, right_core.dtype)
+    if nsites == 1:
+        left_irreps = left_core.left_channel_irreps
+        right_irreps = left_core.right_channel_irreps
+        if left_irreps != right_core.left_channel_irreps or right_irreps != right_core.right_channel_irreps:
+            raise ValueError("Single-site MPO sum requires matching virtual channels.")
+        left_row_offset = right_row_offset = 0
+        left_col_offset = right_col_offset = 0
+    elif site == 0:
+        left_irreps = left_core.left_channel_irreps
+        if left_irreps != right_core.left_channel_irreps:
+            raise ValueError("Left-edge MPO sum requires matching left boundary channels.")
+        right_irreps = left_core.right_channel_irreps + right_core.right_channel_irreps
+        left_row_offset = right_row_offset = 0
+        left_col_offset = 0
+        right_col_offset = len(left_core.right_channel_irreps)
+    elif site == nsites - 1:
+        right_irreps = left_core.right_channel_irreps
+        if right_irreps != right_core.right_channel_irreps:
+            raise ValueError("Right-edge MPO sum requires matching right boundary channels.")
+        left_irreps = left_core.left_channel_irreps + right_core.left_channel_irreps
+        left_row_offset = 0
+        right_row_offset = len(left_core.left_channel_irreps)
+        left_col_offset = right_col_offset = 0
+    else:
+        left_irreps = left_core.left_channel_irreps + right_core.left_channel_irreps
+        right_irreps = left_core.right_channel_irreps + right_core.right_channel_irreps
+        left_row_offset = 0
+        right_row_offset = len(left_core.left_channel_irreps)
+        left_col_offset = 0
+        right_col_offset = len(left_core.right_channel_irreps)
+
+    dense_blocks = {}
+    block_shape = (len(left_irreps), len(right_irreps))
+    for key in set(left_core.dense_blocks) | set(right_core.dense_blocks):
+        q_out, q_in = key
+        shape = block_shape + (
+            left_core.phys_out_leg.dim(q_out),
+            left_core.phys_in_leg.dim(q_in),
+        )
+        block = np.zeros(shape, dtype=dtype)
+        left_block = left_core.dense_blocks.get(key)
+        if left_block is not None:
+            block[
+                left_row_offset: left_row_offset + left_block.shape[0],
+                left_col_offset: left_col_offset + left_block.shape[1],
+            ] += np.asarray(left_block, dtype=dtype)
+        right_block = right_core.dense_blocks.get(key)
+        if right_block is not None:
+            block[
+                right_row_offset: right_row_offset + right_block.shape[0],
+                right_col_offset: right_col_offset + right_block.shape[1],
+            ] += np.asarray(right_block, dtype=dtype)
+        if np.linalg.norm(block.reshape(-1)) > cutoff:
+            dense_blocks[key] = block
+
+    reduced_terms = []
+    for term, row_offset, col_offset in (
+        *((term, left_row_offset, left_col_offset) for term in left_core.reduced_terms),
+        *((term, right_row_offset, right_col_offset) for term in right_core.reduced_terms),
+    ):
+        reduced_terms.append(
+            RankCoupledChannelTerm(
+                reduced_operator=term.reduced_operator,
+                visible_virtual_block=_pad_visible_virtual_block(
+                    term.visible_virtual_block,
+                    block_shape,
+                    row_offset=row_offset,
+                    col_offset=col_offset,
+                    dtype=dtype,
+                ),
+                use_cg_coupling=term.use_cg_coupling,
+            )
+        )
+
+    return RankCoupledMPO(
+        dense_blocks=dense_blocks,
+        phys_out_leg=left_core.phys_out_leg,
+        phys_in_leg=left_core.phys_in_leg,
+        left_channel_irreps=left_irreps,
+        right_channel_irreps=right_irreps,
+        reduced_terms=tuple(reduced_terms),
+    )
+
+
+def sum_mpo_chains(*chains, phys_leg=None, cutoff=0.0):
+    """
+    Sum finite MPO chains while keeping rank-coupled cores rank-coupled.
+    """
+    nonempty = [list(chain) for chain in chains if chain]
+    if not nonempty:
+        return []
+    nsites = len(nonempty[0])
+    if any(len(chain) != nsites for chain in nonempty):
+        raise ValueError("Cannot sum MPOs with different chain lengths.")
+    out = nonempty[0]
+    for chain in nonempty[1:]:
+        out = [
+            direct_sum_rank_coupled_mpo(
+                left_core,
+                right_core,
+                site=site,
+                nsites=nsites,
+                phys_leg=phys_leg,
+                cutoff=cutoff,
+            )
+            for site, (left_core, right_core) in enumerate(zip(out, chain))
+        ]
+    return out

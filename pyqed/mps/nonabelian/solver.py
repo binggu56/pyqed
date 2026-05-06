@@ -6,17 +6,36 @@ Local two-site operator helpers for fixed-layout non-Abelian tensors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, field, replace
+import time
 
 import numpy as np
+try:
+    from scipy.sparse.linalg import LinearOperator, eigsh
+except Exception:  # pragma: no cover - SciPy is optional for lightweight installs.
+    LinearOperator = None
+    eigsh = None
 
 from pyqed.davidson import davidson
 from pyqed.mps.su2 import SpinChargeSector, fuse_charge_spin_sectors
 
+from .basis import TwoSiteBasis
 from .contraction import combine_legs, split_legs
+from .renormalized import (
+    BlockSparseOrthonormalizedLocalProblem,
+    ComponentOrthonormalizedLocalProblem,
+    DirectOrthonormalFactorizedTable,
+    OrthonormalizedLocalProblem,
+    RenormalizedComponentBasis,
+    compile_orthonormal_block_table,
+)
 from .tensor import NonabelianTensor
 
 _BASIS_TRANSFORM_DENSE_MATVEC_SIZE = 0
+_TRANSFORMED_PRECONDITIONER_MAX_BLOCK_SIZE = 128
+_COMPONENT_BASIS_CACHE_MAX_SIZE = 128
+_COMPONENT_BASIS_CACHE = {}
 
 
 @dataclass(frozen=True)
@@ -29,13 +48,35 @@ class PackedEntry:
 
 @dataclass(frozen=True)
 class ReducedStateLayout:
+    """
+    Packed reduced-state layout for a local tensor problem.
+
+    :param entries: Ordered block entries defining the packed vector slices.
+    :param basis: Optional explicit two-site symmetry basis for ``entries``.
+        The basis is metadata only for comparison and hashing, preserving the
+        older tuple-layout cache behavior.
+    """
+
     entries: tuple[PackedEntry, ...]
+    basis: TwoSiteBasis | None = field(default=None, compare=False, hash=False)
+
+    def __post_init__(self):
+        entries = tuple(self.entries)
+        object.__setattr__(self, "entries", entries)
+        if self.basis is not None and not self.basis.compatible_with_layout(entries):
+            raise ValueError("ReducedStateLayout basis is incompatible with its packed entries.")
 
     @property
     def size(self):
+        if self.basis is not None:
+            return self.basis.size
         return sum(entry.size for entry in self.entries)
 
     def basis_vector(self, index, *, dtype=complex):
+        if self.basis is not None:
+            key, block = self.basis.basis_block(index, dtype=dtype)
+            return ReducedStateVector(layout=self, blocks={key: block})
+
         index = int(index)
         if index < 0 or index >= self.size:
             raise IndexError(f"Basis index {index} is out of range for size {self.size}.")
@@ -50,6 +91,12 @@ class ReducedStateLayout:
         raise IndexError(f"Basis index {index} is out of range for size {self.size}.")
 
     def from_packed(self, vector):
+        if self.basis is not None:
+            return ReducedStateVector(
+                layout=self,
+                blocks=self.basis.blocks_from_packed(vector),
+            )
+
         vector = np.asarray(vector)
         blocks = {}
         for entry in self.entries:
@@ -59,6 +106,9 @@ class ReducedStateLayout:
         return ReducedStateVector(layout=self, blocks=blocks)
 
     def to_packed(self, state, *, dtype=None):
+        if self.basis is not None:
+            return self.basis.blocks_to_packed(state.blocks, dtype=dtype)
+
         if dtype is None:
             present = [np.asarray(block).dtype for block in state.blocks.values()]
             dtype = np.result_type(*(present or [float]))
@@ -91,6 +141,16 @@ class ReducedDiagonalPreconditioner:
 
     @classmethod
     def from_packed_diagonals(cls, layout, h_diag, *, n_diag=None):
+        """
+        Build a diagonal reduced preconditioner from packed diagonals.
+
+        :param layout: Reduced-state layout or compatible two-site basis.
+        :param h_diag: Packed Hamiltonian diagonal.
+        :param n_diag: Optional packed norm diagonal.
+        :returns: ``ReducedDiagonalPreconditioner`` with sector-keyed blocks.
+        """
+
+        layout = _reduced_state_layout(layout)
         h_diag = np.asarray(h_diag, dtype=float).reshape(-1)
         if h_diag.size != layout.size:
             raise ValueError("Hamiltonian diagonal must match the reduced-state layout size.")
@@ -101,11 +161,15 @@ class ReducedDiagonalPreconditioner:
             if n_diag.size != layout.size:
                 raise ValueError("Norm diagonal must match the reduced-state layout size.")
 
-        h_blocks = {}
-        n_blocks = {}
-        for entry in layout.entries:
-            h_blocks[entry.key] = h_diag[entry.offset:entry.offset + entry.size].reshape(entry.shape)
-            n_blocks[entry.key] = n_diag[entry.offset:entry.offset + entry.size].reshape(entry.shape)
+        if layout.basis is not None:
+            h_blocks = layout.basis.blocks_from_packed(h_diag, drop_zeros=False)
+            n_blocks = layout.basis.blocks_from_packed(n_diag, drop_zeros=False)
+        else:
+            h_blocks = {}
+            n_blocks = {}
+            for entry in layout.entries:
+                h_blocks[entry.key] = h_diag[entry.offset:entry.offset + entry.size].reshape(entry.shape)
+                n_blocks[entry.key] = n_diag[entry.offset:entry.offset + entry.size].reshape(entry.shape)
         return cls(layout=layout, h_blocks=h_blocks, n_blocks=n_blocks)
 
     def apply(self, resid, theta):
@@ -125,58 +189,181 @@ class ReducedDiagonalPreconditioner:
         return ReducedStateVector(layout=self.layout, blocks=blocks)
 
 
+def _packed_layout_object(layout):
+    """
+    Return the most explicit packed-layout object available.
+
+    :param layout: ``TwoSiteBasis``, ``ReducedStateLayout``, or packed entries.
+    :returns: ``TwoSiteBasis`` when present, otherwise packed entries.
+    """
+
+    if isinstance(layout, TwoSiteBasis):
+        return layout
+    if isinstance(layout, ReducedStateLayout) and layout.basis is not None:
+        return layout.basis
+    return _layout_entries(layout)
+
+
+def _packed_layout_size(layout):
+    """
+    Return the packed dimension for a local layout object.
+
+    :param layout: ``TwoSiteBasis`` or packed entries.
+    :returns: Packed vector size.
+    """
+
+    if isinstance(layout, TwoSiteBasis):
+        return layout.size
+    return sum(entry.size for entry in layout)
+
+
+class _PackedBlockMatrixSource:
+    """
+    Lazy block-matrix accessor aligned with packed local-layout entries.
+
+    :param blocks: Sequence of blocks or provider exposing ``block_matrix_for``.
+    :param entries: Packed local layout entries.
+    :param label: Human-readable block role for validation errors.
+    :param default: Matrix returned for every entry when no provider is given.
+    """
+
+    def __init__(self, blocks, entries, *, label, default=None):
+        self.entries = tuple(entries)
+        self.label = str(label)
+        self.default = default
+        self.provider = blocks if hasattr(blocks, "block_matrix_for") else None
+        self.blocks = None if self.provider is not None else tuple(blocks)
+        if self.blocks is not None and len(self.blocks) != len(self.entries):
+            raise ValueError(f"{self.label} block list must match the packed layout length.")
+        self._cache = {}
+
+    def __len__(self):
+        """Return the number of packed layout entries."""
+
+        return len(self.entries)
+
+    def __getitem__(self, index):
+        """
+        Return one validated block matrix.
+
+        :param index: Packed entry index.
+        :returns: Dense square block or ``None``.
+        """
+
+        index = int(index)
+        if index in self._cache:
+            return self._cache[index]
+        entry = self.entries[index]
+        if self.provider is None:
+            block = self.default if self.blocks is None else self.blocks[index]
+        else:
+            block = self.provider.block_matrix_for(entry)
+        if block is None:
+            normalized = None
+        else:
+            normalized = np.asarray(block, dtype=complex)
+            if normalized.shape != (entry.size, entry.size):
+                raise ValueError(
+                    f"{self.label} block for {entry.key!r} has shape {normalized.shape!r}, "
+                    f"expected {(entry.size, entry.size)!r}."
+                )
+        self._cache[index] = normalized
+        return normalized
+
+    @property
+    def materialized_count(self):
+        """
+        Return the number of provider blocks queried so far.
+
+        :returns: Count of cached block lookups.
+        """
+
+        return len(self._cache)
+
+
 @dataclass(frozen=True)
 class PackedBlockPreconditioner:
-    layout: tuple[PackedEntry, ...]
-    h_blocks: tuple[np.ndarray | None, ...]
-    n_blocks: tuple[np.ndarray | None, ...]
+    layout: object
+    h_blocks: object
+    n_blocks: object
 
     @classmethod
     def from_layout_blocks(cls, layout, h_blocks, *, n_blocks=None):
-        layout = tuple(layout)
-        if len(h_blocks) != len(layout):
-            raise ValueError("Hamiltonian block list must match the packed layout length.")
-        if n_blocks is None:
-            n_blocks = [None] * len(layout)
-        elif len(n_blocks) != len(layout):
-            raise ValueError("Norm block list must match the packed layout length.")
+        """
+        Build a packed block preconditioner from per-entry matrices.
 
-        normalized_h = []
-        normalized_n = []
-        for entry, h_block, n_block in zip(layout, h_blocks, n_blocks):
-            if h_block is None:
-                normalized_h.append(None)
-            else:
-                arr = np.asarray(h_block, dtype=complex)
-                if arr.shape != (entry.size, entry.size):
-                    raise ValueError(
-                        f"Hamiltonian block for {entry.key!r} has shape {arr.shape!r}, "
-                        f"expected {(entry.size, entry.size)!r}."
-                    )
-                normalized_h.append(arr)
-            if n_block is None:
-                normalized_n.append(None)
-            else:
-                arr = np.asarray(n_block, dtype=complex)
-                if arr.shape != (entry.size, entry.size):
-                    raise ValueError(
-                        f"Norm block for {entry.key!r} has shape {arr.shape!r}, "
-                        f"expected {(entry.size, entry.size)!r}."
-                    )
-                normalized_n.append(arr)
-        return cls(layout=layout, h_blocks=tuple(normalized_h), n_blocks=tuple(normalized_n))
+        :param layout: ``TwoSiteBasis``, ``ReducedStateLayout``, or packed entries.
+        :param h_blocks: Hamiltonian block matrices aligned with layout entries.
+        :param n_blocks: Optional norm block matrices aligned with layout entries.
+        :returns: ``PackedBlockPreconditioner``.
+        """
+
+        layout = _packed_layout_object(layout)
+        entries = _layout_entries(layout)
+        h_blocks = _PackedBlockMatrixSource(
+            h_blocks,
+            entries,
+            label="Hamiltonian",
+        )
+        if n_blocks is None:
+            n_blocks = _PackedBlockMatrixSource(
+                [None] * len(entries),
+                entries,
+                label="Norm",
+            )
+        else:
+            n_blocks = _PackedBlockMatrixSource(
+                n_blocks,
+                entries,
+                label="Norm",
+            )
+        return cls(layout=layout, h_blocks=h_blocks, n_blocks=n_blocks)
+
+    @property
+    def materialized_block_count(self):
+        """
+        Return the number of Hamiltonian self-blocks materialized so far.
+
+        :returns: Number of cached block matrices in the Hamiltonian source.
+        """
+
+        return getattr(self.h_blocks, "materialized_count", 0)
 
     def apply(self, resid, theta):
         resid = np.asarray(resid, dtype=complex).reshape(-1)
-        size = sum(entry.size for entry in self.layout)
+        size = _packed_layout_size(self.layout)
         if resid.size != size:
             raise ValueError("Packed residual size must match the preconditioner layout.")
 
         out = np.zeros_like(resid)
-        for entry, h_block, n_block in zip(self.layout, self.h_blocks, self.n_blocks):
+        if isinstance(self.layout, TwoSiteBasis):
+            for idx, (entry, block) in enumerate(self.layout.iter_packed_blocks(resid, drop_zeros=False)):
+                piece = np.asarray(block).reshape(entry.size)
+                if np.linalg.norm(piece) <= 1e-15:
+                    continue
+                h_block = self.h_blocks[idx]
+                n_block = self.n_blocks[idx]
+                if h_block is None:
+                    self.layout.write_packed_block(out, entry, piece)
+                    continue
+                metric = np.eye(entry.size, dtype=complex) if n_block is None else n_block
+                system = theta * metric - h_block
+                # Small regularization keeps nearly singular local blocks usable.
+                system = 0.5 * (system + system.conj().T)
+                reg = 1e-10 * np.eye(entry.size, dtype=complex)
+                try:
+                    corrected = np.linalg.solve(system + reg, piece)
+                except np.linalg.LinAlgError:
+                    corrected, *_ = np.linalg.lstsq(system + reg, piece, rcond=None)
+                self.layout.write_packed_block(out, entry, corrected)
+            return out
+
+        for idx, entry in enumerate(_layout_entries(self.layout)):
             piece = resid[entry.offset:entry.offset + entry.size]
             if np.linalg.norm(piece) <= 1e-15:
                 continue
+            h_block = self.h_blocks[idx]
+            n_block = self.n_blocks[idx]
             if h_block is None:
                 out[entry.offset:entry.offset + entry.size] = piece
                 continue
@@ -193,9 +380,70 @@ class PackedBlockPreconditioner:
         return out
 
 
+class _PackedMatvecBlockProvider:
+    """
+    Lazily build self-sector block matrices from a packed matvec.
+
+    This keeps transformed coupled local operators on the matrix-free path while
+    still giving Davidson a block preconditioner in each reduced local sector.
+
+    :param layout: Packed local layout for the transformed problem.
+    :param packed_matvec: Matrix-free packed-vector action.
+    :param max_block_size: Largest self-sector block to materialize.
+    """
+
+    def __init__(self, layout, packed_matvec, *, max_block_size=_TRANSFORMED_PRECONDITIONER_MAX_BLOCK_SIZE):
+        self.layout = _packed_layout_object(layout)
+        self.packed_matvec = packed_matvec
+        self.max_block_size = int(max_block_size)
+        self._cache = {}
+
+    def block_matrix_for(self, entry_or_key):
+        """
+        Return the self-block matrix for one packed sector entry.
+
+        :param entry_or_key: Packed layout entry or sector key.
+        :returns: Dense self-block matrix, or ``None`` when skipped.
+        """
+
+        if hasattr(entry_or_key, "key"):
+            entry = entry_or_key
+        else:
+            matches = [entry for entry in _layout_entries(self.layout) if entry.key == entry_or_key]
+            if not matches:
+                return None
+            entry = matches[0]
+        cache_key = (entry.key, entry.offset, entry.size)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        if entry.size > self.max_block_size:
+            self._cache[cache_key] = None
+            return None
+        total_dim = _packed_layout_size(self.layout)
+        matrix = np.zeros((entry.size, entry.size), dtype=complex)
+        for col in range(entry.size):
+            basis_vec = np.zeros(total_dim, dtype=complex)
+            basis_vec[entry.offset + col] = 1.0
+            out = np.asarray(self.packed_matvec(basis_vec), dtype=complex).reshape(total_dim)
+            matrix[:, col] = out[entry.offset:entry.offset + entry.size]
+        if np.linalg.norm(matrix) <= 1e-15:
+            matrix = None
+        self._cache[cache_key] = matrix
+        return matrix
+
+
 def _pack_tensor_state(tensor, *, layout=None):
     if not isinstance(tensor, NonabelianTensor):
         raise ValueError("_pack_tensor_state expects a NonabelianTensor.")
+
+    if isinstance(layout, TwoSiteBasis):
+        present_dtypes = [
+            np.asarray(tensor.data[entry.key]).dtype
+            for entry in layout
+            if entry.key in tensor.data
+        ]
+        dtype = np.result_type(*(present_dtypes or [float]))
+        return layout.blocks_to_packed(tensor.data, dtype=dtype), layout.entries
 
     if layout is None:
         entries = []
@@ -206,6 +454,8 @@ def _pack_tensor_state(tensor, *, layout=None):
             entries.append(PackedEntry(tuple(key), tuple(block.shape), offset, size))
             offset += size
         layout = tuple(entries)
+    else:
+        layout = _layout_entries(layout)
 
     if layout:
         present_dtypes = [
@@ -229,6 +479,17 @@ def _unpack_tensor_state(vector, template, *, layout):
     if not isinstance(template, NonabelianTensor):
         raise ValueError("_unpack_tensor_state expects a NonabelianTensor template.")
 
+    if isinstance(layout, TwoSiteBasis):
+        data = layout.blocks_from_packed(vector, drop_zeros=False)
+        return NonabelianTensor(
+            data,
+            [leg[:] for leg in template.qns],
+            template.dirs[:],
+            fusion_legs=template.fusion_legs[:],
+            metadata=template.metadata.copy(),
+        )
+
+    layout = _layout_entries(layout)
     vector = np.asarray(vector)
     data = {}
     for entry in layout:
@@ -243,11 +504,115 @@ def _unpack_tensor_state(vector, template, *, layout):
     )
 
 
-def _reduced_state_layout(layout):
-    return ReducedStateLayout(tuple(layout))
+def _layout_entries(layout):
+    """
+    Return packed entries from any supported local-layout descriptor.
+
+    :param layout: A ``ReducedStateLayout``, ``TwoSiteBasis``, or iterable of
+        ``PackedEntry`` objects.
+    :returns: Tuple of packed entries.
+    """
+
+    if isinstance(layout, ReducedStateLayout):
+        return layout.entries
+    if isinstance(layout, TwoSiteBasis):
+        return layout.entries
+    return tuple(layout)
+
+
+def _two_site_basis_for_layout(template, layout):
+    """
+    Build or recover the explicit two-site basis for a local layout.
+
+    :param template: Rank-4 two-site tensor defining the sector axes.
+    :param layout: Packed local layout or an existing ``TwoSiteBasis``.
+    :returns: ``TwoSiteBasis`` when the template is a two-site tensor,
+        otherwise ``None``.
+    """
+
+    if isinstance(layout, TwoSiteBasis):
+        return layout
+    if not isinstance(template, NonabelianTensor) or template.rank != 4:
+        return None
+    return TwoSiteBasis.from_tensor_and_layout(template, _layout_entries(layout))
+
+
+def _reduced_state_layout(layout, *, basis=None):
+    """
+    Normalize a layout descriptor to ``ReducedStateLayout``.
+
+    :param layout: Packed entries, ``ReducedStateLayout``, or ``TwoSiteBasis``.
+    :param basis: Optional explicit basis attached when ``layout`` is raw
+        packed entries.
+    :returns: Reduced-state layout object.
+    """
+
+    if isinstance(layout, ReducedStateLayout):
+        return layout
+    if isinstance(layout, TwoSiteBasis):
+        return ReducedStateLayout(layout.entries, basis=layout)
+    return ReducedStateLayout(tuple(layout), basis=basis)
+
+
+def _reduced_state_layout_for_tensor(template, layout):
+    """
+    Build a reduced-state layout carrying the tensor's two-site basis.
+
+    :param template: Rank-4 local tensor.
+    :param layout: Packed local layout.
+    :returns: Reduced-state layout with compatible ``TwoSiteBasis`` metadata.
+    """
+
+    return _reduced_state_layout(
+        layout,
+        basis=_two_site_basis_for_layout(template, layout),
+    )
+
+
+def _reduced_state_layout_for_operator(op, template, layout):
+    """
+    Build a reduced-state layout, preferring operator-supplied basis metadata.
+
+    :param op: Local operator that may carry a ``TwoSiteBasis``.
+    :param template: Rank-4 local tensor.
+    :param layout: Packed local layout.
+    :returns: Reduced-state layout with explicit basis metadata.
+    """
+
+    basis = op.basis if isinstance(getattr(op, "basis", None), TwoSiteBasis) else None
+    return _reduced_state_layout(
+        layout,
+        basis=basis or _two_site_basis_for_layout(template, layout),
+    )
+
+
+def _operator_basis_for_layout(op, layout):
+    """
+    Return an operator-supplied basis when it matches a packed layout.
+
+    :param op: Local operator that may carry ``TwoSiteBasis`` metadata.
+    :param layout: Packed local layout used to check compatibility.
+    :returns: Compatible ``TwoSiteBasis`` or ``None``.
+    :raises ValueError: If the operator basis is present but incompatible.
+    """
+
+    basis = getattr(op, "basis", None)
+    if basis is None:
+        return None
+    if not isinstance(basis, TwoSiteBasis):
+        raise TypeError("LocalOperator.basis must be a TwoSiteBasis when provided.")
+    if not basis.compatible_with_layout(_layout_entries(layout)):
+        raise ValueError("LocalOperator.basis is incompatible with the current two-site layout.")
+    return basis
 
 
 def _tensor_to_reduced_state(tensor, *, state_layout):
+    if state_layout.basis is not None:
+        return ReducedStateVector(
+            layout=state_layout,
+            blocks=state_layout.basis.blocks_from_tensor_data(tensor.data),
+        )
+
     blocks = {}
     for entry in state_layout.entries:
         if entry.key not in tensor.data:
@@ -259,14 +624,20 @@ def _tensor_to_reduced_state(tensor, *, state_layout):
 
 
 def _reduced_state_to_tensor(state, template):
-    data = {}
-    for entry in state.layout.entries:
-        if entry.key in state.blocks:
-            data[entry.key] = np.array(state.blocks[entry.key], copy=True).reshape(entry.shape)
-        elif entry.key in template.data:
-            data[entry.key] = np.zeros(entry.shape, dtype=np.asarray(template.data[entry.key]).dtype)
-        else:
-            data[entry.key] = np.zeros(entry.shape, dtype=float)
+    if state.layout.basis is not None:
+        data = state.layout.basis.tensor_data_from_blocks(
+            state.blocks,
+            template_data=template.data,
+        )
+    else:
+        data = {}
+        for entry in state.layout.entries:
+            if entry.key in state.blocks:
+                data[entry.key] = np.array(state.blocks[entry.key], copy=True).reshape(entry.shape)
+            elif entry.key in template.data:
+                data[entry.key] = np.zeros(entry.shape, dtype=np.asarray(template.data[entry.key]).dtype)
+            else:
+                data[entry.key] = np.zeros(entry.shape, dtype=float)
     return NonabelianTensor(
         data,
         [leg[:] for leg in template.qns],
@@ -379,9 +750,30 @@ class LocalOperator:
     """
     Small wrapper for an effective two-site operator.
 
-    Exactly one of ``matrix``, ``matvec``, ``tensor_matvec``, or
-    ``reduced_matvec`` should be
-    supplied.
+    Exactly one of ``matrix``, ``matvec``, ``tensor_matvec``,
+    ``reduced_matvec``, or ``packed_matvec`` should be supplied.
+
+    :param matrix: Dense local operator matrix.
+    :param matvec: Packed-vector matvec callback.
+    :param tensor_matvec: Tensor-to-tensor matvec callback.
+    :param reduced_matvec: ``ReducedStateVector`` matvec callback.
+    :param packed_matvec: Packed-vector matvec callback with direct reduced
+        layout support.
+    :param aux_reduced_matvec: Optional reduced callback used when callers
+        prefer reduced operators.
+    :param aux_packed_matvec: Optional packed callback used when callers
+        prefer packed operators.
+    :param packed_block_matrices: Optional per-layout block matrices for block
+        preconditioning.
+    :param basis: Optional explicit ``TwoSiteBasis`` for the packed local
+        problem.
+    :param diag: Optional packed diagonal.
+    :param name: Optional operator label.
+    :param identity_like: Whether the operator acts as an identity metric in
+        the current basis.
+    :param metadata: Optional diagnostics describing the operator source.
+    :param local_operator_table: Optional typed renormalized local table
+        provider.
     """
 
     matrix: object | None = None
@@ -392,9 +784,12 @@ class LocalOperator:
     aux_reduced_matvec: object | None = None
     aux_packed_matvec: object | None = None
     packed_block_matrices: object | None = None
+    basis: object | None = None
     diag: object | None = None
     name: str | None = None
     identity_like: bool = False
+    metadata: dict | None = None
+    local_operator_table: object | None = None
 
     def __post_init__(self):
         count = sum(
@@ -446,6 +841,22 @@ def pack_two_site_state(two_site, *, layout=None):
     return _pack_tensor_state(two_site, layout=layout)
 
 
+def two_site_state_basis(two_site, *, layout=None):
+    """
+    Return the explicit basis for the packed rank-4 two-site local problem.
+
+    :param two_site: Rank-4 non-Abelian two-site tensor.
+    :param layout: Optional packed layout. When omitted, the tensor is packed
+        to derive the canonical layout.
+    :returns: Explicit ``TwoSiteBasis`` matching the packed layout.
+    """
+    if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
+        raise ValueError("two_site_state_basis expects a rank-4 NonabelianTensor.")
+    if layout is None:
+        _, layout = pack_two_site_state(two_site)
+    return TwoSiteBasis.from_tensor_and_layout(two_site, _layout_entries(layout))
+
+
 def unpack_two_site_state(vector, template, *, layout):
     """
     Rebuild a rank-4 non-Abelian tensor from a packed vector and template.
@@ -456,15 +867,16 @@ def unpack_two_site_state(vector, template, *, layout):
     return _unpack_tensor_state(vector, template, layout=layout)
 
 
-def _coupled_two_site_template(two_site):
+def _coupled_two_site_template(two_site, *, filter_boundary_target=False):
     """
     Build a rank-3 coupled-basis template by fusing the two physical legs.
     """
     if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
         raise ValueError("_coupled_two_site_template expects a rank-4 NonabelianTensor.")
-    return _filter_coupled_template_to_boundary_target(
-        combine_legs(two_site, (1, 2), new_axis=1, use_cg=True)
-    )
+    coupled = combine_legs(two_site, (1, 2), new_axis=1, use_cg=True)
+    if filter_boundary_target:
+        return _filter_coupled_template_to_boundary_target(coupled)
+    return coupled
 
 
 def _fuses_to_boundary_target(left, middle, right):
@@ -780,8 +1192,12 @@ def _normalize_local_operator(local_operator):
             tensor_matvec=local_operator.get("tensor_matvec"),
             reduced_matvec=local_operator.get("reduced_matvec"),
             packed_matvec=local_operator.get("packed_matvec"),
+            basis=local_operator.get("basis"),
             diag=local_operator.get("diag"),
             name=local_operator.get("name"),
+            identity_like=bool(local_operator.get("identity_like", False)),
+            metadata=local_operator.get("metadata"),
+            local_operator_table=local_operator.get("local_operator_table"),
         )
     if callable(local_operator):
         return LocalOperator(matvec=local_operator)
@@ -810,7 +1226,7 @@ def _resolve_davidson_operator(local_operator, template, layout):
         return matvec, diag
 
     if op.reduced_matvec is not None:
-        state_layout = _reduced_state_layout(layout)
+        state_layout = _reduced_state_layout_for_operator(op, template, layout)
 
         def matvec(vec):
             state = state_layout.from_packed(vec)
@@ -887,6 +1303,83 @@ def _build_iterative_guess(diag_h, neigen, *, guess=None, diag_n=None):
     return _orthonormalize_columns_dense(np.column_stack(cols))
 
 
+def _metric_orthogonalize_packed_vector(vector, metric_vector, basis, metric_basis, *, tol):
+    """
+    Orthogonalize one packed vector against an ``N``-orthonormal basis.
+
+    :param vector: Candidate vector in the packed basis.
+    :param metric_vector: ``N @ vector``.
+    :param basis: Existing packed basis columns.
+    :param metric_basis: Existing ``N @ basis`` columns.
+    :param tol: Linear-dependence cutoff in the metric norm.
+    :returns: ``(vector, metric_vector)`` normalized to unit metric norm, or
+        ``(None, None)`` when the candidate is dependent.
+    """
+
+    vector = np.asarray(vector, dtype=complex).reshape(-1)
+    metric_vector = np.asarray(metric_vector, dtype=complex).reshape(-1)
+    if basis.size:
+        for _ in range(2):
+            overlap = basis.conj().T @ metric_vector
+            vector = vector - basis @ overlap
+            metric_vector = metric_vector - metric_basis @ overlap
+    norm2 = float(np.real(np.vdot(vector, metric_vector)))
+    if norm2 <= float(tol) ** 2:
+        return None, None
+    norm = np.sqrt(norm2)
+    return vector / norm, metric_vector / norm
+
+
+def _metric_orthonormalize_packed_columns(columns, metric_operator, *, tol=1e-12):
+    """
+    Build an ``N``-orthonormal packed basis from candidate columns.
+
+    :param columns: Candidate packed basis vectors.
+    :param metric_operator: Callable applying the positive local metric ``N``.
+    :param tol: Linear-dependence cutoff in the metric norm.
+    :returns: ``(V, N @ V)`` with ``V.conj().T @ N @ V = I``.
+    """
+
+    columns = np.asarray(columns, dtype=complex)
+    if columns.ndim == 1:
+        columns = columns.reshape(-1, 1)
+    vectors = []
+    metric_vectors = []
+    size = columns.shape[0]
+    for col in range(columns.shape[1]):
+        vector = columns[:, col]
+        metric_vector = np.asarray(metric_operator(vector), dtype=complex).reshape(-1)
+        if metric_vector.size != size:
+            raise ValueError("Metric operator output must match the packed vector size.")
+        basis = (
+            np.column_stack(vectors)
+            if vectors
+            else np.zeros((size, 0), dtype=complex)
+        )
+        metric_basis = (
+            np.column_stack(metric_vectors)
+            if metric_vectors
+            else np.zeros((size, 0), dtype=complex)
+        )
+        vector, metric_vector = _metric_orthogonalize_packed_vector(
+            vector,
+            metric_vector,
+            basis,
+            metric_basis,
+            tol=tol,
+        )
+        if vector is None:
+            continue
+        vectors.append(vector)
+        metric_vectors.append(metric_vector)
+    if not vectors:
+        return (
+            np.zeros((size, 0), dtype=complex),
+            np.zeros((size, 0), dtype=complex),
+        )
+    return np.column_stack(vectors), np.column_stack(metric_vectors)
+
+
 def _build_iterative_guess_reduced(diag_h, state_layout, *, neigen=1, guess=None, diag_n=None):
     diag_h = np.asarray(diag_h, dtype=float)
     n = diag_h.size
@@ -949,6 +1442,8 @@ def _solve_reduced_generalized_davidson(
     tol_residual=None,
     lindep=1e-12,
     precond=None,
+    use_block_preconditioner=True,
+    allow_unconverged=False,
 ):
     if not isinstance(guess_state, ReducedStateVector):
         raise TypeError("_solve_reduced_generalized_davidson expects a ReducedStateVector guess.")
@@ -1093,7 +1588,42 @@ def _solve_packed_generalized_davidson(
     lindep=1e-12,
     precond=None,
     block_preconditioner=None,
+    use_block_preconditioner=True,
+    profile=False,
 ):
+    timing = {
+        "davidson": 0.0,
+        "matvec": 0.0,
+    } if profile else None
+    h_matvec_count = 0
+    n_matvec_count = 0
+    total_t0 = time.perf_counter() if profile else None
+
+    H_raw = H
+    N_raw = N
+
+    def H_timed(vec):
+        nonlocal h_matvec_count
+        if not profile:
+            return H_raw(vec)
+        t0 = time.perf_counter()
+        out = H_raw(vec)
+        timing["matvec"] += time.perf_counter() - t0
+        h_matvec_count += 1
+        return out
+
+    def N_timed(vec):
+        nonlocal n_matvec_count
+        if N_raw is None:
+            return vec
+        if not profile:
+            return N_raw(vec)
+        t0 = time.perf_counter()
+        out = N_raw(vec)
+        timing["matvec"] += time.perf_counter() - t0
+        n_matvec_count += 1
+        return out
+
     guess_packed = np.asarray(guess_packed, dtype=complex).reshape(-1)
     if np.linalg.norm(guess_packed) < 1e-15:
         raise ValueError("Initial guess for Davidson must have nonzero norm.")
@@ -1103,8 +1633,8 @@ def _solve_packed_generalized_davidson(
         raise ValueError("Hamiltonian diagonal guess must match the packed state dimension.")
 
     has_norm_operator = N is not None
-    if N is None:
-        N = lambda vec: vec
+    H = H_timed
+    N = N_timed
     if n_diag is None:
         n_diag = np.ones_like(h_diag)
     else:
@@ -1116,12 +1646,31 @@ def _solve_packed_generalized_davidson(
         max_space = min(guess_packed.size, 48)
     tol_res = np.sqrt(tol) if tol_residual is None else tol_residual
 
+    metric_orthonormal_krylov = bool(has_norm_operator)
     Vp = _build_iterative_guess(h_diag, 1, guess=guess_packed, diag_n=n_diag)
+    if metric_orthonormal_krylov:
+        Vp, BVp = _metric_orthonormalize_packed_columns(Vp, N, tol=lindep)
+        if Vp.shape[1] == 0:
+            raise ValueError("Initial generalized Davidson basis is singular in the local metric.")
+    else:
+        BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
     AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
-    BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
     preconditioner_mode = None
+    seed_scores = h_diag / np.where(np.abs(n_diag) > 1.0e-12, n_diag, 1.0)
+    seed_order = np.argsort(seed_scores)
 
-    if precond is None and block_preconditioner is not None:
+    def _next_seed_vector():
+        for idx in seed_order:
+            seed = np.zeros_like(guess_packed, dtype=complex)
+            seed[int(idx)] = 1.0
+            if Vp.shape[1]:
+                seed = seed - Vp @ (Vp.conj().T @ seed)
+            norm = float(np.linalg.norm(seed))
+            if norm > lindep:
+                return seed / norm
+        return None
+
+    if precond is None and use_block_preconditioner and block_preconditioner is not None:
         def precondition(resid, theta, vec):
             corrected = block_preconditioner.apply(resid, theta)
             if np.linalg.norm(corrected) <= 1e-15:
@@ -1181,7 +1730,7 @@ def _solve_packed_generalized_davidson(
     iterations = 0
     restarts = 0
     Hs = Vp.conj().T @ AVp
-    Ns = Vp.conj().T @ BVp
+    Ns = None if metric_orthonormal_krylov else Vp.conj().T @ BVp
 
     def _generalized_restart_vectors(Hs_local, Ns_local, keep, *, tol_local):
         Hs_local = 0.5 * (np.asarray(Hs_local) + np.asarray(Hs_local).conj().T)
@@ -1201,57 +1750,143 @@ def _solve_packed_generalized_davidson(
                 coeffs[:, col] = coeffs[:, col] / norm
         return coeffs
 
+    def _lowest_projected_root_with_reference(Hs_local, Ns_local=None):
+        Hs_local = 0.5 * (np.asarray(Hs_local) + np.asarray(Hs_local).conj().T)
+        ref_proj = Vp.conj().T @ guess_packed
+        if Ns_local is None:
+            evals, evecs = np.linalg.eigh(Hs_local)
+            order = np.argsort(np.real(evals))
+            lowest = float(np.real(evals[order[0]]))
+            degenerate = [
+                idx for idx in order
+                if abs(float(np.real(evals[idx])) - lowest) <= max(float(tol), 1.0e-12)
+            ]
+            if len(degenerate) > 1:
+                subspace = evecs[:, degenerate]
+                coeff = subspace @ (subspace.conj().T @ ref_proj)
+                norm = np.linalg.norm(coeff)
+                if norm > 1.0e-15:
+                    return lowest, coeff / norm
+                idx = int(degenerate[0])
+            else:
+                idx = int(order[0])
+            return lowest, evecs[:, idx]
+
+        Ns_local = 0.5 * (np.asarray(Ns_local) + np.asarray(Ns_local).conj().T)
+        if np.allclose(Ns_local, np.eye(Ns_local.shape[0], dtype=Ns_local.dtype), atol=1.0e-10, rtol=1.0e-10):
+            return _lowest_projected_root_with_reference(Hs_local, None)
+        theta_local, coeff_local, _ = _solve_generalized_dense(Hs_local, Ns_local, tol=max(tol, 1e-12))
+        return theta_local, coeff_local
+
     for iterations in range(1, itermax + 1):
-        theta, coeff, _ = _solve_generalized_dense(Hs, Ns, tol=max(tol, 1e-12))
+        if metric_orthonormal_krylov:
+            theta, coeff = _lowest_projected_root_with_reference(Hs, None)
+        else:
+            theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
         ritz_p = Vp @ coeff
         aritz_p = AVp @ coeff
         britz_p = BVp @ coeff
         resid_p = aritz_p - theta * britz_p
         residual_norm = float(np.linalg.norm(resid_p))
         de = np.inf if prev_theta is None else abs(theta - prev_theta)
-        if residual_norm <= tol_res and (prev_theta is None or de <= tol):
+        min_explored_dim = min(guess_packed.size, int(max_space), 16)
+        if (
+            residual_norm <= tol_res
+            and (prev_theta is None or de <= tol)
+            and Vp.shape[1] >= min_explored_dim
+        ):
             converged = True
             break
 
         corr_p = precondition(resid_p, theta, ritz_p)
-        if Vp.shape[1]:
-            corr_p = corr_p - Vp @ (Vp.conj().T @ corr_p)
-        corr_norm = float(np.linalg.norm(corr_p))
-        if corr_norm <= lindep:
-            break
-        corr_p = corr_p / corr_norm
+        if metric_orthonormal_krylov:
+            corr_n = np.asarray(N(corr_p), dtype=complex).reshape(-1)
+            corr_p, corr_n = _metric_orthogonalize_packed_vector(
+                corr_p,
+                corr_n,
+                Vp,
+                BVp,
+                tol=lindep,
+            )
+            if corr_p is None:
+                break
+        else:
+            if Vp.shape[1]:
+                corr_p = corr_p - Vp @ (Vp.conj().T @ corr_p)
+            corr_norm = float(np.linalg.norm(corr_p))
+            if corr_norm <= lindep:
+                corr_p = _next_seed_vector()
+                if corr_p is None:
+                    break
+            else:
+                corr_p = corr_p / corr_norm
 
         if Vp.shape[1] + 1 > max_space:
             restart_keep = min(max(2, max_space // 32), 4)
-            restart_coeffs = _generalized_restart_vectors(Hs, Ns, restart_keep, tol_local=max(tol, 1e-12))
+            if metric_orthonormal_krylov:
+                Hs = 0.5 * (Hs + Hs.conj().T)
+                _evals, restart_coeffs = np.linalg.eigh(Hs)
+                restart_coeffs = restart_coeffs[:, :restart_keep]
+            else:
+                restart_coeffs = _generalized_restart_vectors(Hs, Ns, restart_keep, tol_local=max(tol, 1e-12))
             restart_vectors = []
             if restart_coeffs is not None:
                 restart_vectors.extend(Vp @ restart_coeffs[:, i] for i in range(restart_coeffs.shape[1]))
             else:
                 restart_vectors.append(ritz_p)
             restart_vectors.append(corr_p)
-            Vp = _orthonormalize_columns_dense(np.column_stack(restart_vectors), tol=lindep)
+            if metric_orthonormal_krylov:
+                Vp, BVp = _metric_orthonormalize_packed_columns(
+                    np.column_stack(restart_vectors),
+                    N,
+                    tol=lindep,
+                )
+            else:
+                Vp = _orthonormalize_columns_dense(np.column_stack(restart_vectors), tol=lindep)
+                BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
             restarts += 1
             AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
-            BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
             Hs = Vp.conj().T @ AVp
-            Ns = Vp.conj().T @ BVp
+            Ns = None if metric_orthonormal_krylov else Vp.conj().T @ BVp
         else:
             h_corr = np.asarray(H(corr_p), dtype=complex).reshape(-1)
-            n_corr = np.asarray(N(corr_p), dtype=complex).reshape(-1)
+            if not metric_orthonormal_krylov:
+                corr_n = np.asarray(N(corr_p), dtype=complex).reshape(-1)
             h_overlap = Vp.conj().T @ h_corr
-            n_overlap = Vp.conj().T @ n_corr
             Vp = np.column_stack([Vp, corr_p])
             AVp = np.column_stack([AVp, h_corr])
-            BVp = np.column_stack([BVp, n_corr])
+            BVp = np.column_stack([BVp, corr_n])
             Hs = _expand_projected_matrix(Hs, h_overlap, np.vdot(corr_p, h_corr))
-            Ns = _expand_projected_matrix(Ns, n_overlap, np.vdot(corr_p, n_corr))
+            if not metric_orthonormal_krylov:
+                n_overlap = Vp[:, :-1].conj().T @ corr_n
+                Ns = _expand_projected_matrix(Ns, n_overlap, np.vdot(corr_p, corr_n))
         prev_theta = theta
 
-    theta, coeff, _ = _solve_generalized_dense(Hs, Ns, tol=max(tol, 1e-12))
-    vec_packed = _canonicalize_eigenvector(Vp @ coeff, reference=guess_packed)
+    if metric_orthonormal_krylov:
+        theta, coeff = _lowest_projected_root_with_reference(Hs, None)
+    else:
+        theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
+    guess_h = np.asarray(H(guess_packed), dtype=complex).reshape(-1)
+    guess_n = np.asarray(N(guess_packed), dtype=complex).reshape(-1)
+    guess_denom = np.vdot(guess_packed, guess_n)
+    use_reference_root = False
+    if abs(guess_denom) > 1.0e-15:
+        guess_theta = float(np.real(np.vdot(guess_packed, guess_h) / guess_denom))
+        guess_residual = float(np.linalg.norm(guess_h - theta * guess_n))
+        use_reference_root = (
+            abs(guess_theta - theta) <= max(float(tol), 1.0e-12)
+            and guess_residual <= max(float(tol_res), 1.0e-12)
+        )
+    vec_packed = (
+        np.array(guess_packed, copy=True)
+        if use_reference_root
+        else Vp @ coeff
+    )
+    vec_packed = _canonicalize_eigenvector(vec_packed, reference=guess_packed)
     residual_norm = float(np.linalg.norm((AVp @ coeff) - theta * (BVp @ coeff)))
-    return float(theta), vec_packed, {
+    if profile:
+        timing["davidson"] = time.perf_counter() - total_t0
+    info = {
         "metric": residual_norm,
         "residual": residual_norm,
         "davidson_iterations": int(iterations),
@@ -1261,10 +1896,20 @@ def _solve_packed_generalized_davidson(
         "tensor_davidson": True,
         "reduced_krylov": False,
         "packed_krylov": True,
+        "metric_orthonormal_krylov": metric_orthonormal_krylov,
+        "projected_problem": "standard" if metric_orthonormal_krylov else "generalized",
         "preconditioner_mode": preconditioner_mode,
         "reduced_preconditioner": False,
         "restarts": int(restarts),
     }
+    if profile:
+        info["solver_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
+        info["matvec_count"] = int(h_matvec_count)
+        info["norm_matvec_count"] = int(n_matvec_count)
+    return float(theta), vec_packed, info
 
 
 def _canonicalize_eigenvector(vec, *, reference=None, tol=1e-12):
@@ -1306,6 +1951,8 @@ def _solve_tensor_davidson(
     tol_residual=None,
     lindep=1e-12,
     precond=None,
+    use_block_preconditioner=True,
+    profile=False,
 ):
     op = _normalize_local_operator(operator)
     if (
@@ -1325,7 +1972,7 @@ def _solve_tensor_davidson(
     ):
         raise TypeError("_solve_tensor_davidson requires matrix, tensor_matvec, reduced_matvec, or packed_matvec norm operators.")
 
-    state_layout = _reduced_state_layout(layout)
+    state_layout = _reduced_state_layout_for_operator(op, template, layout)
     guess_state = _prepare_reduced_guess(template, state_layout, guess)
     guess_packed = guess_state.to_packed(dtype=complex)
 
@@ -1412,12 +2059,26 @@ def _solve_tensor_davidson(
             lindep=lindep,
             precond=precond,
             block_preconditioner=block_preconditioner,
+            use_block_preconditioner=use_block_preconditioner,
+            profile=profile,
         )
         optimized = _unpack_tensor_state(vec_packed, template, layout=layout)
         objective["energy"] = float(theta)
         objective["operator_representation"] = "reduced"
+        objective["packed_matvec_backend"] = getattr(H_packed, "backend", None)
+        objective["block_preconditioner"] = block_preconditioner is not None
+        objective["block_preconditioner_blocks"] = (
+            int(block_preconditioner.materialized_block_count)
+            if block_preconditioner is not None
+            else 0
+        )
+        if "solver_timing" in objective:
+            objective["solver_timing"] = objective["solver_timing"]
+        if "matvec_count" in objective:
+            objective["matvec_count"] = objective["matvec_count"]
         if norm_op is not None:
             objective["norm_operator_representation"] = "reduced"
+            objective["norm_packed_matvec_backend"] = getattr(N_packed, "backend", None)
         return optimized, objective
 
     H = _reduced_operator_to_matvec(op, template, state_layout)
@@ -1453,7 +2114,7 @@ def _solve_tensor_davidson(
 
 
 def _coupled_operator_tensor_matvec(op, two_site, uncoupled_layout):
-    uncoupled_state_layout = _reduced_state_layout(uncoupled_layout)
+    uncoupled_state_layout = _reduced_state_layout_for_tensor(two_site, uncoupled_layout)
 
     def apply(coupled_tensor):
         uncoupled_tensor = _uncouple_two_site_tensor(coupled_tensor)
@@ -1492,7 +2153,7 @@ def _lift_operator_to_coupled(
     transform_dag=None,
 ):
     coupled_state_layout = _reduced_state_layout(coupled_layout)
-    uncoupled_state_layout = _reduced_state_layout(uncoupled_layout)
+    uncoupled_state_layout = _reduced_state_layout_for_tensor(two_site, uncoupled_layout)
     if transform is None:
         _, _, transform = _build_basis_transform(
             two_site,
@@ -1567,9 +2228,13 @@ def _lift_operator_to_coupled(
         if op.diag is not None:
             unc_diag = np.asarray(op.diag, dtype=float).reshape(-1)
             diag = np.real((np.abs(transform) ** 2).T @ unc_diag)
+        packed_apply.backend = f"coupled-{getattr(packed_callback, 'backend', 'packed')}"
+        packed_apply.basis = coupled_layout
+        packed_apply.uncoupled_packed_matvec = packed_callback
+        block_provider = _PackedMatvecBlockProvider(coupled_layout, packed_apply)
         return LocalOperator(
             packed_matvec=packed_apply,
-            packed_block_matrices=None,
+            packed_block_matrices=block_provider,
             diag=diag,
             name=op.name,
         )
@@ -1707,9 +2372,12 @@ def _solve_standard_davidson_roots(
     tol_residual=None,
     lindep=1e-12,
     precond=None,
+    use_block_preconditioner=True,
+    allow_unconverged=False,
 ):
     """Return low roots of a standard local problem without materializing H."""
-    op_resolved, diag = _resolve_davidson_operator(operator, template, layout)
+    op = _normalize_local_operator(operator)
+    op_resolved, diag = _resolve_davidson_operator(op, template, layout)
     guess_arr = np.asarray(guess_vec, dtype=complex)
     dim = int(guess_arr.shape[0]) if guess_arr.ndim > 1 else int(guess_arr.reshape(-1).size)
     if diag is None:
@@ -1719,6 +2387,21 @@ def _solve_standard_davidson_roots(
         diag = np.asarray(diag, dtype=float).reshape(dim)
         missing_diag = False
     guess_vec = guess_arr.reshape(dim, -1) if guess_arr.ndim > 1 else guess_arr.reshape(dim)
+    block_preconditioner = None
+    davidson_precond = precond
+    if (
+        davidson_precond is None
+        and use_block_preconditioner
+        and op.packed_block_matrices is not None
+    ):
+        block_preconditioner = PackedBlockPreconditioner.from_layout_blocks(
+            layout,
+            op.packed_block_matrices,
+        )
+
+        def davidson_precond(resid, theta, _vec):
+            return block_preconditioner.apply(resid, theta)
+
     if projector_basis is not None:
         projector_basis = np.asarray(projector_basis, dtype=complex)
         if projector_basis.ndim != 2 or projector_basis.shape[0] != dim:
@@ -1734,6 +2417,13 @@ def _solve_standard_davidson_roots(
             full = projector_basis @ np.asarray(coeff, dtype=complex).reshape(proj_dim)
             return projector_basis.conj().T @ full_matvec(full)
 
+        projected_precond = precond
+        if projected_precond is None and block_preconditioner is not None:
+            def projected_precond(resid, theta, _vec):
+                full_resid = projector_basis @ np.asarray(resid, dtype=complex).reshape(proj_dim)
+                full_corr = block_preconditioner.apply(full_resid, theta)
+                return projector_basis.conj().T @ full_corr
+
         projected_diag = np.real((np.abs(projector_basis) ** 2).T @ diag)
         projected_guess = projector_basis.conj().T @ guess_vec
         if np.linalg.norm(projected_guess) <= 1e-15:
@@ -1746,12 +2436,13 @@ def _solve_standard_davidson_roots(
                 tol=tol,
                 itermax=itermax,
                 diag=projected_diag,
-                precond=precond,
+                precond=projected_precond,
                 guess=projected_guess,
                 max_space=max_space,
                 tol_residual=tol_residual,
                 lindep=lindep,
                 return_info=True,
+                return_partial=allow_unconverged,
             )
         except (RuntimeError, ValueError, IndexError):
             projected_dense = _materialize_local_matrix(projected_matvec, proj_dim)
@@ -1783,6 +2474,13 @@ def _solve_standard_davidson_roots(
             "restarts": int(info.get("restarts", 0)),
             "missing_diagonal_preconditioner": bool(missing_diag),
             "projected_dim": int(proj_dim),
+            "block_preconditioner": block_preconditioner is not None,
+            "block_preconditioner_blocks": (
+                int(block_preconditioner.materialized_block_count)
+                if block_preconditioner is not None
+                else 0
+            ),
+            "packed_matvec_backend": getattr(op.packed_matvec, "backend", None),
         }
     energies, vecs, info = davidson(
         op_resolved,
@@ -1790,12 +2488,13 @@ def _solve_standard_davidson_roots(
         tol=tol,
         itermax=itermax,
         diag=diag,
-        precond=precond,
+        precond=davidson_precond,
         guess=guess_vec,
         max_space=max_space,
         tol_residual=tol_residual,
         lindep=lindep,
         return_info=True,
+        return_partial=allow_unconverged,
     )
     roots = [np.asarray(vecs[:, i], dtype=complex).reshape(dim) for i in range(int(nroots))]
     residuals = info.get("residual_norms")
@@ -1812,6 +2511,13 @@ def _solve_standard_davidson_roots(
         "subspace_dim": int(info.get("subspace_dim", 0)),
         "restarts": int(info.get("restarts", 0)),
         "missing_diagonal_preconditioner": bool(missing_diag),
+        "block_preconditioner": block_preconditioner is not None,
+        "block_preconditioner_blocks": (
+            int(block_preconditioner.materialized_block_count)
+            if block_preconditioner is not None
+            else 0
+        ),
+        "packed_matvec_backend": getattr(op.packed_matvec, "backend", None),
     }
 
 
@@ -1823,12 +2529,81 @@ def _target_projector_basis(
     target_value,
     target_tol,
     min_dim,
-    max_dim=4096,
+    target_dim=None,
+    max_dim=65536,
+    dense_dim=256,
+    itermax=80,
+    max_space=None,
 ):
     op_resolved, _ = _resolve_davidson_operator(target_operator, template, layout)
     dim = sum(entry.size for entry in layout)
     if dim > int(max_dim):
         return None, None
+    if dim > int(dense_dim):
+        if target_dim is None:
+            return None, None
+        target = float(target_value)
+
+        def _apply_target(vec):
+            out = (
+                op_resolved(vec)
+                if callable(op_resolved)
+                else op_resolved @ np.asarray(vec, dtype=complex).reshape(dim)
+            )
+            return np.asarray(out, dtype=complex).reshape(dim) - target * np.asarray(vec, dtype=complex).reshape(dim)
+
+        def _shifted_square(vec):
+            return _apply_target(_apply_target(vec))
+
+        diag = None
+        if not callable(op_resolved):
+            diag = np.real(np.diag(np.asarray(op_resolved, dtype=complex)))
+        if diag is None:
+            diag = np.ones(dim, dtype=float)
+        else:
+            diag = (np.asarray(diag, dtype=float).reshape(dim) - target) ** 2
+            diag = np.where(diag > 1.0e-14, diag, 1.0e-14)
+        requested_dim = int(min_dim) if target_dim is None else max(int(min_dim), int(target_dim))
+        nroots = min(dim, max(requested_dim, 1))
+        try:
+            evals, vecs, info = davidson(
+                _shifted_square,
+                nroots,
+                tol=min(1.0e-10, max(float(target_tol) ** 2, 1.0e-14)),
+                itermax=int(itermax),
+                diag=diag,
+                max_space=max_space or min(dim, max(64, 16 * nroots)),
+                tol_residual=max(float(target_tol) ** 2, 1.0e-12),
+                return_info=True,
+            )
+        except RuntimeError:
+            return None, None
+        vectors = [
+            np.asarray(vecs[:, i], dtype=complex).reshape(dim)
+            for i in range(int(nroots))
+        ]
+        target_values = []
+        for vec in vectors:
+            out = (
+                op_resolved(vec)
+                if callable(op_resolved)
+                else op_resolved @ vec
+            )
+            denom = np.vdot(vec, vec)
+            if abs(denom) <= 1.0e-15:
+                target_values.append(np.inf)
+            else:
+                target_values.append(float(np.real(np.vdot(vec, out) / denom)))
+        distance = np.abs(np.asarray(target_values, dtype=float) - target)
+        keep = np.where(distance <= float(target_tol))[0]
+        if keep.size < int(min_dim):
+            return None, None
+        basis = _orthonormalize_columns_dense(
+            np.column_stack([vectors[int(idx)] for idx in keep])
+        )
+        if basis.shape[1] < int(min_dim):
+            return None, None
+        return basis, np.asarray([target_values[int(idx)] for idx in keep], dtype=float)
     matrix = (
         np.asarray(op_resolved, dtype=complex)
         if isinstance(op_resolved, np.ndarray)
@@ -1839,10 +2614,95 @@ def _target_projector_basis(
     distance = np.abs(np.real(evals) - float(target_value))
     keep = np.where(distance <= float(target_tol))[0]
     if keep.size < int(min_dim):
-        keep = np.argsort(distance)[: int(min_dim)]
-    if keep.size < int(min_dim):
         return None, None
     return evecs[:, keep], np.real(evals[keep]).astype(float)
+
+
+def _target_projector_basis_by_blocks(
+    target_operator,
+    template,
+    layout,
+    *,
+    target_value,
+    target_tol,
+    min_dim,
+    max_block_size=512,
+    max_columns=512,
+    offdiag_tol=1.0e-9,
+):
+    """
+    Build an exact target-sector basis from packed self-sector blocks.
+
+    :param target_operator: Local target operator, normally local ``S^2``.
+    :param template: Tensor template used by the packed operator.
+    :param layout: Packed local layout.
+    :param target_value: Desired target-operator eigenvalue.
+    :param target_tol: Eigenvalue tolerance used to keep target states.
+    :param min_dim: Minimum number of projected vectors required.
+    :param max_block_size: Largest packed sector block to diagonalize.
+    :param max_columns: Maximum total basis columns to probe.
+    :param offdiag_tol: Maximum allowed leakage outside each packed sector.
+    :returns: ``(basis, eigenvalues)`` or ``(None, None)``.
+
+    The routine is intentionally conservative: if the target operator couples
+    different packed sectors, it refuses to construct a block projector. This
+    keeps the local root selection exact in the current reduced basis instead
+    of reintroducing the old truncated global ``S^2`` approximation.
+    """
+
+    entries = _layout_entries(layout)
+    dim = _packed_layout_size(layout)
+    if dim <= 0 or max_block_size is None:
+        return None, None
+    max_block_size = int(max_block_size)
+    max_columns = int(max_columns)
+    if max_block_size <= 0 or max_columns <= 0:
+        return None, None
+    if sum(entry.size for entry in entries) > max_columns:
+        return None, None
+
+    op_resolved, _ = _resolve_davidson_operator(target_operator, template, layout)
+    target = float(target_value)
+    vectors = []
+    target_values = []
+    max_leakage = 0.0
+
+    for entry in entries:
+        if entry.size > max_block_size:
+            return None, None
+        block = np.zeros((entry.size, entry.size), dtype=complex)
+        for col in range(entry.size):
+            basis_vec = np.zeros(dim, dtype=complex)
+            basis_vec[entry.offset + col] = 1.0
+            out = (
+                op_resolved(basis_vec)
+                if callable(op_resolved)
+                else op_resolved @ basis_vec
+            )
+            out = np.asarray(out, dtype=complex).reshape(dim)
+            sl = slice(entry.offset, entry.offset + entry.size)
+            block[:, col] = out[sl]
+            outside_norm = np.linalg.norm(out) ** 2 - np.linalg.norm(out[sl]) ** 2
+            if outside_norm > 0.0:
+                max_leakage = max(max_leakage, float(np.sqrt(outside_norm)))
+        if max_leakage > float(offdiag_tol):
+            return None, None
+        block = 0.5 * (block + block.conj().T)
+        evals, evecs = np.linalg.eigh(block)
+        distance = np.abs(np.real(evals) - target)
+        keep = np.where(distance <= float(target_tol))[0]
+        for idx in keep:
+            vec = np.zeros(dim, dtype=complex)
+            vec[entry.offset:entry.offset + entry.size] = evecs[:, int(idx)]
+            vectors.append(vec)
+            target_values.append(float(np.real(evals[int(idx)])))
+
+    if len(vectors) < int(min_dim):
+        return None, None
+    basis = _orthonormalize_columns_dense(np.column_stack(vectors))
+    if basis.shape[1] < int(min_dim):
+        return None, None
+    return basis, np.asarray(target_values, dtype=float)
 
 
 def _operator_expectations(operator, template, layout, root_vecs, *, norm_operator=None):
@@ -1862,6 +2722,32 @@ def _operator_expectations(operator, template, layout, root_vecs, *, norm_operat
                 dtype=complex,
             ).reshape(-1)
             denom = np.vdot(vec, nvec)
+        if abs(denom) <= 1e-15:
+            values.append(np.inf)
+        else:
+            values.append(float(np.real(np.vdot(vec, out) / denom)))
+    return values
+
+
+def _operator_expectations_with_metric_matvec(operator, template, layout, root_vecs, metric_matvec):
+    """
+    Evaluate local operator expectations with an external metric action.
+
+    This is used by pre-orthonormalized local problems, where the norm is
+    already owned by the reduced problem rather than represented as a
+    :class:`LocalOperator`.
+    """
+
+    op_resolved, _ = _resolve_davidson_operator(operator, template, layout)
+    values = []
+    for vec in root_vecs:
+        vec = np.asarray(vec, dtype=complex).reshape(-1)
+        out = np.asarray(
+            op_resolved(vec) if callable(op_resolved) else op_resolved @ vec,
+            dtype=complex,
+        ).reshape(-1)
+        nvec = np.asarray(metric_matvec(vec), dtype=complex).reshape(-1)
+        denom = np.vdot(vec, nvec)
         if abs(denom) <= 1e-15:
             values.append(np.inf)
         else:
@@ -1904,7 +2790,7 @@ def _select_targeted_roots(
     )
 
 
-def _solve_orthonormalized_dense(H, N, *, tol):
+def _solve_orthonormalized_dense(H, N, *, tol, basis=None):
     """
     Solve a generalized local problem by orthonormalizing the metric first.
 
@@ -1914,19 +2800,2148 @@ def _solve_orthonormalized_dense(H, N, *, tol):
     """
     H = 0.5 * (np.asarray(H) + np.asarray(H).conj().T)
     N = 0.5 * (np.asarray(N) + np.asarray(N).conj().T)
-    s, U = np.linalg.eigh(N)
-    keep = s > max(float(tol), 1e-12)
-    if not np.any(keep):
-        raise ValueError("Canonical local metric is numerically singular.")
-    X = U[:, keep] @ np.diag(1.0 / np.sqrt(s[keep]))
-    H_ortho = X.conj().T @ H @ X
+    if basis is not None:
+        orthonormalization = basis.metric_orthonormalization(N, tol=tol)
+        H_ortho = orthonormalization.operator_to_orthonormal(H)
+    else:
+        s, U = np.linalg.eigh(N)
+        keep = s > max(float(tol), 1e-12)
+        if not np.any(keep):
+            raise ValueError("Canonical local metric is numerically singular.")
+        X = U[:, keep] @ np.diag(1.0 / np.sqrt(s[keep]))
+        orthonormalization = None
+        H_ortho = X.conj().T @ H @ X
     evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
-    coeff = X @ evecs[:, 0]
+    if orthonormalization is not None:
+        coeff = orthonormalization.from_orthonormal_vector(evecs[:, 0])
+    else:
+        coeff = X @ evecs[:, 0]
     norm = np.sqrt(np.real(np.vdot(coeff, N @ coeff)))
     if norm > 1e-15:
         coeff = coeff / norm
     resid = H @ coeff - evals[0] * (N @ coeff)
     return float(np.real(evals[0])), coeff, float(np.linalg.norm(resid))
+
+
+def _solve_orthonormalized_operator_davidson(
+    operator,
+    norm_operator,
+    template,
+    layout,
+    guess_vec,
+    *,
+    tol,
+    itermax=100,
+    max_space=None,
+    tol_residual=None,
+    lindep=1e-12,
+    allow_unconverged=False,
+):
+    """
+    Solve ``H x = E N x`` as a standard Davidson problem in ``N``-orthonormal
+    local coordinates.
+
+    The local metric is materialized once to build ``x = X y`` with
+    ``X.conj().T @ N @ X = I``.  The Hamiltonian remains matrix-free through
+    ``y -> X.conj().T @ H @ X @ y``.  This mirrors the block-DMRG convention
+    of solving the local problem in an orthonormal renormalized basis while
+    retaining PyQED's packed local operator implementation.
+
+    :param operator: Local Hamiltonian operator.
+    :param norm_operator: Local metric operator.
+    :param template: Two-site tensor template.
+    :param layout: Packed two-site basis layout.
+    :param guess_vec: Initial packed vector in the original local basis.
+    :param tol: Davidson convergence tolerance and metric cutoff.
+    :returns: ``(energy, packed_vector, residual, info)``.
+    """
+
+    guess_vec = np.asarray(guess_vec, dtype=complex).reshape(-1)
+    dim = int(guess_vec.size)
+    H_resolved, h_diag = _resolve_davidson_operator(operator, template, layout)
+    N_resolved, _ = _resolve_davidson_operator(norm_operator, template, layout)
+    N_matrix = (
+        np.asarray(N_resolved, dtype=complex)
+        if isinstance(N_resolved, np.ndarray)
+        else _materialize_local_matrix(N_resolved, dim)
+    )
+    basis = layout if isinstance(layout, TwoSiteBasis) else _two_site_basis_for_layout(template, layout)
+    if basis is not None:
+        orthonormalization = basis.metric_orthonormalization(N_matrix, tol=tol)
+        X = np.asarray(orthonormalization.transform, dtype=complex)
+
+        def to_orthonormal(vector):
+            return orthonormalization.to_orthonormal_vector(vector)
+
+        def from_orthonormal(vector):
+            return orthonormalization.from_orthonormal_vector(vector)
+    else:
+        N_matrix = 0.5 * (N_matrix + N_matrix.conj().T)
+        eigvals, eigvecs = np.linalg.eigh(N_matrix)
+        keep = eigvals > max(float(tol), 1.0e-12)
+        if not np.any(keep):
+            raise ValueError("Canonical local metric is numerically singular.")
+        X = eigvecs[:, keep] @ np.diag(1.0 / np.sqrt(eigvals[keep]))
+
+        def to_orthonormal(vector):
+            return X.conj().T @ (N_matrix @ np.asarray(vector, dtype=complex).reshape(dim))
+
+        def from_orthonormal(vector):
+            return X @ np.asarray(vector, dtype=complex).reshape(-1)
+
+    ortho_dim = int(X.shape[1])
+
+    def H_full(vector):
+        vector = np.asarray(vector, dtype=complex).reshape(dim)
+        return (
+            np.asarray(H_resolved @ vector, dtype=complex).reshape(dim)
+            if isinstance(H_resolved, np.ndarray)
+            else np.asarray(H_resolved(vector), dtype=complex).reshape(dim)
+        )
+
+    def H_orthonormal(y):
+        return X.conj().T @ H_full(from_orthonormal(y))
+
+    if h_diag is None:
+        ortho_diag = np.zeros(ortho_dim, dtype=float)
+        missing_diag = True
+    else:
+        h_diag = np.asarray(h_diag, dtype=float).reshape(dim)
+        ortho_diag = np.real((np.abs(X) ** 2).T @ h_diag)
+        missing_diag = False
+
+    guess_y = to_orthonormal(guess_vec)
+    if np.linalg.norm(guess_y) <= 1.0e-15:
+        guess_y = None
+
+    dense_fallback = False
+    try:
+        energies, vecs, info = davidson(
+            H_orthonormal,
+            1,
+            tol=tol,
+            itermax=itermax,
+            diag=ortho_diag,
+            guess=guess_y,
+            max_space=max_space,
+            tol_residual=tol_residual,
+            lindep=lindep,
+            return_info=True,
+            return_partial=allow_unconverged,
+        )
+    except (RuntimeError, ValueError, IndexError):
+        H_ortho = _materialize_local_matrix(H_orthonormal, ortho_dim)
+        evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+        energies = np.asarray([np.real(evals[0])], dtype=float)
+        vecs = np.asarray(evecs[:, :1], dtype=complex)
+        info = {
+            "iterations": 0,
+            "converged": True,
+            "subspace_dim": int(ortho_dim),
+            "restarts": 0,
+        }
+        dense_fallback = True
+
+    y = np.asarray(vecs[:, 0], dtype=complex).reshape(ortho_dim)
+    vec = _canonicalize_eigenvector(from_orthonormal(y), reference=guess_vec)
+    nvec = N_matrix @ vec
+    norm = np.sqrt(max(0.0, float(np.real(np.vdot(vec, nvec)))))
+    if norm > 1.0e-15:
+        vec = vec / norm
+        nvec = nvec / norm
+    energy = float(np.real(np.asarray(energies).reshape(-1)[0]))
+    residual = float(np.linalg.norm(H_full(vec) - energy * nvec))
+    return energy, vec, residual, {
+        "davidson_iterations": int(info.get("iterations", 0)),
+        "davidson_converged": bool(info.get("converged", False)),
+        "subspace_dim": int(info.get("subspace_dim", ortho_dim)),
+        "restarts": int(info.get("restarts", 0)),
+        "orthonormalized_dim": int(ortho_dim),
+        "missing_diagonal_preconditioner": bool(missing_diag),
+        "dense_fallback": bool(dense_fallback),
+    }
+
+
+def build_orthonormalized_local_problem(
+    operator,
+    norm_operator,
+    template,
+    layout,
+    *,
+    tol=1.0e-12,
+    max_dim=None,
+    block_sparse=True,
+    require_block_sparse_table=False,
+    max_block_kernel_elements=None,
+    name=None,
+    source="renormalized_environment",
+    cache_hit=False,
+    profile=False,
+    moving_environment_cache=None,
+):
+    """
+    Store a local effective operator in an orthonormal reduced basis.
+
+    This is the environment-level analogue of block2's local renormalized
+    operator storage: the local metric is materialized once, the parent packed
+    basis is orthonormalized, and the returned object owns the transformed
+    standard Hamiltonian action.  The Hamiltonian itself remains matrix-free in
+    the parent basis and is only wrapped by ``X^H H X``.
+
+    :param operator: Local Hamiltonian operator in the parent packed basis.
+    :param norm_operator: Local identity/norm operator in the same basis.
+    :param template: Rank-4 two-site tensor defining the parent basis.
+    :param layout: Parent packed two-site layout.
+    :param tol: Metric eigenvalue cutoff.
+    :param max_dim: Optional maximum parent dimension to transform.
+    :param block_sparse: If True, first try to build a per-sector transformed
+        operator table without global dense transforms.
+    :param require_block_sparse_table: If True, raise when the per-sector table
+        cannot be built instead of falling back to a global transformed
+        operator.
+    :param max_block_kernel_elements: Optional cap for materializing one
+        sector-to-sector Hamiltonian block while building the table.
+    :param name: Optional diagnostic label.
+    :param source: Description of the renormalized-operator owner.
+    :param cache_hit: Whether this object was returned from an environment
+        operator-table cache.
+    :param profile: Attach local operator-table construction timing metadata.
+    :param moving_environment_cache: Optional sweep-persistent cache for
+        structural moving-environment contraction plans.
+    :returns: :class:`OrthonormalizedLocalProblem`, or ``None`` if ``max_dim``
+        excludes the current local dimension.
+    """
+
+    op = _normalize_local_operator(operator)
+    norm_op = _normalize_local_operator(norm_operator)
+    metadata = getattr(op, "metadata", None)
+    basis = (
+        _operator_basis_for_layout(op, layout)
+        or _operator_basis_for_layout(norm_op, layout)
+        or _two_site_basis_for_layout(template, layout)
+    )
+    if basis is None:
+        _, raw_layout = pack_two_site_state(template, layout=layout)
+        basis = two_site_state_basis(template, layout=raw_layout)
+    dim = int(basis.size)
+    build_timing = {} if profile else None
+
+    if block_sparse:
+        t0 = time.perf_counter() if profile else None
+        sparse_timing = {} if profile else None
+        block_sparse_problem = _build_block_sparse_orthonormalized_local_problem(
+            op,
+            norm_op,
+            template,
+            basis,
+            tol=tol,
+            max_block_kernel_elements=max_block_kernel_elements,
+            name=name,
+            source=f"{source}:block_sparse_operator_table",
+            cache_hit=cache_hit,
+            metadata=metadata,
+            timing=sparse_timing,
+            moving_environment_cache=moving_environment_cache,
+        )
+        if profile:
+            build_timing["block_sparse_table"] = time.perf_counter() - t0
+            for key, value in (sparse_timing or {}).items():
+                build_timing[key] = float(value)
+        if block_sparse_problem is not None:
+            if profile:
+                metadata = dict(block_sparse_problem.metadata or {})
+                metadata["renormalized_operator_build_timing"] = {
+                    key: float(value)
+                    for key, value in build_timing.items()
+                }
+                block_sparse_problem = replace(block_sparse_problem, metadata=metadata)
+            return block_sparse_problem
+        if require_block_sparse_table:
+            raise NotImplementedError(
+                "A block-sparse orthonormalized renormalized-operator table "
+                "could not be built for this local effective problem."
+            )
+
+    if max_dim is not None and dim > int(max_dim):
+        return None
+
+    t0 = time.perf_counter() if profile else None
+    H_resolved, h_diag = _resolve_davidson_operator(op, template, basis)
+    N_resolved, _ = _resolve_davidson_operator(norm_op, template, basis)
+    N_matrix = (
+        np.asarray(N_resolved, dtype=complex)
+        if isinstance(N_resolved, np.ndarray)
+        else _materialize_local_matrix(N_resolved, dim)
+    )
+    if profile:
+        build_timing["dense_metric"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+    orthonormalization = basis.metric_orthonormalization(N_matrix, tol=tol)
+    X = np.asarray(orthonormalization.transform, dtype=complex)
+    ortho_dim = int(X.shape[1])
+    if profile:
+        build_timing["dense_orthonormalize"] = time.perf_counter() - t0
+
+    def H_full(vector):
+        vector = np.asarray(vector, dtype=complex).reshape(dim)
+        return (
+            np.asarray(H_resolved @ vector, dtype=complex).reshape(dim)
+            if isinstance(H_resolved, np.ndarray)
+            else np.asarray(H_resolved(vector), dtype=complex).reshape(dim)
+        )
+
+    def H_orthonormal(y):
+        y = np.asarray(y, dtype=complex).reshape(ortho_dim)
+        return X.conj().T @ H_full(X @ y)
+
+    if h_diag is None:
+        diag = np.zeros(ortho_dim, dtype=float)
+    else:
+        h_diag = np.asarray(h_diag, dtype=float).reshape(dim)
+        diag = np.real((np.abs(X) ** 2).T @ h_diag)
+
+    if profile:
+        metadata = dict(metadata or {})
+        metadata["renormalized_operator_build_timing"] = {
+            key: float(value)
+            for key, value in build_timing.items()
+        }
+    return OrthonormalizedLocalProblem(
+        basis=basis,
+        transform=X,
+        metric=np.asarray(N_matrix, dtype=complex),
+        matvec=H_orthonormal,
+        full_matvec=H_full,
+        diag=diag,
+        name=name,
+        source=source,
+        cache_hit=cache_hit,
+        metadata=metadata,
+    )
+
+
+def _entry_self_metric_block_from_matvec(norm_op, entry, total_size, *, tol):
+    """
+    Materialize one exact metric self-block and reject cross-entry coupling.
+
+    The block-sparse orthonormalized local problem is only valid when the local
+    metric is block diagonal in the packed basis entries.  Provider-side
+    diagonal blocks can be incomplete for larger renormalized environments, so
+    this helper probes the actual packed metric action.
+    """
+
+    metric_action = getattr(norm_op, "packed_matvec", None) or getattr(norm_op, "aux_packed_matvec", None)
+    if metric_action is None:
+        return None
+    size = int(entry.size)
+    total_size = int(total_size)
+    block = np.zeros((size, size), dtype=complex)
+    off_norm_sq = 0.0
+    full_norm_sq = 0.0
+    for col in range(size):
+        basis_vec = np.zeros(total_size, dtype=complex)
+        basis_vec[int(entry.offset) + col] = 1.0
+        out = np.asarray(metric_action(basis_vec), dtype=complex).reshape(total_size)
+        block[:, col] = out[entry.slice]
+        off = np.array(out, copy=True)
+        off[entry.slice] = 0.0
+        off_norm_sq += float(np.linalg.norm(off) ** 2)
+        full_norm_sq += float(np.linalg.norm(out) ** 2)
+    off_norm = np.sqrt(off_norm_sq)
+    full_norm = np.sqrt(full_norm_sq)
+    if off_norm > max(float(tol), 1.0e-10) * max(1.0, full_norm):
+        return False
+    return 0.5 * (block + block.conj().T)
+
+
+def _entry_self_metric_block(norm_op, entry):
+    if norm_op is None:
+        return np.eye(entry.size, dtype=complex)
+    provider = getattr(norm_op, "packed_block_matrices", None)
+    if provider is None and getattr(norm_op, "packed_matvec", None) is not None:
+        provider = getattr(norm_op.packed_matvec, "block_matrices", None)
+    if provider is None and getattr(norm_op, "aux_packed_matvec", None) is not None:
+        provider = getattr(norm_op.aux_packed_matvec, "block_matrices", None)
+    if provider is None:
+        return None
+    if hasattr(provider, "block_matrix_for"):
+        block = provider.block_matrix_for(entry)
+    else:
+        try:
+            block = provider[int(entry.offset)]
+        except Exception:
+            index = None
+            basis = getattr(provider, "basis", None)
+            if basis is not None and hasattr(basis, "entry_index"):
+                index = basis.entry_index(entry.key)
+            block = None if index is None else provider[index]
+    if block is None:
+        return np.eye(entry.size, dtype=complex)
+    block = np.asarray(block, dtype=complex)
+    if block.shape != (entry.size, entry.size):
+        raise ValueError("Metric self-block shape does not match the local basis entry.")
+    return 0.5 * (block + block.conj().T)
+
+
+def _metric_block_transform(metric_block, *, tol):
+    eigvals, eigvecs = np.linalg.eigh(0.5 * (metric_block + metric_block.conj().T))
+    keep = eigvals > max(float(tol), 1.0e-14)
+    if not np.any(keep):
+        return None
+    return eigvecs[:, keep] @ np.diag(1.0 / np.sqrt(eigvals[keep]))
+
+
+def _metric_connected_components(norm_op, basis, *, tol):
+    """
+    Return connected components of the exact local metric in packed entries.
+
+    :param norm_op: Local norm operator with a packed matvec.
+    :param basis: Parent packed two-site basis.
+    :param tol: Numerical threshold for detecting entry coupling.
+    :returns: Tuple of entry-index tuples, or ``None`` when no exact metric
+        action is available.
+    """
+
+    metric_action = getattr(norm_op, "packed_matvec", None) or getattr(norm_op, "aux_packed_matvec", None)
+    if metric_action is None:
+        return None
+    threshold = max(float(tol), 1.0e-10)
+    adjacency = [set() for _entry in basis]
+    for in_idx, entry in enumerate(basis):
+        adjacency[in_idx].add(in_idx)
+        for col in range(int(entry.size)):
+            vec = np.zeros(int(basis.size), dtype=complex)
+            vec[int(entry.offset) + col] = 1.0
+            out = np.asarray(metric_action(vec), dtype=complex).reshape(int(basis.size))
+            out_norm = max(1.0, float(np.linalg.norm(out)))
+            for out_idx, out_entry in enumerate(basis):
+                if np.linalg.norm(out[out_entry.slice]) > threshold * out_norm:
+                    adjacency[in_idx].add(out_idx)
+                    adjacency[out_idx].add(in_idx)
+
+    seen = set()
+    components = []
+    for idx in range(len(adjacency)):
+        if idx in seen:
+            continue
+        stack = [idx]
+        seen.add(idx)
+        component = []
+        while stack:
+            item = stack.pop()
+            component.append(item)
+            for neighbor in adjacency[item]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        components.append(tuple(sorted(component)))
+    return tuple(components)
+
+
+def _component_parent_indices(basis, component):
+    pieces = [
+        np.arange(
+            int(basis.entries[idx].offset),
+            int(basis.entries[idx].offset) + int(basis.entries[idx].size),
+            dtype=int,
+        )
+        for idx in component
+    ]
+    return np.concatenate(pieces) if pieces else np.zeros(0, dtype=int)
+
+
+def _component_metric_block(norm_op, basis, parent_indices, *, tol):
+    metric_action = getattr(norm_op, "packed_matvec", None) or getattr(norm_op, "aux_packed_matvec", None)
+    if metric_action is None:
+        return None
+    parent_indices = np.asarray(parent_indices, dtype=int)
+    block = np.zeros((parent_indices.size, parent_indices.size), dtype=complex)
+    mask = np.ones(int(basis.size), dtype=bool)
+    mask[parent_indices] = False
+    off_norm_sq = 0.0
+    full_norm_sq = 0.0
+    for col, parent_col in enumerate(parent_indices):
+        vec = np.zeros(int(basis.size), dtype=complex)
+        vec[int(parent_col)] = 1.0
+        out = np.asarray(metric_action(vec), dtype=complex).reshape(int(basis.size))
+        block[:, col] = out[parent_indices]
+        off_norm_sq += float(np.linalg.norm(out[mask]) ** 2)
+        full_norm_sq += float(np.linalg.norm(out) ** 2)
+    off_norm = np.sqrt(off_norm_sq)
+    full_norm = np.sqrt(full_norm_sq)
+    if off_norm > max(float(tol), 1.0e-10) * max(1.0, full_norm):
+        return None
+    return 0.5 * (block + block.conj().T)
+
+
+def _component_operator_terms_from_matvec(
+    H_packed,
+    basis,
+    component_indices,
+    component_transforms,
+    *,
+    max_block_kernel_elements,
+):
+    terms_by_input = [[] for _component in component_indices]
+    parent_dim = int(basis.size)
+    for in_idx, in_parent in enumerate(component_indices):
+        in_size = int(in_parent.size)
+        outputs = [
+            np.zeros((int(out_parent.size), in_size), dtype=complex)
+            for out_parent in component_indices
+        ]
+        for col, parent_col in enumerate(in_parent):
+            vec = np.zeros(parent_dim, dtype=complex)
+            vec[int(parent_col)] = 1.0
+            out = np.asarray(H_packed(vec), dtype=complex).reshape(parent_dim)
+            for out_idx, out_parent in enumerate(component_indices):
+                outputs[out_idx][:, col] = out[out_parent]
+        X_in = component_transforms[in_idx]
+        for out_idx, parent_kernel in enumerate(outputs):
+            elements = int(parent_kernel.shape[0]) * int(parent_kernel.shape[1])
+            if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                return None
+            X_out = component_transforms[out_idx]
+            transformed = X_out.conj().T @ parent_kernel @ X_in
+            if np.linalg.norm(transformed.reshape(-1)) > 1.0e-15:
+                terms_by_input[in_idx].append((out_idx, transformed))
+    return tuple(tuple(terms) for terms in terms_by_input)
+
+
+def _entry_kernel_items_from_compiled_packed(
+    packed_operator,
+    basis,
+    *,
+    max_block_kernel_elements=None,
+):
+    compiled_transitions = getattr(packed_operator, "compiled_transitions", None)
+    if compiled_transitions is not None:
+        if getattr(compiled_transitions, "basis", None) is not basis and not basis.compatible_with_layout(
+            getattr(compiled_transitions, "basis", basis).entries
+        ):
+            return None
+        entry_kernel_items = []
+        for in_idx, item in enumerate(getattr(compiled_transitions, "items", ())):
+            if item is None:
+                continue
+            cursor = 0
+            for segment in item.output_segments:
+                pieces = _split_compiled_segment_kernel(item, segment, cursor, basis)
+                if pieces is None:
+                    return None
+                for out_idx, kernel in pieces:
+                    entry_kernel_items.append((in_idx, out_idx, np.asarray(kernel, dtype=complex)))
+                cursor += int(segment.size)
+        return tuple(entry_kernel_items)
+
+    compiled_factorized_terms = getattr(packed_operator, "compiled_factorized_terms", None)
+    if compiled_factorized_terms is not None:
+        entry_kernel_items = []
+        for in_idx, terms in enumerate(getattr(compiled_factorized_terms, "items", ())):
+            for term in terms:
+                out_idx = basis.entry_index(term.output_entry.key)
+                elements = int(term.output_entry.size) * int(term.input_entry.size)
+                if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                    return None
+                kernel = term.kernel_matrix(
+                    term.input_entry.shape,
+                    max_elements=max(elements, 1),
+                )
+                if kernel is None:
+                    return None
+                entry_kernel_items.append((in_idx, out_idx, np.asarray(kernel, dtype=complex)))
+        return tuple(entry_kernel_items)
+
+    return None
+
+
+def _entry_kernel_items_from_local_operator_table(
+    table,
+    basis,
+    *,
+    max_block_kernel_elements=None,
+):
+    """
+    Extract entry kernels from a typed renormalized local operator table.
+
+    :param table: ``RenormalizedLocalOperatorTable`` provider.
+    :param basis: Parent packed two-site basis.
+    :param max_block_kernel_elements: Optional cap on materialized kernels.
+    :returns: Entry-kernel tuples or ``None``.
+    """
+
+    if table is None:
+        return None
+    cache_key = _entry_kernel_items_cache_key(
+        basis,
+        max_block_kernel_elements=max_block_kernel_elements,
+    )
+    cached = table.get_entry_kernel_items(cache_key)
+    if cached is not None:
+        return cached
+    entry_kernel_items = _entry_kernel_items_from_compiled_packed(
+        table,
+        basis,
+        max_block_kernel_elements=max_block_kernel_elements,
+    )
+    if entry_kernel_items is None:
+        return None
+    return table.put_entry_kernel_items(cache_key, entry_kernel_items)
+
+
+def _metric_connected_components_from_entry_kernels(basis, entry_kernel_items, *, tol):
+    threshold = max(float(tol), 1.0e-10)
+    adjacency = [set([idx]) for idx, _entry in enumerate(basis)]
+    for in_idx, out_idx, kernel in entry_kernel_items:
+        if np.linalg.norm(np.asarray(kernel).reshape(-1)) > threshold:
+            adjacency[int(in_idx)].add(int(out_idx))
+            adjacency[int(out_idx)].add(int(in_idx))
+
+    seen = set()
+    components = []
+    for idx in range(len(adjacency)):
+        if idx in seen:
+            continue
+        stack = [idx]
+        seen.add(idx)
+        component = []
+        while stack:
+            item = stack.pop()
+            component.append(item)
+            for neighbor in adjacency[item]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        components.append(tuple(sorted(component)))
+    return tuple(components)
+
+
+def _component_metric_block_from_entry_kernels(basis, component, entry_kernel_items):
+    entry_slices, component_dims = _component_entry_slices(basis, (component,))
+    dim = int(component_dims[0])
+    block = np.zeros((dim, dim), dtype=complex)
+    component_set = set(component)
+    for in_idx, out_idx, kernel in entry_kernel_items:
+        if int(in_idx) not in component_set and int(out_idx) not in component_set:
+            continue
+        if int(in_idx) not in component_set or int(out_idx) not in component_set:
+            if np.linalg.norm(np.asarray(kernel).reshape(-1)) > 1.0e-10:
+                return None
+            continue
+        _in_comp, in_slice = entry_slices[int(in_idx)]
+        _out_comp, out_slice = entry_slices[int(out_idx)]
+        block[out_slice, in_slice] += np.asarray(kernel, dtype=complex)
+    return 0.5 * (block + block.conj().T)
+
+
+def _component_entry_slices(basis, components):
+    entry_slices = {}
+    component_dims = []
+    for comp_idx, component in enumerate(components):
+        cursor = 0
+        for entry_idx in component:
+            entry = basis.entries[entry_idx]
+            entry_slices[int(entry_idx)] = (int(comp_idx), slice(cursor, cursor + int(entry.size)))
+            cursor += int(entry.size)
+        component_dims.append(int(cursor))
+    return entry_slices, tuple(component_dims)
+
+
+def _component_entry_slices_cached(
+    basis,
+    components,
+    *,
+    moving_environment_cache=None,
+    timing=None,
+):
+    """
+    Return component entry slices, optionally via the moving-environment cache.
+
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param moving_environment_cache: Optional structural cache shared by the
+        renormalized block stack.
+    :param timing: Optional timing/counter dictionary.
+    :returns: ``(entry_slices, component_dims)``.
+    """
+
+    if moving_environment_cache is None:
+        return _component_entry_slices(basis, components)
+    cache_key = (
+        "component_entry_slices",
+        _basis_structure_signature(basis),
+        tuple(tuple(int(idx) for idx in component) for component in components),
+    )
+    cached = moving_environment_cache.get(cache_key)
+    if cached is not None:
+        if timing is not None:
+            timing["component_entry_slices_cache_hit"] = timing.get(
+                "component_entry_slices_cache_hit", 0.0
+            ) + 1.0
+        return cached
+    if timing is not None:
+        timing["component_entry_slices_cache_miss"] = timing.get(
+            "component_entry_slices_cache_miss", 0.0
+        ) + 1.0
+    entry_slices, component_dims = _component_entry_slices(basis, components)
+    return moving_environment_cache.put(cache_key, (entry_slices, component_dims))
+
+
+def _basis_structure_signature(basis):
+    """
+    Return a hashable structural signature for a two-site basis.
+
+    :param basis: :class:`TwoSiteBasis`-like object.
+    :returns: Tuple of entry keys, shapes, offsets, and sizes.
+    """
+
+    return tuple(
+        (entry.key, tuple(entry.shape), int(entry.offset), int(entry.size))
+        for entry in basis
+    )
+
+
+def _entry_kernel_items_cache_key(basis, *, max_block_kernel_elements):
+    """
+    Return a cache key for dense entry-kernel extraction.
+
+    :param basis: Parent packed two-site basis.
+    :param max_block_kernel_elements: Optional dense-kernel cap.
+    :returns: Hashable cache key.
+    """
+
+    return (
+        "entry_kernel_items",
+        _basis_structure_signature(basis),
+        None if max_block_kernel_elements is None else int(max_block_kernel_elements),
+    )
+
+
+def _component_basis_cache_key(norm_op, basis, metric_entry_kernels, *, tol):
+    """
+    Return a safe cache key for component orthonormal bases.
+
+    :param norm_op: Local norm operator.
+    :param basis: Parent two-site basis.
+    :param metric_entry_kernels: Optional compiled metric entry kernels.
+    :param tol: Metric cutoff.
+    :returns: Hashable key or ``None`` when the norm source is not cacheable.
+    """
+
+    norm_table = getattr(norm_op, "local_operator_table", None)
+    if norm_table is not None and getattr(norm_table, "key", None) is not None:
+        source_key = ("table", norm_table.key)
+    elif metric_entry_kernels is not None:
+        source_key = ("compiled", id(getattr(norm_op, "packed_matvec", None)))
+    else:
+        return None
+    return (
+        "component_basis",
+        source_key,
+        _basis_structure_signature(basis),
+        float(tol),
+    )
+
+
+def _component_basis_cache_get(key):
+    if key is None:
+        return None
+    return _COMPONENT_BASIS_CACHE.get(key)
+
+
+def _component_basis_cache_put(key, value):
+    if key is None:
+        return value
+    if len(_COMPONENT_BASIS_CACHE) >= _COMPONENT_BASIS_CACHE_MAX_SIZE:
+        _COMPONENT_BASIS_CACHE.pop(next(iter(_COMPONENT_BASIS_CACHE)))
+    _COMPONENT_BASIS_CACHE[key] = value
+    return value
+
+
+def _array_signature(array):
+    """
+    Return a compact content signature for a numeric array.
+
+    :param array: Array-like object.
+    :returns: Tuple containing dtype, shape, and a BLAKE2 digest.
+    """
+
+    arr = np.ascontiguousarray(np.asarray(array))
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(arr.dtype).encode("utf8"))
+    digest.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+    digest.update(arr.view(np.uint8))
+    return (str(arr.dtype), tuple(int(dim) for dim in arr.shape), digest.hexdigest())
+
+
+def _component_transform_signature(component_transforms):
+    """
+    Return a hashable signature for component orthonormal transforms.
+
+    :param component_transforms: Sequence of component transform matrices.
+    :returns: Tuple of compact array signatures.
+    """
+
+    return tuple(_array_signature(transform) for transform in component_transforms)
+
+
+def _component_transformed_table_cache_key(
+    basis,
+    components,
+    component_transforms,
+    *,
+    max_block_kernel_elements,
+    metric_basis_cache_key,
+):
+    """
+    Return the cache key for a transformed component operator table.
+
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param component_transforms: Component orthonormal transforms.
+    :param max_block_kernel_elements: Optional dense-kernel cap.
+    :param metric_basis_cache_key: Key identifying the local metric source.
+    :returns: Hashable transformed-table cache key.
+    """
+
+    return (
+        "component_transformed_operator_table",
+        _basis_structure_signature(basis),
+        tuple(tuple(int(idx) for idx in component) for component in components),
+        _component_transform_signature(component_transforms),
+        None if max_block_kernel_elements is None else int(max_block_kernel_elements),
+        metric_basis_cache_key,
+    )
+
+
+def _component_terms_from_entry_kernels(
+    basis,
+    components,
+    component_transforms,
+    entry_kernel_items,
+    *,
+    max_block_kernel_elements,
+    moving_environment_cache=None,
+    timing=None,
+):
+    plan = None
+    n_items = len(entry_kernel_items)
+    use_cache = moving_environment_cache is not None and 8 < n_items <= 2048
+    if not use_cache:
+        parent_blocks = _component_parent_blocks_from_entry_kernels(
+            basis,
+            components,
+            entry_kernel_items,
+            max_block_kernel_elements=max_block_kernel_elements,
+            moving_environment_cache=moving_environment_cache,
+            timing=timing,
+        )
+        if parent_blocks is None:
+            return None
+        return _component_terms_from_parent_blocks(
+            parent_blocks,
+            components,
+            component_transforms,
+        )
+    if use_cache:
+        cache_key = _component_kernel_plan_cache_key(
+            basis,
+            components,
+            entry_kernel_items,
+            max_block_kernel_elements=max_block_kernel_elements,
+        )
+        plan = moving_environment_cache.get(cache_key)
+        if timing is not None:
+            timing_key = (
+                "component_kernel_plan_cache_hit"
+                if plan is not None
+                else "component_kernel_plan_cache_miss"
+            )
+            timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+    else:
+        cache_key = None
+    if plan is None:
+        t0 = time.perf_counter() if timing is not None else None
+        plan = _build_component_kernel_plan(
+            basis,
+            components,
+            entry_kernel_items,
+            max_block_kernel_elements=max_block_kernel_elements,
+            moving_environment_cache=moving_environment_cache,
+            timing=timing,
+        )
+        if timing is not None:
+            timing["component_kernel_plan_build"] = timing.get(
+                "component_kernel_plan_build", 0.0
+            ) + (time.perf_counter() - t0)
+        if plan is None:
+            return None
+        if use_cache:
+            moving_environment_cache.put(cache_key, plan)
+
+    parent_blocks = {
+        key: np.zeros(shape, dtype=complex)
+        for key, shape in plan["parent_shapes"]
+    }
+    for item_idx, key, in_slice, out_slice in plan["placements"]:
+        parent_blocks[key][out_slice, in_slice] += np.asarray(
+            entry_kernel_items[item_idx][2],
+            dtype=complex,
+        )
+    return _component_terms_from_parent_blocks(
+        parent_blocks,
+        components,
+        component_transforms,
+    )
+
+
+def _component_parent_blocks_from_entry_kernels(
+    basis,
+    components,
+    entry_kernel_items,
+    *,
+    max_block_kernel_elements,
+    moving_environment_cache=None,
+    timing=None,
+):
+    """
+    Assemble component parent-basis kernels directly from entry kernels.
+
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param entry_kernel_items: ``(input_entry, output_entry, kernel)`` tuples.
+    :param max_block_kernel_elements: Optional dense parent-block cap.
+    :returns: Mapping ``(input_component, output_component)`` to kernels, or
+        ``None`` when a parent block exceeds the cap.
+    """
+
+    entry_slices, component_dims = _component_entry_slices_cached(
+        basis,
+        components,
+        moving_environment_cache=moving_environment_cache,
+        timing=timing,
+    )
+    parent_blocks = {}
+    for in_entry_idx, out_entry_idx, kernel in entry_kernel_items:
+        in_comp, in_slice = entry_slices[int(in_entry_idx)]
+        out_comp, out_slice = entry_slices[int(out_entry_idx)]
+        key = (int(in_comp), int(out_comp))
+        if key not in parent_blocks:
+            elements = int(component_dims[out_comp]) * int(component_dims[in_comp])
+            if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                return None
+            parent_blocks[key] = np.zeros(
+                (int(component_dims[out_comp]), int(component_dims[in_comp])),
+                dtype=complex,
+            )
+        parent_blocks[key][out_slice, in_slice] += np.asarray(kernel, dtype=complex)
+    return parent_blocks
+
+
+def _component_terms_from_parent_blocks(
+    parent_blocks,
+    components,
+    component_transforms,
+):
+    """
+    Transform component parent blocks into orthonormal block terms.
+
+    :param parent_blocks: Mapping ``(input_component, output_component)`` to
+        parent-basis kernels.
+    :param components: Metric-connected entry components.
+    :param component_transforms: Parent-to-orthonormal transforms per component.
+    :returns: Tuple of block terms grouped by input component.
+    """
+
+    terms_by_input = [[] for _component in components]
+    for (in_comp, out_comp), parent_kernel in parent_blocks.items():
+        X_in = component_transforms[in_comp]
+        X_out = component_transforms[out_comp]
+        transformed = X_out.conj().T @ parent_kernel @ X_in
+        if np.linalg.norm(transformed.reshape(-1)) > 1.0e-15:
+            terms_by_input[in_comp].append((out_comp, transformed))
+    return tuple(tuple(terms) for terms in terms_by_input)
+
+
+def _component_kernel_plan_cache_key(
+    basis,
+    components,
+    entry_kernel_items,
+    *,
+    max_block_kernel_elements,
+):
+    """
+    Return a structural key for component parent-block assembly.
+
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param entry_kernel_items: ``(input_entry, output_entry, kernel)`` tuples.
+    :param max_block_kernel_elements: Optional dense parent-block cap.
+    :returns: Hashable moving-environment cache key.
+    """
+
+    return (
+        "component_kernel_plan",
+        _basis_structure_signature(basis),
+        tuple(tuple(int(idx) for idx in component) for component in components),
+        tuple(
+            (
+                int(in_idx),
+                int(out_idx),
+                tuple(np.asarray(kernel).shape),
+            )
+            for in_idx, out_idx, kernel in entry_kernel_items
+        ),
+        None if max_block_kernel_elements is None else int(max_block_kernel_elements),
+    )
+
+
+def _build_component_kernel_plan(
+    basis,
+    components,
+    entry_kernel_items,
+    *,
+    max_block_kernel_elements,
+    moving_environment_cache=None,
+    timing=None,
+):
+    """
+    Build a reusable parent-block assembly plan for component kernels.
+
+    The plan contains only slices and block shapes.  Numeric kernels remain
+    MPS/operator dependent and are applied after lookup.
+
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param entry_kernel_items: ``(input_entry, output_entry, kernel)`` tuples.
+    :param max_block_kernel_elements: Optional dense parent-block cap.
+    :returns: Plan dictionary or ``None`` when a block exceeds the cap.
+    """
+
+    entry_slices, component_dims = _component_entry_slices_cached(
+        basis,
+        components,
+        moving_environment_cache=moving_environment_cache,
+        timing=timing,
+    )
+    parent_shapes = {}
+    placements = []
+    for item_idx, (in_entry_idx, out_entry_idx, _kernel) in enumerate(entry_kernel_items):
+        in_comp, in_slice = entry_slices[int(in_entry_idx)]
+        out_comp, out_slice = entry_slices[int(out_entry_idx)]
+        key = (int(in_comp), int(out_comp))
+        if key not in parent_shapes:
+            elements = int(component_dims[out_comp]) * int(component_dims[in_comp])
+            if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                return None
+            parent_shapes[key] = (
+                int(component_dims[out_comp]),
+                int(component_dims[in_comp]),
+            )
+        placements.append((int(item_idx), key, in_slice, out_slice))
+    return {
+        "parent_shapes": tuple(sorted(parent_shapes.items())),
+        "placements": tuple(placements),
+    }
+
+
+def _component_terms_from_compiled_transitions(
+    compiled_transitions,
+    basis,
+    components,
+    component_transforms,
+    *,
+    max_block_kernel_elements,
+    moving_environment_cache=None,
+    timing=None,
+):
+    entry_kernel_items = _entry_kernel_items_from_compiled_packed(
+        compiled_transitions.packed_matvec(base_dtype=complex)
+        if hasattr(compiled_transitions, "packed_matvec")
+        else compiled_transitions,
+        basis,
+        max_block_kernel_elements=max_block_kernel_elements,
+    )
+    if entry_kernel_items is None:
+        if getattr(compiled_transitions, "basis", None) is not basis and not basis.compatible_with_layout(
+            getattr(compiled_transitions, "basis", basis).entries
+        ):
+            return None
+        entry_kernel_items = []
+        for in_idx, item in enumerate(getattr(compiled_transitions, "items", ())):
+            if item is None:
+                continue
+            cursor = 0
+            for segment in item.output_segments:
+                pieces = _split_compiled_segment_kernel(item, segment, cursor, basis)
+                if pieces is None:
+                    return None
+                for out_idx, kernel in pieces:
+                    entry_kernel_items.append((in_idx, out_idx, kernel))
+                cursor += int(segment.size)
+    return _component_terms_from_entry_kernels(
+        basis,
+        components,
+        component_transforms,
+        entry_kernel_items,
+        max_block_kernel_elements=max_block_kernel_elements,
+        moving_environment_cache=moving_environment_cache,
+        timing=timing,
+    )
+
+
+def _component_terms_from_compiled_factorized(
+    compiled_factorized_terms,
+    basis,
+    components,
+    component_transforms,
+    *,
+    max_block_kernel_elements,
+    moving_environment_cache=None,
+    timing=None,
+):
+    owner_table = getattr(compiled_factorized_terms, "local_operator_table", None)
+    if bool(getattr(compiled_factorized_terms, "prefer_direct_component_transform", False)):
+        t0 = time.perf_counter() if timing is not None else None
+        direct_terms = _component_terms_from_compiled_factorized_direct(
+            compiled_factorized_terms,
+            basis,
+            components,
+            component_transforms,
+            moving_environment_cache=moving_environment_cache,
+            timing=timing,
+        )
+        if direct_terms is not None:
+            if timing is not None:
+                timing["component_factorized_direct_transform"] = timing.get(
+                    "component_factorized_direct_transform", 0.0
+                ) + (time.perf_counter() - t0)
+            return direct_terms
+        if timing is not None:
+            timing["component_factorized_direct_transform_fallback"] = timing.get(
+                "component_factorized_direct_transform_fallback", 0.0
+            ) + 1.0
+    cache_key = (
+        _entry_kernel_items_cache_key(
+            basis,
+            max_block_kernel_elements=max_block_kernel_elements,
+        )
+        if owner_table is not None
+        else None
+    )
+    entry_kernel_items = (
+        owner_table.get_entry_kernel_items(cache_key)
+        if owner_table is not None
+        else None
+    )
+    cache_hit = entry_kernel_items is not None
+    t0 = time.perf_counter() if timing is not None else None
+    if entry_kernel_items is None:
+        entry_kernel_items = []
+        for in_idx, terms in enumerate(getattr(compiled_factorized_terms, "items", ())):
+            for term in terms:
+                out_idx = basis.entry_index(term.output_entry.key)
+                elements = int(term.output_entry.size) * int(term.input_entry.size)
+                if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                    return None
+                kernel = term.kernel_matrix(
+                    term.input_entry.shape,
+                    max_elements=max(elements, 1),
+                )
+                if kernel is None:
+                    return None
+                entry_kernel_items.append((in_idx, out_idx, kernel))
+        entry_kernel_items = tuple(entry_kernel_items)
+        if owner_table is not None:
+            owner_table.put_entry_kernel_items(cache_key, entry_kernel_items)
+    if timing is not None:
+        timing["component_factorized_kernel_materialize"] = timing.get(
+            "component_factorized_kernel_materialize", 0.0
+        ) + (time.perf_counter() - t0)
+        timing_key = (
+            "component_factorized_kernel_cache_hit"
+            if cache_hit
+            else "component_factorized_kernel_cache_miss"
+        )
+        timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+        t0 = time.perf_counter()
+    out = _component_terms_from_entry_kernels(
+        basis,
+        components,
+        component_transforms,
+        entry_kernel_items,
+        max_block_kernel_elements=max_block_kernel_elements,
+        moving_environment_cache=moving_environment_cache,
+        timing=timing,
+    )
+    if timing is not None:
+        timing["component_factorized_kernel_transform"] = timing.get(
+            "component_factorized_kernel_transform", 0.0
+        ) + (time.perf_counter() - t0)
+    return out
+
+
+def _component_terms_from_compiled_factorized_direct(
+    compiled_factorized_terms,
+    basis,
+    components,
+    component_transforms,
+    *,
+    moving_environment_cache=None,
+    timing=None,
+):
+    """
+    Transform factorized local terms directly into component coordinates.
+
+    This avoids assembling dense parent component kernels before applying the
+    orthonormal transforms.  Each compiled factorized block contributes
+    ``X_out^H L R X_in`` directly to the transformed component block.
+
+    :param compiled_factorized_terms: Compiled factorized local terms.
+    :param basis: Parent two-site basis.
+    :param components: Metric-connected entry components.
+    :param component_transforms: Component orthonormal transforms.
+    :param moving_environment_cache: Optional structural cache for entry slices.
+    :param timing: Optional timing dictionary.
+    :returns: Component block terms, or ``None`` when metadata is incompatible.
+    """
+
+    if getattr(compiled_factorized_terms, "basis", None) is not basis and not basis.compatible_with_layout(
+        getattr(compiled_factorized_terms, "basis", basis).entries
+    ):
+        return None
+    entry_slices, _component_dims = _component_entry_slices_cached(
+        basis,
+        components,
+        moving_environment_cache=moving_environment_cache,
+        timing=timing,
+    )
+    terms_by_input = [[] for _component in components]
+    accum = {}
+    for in_idx, terms in enumerate(getattr(compiled_factorized_terms, "items", ())):
+        in_info = entry_slices.get(int(in_idx))
+        if in_info is None:
+            return None
+        in_comp, in_slice = in_info
+        X_in = np.asarray(component_transforms[in_comp][in_slice, :], dtype=complex)
+        X_in_tensor = X_in.reshape(tuple(basis.entries[int(in_idx)].shape) + (X_in.shape[1],))
+        for term in terms:
+            out_idx = basis.entry_index(term.output_entry.key)
+            out_info = entry_slices.get(int(out_idx))
+            if out_info is None:
+                return None
+            out_comp, out_slice = out_info
+            X_out = np.asarray(component_transforms[out_comp][out_slice, :], dtype=complex)
+            X_out_tensor = X_out.reshape(tuple(term.output_entry.shape) + (X_out.shape[1],))
+            t0 = time.perf_counter() if timing is not None else None
+            transformed = _transform_factorized_block_direct(
+                term,
+                X_out_tensor,
+                X_in_tensor,
+            )
+            if timing is not None:
+                timing["component_factorized_direct_block_contract"] = timing.get(
+                    "component_factorized_direct_block_contract", 0.0
+                ) + (time.perf_counter() - t0)
+            if np.linalg.norm(transformed.reshape(-1)) <= 1.0e-15:
+                continue
+            key = (int(in_comp), int(out_comp))
+            if key in accum:
+                accum[key] += transformed
+            else:
+                accum[key] = np.ascontiguousarray(transformed)
+    for (in_comp, out_comp), transformed in accum.items():
+        terms_by_input[in_comp].append((out_comp, transformed))
+    return tuple(tuple(terms) for terms in terms_by_input)
+
+
+def _transform_factorized_block_direct(term, X_out_tensor, X_in_tensor):
+    """
+    Contract one factorized local block into orthonormal coordinates.
+
+    :param term: ``CompiledFactorizedBlock``.
+    :param X_out_tensor: Output-entry transform with shape
+        ``term.output_entry.shape + (d_out,)``.
+    :param X_in_tensor: Input-entry transform with shape
+        ``term.input_entry.shape + (d_in,)``.
+    :returns: Dense transformed block ``(d_out, d_in)``.
+    """
+
+    left = np.asarray(term.left_stack)
+    right = np.asarray(term.right_stack)
+    tmp = np.einsum(
+        "ladqo,tlkwab->otkwbdq",
+        np.asarray(X_out_tensor).conj(),
+        left,
+        optimize=True,
+    )
+    tmp = np.einsum(
+        "otkwbdq,twqrdc->okbrc",
+        tmp,
+        right,
+        optimize=True,
+    )
+    return np.einsum(
+        "okbrc,kbcri->oi",
+        tmp,
+        np.asarray(X_in_tensor),
+        optimize=True,
+    )
+
+
+def _split_compiled_segment_kernel(item, segment, cursor, basis):
+    pieces = []
+    local_offset = int(segment.offset)
+    remaining = int(segment.size)
+    row_cursor = int(cursor)
+    offset_to_index = {int(entry.offset): idx for idx, entry in enumerate(basis)}
+    while remaining > 0:
+        out_idx = offset_to_index.get(local_offset)
+        if out_idx is None:
+            return None
+        out_entry = basis[out_idx]
+        if int(out_entry.offset) != local_offset or int(out_entry.size) > remaining:
+            return None
+        next_cursor = row_cursor + int(out_entry.size)
+        pieces.append((out_idx, item.kernel[row_cursor:next_cursor, :]))
+        row_cursor = next_cursor
+        local_offset += int(out_entry.size)
+        remaining -= int(out_entry.size)
+    return pieces
+
+
+def _compiled_transition_block_terms(compiled_transitions, basis, block_transforms):
+    terms_by_input = [[] for _entry in basis]
+    if getattr(compiled_transitions, "basis", None) is not basis and not basis.compatible_with_layout(
+        getattr(compiled_transitions, "basis", basis).entries
+    ):
+        return None
+    for in_idx, item in enumerate(getattr(compiled_transitions, "items", ())):
+        if item is None:
+            continue
+        X_in = block_transforms[in_idx]
+        cursor = 0
+        for segment in item.output_segments:
+            pieces = _split_compiled_segment_kernel(item, segment, cursor, basis)
+            if pieces is None:
+                return None
+            for out_idx, kernel in pieces:
+                X_out = block_transforms[out_idx]
+                transformed = X_out.conj().T @ np.asarray(kernel, dtype=complex) @ X_in
+                if np.linalg.norm(transformed.reshape(-1)) > 1.0e-15:
+                    terms_by_input[in_idx].append((out_idx, transformed))
+            cursor += int(segment.size)
+    return tuple(tuple(terms) for terms in terms_by_input)
+
+
+def _compiled_factorized_block_terms(compiled_factorized_terms, basis, block_transforms, *, max_block_kernel_elements):
+    terms_by_input = [[] for _entry in basis]
+    for in_idx, terms in enumerate(getattr(compiled_factorized_terms, "items", ())):
+        X_in = block_transforms[in_idx]
+        for term in terms:
+            out_idx = basis.entry_index(term.output_entry.key)
+            X_out = block_transforms[out_idx]
+            elements = int(term.output_entry.size) * int(term.input_entry.size)
+            if max_block_kernel_elements is not None and elements > int(max_block_kernel_elements):
+                return None
+            kernel = term.kernel_matrix(
+                term.input_entry.shape,
+                max_elements=max(elements, 1),
+            )
+            if kernel is None:
+                return None
+            transformed = X_out.conj().T @ np.asarray(kernel, dtype=complex) @ X_in
+            if np.linalg.norm(transformed.reshape(-1)) > 1.0e-15:
+                terms_by_input[in_idx].append((out_idx, transformed))
+    return tuple(tuple(terms) for terms in terms_by_input)
+
+
+def _build_component_sparse_orthonormalized_local_problem(
+    op,
+    norm_op,
+    basis,
+    *,
+    tol,
+    max_block_kernel_elements,
+    name,
+    source,
+    cache_hit,
+    metadata=None,
+    timing=None,
+    moving_environment_cache=None,
+):
+    H_packed = getattr(op, "packed_matvec", None) or getattr(op, "aux_packed_matvec", None)
+    if H_packed is None or norm_op is None:
+        return None
+    norm_packed = getattr(norm_op, "packed_matvec", None) or getattr(norm_op, "aux_packed_matvec", None)
+    H_table = getattr(op, "local_operator_table", None)
+    norm_table = getattr(norm_op, "local_operator_table", None)
+    metric_entry_kernels = (
+        _entry_kernel_items_from_local_operator_table(norm_table, basis)
+        or (
+            None
+            if norm_packed is None
+            else _entry_kernel_items_from_compiled_packed(norm_packed, basis)
+        )
+    )
+    basis_cache_key = _component_basis_cache_key(
+        norm_op,
+        basis,
+        metric_entry_kernels,
+        tol=tol,
+    )
+    cached_basis = _component_basis_cache_get(basis_cache_key)
+    if cached_basis is not None:
+        if timing is not None:
+            timing["component_basis_cache_hit"] = timing.get("component_basis_cache_hit", 0.0) + 1.0
+        components = cached_basis["components"]
+        component_indices = cached_basis["component_indices"]
+        component_transforms = cached_basis["component_transforms"]
+        metric_blocks = cached_basis["metric_blocks"]
+        orth_offsets = cached_basis["orth_offsets"]
+        offset = int(cached_basis["orth_dim"])
+    else:
+        if timing is not None:
+            timing["component_basis_cache_miss"] = timing.get("component_basis_cache_miss", 0.0) + 1.0
+        t0 = time.perf_counter() if timing is not None else None
+        components = (
+            _metric_connected_components_from_entry_kernels(
+                basis,
+                metric_entry_kernels,
+                tol=tol,
+            )
+            if metric_entry_kernels is not None
+            else _metric_connected_components(norm_op, basis, tol=tol)
+        )
+        if timing is not None:
+            timing["component_components"] = timing.get("component_components", 0.0) + (
+                time.perf_counter() - t0
+            )
+        if not components:
+            return None
+
+        component_indices = []
+        component_transforms = []
+        metric_blocks = []
+        orth_offsets = []
+        offset = 0
+        t0 = time.perf_counter() if timing is not None else None
+        for component in components:
+            parent_indices = _component_parent_indices(basis, component)
+            metric_block = (
+                _component_metric_block_from_entry_kernels(
+                    basis,
+                    component,
+                    metric_entry_kernels,
+                )
+                if metric_entry_kernels is not None
+                else _component_metric_block(norm_op, basis, parent_indices, tol=tol)
+            )
+            if metric_block is None:
+                return None
+            transform = _metric_block_transform(metric_block, tol=tol)
+            if transform is None:
+                return None
+            component_indices.append(np.asarray(parent_indices, dtype=int))
+            component_transforms.append(np.asarray(transform, dtype=complex))
+            metric_blocks.append(np.asarray(metric_block, dtype=complex))
+            orth_offsets.append(int(offset))
+            offset += int(transform.shape[1])
+        if timing is not None:
+            timing["component_metric_transforms"] = timing.get("component_metric_transforms", 0.0) + (
+                time.perf_counter() - t0
+            )
+        _component_basis_cache_put(
+            basis_cache_key,
+            {
+                "components": tuple(components),
+                "component_indices": tuple(component_indices),
+                "component_transforms": tuple(component_transforms),
+                "metric_blocks": tuple(metric_blocks),
+                "orth_offsets": tuple(orth_offsets),
+                "orth_dim": int(offset),
+            },
+        )
+
+    compiled_transitions = (
+        getattr(H_table, "compiled_transitions", None)
+        if H_table is not None
+        else None
+    ) or getattr(H_packed, "compiled_transitions", None)
+    compiled_factorized_terms = (
+        getattr(H_table, "compiled_factorized_terms", None)
+        if H_table is not None
+        else None
+    ) or getattr(H_packed, "compiled_factorized_terms", None)
+    component_basis = RenormalizedComponentBasis(
+        parent_basis=basis,
+        component_indices=tuple(component_indices),
+        component_transforms=tuple(component_transforms),
+        metric_blocks=tuple(metric_blocks),
+        orth_offsets=tuple(orth_offsets),
+    )
+    block_table = None
+    block_terms = None
+    prefer_direct_factorized = bool(
+        compiled_factorized_terms is not None
+        and getattr(compiled_factorized_terms, "prefer_direct_orthonormal_projection", False)
+    )
+    prefer_recursive_factorized = bool(
+        compiled_factorized_terms is not None
+        and getattr(compiled_factorized_terms, "prefer_recursive_operator_matvec", False)
+    )
+    transformed_table_cache_key = None
+    if H_table is not None and not prefer_direct_factorized and not prefer_recursive_factorized:
+        transformed_table_cache_key = _component_transformed_table_cache_key(
+            basis,
+            components,
+            tuple(component_transforms),
+            max_block_kernel_elements=max_block_kernel_elements,
+            metric_basis_cache_key=basis_cache_key,
+        )
+        t0 = time.perf_counter() if timing is not None else None
+        block_table = H_table.get_transformed_operator_table(transformed_table_cache_key)
+        if timing is not None:
+            timing_key = (
+                "component_transformed_table_cache_hit"
+                if block_table is not None
+                else "component_transformed_table_cache_miss"
+            )
+            timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+            timing["component_transformed_table_cache_lookup"] = timing.get(
+                "component_transformed_table_cache_lookup", 0.0
+            ) + (time.perf_counter() - t0)
+        if block_table is None and moving_environment_cache is not None:
+            t0 = time.perf_counter() if timing is not None else None
+            moving_cache_key = (
+                "component_transformed_operator_table",
+                getattr(H_table, "key", None),
+                transformed_table_cache_key,
+            )
+            block_table = moving_environment_cache.get(moving_cache_key)
+            if block_table is not None:
+                H_table.put_transformed_operator_table(
+                    transformed_table_cache_key,
+                    block_table,
+                )
+            if timing is not None:
+                timing_key = (
+                    "component_transformed_table_moving_cache_hit"
+                    if block_table is not None
+                    else "component_transformed_table_moving_cache_miss"
+                )
+                timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+                timing["component_transformed_table_moving_cache_lookup"] = timing.get(
+                    "component_transformed_table_moving_cache_lookup", 0.0
+                ) + (time.perf_counter() - t0)
+    if block_table is not None:
+        block_terms = None
+    elif compiled_transitions is not None:
+        t0 = time.perf_counter() if timing is not None else None
+        block_terms = _component_terms_from_compiled_transitions(
+            compiled_transitions,
+            basis,
+            components,
+            tuple(component_transforms),
+            max_block_kernel_elements=max_block_kernel_elements,
+            moving_environment_cache=moving_environment_cache,
+            timing=timing,
+        )
+        if timing is not None:
+            timing["component_kernel_terms"] = timing.get("component_kernel_terms", 0.0) + (
+                time.perf_counter() - t0
+            )
+    elif compiled_factorized_terms is not None:
+        if prefer_direct_factorized or prefer_recursive_factorized:
+            t0 = time.perf_counter() if timing is not None else None
+            block_table = DirectOrthonormalFactorizedTable(
+                component_basis=component_basis,
+                packed_matvec=H_packed,
+                source=str(
+                    "recursive_complementary_operator_matvec"
+                    if prefer_recursive_factorized
+                    else getattr(
+                            compiled_factorized_terms,
+                            "direct_orthonormal_projection_source",
+                            "component_sparse_direct_factorized",
+                        )
+                    )
+                ,
+                compiled_factorized_terms=compiled_factorized_terms,
+                components=tuple(components),
+            )
+            if timing is not None:
+                timing["component_direct_factorized_table"] = timing.get(
+                    "component_direct_factorized_table", 0.0
+                ) + (
+                    time.perf_counter() - t0
+                )
+                timing["component_direct_factorized_preferred"] = timing.get(
+                    "component_direct_factorized_preferred", 0.0
+                ) + 1.0
+                if prefer_recursive_factorized:
+                    timing["component_recursive_operator_matvec_preferred"] = timing.get(
+                        "component_recursive_operator_matvec_preferred", 0.0
+                    ) + 1.0
+                timing_key = (
+                    "component_recursive_parent_block_kernel"
+                    if getattr(block_table, "uses_component_parent_block_kernel", False)
+                    else (
+                        "component_direct_factorized_kernel"
+                        if getattr(block_table, "uses_component_direct_kernel", False)
+                        else "component_direct_factorized_full_matvec"
+                    )
+                )
+                timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+        else:
+            t0 = time.perf_counter() if timing is not None else None
+            block_terms = _component_terms_from_compiled_factorized(
+                compiled_factorized_terms,
+                basis,
+                components,
+                tuple(component_transforms),
+                max_block_kernel_elements=max_block_kernel_elements,
+                moving_environment_cache=moving_environment_cache,
+                timing=timing,
+            )
+            if timing is not None:
+                timing["component_kernel_terms"] = timing.get("component_kernel_terms", 0.0) + (
+                    time.perf_counter() - t0
+                )
+            if block_terms is None:
+                t0 = time.perf_counter() if timing is not None else None
+                block_table = DirectOrthonormalFactorizedTable(
+                    component_basis=component_basis,
+                    packed_matvec=H_packed,
+                    source="component_sparse_direct_factorized_fallback",
+                    compiled_factorized_terms=compiled_factorized_terms,
+                    components=tuple(components),
+                )
+                if timing is not None:
+                    timing["component_direct_factorized_table"] = timing.get(
+                        "component_direct_factorized_table", 0.0
+                    ) + (
+                        time.perf_counter() - t0
+                    )
+                    timing_key = (
+                        "component_recursive_parent_block_kernel"
+                        if getattr(block_table, "uses_component_parent_block_kernel", False)
+                        else (
+                            "component_direct_factorized_kernel"
+                            if getattr(block_table, "uses_component_direct_kernel", False)
+                            else "component_direct_factorized_full_matvec"
+                        )
+                    )
+                    timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+    else:
+        t0 = time.perf_counter() if timing is not None else None
+        block_terms = _component_operator_terms_from_matvec(
+            H_packed,
+            basis,
+            tuple(component_indices),
+            tuple(component_transforms),
+            max_block_kernel_elements=max_block_kernel_elements,
+        )
+        if timing is not None:
+            timing["component_kernel_terms"] = timing.get("component_kernel_terms", 0.0) + (
+                time.perf_counter() - t0
+            )
+    if block_terms is None and block_table is None:
+        return None
+    if block_table is None:
+        t0 = time.perf_counter() if timing is not None else None
+        block_table = compile_orthonormal_block_table(
+            block_terms,
+            tuple(component_transforms),
+            tuple(orth_offsets),
+        )
+        if transformed_table_cache_key is not None and H_table is not None:
+            H_table.put_transformed_operator_table(
+                transformed_table_cache_key,
+                block_table,
+            )
+            if moving_environment_cache is not None:
+                moving_environment_cache.put(
+                    (
+                        "component_transformed_operator_table",
+                        getattr(H_table, "key", None),
+                        transformed_table_cache_key,
+                    ),
+                    block_table,
+                )
+        if timing is not None:
+            timing["component_table_compile"] = timing.get("component_table_compile", 0.0) + (
+                time.perf_counter() - t0
+            )
+            if transformed_table_cache_key is not None and H_table is not None:
+                timing["component_transformed_table_cache_put"] = timing.get(
+                    "component_transformed_table_cache_put", 0.0
+                ) + 1.0
+                if moving_environment_cache is not None:
+                    timing["component_transformed_table_moving_cache_put"] = timing.get(
+                        "component_transformed_table_moving_cache_put", 0.0
+                    ) + 1.0
+
+    t0 = time.perf_counter() if timing is not None else None
+    orth_dim = int(offset)
+    h_diag = None if op.diag is None else np.asarray(op.diag, dtype=float).reshape(basis.size)
+    if h_diag is None:
+        diag = np.zeros(orth_dim, dtype=float)
+    else:
+        diag = np.zeros(orth_dim, dtype=float)
+        for idx, parent_indices in enumerate(component_indices):
+            parent_diag = h_diag[parent_indices]
+            local_diag = np.real((np.abs(component_transforms[idx]) ** 2).T @ parent_diag)
+            start = int(orth_offsets[idx])
+            diag[start:start + local_diag.size] = local_diag
+
+    def H_full(vector):
+        vector = np.asarray(vector, dtype=complex).reshape(basis.size)
+        return np.asarray(H_packed(vector), dtype=complex).reshape(basis.size)
+
+    if timing is not None:
+        timing["component_finalize"] = timing.get("component_finalize", 0.0) + (
+            time.perf_counter() - t0
+        )
+
+    return ComponentOrthonormalizedLocalProblem(
+        component_basis=component_basis,
+        block_table=block_table,
+        full_matvec=H_full,
+        diag=diag,
+        name=name,
+        source=source,
+        cache_hit=cache_hit,
+        metadata=metadata,
+    )
+
+
+def _build_block_sparse_orthonormalized_local_problem(
+    op,
+    norm_op,
+    template,
+    basis,
+    *,
+    tol,
+    max_block_kernel_elements,
+    name,
+    source,
+    cache_hit,
+    metadata=None,
+    timing=None,
+    moving_environment_cache=None,
+):
+    H_packed = getattr(op, "packed_matvec", None) or getattr(op, "aux_packed_matvec", None)
+    if H_packed is None:
+        return None
+    H_table = getattr(op, "local_operator_table", None)
+    h_diag = None if op.diag is None else np.asarray(op.diag, dtype=float)
+
+    block_transforms = []
+    metric_blocks = []
+    orth_offsets = []
+    offset = 0
+    t0 = time.perf_counter() if timing is not None else None
+    for entry in basis:
+        metric_block = _entry_self_metric_block_from_matvec(
+            norm_op,
+            entry,
+            basis.size,
+            tol=tol,
+        )
+        if metric_block is False:
+            component_source = (
+                source.rsplit(":block_sparse_operator_table", 1)[0]
+                if str(source).endswith(":block_sparse_operator_table")
+                else source
+            )
+            return _build_component_sparse_orthonormalized_local_problem(
+                op,
+                norm_op,
+                basis,
+                tol=tol,
+                max_block_kernel_elements=max_block_kernel_elements,
+                name=name,
+                source=f"{component_source}:component_sparse_operator_table",
+                cache_hit=cache_hit,
+                metadata=metadata,
+                timing=timing,
+                moving_environment_cache=moving_environment_cache,
+            )
+        if metric_block is None:
+            metric_block = _entry_self_metric_block(norm_op, entry)
+        if metric_block is None:
+            return None
+        transform = _metric_block_transform(metric_block, tol=tol)
+        if transform is None:
+            return None
+        block_transforms.append(np.asarray(transform, dtype=complex))
+        metric_blocks.append(np.asarray(metric_block, dtype=complex))
+        orth_offsets.append(int(offset))
+        offset += int(transform.shape[1])
+    if timing is not None:
+        timing["block_metric_transforms"] = timing.get("block_metric_transforms", 0.0) + (
+            time.perf_counter() - t0
+        )
+
+    compiled_transitions = (
+        getattr(H_table, "compiled_transitions", None)
+        if H_table is not None
+        else None
+    ) or getattr(H_packed, "compiled_transitions", None)
+    compiled_factorized_terms = (
+        getattr(H_table, "compiled_factorized_terms", None)
+        if H_table is not None
+        else None
+    ) or getattr(H_packed, "compiled_factorized_terms", None)
+    if compiled_transitions is not None:
+        t0 = time.perf_counter() if timing is not None else None
+        block_terms = _compiled_transition_block_terms(
+            compiled_transitions,
+            basis,
+            tuple(block_transforms),
+        )
+        if timing is not None:
+            timing["block_kernel_terms"] = timing.get("block_kernel_terms", 0.0) + (
+                time.perf_counter() - t0
+            )
+    elif compiled_factorized_terms is not None:
+        t0 = time.perf_counter() if timing is not None else None
+        block_terms = _compiled_factorized_block_terms(
+            compiled_factorized_terms,
+            basis,
+            tuple(block_transforms),
+            max_block_kernel_elements=max_block_kernel_elements,
+        )
+        if timing is not None:
+            timing["block_kernel_terms"] = timing.get("block_kernel_terms", 0.0) + (
+                time.perf_counter() - t0
+            )
+    else:
+        return None
+    if block_terms is None:
+        return None
+    t0 = time.perf_counter() if timing is not None else None
+    block_table = compile_orthonormal_block_table(
+        block_terms,
+        tuple(block_transforms),
+        tuple(orth_offsets),
+    )
+    if timing is not None:
+        timing["block_table_compile"] = timing.get("block_table_compile", 0.0) + (
+            time.perf_counter() - t0
+        )
+
+    t0 = time.perf_counter() if timing is not None else None
+    orth_dim = int(offset)
+    if h_diag is None:
+        diag = np.zeros(orth_dim, dtype=float)
+    else:
+        h_diag = np.asarray(h_diag, dtype=float).reshape(basis.size)
+        diag = np.zeros(orth_dim, dtype=float)
+        for idx, entry in enumerate(basis):
+            parent_diag = h_diag[entry.slice]
+            local_diag = np.real((np.abs(block_transforms[idx]) ** 2).T @ parent_diag)
+            start = orth_offsets[idx]
+            diag[start:start + local_diag.size] = local_diag
+
+    def H_full(vector):
+        vector = np.asarray(vector, dtype=complex).reshape(basis.size)
+        return np.asarray(H_packed(vector), dtype=complex).reshape(basis.size)
+    if timing is not None:
+        timing["block_finalize"] = timing.get("block_finalize", 0.0) + (
+            time.perf_counter() - t0
+        )
+
+    return BlockSparseOrthonormalizedLocalProblem(
+        basis=basis,
+        block_transforms=tuple(block_transforms),
+        metric_blocks=tuple(metric_blocks),
+        block_table=block_table,
+        orth_offsets=tuple(orth_offsets),
+        full_matvec=H_full,
+        diag=diag,
+        name=name,
+        source=source,
+        cache_hit=cache_hit,
+        metadata=metadata,
+    )
+
+
+def _solve_preorthonormalized_local_problem(
+    problem,
+    guess_vec,
+    *,
+    nroots=1,
+    projector_basis=None,
+    root_guess_vecs=None,
+    tol,
+    itermax=100,
+    max_space=None,
+    tol_residual=None,
+    lindep=1.0e-12,
+    allow_unconverged=False,
+    profile=False,
+):
+    """
+    Solve a prebuilt orthonormal reduced local problem.
+
+    :param problem: :class:`OrthonormalizedLocalProblem` storing ``X^H H X``.
+    :param guess_vec: Initial packed vector in the parent basis.
+    :param tol: Davidson convergence tolerance.
+    :param nroots: Number of lowest roots to solve.
+    :param projector_basis: Optional projector in orthonormal coordinates.
+    :param root_guess_vecs: Optional parent-basis guesses for additional roots.
+    :returns: ``(energies, parent_vectors, residuals, info)``.
+    """
+
+    timing = {
+        "guess_project": 0.0,
+        "projector": 0.0,
+        "davidson": 0.0,
+        "matvec": 0.0,
+        "residual": 0.0,
+        "total": 0.0,
+    } if profile else None
+    matvec_count = 0
+    total_t0 = time.perf_counter() if profile else None
+
+    def timed_matvec(vec):
+        nonlocal matvec_count
+        if not profile:
+            return problem.matvec(vec)
+        t0 = time.perf_counter()
+        out = problem.matvec(vec)
+        timing["matvec"] += time.perf_counter() - t0
+        matvec_count += 1
+        return out
+
+    def _sparse_fallback():
+        if eigsh is None or LinearOperator is None:
+            return None
+        dim = int(problem.orthonormal_dim)
+        if dim <= 2 or int(nroots) >= dim:
+            return None
+
+        def matvec(vec):
+            return np.asarray(timed_matvec(vec), dtype=complex).reshape(dim)
+
+        linear_operator = LinearOperator(
+            (dim, dim),
+            matvec=matvec,
+            dtype=np.dtype(complex),
+        )
+        v0 = None
+        if guess_y is not None:
+            first_guess = np.asarray(guess_y[:, 0] if guess_y.ndim == 2 else guess_y, dtype=complex).reshape(dim)
+            if np.linalg.norm(first_guess) > 1.0e-15:
+                v0 = first_guess / np.linalg.norm(first_guess)
+        try:
+            evals, evecs = eigsh(
+                linear_operator,
+                k=int(nroots),
+                which="SA",
+                v0=v0,
+                tol=float(tol_residual if tol_residual is not None else max(tol, 1.0e-10)),
+                maxiter=max(20, int(itermax) * max(2, int(nroots) + 1)),
+            )
+        except Exception:
+            return None
+        order = np.argsort(np.real(evals))[: int(nroots)]
+        return (
+            np.real(evals[order]).astype(float),
+            np.asarray(evecs[:, order], dtype=complex),
+            {
+                "iterations": int(itermax),
+                "converged": True,
+                "subspace_dim": int(dim),
+                "restarts": 0,
+                "sparse_fallback": True,
+            },
+        )
+
+    guess_vec = np.asarray(guess_vec, dtype=complex).reshape(problem.parent_dim)
+    nroots = int(nroots)
+    if nroots < 1:
+        raise ValueError("nroots must be positive.")
+    t0 = time.perf_counter() if profile else None
+    guess_cols = [problem.to_orthonormal(guess_vec)]
+    for root_guess in root_guess_vecs or ():
+        root_guess = np.asarray(root_guess, dtype=complex).reshape(problem.parent_dim)
+        root_guess_y = problem.to_orthonormal(root_guess)
+        if np.linalg.norm(root_guess_y) > 1.0e-15:
+            guess_cols.append(root_guess_y)
+    guess_y = np.column_stack(guess_cols)
+    if np.linalg.norm(guess_y) <= 1.0e-15:
+        guess_y = None
+    if profile:
+        timing["guess_project"] += time.perf_counter() - t0
+
+    dense_fallback = False
+    sparse_fallback = False
+    projected_dim = None
+    try:
+        t0 = time.perf_counter() if profile else None
+        if projector_basis is None:
+            energies, vecs, info = davidson(
+                timed_matvec,
+                nroots,
+                tol=tol,
+                itermax=itermax,
+                diag=problem.diag,
+                guess=guess_y,
+                max_space=max_space,
+                tol_residual=tol_residual,
+                lindep=lindep,
+                return_info=True,
+                return_partial=allow_unconverged,
+            )
+            if (
+                not bool(info.get("converged", False))
+                and int(problem.orthonormal_dim) > 256
+            ):
+                sparse_result = _sparse_fallback()
+                if sparse_result is not None:
+                    energies, vecs, info = sparse_result
+                    sparse_fallback = True
+        else:
+            if profile:
+                timing["projector"] += time.perf_counter() - t0
+                t0 = time.perf_counter()
+            projector_basis = np.asarray(projector_basis, dtype=complex)
+            if (
+                projector_basis.ndim != 2
+                or projector_basis.shape[0] != int(problem.orthonormal_dim)
+            ):
+                raise ValueError(
+                    "projector_basis must have shape "
+                    "(problem.orthonormal_dim, projected_dim)."
+                )
+            projected_dim = int(projector_basis.shape[1])
+            if int(nroots) > projected_dim:
+                raise ValueError("Cannot request more roots than the projected dimension.")
+
+            def projected_matvec(coeff):
+                full = projector_basis @ np.asarray(coeff, dtype=complex).reshape(projected_dim)
+                return projector_basis.conj().T @ timed_matvec(full)
+
+            projected_diag = (
+                None
+                if problem.diag is None
+                else np.real((np.abs(projector_basis) ** 2).T @ np.asarray(problem.diag, dtype=float))
+            )
+            projected_guess = None if guess_y is None else projector_basis.conj().T @ guess_y
+            if projected_guess is not None and np.linalg.norm(projected_guess) <= 1.0e-15:
+                projected_guess = None
+            energies, vecs, info = davidson(
+                projected_matvec,
+                nroots,
+                tol=tol,
+                itermax=itermax,
+                diag=projected_diag,
+                guess=projected_guess,
+                max_space=max_space,
+                tol_residual=tol_residual,
+                lindep=lindep,
+                return_info=True,
+                return_partial=allow_unconverged,
+            )
+            vecs = projector_basis @ np.asarray(vecs, dtype=complex)
+        if profile:
+            timing["davidson"] += time.perf_counter() - t0
+    except (RuntimeError, ValueError, IndexError):
+        sparse_result = None if projector_basis is not None else _sparse_fallback()
+        if sparse_result is not None:
+            energies, vecs, info = sparse_result
+            sparse_fallback = True
+        elif projector_basis is None:
+            t0 = time.perf_counter() if profile else None
+            H_ortho = _materialize_local_matrix(timed_matvec, problem.orthonormal_dim)
+            if profile:
+                timing["davidson"] += time.perf_counter() - t0
+            evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+            order = np.argsort(np.real(evals))[:nroots]
+            energies = np.real(evals[order]).astype(float)
+            vecs = np.asarray(evecs[:, order], dtype=complex)
+            info = {
+                "iterations": 0,
+                "converged": True,
+                "subspace_dim": int(problem.orthonormal_dim),
+                "restarts": 0,
+            }
+            dense_fallback = True
+        else:
+            projector_basis = np.asarray(projector_basis, dtype=complex)
+            projected_dim = int(projector_basis.shape[1])
+
+            def projected_matvec(coeff):
+                full = projector_basis @ np.asarray(coeff, dtype=complex).reshape(projected_dim)
+                return projector_basis.conj().T @ timed_matvec(full)
+
+            t0 = time.perf_counter() if profile else None
+            H_ortho = _materialize_local_matrix(projected_matvec, projected_dim)
+            if profile:
+                timing["davidson"] += time.perf_counter() - t0
+            evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+            order = np.argsort(np.real(evals))[:nroots]
+            energies = np.real(evals[order]).astype(float)
+            vecs = np.asarray(evecs[:, order], dtype=complex)
+            vecs = projector_basis @ vecs
+            info = {
+                "iterations": 0,
+                "converged": True,
+                "subspace_dim": int(projected_dim or problem.orthonormal_dim),
+                "restarts": 0,
+            }
+            dense_fallback = True
+
+    energies = np.real(np.asarray(energies).reshape(-1)[:nroots]).astype(float)
+    root_vecs = []
+    residuals = []
+    t0 = time.perf_counter() if profile else None
+    for root_idx in range(len(energies)):
+        y = np.asarray(vecs[:, root_idx], dtype=complex).reshape(problem.orthonormal_dim)
+        reference = guess_vec if root_idx == 0 else None
+        vec = _canonicalize_eigenvector(problem.from_orthonormal(y), reference=reference)
+        if hasattr(problem, "metric_matvec"):
+            nvec = problem.metric_matvec(vec)
+        else:
+            nvec = problem.metric @ vec
+        norm = np.sqrt(max(0.0, float(np.real(np.vdot(vec, nvec)))))
+        if norm > 1.0e-15:
+            vec = vec / norm
+            nvec = nvec / norm
+        residuals.append(float(np.linalg.norm(problem.full_matvec(vec) - float(energies[root_idx]) * nvec)))
+        root_vecs.append(vec)
+    if profile:
+        timing["residual"] += time.perf_counter() - t0
+        timing["total"] = time.perf_counter() - total_t0
+    info_out = {
+        "davidson_iterations": int(info.get("iterations", 0)),
+        "davidson_converged": bool(info.get("converged", False)),
+        "subspace_dim": int(info.get("subspace_dim", problem.orthonormal_dim)),
+        "restarts": int(info.get("restarts", 0)),
+        "orthonormalized_dim": int(problem.orthonormal_dim),
+        "dense_fallback": bool(dense_fallback),
+        "sparse_fallback": bool(sparse_fallback or info.get("sparse_fallback", False)),
+        "renormalized_operator_storage": problem.source,
+        "renormalized_operator_cache_hit": bool(getattr(problem, "cache_hit", False)),
+        "renormalized_operator_table_stats": getattr(problem, "table_stats", None),
+        "renormalized_operator_metadata": getattr(problem, "metadata", None),
+        "root_projector_dim": projected_dim,
+    }
+    metadata = getattr(problem, "metadata", None) or {}
+    if "orthonormal_operator_factory_timing" in metadata:
+        info_out["operator_factory_timing"] = metadata["orthonormal_operator_factory_timing"]
+    if "renormalized_operator_build_timing" in metadata:
+        info_out["renormalized_operator_build_timing"] = metadata["renormalized_operator_build_timing"]
+    if profile:
+        info_out["solver_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
+        info_out["matvec_count"] = int(matvec_count)
+    return energies, root_vecs, residuals, info_out
 
 
 def solve_local_two_site(
@@ -1944,6 +4959,8 @@ def solve_local_two_site(
     precond=None,
     dense_fallback_dim=512,
     orthonormalized_dense_dim=96,
+    orthonormalize_generalized_dim=None,
+    orthonormalize_generalized_operator=False,
     couple_physical=False,
     nstates=1,
     weights=None,
@@ -1952,6 +4969,16 @@ def solve_local_two_site(
     root_target_value=None,
     root_target_tol=1e-6,
     root_selection_buffer=2,
+    root_projector_dim=None,
+    root_projector_dense_dim=256,
+    root_projector_block_dim=512,
+    root_projector_block_max_columns=512,
+    root_projector_block_offdiag_tol=1.0e-9,
+    root_projector_max_dim=65536,
+    filter_coupled_boundary=False,
+    use_block_preconditioner=True,
+    allow_unconverged_roots=False,
+    profile=False,
 ):
     """
     Solve a local effective two-site problem with Davidson.
@@ -1970,7 +4997,44 @@ def solve_local_two_site(
         norm_operator = local_operator.norm_operator
         local_operator = local_operator.operator
 
-    vec0, layout = pack_two_site_state(two_site)
+    preorthonormalized_problem = None
+    if isinstance(
+        local_operator,
+        (
+            OrthonormalizedLocalProblem,
+            BlockSparseOrthonormalizedLocalProblem,
+            ComponentOrthonormalizedLocalProblem,
+        ),
+    ):
+        if norm_operator is not None:
+            raise ValueError(
+                "OrthonormalizedLocalProblem already stores the local metric transform; "
+                "do not pass a separate norm_operator."
+            )
+        preorthonormalized_problem = local_operator
+        op_preview = None
+        norm_preview = None
+        canonical_norm = True
+    else:
+        op_preview = _normalize_local_operator(local_operator)
+        norm_preview = None if norm_operator is None else _normalize_local_operator(norm_operator)
+
+    vec0, raw_layout = pack_two_site_state(two_site)
+    if preorthonormalized_problem is not None:
+        local_basis = preorthonormalized_problem.basis
+        if not local_basis.compatible_with_layout(raw_layout):
+            raise ValueError("Prebuilt orthonormalized local problem does not match the active two-site layout.")
+    else:
+        local_basis = (
+            _operator_basis_for_layout(op_preview, raw_layout)
+            or (
+                _operator_basis_for_layout(norm_preview, raw_layout)
+                if norm_preview is not None
+                else None
+            )
+            or two_site_state_basis(two_site, layout=raw_layout)
+        )
+    layout = local_basis
     if guess is None:
         guess_vec = vec0
     elif isinstance(guess, NonabelianTensor):
@@ -2014,10 +5078,176 @@ def solve_local_two_site(
     if coupled_mode not in {False, True, "auto"}:
         raise ValueError("couple_physical must be one of False, True, or 'auto'.")
 
+    if preorthonormalized_problem is not None:
+        preorth_root_target_op = (
+            _normalize_local_operator(root_target_operator)
+            if root_target_operator is not None
+            else None
+        )
+        nsolve = int(nstates)
+        projector_basis = None
+        projector_target_values = None
+        projector_method = None
+        if preorth_root_target_op is not None and root_target_value is not None:
+            projected_min_dim = min(
+                int(preorthonormalized_problem.parent_dim),
+                max(nsolve, int(nstates) + max(0, int(root_selection_buffer))),
+            )
+            parent_projector, projector_target_values = _target_projector_basis_by_blocks(
+                preorth_root_target_op,
+                two_site,
+                layout,
+                target_value=root_target_value,
+                target_tol=root_target_tol,
+                min_dim=projected_min_dim,
+                max_block_size=root_projector_block_dim,
+                max_columns=root_projector_block_max_columns,
+                offdiag_tol=root_projector_block_offdiag_tol,
+            )
+            if parent_projector is not None:
+                projector_method = "block"
+            else:
+                parent_projector, projector_target_values = _target_projector_basis(
+                    preorth_root_target_op,
+                    two_site,
+                    layout,
+                    target_value=root_target_value,
+                    target_tol=root_target_tol,
+                    min_dim=projected_min_dim,
+                    target_dim=root_projector_dim,
+                    dense_dim=root_projector_dense_dim,
+                    max_dim=root_projector_max_dim,
+                )
+                if parent_projector is not None:
+                    projector_method = (
+                        "dense"
+                        if int(preorthonormalized_problem.parent_dim) <= int(root_projector_dense_dim)
+                        else "iterative"
+                    )
+            if parent_projector is not None:
+                orth_columns = [
+                    preorthonormalized_problem.to_orthonormal(parent_projector[:, idx])
+                    for idx in range(int(parent_projector.shape[1]))
+                ]
+                projector_basis = _orthonormalize_columns_dense(np.column_stack(orth_columns))
+                if projector_basis.shape[1] > 0:
+                    nsolve = min(nsolve, int(projector_basis.shape[1]))
+                else:
+                    projector_basis = None
+                    projector_method = None
+            if projector_basis is None:
+                projector_target_values = None
+                projector_method = None
+            nsolve = min(
+                int(preorthonormalized_problem.orthonormal_dim),
+                max(nsolve, int(nstates) + max(0, int(root_selection_buffer))),
+            ) if projector_basis is None else nsolve
+        energies, root_vecs, residuals, solver_info = _solve_preorthonormalized_local_problem(
+            preorthonormalized_problem,
+            guess_vec,
+            nroots=nsolve,
+            projector_basis=projector_basis,
+            root_guess_vecs=root_guess_vecs,
+            tol=tol,
+            itermax=itermax,
+            max_space=max_space,
+            tol_residual=tol_residual,
+            lindep=lindep,
+            allow_unconverged=allow_unconverged_roots,
+            profile=profile,
+        )
+        target_values = None
+        selected_roots = list(range(min(int(nstates), len(root_vecs))))
+        if preorth_root_target_op is not None and root_target_value is not None:
+            metric_matvec = (
+                preorthonormalized_problem.metric_matvec
+                if hasattr(preorthonormalized_problem, "metric_matvec")
+                else lambda vector: preorthonormalized_problem.metric @ vector
+            )
+            target_values = _operator_expectations_with_metric_matvec(
+                preorth_root_target_op,
+                two_site,
+                layout,
+                root_vecs,
+                metric_matvec,
+            )
+            energies, root_vecs, residuals, selected_roots = _select_targeted_roots(
+                energies,
+                root_vecs,
+                residuals,
+                nstates=nstates,
+                target_values=target_values,
+                target_value=root_target_value,
+                target_tol=root_target_tol,
+            )
+        optimized_roots = [
+            unpack_two_site_state(vec, two_site, layout=layout)
+            for vec in root_vecs
+        ]
+        optimized = optimized_roots[0]
+        local_weights = weights[: len(energies)]
+        local_weights = local_weights / np.sum(local_weights)
+        residual = max(residuals) if residuals else 0.0
+        return optimized, {
+            "energy": float(energies[0]),
+            "state_energies": [float(x) for x in energies],
+            "state_average_energy": float(np.dot(local_weights, energies)),
+            "state_average_weights": [float(x) for x in local_weights],
+            "optimized_roots": optimized_roots if nstates > 1 else None,
+            "metric": float(residual),
+            "residual": float(residual),
+            "davidson_iterations": int(solver_info.get("davidson_iterations", 0)),
+            "davidson_converged": bool(solver_info.get("davidson_converged", False)),
+            "subspace_dim": int(solver_info.get("subspace_dim", 0)),
+            "restarts": int(solver_info.get("restarts", 0)),
+            "coupled_physical_used": False,
+            "canonical_norm": True,
+            "canonical_norm_used": True,
+            "dense_fallback": bool(solver_info.get("dense_fallback", False)),
+            "operator_representation": "orthonormalized_renormalized",
+            "norm_operator_representation": "stored_metric_transform",
+            "orthonormal_basis": "renormalized_environment",
+            "effective_local_problem": "orthonormalized_operator_standard",
+            "block_davidson": True,
+            "orthonormalized_dim": solver_info.get("orthonormalized_dim"),
+            "nstates": int(nstates),
+            "renormalized_operator_storage": solver_info.get("renormalized_operator_storage"),
+            "renormalized_operator_cache_hit": bool(
+                solver_info.get("renormalized_operator_cache_hit", False)
+            ),
+            "renormalized_operator_table_stats": solver_info.get("renormalized_operator_table_stats"),
+            "renormalized_operator_metadata": solver_info.get("renormalized_operator_metadata"),
+            "target_irrep_filtered": preorth_root_target_op is not None,
+            "root_target_values": (
+                [float(target_values[idx]) for idx in selected_roots]
+                if target_values is not None
+                else None
+            ),
+            "root_target_value": None if root_target_value is None else float(root_target_value),
+            "root_selection_used": target_values is not None,
+            "root_selection_candidates": int(nsolve),
+            "root_projector_dim": int(projector_basis.shape[1]) if projector_basis is not None else None,
+            "root_projector_method": projector_method,
+            "root_projector_target_values": (
+                [float(x) for x in projector_target_values]
+                if projector_target_values is not None
+                else None
+            ),
+            "solver_timing": solver_info.get("solver_timing"),
+            "matvec_count": solver_info.get("matvec_count"),
+            "operator_factory_timing": solver_info.get("operator_factory_timing"),
+            "renormalized_operator_build_timing": solver_info.get(
+                "renormalized_operator_build_timing"
+            ),
+        }
+
     transform_error = None
     if coupled_mode is not False:
         try:
-            coupled_template = _coupled_two_site_template(two_site)
+            coupled_template = _coupled_two_site_template(
+                two_site,
+                filter_boundary_target=filter_coupled_boundary,
+            )
         except Exception as exc:
             if coupled_mode is True:
                 raise
@@ -2038,8 +5268,6 @@ def solve_local_two_site(
         coupled_template = coupled_layout = None
         transform = transform_dag = None
 
-    op_preview = _normalize_local_operator(local_operator)
-    norm_preview = None if norm_operator is None else _normalize_local_operator(norm_operator)
     canonical_norm_requested = bool(canonical_norm or (norm_preview is not None and norm_preview.identity_like))
     canonical_norm = bool(canonical_norm_requested)
     use_uncoupled_canonical_path = False
@@ -2047,7 +5275,13 @@ def solve_local_two_site(
     if canonical_norm and coupled_template is None:
         norm_operator = None
         norm_preview = None
-    use_aux_packed_operator = guess_vec.size > 64
+    use_aux_packed_operator = (
+        canonical_norm_requested
+        and (
+            op_preview.aux_packed_matvec is not None
+            or (norm_preview is not None and norm_preview.aux_packed_matvec is not None)
+        )
+    )
     effective_op = op_preview
     if (
         use_aux_packed_operator
@@ -2057,6 +5291,7 @@ def solve_local_two_site(
         effective_op = LocalOperator(
             packed_matvec=op_preview.aux_packed_matvec,
             packed_block_matrices=op_preview.packed_block_matrices,
+            basis=op_preview.basis or local_basis,
             diag=op_preview.diag,
             name=op_preview.name,
             identity_like=op_preview.identity_like,
@@ -2071,6 +5306,7 @@ def solve_local_two_site(
         effective_norm_op = LocalOperator(
             packed_matvec=norm_preview.aux_packed_matvec,
             packed_block_matrices=norm_preview.packed_block_matrices,
+            basis=norm_preview.basis or local_basis,
             diag=norm_preview.diag,
             name=norm_preview.name,
             identity_like=norm_preview.identity_like,
@@ -2091,6 +5327,7 @@ def solve_local_two_site(
             root_target_op = LocalOperator(
                 packed_matvec=root_target_op.aux_packed_matvec,
                 packed_block_matrices=root_target_op.packed_block_matrices,
+                basis=root_target_op.basis or local_basis,
                 diag=root_target_op.diag,
                 name=root_target_op.name,
                 identity_like=root_target_op.identity_like,
@@ -2160,35 +5397,81 @@ def solve_local_two_site(
             )
             projector_basis = None
             projector_target_values = None
+            projector_method = None
             if coupled_target_operator is not None and root_target_value is not None:
-                projector_basis, projector_target_values = _target_projector_basis(
+                projector_basis, projector_target_values = _target_projector_basis_by_blocks(
                     coupled_target_operator,
                     coupled_template,
                     coupled_layout,
                     target_value=root_target_value,
                     target_tol=root_target_tol,
                     min_dim=projected_min_dim,
+                    max_block_size=root_projector_block_dim,
+                    max_columns=root_projector_block_max_columns,
+                    offdiag_tol=root_projector_block_offdiag_tol,
                 )
+                if projector_basis is not None:
+                    projector_method = "block"
+                else:
+                    projector_basis, projector_target_values = _target_projector_basis(
+                        coupled_target_operator,
+                        coupled_template,
+                        coupled_layout,
+                        target_value=root_target_value,
+                        target_tol=root_target_tol,
+                        min_dim=projected_min_dim,
+                        target_dim=root_projector_dim,
+                        dense_dim=root_projector_dense_dim,
+                        max_dim=root_projector_max_dim,
+                    )
+                    if projector_basis is not None:
+                        projector_method = "dense" if dim <= int(root_projector_dense_dim) else "iterative"
                 if projector_basis is not None:
                     nsolve = min(nsolve, int(projector_basis.shape[1]))
             if projector_basis is None and coupled_target_operator is not None and root_target_value is not None:
                 nsolve = min(dim, max(nsolve, int(nstates) + max(0, int(root_selection_buffer))))
             solver_info = {}
             if coupled_norm_operator is None:
-                energies, root_vecs, residuals, solver_info = _solve_standard_davidson_roots(
-                    coupled_operator,
-                    coupled_template,
-                    coupled_layout,
-                    root_coupled_guess_matrix if root_coupled_guess_matrix is not None else guess_coupled_vec,
-                    nroots=nsolve,
-                    projector_basis=projector_basis,
-                    tol=tol,
-                    itermax=itermax,
-                    max_space=max_space,
-                    tol_residual=tol_residual,
-                    lindep=lindep,
-                    precond=precond,
-                )
+                try:
+                    energies, root_vecs, residuals, solver_info = _solve_standard_davidson_roots(
+                        coupled_operator,
+                        coupled_template,
+                        coupled_layout,
+                        root_coupled_guess_matrix if root_coupled_guess_matrix is not None else guess_coupled_vec,
+                        nroots=nsolve,
+                        projector_basis=projector_basis,
+                        tol=tol,
+                        itermax=itermax,
+                        max_space=max_space,
+                        tol_residual=tol_residual,
+                        lindep=lindep,
+                        precond=precond,
+                        use_block_preconditioner=use_block_preconditioner,
+                        allow_unconverged=allow_unconverged_roots,
+                    )
+                except RuntimeError:
+                    if dense_fallback_dim is None or dim > int(dense_fallback_dim):
+                        raise
+                    operator_dense, _ = _resolve_davidson_operator(coupled_operator, coupled_template, coupled_layout)
+                    H_matrix = (
+                        np.asarray(operator_dense)
+                        if isinstance(operator_dense, np.ndarray)
+                        else _materialize_local_matrix(operator_dense, dim)
+                    )
+                    energies, root_vecs, residuals = _solve_generalized_dense_roots(
+                        H_matrix,
+                        None,
+                        nroots=nsolve,
+                        tol=max(tol, 1e-12),
+                    )
+                    solver_info = {
+                        "davidson_iterations": int(itermax),
+                        "davidson_converged": False,
+                        "subspace_dim": int(dim),
+                        "restarts": 0,
+                        "generalized_dense_fallback": True,
+                        "standard_dense_fallback": True,
+                    }
             elif dense_fallback_dim is None or dim > int(dense_fallback_dim):
                 raise NotImplementedError(
                     "State-averaged coupled non-Abelian local solves currently require "
@@ -2261,6 +5544,9 @@ def solve_local_two_site(
                 "subspace_dim": int(solver_info.get("subspace_dim", dim)),
                 "dense_fallback": bool(solver_info.get("generalized_dense_fallback", False)),
                 "block_davidson": not bool(solver_info.get("generalized_dense_fallback", False)),
+                "block_preconditioner": bool(solver_info.get("block_preconditioner", False)),
+                "block_preconditioner_blocks": int(solver_info.get("block_preconditioner_blocks", 0)),
+                "packed_matvec_backend": solver_info.get("packed_matvec_backend"),
                 "restarts": int(solver_info.get("restarts", 0)),
                 "coupled_physical_used": True,
                 "canonical_norm": canonical_norm,
@@ -2278,6 +5564,7 @@ def solve_local_two_site(
                 "root_target_value": None if root_target_value is None else float(root_target_value),
                 "root_selection_used": target_values is not None,
                 "root_projector_dim": int(projector_basis.shape[1]) if projector_basis is not None else None,
+                "root_projector_method": projector_method,
                 "root_projector_target_values": (
                     [float(x) for x in projector_target_values]
                     if projector_target_values is not None
@@ -2298,35 +5585,81 @@ def solve_local_two_site(
         )
         projector_basis = None
         projector_target_values = None
+        projector_method = None
         if root_target_op is not None and root_target_value is not None:
-            projector_basis, projector_target_values = _target_projector_basis(
+            projector_basis, projector_target_values = _target_projector_basis_by_blocks(
                 root_target_op,
                 two_site,
                 layout,
                 target_value=root_target_value,
                 target_tol=root_target_tol,
                 min_dim=projected_min_dim,
+                max_block_size=root_projector_block_dim,
+                max_columns=root_projector_block_max_columns,
+                offdiag_tol=root_projector_block_offdiag_tol,
             )
+            if projector_basis is not None:
+                projector_method = "block"
+            else:
+                projector_basis, projector_target_values = _target_projector_basis(
+                    root_target_op,
+                    two_site,
+                    layout,
+                    target_value=root_target_value,
+                    target_tol=root_target_tol,
+                    min_dim=projected_min_dim,
+                    target_dim=root_projector_dim,
+                    dense_dim=root_projector_dense_dim,
+                    max_dim=root_projector_max_dim,
+                )
+                if projector_basis is not None:
+                    projector_method = "dense" if dim <= int(root_projector_dense_dim) else "iterative"
             if projector_basis is not None:
                 nsolve = min(nsolve, int(projector_basis.shape[1]))
         if projector_basis is None and root_target_op is not None and root_target_value is not None:
             nsolve = min(dim, max(nsolve, int(nstates) + max(0, int(root_selection_buffer))))
         solver_info = {}
         if effective_norm_op is None:
-            energies, root_vecs, residuals, solver_info = _solve_standard_davidson_roots(
-                effective_op,
-                two_site,
-                layout,
-                root_guess_matrix if root_guess_matrix is not None else guess_vec,
-                nroots=nsolve,
-                projector_basis=projector_basis,
-                tol=tol,
-                itermax=itermax,
-                max_space=max_space,
-                tol_residual=tol_residual,
-                lindep=lindep,
-                precond=precond,
-            )
+            try:
+                energies, root_vecs, residuals, solver_info = _solve_standard_davidson_roots(
+                    effective_op,
+                    two_site,
+                    layout,
+                    root_guess_matrix if root_guess_matrix is not None else guess_vec,
+                    nroots=nsolve,
+                    projector_basis=projector_basis,
+                    tol=tol,
+                    itermax=itermax,
+                    max_space=max_space,
+                    tol_residual=tol_residual,
+                    lindep=lindep,
+                    precond=precond,
+                    use_block_preconditioner=use_block_preconditioner,
+                    allow_unconverged=allow_unconverged_roots,
+                )
+            except RuntimeError:
+                if dense_fallback_dim is None or dim > int(dense_fallback_dim):
+                    raise
+                operator_dense, _ = _resolve_davidson_operator(effective_op, two_site, layout)
+                H_matrix = (
+                    np.asarray(operator_dense)
+                    if isinstance(operator_dense, np.ndarray)
+                    else _materialize_local_matrix(operator_dense, dim)
+                )
+                energies, root_vecs, residuals = _solve_generalized_dense_roots(
+                    H_matrix,
+                    None,
+                    nroots=nsolve,
+                    tol=max(tol, 1e-12),
+                )
+                solver_info = {
+                    "davidson_iterations": int(itermax),
+                    "davidson_converged": False,
+                    "subspace_dim": int(dim),
+                    "restarts": 0,
+                    "generalized_dense_fallback": True,
+                    "standard_dense_fallback": True,
+                }
         elif dense_fallback_dim is None or dim > int(dense_fallback_dim):
             raise NotImplementedError(
                 "State-averaged non-Abelian local solves currently require "
@@ -2398,6 +5731,9 @@ def solve_local_two_site(
             "subspace_dim": int(solver_info.get("subspace_dim", dim)),
             "dense_fallback": bool(solver_info.get("generalized_dense_fallback", False)),
             "block_davidson": not bool(solver_info.get("generalized_dense_fallback", False)),
+            "block_preconditioner": bool(solver_info.get("block_preconditioner", False)),
+            "block_preconditioner_blocks": int(solver_info.get("block_preconditioner_blocks", 0)),
+            "packed_matvec_backend": solver_info.get("packed_matvec_backend"),
             "restarts": int(solver_info.get("restarts", 0)),
             "coupled_physical_used": False,
             "canonical_norm": canonical_norm,
@@ -2414,6 +5750,7 @@ def solve_local_two_site(
             "root_target_value": None if root_target_value is None else float(root_target_value),
             "root_selection_used": target_values is not None,
             "root_projector_dim": int(projector_basis.shape[1]) if projector_basis is not None else None,
+            "root_projector_method": projector_method,
             "root_projector_target_values": (
                 [float(x) for x in projector_target_values]
                 if projector_target_values is not None
@@ -2474,6 +5811,8 @@ def solve_local_two_site(
                         tol_residual=tol_residual,
                         lindep=lindep,
                         precond=precond,
+                        use_block_preconditioner=use_block_preconditioner,
+                        profile=profile,
                     )
                     optimized = _uncouple_two_site_tensor(optimized_coupled)
                     objective["coupled_physical"] = True
@@ -2505,7 +5844,12 @@ def solve_local_two_site(
                     else _materialize_local_matrix(N_coupled, coupled_dim)
                 )
                 guess_coupled_vec, _ = _pack_tensor_state(guess_coupled, layout=coupled_layout)
-                energy, vec, residual = _solve_orthonormalized_dense(H_matrix, N_matrix, tol=tol)
+                energy, vec, residual = _solve_orthonormalized_dense(
+                    H_matrix,
+                    N_matrix,
+                    tol=tol,
+                    basis=_two_site_basis_for_layout(coupled_template, coupled_layout),
+                )
                 vec = _canonicalize_eigenvector(vec, reference=guess_coupled_vec)
                 optimized_coupled = _unpack_tensor_state(vec, coupled_template, layout=coupled_layout)
                 optimized = _uncouple_two_site_tensor(optimized_coupled)
@@ -2526,11 +5870,12 @@ def solve_local_two_site(
                     "dense_fallback": True,
                     "operator_representation": "dense",
                     "norm_operator_representation": "dense",
+                    "orthonormal_basis": "TwoSiteBasis",
                 }
                 if coupled_mode == "auto":
                     objective["coupled_physical_skipped"] = "uncoupled_orthonormalized_path"
                 return optimized, objective
-        if canonical_norm_requested:
+        if canonical_norm_requested and coupled_norm_operator is not None:
             use_uncoupled_canonical_path = True
             norm_operator = None
             norm_preview = None
@@ -2556,12 +5901,17 @@ def solve_local_two_site(
                 tol_residual=tol_residual,
                 lindep=lindep,
                 precond=precond,
+                use_block_preconditioner=use_block_preconditioner,
+                profile=profile,
             )
             optimized = _uncouple_two_site_tensor(optimized_coupled)
             objective["coupled_physical"] = True
             objective["coupled_physical_used"] = True
             objective["canonical_norm"] = canonical_norm
-            objective["effective_local_problem"] = "standard" if canonical_norm else "generalized"
+            objective["canonical_norm_used"] = bool(canonical_norm)
+            objective["effective_local_problem"] = (
+                "orthonormalized_standard" if canonical_norm else "generalized"
+            )
             objective["dense_fallback"] = False
             if canonical_norm_requested and coupled_template is not None:
                 objective["canonical_norm_skipped"] = "coupled_physical_path"
@@ -2591,44 +5941,90 @@ def solve_local_two_site(
     if effective_norm_op is not None and (
         use_uncoupled_orthonormalized_path
         or (canonical_norm_requested and orthonormalized_dense_dim is not None)
+        or orthonormalize_generalized_dim is not None
     ):
         dim = guess_vec.size
-        if dim <= int(orthonormalized_dense_dim):
-            operator_dense, _ = _resolve_davidson_operator(effective_op, two_site, layout)
-            norm_dense, _ = _resolve_davidson_operator(effective_norm_op, two_site, layout)
-            H_matrix = (
-                np.asarray(operator_dense)
-                if isinstance(operator_dense, np.ndarray)
-                else _materialize_local_matrix(operator_dense, dim)
+        ortho_dim_limit = orthonormalized_dense_dim
+        if orthonormalize_generalized_dim is not None:
+            ortho_dim_limit = max(
+                int(orthonormalized_dense_dim or 0),
+                int(orthonormalize_generalized_dim),
             )
-            N_matrix = (
-                np.asarray(norm_dense)
-                if isinstance(norm_dense, np.ndarray)
-                else _materialize_local_matrix(norm_dense, dim)
-            )
-            energy, vec, residual = _solve_orthonormalized_dense(H_matrix, N_matrix, tol=tol)
+        if dim <= int(ortho_dim_limit):
+            solver_info = {}
+            if orthonormalize_generalized_operator:
+                energy, vec, residual, solver_info = _solve_orthonormalized_operator_davidson(
+                    effective_op,
+                    effective_norm_op,
+                    two_site,
+                    layout,
+                    guess_vec,
+                    tol=tol,
+                    itermax=itermax,
+                    max_space=max_space,
+                    tol_residual=tol_residual,
+                    lindep=lindep,
+                    allow_unconverged=allow_unconverged_roots,
+                )
+            else:
+                operator_dense, _ = _resolve_davidson_operator(effective_op, two_site, layout)
+                norm_dense, _ = _resolve_davidson_operator(effective_norm_op, two_site, layout)
+                H_matrix = (
+                    np.asarray(operator_dense)
+                    if isinstance(operator_dense, np.ndarray)
+                    else _materialize_local_matrix(operator_dense, dim)
+                )
+                N_matrix = (
+                    np.asarray(norm_dense)
+                    if isinstance(norm_dense, np.ndarray)
+                    else _materialize_local_matrix(norm_dense, dim)
+                )
+                energy, vec, residual = _solve_orthonormalized_dense(
+                    H_matrix,
+                    N_matrix,
+                    tol=tol,
+                    basis=layout if isinstance(layout, TwoSiteBasis) else None,
+                )
             vec = _canonicalize_eigenvector(vec, reference=guess_vec)
             optimized = unpack_two_site_state(vec, two_site, layout=layout)
             objective = {
                 "energy": float(energy),
                 "metric": residual,
                 "residual": residual,
-                "davidson_iterations": 0,
-                "davidson_converged": False,
-                "subspace_dim": int(dim),
+                "davidson_iterations": int(solver_info.get("davidson_iterations", 0)),
+                "davidson_converged": bool(solver_info.get("davidson_converged", False)),
+                "subspace_dim": int(solver_info.get("subspace_dim", dim)),
                 "coupled_physical_used": False,
                 "canonical_norm": canonical_norm,
-                "dense_fallback": True,
-                "operator_representation": "dense",
+                "dense_fallback": not bool(orthonormalize_generalized_operator) or bool(
+                    solver_info.get("dense_fallback", False)
+                ),
+                "operator_representation": (
+                    "orthonormalized_operator"
+                    if orthonormalize_generalized_operator
+                    else "dense"
+                ),
                 "norm_operator_representation": "dense",
+                "orthonormal_basis": "TwoSiteBasis" if isinstance(layout, TwoSiteBasis) else "dense",
                 "effective_local_problem": (
-                    "orthonormalized_standard" if canonical_norm else "orthonormalized_dense"
+                    "orthonormalized_operator_standard"
+                    if orthonormalize_generalized_operator
+                    else "orthonormalized_standard"
+                    if canonical_norm
+                    else "orthonormalized_dense"
+                ),
+                "block_davidson": bool(orthonormalize_generalized_operator),
+                "orthonormalized_dim": solver_info.get("orthonormalized_dim"),
+                "missing_diagonal_preconditioner": bool(
+                    solver_info.get("missing_diagonal_preconditioner", False)
                 ),
             }
             if use_uncoupled_canonical_path:
                 objective["coupled_physical_skipped"] = "uncoupled_canonical_path"
             elif use_uncoupled_orthonormalized_path:
                 objective["coupled_physical_skipped"] = "uncoupled_orthonormalized_path"
+            elif orthonormalize_generalized_dim is not None:
+                objective["coupled_physical_skipped"] = "metric_orthonormalized_generalized_path"
             elif canonical_norm_requested and coupled_template is not None:
                 objective["canonical_norm_skipped"] = "coupled_physical_path"
             if transform_error is not None and coupled_mode == "auto":
@@ -2647,11 +6043,24 @@ def solve_local_two_site(
             tol_residual=tol_residual,
             lindep=lindep,
             precond=precond,
+            use_block_preconditioner=use_block_preconditioner,
+            profile=profile,
         )
         objective["dense_fallback"] = False
         objective["coupled_physical_used"] = False
         objective["canonical_norm"] = canonical_norm
-        objective["effective_local_problem"] = "standard" if canonical_norm else "generalized"
+        objective["canonical_norm_used"] = bool(canonical_norm)
+        objective["effective_local_problem"] = (
+            "orthonormalized_standard"
+            if canonical_norm and use_uncoupled_canonical_path
+            else "orthonormalized_standard"
+            if objective.get("metric_orthonormal_krylov", False)
+            else "standard"
+            if canonical_norm
+            else "generalized"
+        )
+        if objective.get("metric_orthonormal_krylov", False):
+            objective["orthonormal_basis"] = "metric_krylov"
         if use_uncoupled_canonical_path:
             objective["coupled_physical_skipped"] = "uncoupled_canonical_path"
         elif use_uncoupled_orthonormalized_path:
@@ -2766,7 +6175,14 @@ def solve_local_two_site(
     objective["dense_fallback"] = fallback_used
     objective["coupled_physical_used"] = False
     objective["canonical_norm"] = canonical_norm
-    objective["effective_local_problem"] = "standard" if canonical_norm else "generalized"
+    objective["canonical_norm_used"] = bool(canonical_norm)
+    objective["effective_local_problem"] = (
+        "orthonormalized_standard"
+        if canonical_norm and use_uncoupled_canonical_path
+        else "standard"
+        if canonical_norm
+        else "generalized"
+    )
     if use_uncoupled_canonical_path:
         objective["coupled_physical_skipped"] = "uncoupled_canonical_path"
     elif canonical_norm_requested and coupled_template is not None:

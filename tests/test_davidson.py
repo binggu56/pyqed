@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyqed.davidson import davidson, davidson_solver
 
@@ -110,3 +111,24 @@ def test_davidson_incremental_projected_updates_match_dense_path():
 
     assert np.allclose(w, w_ref[:4], atol=1e-9, rtol=1e-9)
     assert info["restarts"] >= 0
+
+
+def test_davidson_can_return_partial_ritz_pairs_on_iteration_limit():
+    h = _random_symmetric(18, seed=41)
+
+    with pytest.raises(RuntimeError):
+        davidson(h, neigen=2, tol=1e-14, itermax=1)
+
+    w, v, info = davidson(
+        h,
+        neigen=2,
+        tol=1e-14,
+        itermax=1,
+        return_info=True,
+        return_partial=True,
+    )
+
+    assert w.shape == (2,)
+    assert v.shape == (18, 2)
+    assert info["converged"] is False
+    assert info["max_iterations_reached"] is True

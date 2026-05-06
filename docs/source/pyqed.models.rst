@@ -1,61 +1,17 @@
-pyqed.models package
-====================
+Models
+======
 
-Submodules
-----------
+The :mod:`pyqed.models` package contains model Hamiltonians used by the
+dynamics and spectroscopy examples.
 
-pyqed.models.dho module
------------------------
+Main source modules:
 
-.. automodule:: pyqed.models.dho
-   :members:
-   :undoc-members:
-   :show-inheritance:
+* ``pyqed.models.dho``
+* ``pyqed.models.exciton``
+* ``pyqed.models.jahn_teller``
+* ``pyqed.models.pyrazine``
+* ``pyqed.models.pyrrole``
+* ``pyqed.models.vibronic``
 
-pyqed.models.exciton module
----------------------------
-
-.. automodule:: pyqed.models.exciton
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.models.jahn\_teller module
---------------------------------
-
-.. automodule:: pyqed.models.jahn_teller
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.models.pyrazine module
-----------------------------
-
-.. automodule:: pyqed.models.pyrazine
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.models.pyrrole module
----------------------------
-
-.. automodule:: pyqed.models.pyrrole
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.models.vibronic module
-----------------------------
-
-.. automodule:: pyqed.models.vibronic
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Module contents
----------------
-
-.. automodule:: pyqed.models
-   :members:
-   :undoc-members:
-   :show-inheritance:
+This page avoids importing the modules during documentation builds so that
+legacy examples and free-form mathematical docstrings do not break RTD.

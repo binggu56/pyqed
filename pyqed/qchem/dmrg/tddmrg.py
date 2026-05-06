@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.linalg import expm
 
-from pyqed.mps import MPS, MPO as TensorMPO
+from pyqed.mps import MPS
+from pyqed.mps.mps import MPO as TensorMPO
 from pyqed.mps.mps import symmetric_to_dense
 from pyqed.mps.tdmps import TDMPS
 from pyqed.mps.decompose import decompose, tt_to_tensor

@@ -18,7 +18,15 @@ from .casci import (
     _resolve_use_cholesky_integrals,
     transform_eri_factors_to_mo_pair,
 )
-from .direct_ci import CASCI
+from .direct_ci import (
+    CASCI,
+    build_direct_connectivity,
+    _compute_diag_compact_factors,
+    _compute_double_cross_values_from_factors,
+    _compute_double_same_values_from_factors,
+    _compute_single_values_from_factors,
+    _sigma_compact_derivative_batch_numba,
+)
 from .orbopt import (
     augmented_hessian_direction,
     davidson_augmented_hessian_direction,
@@ -1964,6 +1972,84 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         grad = orbital_gradient(fock)
         return pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
 
+    def _pair_factor_response_slices(self, pair_factors, kappa, nocc_like):
+        pair_factors = np.asarray(pair_factors)
+        kappa = np.asarray(kappa)
+        nocc_like = int(nocc_like)
+        kappa_occ = kappa[:, :nocc_like]
+        d_full_occ = (
+            np.einsum(
+                "Ppj,pi->Pij",
+                pair_factors[:, :, :nocc_like],
+                kappa,
+                optimize=True,
+            )
+            + np.einsum(
+                "Piq,qj->Pij",
+                pair_factors,
+                kappa_occ,
+                optimize=True,
+            )
+        )
+        return d_full_occ, d_full_occ[:, :nocc_like, :]
+
+    def _generalized_fock_factor_product_sliced(self, left_full_occ, right_occ_occ, dm2_occ):
+        contracted = np.einsum(
+            "Pst,rqst->Prq",
+            right_occ_occ,
+            dm2_occ,
+            optimize=True,
+        )
+        return np.einsum(
+            "Ppr,Prq->pq",
+            left_full_occ,
+            contracted,
+            optimize=True,
+        )
+
+    def _orbital_hessian_action_from_factors(
+        self,
+        h1_mo,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappa,
+    ):
+        h1_mo = np.asarray(h1_mo)
+        pair_factors = np.asarray(pair_factors)
+        dm1_occ = np.asarray(dm1_occ)
+        dm2_occ = np.asarray(dm2_occ)
+        kappa = np.asarray(kappa)
+        nocc_like = int(dm1_occ.shape[0])
+
+        dh1 = h1_mo @ kappa - kappa @ h1_mo
+        pair_full_occ = pair_factors[:, :, :nocc_like]
+        pair_occ_occ = pair_full_occ[:, :nocc_like, :]
+        d_full_occ, d_occ_occ = self._pair_factor_response_slices(
+            pair_factors,
+            kappa,
+            nocc_like,
+        )
+
+        dfock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, pair_factors, dm2_occ))
+        dfock[:, :nocc_like] = np.einsum(
+            "pr,rq->pq",
+            dh1[:, :nocc_like],
+            dm1_occ,
+            optimize=True,
+        )
+        dfock[:, :nocc_like] += self._generalized_fock_factor_product_sliced(
+            d_full_occ,
+            pair_occ_occ,
+            dm2_occ,
+        )
+        dfock[:, :nocc_like] += self._generalized_fock_factor_product_sliced(
+            pair_full_occ,
+            d_occ_occ,
+            dm2_occ,
+        )
+        return orbital_gradient(dfock)
+
     def _parameterized_orbital_hessian_action(
         self,
         h1_mo,
@@ -2384,6 +2470,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         return h1_active, eri_active
 
     def _active_integrals_from_full_mo_factors(self, h1_mo, pair_factors, ncore, ncas):
+        h1_active, pair_active = self._active_h1_pair_from_full_mo_factors(
+            h1_mo,
+            pair_factors,
+            ncore,
+            ncas,
+        )
+        eri_active = np.einsum("Ppq,Prs->pqrs", pair_active, pair_active, optimize=True)
+        return h1_active, eri_active
+
+    def _active_h1_pair_from_full_mo_factors(self, h1_mo, pair_factors, ncore, ncas):
         ncore = int(ncore)
         ncas = int(ncas)
         nocc = ncore + ncas
@@ -2400,8 +2496,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             core_k = np.einsum("Ppi,Pqi->pq", pair_ac, pair_ac, optimize=True)
             h1_active = h1_active + core_j - core_k
         pair_active = pair_factors[:, active, active]
-        eri_active = np.einsum("Ppq,Prs->pqrs", pair_active, pair_active, optimize=True)
-        return h1_active, eri_active
+        return h1_active, pair_active
 
     def _active_integral_derivatives_from_factor_step(
         self,
@@ -2725,23 +2820,41 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             and self._full_derivative_sigma_cache.get("key") == key
         ):
             return self._full_derivative_sigma_cache["sigma"]
-        cols = []
-        for iorb in range(dh1_basis.shape[0]):
-            deriv_mc = self._make_active_sigma_casci(
-                mc,
-                dh1_basis[iorb],
-                deri_basis[iorb],
-            )
-            cols.append(deriv_mc.ci_sigma(c0))
-        if cols:
-            sigma_basis = np.asarray(cols)
-        else:
-            sigma_basis = np.zeros((0, np.asarray(c0).size), dtype=float)
+        sigma_basis = self._batched_derivative_sigma(mc, dh1_basis, deri_basis, c0)
         self._full_derivative_sigma_cache = {
             "key": key,
             "sigma": sigma_basis,
         }
         return sigma_basis
+
+    def _batched_derivative_sigma(self, mc, dh1_basis, deri_basis, c0):
+        if dh1_basis.shape[0] == 0:
+            return np.zeros((0, np.asarray(c0).size), dtype=float)
+        if getattr(mc, "direct_connectivity", None) is None:
+            mc.direct_connectivity = build_direct_connectivity(mc.binary)
+        conn = mc.direct_connectivity
+        try:
+            return _sigma_compact_derivative_batch_numba(
+                np.ascontiguousarray(dh1_basis),
+                np.ascontiguousarray(deri_basis),
+                np.ascontiguousarray(c0),
+                mc.binary,
+                conn.I_A, conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                conn.I_B, conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                conn.I_AA, conn.J_AA, conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA,
+                conn.I_BB, conn.J_BB, conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB,
+                conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
+            )
+        except Exception:
+            cols = []
+            for iorb in range(dh1_basis.shape[0]):
+                deriv_mc = self._make_active_sigma_casci(
+                    mc,
+                    dh1_basis[iorb],
+                    deri_basis[iorb],
+                )
+                cols.append(deriv_mc.ci_sigma(c0))
+            return np.asarray(cols)
 
     def _factor_derivative_sigma_basis(self, mc, h1_mo, pair_factors, c0):
         dh1_basis, deri_basis = self._active_integral_derivative_basis_factors(
@@ -2763,18 +2876,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             and self._full_derivative_sigma_cache.get("key") == key
         ):
             return self._full_derivative_sigma_cache["sigma"]
-        cols = []
-        for iorb in range(dh1_basis.shape[0]):
-            deriv_mc = self._make_active_sigma_casci(
-                mc,
-                dh1_basis[iorb],
-                deri_basis[iorb],
-            )
-            cols.append(deriv_mc.ci_sigma(c0))
-        if cols:
-            sigma_basis = np.asarray(cols)
-        else:
-            sigma_basis = np.zeros((0, np.asarray(c0).size), dtype=float)
+        sigma_basis = self._batched_derivative_sigma(mc, dh1_basis, deri_basis, c0)
         self._full_derivative_sigma_cache = {
             "key": key,
             "sigma": sigma_basis,
@@ -2851,13 +2953,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         return sigma_mc
 
     def _make_factor_integral_sigma_casci(self, mc, h1_mo, pair_factors):
-        h1_active, eri_active = self._active_integrals_from_full_mo_factors(
+        h1_active, pair_active = self._active_h1_pair_from_full_mo_factors(
             h1_mo,
             pair_factors,
             mc.ncore,
             mc.ncas,
         )
-        sigma_mc = self._make_active_sigma_casci(mc, h1_active, eri_active)
+        sigma_mc = self._make_active_factor_sigma_casci(mc, h1_active, pair_active)
         sigma_mc.e_core = self._core_energy_from_full_mo_factors(
             h1_mo,
             pair_factors,
@@ -2895,6 +2997,77 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         sigma_mc._direct_factor_H_AB = None
         sigma_mc.direct_connectivity = mc.direct_connectivity
         sigma_mc.binary = mc.binary
+        return sigma_mc
+
+    def _make_active_factor_sigma_casci(self, mc, h1_active, pair_active):
+        """
+        Lightweight CASCI-like object for CI sigma with active-space pair factors.
+        """
+        sigma_mc = copy.copy(mc)
+        h1_active = np.asarray(h1_active)
+        pair_active = np.asarray(pair_active)
+        sigma_mc.hcore = np.asarray([h1_active, h1_active])
+        sigma_mc.h2e_cas = None
+        sigma_mc.eri_so = None
+        sigma_mc._direct_spatial_h1 = h1_active
+        sigma_mc._direct_spatial_eri = None
+        sigma_mc._direct_same_spin_eri = None
+        sigma_mc._direct_cross_spin_eri = None
+        sigma_mc._direct_pair_factors = pair_active
+        sigma_mc.direct_connectivity = mc.direct_connectivity
+        sigma_mc.binary = mc.binary
+        if sigma_mc.direct_connectivity is None:
+            sigma_mc.direct_connectivity = build_direct_connectivity(sigma_mc.binary)
+        conn = sigma_mc.direct_connectivity
+        sigma_mc._direct_factor_H_diag = _compute_diag_compact_factors(
+            h1_active,
+            pair_active,
+            sigma_mc.binary,
+        )
+        sigma_mc._direct_factor_H_A = _compute_single_values_from_factors(
+            conn.J_A,
+            conn.p_A,
+            conn.q_A,
+            conn.phase_A,
+            h1_active,
+            pair_active,
+            sigma_mc.binary,
+            0,
+        )
+        sigma_mc._direct_factor_H_B = _compute_single_values_from_factors(
+            conn.J_B,
+            conn.p_B,
+            conn.q_B,
+            conn.phase_B,
+            h1_active,
+            pair_active,
+            sigma_mc.binary,
+            1,
+        )
+        sigma_mc._direct_factor_H_AA = _compute_double_same_values_from_factors(
+            conn.p_AA,
+            conn.q_AA,
+            conn.r_AA,
+            conn.s_AA,
+            conn.phase_AA,
+            pair_active,
+        )
+        sigma_mc._direct_factor_H_BB = _compute_double_same_values_from_factors(
+            conn.p_BB,
+            conn.q_BB,
+            conn.r_BB,
+            conn.s_BB,
+            conn.phase_BB,
+            pair_active,
+        )
+        sigma_mc._direct_factor_H_AB = _compute_double_cross_values_from_factors(
+            conn.p_AB,
+            conn.q_AB,
+            conn.r_AB,
+            conn.s_AB,
+            conn.phase_AB,
+            pair_active,
+        )
         return sigma_mc
 
     def _orbital_gradient_from_ci_response(self, mc, h1_mo, eri_mo, c0, dc):
@@ -4349,14 +4522,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     dm1, dm2 = self._effective_rdms(mc, self.state_id)
                     fock = generalized_fock(h1_cur, eri_cur, dm1, dm2)
                 if self.nstates == 1:
-                    if self.use_cholesky_integrals:
-                        grad_vec = self._factor_exact_orbital_gradient_vector(
-                            mc,
-                            h1_cur,
-                            pair_cur,
-                            mc.ci[self.state_id],
-                        )
-                    else:
+                    if not self.use_cholesky_integrals:
                         grad_vec = self._exact_orbital_gradient_vector(
                             mc,
                             h1_cur,
@@ -4375,22 +4541,30 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     gnorm = gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
                     grad_vec = pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
 
-                use_parameterized_hessian = (
-                    self.ah_hessian == "finite_difference"
-                    or self.use_cholesky_integrals
-                )
+                use_parameterized_hessian = self.ah_hessian == "finite_difference"
                 if use_parameterized_hessian:
-                    orbital_hessian_model = (
-                        "factorized_frozen_finite_difference"
-                        if self.use_cholesky_integrals
-                        else "parameterized_finite_difference"
-                    )
+                    orbital_hessian_model = "parameterized_finite_difference"
+                elif self.use_cholesky_integrals:
+                    orbital_hessian_model = "factorized_analytic_integral_response"
                 elif self.orbital_parameterization == "wmk":
                     orbital_hessian_model = "analytic_wmk_second_order"
                 else:
                     orbital_hessian_model = "analytic_integral_response"
 
                 def base_hessian_action(vec):
+                    if self.use_cholesky_integrals and not use_parameterized_hessian:
+                        return pack_nonredundant(
+                            self._orbital_hessian_action_from_factors(
+                                h1_cur,
+                                pair_cur,
+                                dm1,
+                                dm2,
+                                unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo),
+                            ),
+                            mc.ncore,
+                            mc.ncas,
+                            self.nmo,
+                        )
                     if self.use_cholesky_integrals:
                         return self._factor_parameterized_orbital_hessian_action(
                             h1_cur,
@@ -4438,6 +4612,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     grad_qn = np.array(grad_vec, copy=True)
 
                     def qn_base_hessian_action(vec):
+                        if self.use_cholesky_integrals and not use_parameterized_hessian:
+                            return pack_nonredundant(
+                                self._orbital_hessian_action_from_factors(
+                                    h1_qn,
+                                    pair_qn,
+                                    dm1_qn,
+                                    dm2_qn,
+                                    unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo),
+                                ),
+                                mc.ncore,
+                                mc.ncas,
+                                self.nmo,
+                            )
                         if self.use_cholesky_integrals:
                             return self._factor_parameterized_orbital_hessian_action(
                                 h1_qn,

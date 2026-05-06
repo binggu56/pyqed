@@ -19,6 +19,87 @@ from .coupling import clebsch_gordan, ordered_two_m_values
 from .tensor import NonabelianTensor
 
 
+class FullyReducedSpatialOrbitalSite(SpatialOrbitalSite):
+    """
+    Multiplicity-only SU(2) spatial-orbital site descriptor.
+
+    ``SpatialOrbitalSite`` stores the singly occupied local multiplet with its
+    explicit two-dimensional ``m`` basis. That is convenient for dense
+    spin-resolved MPOs, but it is not the fully reduced Wigner-Eckart
+    convention used by block2-style SU(2) DMRG. This descriptor keeps one
+    reduced basis vector per local irrep:
+
+    - N=0, S=0
+    - N=1, S=1/2
+    - N=2, S=0
+
+    Site operators used with this layout must be reduced tensor operators; a
+    dense spin-resolved physical MPO is intentionally incompatible with it.
+    """
+
+    labels = ("empty", "single", "double")
+    state_index = ((0,), (0,), (0,))
+
+    @property
+    def d(self) -> int:
+        return 3
+
+    @property
+    def degeneracy(self) -> tuple[int, ...]:
+        return (1, 1, 1)
+
+
+def build_reduced_product_spatial_mps(labels):
+    """
+    Build a product MPS in the fully reduced spatial-orbital convention.
+
+    Only ``"empty"``, ``"single"``, ``"double"``, and ``"full"`` are accepted:
+    spin-projection labels such as ``"up"``/``"down"`` are not states in a
+    Wigner-Eckart reduced local basis.
+    """
+    if not labels:
+        raise ValueError("build_reduced_product_spatial_mps requires at least one label.")
+    site = FullyReducedSpatialOrbitalSite()
+    phys_by_label = {
+        "empty": site.qn[0],
+        "single": site.qn[1],
+        "double": site.qn[2],
+        "full": site.qn[2],
+    }
+    vacuum = spatial_target_sector(0, 0)
+    left = vacuum
+    parsed = []
+    for raw_label in labels:
+        label = str(raw_label).lower()
+        if label not in phys_by_label:
+            raise ValueError(
+                "Fully reduced product MPS labels must be empty/single/double/full; "
+                f"got {raw_label!r}."
+            )
+        q_phys = phys_by_label[label]
+        fused = _fuse_spatial_sectors(left, q_phys)
+        if len(fused) != 1:
+            raise ValueError(
+                f"Label sequence {labels!r} is not a unique reduced product path at {raw_label!r}."
+            )
+        right = fused[0]
+        parsed.append((q_phys, left, right))
+        left = right
+
+    tensors = []
+    for q_phys, q_left, q_right in parsed:
+        block = np.ones((1, 1, 1), dtype=float)
+        tensors.append(
+            NonabelianTensor(
+                data={(q_left, q_phys, q_right): block},
+                qns=[[q_left], list(site.qn), [q_right]],
+                dirs=[-1, 1, 1],
+                metadata={"physical_basis": "fully_reduced_su2"},
+            )
+        )
+    return tensors
+
+
 def spatial_target_sector(charge, two_j=0):
     """
     Build a total ``charge x SU(2)`` target sector for a spatial-orbital chain.
@@ -476,6 +557,104 @@ def build_random_spatial_mps(
         )
 
     return tensors
+
+
+def build_random_reduced_spatial_mps(
+    nsites,
+    *,
+    target_sector=None,
+    bond_multiplicity=2,
+    seed=None,
+    scale=1.0,
+    dtype=float,
+):
+    """
+    Build a random MPS in the fully reduced spatial-orbital convention.
+
+    This is the multiplicity-only analogue of :func:`build_random_spatial_mps`:
+    the physical ``N=1, S=1/2`` site irrep has local dimension one rather than
+    explicit ``m=+/-1/2`` components.  It is the local basis needed for a
+    block2-style Wigner-Eckart SU(2) sweep path.
+
+    :param nsites: Number of spatial-orbital sites.
+    :param target_sector: Total charge-spin sector on the right boundary.
+    :param bond_multiplicity: Initial multiplicity copies per reachable
+        intermediate sector.
+    :param seed: Optional random seed.
+    :param scale: Gaussian scale for initialized reduced blocks.
+    :param dtype: Block dtype.
+    :returns: List of rank-3 fully reduced MPS site tensors.
+    """
+
+    nsites = int(nsites)
+    if nsites < 2:
+        raise ValueError("build_random_reduced_spatial_mps requires at least two sites.")
     bond_multiplicity = int(bond_multiplicity)
     if bond_multiplicity < 1:
         raise ValueError("bond_multiplicity must be a positive integer.")
+
+    site = FullyReducedSpatialOrbitalSite()
+    phys_sectors = tuple(site.qn)
+    phys_dims = {sector: 1 for sector in phys_sectors}
+    vacuum = phys_sectors[0]
+
+    if target_sector is None:
+        if nsites % 2 == 0:
+            target_sector = half_filled_singlet_sector(nsites)
+        else:
+            target_sector = spatial_target_sector(nsites, 1)
+
+    forward = _forward_reachable(phys_sectors, nsites, vacuum)
+    backward = _backward_reachable(phys_sectors, forward, target_sector)
+    bond_sector_sets = [
+        tuple(sorted(forward[i].intersection(backward[i])))
+        for i in range(nsites + 1)
+    ]
+    if bond_sector_sets[0] != (vacuum,):
+        raise ValueError("Failed to anchor the left boundary to the vacuum sector.")
+    if bond_sector_sets[-1] != (target_sector,):
+        raise ValueError(
+            f"Target sector {target_sector!r} is not reachable with {nsites} reduced spatial sites."
+        )
+
+    rng = np.random.default_rng(seed)
+    tensors = []
+    for site_index in range(nsites):
+        left_sectors = bond_sector_sets[site_index]
+        right_sectors = bond_sector_sets[site_index + 1]
+        left_qns = (
+            [left_sectors[0]]
+            if site_index == 0
+            else [sector for sector in left_sectors for _ in range(bond_multiplicity)]
+        )
+        right_qns = (
+            [right_sectors[0]]
+            if site_index == nsites - 1
+            else [sector for sector in right_sectors for _ in range(bond_multiplicity)]
+        )
+
+        data = {}
+        for q_left in left_sectors:
+            d_left = _sector_multiplicity(left_qns, q_left)
+            for q_phys in phys_sectors:
+                fused = _fuse_spatial_sectors(q_left, q_phys)
+                for q_right in right_sectors:
+                    if q_right not in fused:
+                        continue
+                    d_right = _sector_multiplicity(right_qns, q_right)
+                    d_phys = phys_dims[q_phys]
+                    data[(q_left, q_phys, q_right)] = rng.normal(
+                        scale=scale,
+                        size=(d_left, d_phys, d_right),
+                    ).astype(dtype)
+
+        tensors.append(
+            NonabelianTensor(
+                data=data,
+                qns=[left_qns, list(phys_sectors), right_qns],
+                dirs=[-1, 1, 1],
+                metadata={"physical_basis": "fully_reduced_su2"},
+            )
+        )
+
+    return tensors

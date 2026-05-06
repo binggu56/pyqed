@@ -1295,6 +1295,136 @@ def _sigma_compact_conn_numba(
 
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
+def _sigma_compact_derivative_batch_numba(
+    h1_batch,
+    eri_batch,
+    c,
+    Binary,
+    I_A,
+    J_A,
+    p_A,
+    q_A,
+    phase_A,
+    I_B,
+    J_B,
+    p_B,
+    q_B,
+    phase_B,
+    I_AA,
+    J_AA,
+    p_AA,
+    q_AA,
+    r_AA,
+    s_AA,
+    phase_AA,
+    I_BB,
+    J_BB,
+    p_BB,
+    q_BB,
+    r_BB,
+    s_BB,
+    phase_BB,
+    I_AB,
+    J_AB,
+    p_AB,
+    q_AB,
+    r_AB,
+    s_AB,
+    phase_AB,
+):
+    """
+    Batched compact direct-CI sigma for orbital-derivative active integrals.
+
+    Each batch item is a spin-independent active-space Hamiltonian derivative.
+    Keeping the orbital-variable loop inside Numba removes thousands of Python
+    calls in the exact orbital-gradient path.
+    """
+    n_batch = h1_batch.shape[0]
+    n_det, _, n_mo = Binary.shape
+    sigma = np.zeros((n_batch, n_det), dtype=c.dtype)
+
+    for b in prange(n_batch):
+        h1 = h1_batch[b]
+        eri = eri_batch[b]
+
+        for det in range(n_det):
+            val = 0.0
+            for p in range(n_mo):
+                if Binary[det, 0, p]:
+                    val += h1[p, p]
+                if Binary[det, 1, p]:
+                    val += h1[p, p]
+
+            for p in range(n_mo):
+                if Binary[det, 0, p]:
+                    for q in range(n_mo):
+                        if Binary[det, 0, q]:
+                            val += 0.5 * (eri[p, p, q, q] - eri[p, q, q, p])
+                        if Binary[det, 1, q]:
+                            val += 0.5 * eri[p, p, q, q]
+
+                if Binary[det, 1, p]:
+                    for q in range(n_mo):
+                        if Binary[det, 1, q]:
+                            val += 0.5 * (eri[p, p, q, q] - eri[p, q, q, p])
+                        if Binary[det, 0, q]:
+                            val += 0.5 * eri[p, p, q, q]
+
+            sigma[b, det] = val * c[det]
+
+        for k in range(I_A.shape[0]):
+            p = p_A[k]
+            q = q_A[k]
+            sign = phase_A[k]
+            j = J_A[k]
+            val = -sign * h1[p, q]
+            for r in range(n_mo):
+                if Binary[j, 0, r] and r != q:
+                    val -= sign * (eri[p, q, r, r] - eri[p, r, r, q])
+                if Binary[j, 1, r]:
+                    val -= sign * eri[p, q, r, r]
+            sigma[b, I_A[k]] += val * c[j]
+
+        for k in range(I_B.shape[0]):
+            p = p_B[k]
+            q = q_B[k]
+            sign = phase_B[k]
+            j = J_B[k]
+            val = -sign * h1[p, q]
+            for r in range(n_mo):
+                if Binary[j, 1, r] and r != q:
+                    val -= sign * (eri[p, q, r, r] - eri[p, r, r, q])
+                if Binary[j, 0, r]:
+                    val -= sign * eri[p, q, r, r]
+            sigma[b, I_B[k]] += val * c[j]
+
+        for k in range(I_AA.shape[0]):
+            sigma[b, I_AA[k]] += (
+                phase_AA[k]
+                * (eri[p_AA[k], q_AA[k], r_AA[k], s_AA[k]]
+                   - eri[p_AA[k], s_AA[k], r_AA[k], q_AA[k]])
+                * c[J_AA[k]]
+            )
+
+        for k in range(I_BB.shape[0]):
+            sigma[b, I_BB[k]] += (
+                phase_BB[k]
+                * (eri[p_BB[k], q_BB[k], r_BB[k], s_BB[k]]
+                   - eri[p_BB[k], s_BB[k], r_BB[k], q_BB[k]])
+                * c[J_BB[k]]
+            )
+
+        for k in range(I_AB.shape[0]):
+            sigma[b, I_AB[k]] += (
+                phase_AB[k]
+                * eri[p_AB[k], q_AB[k], r_AB[k], s_AB[k]]
+                * c[J_AB[k]]
+            )
+
+    return sigma
+
+
+@njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_single_values_from_factors(J, p_idx, q_idx, phase, h1, pair_factors, Binary, spin):
     n_exc = len(J)
     n_mo = h1.shape[0]
@@ -1850,7 +1980,7 @@ class CASCI(mcscf.casci.CASCI):
         """
         if self.binary is None:
             raise ValueError('Build the determinant basis before requesting Slater-Condon tables.')
-        if self.SC1 is None or self.SC2 is None:
+        if getattr(self, "SC1", None) is None or getattr(self, "SC2", None) is None:
             self.SC1, self.SC2 = SlaterCondon(self.binary)
         return self.SC1, self.SC2
 
@@ -2628,8 +2758,8 @@ class CASCI(mcscf.casci.CASCI):
 
         """
 
-        self.ensure_slater_condon_cache()
         ci = self.ci[state_id]
+        sc1 = getattr(self, "SC1", None)
         # if representation.lower() == 'ao':
         #     C = self.mf.mo_coeff
         #     h1e = ao2mo(h1e, C)
@@ -2650,7 +2780,7 @@ class CASCI(mcscf.casci.CASCI):
             if ncore > 0:
                 for i in range(ncore):
                     D[i, i] = 2
-            D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
+            D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, sc1)
 
             return D
 
@@ -2660,11 +2790,11 @@ class CASCI(mcscf.casci.CASCI):
             if ncore > 0:
                 for i in range(ncore):
                     D[i, i] = 2
-            D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
+            D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, sc1)
 
             return D
         else:
-            return make_rdm1(ci, self.binary, self.SC1)
+            return make_rdm1(ci, self.binary, sc1)
 
     def make_rdm1s(self, state_id):
         """
@@ -2680,8 +2810,7 @@ class CASCI(mcscf.casci.CASCI):
 
         """
         ci = self.ci[state_id]
-        self.ensure_slater_condon_cache()
-        return mcscf.casci.make_rdm1s(ci, self.binary, self.SC1)
+        return mcscf.casci.make_rdm1s(ci, self.binary, getattr(self, "SC1", None))
 
     def make_rdm2(self, state_id=0, with_core=False, with_vir=False):
         """
@@ -2701,8 +2830,9 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-        self.ensure_slater_condon_cache()
         ci = self.ci[state_id]
+        sc1 = getattr(self, "SC1", None)
+        sc2 = getattr(self, "SC2", None)
 
 
         if with_core: # we probably never need this!
@@ -2713,7 +2843,7 @@ class CASCI(mcscf.casci.CASCI):
             nmo = ncore + ncas
 
             if ncore == 0:
-                return make_rdm2(ci, self.binary, self.SC1, self.SC2)
+                return make_rdm2(ci, self.binary, sc1, sc2)
 
             D = np.zeros((nmo, nmo, nmo, nmo))
 
@@ -2731,13 +2861,13 @@ class CASCI(mcscf.casci.CASCI):
                 D[ncore:ncore+ncas, i, ncore:ncore+ncas, i] = -dm1
 
             D[ncore:ncore+ncas, ncore:ncore+ncas, ncore:ncore+ncas, ncore:ncore+ncas]=\
-                make_rdm2(ci, self.binary, self.SC1, self.SC2)
+                make_rdm2(ci, self.binary, sc1, sc2)
 
             return D
 
         else: #active space DM
 
-            return make_rdm2(ci, self.binary, self.SC1, self.SC2)
+            return make_rdm2(ci, self.binary, sc1, sc2)
 
 
     def contract_with_rdm2(self, h2e, state_id=0):
@@ -2872,11 +3002,10 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-        self.ensure_slater_condon_cache()
         cibra = self.ci[bra_id]
         ciket = self.ci[ket_id]
 
-        return make_tdm1(cibra, ciket, self.binary, self.SC1)
+        return make_tdm1(cibra, ciket, self.binary, getattr(self, "SC1", None))
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
@@ -2889,10 +3018,15 @@ class CASCI(mcscf.casci.CASCI):
               p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
               |\Psi_\alpha>
         """
-        self.ensure_slater_condon_cache()
         cibra = self.ci[bra_id]
         ciket = self.ci[ket_id]
-        return _make_tdm2_dense(cibra, ciket, self.binary, self.SC1, self.SC2)
+        return _make_tdm2_dense(
+            cibra,
+            ciket,
+            self.binary,
+            getattr(self, "SC1", None),
+            getattr(self, "SC2", None),
+        )
 
 
 

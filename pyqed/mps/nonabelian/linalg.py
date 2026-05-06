@@ -198,6 +198,15 @@ def normalize_max_bond_mode(mode, *, default="reduced"):
     normalized = str(mode).strip().lower().replace("-", "_")
     if normalized in {"reduced", "multiplet", "multiplets", "channel", "channels"}:
         return "reduced"
+    if normalized in {
+        "per_sector",
+        "sector",
+        "sectors",
+        "per_irrep",
+        "per_symmetry_sector",
+        "block2",
+    }:
+        return "per_sector"
     if normalized in {"state", "states", "physical", "full", "irrep"}:
         return "states"
     raise ValueError(f"Unsupported max_bond_mode {mode!r}.")
@@ -232,13 +241,25 @@ def select_kept_singular_values(items, max_bond, *, mode):
     if mode == "reduced":
         return ordered[:budget]
 
+    if mode == "per_sector":
+        counts = {}
+        kept = []
+        for item in ordered:
+            sector = item[1]
+            count = counts.get(sector, 0)
+            if count >= budget:
+                continue
+            kept.append(item)
+            counts[sector] = count + 1
+        return kept
+
     if mode != "states":
         raise ValueError(f"Unsupported max_bond_mode {mode!r}.")
 
     states = {0: (0.0, ())}
     for idx, item in enumerate(ordered):
         weight = int(item[3])
-        value = float(item[0] ** 2)
+        value = float(weight * item[0] ** 2)
         updated = dict(states)
         for used, (score, chosen) in states.items():
             new_used = used + weight
@@ -272,7 +293,7 @@ def select_kept_singular_values(items, max_bond, *, mode):
                 best_used = used
 
     if not best_choice:
-        best_idx = max(range(len(ordered)), key=lambda i: (ordered[i][0] ** 2, -ordered[i][3], -i))
+        best_idx = max(range(len(ordered)), key=lambda i: (ordered[i][3] * ordered[i][0] ** 2, -ordered[i][3], -i))
         return [ordered[best_idx]]
     return [ordered[i] for i in best_choice]
 
@@ -335,10 +356,10 @@ def truncate_reduced_svds(sector_svds, *, cutoff=1.0e-10, max_bond=None, mode="r
     if not sv_list:
         raise ValueError("All non-Abelian singular values were truncated.")
 
-    sv_list.sort(reverse=True, key=lambda item: item[0])
-    full_sq_norm = sum(sval**2 for sval, _, _, _ in sv_list)
+    sv_list.sort(reverse=True, key=lambda item: item[3] * item[0] ** 2)
+    full_sq_norm = sum(weight * sval**2 for sval, _, _, weight in sv_list)
     kept_items = select_kept_singular_values(sv_list, max_bond, mode=mode)
-    kept_sq_norm = sum(sval**2 for sval, _, _, _ in kept_items)
+    kept_sq_norm = sum(weight * sval**2 for sval, _, _, weight in kept_items)
     trunc_err = 0.0 if full_sq_norm <= 1.0e-15 else 1.0 - kept_sq_norm / full_sq_norm
 
     kept_indices_by_sector = {}

@@ -610,35 +610,45 @@ def recouple_fused_leg(tensor, axis, target_scheme):
         entries = sorted(pipe.entries_for_sector(fused_sector), key=lambda entry: entry.slot)
         if not entries:
             continue
-        child_combo = entries[0].child_sectors
-        if any(entry.child_sectors != child_combo for entry in entries):
-            raise ValueError(
-                "recouple_fused_leg currently requires a fixed child-sector tuple per fused-sector block."
-            )
-        bond_space_source = fusion_leg.bond_space(child_combo, fused_sector, scheme=source_scheme)
-        bond_space_target = fusion_leg.bond_space(child_combo, fused_sector, scheme=target_scheme)
-        recouple = bond_space_source.recouple_to(bond_space_target)
-        if recouple.shape[0] != len(entries):
-            raise ValueError(
-                f"Recoupling multiplicity mismatch for fused sector {fused_sector!r}: "
-                f"matrix has {recouple.shape[0]} rows but packed tensor has {len(entries)} channels."
-            )
-        fused_dim = bond_space_source.fused_dim
         before = block.shape[:axis]
         after = block.shape[axis + 1:]
-        tail_dim = int(np.prod(after or (1,), dtype=int))
-        stacked = []
-        for entry in entries:
-            slicer = [slice(None)] * block.ndim
-            slicer[axis] = slice(entry.offset, entry.offset + entry.local_dim)
-            sliced = block[tuple(slicer)]
-            stacked.append(sliced.reshape(before + (fused_dim,) + after))
-        stacked = np.stack(stacked, axis=axis)
         lead_dim = int(np.prod(before or (1,), dtype=int))
-        stacked = stacked.reshape((lead_dim, len(entries), fused_dim, tail_dim))
-        rotated = np.einsum("ji,lifb->ljfb", recouple, stacked, optimize=True)
-        rotated = rotated.reshape(before + (len(entries) * fused_dim,) + after)
-        new_data[key] = rotated
+        tail_dim = int(np.prod(after or (1,), dtype=int))
+        rotated_block = np.zeros_like(block)
+
+        entries_by_child_combo = {}
+        for entry in entries:
+            entries_by_child_combo.setdefault(entry.child_sectors, []).append(entry)
+
+        for child_combo, child_entries in entries_by_child_combo.items():
+            child_entries = sorted(child_entries, key=lambda entry: entry.slot)
+            bond_space_source = fusion_leg.bond_space(child_combo, fused_sector, scheme=source_scheme)
+            bond_space_target = fusion_leg.bond_space(child_combo, fused_sector, scheme=target_scheme)
+            recouple = bond_space_source.recouple_to(bond_space_target)
+            if recouple.shape != (len(child_entries), len(child_entries)):
+                raise ValueError(
+                    f"Recoupling multiplicity mismatch for child sectors {child_combo!r} "
+                    f"and fused sector {fused_sector!r}: matrix has shape {recouple.shape} "
+                    f"but packed tensor has {len(child_entries)} channels."
+                )
+            fused_dim = bond_space_source.fused_dim
+            stacked = []
+            for entry in child_entries:
+                slicer = [slice(None)] * block.ndim
+                slicer[axis] = slice(entry.offset, entry.offset + entry.local_dim)
+                sliced = block[tuple(slicer)]
+                stacked.append(sliced.reshape(before + (fused_dim,) + after))
+            stacked = np.stack(stacked, axis=axis)
+            stacked = stacked.reshape((lead_dim, len(child_entries), fused_dim, tail_dim))
+            rotated = np.einsum("ji,lifb->ljfb", recouple, stacked, optimize=True)
+            for target_index, entry in enumerate(child_entries):
+                piece = rotated[:, target_index, :, :].reshape(
+                    before + (entry.local_dim,) + after
+                )
+                slicer = [slice(None)] * block.ndim
+                slicer[axis] = slice(entry.offset, entry.offset + entry.local_dim)
+                rotated_block[tuple(slicer)] = piece
+        new_data[key] = rotated_block
 
     new_pipe = FusionPipe.from_entries(
         child_legs=pipe.child_legs,

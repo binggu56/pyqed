@@ -88,6 +88,8 @@ _BUILTIN_OPTION_SPECS = (
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 0.0),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "dense"),
+    ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
+    ("ri_metric_tol", "builtin_ri_metric_tol", "native_ri_metric_tol", float, 1e-10),
     ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
     ("build_factors", "builtin_build_factors", "native_build_factors", bool, False),
@@ -132,6 +134,29 @@ def _pop_builtin_options(kwargs):
     return options
 
 
+def _normalize_eri_representation(value):
+    value = str(value).lower().replace("_", "-")
+    aliases = {
+        "factor": "factors",
+        "factored": "factors",
+        "factorized": "factors",
+        "cholesky": "factors",
+        "cd": "factors",
+        "df": "ri",
+        "density-fit": "ri",
+        "density-fitting": "ri",
+        "ri": "ri",
+        "dense-factors": "dense+factors",
+        "dense-plus-factors": "dense+factors",
+        "dense+factor": "dense+factors",
+        "dense-ri": "dense+ri",
+        "dense+df": "dense+ri",
+        "dense-density-fit": "dense+ri",
+        "dense-density-fitting": "dense+ri",
+    }
+    return aliases.get(value, value)
+
+
 def _normalize_builtin_options(options, strict=False):
     """
     Normalize a build-time builtin options mapping.
@@ -143,6 +168,9 @@ def _normalize_builtin_options(options, strict=False):
 
     tmp = {"builtin_options": dict(options)}
     normalized = _pop_builtin_options(tmp)
+    normalized["eri_representation"] = _normalize_eri_representation(
+        normalized["eri_representation"]
+    )
     if strict and tmp:
         unknown = ", ".join(sorted(tmp))
         raise ValueError(f"Unknown builtin build option(s): {unknown}")
@@ -1123,6 +1151,9 @@ class Molecule:
         Apply builtin backend options and keep legacy aliases in sync.
         """
         self.builtin_options = dict(options)
+        self.builtin_options["eri_representation"] = _normalize_eri_representation(
+            self.builtin_options["eri_representation"]
+        )
         self.builtin_coord_type = self.builtin_options["coord_type"]
         self.builtin_parallel = self.builtin_options["parallel"]
         self.builtin_eri_workers = self.builtin_options["eri_workers"]
@@ -1130,6 +1161,8 @@ class Molecule:
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
         self.builtin_eri_backend = self.builtin_options["eri_backend"]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
+        self.builtin_auxbasis = self.builtin_options["auxbasis"]
+        self.builtin_ri_metric_tol = self.builtin_options["ri_metric_tol"]
         self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
         self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
         self.builtin_build_factors = self.builtin_options["build_factors"]
@@ -1143,6 +1176,8 @@ class Molecule:
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
         self.native_eri_backend = self.builtin_eri_backend
         self.native_eri_representation = self.builtin_eri_representation
+        self.native_auxbasis = self.builtin_auxbasis
+        self.native_ri_metric_tol = self.builtin_ri_metric_tol
         self.native_low_rank_tol = self.builtin_low_rank_tol
         self.native_low_rank_max_rank = self.builtin_low_rank_max_rank
         self.native_build_factors = self.builtin_build_factors
@@ -1162,7 +1197,7 @@ class Molecule:
 
         return np.einsum('z,zx->x', charges, coords) / charges.sum()
 
-    def build(self, driver='builtin', options=None):
+    def build(self, driver='builtin', options=None, eri=None, auxbasis=None):
         """
         build molecular integrals
 
@@ -1179,6 +1214,11 @@ class Molecule:
             Backend-specific build options. For ``driver='builtin'``, use short
             keys such as ``eri_representation``, ``low_rank_tol``,
             ``eri_screen_tol``, ``parallel``, and ``eri_workers``.
+        eri : {'dense', 'factors', 'dense+factors', 'ri', 'dense+ri'}, optional
+            Short alias for the builtin ``eri_representation`` option.
+        auxbasis : str, optional
+            Short alias for the builtin ``auxbasis`` option used by
+            ``eri='ri'`` and ``eri='dense+ri'``.
 
         Returns
         -------
@@ -1190,6 +1230,22 @@ class Molecule:
         driver = driver.lower()
         if driver in ('native', 'own', 'pyqed'):
             driver = 'builtin'
+
+        if eri is not None:
+            if driver != 'builtin':
+                raise ValueError(
+                    "build(eri=...) is only supported for driver='builtin' or its 'native' alias."
+                )
+            options = {} if options is None else dict(options)
+            options["eri_representation"] = _normalize_eri_representation(eri)
+
+        if auxbasis is not None:
+            if driver != 'builtin':
+                raise ValueError(
+                    "build(auxbasis=...) is only supported for driver='builtin' or its 'native' alias."
+                )
+            options = {} if options is None else dict(options)
+            options["auxbasis"] = auxbasis
 
         if options is not None:
             if driver != 'builtin':

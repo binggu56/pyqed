@@ -11,8 +11,15 @@ from pyqed.qchem import (
     SecondOrderCASSCF,
 )
 from pyqed.qchem.mcscf.direct_ci import CASCI
+from pyqed.qchem.mcscf.casci import (
+    _get_mf_cholesky_factors,
+    transform_eri_factors_to_mo_pair,
+)
 from pyqed.qchem.mcscf.orbopt import (
     davidson_augmented_hessian_direction,
+    generalized_fock_from_factors,
+    orbital_gradient,
+    pack_nonredundant,
     shifted_hessian_trust_step,
 )
 
@@ -846,6 +853,7 @@ def test_second_order_casscf_factorized_qn_avoids_dense_mo_eri(monkeypatch):
     assert np.isfinite(factor.e_tot[0])
     assert factor.use_cholesky_integrals
     assert factor.casci.use_cholesky_integrals
+    assert factor.micro_history[0]["orbital_hessian_model"] == "factorized_analytic_integral_response"
 
 
 def test_second_order_casscf_factorized_full_matches_dense_on_lih():
@@ -905,6 +913,43 @@ def test_second_order_casscf_factorized_full_default_avoids_dense_mo_eri(monkeyp
     assert np.isfinite(factor.e_tot[0])
     assert factor.use_cholesky_integrals
     assert factor.casci.use_cholesky_integrals
+
+
+def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
+    atom = "H 0 0 0; H 0 0 0.9; H 0 0 1.8; H 0 0 2.7"
+    mol_dense = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
+    mol_dense.build(driver="gbasis-pyscf")
+    mol_factor = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
+    mol_factor.build(driver="gbasis-pyscf")
+
+    mf_dense = mol_dense.RHF().run()
+    mf_factor = mol_factor.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
+    common = dict(
+        ncas=4,
+        nelecas=4,
+        max_cycle=6,
+        max_micro_cycle=2,
+        conv_tol=1.0e-6,
+        conv_tol_grad=1.0e-4,
+        conv_tol_grad_relaxed=1.0e-3,
+        auto_active_restarts=False,
+    )
+
+    dense = (
+        SecondOrderCASSCF(mf_dense, **common)
+        .state_average([0.5, 0.5])
+        .run(nstates=2, use_cholesky=False)
+    )
+    factor = (
+        SecondOrderCASSCF(mf_factor, **common)
+        .state_average([0.5, 0.5])
+        .run(nstates=2)
+    )
+
+    assert factor.use_cholesky_integrals
+    assert factor.coupling == "full"
+    assert str(factor.casci.solver_backend).startswith("direct_ci_factor_conn")
+    np.testing.assert_allclose(factor.e_tot, dense.e_tot, atol=1.0e-8)
 
 
 def test_second_order_simultaneous_reduced_alias_uses_partial_path():
@@ -1151,3 +1196,43 @@ def test_second_order_exact_orbital_gradient_matches_energy_finite_difference():
     finite_difference = (e_plus - e_minus) / (2.0 * eps)
 
     np.testing.assert_allclose(np.dot(grad_vec, step), finite_difference, atol=1.0e-7)
+
+
+def test_second_order_factorized_fock_gradient_matches_exact_gradient():
+    mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
+    mol.build(driver="gbasis")
+    mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
+    driver = SecondOrderCASSCF(mf, ncas=2, nelecas=2, coupling="qn")
+    driver.nstates = 1
+    driver.state_id = 0
+    driver.use_cholesky_integrals = True
+
+    mo_coeff = mf.mo_coeff
+    h1_mo = mf.get_hcore_mo(mo_coeff)
+    pair_factors = transform_eri_factors_to_mo_pair(
+        _get_mf_cholesky_factors(mf),
+        mo_coeff,
+    )
+    casci = driver._make_factor_integral_casci(h1_mo, pair_factors, mo_coeff, 1)
+    dm1_occ, dm2_occ = driver._effective_rdms_occ(casci, 0)
+    nocc_like = casci.ncore + casci.ncas
+    fock = generalized_fock_from_factors(
+        h1_mo,
+        pair_factors[:, :, :nocc_like],
+        dm1_occ,
+        dm2_occ,
+    )
+    fock_grad = pack_nonredundant(
+        orbital_gradient(fock),
+        casci.ncore,
+        casci.ncas,
+        mf.nmo,
+    )
+    exact_grad = driver._factor_exact_orbital_gradient_vector(
+        casci,
+        h1_mo,
+        pair_factors,
+        casci.ci[0],
+    )
+
+    np.testing.assert_allclose(fock_grad, exact_grad, atol=1.0e-10)

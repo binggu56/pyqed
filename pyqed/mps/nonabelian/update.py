@@ -7,6 +7,7 @@ Minimal two-site update helpers for fixed-layout non-Abelian tensors.
 from __future__ import annotations
 
 from collections import defaultdict
+import time
 
 import numpy as np
 
@@ -260,6 +261,8 @@ def _prefer_reduced_local_operator(operator, norm_operator=None):
     if operator is not None and getattr(operator, "aux_packed_matvec", None) is not None:
         operator = LocalOperator(
             packed_matvec=operator.aux_packed_matvec,
+            packed_block_matrices=getattr(operator, "packed_block_matrices", None),
+            basis=getattr(operator, "basis", None),
             diag=operator.diag,
             name=operator.name,
             identity_like=getattr(operator, "identity_like", False),
@@ -267,6 +270,7 @@ def _prefer_reduced_local_operator(operator, norm_operator=None):
     elif operator is not None and getattr(operator, "aux_reduced_matvec", None) is not None:
         operator = LocalOperator(
             reduced_matvec=operator.aux_reduced_matvec,
+            basis=getattr(operator, "basis", None),
             diag=operator.diag,
             name=operator.name,
             identity_like=getattr(operator, "identity_like", False),
@@ -274,6 +278,8 @@ def _prefer_reduced_local_operator(operator, norm_operator=None):
     if norm_operator is not None and getattr(norm_operator, "aux_packed_matvec", None) is not None:
         norm_operator = LocalOperator(
             packed_matvec=norm_operator.aux_packed_matvec,
+            packed_block_matrices=getattr(norm_operator, "packed_block_matrices", None),
+            basis=getattr(norm_operator, "basis", None),
             diag=norm_operator.diag,
             name=norm_operator.name,
             identity_like=getattr(norm_operator, "identity_like", False),
@@ -281,6 +287,7 @@ def _prefer_reduced_local_operator(operator, norm_operator=None):
     elif norm_operator is not None and getattr(norm_operator, "aux_reduced_matvec", None) is not None:
         norm_operator = LocalOperator(
             reduced_matvec=norm_operator.aux_reduced_matvec,
+            basis=getattr(norm_operator, "basis", None),
             diag=norm_operator.diag,
             name=norm_operator.name,
             identity_like=getattr(norm_operator, "identity_like", False),
@@ -371,6 +378,7 @@ def two_site_update(
     max_bond_mode="reduced",
     cutoff=1e-10,
     absorb="right",
+    profile=False,
 ):
     """
     Perform one minimal non-Abelian two-site update step.
@@ -412,12 +420,28 @@ def two_site_update(
     if n_modes > 1:
         raise ValueError("Specify only one of solver, optimized_two_site, or local_operator.")
 
+    timing = {
+        "merge_expand": 0.0,
+        "operator_factory": 0.0,
+        "local_solve": 0.0,
+        "optimized_expand": 0.0,
+        "svd": 0.0,
+        "total": 0.0,
+    } if profile else None
+    total_t0 = time.perf_counter() if profile else None
+
+    t0 = time.perf_counter() if profile else None
     merged = _expand_two_site_support(A, B, merge_mps_sites(A, B))
+    if profile:
+        timing["merge_expand"] += time.perf_counter() - t0
 
     local_objective = {}
     local_guess_used = False
     if solver is not None:
+        t0 = time.perf_counter() if profile else None
         optimized, local_objective = _normalize_solver_output(solver(merged))
+        if profile:
+            timing["local_solve"] += time.perf_counter() - t0
     elif local_operator is not None:
         solver_kwargs = dict(local_solver_kwargs or {})
         if isinstance(solver_kwargs.get("guess"), NonabelianTensor):
@@ -436,6 +460,7 @@ def two_site_update(
                 rng=mixer_rng,
             )
             local_guess_used = True
+        t0 = time.perf_counter() if profile else None
         operator_spec = (
             local_operator(merged)
             if getattr(local_operator, "_is_local_operator_factory", False)
@@ -444,19 +469,25 @@ def two_site_update(
         root_target_operator = solver_kwargs.get("root_target_operator")
         if getattr(root_target_operator, "_is_local_operator_factory", False):
             solver_kwargs["root_target_operator"] = root_target_operator(merged)
+        if profile:
+            timing["operator_factory"] += time.perf_counter() - t0
         operator_spec, norm_operator, canonical_norm = _normalize_local_operator_spec(operator_spec)
         if prefer_reduced_local_operator:
             operator_spec, norm_operator = _prefer_reduced_local_operator(
                 operator_spec,
                 norm_operator,
             )
+        t0 = time.perf_counter() if profile else None
         optimized, local_objective = solve_local_two_site(
             merged,
             operator_spec,
             norm_operator=norm_operator,
             canonical_norm=canonical_norm,
+            profile=profile,
             **solver_kwargs,
         )
+        if profile:
+            timing["local_solve"] += time.perf_counter() - t0
     elif optimized_two_site is not None:
         optimized = optimized_two_site
     else:
@@ -465,12 +496,16 @@ def two_site_update(
     if not isinstance(optimized, NonabelianTensor) or optimized.rank != 4:
         raise ValueError("two_site_update requires a rank-4 NonabelianTensor as the optimized two-site tensor.")
     if optimized is not merged:
+        t0 = time.perf_counter() if profile else None
         optimized = _expand_two_site_support(A, B, optimized)
+        if profile:
+            timing["optimized_expand"] += time.perf_counter() - t0
 
     optimized_roots = None
     if isinstance(local_objective, dict):
         optimized_roots = local_objective.pop("optimized_roots", None)
     if optimized_roots is not None:
+        t0 = time.perf_counter() if profile else None
         optimized_roots = [
             _expand_two_site_support(A, B, root) if root is not merged else root
             for root in optimized_roots
@@ -484,9 +519,12 @@ def two_site_update(
             cutoff=cutoff,
             absorb=absorb,
         )
+        if profile:
+            timing["svd"] += time.perf_counter() - t0
         local_objective["state_averaged_svd"] = True
     else:
         root_site_pairs = None
+        t0 = time.perf_counter() if profile else None
         left, right, singular_values, trunc_err, kept = svd_two_site(
             optimized,
             bond_coupling=bond_coupling,
@@ -495,13 +533,31 @@ def two_site_update(
             cutoff=cutoff,
             absorb=absorb,
         )
+        if profile:
+            timing["svd"] += time.perf_counter() - t0
     kept_states = sum(
         sector_state_weight(q_mid) * int(block.shape[0])
         for q_mid, block in singular_values.items()
     )
+    if isinstance(local_objective, dict):
+        local_objective = dict(local_objective)
+        local_objective.setdefault("trunc_err", float(trunc_err))
+        if isinstance(kept, dict):
+            objective_kept = {key: list(value) for key, value in kept.items()}
+        else:
+            objective_kept = int(kept)
+        local_objective.setdefault("kept", objective_kept)
+        local_objective.setdefault("kept_states", int(kept_states))
     if local_guess_used:
         local_objective = dict(local_objective)
         local_objective["local_guess_used"] = True
+    if profile:
+        timing["total"] = time.perf_counter() - total_t0
+        local_objective = dict(local_objective)
+        local_objective["update_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
     return {
         "merged": merged,
         "optimized": optimized,
