@@ -66,9 +66,12 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
 
     assert mol.eri is None
     assert mol.eri_factors is not None
-    assert mol.eri_factors.shape == (30, mol.nao, mol.nao)
+    assert mol.eri_factors.shape == (50, mol.nao, mol.nao)
     assert mol._builtin_build_info["factor_builder"] == "native-ri"
-    assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-rifit"
+    assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-jkfit"
+    assert mol._builtin_build_info["ri"]["metric_solver"] == "cholesky"
+    assert mol._builtin_build_info["ri"]["storage"] == "full"
+    assert mol._builtin_build_info["ri"]["tensor_builder"] == "cython-kernel-packed"
 
 
 def test_builtin_native_ri_accepts_auxbasis_keyword():
@@ -85,6 +88,7 @@ def test_builtin_native_ri_accepts_auxbasis_keyword():
     assert mol.eri is None
     assert mol.eri_factors.shape == (30, mol.nao, mol.nao)
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-rifit"
+    assert mol._builtin_build_info["ri"]["storage"] == "full"
 
 
 def test_builtin_native_ri_defaults_pople_to_cc_pvdz_jkfit():
@@ -101,6 +105,65 @@ def test_builtin_native_ri_defaults_pople_to_cc_pvdz_jkfit():
     assert mol.eri is None
     assert mol.eri_factors is not None
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-jkfit"
+
+
+def test_builtin_native_ri_purpose_can_prefer_rifit():
+    _use_source_tree_pyqed()
+    from pyqed.qchem import Molecule
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="cc-pvdz",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="ri", options={"ri_purpose": "ri"})
+
+    assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-rifit"
+    assert mol._builtin_build_info["ri"]["purpose"] == "ri"
+    assert mol._builtin_build_info["ri"]["storage"] == "packed"
+
+
+def test_builtin_native_ri_packed_storage_option():
+    _use_source_tree_pyqed()
+    from pyqed.qchem import Molecule
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="cc-pvdz",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="ri", options={"ri_storage": "packed"})
+
+    assert mol._builtin_build_info["ri"]["storage"] == "packed"
+    assert mol.eri_factors.pair_shape == (50, mol.nao * (mol.nao + 1) // 2)
+
+
+def test_builtin_native_ri_full_storage_option_matches_packed_jk():
+    _use_source_tree_pyqed()
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.basis import contract_jk_ri
+
+    atom = "H 0 0 0; H 0 0 0.74"
+    packed = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
+    packed.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+
+    full = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
+    full.build(
+        driver="builtin",
+        eri="ri",
+        auxbasis="cc-pvdz-rifit",
+        options={"ri_storage": "full"},
+    )
+
+    rng = np.random.default_rng(123)
+    dm = rng.normal(size=(packed.nao, packed.nao))
+    dm = dm + dm.T
+    vj_packed, vk_packed = contract_jk_ri(packed.eri_factors, dm, packed.nao)
+    vj_full, vk_full = contract_jk_ri(full.eri_factors, dm, full.nao)
+
+    assert full._builtin_build_info["ri"]["storage"] == "full"
+    np.testing.assert_allclose(vj_packed, vj_full, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(vk_packed, vk_full, atol=1e-11, rtol=1e-11)
 
 
 def test_builtin_native_ri_reconstructs_dense_eri_to_auxbasis_accuracy():

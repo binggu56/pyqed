@@ -42,7 +42,8 @@ def _get_uhf_eri_factors(mf):
 def _transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
     if mo_right is None:
         mo_right = mo_left
-    return contract('Pmn,mp,nq->Ppq', eri_factors, mo_left.conj(), mo_right)
+    from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
+    return transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
 
 
 def _reference_density_rhf(mo_coeff, nocc):

@@ -23,7 +23,7 @@ A typical native calculation follows this structure:
        unit="angstrom",
        basis="sto-3g",
    )
-   mol.build(driver="builtin", eri="ri")
+   mol.build(driver="builtin", eri="auto")
 
    mf = mol.RHF().run()
    print(mf.e_tot)
@@ -54,13 +54,23 @@ The molecular build step can use different integral representations depending
 on the calculation:
 
 * ``driver="builtin"`` uses the native integral path.
-* ``eri="dense"`` stores the four-index electron repulsion tensor explicitly.
+* ``eri="auto"`` uses compact eight-fold exact storage for small systems and
+  prefers native RI factors for larger systems when an auxiliary basis is
+  available.
+* ``eri="dense", aosym="s1"`` stores the four-index electron repulsion tensor
+  explicitly.
+* ``eri="dense", aosym="s4"`` stores the tensor in unique AO-pair form.
+* ``eri="dense", aosym="s8"`` stores only unique AO-pair-pair values,
+  exploiting the full eight-fold ERI permutation symmetry for memory.
+* ``eri="direct"`` avoids dense AO ERI construction and uses compact ``s8``
+  storage for cartesian J/K builds.
 * ``eri="factors"`` stores a Cholesky/factorized representation when available.
 * ``eri="dense+factors"`` keeps both representations for algorithms that need
   dense tensors and factorized contractions.
 * ``eri="ri"`` builds native density-fitting factors from bundled auxiliary
-  basis sets, without using PySCF. For example, ``cc-pVDZ`` automatically uses
-  ``cc-pVDZ-RIFIT`` when available.
+  basis sets, without using PySCF. The default ``ri_purpose="jk"`` prefers
+  JKFIT sets for SCF when available; use ``options={"ri_purpose": "ri"}`` to
+  prefer RIFIT sets for correlation-style fitting.
 * ``eri="dense+ri"`` keeps the dense tensor and the native RI factors.
 
 Auxiliary bases can be selected explicitly:
@@ -77,7 +87,12 @@ The Cholesky and RI paths are useful for larger active-space and CASSCF
 workflows because they avoid materializing dense transformed electron-repulsion
 tensors when the solver can contract directly with factors. Cholesky factors
 are an exact low-rank decomposition of the AO ERI tensor up to the selected
-tolerance; RI factors are an auxiliary-basis approximation.
+tolerance; RI factors are an auxiliary-basis approximation. Native RI builds
+three-center tensors in packed AO-pair form, uses full factor storage by default
+for the current faster RHF contraction path, supports ``ri_storage="packed"``
+for memory-sensitive runs, applies a Cholesky-first metric solve with an
+eigenvalue fallback, and supports optional three-center screening via
+``ri_screen_tol``.
 
 Multiconfigurational Methods
 ----------------------------

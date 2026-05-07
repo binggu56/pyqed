@@ -17,7 +17,7 @@ DEF RYS_FIXED_MAX_TERMS = 128
 
 
 cdef int MAX_FACTORS = 8
-cdef int MAX_TERMS = 4096
+cdef int MAX_TERMS = 65536
 
 
 cdef inline double _vec_component(int name_id, int idx, double[:] AB, double[:] CD, double[:] PQ) noexcept nogil:

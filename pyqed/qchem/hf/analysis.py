@@ -200,6 +200,31 @@ class RHFAnalysis:
             raise ValueError("Frontier orbitals require at least one occupied and one virtual MO.")
         return int(occ_idx[-1]), int(vir_idx[0])
 
+    def _resolve_mo_index(self, mo_index):
+        if isinstance(mo_index, str):
+            key = mo_index.strip().lower().replace("_", "").replace(" ", "")
+            if key in {'homo', 'highestoccupied'}:
+                return self._frontier_orbital_indices()[0]
+            if key in {'lumo', 'lowestunoccupied'}:
+                return self._frontier_orbital_indices()[1]
+            if key.startswith('homo') and len(key) > 4:
+                offset = int(key[4:])
+                return self._frontier_orbital_indices()[0] + offset
+            if key.startswith('lumo') and len(key) > 4:
+                offset = int(key[4:])
+                return self._frontier_orbital_indices()[1] + offset
+            raise ValueError("mo_index must be an integer, 'homo', 'lumo', 'homo-1', or 'lumo+1'.")
+        return int(mo_index)
+
+    def _mo_title(self, requested_mo_index, resolved_mo_index, mo_energy):
+        if isinstance(requested_mo_index, str):
+            label = requested_mo_index.strip().upper().replace("_", " ")
+        else:
+            label = f"MO {int(resolved_mo_index) + 1}"
+        if mo_energy is not None:
+            label += f"  E={float(mo_energy):.6f} Eh"
+        return label
+
     def orbital_cube(
         self,
         orbital_index,
@@ -1100,7 +1125,7 @@ class RHFAnalysis:
         if self.mf.mo_coeff is None:
             raise ValueError("Run RHF before sampling molecular orbitals.")
 
-        mo_index = int(mo_index)
+        mo_index = self._resolve_mo_index(mo_index)
         coeff = np.asarray(self.mf.mo_coeff)
         if mo_index < 0 or mo_index >= coeff.shape[1]:
             raise IndexError("Requested MO index is out of range.")
@@ -1157,6 +1182,7 @@ class RHFAnalysis:
         nz = nx if nz is None else int(nz)
         if nx < 2 or ny < 2 or nz < 2:
             raise ValueError("nx, ny, and nz must each be at least 2.")
+        resolved_mo_index = self._resolve_mo_index(mo_index)
 
         if bounds is None:
             atom_coords = np.asarray(self.mf.mol.atom_coords(), dtype=float)
@@ -1179,15 +1205,15 @@ class RHFAnalysis:
         X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
         values = self.sample_mo(
-            mo_index,
+            resolved_mo_index,
             points,
             screen_basis=screen_basis,
             tol_screen=tol_screen,
         ).reshape(nx, ny, nz)
 
         return {
-            'mo_index': int(mo_index),
-            'mo_energy': None if self.mf.mo_energy is None else float(self.mf.mo_energy[int(mo_index)]),
+            'mo_index': resolved_mo_index,
+            'mo_energy': None if self.mf.mo_energy is None else float(self.mf.mo_energy[resolved_mo_index]),
             'x': x,
             'y': y,
             'z': z,
@@ -1259,6 +1285,77 @@ class RHFAnalysis:
             'bounds': np.vstack([lower, upper]),
         }
 
+    def plot_mo(self, mo_index='homo', save=None, **kwargs):
+        if isinstance(mo_index, str) or not isinstance(mo_index, (list, tuple, np.ndarray)):
+            return self.plot_mo_3d(mo_index, save=save, **kwargs)
+
+        mo_indices = list(mo_index)
+        if len(mo_indices) == 0:
+            raise ValueError("mo_index list must contain at least one orbital.")
+
+        from math import ceil
+        from pathlib import Path
+
+        import matplotlib.pyplot as plt
+
+        backend = str(kwargs.pop('backend', 'matplotlib')).lower()
+        if backend != 'matplotlib':
+            raise ValueError("plot_mo with multiple orbitals currently supports only backend='matplotlib'.")
+
+        title = kwargs.pop('title', None)
+        if isinstance(title, (list, tuple, np.ndarray)):
+            if len(title) != len(mo_indices):
+                raise ValueError("A title list must have the same length as the MO list.")
+            subplot_titles = list(title)
+            figure_title = None
+        else:
+            subplot_titles = [None] * len(mo_indices)
+            figure_title = title
+
+        nplots = len(mo_indices)
+        ncols = min(3, nplots)
+        nrows = int(ceil(nplots / ncols))
+        figsize = kwargs.pop('figsize', (4.8 * ncols, 4.6 * nrows))
+
+        fig = plt.figure(figsize=figsize)
+        axes = []
+        results = []
+        for idx, orbital in enumerate(mo_indices):
+            ax = fig.add_subplot(nrows, ncols, idx + 1, projection='3d')
+            axes.append(ax)
+            results.append(
+                self.plot_mo_3d(
+                    orbital,
+                    ax=ax,
+                    title=subplot_titles[idx],
+                    backend=backend,
+                    save=None,
+                    **kwargs,
+                )
+            )
+
+        for idx in range(nplots, nrows * ncols):
+            ax = fig.add_subplot(nrows, ncols, idx + 1, projection='3d')
+            ax.set_axis_off()
+
+        if figure_title is not None:
+            fig.suptitle(str(figure_title))
+        fig.tight_layout()
+
+        save_path = None
+        if save is not None:
+            save_path = Path(save)
+            fig.savefig(save_path, dpi=200, bbox_inches='tight')
+
+        return {
+            'figure': fig,
+            'axes': tuple(axes),
+            'results': tuple(results),
+            'mo_indices': tuple(result['grid']['mo_index'] for result in results),
+            'save_path': None if save_path is None else str(save_path),
+            'backend': 'matplotlib',
+        }
+
     def plot_mo_3d(
         self,
         mo_index,
@@ -1300,6 +1397,7 @@ class RHFAnalysis:
     ):
         from pathlib import Path
 
+        requested_mo_index = mo_index
         grid = self.sample_mo_grid(
             mo_index,
             nx=nx,
@@ -1342,13 +1440,11 @@ class RHFAnalysis:
         backend = str(backend).lower()
 
         if title is None:
-            title = f"MO {int(mo_index)}"
-            if grid['mo_energy'] is not None:
-                title += f"  E={grid['mo_energy']:.6f} Eh"
+            title = self._mo_title(requested_mo_index, grid['mo_index'], grid['mo_energy'])
 
         if backend == 'pyvista':
             return self._plot_mo_3d_pyvista(
-                mo_index=mo_index,
+                mo_index=grid['mo_index'],
                 grid=grid,
                 level=level,
                 positive_color=positive_color,

@@ -26,6 +26,49 @@ cdef inline size_t idx4(int t, int u, int v, int n, int udim, int vdim, int ndim
     return ((((<size_t>t * <size_t>udim) + <size_t>u) * <size_t>vdim) + <size_t>v) * <size_t>ndim + <size_t>n
 
 
+cdef inline int pair_index(int i, int j) noexcept nogil:
+    cdef int tmp
+    if i < j:
+        tmp = i
+        i = j
+        j = tmp
+    return i * (i + 1) // 2 + j
+
+
+cdef inline int pair_pair_index(int ij, int kl) noexcept nogil:
+    cdef int tmp
+    if ij < kl:
+        tmp = ij
+        ij = kl
+        kl = tmp
+    return ij * (ij + 1) // 2 + kl
+
+
+cdef inline bint direct_perm_seen(
+    int* aa, int* bb, int* cc, int* dd, int n,
+    int a, int b, int c, int d,
+) noexcept nogil:
+    cdef int idx
+    for idx in range(n):
+        if aa[idx] == a and bb[idx] == b and cc[idx] == c and dd[idx] == d:
+            return True
+    return False
+
+
+cdef inline void direct_jk_add_perm(
+    double[:, ::1] vj_v,
+    double[:, ::1] vk_v,
+    double[:, ::1] dm_v,
+    double value,
+    int a,
+    int b,
+    int c,
+    int d,
+) noexcept nogil:
+    vj_v[a, b] += dm_v[d, c] * value
+    vk_v[a, d] += dm_v[b, c] * value
+
+
 cdef inline int ncart_for_l(int l) noexcept nogil:
     return (l + 1) * (l + 2) // 2
 
@@ -1788,6 +1831,72 @@ cpdef compute_ri_tensors(
     return metric, j3
 
 
+cpdef compute_ri_tensors_packed(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    cdef cnp.ndarray[double, ndim=2] metric = np.zeros((naux, naux), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] j3 = np.zeros((naux, npair), dtype=np.float64)
+    cdef int p, q, a, pair
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double value, aux_bound
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[:, ::1] metric_v = metric
+    cdef double[:, ::1] j3_v = j3
+
+    for p in range(naux):
+        for q in range(p + 1):
+            value = contracted_two_center_coulomb_indices(
+                p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
+            )
+            metric_v[p, q] = value
+            metric_v[q, p] = value
+
+    for a in range(naux):
+        aux_bound = sqrt(fabs(metric_v[a, a]))
+        pair = 0
+        for p in range(nao):
+            for q in range(p + 1):
+                if screen_tol > 0.0 and pair_bounds_v[p, q] * aux_bound < screen_tol:
+                    skipped += 1
+                    pair += 1
+                    continue
+                value = contracted_three_center_indices(
+                    p, q, a,
+                    shells_v, origins_v, exps_v, weights_v, nprim_v,
+                    aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v,
+                )
+                j3_v[a, pair] = value
+                computed += 1
+                pair += 1
+
+    return metric, j3, int(computed), int(skipped)
+
+
 cpdef compute_dense_eri(
     cnp.ndarray[int64_t, ndim=2] shells,
     cnp.ndarray[double, ndim=2] origins,
@@ -2389,6 +2498,163 @@ cpdef compute_dense_eri_blocked(
     return eri, int(computed), int(skipped)
 
 
+cpdef compute_eri_s8(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    cdef cnp.ndarray[double, ndim=1] eri_s8 = np.zeros((npair * (npair + 1)) // 2, dtype=np.float64)
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[::1] eri_v = eri_s8
+    cdef int p, q, r, s, s_max, ij, kl, pbase, rbase
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double bound_pq
+
+    for p in range(nao):
+        pbase = p * (p + 1) // 2
+        for q in range(p + 1):
+            ij = pbase + q
+            bound_pq = pair_bounds_v[p, q]
+            for r in range(p + 1):
+                rbase = r * (r + 1) // 2
+                s_max = q if r == p else r
+                for s in range(s_max + 1):
+                    kl = rbase + s
+                    if screen_tol > 0.0 and bound_pq * pair_bounds_v[r, s] < screen_tol:
+                        skipped += 1
+                        continue
+                    eri_v[ij * (ij + 1) // 2 + kl] = contracted_eri_indices(
+                        p, q, r, s,
+                        shells_v, origins_v, exps_v, weights_v, nprim_v,
+                    )
+                    computed += 1
+
+    return eri_s8, int(computed), int(skipped)
+
+
+cpdef compute_eri_s8_blocked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int nshell = shell_starts.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    cdef cnp.ndarray[double, ndim=1] eri_s8 = np.zeros((npair * (npair + 1)) // 2, dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=4] block
+    cdef double[::1] eri_v = eri_s8
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int ish, jsh, ksh, lsh, lsh_max
+    cdef int p0, p1, q0, q1, r0, r1, s0, s1
+    cdef int ip, iq, ir, is_, p, q, r, s, ij, kl
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double bound_pq, bound_rs
+    cdef double* shell_pair_bounds
+    cdef int* shell_pair_min
+    cdef int* shell_pair_max
+    cdef int pair_pos
+
+    shell_pair_bounds = <double*>malloc(nshell * nshell * sizeof(double))
+    shell_pair_min = <int*>malloc(nshell * nshell * sizeof(int))
+    shell_pair_max = <int*>malloc(nshell * nshell * sizeof(int))
+    if shell_pair_bounds == NULL or shell_pair_min == NULL or shell_pair_max == NULL:
+        free(shell_pair_bounds)
+        free(shell_pair_min)
+        free(shell_pair_max)
+        return eri_s8, 0, 0
+
+    for ish in range(nshell):
+        p0 = <int>shell_starts_v[ish]
+        p1 = <int>shell_stops_v[ish]
+        for jsh in range(nshell):
+            q0 = <int>shell_starts_v[jsh]
+            q1 = <int>shell_stops_v[jsh]
+            bound_pq = 0.0
+            shell_pair_min[ish * nshell + jsh] = npair
+            shell_pair_max[ish * nshell + jsh] = -1
+            for ip in range(p0, p1):
+                for iq in range(q0, q1):
+                    if pair_bounds_v[ip, iq] > bound_pq:
+                        bound_pq = pair_bounds_v[ip, iq]
+                    if ip >= iq:
+                        pair_pos = pair_index(ip, iq)
+                        if pair_pos < shell_pair_min[ish * nshell + jsh]:
+                            shell_pair_min[ish * nshell + jsh] = pair_pos
+                        if pair_pos > shell_pair_max[ish * nshell + jsh]:
+                            shell_pair_max[ish * nshell + jsh] = pair_pos
+            shell_pair_bounds[ish * nshell + jsh] = bound_pq
+
+    for ish in range(nshell):
+        p0 = <int>shell_starts_v[ish]
+        p1 = <int>shell_stops_v[ish]
+        for jsh in range(ish + 1):
+            q0 = <int>shell_starts_v[jsh]
+            q1 = <int>shell_stops_v[jsh]
+            bound_pq = shell_pair_bounds[ish * nshell + jsh]
+
+            for ksh in range(nshell):
+                r0 = <int>shell_starts_v[ksh]
+                r1 = <int>shell_stops_v[ksh]
+                for lsh in range(ksh + 1):
+                    s0 = <int>shell_starts_v[lsh]
+                    s1 = <int>shell_stops_v[lsh]
+                    bound_rs = shell_pair_bounds[ksh * nshell + lsh]
+                    if shell_pair_max[ish * nshell + jsh] < shell_pair_min[ksh * nshell + lsh]:
+                        continue
+                    if screen_tol > 0.0 and bound_pq * bound_rs < screen_tol:
+                        skipped += 1
+                        continue
+
+                    block = compute_cartesian_shell_quartet_block(
+                        shells, origins, exps, weights, nprim,
+                        p0, p1, q0, q1, r0, r1, s0, s1,
+                    )
+                    for ip in range(p1 - p0):
+                        p = p0 + ip
+                        for iq in range(q1 - q0):
+                            q = q0 + iq
+                            if p < q:
+                                continue
+                            ij = pair_index(p, q)
+                            for ir in range(r1 - r0):
+                                r = r0 + ir
+                                for is_ in range(s1 - s0):
+                                    s = s0 + is_
+                                    if r < s:
+                                        continue
+                                    kl = pair_index(r, s)
+                                    if ij < kl:
+                                        continue
+                                    eri_v[pair_pair_index(ij, kl)] = block[ip, iq, ir, is_]
+                                    computed += 1
+
+    free(shell_pair_bounds)
+    free(shell_pair_min)
+    free(shell_pair_max)
+    return eri_s8, int(computed), int(skipped)
+
+
 cpdef compute_cartesian_shell_quartet_block(
     cnp.ndarray[int64_t, ndim=2] shells,
     cnp.ndarray[double, ndim=2] origins,
@@ -2785,6 +3051,382 @@ cpdef compute_pivoted_cholesky_factors(
         rank += 1
 
     return np.asarray(chol[:, :rank].T, dtype=np.float64), np.asarray(pairs, dtype=np.int64)
+
+
+cpdef contract_jk_s4(
+    cnp.ndarray[double, ndim=2] eri_s4,
+    cnp.ndarray[double, ndim=2] dm,
+    int nao,
+):
+    cdef int npair = nao * (nao + 1) // 2
+    if eri_s4.shape[0] != npair or eri_s4.shape[1] != npair:
+        raise ValueError("eri_s4 shape is inconsistent with nao.")
+    if dm.shape[0] != nao or dm.shape[1] != nao:
+        raise ValueError("dm shape is inconsistent with nao.")
+
+    cdef cnp.ndarray[double, ndim=2] vj = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] vk = np.zeros((nao, nao), dtype=np.float64)
+    cdef double[:, ::1] eri_v = eri_s4
+    cdef double[:, ::1] dm_v = dm
+    cdef double[:, ::1] vj_v = vj
+    cdef double[:, ::1] vk_v = vk
+    cdef int i, j, k, l, ij, kl, il, kj
+    cdef double total, dkl
+
+    ij = 0
+    for i in range(nao):
+        for j in range(i + 1):
+            total = 0.0
+            kl = 0
+            for k in range(nao):
+                for l in range(k + 1):
+                    dkl = dm_v[l, k]
+                    if k != l:
+                        dkl += dm_v[k, l]
+                    total += eri_v[ij, kl] * dkl
+                    kl += 1
+            vj_v[i, j] = total
+            vj_v[j, i] = total
+            ij += 1
+
+    for i in range(nao):
+        for j in range(nao):
+            total = 0.0
+            for k in range(nao):
+                kj = pair_index(k, j)
+                for l in range(nao):
+                    il = pair_index(i, l)
+                    total += dm_v[l, k] * eri_v[il, kj]
+            vk_v[i, j] = total
+
+    return vj, vk
+
+
+cpdef contract_jk_s8(
+    cnp.ndarray[double, ndim=1] eri_s8,
+    cnp.ndarray[double, ndim=2] dm,
+    int nao,
+):
+    cdef int npair = nao * (nao + 1) // 2
+    if eri_s8.shape[0] != npair * (npair + 1) // 2:
+        raise ValueError("eri_s8 shape is inconsistent with nao.")
+    if dm.shape[0] != nao or dm.shape[1] != nao:
+        raise ValueError("dm shape is inconsistent with nao.")
+
+    cdef cnp.ndarray[double, ndim=2] vj = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] vk = np.zeros((nao, nao), dtype=np.float64)
+    cdef double[::1] eri_v = eri_s8
+    cdef double[:, ::1] dm_v = dm
+    cdef double[:, ::1] vj_v = vj
+    cdef double[:, ::1] vk_v = vk
+    cdef int i, j, k, l, ij, kl, il, kj
+    cdef double total, dkl
+
+    ij = 0
+    for i in range(nao):
+        for j in range(i + 1):
+            total = 0.0
+            kl = 0
+            for k in range(nao):
+                for l in range(k + 1):
+                    dkl = dm_v[l, k]
+                    if k != l:
+                        dkl += dm_v[k, l]
+                    total += eri_v[pair_pair_index(ij, kl)] * dkl
+                    kl += 1
+            vj_v[i, j] = total
+            vj_v[j, i] = total
+            ij += 1
+
+    for i in range(nao):
+        for j in range(nao):
+            total = 0.0
+            for k in range(nao):
+                kj = pair_index(k, j)
+                for l in range(nao):
+                    il = pair_index(i, l)
+                    total += dm_v[l, k] * eri_v[pair_pair_index(il, kj)]
+            vk_v[i, j] = total
+
+    return vj, vk
+
+
+cpdef contract_jk_ri_pairs(
+    cnp.ndarray[double, ndim=2] factors,
+    cnp.ndarray[double, ndim=2] dm,
+    int nao,
+):
+    cdef int naux = factors.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    if factors.shape[1] != npair:
+        raise ValueError("RI pair-factor shape is inconsistent with nao.")
+    if dm.shape[0] != nao or dm.shape[1] != nao:
+        raise ValueError("dm shape is inconsistent with nao.")
+
+    cdef cnp.ndarray[double, ndim=2] vj = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] vk = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=1] coeff = np.zeros((naux,), dtype=np.float64)
+    cdef double[:, ::1] fac_v = factors
+    cdef double[:, ::1] dm_v = dm
+    cdef double[:, ::1] vj_v = vj
+    cdef double[:, ::1] vk_v = vk
+    cdef double[::1] coeff_v = coeff
+    cdef int p, i, j, k, l, ij, il, kj
+    cdef double dkl, total
+
+    for p in range(naux):
+        ij = 0
+        total = 0.0
+        for i in range(nao):
+            for j in range(i + 1):
+                dkl = dm_v[j, i]
+                if i != j:
+                    dkl += dm_v[i, j]
+                total += fac_v[p, ij] * dkl
+                ij += 1
+        coeff_v[p] = total
+
+    ij = 0
+    for i in range(nao):
+        for j in range(i + 1):
+            total = 0.0
+            for p in range(naux):
+                total += coeff_v[p] * fac_v[p, ij]
+            vj_v[i, j] = total
+            vj_v[j, i] = total
+            ij += 1
+
+    for i in range(nao):
+        for j in range(nao):
+            total = 0.0
+            for p in range(naux):
+                for l in range(nao):
+                    il = pair_index(i, l)
+                    for k in range(nao):
+                        kj = pair_index(k, j)
+                        total += fac_v[p, il] * dm_v[l, k] * fac_v[p, kj]
+            vk_v[i, j] = total
+
+    return vj, vk
+
+
+cpdef direct_jk(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[double, ndim=2] dm,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    if dm.shape[0] != nao or dm.shape[1] != nao:
+        raise ValueError("dm shape is inconsistent with the AO basis.")
+    if pair_bounds.shape[0] != nao or pair_bounds.shape[1] != nao:
+        raise ValueError("pair_bounds shape is inconsistent with the AO basis.")
+
+    cdef cnp.ndarray[double, ndim=2] vj = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] vk = np.zeros((nao, nao), dtype=np.float64)
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[:, ::1] dm_v = dm
+    cdef double[:, ::1] vj_v = vj
+    cdef double[:, ::1] vk_v = vk
+    cdef int p, q, r, s, s_max, nperm
+    cdef int aa[8]
+    cdef int bb[8]
+    cdef int cc[8]
+    cdef int dd[8]
+    cdef double value, bound_pq
+
+    for p in range(nao):
+        for q in range(p + 1):
+            bound_pq = pair_bounds_v[p, q]
+            for r in range(p + 1):
+                s_max = q if r == p else r
+                for s in range(s_max + 1):
+                    if screen_tol > 0.0 and bound_pq * pair_bounds_v[r, s] < screen_tol:
+                        continue
+                    value = contracted_eri_indices(
+                        p, q, r, s,
+                        shells_v, origins_v, exps_v, weights_v, nprim_v,
+                    )
+                    nperm = 0
+
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, p, q, r, s):
+                        aa[nperm] = p; bb[nperm] = q; cc[nperm] = r; dd[nperm] = s; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, p, q, r, s)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, q, p, r, s):
+                        aa[nperm] = q; bb[nperm] = p; cc[nperm] = r; dd[nperm] = s; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, q, p, r, s)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, p, q, s, r):
+                        aa[nperm] = p; bb[nperm] = q; cc[nperm] = s; dd[nperm] = r; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, p, q, s, r)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, q, p, s, r):
+                        aa[nperm] = q; bb[nperm] = p; cc[nperm] = s; dd[nperm] = r; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, q, p, s, r)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, r, s, p, q):
+                        aa[nperm] = r; bb[nperm] = s; cc[nperm] = p; dd[nperm] = q; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, r, s, p, q)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, s, r, p, q):
+                        aa[nperm] = s; bb[nperm] = r; cc[nperm] = p; dd[nperm] = q; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, s, r, p, q)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, r, s, q, p):
+                        aa[nperm] = r; bb[nperm] = s; cc[nperm] = q; dd[nperm] = p; nperm += 1
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, r, s, q, p)
+                    if not direct_perm_seen(aa, bb, cc, dd, nperm, s, r, q, p):
+                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, s, r, q, p)
+
+    return vj, vk
+
+
+cpdef direct_jk_blocked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    cnp.ndarray[double, ndim=2] dm,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int nshell = shell_starts.shape[0]
+    if dm.shape[0] != nao or dm.shape[1] != nao:
+        raise ValueError("dm shape is inconsistent with the AO basis.")
+    if pair_bounds.shape[0] != nao or pair_bounds.shape[1] != nao:
+        raise ValueError("pair_bounds shape is inconsistent with the AO basis.")
+
+    cdef cnp.ndarray[double, ndim=2] vj = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] vk = np.zeros((nao, nao), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=4] block
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[:, ::1] dm_v = dm
+    cdef double[:, ::1] vj_v = vj
+    cdef double[:, ::1] vk_v = vk
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int ish, jsh, ksh, lsh, lsh_max
+    cdef int p0, p1, q0, q1, r0, r1, s0, s1
+    cdef int ip, iq, ir, is_, p, q, r, s, ij, kl, nperm
+    cdef int aa[8]
+    cdef int bb[8]
+    cdef int cc[8]
+    cdef int dd[8]
+    cdef double value, bound_pq, bound_rs
+    cdef double* shell_pair_bounds
+    cdef int* shell_pair_min
+    cdef int* shell_pair_max
+    cdef int pair_pos
+
+    shell_pair_bounds = <double*>malloc(nshell * nshell * sizeof(double))
+    shell_pair_min = <int*>malloc(nshell * nshell * sizeof(int))
+    shell_pair_max = <int*>malloc(nshell * nshell * sizeof(int))
+    if shell_pair_bounds == NULL or shell_pair_min == NULL or shell_pair_max == NULL:
+        free(shell_pair_bounds)
+        free(shell_pair_min)
+        free(shell_pair_max)
+        return vj, vk
+
+    for ish in range(nshell):
+        p0 = <int>shell_starts_v[ish]
+        p1 = <int>shell_stops_v[ish]
+        for jsh in range(nshell):
+            q0 = <int>shell_starts_v[jsh]
+            q1 = <int>shell_stops_v[jsh]
+            bound_pq = 0.0
+            shell_pair_min[ish * nshell + jsh] = nao * (nao + 1) // 2
+            shell_pair_max[ish * nshell + jsh] = -1
+            for ip in range(p0, p1):
+                for iq in range(q0, q1):
+                    if pair_bounds_v[ip, iq] > bound_pq:
+                        bound_pq = pair_bounds_v[ip, iq]
+                    if ip >= iq:
+                        pair_pos = pair_index(ip, iq)
+                        if pair_pos < shell_pair_min[ish * nshell + jsh]:
+                            shell_pair_min[ish * nshell + jsh] = pair_pos
+                        if pair_pos > shell_pair_max[ish * nshell + jsh]:
+                            shell_pair_max[ish * nshell + jsh] = pair_pos
+            shell_pair_bounds[ish * nshell + jsh] = bound_pq
+
+    for ish in range(nshell):
+        p0 = <int>shell_starts_v[ish]
+        p1 = <int>shell_stops_v[ish]
+        for jsh in range(ish + 1):
+            q0 = <int>shell_starts_v[jsh]
+            q1 = <int>shell_stops_v[jsh]
+            bound_pq = shell_pair_bounds[ish * nshell + jsh]
+
+            for ksh in range(nshell):
+                r0 = <int>shell_starts_v[ksh]
+                r1 = <int>shell_stops_v[ksh]
+                for lsh in range(ksh + 1):
+                    s0 = <int>shell_starts_v[lsh]
+                    s1 = <int>shell_stops_v[lsh]
+                    bound_rs = shell_pair_bounds[ksh * nshell + lsh]
+                    if shell_pair_max[ish * nshell + jsh] < shell_pair_min[ksh * nshell + lsh]:
+                        continue
+                    if screen_tol > 0.0 and bound_pq * bound_rs < screen_tol:
+                        continue
+
+                    block = compute_cartesian_shell_quartet_block(
+                        shells, origins, exps, weights, nprim,
+                        p0, p1, q0, q1, r0, r1, s0, s1,
+                    )
+                    for ip in range(p1 - p0):
+                        p = p0 + ip
+                        for iq in range(q1 - q0):
+                            q = q0 + iq
+                            if p < q:
+                                continue
+                            ij = pair_index(p, q)
+                            for ir in range(r1 - r0):
+                                r = r0 + ir
+                                for is_ in range(s1 - s0):
+                                    s = s0 + is_
+                                    if r < s:
+                                        continue
+                                    kl = pair_index(r, s)
+                                    if ij < kl:
+                                        continue
+                                    value = block[ip, iq, ir, is_]
+                                    nperm = 0
+
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, p, q, r, s):
+                                        aa[nperm] = p; bb[nperm] = q; cc[nperm] = r; dd[nperm] = s; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, p, q, r, s)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, q, p, r, s):
+                                        aa[nperm] = q; bb[nperm] = p; cc[nperm] = r; dd[nperm] = s; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, q, p, r, s)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, p, q, s, r):
+                                        aa[nperm] = p; bb[nperm] = q; cc[nperm] = s; dd[nperm] = r; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, p, q, s, r)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, q, p, s, r):
+                                        aa[nperm] = q; bb[nperm] = p; cc[nperm] = s; dd[nperm] = r; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, q, p, s, r)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, r, s, p, q):
+                                        aa[nperm] = r; bb[nperm] = s; cc[nperm] = p; dd[nperm] = q; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, r, s, p, q)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, s, r, p, q):
+                                        aa[nperm] = s; bb[nperm] = r; cc[nperm] = p; dd[nperm] = q; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, s, r, p, q)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, r, s, q, p):
+                                        aa[nperm] = r; bb[nperm] = s; cc[nperm] = q; dd[nperm] = p; nperm += 1
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, r, s, q, p)
+                                    if not direct_perm_seen(aa, bb, cc, dd, nperm, s, r, q, p):
+                                        direct_jk_add_perm(vj_v, vk_v, dm_v, value, s, r, q, p)
+
+    free(shell_pair_bounds)
+    free(shell_pair_min)
+    free(shell_pair_max)
+    return vj, vk
 
 
 cpdef compute_pivoted_cholesky_factors_blocked(

@@ -256,7 +256,8 @@ def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
     """
     if mo_right is None:
         mo_right = mo_left
-    return contract('Pmn,mp,nq->Ppq', eri_factors, mo_left.conj(), mo_right)
+    from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
+    return transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
 
 
 def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):
@@ -294,13 +295,54 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
             pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
         return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
 
-    return contract(
-        'ip, jq, ijkl, kr, ls -> pqrs',
-        mo_left.conj(),
-        mo_right,
-        mf.eri,
-        mo_left_2.conj(),
-        mo_right_2,
+    eri_source = getattr(mf, 'eri', None)
+    if eri_source is None and getattr(mf, 'eri_s4', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+        eri_source = unpack_eri_s4(mf.eri_s4, mf.mol.nao)
+    if eri_source is None and getattr(mf, 'eri_s8', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+        eri_source = unpack_eri_s8(mf.eri_s8, mf.mol.nao)
+    mol = getattr(mf, 'mol', None)
+    if eri_source is None and mol is not None:
+        eri_source = getattr(mol, 'eri', None)
+    if eri_source is None and mol is not None and getattr(mol, 'eri_s4', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+        eri_source = unpack_eri_s4(mol.eri_s4, mol.nao)
+    if eri_source is None and mol is not None and getattr(mol, 'eri_s8', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+        eri_source = unpack_eri_s8(mol.eri_s8, mol.nao)
+    eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
+    if eri_source is not None and eri_ndim == 4:
+        return contract(
+            'ip, jq, ijkl, kr, ls -> pqrs',
+            mo_left.conj(),
+            mo_right,
+            eri_source,
+            mo_left_2.conj(),
+            mo_right_2,
+        )
+
+    if eri_factors is None:
+        eri_factors = getattr(mf, 'eri_factors', None)
+    if eri_factors is None:
+        eri_factors = getattr(getattr(mf, 'mol', None), 'eri_factors', None)
+    if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
+        eri_factors = eri_source
+    if eri_factors is not None:
+        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        if (
+            mo_left_2 is mo_left and mo_right_2 is mo_right
+        ) or (
+            np.array_equal(mo_left_2, mo_left) and np.array_equal(mo_right_2, mo_right)
+        ):
+            pair_factors_rs = pair_factors_pq
+        else:
+            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+        return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
+
+    raise ValueError(
+        "transform_spatial_eri_to_mo requires dense 4-index ERIs or RI/Cholesky "
+        "factors. Got mf.eri with ndim={}.".format(eri_ndim)
     )
 
 

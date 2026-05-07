@@ -1838,14 +1838,14 @@ ALIAS = {
     '631g++'     : "/6-31g++.gbs",
     '631g*'      : "6-31g_st_.0.gbs",
     'ccpvdz'     : 'cc-pvdz.0.gbs'    ,
-    'ccpvtz'     : 'cc-pvtz.dat'    ,
-    'ccpvqz'     : 'cc-pvqz.dat'    ,
-    'ccpv5z'     : 'cc-pv5z.dat'    ,
+    'ccpvtz'     : 'cc-pvtz.0.gbs'    ,
+    'ccpvqz'     : 'cc-pvqz.0.gbs'    ,
+    'ccpv5z'     : 'cc-pv5z.0.gbs'    ,
     'ccpvdpdz'   : 'cc-pvdpdz.dat'  ,
-    'augccpvdz'  : 'aug-cc-pvdz.dat',
-    'augccpvtz'  : 'aug-cc-pvtz.dat',
-    'augccpvqz'  : 'aug-cc-pvqz.dat',
-    'augccpv5z'  : 'aug-cc-pv5z.dat',
+    'augccpvdz'  : 'aug-cc-pvdz.0.gbs',
+    'augccpvtz'  : 'aug-cc-pvtz.0.gbs',
+    'augccpvqz'  : 'aug-cc-pvqz.0.gbs',
+    'augccpv5z'  : 'aug-cc-pv5z.0.gbs',
     'augccpvdpdz': 'aug-cc-pvdpdz.dat',
     'ccpvdzdk'   : 'cc-pvdz-dk.dat' ,
     'ccpvtzdk'   : 'cc-pvtz-dk.dat' ,
@@ -1870,7 +1870,9 @@ def _basis_path(basis_name):
     basis_dir = os.path.abspath(f'{pyqed.__file__}/../qchem/basis_set/')
     key = _normalize_basis_lookup_name(basis_name)
     if key in ALIAS:
-        return os.path.join(basis_dir, ALIAS[key].lstrip('/'))
+        aliased = os.path.join(basis_dir, ALIAS[key].lstrip('/'))
+        if os.path.exists(aliased):
+            return aliased
 
     candidates = []
     for entry in os.listdir(basis_dir):
@@ -1894,9 +1896,11 @@ def _basis_path(basis_name):
     return os.path.join(basis_dir, sorted(candidates, key=_basis_sort_key)[0])
 
 
-def _default_auxbasis_name(primary_basis):
+def _default_auxbasis_name(primary_basis, purpose="jk"):
     basis = str(primary_basis)
     lower = basis.lower()
+    purpose = str(purpose or "jk").lower().replace("_", "-")
+    prefer_jk = purpose in {"auto", "j", "jk", "scf", "hf", "rhf"}
     if lower.startswith("6-311"):
         try:
             _basis_path("cc-pvtz-jkfit")
@@ -1909,13 +1913,22 @@ def _default_auxbasis_name(primary_basis):
             return "cc-pvdz-jkfit"
         except ValueError:
             pass
-    candidates = (
-        f"{basis}-rifit",
-        f"{basis}-jkfit",
-        f"{basis}-j",
-        f"{basis}_st_-rifit",
-        f"{basis}_st_-j",
-    )
+    if prefer_jk:
+        candidates = (
+            f"{basis}-jkfit",
+            f"{basis}-j",
+            f"{basis}-rifit",
+            f"{basis}_st_-j",
+            f"{basis}_st_-rifit",
+        )
+    else:
+        candidates = (
+            f"{basis}-rifit",
+            f"{basis}-jkfit",
+            f"{basis}-j",
+            f"{basis}_st_-rifit",
+            f"{basis}_st_-j",
+        )
     for candidate in candidates:
         try:
             _basis_path(candidate)
@@ -1964,6 +1977,36 @@ def _compute_native_ri_tensors_cython(signatures, aux_signatures):
     return np.asarray(metric, dtype=np.float64), np.asarray(j3, dtype=np.float64)
 
 
+def _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol):
+    if _basis_cy is None or not hasattr(_basis_cy, "compute_ri_tensors_packed"):
+        return None
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    try:
+        metric, j3_pair, computed, skipped = _basis_cy.compute_ri_tensors_packed(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(aux_shells, dtype=np.int64),
+            np.ascontiguousarray(aux_origins, dtype=np.float64),
+            np.ascontiguousarray(aux_exps, dtype=np.float64),
+            np.ascontiguousarray(aux_weights, dtype=np.float64),
+            np.ascontiguousarray(aux_nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(ri_screen_tol),
+        )
+    except Exception:
+        return None
+    return (
+        np.asarray(metric, dtype=np.float64),
+        np.asarray(j3_pair, dtype=np.float64),
+        int(computed),
+        int(skipped),
+    )
+
+
 def _compute_three_center_tensor_from_signatures(signatures, aux_signatures):
     naux = len(aux_signatures)
     nao = len(signatures)
@@ -1977,6 +2020,40 @@ def _compute_three_center_tensor_from_signatures(signatures, aux_signatures):
                 j3[p, i, j] = value
                 j3[p, j, i] = value
     return j3
+
+
+def _compute_three_center_pair_tensor_from_signatures(signatures, aux_signatures, pair_bounds=None, ri_screen_tol=0.0):
+    naux = len(aux_signatures)
+    nao = len(signatures)
+    npair = nao * (nao + 1) // 2
+    aux_diag = np.ones(naux, dtype=float)
+    if ri_screen_tol > 0.0:
+        aux_diag = np.array([
+            math.sqrt(max(abs(float(np.real(_contracted_two_center_coulomb_from_signatures(sig, sig)))), 0.0))
+            for sig in aux_signatures
+        ])
+    j3 = np.zeros((naux, npair), dtype=float)
+    computed = 0
+    skipped = 0
+    for p, aux_sig in enumerate(aux_signatures):
+        pair = 0
+        for i in range(nao):
+            for j in range(i + 1):
+                if (
+                    ri_screen_tol > 0.0
+                    and pair_bounds is not None
+                    and pair_bounds[i, j] * aux_diag[p] < ri_screen_tol
+                ):
+                    skipped += 1
+                    pair += 1
+                    continue
+                value = _contracted_three_center_from_signatures(
+                    signatures[i], signatures[j], aux_sig
+                )
+                j3[p, pair] = value
+                computed += 1
+                pair += 1
+    return j3, computed, skipped
 
 
 def _init_builtin_ri_worker(signatures, aux_signatures):
@@ -2033,6 +2110,50 @@ def _compute_three_center_tensor_parallel(signatures, aux_signatures, workers):
     return j3
 
 
+def _metric_factorize_ri(metric, j3_pair, tol=1e-10, solver="auto", block_size=None):
+    solver = str(solver or "auto").lower().replace("_", "-")
+    if solver not in {"auto", "cholesky", "eig", "eigh"}:
+        raise ValueError("builtin_ri_metric_solver must be 'auto', 'cholesky', or 'eigh'.")
+    metric = np.asarray(metric, dtype=np.float64)
+    j3_pair = np.asarray(j3_pair, dtype=np.float64)
+    naux, npair = j3_pair.shape
+    if block_size is None:
+        block_size = max(1, min(npair, 8192))
+    else:
+        block_size = max(1, int(block_size))
+
+    if solver in {"auto", "cholesky"}:
+        try:
+            chol = np.linalg.cholesky(metric)
+            factors = np.empty_like(j3_pair)
+            for start in range(0, npair, block_size):
+                stop = min(start + block_size, npair)
+                factors[:, start:stop] = np.linalg.solve(chol, j3_pair[:, start:stop])
+            return factors, {
+                "metric_solver": "cholesky",
+                "metric_rank": int(naux),
+                "block_size": int(block_size),
+            }
+        except np.linalg.LinAlgError:
+            if solver == "cholesky":
+                raise
+
+    evals, evecs = np.linalg.eigh(metric)
+    keep = evals > float(tol)
+    if not np.any(keep):
+        raise ValueError("Auxiliary Coulomb metric has no eigenvalues above ri_metric_tol.")
+    factors = np.empty((int(np.count_nonzero(keep)), npair), dtype=np.float64)
+    projector = evecs[:, keep].T / np.sqrt(evals[keep])[:, None]
+    for start in range(0, npair, block_size):
+        stop = min(start + block_size, npair)
+        factors[:, start:stop] = projector @ j3_pair[:, start:stop]
+    return factors, {
+        "metric_solver": "eigh",
+        "metric_rank": int(np.count_nonzero(keep)),
+        "block_size": int(block_size),
+    }
+
+
 def _builtin_ri_worker_count(mol, nao, naux):
     requested = getattr(mol, "builtin_eri_workers", getattr(mol, "native_eri_workers", None))
     if requested is not None:
@@ -2048,8 +2169,9 @@ def _builtin_ri_worker_count(mol, nao, naux):
 
 def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     auxbasis = getattr(mol, "builtin_auxbasis", getattr(mol, "native_auxbasis", None))
+    purpose = getattr(mol, "builtin_ri_purpose", getattr(mol, "native_ri_purpose", "jk"))
     if auxbasis is None:
-        auxbasis = _default_auxbasis_name(mol.basis)
+        auxbasis = _default_auxbasis_name(mol.basis, purpose=purpose)
 
     aux_dict = parse_gbs(_basis_path(auxbasis))
     try:
@@ -2062,16 +2184,26 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
 
     signatures = tuple(_basis_signature(fn) for fn in basis_cart)
     aux_signatures = tuple(_basis_signature(fn) for fn in aux_cart)
-    cy_tensors = _compute_native_ri_tensors_cython(signatures, aux_signatures)
+    pair_bounds = _compute_pair_bounds(signatures)
+    ri_screen_tol = getattr(mol, "builtin_ri_screen_tol", getattr(mol, "native_ri_screen_tol", None))
+    if ri_screen_tol is None:
+        ri_screen_tol = getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12))
+    ri_screen_tol = float(ri_screen_tol or 0.0)
+    cy_tensors = _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol)
     if cy_tensors is None:
         metric = _compute_aux_coulomb_metric(aux_signatures)
         workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_cart))
-        j3 = _compute_three_center_tensor_parallel(signatures, aux_signatures, workers)
+        j3_pair, ri_computed, ri_skipped = _compute_three_center_pair_tensor_from_signatures(
+            signatures,
+            aux_signatures,
+            pair_bounds=pair_bounds,
+            ri_screen_tol=ri_screen_tol,
+        )
         tensor_builder = "python"
     else:
-        metric, j3 = cy_tensors
+        metric, j3_pair, ri_computed, ri_skipped = cy_tensors
         workers = 1
-        tensor_builder = "cython-kernel"
+        tensor_builder = "cython-kernel-packed"
     evals, evecs = np.linalg.eigh(metric)
     tol = float(getattr(mol, "builtin_ri_metric_tol", getattr(mol, "native_ri_metric_tol", 1e-10)))
     keep = evals > tol
@@ -2080,16 +2212,35 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             f"Auxiliary Coulomb metric for {auxbasis!r} has no eigenvalues above ri_metric_tol={tol:g}."
         )
 
-    invsqrt = (evecs[:, keep] / np.sqrt(evals[keep])) @ evecs[:, keep].T
-    factors = np.einsum('pq,qij->pij', invsqrt, j3, optimize=True)
+    factors_pair, factor_info = _metric_factorize_ri(
+        metric,
+        j3_pair,
+        tol=tol,
+        solver=getattr(mol, "builtin_ri_metric_solver", getattr(mol, "native_ri_metric_solver", "auto")),
+        block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
+    )
+    storage = str(getattr(mol, "builtin_ri_storage", getattr(mol, "native_ri_storage", "auto"))).lower()
+    if storage == "auto":
+        storage = "full" if str(purpose or "jk").lower().replace("_", "-") in {"auto", "j", "jk", "scf", "hf", "rhf"} else "packed"
+    if storage not in {"packed", "full"}:
+        raise ValueError("builtin_ri_storage/native_ri_storage must be 'auto', 'packed', or 'full'.")
+    factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
     info = {
         "auxbasis": auxbasis,
+        "purpose": purpose,
         "naux": len(aux_cart),
-        "metric_rank": int(np.count_nonzero(keep)),
+        "metric_rank": int(factor_info["metric_rank"]),
         "metric_min_eig": float(np.min(evals)),
         "metric_max_eig": float(np.max(evals)),
+        "metric_solver": factor_info["metric_solver"],
+        "block_size": factor_info["block_size"],
         "workers": int(workers),
         "tensor_builder": tensor_builder,
+        "storage": storage,
+        "pair_shape": tuple(int(x) for x in factors_pair.shape),
+        "screen_tol": float(ri_screen_tol),
+        "three_center_computed": int(ri_computed),
+        "three_center_screened": int(ri_skipped),
     }
     return factors, info
 
@@ -2149,6 +2300,427 @@ def _builtin_worker_count(mol, nao):
     return max(1, int(requested))
 
 
+def _select_builtin_auto_eri_representation(mol, nao_cart):
+    """
+    Pick a native ERI representation that avoids dense tensors for larger AO
+    spaces while preserving dense defaults for small/debug calculations.
+    """
+    threshold = int(getattr(mol, "builtin_auto_ri_min_nao", getattr(mol, "native_auto_ri_min_nao", 24)))
+    if int(nao_cart) < threshold:
+        return "dense"
+    try:
+        purpose = getattr(mol, "builtin_ri_purpose", getattr(mol, "native_ri_purpose", "jk"))
+        _basis_path(_default_auxbasis_name(mol.basis, purpose=purpose))
+    except Exception:
+        return "factors"
+    return "ri"
+
+
+def _ao_unique_pairs(nao):
+    return [(i, j) for i in range(nao) for j in range(i + 1)]
+
+
+def _ao_pair_indices(nao):
+    return np.tril_indices(int(nao))
+
+
+def _ao_pair_index_matrix(nao):
+    idx = np.arange(int(nao), dtype=np.int64)
+    i = idx[:, None]
+    j = idx[None, :]
+    hi = np.maximum(i, j)
+    lo = np.minimum(i, j)
+    return hi * (hi + 1) // 2 + lo
+
+
+def _packed_pair_pair_indices(ij, kl):
+    ij = np.asarray(ij, dtype=np.int64)
+    kl = np.asarray(kl, dtype=np.int64)
+    hi = np.maximum(ij, kl)
+    lo = np.minimum(ij, kl)
+    return hi * (hi + 1) // 2 + lo
+
+
+def _density_to_pair_vector(dm, nao):
+    rows, cols = _ao_pair_indices(nao)
+    pair_dm = np.asarray(dm)[cols, rows].astype(np.result_type(dm), copy=True)
+    offdiag = rows != cols
+    pair_dm[offdiag] += np.asarray(dm)[rows[offdiag], cols[offdiag]]
+    return pair_dm
+
+
+def _symmetric_matrix_to_pair_vector(mat, nao):
+    rows, cols = _ao_pair_indices(nao)
+    return np.asarray(mat)[rows, cols]
+
+
+def _pair_vector_to_symmetric_matrix(values, nao):
+    rows, cols = _ao_pair_indices(nao)
+    mat = np.empty((nao, nao), dtype=np.asarray(values).dtype)
+    mat[rows, cols] = values
+    mat[cols, rows] = values
+    return mat
+
+
+def _pair_factors_to_full(pair_factors, nao):
+    pair_factors = np.asarray(pair_factors)
+    rows, cols = _ao_pair_indices(nao)
+    full = np.zeros((pair_factors.shape[0], nao, nao), dtype=pair_factors.dtype)
+    full[:, rows, cols] = pair_factors
+    full[:, cols, rows] = pair_factors
+    return full
+
+
+def _pair_factor_blocks_to_vk(pair_factors, dm, nao, block_size=None):
+    pair_factors = np.asarray(pair_factors)
+    if block_size is None:
+        target_bytes = 16 * 1024 * 1024
+        bytes_per_factor = max(1, int(nao) * int(nao) * pair_factors.dtype.itemsize)
+        block_size = max(1, min(pair_factors.shape[0], target_bytes // bytes_per_factor))
+    else:
+        block_size = max(1, int(block_size))
+
+    vk = np.zeros((nao, nao), dtype=np.result_type(pair_factors, dm))
+    for start in range(0, pair_factors.shape[0], block_size):
+        stop = min(start + block_size, pair_factors.shape[0])
+        factors = _pair_factors_to_full(pair_factors[start:stop], nao)
+        vk += np.einsum("pil,lk,pkj->ij", factors, dm, factors, optimize=True)
+    return vk
+
+
+class PackedRIFactors:
+    """
+    Lazy compatibility wrapper for RI/DF factors stored over unique AO pairs.
+
+    NumPy sees this as the traditional ``(naux, nao, nao)`` tensor when an
+    array is requested, while pair-aware code can consume ``pair_factors``
+    directly and avoid materializing the full symmetric matrices.
+    """
+
+    __array_priority__ = 1000
+
+    def __init__(self, pair_factors, nao):
+        pair_factors = np.ascontiguousarray(pair_factors, dtype=np.float64)
+        nao = int(nao)
+        npair = nao * (nao + 1) // 2
+        if pair_factors.ndim != 2 or pair_factors.shape[1] != npair:
+            raise ValueError("pair_factors shape is inconsistent with nao.")
+        self.pair_factors = pair_factors
+        self.nao = nao
+        self.shape = (pair_factors.shape[0], nao, nao)
+        self.pair_shape = pair_factors.shape
+        self.dtype = pair_factors.dtype
+        self.ndim = 3
+
+    def __array__(self, dtype=None):
+        full = _pair_factors_to_full(self.pair_factors, self.nao)
+        if dtype is not None:
+            full = full.astype(dtype, copy=False)
+        return full
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        return np.asarray(self)[key]
+
+    def copy(self):
+        return PackedRIFactors(self.pair_factors.copy(), self.nao)
+
+
+def _as_ri_pair_factors(eri_factors, nao):
+    if isinstance(eri_factors, PackedRIFactors):
+        return eri_factors.pair_factors
+    arr = np.asarray(eri_factors)
+    if arr.ndim == 2:
+        npair = int(nao) * (int(nao) + 1) // 2
+        if arr.shape[1] != npair:
+            raise ValueError("RI pair-factor shape is inconsistent with nao.")
+        return arr
+    if arr.ndim == 3:
+        return np.asarray([_symmetric_matrix_to_pair_vector(block, nao) for block in arr], dtype=arr.dtype)
+    raise ValueError("RI factors must have shape (naux, nao, nao) or (naux, npair).")
+
+
+def pack_eri_s4(eri):
+    """
+    Pack a four-index AO ERI tensor into unique AO-pair storage.
+
+    The returned matrix is indexed by unordered AO pairs ``(i >= j)`` and
+    stores ``(ij|kl)`` without metric scaling. It is intended for symmetric AO
+    density contractions and compact archival of dense builtin builds.
+    """
+    eri = np.asarray(eri)
+    if eri.ndim != 4 or len(set(eri.shape)) != 1:
+        raise ValueError("pack_eri_s4 expects a square rank-4 ERI tensor.")
+    nao = eri.shape[0]
+    pairs = _ao_unique_pairs(nao)
+    packed = np.empty((len(pairs), len(pairs)), dtype=eri.dtype)
+    for ij, (i, j) in enumerate(pairs):
+        for kl, (k, l) in enumerate(pairs):
+            packed[ij, kl] = eri[i, j, k, l]
+    return packed
+
+
+def _packed_pair_index(i, j):
+    if i < j:
+        i, j = j, i
+    return i * (i + 1) // 2 + j
+
+
+def _packed_pair_pair_index(ij, kl):
+    if ij < kl:
+        ij, kl = kl, ij
+    return ij * (ij + 1) // 2 + kl
+
+
+def pack_eri_s8(eri):
+    """
+    Pack ERIs into eight-fold unique AO-pair-pair storage.
+
+    The vector stores only ``ij >= kl`` over unordered AO pairs. This is the
+    compact memory counterpart of the eight permutation assignments used by
+    the dense shell builders.
+    """
+    eri = np.asarray(eri)
+    if eri.ndim != 4 or len(set(eri.shape)) != 1:
+        raise ValueError("pack_eri_s8 expects a square rank-4 ERI tensor.")
+    nao = eri.shape[0]
+    pairs = _ao_unique_pairs(nao)
+    npair = len(pairs)
+    packed = np.empty((npair * (npair + 1)) // 2, dtype=eri.dtype)
+    for ij, (i, j) in enumerate(pairs):
+        for kl in range(ij + 1):
+            k, l = pairs[kl]
+            packed[_packed_pair_pair_index(ij, kl)] = eri[i, j, k, l]
+    return packed
+
+
+def unpack_eri_s4(eri_s4, nao):
+    """
+    Expand unique AO-pair ERI storage back to a full four-index tensor.
+    """
+    eri_s4 = np.asarray(eri_s4)
+    pairs = _ao_unique_pairs(int(nao))
+    npair = len(pairs)
+    if eri_s4.shape != (npair, npair):
+        raise ValueError("eri_s4 shape is inconsistent with nao.")
+    eri = np.empty((nao, nao, nao, nao), dtype=eri_s4.dtype)
+    for ij, (i, j) in enumerate(pairs):
+        for kl, (k, l) in enumerate(pairs):
+            value = eri_s4[ij, kl]
+            eri[i, j, k, l] = value
+            eri[j, i, k, l] = value
+            eri[i, j, l, k] = value
+            eri[j, i, l, k] = value
+    return eri
+
+
+def unpack_eri_s8(eri_s8, nao):
+    """
+    Expand eight-fold AO-pair-pair ERI storage back to a full tensor.
+    """
+    eri_s8 = np.asarray(eri_s8)
+    pairs = _ao_unique_pairs(int(nao))
+    npair = len(pairs)
+    if eri_s8.shape != ((npair * (npair + 1)) // 2,):
+        raise ValueError("eri_s8 shape is inconsistent with nao.")
+    eri = np.empty((nao, nao, nao, nao), dtype=eri_s8.dtype)
+    for ij, (i, j) in enumerate(pairs):
+        for kl, (k, l) in enumerate(pairs):
+            value = eri_s8[_packed_pair_pair_index(ij, kl)]
+            eri[i, j, k, l] = value
+            eri[j, i, k, l] = value
+            eri[i, j, l, k] = value
+            eri[j, i, l, k] = value
+            eri[k, l, i, j] = value
+            eri[l, k, i, j] = value
+            eri[k, l, j, i] = value
+            eri[l, k, j, i] = value
+    return eri
+
+
+def contract_jk_s4(eri_s4, dm, nao):
+    """
+    Contract packed AO-pair ERIs with a symmetric density matrix.
+    """
+    eri_s4 = np.asarray(eri_s4)
+    dm = np.asarray(dm)
+    nao = int(nao)
+    if _basis_cy is not None and hasattr(_basis_cy, "contract_jk_s4"):
+        return _basis_cy.contract_jk_s4(
+            np.ascontiguousarray(eri_s4, dtype=np.float64),
+            np.ascontiguousarray(dm, dtype=np.float64),
+            nao,
+        )
+    pair_index = _ao_pair_index_matrix(nao)
+    pair_dm = _density_to_pair_vector(dm, nao)
+    j_pairs = eri_s4 @ pair_dm
+    vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
+
+    vk = np.zeros((nao, nao), dtype=np.result_type(eri_s4, dm))
+    for i in range(nao):
+        row_pairs = pair_index[i, :]
+        for j in range(nao):
+            block = eri_s4[np.ix_(row_pairs, pair_index[:, j])]
+            vk[i, j] = np.einsum("lk,lk->", dm, block, optimize=True)
+    return vj, vk
+
+
+def contract_jk_s8(eri_s8, dm, nao):
+    """
+    Contract eight-fold packed AO-pair ERIs with a symmetric density matrix.
+    """
+    eri_s8 = np.asarray(eri_s8)
+    dm = np.asarray(dm)
+    nao = int(nao)
+    if _basis_cy is not None and hasattr(_basis_cy, "contract_jk_s8"):
+        return _basis_cy.contract_jk_s8(
+            np.ascontiguousarray(eri_s8, dtype=np.float64),
+            np.ascontiguousarray(dm, dtype=np.float64),
+            nao,
+        )
+    pair_index = _ao_pair_index_matrix(nao)
+    npair = nao * (nao + 1) // 2
+    if eri_s8.shape != ((npair * (npair + 1)) // 2,):
+        raise ValueError("eri_s8 shape is inconsistent with nao.")
+
+    pair_dm = _density_to_pair_vector(dm, nao)
+    pair_ids = np.arange(npair, dtype=np.int64)
+    j_pairs = np.zeros(npair, dtype=np.result_type(eri_s8, dm))
+    for ij in range(npair):
+        j_pairs[ij] = np.dot(eri_s8[_packed_pair_pair_indices(ij, pair_ids)], pair_dm)
+    vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
+
+    vk = np.zeros((nao, nao), dtype=np.result_type(eri_s8, dm))
+    for i in range(nao):
+        row_pairs = pair_index[i, :]
+        for j in range(nao):
+            indices = _packed_pair_pair_indices(row_pairs[:, None], pair_index[None, :, j])
+            vk[i, j] = np.einsum("lk,lk->", dm, eri_s8[indices], optimize=True)
+    return vj, vk
+
+
+def contract_jk_ri(eri_factors, dm, nao):
+    """
+    Contract RI/DF factors with a symmetric AO density matrix.
+
+    Pair-stored factors avoid materializing the full ``(P, i, j)`` tensor.
+    Full tensors are still accepted for compatibility.
+    """
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    nao = int(nao)
+    if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
+        pair_factors = _as_ri_pair_factors(eri_factors, nao)
+        pair_dm = _density_to_pair_vector(dm, nao)
+        coeff = pair_factors @ pair_dm
+        j_pairs = coeff @ pair_factors
+        vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
+        vk = _pair_factor_blocks_to_vk(pair_factors, dm, nao)
+        return vj, vk
+
+    eri_factors = np.ascontiguousarray(eri_factors, dtype=np.float64)
+    coeff = np.einsum('pkl,lk->p', eri_factors, dm, optimize=True)
+    vj = np.einsum('p,pij->ij', coeff, eri_factors, optimize=True)
+    vk = np.einsum('pil,lk,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
+    return vj, vk
+
+
+def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+    """
+    Transform AO RI factors to an MO pair block without forcing packed factors
+    through a generic einsum backend.
+    """
+    if mo_right is None:
+        mo_right = mo_left
+    mo_left = np.asarray(mo_left)
+    mo_right = np.asarray(mo_right)
+    if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
+        pair_factors = _as_ri_pair_factors(eri_factors, mo_left.shape[0])
+        out = np.empty(
+            (pair_factors.shape[0], mo_left.shape[1], mo_right.shape[1]),
+            dtype=np.result_type(pair_factors, mo_left, mo_right),
+        )
+        left = mo_left.conj()
+        for p, packed in enumerate(pair_factors):
+            factor = _pair_vector_to_symmetric_matrix(packed, mo_left.shape[0])
+            out[p] = left.T @ factor @ mo_right
+        return out
+    return np.einsum(
+        'Pmn,mp,nq->Ppq',
+        np.asarray(eri_factors),
+        mo_left.conj(),
+        mo_right,
+        optimize=True,
+    )
+
+
+def _compute_dense_eri_spherical_shellwise(basis_cart, signatures, pair_bounds, screen_tol):
+    """
+    Build spherical AO ERIs by transforming each Cartesian shell quartet before
+    scattering, avoiding a monolithic four-index Cartesian->spherical einsum.
+    """
+    blocks = _cart_shell_blocks(basis_cart)
+    sph_blocks = []
+    sph_start = 0
+    transforms = []
+    for start, stop, l in blocks:
+        transform = _cart2sph_unit_block(l)
+        sph_stop = sph_start + transform.shape[1]
+        sph_blocks.append((sph_start, sph_stop))
+        transforms.append(transform)
+        sph_start = sph_stop
+
+    eri = np.zeros((sph_start, sph_start, sph_start, sph_start), dtype=float)
+    computed = 0
+    skipped = 0
+    for ip, (p0, p1, _lp) in enumerate(blocks):
+        tp = transforms[ip]
+        sp0, sp1 = sph_blocks[ip]
+        for iq, (q0, q1, _lq) in enumerate(blocks):
+            tq = transforms[iq]
+            sq0, sq1 = sph_blocks[iq]
+            bound_pq = float(np.max(pair_bounds[p0:p1, q0:q1]))
+            for ir, (r0, r1, _lr) in enumerate(blocks):
+                tr = transforms[ir]
+                sr0, sr1 = sph_blocks[ir]
+                for is_, (s0, s1, _ls) in enumerate(blocks):
+                    ts = transforms[is_]
+                    ss0, ss1 = sph_blocks[is_]
+                    ncart = (p1 - p0) * (q1 - q0) * (r1 - r0) * (s1 - s0)
+                    bound_rs = float(np.max(pair_bounds[r0:r1, s0:s1]))
+                    if screen_tol > 0.0 and bound_pq * bound_rs < screen_tol:
+                        skipped += ncart
+                        continue
+                    block = _compute_cartesian_shell_quartet_block_cython(
+                        signatures, (p0, p1, q0, q1, r0, r1, s0, s1)
+                    )
+                    if block is None:
+                        block = np.empty((p1 - p0, q1 - q0, r1 - r0, s1 - s0), dtype=float)
+                        for a, p in enumerate(range(p0, p1)):
+                            for b, q in enumerate(range(q0, q1)):
+                                for c, r in enumerate(range(r0, r1)):
+                                    for d, s in enumerate(range(s0, s1)):
+                                        block[a, b, c, d] = _contracted_eri_from_signatures(
+                                            signatures[p], signatures[q], signatures[r], signatures[s]
+                                        )
+                    computed += ncart
+                    if screen_tol > 0.0:
+                        small = np.abs(block) < screen_tol
+                        skipped += int(np.count_nonzero(small))
+                        block = np.where(small, 0.0, block)
+                    eri[sp0:sp1, sq0:sq1, sr0:sr1, ss0:ss1] = np.einsum(
+                        "pa,qb,rc,sd,pqrs->abcd",
+                        tp,
+                        tq,
+                        tr,
+                        ts,
+                        block,
+                        optimize=True,
+                    )
+    return eri, computed, skipped
+
+
 def build_builtin(mol):
     """
     Build AO integrals with pyqed's builtin Gaussian integral engine.
@@ -2179,7 +2751,7 @@ def build_builtin(mol):
     timings["one_electron"] = time.perf_counter() - t0
 
     screen_tol = float(
-        getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 0.0)) or 0.0
+        getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12)) or 0.0
     )
     eri_backend = str(
         getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
@@ -2191,11 +2763,7 @@ def build_builtin(mol):
         "builtin_eri_representation",
         getattr(mol, "native_eri_representation", "dense"),
     )
-    if eri_representation not in {"dense", "dense+factors", "factors", "ri", "dense+ri"}:
-        raise ValueError(
-            "builtin_eri_representation must be 'dense', 'dense+factors', 'factors', 'ri', or 'dense+ri'."
-        )
-
+    aosym = str(getattr(mol, "builtin_aosym", getattr(mol, "native_aosym", "s1"))).lower()
     coord_type = str(
         getattr(mol, "builtin_coord_type", getattr(mol, "native_coord_type", "spherical"))
     ).lower()
@@ -2206,16 +2774,43 @@ def build_builtin(mol):
     else:
         raise ValueError("builtin_coord_type/native_coord_type must be 'spherical' or 'cartesian'.")
 
+    requested_eri_representation = eri_representation
+    if eri_representation == "auto":
+        eri_representation = _select_builtin_auto_eri_representation(mol, nao_cart)
+        if eri_representation == "dense" and aosym == "s1":
+            aosym = "s8"
+
+    if eri_representation not in {"dense", "dense+factors", "factors", "ri", "dense+ri", "direct"}:
+        raise ValueError(
+            "builtin_eri_representation must be 'auto', 'dense', 'dense+factors', "
+            "'factors', 'ri', 'dense+ri', or 'direct'. Use builtin_aosym for 's4'/'s8' storage."
+        )
+    if aosym not in {"s1", "s4", "s8"}:
+        raise ValueError("builtin_aosym/native_aosym must be 's1', 's4', or 's8'.")
+    if aosym != "s1" and eri_representation in {"factors", "ri", "dense+ri"}:
+        raise ValueError("builtin_aosym only applies to dense-like or direct builtin ERIs.")
+
     workers = _builtin_worker_count(mol, nao_cart)
     computed = 0
     skipped = 0
     eri = None
+    eri_s4 = None
+    eri_s8 = None
     factors = None
+<<<<<<< HEAD
     pair_bounds = None
+=======
+    direct_jk_data = None
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     dense_builder = None
     factor_builder = None
     ri_info = None
+    eri_is_spherical = False
+    factors_are_spherical = False
+    pack_s4 = aosym == "s4" and eri_representation in {"dense", "dense+factors"}
+    pack_s8 = aosym == "s8" and eri_representation in {"dense", "dense+factors"}
 
+<<<<<<< HEAD
     if eri_representation in {"dense", "dense+factors", "dense+ri"}:
         if screen_tol > 0.0:
             t0 = time.perf_counter()
@@ -2235,6 +2830,45 @@ def build_builtin(mol):
         )
         t0 = time.perf_counter()
         if use_rys:
+=======
+    if (
+        eri_representation == "dense"
+        and aosym == "s8"
+        and coord_type == "cartesian"
+        and eri_backend == "auto"
+        and workers <= 1
+        and _basis_cy is not None
+        and hasattr(_basis_cy, "compute_eri_s8")
+        and not bool(getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False)))
+    ):
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        eri_s8, computed, skipped = _basis_cy.compute_eri_s8(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(screen_tol),
+        )
+        dense_builder = "cython-s8-packed"
+        pack_s8 = False
+
+    if eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is None:
+        use_shellwise_spherical = bool(
+            getattr(mol, "builtin_shellwise_spherical", getattr(mol, "native_shellwise_spherical", False))
+        )
+        if coord_type == "spherical" and workers <= 1 and eri_backend == "auto" and use_shellwise_spherical:
+            shellwise = _compute_dense_eri_spherical_shellwise(
+                basis_cart, signatures, pair_bounds, screen_tol
+            )
+            if shellwise is not None:
+                eri, computed, skipped = shellwise
+                dense_builder = "cython-shellwise-spherical"
+                eri_is_spherical = True
+
+        if eri is None and eri_backend == "rys":
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             if _rys_cy is not None and _signatures_are_sp_only(signatures):
                 shell_blocks = _cart_shell_blocks(basis_cart)
                 shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
@@ -2267,6 +2901,7 @@ def build_builtin(mol):
                         else "rys-screened-mixed-auto"
                     )
             else:
+<<<<<<< HEAD
                 # The current blocked Rys production path is only a win for pure s/p
                 # bases. Mixed/high-l quartets use the compiled OS shell-block path.
                 blocked = None
@@ -2281,10 +2916,18 @@ def build_builtin(mol):
                     )
                     dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
         elif workers > 1:
+=======
+                eri, computed, skipped = _compute_dense_eri_serial_shellblocked_rys(
+                    signatures, pair_bounds, screen_tol
+                )
+                dense_builder = "rys-screened-mixed" if _rys_cy is not None else "rys-screened-generic"
+        elif eri is None and workers > 1:
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             eri, computed, skipped = _compute_dense_eri_parallel(
                 signatures, pair_bounds, screen_tol, workers
             )
             dense_builder = "python-parallel"
+<<<<<<< HEAD
         else:
             blocked = None
             if not _signatures_are_sp_only(signatures) and nao_cart <= _OS_BLOCKED_MAX_NAO:
@@ -2298,6 +2941,13 @@ def build_builtin(mol):
                 )
                 dense_builder = _default_dense_builder_name()
         timings["dense_eri"] = time.perf_counter() - t0
+=======
+        elif eri is None:
+            eri, computed, skipped = _compute_dense_eri_serial(
+                signatures, pair_bounds, screen_tol
+            )
+            dense_builder = _default_dense_builder_name()
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
         if eri_representation == "dense+ri":
             t0 = time.perf_counter()
@@ -2323,11 +2973,48 @@ def build_builtin(mol):
             )
             timings["low_rank_factors"] = time.perf_counter() - t0
             factor_builder = "pivoted-cholesky-dense"
+            factors_are_spherical = bool(eri_is_spherical)
+
+    elif eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is not None:
+        pass
     elif eri_representation == "ri":
         t0 = time.perf_counter()
         factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
         timings["ri_factors"] = time.perf_counter() - t0
         factor_builder = "native-ri"
+    elif eri_representation == "direct":
+        aosym = "s8"
+        if _basis_cy is None or not hasattr(_basis_cy, "direct_jk"):
+            raise RuntimeError("builtin eri='direct' requires the compiled _basis_cy direct_jk kernel.")
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        if coord_type == "cartesian" and hasattr(_basis_cy, "compute_eri_s8"):
+            eri_s8, computed, skipped = _basis_cy.compute_eri_s8(
+                np.ascontiguousarray(shells, dtype=np.int64),
+                np.ascontiguousarray(origins, dtype=np.float64),
+                np.ascontiguousarray(exps, dtype=np.float64),
+                np.ascontiguousarray(weights, dtype=np.float64),
+                np.ascontiguousarray(nprim, dtype=np.int64),
+                np.ascontiguousarray(pair_bounds, dtype=np.float64),
+                float(screen_tol),
+            )
+            dense_builder = "direct-cython-s8-cache"
+        else:
+            shell_blocks = _cart_shell_blocks(basis_cart)
+            shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
+            shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+            direct_jk_data = {
+                "shells": np.ascontiguousarray(shells, dtype=np.int64),
+                "origins": np.ascontiguousarray(origins, dtype=np.float64),
+                "exps": np.ascontiguousarray(exps, dtype=np.float64),
+                "weights": np.ascontiguousarray(weights, dtype=np.float64),
+                "nprim": np.ascontiguousarray(nprim, dtype=np.int64),
+                "pair_bounds": np.ascontiguousarray(pair_bounds, dtype=np.float64),
+                "shell_starts": shell_starts,
+                "shell_stops": shell_stops,
+                "screen_tol": float(screen_tol),
+                "cache_aosym": None,
+            }
+            dense_builder = "direct-cython-jk"
     else:
         t0 = time.perf_counter()
         pair_bounds = _compute_pair_bounds(signatures)
@@ -2386,9 +3073,9 @@ def build_builtin(mol):
 
         overlap_mat = np.einsum('pi,pq,qj->ij', transform, overlap_mat, transform, optimize=True)
         hcore_mat = np.einsum('pi,pq,qj->ij', transform, kinetic_mat + vnuc_mat, transform, optimize=True)
-        if eri is not None:
+        if eri is not None and not eri_is_spherical:
             eri = np.einsum('pa,qb,rc,sd,pqrs->abcd', transform, transform, transform, transform, eri, optimize=True)
-        if factors is not None:
+        if factors is not None and not factors_are_spherical:
             factors = np.einsum('pa,rpq,qb->rab', transform, factors, transform, optimize=True)
         basis_out = basis_cart
         mol.cart = False
@@ -2397,11 +3084,25 @@ def build_builtin(mol):
         mol.cart = True
     timings["ao_transform"] = time.perf_counter() - t0
 
+    if pack_s4 and eri is not None:
+        eri_s4 = pack_eri_s4(eri)
+        eri = None
+    elif pack_s8 and eri is not None:
+        eri_s8 = pack_eri_s8(eri)
+        eri = None
+
     mol.nao = overlap_mat.shape[0]
     mol.overlap = overlap_mat
     mol.hcore = hcore_mat
     mol.eri = eri
+    mol.eri_s4 = eri_s4
+    mol.eri_s8 = eri_s8
     mol.eri_factors = factors
+    mol._builtin_direct_jk_data = direct_jk_data
+    mol.builtin_resolved_eri_representation = eri_representation
+    mol.builtin_resolved_aosym = aosym
+    mol.native_resolved_eri_representation = eri_representation
+    mol.native_resolved_aosym = aosym
     mol._bas = basis_out
     mol._bas_cart = basis_cart if transform is not None else None
     mol._ao_cart2sph = transform
@@ -2411,7 +3112,13 @@ def build_builtin(mol):
     mol.nbas = mol.nao
     mol._builtin_build_info = {
         "coord_type": coord_type,
+        "requested_representation": requested_eri_representation,
         "representation": eri_representation,
+        "aosym": aosym,
+        "dense_storage": (
+            "s8" if eri_s8 is not None
+            else ("s4" if eri_s4 is not None else ("dense" if eri is not None else None))
+        ),
         "eri_backend": eri_backend,
         "workers": workers,
         "screen_tol": screen_tol,

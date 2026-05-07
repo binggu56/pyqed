@@ -913,6 +913,7 @@ class GW(object):
         elif method in ('scgw0', 'sc-gw0', 'self-consistent-gw0'):
             from pyqed.gw.scgw import SCGW
 
+<<<<<<< HEAD
             init_keys = {
                 "nfreq",
                 "wmax",
@@ -922,6 +923,9 @@ class GW(object):
                 "density_nfreq",
                 "grid",
             }
+=======
+            init_keys = {"nfreq", "wmax", "beta", "adjust_mu", "target_nelec", "density_nfreq"}
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
             kwargs.setdefault("update_screening", False)
             self.scgw_result = SCGW(
@@ -936,6 +940,7 @@ class GW(object):
         elif method in ('scgw', 'sc-gw', 'self-consistent-gw'):
             from pyqed.gw.scgw import SCGW
 
+<<<<<<< HEAD
             init_keys = {
                 "nfreq",
                 "wmax",
@@ -945,6 +950,9 @@ class GW(object):
                 "density_nfreq",
                 "grid",
             }
+=======
+            init_keys = {"nfreq", "wmax", "beta", "adjust_mu", "target_nelec", "density_nfreq"}
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
             kwargs.setdefault("update_screening", True)
             self.scgw_result = SCGW(

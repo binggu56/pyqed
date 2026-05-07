@@ -106,6 +106,44 @@ class DirectConnectivity:
     phase_AB: np.ndarray
 
 
+@dataclass
+class SpinStringConnectivity:
+    """
+    Spin-string factored connectivity for RHF compact direct-CI.
+
+    Determinants are ordered as ``alpha_index * n_beta + beta_index`` by
+    ``get_fci_combos``.  Factoring the links by spin string avoids materializing
+    the repeated determinant-product connectivity, which becomes the dominant
+    setup cost for spaces such as CAS(10,10).
+    """
+    alpha_occ: np.ndarray
+    beta_occ: np.ndarray
+    I_A: np.ndarray
+    J_A: np.ndarray
+    p_A: np.ndarray
+    q_A: np.ndarray
+    phase_A: np.ndarray
+    I_B: np.ndarray
+    J_B: np.ndarray
+    p_B: np.ndarray
+    q_B: np.ndarray
+    phase_B: np.ndarray
+    I_AA: np.ndarray
+    J_AA: np.ndarray
+    p_AA: np.ndarray
+    q_AA: np.ndarray
+    r_AA: np.ndarray
+    s_AA: np.ndarray
+    phase_AA: np.ndarray
+    I_BB: np.ndarray
+    J_BB: np.ndarray
+    p_BB: np.ndarray
+    q_BB: np.ndarray
+    r_BB: np.ndarray
+    s_BB: np.ndarray
+    phase_BB: np.ndarray
+
+
 def _orthonormalize_columns(V, tol=1e-12):
     """
     Return an orthonormal basis spanning the columns of ``V``.
@@ -381,6 +419,125 @@ def _empty_int_array():
 
 def _empty_phase_array():
     return np.zeros(0, dtype=np.int8)
+
+
+def _string_orbital_phases(strings):
+    occupied_before = np.cumsum(strings, axis=1) - strings
+    return np.where(occupied_before % 2, -1, 1).astype(np.int8)
+
+
+def _single_string_links(strings):
+    n_string, n_mo = strings.shape
+    bits = [_binary_row_to_bits(strings[i]) for i in range(n_string)]
+    lookup = {bits[i]: i for i in range(n_string)}
+    phases = _string_orbital_phases(strings)
+    links = []
+
+    for ket in range(n_string):
+        occ = np.where(strings[ket] == 1)[0]
+        vir = np.where(strings[ket] == 0)[0]
+        ket_bits = bits[ket]
+        for q in occ:
+            removed = ket_bits ^ (1 << int(q))
+            for p in vir:
+                bra = lookup[removed | (1 << int(p))]
+                phase = int(phases[ket, p]) * int(phases[bra, q])
+                links.append((bra, ket, int(p), int(q), phase))
+
+    if not links:
+        return (
+            _empty_int_array(), _empty_int_array(), _empty_int_array(),
+            _empty_int_array(), _empty_phase_array(),
+        )
+    cols = list(zip(*links))
+    return (
+        np.asarray(cols[0], dtype=np.int32),
+        np.asarray(cols[1], dtype=np.int32),
+        np.asarray(cols[2], dtype=np.int32),
+        np.asarray(cols[3], dtype=np.int32),
+        np.asarray(cols[4], dtype=np.int8),
+    )
+
+
+def _double_string_links(strings):
+    n_string, n_mo = strings.shape
+    bits = [_binary_row_to_bits(strings[i]) for i in range(n_string)]
+    lookup = {bits[i]: i for i in range(n_string)}
+    phases = _string_orbital_phases(strings)
+    links = []
+
+    for ket in range(n_string):
+        occ = np.where(strings[ket] == 1)[0]
+        vir = np.where(strings[ket] == 0)[0]
+        ket_bits = bits[ket]
+        for iq, q in enumerate(occ):
+            for s in occ[iq + 1:]:
+                removed = ket_bits ^ (1 << int(q)) ^ (1 << int(s))
+                for ip, p in enumerate(vir):
+                    for r in vir[ip + 1:]:
+                        bra = lookup[removed | (1 << int(p)) | (1 << int(r))]
+                        # Match get_excitation_op's double-excitation ordering:
+                        # first tensor leg uses the higher created/annihilated
+                        # orbital, second leg uses the lower one.
+                        phase = (
+                            int(phases[ket, r])
+                            * int(phases[bra, s])
+                            * int(phases[ket, p])
+                            * int(phases[bra, q])
+                        )
+                        links.append((bra, ket, int(r), int(s), int(p), int(q), phase))
+
+    if not links:
+        return (
+            _empty_int_array(), _empty_int_array(), _empty_int_array(),
+            _empty_int_array(), _empty_int_array(), _empty_int_array(),
+            _empty_phase_array(),
+        )
+    cols = list(zip(*links))
+    return (
+        np.asarray(cols[0], dtype=np.int32),
+        np.asarray(cols[1], dtype=np.int32),
+        np.asarray(cols[2], dtype=np.int32),
+        np.asarray(cols[3], dtype=np.int32),
+        np.asarray(cols[4], dtype=np.int32),
+        np.asarray(cols[5], dtype=np.int32),
+        np.asarray(cols[6], dtype=np.int8),
+    )
+
+
+def build_spin_string_connectivity(Binary):
+    """
+    Build alpha/beta spin-string links without expanding to determinant pairs.
+    """
+    n_det = Binary.shape[0]
+    n_beta = 0
+    while n_beta < n_det and np.array_equal(Binary[n_beta, 0, :], Binary[0, 0, :]):
+        n_beta += 1
+    if n_beta == 0 or n_det % n_beta != 0:
+        raise ValueError("Determinant basis is not a rectangular alpha/beta product.")
+
+    alpha_occ = np.ascontiguousarray(Binary[::n_beta, 0, :])
+    beta_occ = np.ascontiguousarray(Binary[:n_beta, 1, :])
+    n_alpha = alpha_occ.shape[0]
+    if n_alpha * n_beta != Binary.shape[0]:
+        raise ValueError("Determinant basis is not a rectangular alpha/beta product.")
+    if not (
+        np.array_equal(Binary[:, 0, :], np.repeat(alpha_occ, n_beta, axis=0))
+        and np.array_equal(Binary[:, 1, :], np.tile(beta_occ, (n_alpha, 1)))
+    ):
+        raise ValueError("Spin-string direct-CI expects alpha-major determinant ordering.")
+
+    I_A, J_A, p_A, q_A, phase_A = _single_string_links(alpha_occ)
+    I_B, J_B, p_B, q_B, phase_B = _single_string_links(beta_occ)
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA = _double_string_links(alpha_occ)
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB = _double_string_links(beta_occ)
+    return SpinStringConnectivity(
+        alpha_occ, beta_occ,
+        I_A, J_A, p_A, q_A, phase_A,
+        I_B, J_B, p_B, q_B, phase_B,
+        I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    )
 
 
 def _extract_single_data(I, J, Binary, sign, spin):
@@ -1294,6 +1451,90 @@ def _sigma_compact_conn_numba(
     return sigma_vec
 
 
+@njit(nogil=True, cache=True, fastmath=True)
+def _sigma_compact_spin_string_numba(
+    h1, eri_same, eri_cross, H_diag, c,
+    alpha_occ, beta_occ,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+):
+    """
+    Compact RHF direct-CI sigma in a spin-string product basis.
+
+    This performs the same work as the determinant connectivity kernel, but it
+    loops over alpha and beta string links separately instead of walking a large
+    pre-expanded determinant-pair table.
+    """
+    n_alpha = alpha_occ.shape[0]
+    n_beta = beta_occ.shape[0]
+    n_mo = h1.shape[0]
+    sigma_vec = H_diag * c
+
+    for link in range(I_A.shape[0]):
+        ia = I_A[link]
+        ja = J_A[link]
+        p = p_A[link]
+        q = q_A[link]
+        sign = phase_A[link]
+        same_part = -sign * h1[p, q]
+        for r in range(n_mo):
+            if alpha_occ[ja, r] and r != q:
+                same_part -= sign * eri_same[p, q, r, r]
+        for ib in range(n_beta):
+            val = same_part
+            for r in range(n_mo):
+                if beta_occ[ib, r]:
+                    val -= sign * eri_cross[p, q, r, r]
+            sigma_vec[ia * n_beta + ib] += val * c[ja * n_beta + ib]
+
+    for link in range(I_B.shape[0]):
+        ib = I_B[link]
+        jb = J_B[link]
+        p = p_B[link]
+        q = q_B[link]
+        sign = phase_B[link]
+        same_part = -sign * h1[p, q]
+        for r in range(n_mo):
+            if beta_occ[jb, r] and r != q:
+                same_part -= sign * eri_same[p, q, r, r]
+        for ia in range(n_alpha):
+            val = same_part
+            for r in range(n_mo):
+                if alpha_occ[ia, r]:
+                    val -= sign * eri_cross[p, q, r, r]
+            sigma_vec[ia * n_beta + ib] += val * c[ia * n_beta + jb]
+
+    for link in range(I_AA.shape[0]):
+        ia = I_AA[link]
+        ja = J_AA[link]
+        val = phase_AA[link] * eri_same[p_AA[link], q_AA[link], r_AA[link], s_AA[link]]
+        for ib in range(n_beta):
+            sigma_vec[ia * n_beta + ib] += val * c[ja * n_beta + ib]
+
+    for link in range(I_BB.shape[0]):
+        ib = I_BB[link]
+        jb = J_BB[link]
+        val = phase_BB[link] * eri_same[p_BB[link], q_BB[link], r_BB[link], s_BB[link]]
+        for ia in range(n_alpha):
+            sigma_vec[ia * n_beta + ib] += val * c[ia * n_beta + jb]
+
+    for la in range(I_A.shape[0]):
+        ia = I_A[la]
+        ja = J_A[la]
+        pa = p_A[la]
+        qa = q_A[la]
+        phase_alpha = phase_A[la]
+        for lb in range(I_B.shape[0]):
+            ib = I_B[lb]
+            jb = J_B[lb]
+            val = phase_alpha * phase_B[lb] * eri_cross[pa, qa, p_B[lb], q_B[lb]]
+            sigma_vec[ia * n_beta + ib] += val * c[ja * n_beta + jb]
+
+    return sigma_vec
+
+
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _sigma_compact_derivative_batch_numba(
     h1_batch,
@@ -1625,6 +1866,7 @@ class CASCI(mcscf.casci.CASCI):
         """
         super().__init__(mf, ncas, nelecas, ncore=ncore, spin=spin, verbose=verbose)
         self.direct_connectivity = None
+        self.spin_string_connectivity = None
         
         self.tol = tol
         self.direct_ci_dense_fallback_ndets = DIRECT_CI_DENSE_FALLBACK_NDETS
@@ -2459,12 +2701,9 @@ class CASCI(mcscf.casci.CASCI):
                 mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
                 binary = get_fci_combos(mo_occ = mo_occ)
                 self.binary = binary
-                self.direct_connectivity = build_direct_connectivity(binary)
 
             else:
                 binary = self.binary
-                if self.direct_connectivity is None:
-                    self.direct_connectivity = build_direct_connectivity(binary)
 
 
             factor_data = None
@@ -2536,6 +2775,17 @@ class CASCI(mcscf.casci.CASCI):
             self.hcore = h1e
             self.h2e_cas = spatial_eri
             self.eri_so = h2e
+            spin_string_conn = None
+            use_spin_string_backend = (
+                factor_data is None
+                and spatial_eri is not None
+                and not uhf_reference
+                and not self.spin_purification
+            )
+            if use_spin_string_backend:
+                if self.spin_string_connectivity is None:
+                    self.spin_string_connectivity = build_spin_string_connectivity(binary)
+                spin_string_conn = self.spin_string_connectivity
 
             if (
                 factor_data is None
@@ -2564,6 +2814,8 @@ class CASCI(mcscf.casci.CASCI):
             else:
                 if factor_data is not None:
                     self.solver_backend = 'direct_ci_factor_conn_uhf' if uhf_reference else 'direct_ci_factor_conn'
+                elif spin_string_conn is not None:
+                    self.solver_backend = 'direct_ci_spin_string'
                 else:
                     self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
                 extra_roots = 0
@@ -2577,7 +2829,10 @@ class CASCI(mcscf.casci.CASCI):
                     H_diag = H_diag_factor
                 else:
                     H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary) if spatial_eri is not None else _compute_diag(h1e, h2e, binary)
-                conn = self.direct_connectivity
+                conn = None if spin_string_conn is not None else self.direct_connectivity
+                if conn is None and spin_string_conn is None:
+                    self.direct_connectivity = build_direct_connectivity(binary)
+                    conn = self.direct_connectivity
 
                 def mv(c):
                     # Keep the Lanczos matvec almost entirely inside compiled
@@ -2596,6 +2851,25 @@ class CASCI(mcscf.casci.CASCI):
                             conn.I_AA, conn.J_AA,
                             conn.I_BB, conn.J_BB,
                             conn.I_AB, conn.J_AB,
+                        )
+                    if spin_string_conn is not None:
+                        return _sigma_compact_spin_string_numba(
+                            spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c,
+                            spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
+                            spin_string_conn.I_A, spin_string_conn.J_A,
+                            spin_string_conn.p_A, spin_string_conn.q_A,
+                            spin_string_conn.phase_A,
+                            spin_string_conn.I_B, spin_string_conn.J_B,
+                            spin_string_conn.p_B, spin_string_conn.q_B,
+                            spin_string_conn.phase_B,
+                            spin_string_conn.I_AA, spin_string_conn.J_AA,
+                            spin_string_conn.p_AA, spin_string_conn.q_AA,
+                            spin_string_conn.r_AA, spin_string_conn.s_AA,
+                            spin_string_conn.phase_AA,
+                            spin_string_conn.I_BB, spin_string_conn.J_BB,
+                            spin_string_conn.p_BB, spin_string_conn.q_BB,
+                            spin_string_conn.r_BB, spin_string_conn.s_BB,
+                            spin_string_conn.phase_BB,
                         )
                     if spatial_eri is not None:
                         return _sigma_compact_conn_numba(

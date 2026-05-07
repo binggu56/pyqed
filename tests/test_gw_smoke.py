@@ -214,6 +214,7 @@ def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
     assert len(scgw.history) == 2
     assert len(scgw.mu_history) == 3
     assert scgw.info["method"] == "scgw_imaginary_axis_prototype"
+<<<<<<< HEAD
     assert scgw.info["grid"] == "tangent"
     assert scgw.info["adjust_mu"] is True
     assert scgw.info["total_energy"] == "galitskii_migdal"
@@ -223,6 +224,12 @@ def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
     np.testing.assert_allclose(scgw.nelec, scgw.target_nelec, atol=1e-8)
     np.testing.assert_allclose(np.trace(scgw.density_matrix), scgw.nelec, atol=1e-10)
     assert np.isfinite(scgw.e_tot)
+=======
+    assert scgw.info["adjust_mu"] is True
+    assert scgw.info["total_energy"] == "not_implemented"
+    np.testing.assert_allclose(scgw.nelec, scgw.target_nelec, atol=1e-8)
+    np.testing.assert_allclose(np.trace(scgw.density_matrix), scgw.nelec, atol=1e-10)
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     assert np.all(np.isfinite(scgw.e_qp))
     assert np.all(np.isfinite(scgw.G))
 
@@ -268,7 +275,10 @@ def test_gw_driver_exposes_scgw_and_scgw0():
     gw0 = GW(mf, screening="TDH", eta=1e-8).scgw0(
         nfreq=7,
         wmax=8.0,
+<<<<<<< HEAD
         grid="linear",
+=======
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         max_cycle=1,
         damping=0.5,
     )
@@ -283,8 +293,11 @@ def test_gw_driver_exposes_scgw_and_scgw0():
     assert gw.method == "scgw"
     assert gw0.scgw_result.info["update_screening"] is False
     assert gw.scgw_result.info["update_screening"] is True
+<<<<<<< HEAD
     assert gw0.scgw_result.info["grid"] == "linear"
     assert gw.scgw_result.info["grid"] == "tangent"
+=======
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     assert gw0.e_qp.shape == (gw0.nso // 2,)
     assert gw.e_qp.shape == (gw.nso // 2,)
     assert np.all(np.isfinite(np.asarray(gw0)))
@@ -314,6 +327,7 @@ def test_scgw_uses_factorized_backend_when_available():
     assert scgw.W.shape == scgw.P.shape
     assert np.all(np.isfinite(scgw.G))
     assert np.all(np.isfinite(scgw.Sigma_c))
+<<<<<<< HEAD
     assert np.isfinite(scgw.e_tot)
 
 
@@ -386,6 +400,8 @@ def test_scgw_frequency_convergence_scan_reports_grid_deltas():
     assert rows[1]["nfreq"] == 7
     assert np.all(np.isfinite(rows[1]["e_qp"]))
     assert np.isfinite(rows[1]["e_tot"])
+=======
+>>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
 
 def test_scgw_matsubara_density_matches_static_limit():
