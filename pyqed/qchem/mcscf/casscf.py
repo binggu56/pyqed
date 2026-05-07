@@ -327,6 +327,24 @@ class FirstOrderCASSCF:
         mc.nstates = int(requested_nstates)
         return mc
 
+    def _casci_verbose(self):
+        """Keep CASSCF-level verbosity from leaking raw internal CASCI solves."""
+        return max(0, self.verbose - 1)
+
+    def _log_casscf_cycle(self, cycle, energy, gnorm, step_norm, micro_cycles=None):
+        if self.verbose < 1:
+            return
+        step_text = "None" if step_norm is None else "{:.3e}".format(float(step_norm))
+        fields = [
+            "CASSCF cycle {:3d}".format(int(cycle)),
+            "E = {:.10f}".format(float(energy)),
+            "|g| = {:.3e}".format(float(gnorm)),
+            "step = {}".format(step_text),
+        ]
+        if micro_cycles is not None:
+            fields.append("micro = {}".format(int(micro_cycles)))
+        print("  ".join(fields))
+
     @staticmethod
     def _copy_ci_guess(ci):
         if ci is None:
@@ -346,7 +364,12 @@ class FirstOrderCASSCF:
         return self
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
-        probe = CASCI(self.mf, ncas=self.ncas, nelecas=self.nelecas, verbose=self.verbose)
+        probe = CASCI(
+            self.mf,
+            ncas=self.ncas,
+            nelecas=self.nelecas,
+            verbose=self._casci_verbose(),
+        )
         probe.fix_spin(s=s, ss=ss, shift=shift)
         self.spin_purification = probe.spin_purification
         self.ss = probe.ss
@@ -354,7 +377,12 @@ class FirstOrderCASSCF:
         return self
 
     def _make_casci(self, mo_coeff, nstates, ci0=None):
-        mc = CASCI(self.mf, ncas=self.ncas, nelecas=self.nelecas, verbose=self.verbose)
+        mc = CASCI(
+            self.mf,
+            ncas=self.ncas,
+            nelecas=self.nelecas,
+            verbose=self._casci_verbose(),
+        )
         if self._casci_binary_cache is not None:
             mc.binary = self._casci_binary_cache
         if self._casci_direct_connectivity_cache is not None:
@@ -885,6 +913,7 @@ class FirstOrderCASSCF:
                     "step_norm": prev_step_norm,
                 }
             )
+            self._log_casscf_cycle(cycle, energy, gnorm, prev_step_norm)
 
             if (
                 prev_energy is not None
@@ -1526,7 +1555,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
     def _make_integral_casci(self, h1_mo, eri_mo, mo_coeff, nstates, ci0=None):
         frozen_mf = self._FrozenIntegralRHF(self.mf, h1_mo, eri_mo, mo_coeff)
-        mc = CASCI(frozen_mf, ncas=self.ncas, nelecas=self.nelecas, verbose=self.verbose)
+        mc = CASCI(
+            frozen_mf,
+            ncas=self.ncas,
+            nelecas=self.nelecas,
+            verbose=self._casci_verbose(),
+        )
         if self.spin_purification:
             mc.spin_purification = self.spin_purification
             mc.ss = self.ss
@@ -1558,7 +1592,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ci0=None,
     ):
         frozen_mf = self._FrozenFactorRHF(self.mf, h1_mo, pair_factors, mo_coeff)
-        mc = CASCI(frozen_mf, ncas=self.ncas, nelecas=self.nelecas, verbose=self.verbose)
+        mc = CASCI(
+            frozen_mf,
+            ncas=self.ncas,
+            nelecas=self.nelecas,
+            verbose=self._casci_verbose(),
+        )
         if self.spin_purification:
             mc.spin_purification = self.spin_purification
             mc.ss = self.ss
@@ -5083,6 +5122,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     "step_norm": 0.0 if micro_step is None else float(micro_step),
                     "micro_cycles": micro,
                 }
+            )
+            self._log_casscf_cycle(
+                macro,
+                micro_energy,
+                micro_gnorm,
+                0.0 if micro_step is None else float(micro_step),
+                micro_cycles=micro,
             )
             self.casci = micro_mc
 
