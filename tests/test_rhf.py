@@ -537,6 +537,53 @@ def test_rhf_sample_mo_grid_and_plot_3d_builtin_h2(tmp_path):
     assert out.stat().st_size > 0
 
 
+def test_rhf_plot_mo_3d_accepts_frontier_aliases_builtin_h2(tmp_path):
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin')
+    mf = RHF(mol).run()
+
+    grid = mf.sample_mo_grid('homo', nx=12, ny=12, nz=12, margin=2.0)
+    assert grid['mo_index'] == 0
+
+    out = tmp_path / 'h2_homo.png'
+    result = mf.plot_mo_3d('homo', nx=12, ny=12, nz=12, margin=2.0, save=out)
+
+    assert result['grid']['mo_index'] == 0
+    assert result['save_path'] == str(out)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_rhf_plot_mo_defaults_to_homo_builtin_h2(tmp_path):
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin')
+    mf = RHF(mol).run()
+
+    out = tmp_path / 'h2_default_homo.png'
+    result = mf.plot_mo(nx=12, ny=12, nz=12, margin=2.0, save=out)
+
+    assert result['grid']['mo_index'] == 0
+    assert result['save_path'] == str(out)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_rhf_plot_mo_accepts_orbital_lists_builtin_h2(tmp_path):
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin')
+    mf = RHF(mol).run()
+
+    out = tmp_path / 'h2_frontier.png'
+    result = mf.plot_mo(['homo', 'lumo'], nx=12, ny=12, nz=12, margin=2.0, save=out)
+
+    assert result['mo_indices'] == (0, 1)
+    assert len(result['axes']) == 2
+    assert len(result['results']) == 2
+    assert result['save_path'] == str(out)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
 def test_rhf_orbital_cube_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='builtin')

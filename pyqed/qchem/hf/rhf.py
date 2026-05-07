@@ -425,6 +425,8 @@ class RHF:
         self.dm = None
 
         self.eri = mol.eri
+        self.eri_s4 = getattr(mol, 'eri_s4', None)
+        self.eri_s8 = getattr(mol, 'eri_s8', None)
         # self.eri_so = None
 
         self.mo_energy = None
@@ -1102,6 +1104,9 @@ class RHF:
             comment=comment,
         )
 
+    def plot_mo(self, mo_index='homo', save=None, **kwargs):
+        return self.analyze().plot_mo(mo_index, save=save, **kwargs)
+
     def plot_mo_3d(
         self,
         mo_index,
@@ -1357,11 +1362,28 @@ class RHF:
         else:
             C = mo_coeff
 
-        if self.eri is not None:
+        eri_source = self.eri
+        if eri_source is None and getattr(self, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            eri_source = unpack_eri_s4(self.eri_s4, self.mol.nao)
+        if eri_source is None and getattr(self, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            eri_source = unpack_eri_s8(self.eri_s8, self.mol.nao)
+        if eri_source is None:
+            eri_source = getattr(self.mol, 'eri', None)
+        if eri_source is None and getattr(self.mol, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            eri_source = unpack_eri_s4(self.mol.eri_s4, self.mol.nao)
+        if eri_source is None and getattr(self.mol, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            eri_source = unpack_eri_s8(self.mol.eri_s8, self.mol.nao)
+
+        eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
+        if eri_source is not None and eri_ndim == 4:
             if notation == 'chem':
-                eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', self.eri, C.conj(), C, C.conj(), C)
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', eri_source, C.conj(), C, C.conj(), C)
             elif notation == 'phys':
-                eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', self.eri, C.conj(), C, C.conj(), C)
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', eri_source, C.conj(), C, C.conj(), C)
             else:
                 raise ValueError("notation must be 'chem' or 'phys'.")
             return eri_mo
@@ -1369,10 +1391,13 @@ class RHF:
         eri_factors = getattr(self, 'eri_factors', None)
         if eri_factors is None:
             eri_factors = getattr(self.mol, 'eri_factors', None)
+        if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
+            eri_factors = eri_source
         if eri_factors is None:
             raise ValueError("RHF.get_eri_mo() requires either dense eri or eri_factors.")
 
-        pair_factors = contract('Pmn,mp,nq->Ppq', eri_factors, C.conj(), C)
+        from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
+        pair_factors = transform_ri_factors_to_mo_pair(eri_factors, C)
         eri_mo = contract('Ppq,Prs->pqrs', pair_factors, pair_factors)
 
         if notation == 'chem':
@@ -1709,7 +1734,14 @@ def get_or_build_low_rank_eri_factors(mol, tol=1e-8, max_rank=None, warm_start=T
     if getattr(mol, 'eri', None) is None:
         if existing is not None:
             return existing
-        raise ValueError("mol.eri or mol.eri_factors is required for the builtin low-rank J/K path.")
+        if getattr(mol, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            mol.eri = unpack_eri_s4(mol.eri_s4, mol.nao)
+        elif getattr(mol, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            mol.eri = unpack_eri_s8(mol.eri_s8, mol.nao)
+        else:
+            raise ValueError("mol.eri, mol.eri_s4, mol.eri_s8, or mol.eri_factors is required for the builtin low-rank J/K path.")
 
     cache = getattr(mol, '_low_rank_eri_cache', None)
     if cache is None:
@@ -1795,12 +1827,61 @@ def get_jk(mol, dm, eri_factors=None):
 
     """
     if eri_factors is not None:
-        coeff = np.einsum('pkl,lk->p', eri_factors, dm, optimize=True)
-        vj = np.einsum('p,pij->ij', coeff, eri_factors, optimize=True)
-        vk = np.einsum('pil,lk,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
+        from pyqed.qchem.basis import contract_jk_ri
+        return contract_jk_ri(eri_factors, dm, mol.nao)
+
+    eri_s4 = getattr(mol, 'eri_s4', None)
+    if eri_s4 is not None:
+        from pyqed.qchem.basis import contract_jk_s4
+        return contract_jk_s4(eri_s4, dm, mol.nao)
+
+    eri_s8 = getattr(mol, 'eri_s8', None)
+    if eri_s8 is not None:
+        from pyqed.qchem.basis import contract_jk_s8
+        return contract_jk_s8(eri_s8, dm, mol.nao)
+
+    direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
+    if direct_jk_data is not None:
+        from pyqed.qchem.basis import _basis_cy
+
+        transform = getattr(mol, '_ao_cart2sph', None)
+        if transform is None and direct_jk_data.get("cache_aosym") == "s8" and hasattr(_basis_cy, "compute_eri_s8"):
+            from pyqed.qchem.basis import contract_jk_s8
+
+            eri_s8, _computed, _skipped = _basis_cy.compute_eri_s8(
+                direct_jk_data["shells"],
+                direct_jk_data["origins"],
+                direct_jk_data["exps"],
+                direct_jk_data["weights"],
+                direct_jk_data["nprim"],
+                direct_jk_data["pair_bounds"],
+                float(direct_jk_data.get("screen_tol", 0.0)),
+            )
+            mol.eri_s8 = eri_s8
+            mol._builtin_direct_jk_data = None
+            return contract_jk_s8(eri_s8, dm, mol.nao)
+
+        dm_work = dm
+        if transform is not None:
+            dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
+        vj, vk = _basis_cy.direct_jk(
+            direct_jk_data["shells"],
+            direct_jk_data["origins"],
+            direct_jk_data["exps"],
+            direct_jk_data["weights"],
+            direct_jk_data["nprim"],
+            direct_jk_data["pair_bounds"],
+            np.ascontiguousarray(dm_work, dtype=np.float64),
+            float(direct_jk_data.get("screen_tol", 0.0)),
+        )
+        if transform is not None:
+            vj = np.einsum('pa,pq,qb->ab', transform, vj, transform, optimize=True)
+            vk = np.einsum('pa,pq,qb->ab', transform, vk, transform, optimize=True)
         return vj, vk
 
     eri = mol.eri
+    if eri is None:
+        raise ValueError("get_jk requires mol.eri, mol.eri_s4, mol.eri_s8, mol._builtin_direct_jk_data, or eri_factors.")
 
     vj = contract('lk, ijkl -> ij', dm, eri)
     vk = contract('lk, ilkj -> ij', dm, eri)

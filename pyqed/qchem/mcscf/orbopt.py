@@ -147,13 +147,13 @@ def nonredundant_pairs(ncore, ncas, nmo):
 
 def gradient_norm(gradient, ncore, ncas, nmo):
     """
-    Infinity norm over the nonredundant orbital-rotation blocks.
+    L2 norm over the nonredundant orbital-rotation blocks.
     """
     pairs = nonredundant_pairs(ncore, ncas, nmo)
     if not pairs:
         return 0.0
     vals = [abs(gradient[p, q]) for p, q in pairs]
-    return float(np.max(vals))
+    return float(np.linalg.norm(vals))
 
 
 def pack_nonredundant(matrix, ncore, ncas, nmo):

@@ -17,6 +17,10 @@ from pyqed.qchem.basis import (
     make_contractions,
     parse_gbs,
     _basis_path,
+    contract_jk_s4,
+    contract_jk_s8,
+    unpack_eri_s4,
+    unpack_eri_s8,
 )
 
 try:
@@ -34,7 +38,11 @@ def test_native_build_is_default_and_produces_ao_tensors():
     assert mol.nao == 2
     assert mol.overlap.shape == (2, 2)
     assert mol.hcore.shape == (2, 2)
-    assert mol.eri.shape == (2, 2, 2, 2)
+    assert mol.eri is None
+    assert mol.eri_s8 is not None
+    assert mol._builtin_build_info['requested_representation'] == 'auto'
+    assert mol._builtin_build_info['representation'] == 'dense'
+    assert mol._builtin_build_info['aosym'] == 's8'
     np.testing.assert_allclose(np.diag(mol.overlap), np.ones(2), atol=1e-12)
 
 
@@ -125,16 +133,143 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
     np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-9, rtol=1e-9)
-    expected_builder = (
-        'cython-kernel-mixed-d-fallback'
-        if _basis_cy is not None
-        else 'python-serial-mixed-d-fallback'
-    )
-    assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
+    assert mol_rys._builtin_build_info['dense_builder'] == 'rys-screened-mixed'
 
     e_default = mol_default.RHF().run(max_cycle=80).e_tot
     e_rys = mol_rys.RHF().run(max_cycle=80).e_tot
     np.testing.assert_allclose(e_rys, e_default, atol=1e-9, rtol=1e-9)
+
+
+def test_builtin_basis_aliases_resolve_existing_gbs_files():
+    assert _basis_path("cc-pvtz").endswith("cc-pvtz.0.gbs")
+    assert _basis_path("aug-cc-pvdz").endswith("aug-cc-pvdz.0.gbs")
+
+
+def test_builtin_s4_storage_matches_dense_rhf_energy():
+    atom = 'H 0 0 0; H 0 0 1.4'
+
+    mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_dense.build(driver='builtin', eri='dense')
+    e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
+
+    mol_s4 = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_s4.build(driver='builtin', eri='s4')
+    e_s4 = mol_s4.RHF().run(max_cycle=80).e_tot
+
+    assert mol_s4.eri is None
+    assert mol_s4.eri_s4 is not None
+    np.testing.assert_allclose(unpack_eri_s4(mol_s4.eri_s4, mol_s4.nao), mol_dense.eri, atol=1e-12)
+    np.testing.assert_allclose(e_s4, e_dense, atol=1e-10, rtol=1e-10)
+
+
+def test_builtin_s8_storage_matches_dense_rhf_energy():
+    atom = 'H 0 0 0; H 0 0 1.4'
+
+    mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_dense.build(driver='builtin', eri='dense')
+    e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
+
+    mol_s8 = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_s8.build(driver='builtin', eri='s8')
+    e_s8 = mol_s8.RHF().run(max_cycle=80).e_tot
+
+    npair = mol_s8.nao * (mol_s8.nao + 1) // 2
+    assert mol_s8.eri is None
+    assert mol_s8.eri_s8 is not None
+    assert mol_s8.eri_s8.shape == (npair * (npair + 1) // 2,)
+    np.testing.assert_allclose(unpack_eri_s8(mol_s8.eri_s8, mol_s8.nao), mol_dense.eri, atol=1e-12)
+    np.testing.assert_allclose(e_s8, e_dense, atol=1e-10, rtol=1e-10)
+
+
+def test_builtin_aosym_s8_matches_legacy_eri_alias():
+    atom = 'H 0 0 0; H 0 0 1.4'
+
+    mol_aosym = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_aosym.build(driver='builtin', eri='dense', aosym='s8')
+
+    mol_legacy = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_legacy.build(driver='builtin', eri='s8')
+
+    assert mol_aosym.builtin_eri_representation == 'dense'
+    assert mol_aosym.builtin_aosym == 's8'
+    assert mol_aosym._builtin_build_info['representation'] == 'dense'
+    assert mol_aosym._builtin_build_info['aosym'] == 's8'
+    assert mol_aosym._builtin_build_info['dense_builder'] == 'cython-s8-packed'
+    np.testing.assert_allclose(mol_aosym.eri_s8, mol_legacy.eri_s8, atol=1e-12)
+
+
+def test_builtin_packed_jk_contractions_match_dense_tensor():
+    mol_dense = Molecule(atom='O 0 0 0; H 0 0 1.8; H 0 1.7 0', unit='bohr', basis='sto-3g')
+    mol_dense.build(driver='builtin', eri='dense')
+
+    mol_s4 = Molecule(atom=mol_dense.atom, unit='bohr', basis='sto-3g')
+    mol_s4.build(driver='builtin', eri='s4')
+    mol_s8 = Molecule(atom=mol_dense.atom, unit='bohr', basis='sto-3g')
+    mol_s8.build(driver='builtin', eri='s8')
+
+    rng = np.random.default_rng(123)
+    dm = rng.normal(size=(mol_dense.nao, mol_dense.nao))
+    dm = dm + dm.T
+    vj_dense = np.einsum('lk,ijkl->ij', dm, mol_dense.eri, optimize=True)
+    vk_dense = np.einsum('lk,ilkj->ij', dm, mol_dense.eri, optimize=True)
+
+    vj_s4, vk_s4 = contract_jk_s4(mol_s4.eri_s4, dm, mol_s4.nao)
+    vj_s8, vk_s8 = contract_jk_s8(mol_s8.eri_s8, dm, mol_s8.nao)
+
+    np.testing.assert_allclose(vj_s4, vj_dense, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(vk_s4, vk_dense, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(vj_s8, vj_dense, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(vk_s8, vk_dense, atol=1e-11, rtol=1e-11)
+
+
+def test_builtin_direct_jk_matches_dense_tensor_and_rhf_energy():
+    atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
+    mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_dense.build(driver='builtin', eri='dense')
+
+    mol_direct = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol_direct.build(driver='builtin', eri='direct')
+
+    rng = np.random.default_rng(321)
+    dm = rng.normal(size=(mol_dense.nao, mol_dense.nao))
+    dm = dm + dm.T
+    vj_dense = np.einsum('lk,ijkl->ij', dm, mol_dense.eri, optimize=True)
+    vk_dense = np.einsum('lk,ilkj->ij', dm, mol_dense.eri, optimize=True)
+    from pyqed.qchem.hf.rhf import get_jk
+    vj_direct, vk_direct = get_jk(mol_direct, dm)
+
+    np.testing.assert_allclose(vj_direct, vj_dense, atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(vk_direct, vk_dense, atol=1e-11, rtol=1e-11)
+    assert mol_direct._builtin_direct_jk_data is None
+    assert mol_direct.eri_s8 is not None
+    e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
+    e_direct = mol_direct.RHF().run(max_cycle=80).e_tot
+    np.testing.assert_allclose(e_direct, e_dense, atol=1e-10, rtol=1e-10)
+
+
+def test_builtin_auto_prefers_ri_for_larger_native_builds():
+    mol = Molecule(
+        atom='O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266',
+        unit='bohr',
+        basis='def2-svp',
+    )
+    mol.build(driver='builtin', eri='auto')
+
+    assert mol._builtin_build_info['representation'] == 'ri'
+    assert mol.eri is None
+    assert mol.eri_factors is not None
+
+
+def test_builtin_auto_uses_packed_s8_for_small_exact_builds():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin', eri='auto')
+
+    assert mol._builtin_build_info['representation'] == 'dense'
+    assert mol._builtin_build_info['aosym'] == 's8'
+    assert mol.eri is None
+    assert mol.eri_s8 is not None
+    assert mol.builtin_resolved_eri_representation == 'dense'
+    assert mol.builtin_resolved_aosym == 's8'
 
 
 def test_shell_blocked_dense_eri_matches_legacy_aopair_builder():

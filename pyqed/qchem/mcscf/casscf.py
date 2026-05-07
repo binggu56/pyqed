@@ -1171,11 +1171,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         mf,
         ncas,
         nelecas,
-        max_cycle=16,
+        max_cycle=50,
         max_micro_cycle=8,
-        conv_tol=1.0e-8,
-        conv_tol_grad=5.0e-6,
-        conv_tol_grad_relaxed=5.0e-4,
+        conv_tol=1.0e-7,
+        conv_tol_grad=None,
+        conv_tol_grad_relaxed=None,
         conv_tol_step=1.0e-4,
         level_shift=5.0e-4,
         step_size=0.25,
@@ -1195,7 +1195,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ah_hessian="analytic",
         ci_method="direct_ci",
         use_cholesky=None,
-        coupling="full",
+        coupling="qn",
         coupled_fd_step=5.0e-4,
         coupled_ci_roots=0,
         coupled_qspace_cycles=2,
@@ -1220,16 +1220,21 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         auto_active_restarts=True,
         active_restart_window=2,
         active_restart_max=4,
+        exact_state_specific_gradient=False,
         max_cycles=None,
         verbose=0,
     ):
         if max_cycles is not None:
-            if int(max_cycle) != 16 and int(max_cycle) != int(max_cycles):
+            if int(max_cycle) != 50 and int(max_cycle) != int(max_cycles):
                 raise ValueError(
                     "Received conflicting values for max_cycle={} and "
                     "max_cycles={}.".format(max_cycle, max_cycles)
                 )
             max_cycle = max_cycles
+        if conv_tol_grad is None:
+            conv_tol_grad = math.sqrt(float(conv_tol))
+        if conv_tol_grad_relaxed is None:
+            conv_tol_grad_relaxed = conv_tol_grad
 
         super().__init__(
             mf,
@@ -1384,6 +1389,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.auto_active_restarts = bool(auto_active_restarts)
         self.active_restart_window = int(active_restart_window)
         self.active_restart_max = int(active_restart_max)
+        self.exact_state_specific_gradient = bool(exact_state_specific_gradient)
         self.active_restart_history = []
         self.internal_preopt_history = []
         self.micro_history = []
@@ -3860,7 +3866,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             return False, mo_coeff, energy, mc, 0.0, 0.0
 
         internal_grad = grad_vec[mask]
-        gnorm = float(np.max(np.abs(internal_grad))) if internal_grad.size else 0.0
+        gnorm = float(np.linalg.norm(internal_grad)) if internal_grad.size else 0.0
         if gnorm < self.conv_tol_grad:
             return False, mo_coeff, energy, mc, gnorm, 0.0
 
@@ -4174,7 +4180,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 local_ci = self._copy_ci_guess(post_mc.ci)
                 mask = self._internal_preopt_mask(post_mc.ncore, post_mc.ncas, self.nmo)
                 if post_grad.size and np.any(mask):
-                    post_gnorm = float(np.max(np.abs(post_grad[mask])))
+                    post_gnorm = float(np.linalg.norm(post_grad[mask]))
                 else:
                     post_gnorm = 0.0
                 energy_drop = float(record["energy"] - record["trial_energy"])
@@ -4307,6 +4313,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             internal_conv_tol_step=self.internal_conv_tol_step,
             internal_conv_tol_energy=self.internal_conv_tol_energy,
             auto_active_restarts=False,
+            exact_state_specific_gradient=self.exact_state_specific_gradient,
             verbose=self.verbose,
         )
         trial.weights = None if self.weights is None else np.array(self.weights, copy=True)
@@ -4521,25 +4528,27 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 else:
                     dm1, dm2 = self._effective_rdms(mc, self.state_id)
                     fock = generalized_fock(h1_cur, eri_cur, dm1, dm2)
-                if self.nstates == 1:
-                    if not self.use_cholesky_integrals:
-                        grad_vec = self._exact_orbital_gradient_vector(
-                            mc,
-                            h1_cur,
-                            eri_cur,
-                            mc.ci[self.state_id],
-                        )
+                    grad = orbital_gradient(fock)
+                    gnorm = gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
+                    grad_vec = pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+                if (
+                    self.nstates == 1
+                    and self.exact_state_specific_gradient
+                    and not self.use_cholesky_integrals
+                ):
+                    grad_vec = self._exact_orbital_gradient_vector(
+                        mc,
+                        h1_cur,
+                        eri_cur,
+                        mc.ci[self.state_id],
+                    )
                     grad = self._gradient_matrix_from_vector(
                         grad_vec,
                         mc.ncore,
                         mc.ncas,
                         self.nmo,
                     )
-                    gnorm = float(np.max(np.abs(grad_vec))) if grad_vec.size else 0.0
-                elif not self.use_cholesky_integrals:
-                    grad = orbital_gradient(fock)
-                    gnorm = gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
-                    grad_vec = pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+                    gnorm = float(np.linalg.norm(grad_vec)) if grad_vec.size else 0.0
 
                 use_parameterized_hessian = self.ah_hessian == "finite_difference"
                 if use_parameterized_hessian:

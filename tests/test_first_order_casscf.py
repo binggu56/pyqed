@@ -71,7 +71,7 @@ def test_public_second_order_casscf_accepts_max_cycles_alias():
 
     assert mc.max_cycle == 40
     assert mc.max_cycles == 40
-    assert mc.coupling == "full"
+    assert mc.coupling == "qn"
 
 
 def test_public_second_order_casscf_rejects_conflicting_cycle_aliases():
@@ -886,14 +886,14 @@ def test_second_order_casscf_factorized_full_matches_dense_on_lih():
     np.testing.assert_allclose(factor.e_tot[0], dense.e_tot[0], atol=1.0e-8)
 
 
-def test_second_order_casscf_factorized_full_default_avoids_dense_mo_eri(monkeypatch):
+def test_second_order_casscf_factorized_default_avoids_dense_mo_eri(monkeypatch):
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
     mol.build(driver="gbasis-pyscf")
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     def fail_get_eri_mo(*args, **kwargs):
-        raise AssertionError("dense MO ERIs should not be built in factorized full CASSCF")
+        raise AssertionError("dense MO ERIs should not be built in factorized CASSCF")
 
     monkeypatch.setattr(mf, "get_eri_mo", fail_get_eri_mo)
 
@@ -909,7 +909,7 @@ def test_second_order_casscf_factorized_full_default_avoids_dense_mo_eri(monkeyp
         auto_active_restarts=False,
     ).run()
 
-    assert factor.coupling == "full"
+    assert factor.coupling == "qn"
     assert np.isfinite(factor.e_tot[0])
     assert factor.use_cholesky_integrals
     assert factor.casci.use_cholesky_integrals
@@ -947,7 +947,7 @@ def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
     )
 
     assert factor.use_cholesky_integrals
-    assert factor.coupling == "full"
+    assert factor.coupling == "qn"
     assert str(factor.casci.solver_backend).startswith("direct_ci_factor_conn")
     np.testing.assert_allclose(factor.e_tot, dense.e_tot, atol=1.0e-8)
 

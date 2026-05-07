@@ -13,10 +13,13 @@ mol = Molecule(
     unit='bohr',
     basis='631g',
 )
-mol.build(driver='builtin')
+mol.build(driver='builtin', aosym='s8', eri='dense')
 
 mf = mol.RHF().run()
-mc = CASSCF(mf, ncas=10, nelecas=10).run()
+
+print(mf.e_tot)
+
+mc = CASSCF(mf, ncas=10, nelecas=10, verbose=1).run()
 
 print(mc.e_tot)
 # print(mc.e_history)

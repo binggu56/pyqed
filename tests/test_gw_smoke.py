@@ -136,15 +136,200 @@ def test_bse_accepts_chainable_gw_object():
     gw = GW(mf, screening="TDH", eta=1e-3).run()
     bse = BSE(gw).run(nroots=1, low_rank=False, return_vectors=True)
     tda = TDA(gw).run(nroots=1, low_rank=False, return_vectors=True)
+    bse_from_gw = gw.bse().run(nroots=1, low_rank=False)
+    tda_from_gw = gw.tda().run(nroots=1, low_rank=False)
 
     assert bse.gw is gw
     assert tda.gw is gw
+    assert bse.reference is gw
     assert bse.e_qp is gw.e_qp
     assert tda.e_qp is gw.e_qp
     assert bse.e.shape == (1,)
     assert tda.e.shape == (1,)
     assert bse.xy.shape[1] == 1
     assert tda.x.shape[1] == 1
+    np.testing.assert_allclose(bse_from_gw.e, bse.e, atol=0.0)
+    np.testing.assert_allclose(tda_from_gw.e, tda.e, atol=0.0)
+
+
+def test_bse_and_tda_as_scanner_return_pes_arrays():
+    _use_source_tree_pyqed()
+    from pyqed.gw.bse import BSE, TDA
+    from pyqed.gw.gw import GW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+    gw = GW(mf, screening="TDH", eta=1e-3).run()
+
+    bse = BSE(gw).run(nroots=1, low_rank=False)
+    scanner = bse.as_scanner(nroots=1, run_kwargs={"low_rank": False})
+    e_pes = scanner(mol.atom_coords() + np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.01]]))
+
+    assert e_pes.shape == (2,)
+    assert scanner.bse.e.shape == (1,)
+    np.testing.assert_allclose(e_pes[0], scanner.mf.e_tot, atol=0.0)
+    np.testing.assert_allclose(e_pes[1], scanner.mf.e_tot + scanner.bse.e[0], atol=0.0)
+
+    tda = TDA(gw).run(nroots=1, low_rank=False)
+    omega_scanner = tda.as_scanner(
+        nroots=1,
+        energy="excitation",
+        run_kwargs={"low_rank": False},
+    )
+    omega = omega_scanner(mol.atom_coords())
+
+    assert omega.shape == (1,)
+    np.testing.assert_allclose(omega, omega_scanner.bse.e, atol=0.0)
+
+
+def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
+    _use_source_tree_pyqed()
+    from pyqed.gw.scgw import SCGW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    scgw = SCGW(mf, nfreq=7, wmax=8.0).run(max_cycle=2, damping=0.5)
+
+    assert scgw.G.shape == (7, scgw.nso, scgw.nso)
+    assert scgw.P.shape == (7, scgw.nso * scgw.nso, scgw.nso * scgw.nso)
+    assert scgw.W.shape == scgw.P.shape
+    assert scgw.Sigma_c.shape == scgw.G.shape
+    assert scgw.density_matrix.shape == (scgw.nso, scgw.nso)
+    assert scgw.e_qp.shape == (scgw.nso // 2,)
+    assert len(scgw.history) == 2
+    assert len(scgw.mu_history) == 3
+    assert scgw.info["method"] == "scgw_imaginary_axis_prototype"
+    assert scgw.info["adjust_mu"] is True
+    assert scgw.info["total_energy"] == "not_implemented"
+    np.testing.assert_allclose(scgw.nelec, scgw.target_nelec, atol=1e-8)
+    np.testing.assert_allclose(np.trace(scgw.density_matrix), scgw.nelec, atol=1e-10)
+    assert np.all(np.isfinite(scgw.e_qp))
+    assert np.all(np.isfinite(scgw.G))
+
+
+def test_scgw0_uses_fixed_screened_interaction():
+    _use_source_tree_pyqed()
+    from pyqed.gw.scgw import SCGW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    scgw0 = SCGW(mf, nfreq=7, wmax=8.0).scgw0(max_cycle=2, damping=0.5)
+
+    assert scgw0.info["method"] == "scgw0_imaginary_axis_prototype"
+    assert scgw0.info["update_screening"] is False
+    assert scgw0.info["update_exchange"] is True
+    assert scgw0.W0 is not None
+    np.testing.assert_allclose(scgw0.W, scgw0.W0, atol=0.0)
+    assert np.all(np.isfinite(scgw0.e_qp))
+
+
+def test_gw_driver_exposes_scgw_and_scgw0():
+    _use_source_tree_pyqed()
+    from pyqed.gw.gw import GW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    gw0 = GW(mf, screening="TDH", eta=1e-8).scgw0(
+        nfreq=7,
+        wmax=8.0,
+        max_cycle=1,
+        damping=0.5,
+    )
+    gw = GW(mf, screening="TDH", eta=1e-8).scgw(
+        nfreq=7,
+        wmax=8.0,
+        max_cycle=1,
+        damping=0.5,
+    )
+
+    assert gw0.method == "scgw0"
+    assert gw.method == "scgw"
+    assert gw0.scgw_result.info["update_screening"] is False
+    assert gw.scgw_result.info["update_screening"] is True
+    assert gw0.e_qp.shape == (gw0.nso // 2,)
+    assert gw.e_qp.shape == (gw.nso // 2,)
+    assert np.all(np.isfinite(np.asarray(gw0)))
+    assert np.all(np.isfinite(np.asarray(gw)))
+
+
+def test_scgw_uses_factorized_backend_when_available():
+    _use_source_tree_pyqed()
+    from pyqed.gw.scgw import SCGW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="factors")
+    mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
+
+    scgw = SCGW(mf, nfreq=5, wmax=6.0).scgw0(max_cycle=1, damping=0.5)
+
+    assert scgw.info["backend"] == "factorized"
+    assert scgw.eri is None
+    assert scgw.pair_factors is not None
+    assert scgw.P.shape == (5, scgw.pair_factors.shape[0], scgw.pair_factors.shape[0])
+    assert scgw.W.shape == scgw.P.shape
+    assert np.all(np.isfinite(scgw.G))
+    assert np.all(np.isfinite(scgw.Sigma_c))
+
+
+def test_scgw_matsubara_density_matches_static_limit():
+    _use_source_tree_pyqed()
+    from pyqed.gw.scgw import SCGW
+    from pyqed.qchem import Molecule
+    from pyqed.qchem.hf.rhf import RHF
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    scgw = SCGW(mf, nfreq=7, wmax=8.0, beta=100.0, density_nfreq=1601)
+    sigma = np.zeros_like(scgw.Sigma_c)
+    mu = scgw._solve_mu(sigma)
+    dm_green = scgw.make_density_matrix(sigma_c=sigma, mu=mu, method="green")
+    dm_static = scgw.make_density_matrix(sigma_c=sigma, mu=mu, method="static")
+
+    np.testing.assert_allclose(np.trace(dm_green), scgw.target_nelec, atol=1e-6)
+    np.testing.assert_allclose(dm_green, dm_static, atol=5e-3)
 
 
 def test_gw_gnw0_alias_matches_fixed_screening_evgw():

@@ -20,7 +20,7 @@ def test_builtin_spherical_matches_pyscf_rhf_energy():
 
     mol = Molecule(atom=atom, basis=basis, unit="bohr")
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        mol.build(driver="builtin", options={"coord_type": "spherical"})
+        mol.build(driver="builtin", options={"coord_type": "spherical", "eri_representation": "dense"})
         mf = RHF(mol).run(tol=1e-9, max_cycle=100)
 
     pmol = gto.M(atom=atom, basis=basis, unit="Bohr", cart=False, verbose=0)

@@ -542,7 +542,12 @@ def test_public_casci_defaults_to_direct_ci():
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=4, nelecas=4).run(nstates=2)
 
-    assert mc.solver_backend in {'ci_dense_fallback', 'direct_ci_compact_conn', 'direct_ci_factor_conn'}
+    assert mc.solver_backend in {
+        'ci_dense_fallback',
+        'direct_ci_spin_string',
+        'direct_ci_compact_conn',
+        'direct_ci_factor_conn',
+    }
 
 
 def test_direct_ci_falls_back_to_dense_solver_for_small_spaces():
@@ -570,7 +575,7 @@ def test_direct_ci_on_the_fly_matches_dense_solver():
 
     mc_dense = CASCI(mf, ncas=4, nelecas=4).run(nstates=2, method='ci')
 
-    assert mc_direct.solver_backend == 'direct_ci_compact_conn'
+    assert mc_direct.solver_backend == 'direct_ci_spin_string'
     np.testing.assert_allclose(mc_direct.e_tot, mc_dense.e_tot, atol=1e-10)
 
 
@@ -679,6 +684,20 @@ def test_cholesky_active_space_eri_transform_matches_dense():
     eri_cd = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=True)
 
     np.testing.assert_allclose(eri_cd, eri_dense, atol=1e-8)
+
+
+def test_builtin_s8_dense_eri_transform_unpacks_compressed_cache():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin', aosym='s8', eri='dense')
+
+    mf = mol.RHF().run()
+    mo_cas = mf.mo_coeff[:, :2]
+
+    assert mf.eri is None
+    assert mf.eri_s8 is not None
+    eri_active = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=False)
+
+    np.testing.assert_allclose(eri_active, mf.get_eri_mo()[0:2, 0:2, 0:2, 0:2])
 
 
 def test_casci_use_cholesky_matches_dense_energy():

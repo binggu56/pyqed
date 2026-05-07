@@ -27,7 +27,7 @@ Build a Molecule
        unit="angstrom",
        basis="sto-3g",
    )
-   mol.build(driver="builtin", eri="factors")
+   mol.build(driver="builtin", eri="auto")
 
 Run RHF
 -------
@@ -37,9 +37,10 @@ Run RHF
    mf = mol.RHF().run()
    print("RHF energy:", mf.e_tot)
 
-The ``eri="factors"`` option asks the native integral path to keep a
-factorized electron-repulsion representation when available. RHF automatically
-uses the factorized JK path for this representation.
+The ``eri="auto"`` option uses compact eight-fold exact storage for small
+systems and switches to native RI/factorized storage for larger systems when an
+auxiliary basis is available. RHF automatically uses the packed or factorized
+JK path for these representations.
 
 Run MP2
 -------
@@ -67,7 +68,7 @@ solver:
 
 .. code-block:: python
 
-   mol.build(driver="builtin", eri="factors")
+   mol.build(driver="builtin", eri="auto")
    mf = mol.RHF().run()
    mc = CASSCF(mf, ncas=4, nelecas=4).run()
 

@@ -85,11 +85,19 @@ _BUILTIN_OPTION_SPECS = (
     ("parallel", "builtin_parallel", "native_parallel", bool, False),
     ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
-    ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 0.0),
+    ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-12),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
-    ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "dense"),
+    ("shellwise_spherical", "builtin_shellwise_spherical", "native_shellwise_spherical", bool, False),
+    ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "auto"),
+    ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s1"),
     ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
     ("ri_metric_tol", "builtin_ri_metric_tol", "native_ri_metric_tol", float, 1e-10),
+    ("ri_metric_solver", "builtin_ri_metric_solver", "native_ri_metric_solver", str, "auto"),
+    ("ri_purpose", "builtin_ri_purpose", "native_ri_purpose", str, "jk"),
+    ("ri_screen_tol", "builtin_ri_screen_tol", "native_ri_screen_tol", lambda v: None if v is None else float(v), None),
+    ("ri_block_size", "builtin_ri_block_size", "native_ri_block_size", lambda v: None if v is None else int(v), None),
+    ("ri_storage", "builtin_ri_storage", "native_ri_storage", str, "auto"),
+    ("auto_ri_min_nao", "builtin_auto_ri_min_nao", "native_auto_ri_min_nao", int, 24),
     ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
     ("build_factors", "builtin_build_factors", "native_build_factors", bool, False),
@@ -146,6 +154,20 @@ def _normalize_eri_representation(value):
         "density-fit": "ri",
         "density-fitting": "ri",
         "ri": "ri",
+        "direct": "direct",
+        "direct-scf": "direct",
+        "direct_jk": "direct",
+        "direct-jk": "direct",
+        "auto": "auto",
+        "automatic": "auto",
+        "s4": "s4",
+        "packed": "s4",
+        "packed-dense": "s4",
+        "s8": "s8",
+        "packed8": "s8",
+        "packed-8": "s8",
+        "eightfold": "s8",
+        "8fold": "s8",
         "dense-factors": "dense+factors",
         "dense-plus-factors": "dense+factors",
         "dense+factor": "dense+factors",
@@ -153,8 +175,62 @@ def _normalize_eri_representation(value):
         "dense+df": "dense+ri",
         "dense-density-fit": "dense+ri",
         "dense-density-fitting": "dense+ri",
+        "s4-factors": "s4+factors",
+        "s4+factor": "s4+factors",
+        "packed-factors": "s4+factors",
+        "s8-factors": "s8+factors",
+        "s8+factor": "s8+factors",
+        "packed8-factors": "s8+factors",
     }
     return aliases.get(value, value)
+
+
+def _normalize_aosym(value):
+    if value is None:
+        return "s1"
+    value = str(value).lower().replace("_", "-")
+    aliases = {
+        "1": "s1",
+        "s1": "s1",
+        "dense": "s1",
+        "full": "s1",
+        "none": "s1",
+        "4": "s4",
+        "s4": "s4",
+        "packed": "s4",
+        "packed-dense": "s4",
+        "8": "s8",
+        "s8": "s8",
+        "packed8": "s8",
+        "packed-8": "s8",
+        "eightfold": "s8",
+        "8fold": "s8",
+    }
+    normalized = aliases.get(value, value)
+    if normalized not in {"s1", "s4", "s8"}:
+        raise ValueError("builtin_aosym/native_aosym must be 's1', 's4', or 's8'.")
+    return normalized
+
+
+def _split_eri_representation_and_aosym(eri_representation, aosym="s1"):
+    """
+    Keep legacy eri='s8' style inputs working while making aosym the canonical
+    home for AO permutation symmetry.
+    """
+    eri_representation = _normalize_eri_representation(eri_representation)
+    aosym = _normalize_aosym(aosym)
+    legacy = {
+        "s4": ("dense", "s4"),
+        "s8": ("dense", "s8"),
+        "s4+factors": ("dense+factors", "s4"),
+        "s8+factors": ("dense+factors", "s8"),
+    }
+    if eri_representation in legacy:
+        eri_representation, legacy_aosym = legacy[eri_representation]
+        if aosym != "s1" and aosym != legacy_aosym:
+            raise ValueError("Conflicting ERI symmetry requested by eri and aosym.")
+        aosym = legacy_aosym
+    return eri_representation, aosym
 
 
 def _normalize_builtin_options(options, strict=False):
@@ -168,8 +244,9 @@ def _normalize_builtin_options(options, strict=False):
 
     tmp = {"builtin_options": dict(options)}
     normalized = _pop_builtin_options(tmp)
-    normalized["eri_representation"] = _normalize_eri_representation(
-        normalized["eri_representation"]
+    normalized["eri_representation"], normalized["aosym"] = _split_eri_representation_and_aosym(
+        normalized["eri_representation"],
+        normalized.get("aosym", "s1"),
     )
     if strict and tmp:
         unknown = ", ".join(sorted(tmp))
@@ -1109,7 +1186,14 @@ class Molecule:
         self.overlap = None
         self.hcore = None
         self.eri = None
+        self.eri_s4 = None
+        self.eri_s8 = None
         self.eri_factors = None
+        self._builtin_direct_jk_data = None
+        self.builtin_resolved_eri_representation = None
+        self.builtin_resolved_aosym = None
+        self.native_resolved_eri_representation = None
+        self.native_resolved_aosym = None
 
         self.nao = None
         self.nmo = None
@@ -1151,8 +1235,9 @@ class Molecule:
         Apply builtin backend options and keep legacy aliases in sync.
         """
         self.builtin_options = dict(options)
-        self.builtin_options["eri_representation"] = _normalize_eri_representation(
-            self.builtin_options["eri_representation"]
+        self.builtin_options["eri_representation"], self.builtin_options["aosym"] = _split_eri_representation_and_aosym(
+            self.builtin_options["eri_representation"],
+            self.builtin_options.get("aosym", "s1"),
         )
         self.builtin_coord_type = self.builtin_options["coord_type"]
         self.builtin_parallel = self.builtin_options["parallel"]
@@ -1160,9 +1245,17 @@ class Molecule:
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
         self.builtin_eri_backend = self.builtin_options["eri_backend"]
+        self.builtin_shellwise_spherical = self.builtin_options["shellwise_spherical"]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
+        self.builtin_aosym = self.builtin_options["aosym"]
         self.builtin_auxbasis = self.builtin_options["auxbasis"]
         self.builtin_ri_metric_tol = self.builtin_options["ri_metric_tol"]
+        self.builtin_ri_metric_solver = self.builtin_options["ri_metric_solver"]
+        self.builtin_ri_purpose = self.builtin_options["ri_purpose"]
+        self.builtin_ri_screen_tol = self.builtin_options["ri_screen_tol"]
+        self.builtin_ri_block_size = self.builtin_options["ri_block_size"]
+        self.builtin_ri_storage = self.builtin_options["ri_storage"]
+        self.builtin_auto_ri_min_nao = self.builtin_options["auto_ri_min_nao"]
         self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
         self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
         self.builtin_build_factors = self.builtin_options["build_factors"]
@@ -1175,9 +1268,17 @@ class Molecule:
         self.native_parallel_min_nao = self.builtin_parallel_min_nao
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
         self.native_eri_backend = self.builtin_eri_backend
+        self.native_shellwise_spherical = self.builtin_shellwise_spherical
         self.native_eri_representation = self.builtin_eri_representation
+        self.native_aosym = self.builtin_aosym
         self.native_auxbasis = self.builtin_auxbasis
         self.native_ri_metric_tol = self.builtin_ri_metric_tol
+        self.native_ri_metric_solver = self.builtin_ri_metric_solver
+        self.native_ri_purpose = self.builtin_ri_purpose
+        self.native_ri_screen_tol = self.builtin_ri_screen_tol
+        self.native_ri_block_size = self.builtin_ri_block_size
+        self.native_ri_storage = self.builtin_ri_storage
+        self.native_auto_ri_min_nao = self.builtin_auto_ri_min_nao
         self.native_low_rank_tol = self.builtin_low_rank_tol
         self.native_low_rank_max_rank = self.builtin_low_rank_max_rank
         self.native_build_factors = self.builtin_build_factors
@@ -1197,7 +1298,7 @@ class Molecule:
 
         return np.einsum('z,zx->x', charges, coords) / charges.sum()
 
-    def build(self, driver='builtin', options=None, eri=None, auxbasis=None):
+    def build(self, driver='builtin', options=None, eri=None, aosym=None, auxbasis=None):
         """
         build molecular integrals
 
@@ -1212,10 +1313,12 @@ class Molecule:
             - 'pyscf'.
         options : dict, optional
             Backend-specific build options. For ``driver='builtin'``, use short
-            keys such as ``eri_representation``, ``low_rank_tol``,
+            keys such as ``eri_representation``, ``aosym``, ``low_rank_tol``,
             ``eri_screen_tol``, ``parallel``, and ``eri_workers``.
-        eri : {'dense', 'factors', 'dense+factors', 'ri', 'dense+ri'}, optional
+        eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'ri'}, optional
             Short alias for the builtin ``eri_representation`` option.
+        aosym : {'s1', 's4', 's8'}, optional
+            AO ERI permutation symmetry for dense-like builtin storage.
         auxbasis : str, optional
             Short alias for the builtin ``auxbasis`` option used by
             ``eri='ri'`` and ``eri='dense+ri'``.
@@ -1239,6 +1342,18 @@ class Molecule:
             options = {} if options is None else dict(options)
             options["eri_representation"] = _normalize_eri_representation(eri)
 
+        if aosym is not None:
+            if driver != 'builtin':
+                raise ValueError(
+                    "build(aosym=...) is only supported for driver='builtin' or its 'native' alias."
+                )
+            options = {} if options is None else dict(options)
+            requested_aosym = _normalize_aosym(aosym)
+            existing_aosym = _normalize_aosym(options.get("aosym", "s1"))
+            if existing_aosym != "s1" and existing_aosym != requested_aosym:
+                raise ValueError("Conflicting ERI symmetry requested by eri/options and aosym.")
+            options["aosym"] = requested_aosym
+
         if auxbasis is not None:
             if driver != 'builtin':
                 raise ValueError(
@@ -1255,7 +1370,14 @@ class Molecule:
             self._set_builtin_options(_normalize_builtin_options(options, strict=True))
 
         self._build_driver = driver
+        self.eri_s4 = None
+        self.eri_s8 = None
         self.eri_factors = None
+        self._builtin_direct_jk_data = None
+        self.builtin_resolved_eri_representation = None
+        self.builtin_resolved_aosym = None
+        self.native_resolved_eri_representation = None
+        self.native_resolved_aosym = None
         self._builtin_build_info = None
         self._native_build_info = None
 
