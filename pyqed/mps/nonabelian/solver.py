@@ -12,6 +12,11 @@ import time
 
 import numpy as np
 try:
+    from scipy import linalg as scipy_linalg
+except Exception:  # pragma: no cover - SciPy is optional for lightweight installs.
+    scipy_linalg = None
+
+try:
     from scipy.sparse.linalg import LinearOperator, eigsh
 except Exception:  # pragma: no cover - SciPy is optional for lightweight installs.
     LinearOperator = None
@@ -1192,6 +1197,9 @@ def _normalize_local_operator(local_operator):
             tensor_matvec=local_operator.get("tensor_matvec"),
             reduced_matvec=local_operator.get("reduced_matvec"),
             packed_matvec=local_operator.get("packed_matvec"),
+            aux_reduced_matvec=local_operator.get("aux_reduced_matvec"),
+            aux_packed_matvec=local_operator.get("aux_packed_matvec"),
+            packed_block_matrices=local_operator.get("packed_block_matrices"),
             basis=local_operator.get("basis"),
             diag=local_operator.get("diag"),
             name=local_operator.get("name"),
@@ -1444,6 +1452,7 @@ def _solve_reduced_generalized_davidson(
     precond=None,
     use_block_preconditioner=True,
     allow_unconverged=False,
+    profile=False,
 ):
     if not isinstance(guess_state, ReducedStateVector):
         raise TypeError("_solve_reduced_generalized_davidson expects a ReducedStateVector guess.")
@@ -1454,7 +1463,43 @@ def _solve_reduced_generalized_davidson(
     if h_diag.size != state_layout.size:
         raise ValueError("Hamiltonian diagonal guess must match the packed state dimension.")
 
+    timing = {
+        "davidson": 0.0,
+        "matvec": 0.0,
+        "projected": 0.0,
+        "precondition": 0.0,
+    } if profile else None
+    total_t0 = time.perf_counter() if profile else None
+    h_matvec_count = 0
+    n_matvec_count = 0
+    H_raw = H
+    N_raw = N
     has_norm_operator = N is not None
+
+    def H_timed(vec):
+        nonlocal h_matvec_count
+        if not profile:
+            return H_raw(vec)
+        t0 = time.perf_counter()
+        out = H_raw(vec)
+        timing["matvec"] += time.perf_counter() - t0
+        h_matvec_count += 1
+        return out
+
+    def N_timed(vec):
+        nonlocal n_matvec_count
+        if N_raw is None:
+            return vec
+        if not profile:
+            return N_raw(vec)
+        t0 = time.perf_counter()
+        out = N_raw(vec)
+        timing["matvec"] += time.perf_counter() - t0
+        n_matvec_count += 1
+        return out
+
+    H = H_timed
+    N = N_timed
     if N is None:
         N = lambda vec: vec
     if n_diag is None:
@@ -1512,12 +1557,15 @@ def _solve_reduced_generalized_davidson(
     restarts = 0
 
     for iterations in range(1, itermax + 1):
+        t0 = time.perf_counter() if profile else None
         Vp = _packed_matrix_from_reduced_vectors(V, state_layout)
         AVp = _packed_matrix_from_reduced_vectors(AV, state_layout)
         BVp = _packed_matrix_from_reduced_vectors(BV, state_layout)
         Hs = Vp.conj().T @ AVp
         Ns = Vp.conj().T @ BVp
         theta, coeff, _ = _solve_generalized_dense(Hs, Ns, tol=max(tol, 1e-12))
+        if profile:
+            timing["projected"] += time.perf_counter() - t0
         ritz_p = Vp @ coeff
         aritz_p = AVp @ coeff
         britz_p = BVp @ coeff
@@ -1530,7 +1578,10 @@ def _solve_reduced_generalized_davidson(
 
         ritz = state_layout.from_packed(ritz_p)
         resid = state_layout.from_packed(resid_p)
+        t0 = time.perf_counter() if profile else None
         corr = precondition(resid, theta, ritz)
+        if profile:
+            timing["precondition"] += time.perf_counter() - t0
         corr_p = corr.to_packed(dtype=complex)
         if Vp.shape[1]:
             corr_p = corr_p - Vp @ (Vp.conj().T @ corr_p)
@@ -1559,7 +1610,9 @@ def _solve_reduced_generalized_davidson(
     vec_packed = _canonicalize_eigenvector(Vp @ coeff, reference=guess_state.to_packed(dtype=complex))
     vec = state_layout.from_packed(vec_packed)
     residual_norm = float(np.linalg.norm((AVp @ coeff) - theta * (BVp @ coeff)))
-    return float(theta), vec, {
+    if profile:
+        timing["davidson"] = time.perf_counter() - total_t0
+    info = {
         "metric": residual_norm,
         "residual": residual_norm,
         "davidson_iterations": int(iterations),
@@ -1572,6 +1625,14 @@ def _solve_reduced_generalized_davidson(
         "reduced_preconditioner": reduced_preconditioner is not None,
         "restarts": int(restarts),
     }
+    if profile:
+        info["solver_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
+        info["matvec_count"] = int(h_matvec_count)
+        info["norm_matvec_count"] = int(n_matvec_count)
+    return float(theta), vec, info
 
 
 def _solve_packed_generalized_davidson(
@@ -1594,6 +1655,12 @@ def _solve_packed_generalized_davidson(
     timing = {
         "davidson": 0.0,
         "matvec": 0.0,
+        "projected": 0.0,
+        "precondition": 0.0,
+        "orthogonalize": 0.0,
+        "restart": 0.0,
+        "basis_update": 0.0,
+        "final_reference": 0.0,
     } if profile else None
     h_matvec_count = 0
     n_matvec_count = 0
@@ -1649,7 +1716,10 @@ def _solve_packed_generalized_davidson(
     metric_orthonormal_krylov = bool(has_norm_operator)
     Vp = _build_iterative_guess(h_diag, 1, guess=guess_packed, diag_n=n_diag)
     if metric_orthonormal_krylov:
+        t0 = time.perf_counter() if profile else None
         Vp, BVp = _metric_orthonormalize_packed_columns(Vp, N, tol=lindep)
+        if profile:
+            timing["orthogonalize"] += time.perf_counter() - t0
         if Vp.shape[1] == 0:
             raise ValueError("Initial generalized Davidson basis is singular in the local metric.")
     else:
@@ -1754,23 +1824,11 @@ def _solve_packed_generalized_davidson(
         Hs_local = 0.5 * (np.asarray(Hs_local) + np.asarray(Hs_local).conj().T)
         ref_proj = Vp.conj().T @ guess_packed
         if Ns_local is None:
-            evals, evecs = np.linalg.eigh(Hs_local)
-            order = np.argsort(np.real(evals))
-            lowest = float(np.real(evals[order[0]]))
-            degenerate = [
-                idx for idx in order
-                if abs(float(np.real(evals[idx])) - lowest) <= max(float(tol), 1.0e-12)
-            ]
-            if len(degenerate) > 1:
-                subspace = evecs[:, degenerate]
-                coeff = subspace @ (subspace.conj().T @ ref_proj)
-                norm = np.linalg.norm(coeff)
-                if norm > 1.0e-15:
-                    return lowest, coeff / norm
-                idx = int(degenerate[0])
-            else:
-                idx = int(order[0])
-            return lowest, evecs[:, idx]
+            return _lowest_hermitian_projected_root(
+                Hs_local,
+                reference=ref_proj,
+                tol=tol,
+            )
 
         Ns_local = 0.5 * (np.asarray(Ns_local) + np.asarray(Ns_local).conj().T)
         if np.allclose(Ns_local, np.eye(Ns_local.shape[0], dtype=Ns_local.dtype), atol=1.0e-10, rtol=1.0e-10):
@@ -1779,10 +1837,13 @@ def _solve_packed_generalized_davidson(
         return theta_local, coeff_local
 
     for iterations in range(1, itermax + 1):
+        t0 = time.perf_counter() if profile else None
         if metric_orthonormal_krylov:
             theta, coeff = _lowest_projected_root_with_reference(Hs, None)
         else:
             theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
+        if profile:
+            timing["projected"] += time.perf_counter() - t0
         ritz_p = Vp @ coeff
         aritz_p = AVp @ coeff
         britz_p = BVp @ coeff
@@ -1798,8 +1859,12 @@ def _solve_packed_generalized_davidson(
             converged = True
             break
 
+        t0 = time.perf_counter() if profile else None
         corr_p = precondition(resid_p, theta, ritz_p)
+        if profile:
+            timing["precondition"] += time.perf_counter() - t0
         if metric_orthonormal_krylov:
+            t0 = time.perf_counter() if profile else None
             corr_n = np.asarray(N(corr_p), dtype=complex).reshape(-1)
             corr_p, corr_n = _metric_orthogonalize_packed_vector(
                 corr_p,
@@ -1808,9 +1873,12 @@ def _solve_packed_generalized_davidson(
                 BVp,
                 tol=lindep,
             )
+            if profile:
+                timing["orthogonalize"] += time.perf_counter() - t0
             if corr_p is None:
                 break
         else:
+            t0 = time.perf_counter() if profile else None
             if Vp.shape[1]:
                 corr_p = corr_p - Vp @ (Vp.conj().T @ corr_p)
             corr_norm = float(np.linalg.norm(corr_p))
@@ -1820,8 +1888,11 @@ def _solve_packed_generalized_davidson(
                     break
             else:
                 corr_p = corr_p / corr_norm
+            if profile:
+                timing["orthogonalize"] += time.perf_counter() - t0
 
         if Vp.shape[1] + 1 > max_space:
+            t0 = time.perf_counter() if profile else None
             restart_keep = min(max(2, max_space // 32), 4)
             if metric_orthonormal_krylov:
                 Hs = 0.5 * (Hs + Hs.conj().T)
@@ -1848,7 +1919,10 @@ def _solve_packed_generalized_davidson(
             AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
             Hs = Vp.conj().T @ AVp
             Ns = None if metric_orthonormal_krylov else Vp.conj().T @ BVp
+            if profile:
+                timing["restart"] += time.perf_counter() - t0
         else:
+            t0 = time.perf_counter() if profile else None
             h_corr = np.asarray(H(corr_p), dtype=complex).reshape(-1)
             if not metric_orthonormal_krylov:
                 corr_n = np.asarray(N(corr_p), dtype=complex).reshape(-1)
@@ -1860,8 +1934,11 @@ def _solve_packed_generalized_davidson(
             if not metric_orthonormal_krylov:
                 n_overlap = Vp[:, :-1].conj().T @ corr_n
                 Ns = _expand_projected_matrix(Ns, n_overlap, np.vdot(corr_p, corr_n))
+            if profile:
+                timing["basis_update"] += time.perf_counter() - t0
         prev_theta = theta
 
+    t0 = time.perf_counter() if profile else None
     if metric_orthonormal_krylov:
         theta, coeff = _lowest_projected_root_with_reference(Hs, None)
     else:
@@ -1877,6 +1954,8 @@ def _solve_packed_generalized_davidson(
             abs(guess_theta - theta) <= max(float(tol), 1.0e-12)
             and guess_residual <= max(float(tol_res), 1.0e-12)
         )
+    if profile:
+        timing["final_reference"] += time.perf_counter() - t0
     vec_packed = (
         np.array(guess_packed, copy=True)
         if use_reference_root
@@ -2032,19 +2111,36 @@ def _solve_tensor_davidson(
             objective["norm_operator_representation"] = "dense"
         return optimized, objective
 
-    if op.packed_matvec is not None and (norm_op is None or norm_op.packed_matvec is not None):
-        H_packed = op.packed_matvec
-        N_packed = norm_op.packed_matvec if norm_op is not None else None
+    H_direct_packed = op.packed_matvec or op.aux_packed_matvec
+    N_direct_packed = (
+        None
+        if norm_op is None
+        else norm_op.packed_matvec or norm_op.aux_packed_matvec
+    )
+    if H_direct_packed is not None and (norm_op is None or N_direct_packed is not None):
+        H_packed = H_direct_packed
+        N_packed = N_direct_packed
         block_preconditioner = None
-        if precond is None and op.packed_block_matrices is not None:
+        packed_block_matrices = (
+            op.packed_block_matrices
+            if op.packed_block_matrices is not None
+            else getattr(H_packed, "block_matrices", None)
+        )
+        norm_packed_block_matrices = (
+            None
+            if norm_op is None
+            else (
+                norm_op.packed_block_matrices
+                if norm_op.packed_block_matrices is not None
+                else getattr(N_packed, "block_matrices", None)
+            )
+        )
+        use_auxiliary_packed = op.packed_matvec is not H_packed
+        if precond is None and packed_block_matrices is not None and not use_auxiliary_packed:
             block_preconditioner = PackedBlockPreconditioner.from_layout_blocks(
                 layout,
-                op.packed_block_matrices,
-                n_blocks=(
-                    norm_op.packed_block_matrices
-                    if norm_op is not None and norm_op.packed_block_matrices is not None
-                    else None
-                ),
+                packed_block_matrices,
+                n_blocks=norm_packed_block_matrices,
             )
         theta, vec_packed, objective = _solve_packed_generalized_davidson(
             guess_packed,
@@ -2066,6 +2162,9 @@ def _solve_tensor_davidson(
         objective["energy"] = float(theta)
         objective["operator_representation"] = "reduced"
         objective["packed_matvec_backend"] = getattr(H_packed, "backend", None)
+        objective["packed_matvec_source"] = (
+            "primary" if op.packed_matvec is H_packed else "auxiliary"
+        )
         objective["block_preconditioner"] = block_preconditioner is not None
         objective["block_preconditioner_blocks"] = (
             int(block_preconditioner.materialized_block_count)
@@ -2079,6 +2178,9 @@ def _solve_tensor_davidson(
         if norm_op is not None:
             objective["norm_operator_representation"] = "reduced"
             objective["norm_packed_matvec_backend"] = getattr(N_packed, "backend", None)
+            objective["norm_packed_matvec_source"] = (
+                "primary" if norm_op.packed_matvec is N_packed else "auxiliary"
+            )
         return optimized, objective
 
     H = _reduced_operator_to_matvec(op, template, state_layout)
@@ -2087,12 +2189,19 @@ def _solve_tensor_davidson(
         if norm_op is not None
         else None
     )
-    theta, vec, objective = _solve_reduced_generalized_davidson(
-        guess_state,
-        H,
-        state_layout=state_layout,
+    def H_packed(vector):
+        state = state_layout.from_packed(vector)
+        return H(state).to_packed(dtype=complex)
+
+    def N_packed(vector):
+        state = state_layout.from_packed(vector)
+        return N(state).to_packed(dtype=complex)
+
+    theta, vec_packed, objective = _solve_packed_generalized_davidson(
+        guess_state.to_packed(dtype=complex),
+        H_packed,
         h_diag=h_diag,
-        N=N,
+        N=N_packed if N is not None else None,
         n_diag=n_diag,
         tol=tol,
         itermax=itermax,
@@ -2100,8 +2209,10 @@ def _solve_tensor_davidson(
         tol_residual=tol_residual,
         lindep=lindep,
         precond=precond,
+        use_block_preconditioner=use_block_preconditioner,
+        profile=profile,
     )
-    optimized = _reduced_state_to_tensor(vec, template)
+    optimized = _reduced_state_to_tensor(state_layout.from_packed(vec_packed), template)
     objective["energy"] = float(theta)
     objective["operator_representation"] = (
         "reduced" if (op.reduced_matvec is not None or op.packed_matvec is not None) else "tensor"
@@ -2318,6 +2429,48 @@ def _solve_generalized_dense(H, N, *, tol):
         coeff = coeff / norm
     resid = H @ coeff - evals[0] * (N @ coeff)
     return float(np.real(evals[0])), coeff, float(np.linalg.norm(resid))
+
+
+def _lowest_hermitian_projected_root(H, *, reference=None, tol=1e-12, subset=4):
+    """
+    Return the lowest eigenpair of a small Hermitian projected matrix.
+
+    Only a few lowest roots are requested when SciPy is available.  The extra
+    roots preserve the old degenerate-root reference projection behavior without
+    paying for a full eigendecomposition on every Davidson iteration.
+    """
+
+    H = 0.5 * (np.asarray(H) + np.asarray(H).conj().T)
+    dim = int(H.shape[0])
+    if dim == 0:
+        raise ValueError("Projected Hermitian matrix must be nonempty.")
+    if scipy_linalg is not None and dim > 1:
+        nsubset = min(dim, max(1, int(subset)))
+        evals, evecs = scipy_linalg.eigh(
+            H,
+            subset_by_index=(0, nsubset - 1),
+            check_finite=False,
+        )
+    else:
+        evals, evecs = np.linalg.eigh(H)
+        order = np.argsort(np.real(evals))
+        evals = evals[order]
+        evecs = evecs[:, order]
+
+    lowest = float(np.real(evals[0]))
+    degenerate = [
+        idx
+        for idx, value in enumerate(evals)
+        if abs(float(np.real(value)) - lowest) <= max(float(tol), 1.0e-12)
+    ]
+    if len(degenerate) > 1 and reference is not None:
+        ref = np.asarray(reference, dtype=complex).reshape(-1)
+        subspace = evecs[:, degenerate]
+        coeff = subspace @ (subspace.conj().T @ ref)
+        norm = np.linalg.norm(coeff)
+        if norm > 1.0e-15:
+            return lowest, coeff / norm
+    return lowest, evecs[:, 0]
 
 
 def _solve_generalized_dense_roots(H, N=None, *, nroots=1, tol=1e-12):
@@ -2836,6 +2989,7 @@ def _solve_orthonormalized_operator_davidson(
     tol_residual=None,
     lindep=1e-12,
     allow_unconverged=False,
+    profile=False,
 ):
     """
     Solve ``H x = E N x`` as a standard Davidson problem in ``N``-orthonormal
@@ -2858,8 +3012,20 @@ def _solve_orthonormalized_operator_davidson(
 
     guess_vec = np.asarray(guess_vec, dtype=complex).reshape(-1)
     dim = int(guess_vec.size)
+    timing = {
+        "resolve": 0.0,
+        "metric": 0.0,
+        "davidson": 0.0,
+        "matvec": 0.0,
+        "residual": 0.0,
+    } if profile else None
+    total_t0 = time.perf_counter() if profile else None
+    t0 = time.perf_counter() if profile else None
     H_resolved, h_diag = _resolve_davidson_operator(operator, template, layout)
     N_resolved, _ = _resolve_davidson_operator(norm_operator, template, layout)
+    if profile:
+        timing["resolve"] += time.perf_counter() - t0
+        t0 = time.perf_counter()
     N_matrix = (
         np.asarray(N_resolved, dtype=complex)
         if isinstance(N_resolved, np.ndarray)
@@ -2890,14 +3056,23 @@ def _solve_orthonormalized_operator_davidson(
             return X @ np.asarray(vector, dtype=complex).reshape(-1)
 
     ortho_dim = int(X.shape[1])
+    if profile:
+        timing["metric"] += time.perf_counter() - t0
 
+    matvec_count = 0
     def H_full(vector):
+        nonlocal matvec_count
+        matvec_count += 1
+        t0 = time.perf_counter() if profile else None
         vector = np.asarray(vector, dtype=complex).reshape(dim)
-        return (
+        out = (
             np.asarray(H_resolved @ vector, dtype=complex).reshape(dim)
             if isinstance(H_resolved, np.ndarray)
             else np.asarray(H_resolved(vector), dtype=complex).reshape(dim)
         )
+        if profile:
+            timing["matvec"] += time.perf_counter() - t0
+        return out
 
     def H_orthonormal(y):
         return X.conj().T @ H_full(from_orthonormal(y))
@@ -2916,6 +3091,7 @@ def _solve_orthonormalized_operator_davidson(
 
     dense_fallback = False
     try:
+        t0 = time.perf_counter() if profile else None
         energies, vecs, info = davidson(
             H_orthonormal,
             1,
@@ -2929,9 +3105,14 @@ def _solve_orthonormalized_operator_davidson(
             return_info=True,
             return_partial=allow_unconverged,
         )
+        if profile:
+            timing["davidson"] += time.perf_counter() - t0
     except (RuntimeError, ValueError, IndexError):
+        t0 = time.perf_counter() if profile else None
         H_ortho = _materialize_local_matrix(H_orthonormal, ortho_dim)
         evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+        if profile:
+            timing["davidson"] += time.perf_counter() - t0
         energies = np.asarray([np.real(evals[0])], dtype=float)
         vecs = np.asarray(evecs[:, :1], dtype=complex)
         info = {
@@ -2950,8 +3131,12 @@ def _solve_orthonormalized_operator_davidson(
         vec = vec / norm
         nvec = nvec / norm
     energy = float(np.real(np.asarray(energies).reshape(-1)[0]))
+    t0 = time.perf_counter() if profile else None
     residual = float(np.linalg.norm(H_full(vec) - energy * nvec))
-    return energy, vec, residual, {
+    if profile:
+        timing["residual"] += time.perf_counter() - t0
+        timing["total"] = time.perf_counter() - total_t0
+    info_out = {
         "davidson_iterations": int(info.get("iterations", 0)),
         "davidson_converged": bool(info.get("converged", False)),
         "subspace_dim": int(info.get("subspace_dim", ortho_dim)),
@@ -2960,6 +3145,13 @@ def _solve_orthonormalized_operator_davidson(
         "missing_diagonal_preconditioner": bool(missing_diag),
         "dense_fallback": bool(dense_fallback),
     }
+    if profile:
+        info_out["solver_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
+        info_out["matvec_count"] = int(matvec_count)
+    return energy, vec, residual, info_out
 
 
 def build_orthonormalized_local_problem(
@@ -4291,6 +4483,7 @@ def _build_component_sparse_orthonormalized_local_problem(
         and getattr(compiled_factorized_terms, "prefer_recursive_operator_matvec", False)
     )
     transformed_table_cache_key = None
+    direct_factorized_table_cache_key = None
     if H_table is not None and not prefer_direct_factorized and not prefer_recursive_factorized:
         transformed_table_cache_key = _component_transformed_table_cache_key(
             basis,
@@ -4334,6 +4527,62 @@ def _build_component_sparse_orthonormalized_local_problem(
                 timing["component_transformed_table_moving_cache_lookup"] = timing.get(
                     "component_transformed_table_moving_cache_lookup", 0.0
                 ) + (time.perf_counter() - t0)
+    elif H_table is not None and (prefer_direct_factorized or prefer_recursive_factorized):
+        direct_factorized_table_cache_key = (
+            "component_direct_factorized_operator_table",
+            (
+                "recursive_complementary_operator_matvec"
+                if prefer_recursive_factorized
+                else getattr(
+                    compiled_factorized_terms,
+                    "direct_orthonormal_projection_source",
+                    "component_sparse_direct_factorized",
+                )
+            ),
+            _component_transformed_table_cache_key(
+                basis,
+                components,
+                tuple(component_transforms),
+                max_block_kernel_elements=None,
+                metric_basis_cache_key=basis_cache_key,
+            ),
+            getattr(compiled_factorized_terms, "complementary_payload_signature", None),
+        )
+        t0 = time.perf_counter() if timing is not None else None
+        block_table = H_table.get_transformed_operator_table(direct_factorized_table_cache_key)
+        if timing is not None:
+            timing_key = (
+                "component_direct_factorized_table_cache_hit"
+                if block_table is not None
+                else "component_direct_factorized_table_cache_miss"
+            )
+            timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+            timing["component_direct_factorized_table_cache_lookup"] = timing.get(
+                "component_direct_factorized_table_cache_lookup", 0.0
+            ) + (time.perf_counter() - t0)
+        if block_table is None and moving_environment_cache is not None:
+            t0 = time.perf_counter() if timing is not None else None
+            moving_cache_key = (
+                "component_direct_factorized_operator_table",
+                getattr(H_table, "key", None),
+                direct_factorized_table_cache_key,
+            )
+            block_table = moving_environment_cache.get(moving_cache_key)
+            if block_table is not None:
+                H_table.put_transformed_operator_table(
+                    direct_factorized_table_cache_key,
+                    block_table,
+                )
+            if timing is not None:
+                timing_key = (
+                    "component_direct_factorized_table_moving_cache_hit"
+                    if block_table is not None
+                    else "component_direct_factorized_table_moving_cache_miss"
+                )
+                timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
+                timing["component_direct_factorized_table_moving_cache_lookup"] = timing.get(
+                    "component_direct_factorized_table_moving_cache_lookup", 0.0
+                ) + (time.perf_counter() - t0)
     if block_table is not None:
         block_terms = None
     elif compiled_transitions is not None:
@@ -4370,6 +4619,20 @@ def _build_component_sparse_orthonormalized_local_problem(
                 compiled_factorized_terms=compiled_factorized_terms,
                 components=tuple(components),
             )
+            if H_table is not None and direct_factorized_table_cache_key is not None:
+                H_table.put_transformed_operator_table(
+                    direct_factorized_table_cache_key,
+                    block_table,
+                )
+                if moving_environment_cache is not None:
+                    moving_environment_cache.put(
+                        (
+                            "component_direct_factorized_operator_table",
+                            getattr(H_table, "key", None),
+                            direct_factorized_table_cache_key,
+                        ),
+                        block_table,
+                    )
             if timing is not None:
                 timing["component_direct_factorized_table"] = timing.get(
                     "component_direct_factorized_table", 0.0
@@ -4384,12 +4647,21 @@ def _build_component_sparse_orthonormalized_local_problem(
                         "component_recursive_operator_matvec_preferred", 0.0
                     ) + 1.0
                 timing_key = (
-                    "component_recursive_parent_block_kernel"
-                    if getattr(block_table, "uses_component_parent_block_kernel", False)
+                    "component_complementary_family_table_kernel"
+                    if getattr(block_table, "uses_complementary_family_table_kernel", False)
                     else (
-                        "component_direct_factorized_kernel"
-                        if getattr(block_table, "uses_component_direct_kernel", False)
-                        else "component_direct_factorized_full_matvec"
+                        "component_complementary_payload_tensor_kernel"
+                        if getattr(block_table, "uses_complementary_payload_tensor_kernel", False)
+                        and getattr(block_table, "uses_component_direct_kernel", False)
+                        else (
+                            "component_recursive_parent_block_kernel"
+                            if getattr(block_table, "uses_component_parent_block_kernel", False)
+                            else (
+                                "component_direct_factorized_kernel"
+                                if getattr(block_table, "uses_component_direct_kernel", False)
+                                else "component_direct_factorized_full_matvec"
+                            )
+                        )
                     )
                 )
                 timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
@@ -4424,12 +4696,21 @@ def _build_component_sparse_orthonormalized_local_problem(
                         time.perf_counter() - t0
                     )
                     timing_key = (
-                        "component_recursive_parent_block_kernel"
-                        if getattr(block_table, "uses_component_parent_block_kernel", False)
+                        "component_complementary_family_table_kernel"
+                        if getattr(block_table, "uses_complementary_family_table_kernel", False)
                         else (
-                            "component_direct_factorized_kernel"
-                            if getattr(block_table, "uses_component_direct_kernel", False)
-                            else "component_direct_factorized_full_matvec"
+                            "component_complementary_payload_tensor_kernel"
+                            if getattr(block_table, "uses_complementary_payload_tensor_kernel", False)
+                            and getattr(block_table, "uses_component_direct_kernel", False)
+                            else (
+                                "component_recursive_parent_block_kernel"
+                                if getattr(block_table, "uses_component_parent_block_kernel", False)
+                                else (
+                                    "component_direct_factorized_kernel"
+                                    if getattr(block_table, "uses_component_direct_kernel", False)
+                                    else "component_direct_factorized_full_matvec"
+                                )
+                            )
                         )
                     )
                     timing[timing_key] = timing.get(timing_key, 0.0) + 1.0
@@ -5636,6 +5917,7 @@ def solve_local_two_site(
                     precond=precond,
                     use_block_preconditioner=use_block_preconditioner,
                     allow_unconverged=allow_unconverged_roots,
+                    profile=profile,
                 )
             except RuntimeError:
                 if dense_fallback_dim is None or dim > int(dense_fallback_dim):
@@ -6018,6 +6300,8 @@ def solve_local_two_site(
                 "missing_diagonal_preconditioner": bool(
                     solver_info.get("missing_diagonal_preconditioner", False)
                 ),
+                "solver_timing": solver_info.get("solver_timing"),
+                "matvec_count": solver_info.get("matvec_count"),
             }
             if use_uncoupled_canonical_path:
                 objective["coupled_physical_skipped"] = "uncoupled_canonical_path"

@@ -104,6 +104,8 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
     np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-11, rtol=1e-11)
+    if _rys_cy is not None:
+        assert mol_default._builtin_build_info['dense_builder'] == 'rys-cython-blocked-auto'
     expected_builder = 'rys-cython-blocked' if _rys_cy is not None else 'rys-screened-mixed'
     assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
 
@@ -126,7 +128,7 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
     np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-9, rtol=1e-9)
     expected_builder = (
-        'cython-kernel-mixed-d-fallback'
+        'cython-shell-os-blocked-mixed-d-fallback'
         if _basis_cy is not None
         else 'python-serial-mixed-d-fallback'
     )
@@ -216,6 +218,31 @@ def test_cython_cartesian_shell_quartet_block_matches_dense_slice():
     eri_dense, _, _ = _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
     ref = eri_dense[a0:a1, b0:b1, c0:c1, d0:d1]
     np.testing.assert_allclose(block, ref, atol=1e-9, rtol=1e-9)
+
+
+def test_cython_iterative_os_shell_quartet_matches_default_block():
+    if _basis_cy is None:
+        return
+
+    atom = 'H 0 0 0; F 0 0 0.9'
+    mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
+    mol.build(driver='builtin', options={'eri_representation': 'dense'})
+    signatures = tuple(_basis_signature(fn) for fn in mol._bas)
+    shell_blocks = _cart_shell_blocks(mol._bas)
+
+    a0, a1, _ = shell_blocks[1]
+    b0, b1, _ = shell_blocks[2]
+    c0, c1, _ = shell_blocks[-2]
+    d0, d1, _ = shell_blocks[-1]
+    shell_block = (a0, a1, b0, b1, c0, c1, d0, d1)
+    block_default = _compute_cartesian_shell_quartet_block_cython(signatures, shell_block)
+    block_iterative = _compute_cartesian_shell_quartet_block_cython(
+        signatures, shell_block, use_iterative=True
+    )
+
+    if block_default is None or block_iterative is None:
+        return
+    np.testing.assert_allclose(block_iterative, block_default, atol=1e-12, rtol=1e-12)
 
 
 def test_cython_one_electron_matches_python_builder():

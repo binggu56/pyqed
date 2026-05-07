@@ -122,7 +122,7 @@ def _normalize_site_legs(sites_or_legs, *, min_sites=2):
     return tuple(site_legs)
 
 
-def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12):
+def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
     """
     Add a spin-summed spatial-orbital one-body Hamiltonian.
 
@@ -156,7 +156,12 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12):
 
     for site, coeff in enumerate(np.diag(h1e)):
         if abs(coeff) > cutoff:
-            autompo.add_onsite(site, spatial_number(phys_leg, dtype=dtype), coeff=coeff)
+            autompo.add_onsite(
+                site,
+                spatial_number(phys_leg, dtype=dtype),
+                coeff=coeff,
+                family=family,
+            )
 
     for left_site in range(autompo.nsites):
         for right_site in range(left_site + 1, autompo.nsites):
@@ -168,6 +173,7 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12):
                     right_site,
                     reduced_fermion,
                     coeff=forward,
+                    family=family,
                 )
             backward = h1e[right_site, left_site]
             if abs(backward) > cutoff:
@@ -178,6 +184,7 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12):
                     right_site,
                     reduced_creation,
                     coeff=-backward,
+                    family=family,
                 )
 
     return autompo
@@ -401,6 +408,7 @@ def _emit_shared_spinfree_we_terms(autompo, pending_we, *, phys_leg, dtype, cuto
             intermediate_irreps=(SU2Irrep(1), SU2Irrep(middle_irrep), SU2Irrep(1)),
             coeff=coeff,
             middle_operators=middle,
+            family="P",
         )
         count += 1
     return count
@@ -643,7 +651,7 @@ def _emit_shared_scalar_product_terms(autompo, pending_scalar, *, cutoff):
     for coeff, site_ops in pending_scalar.values():
         if abs(coeff) <= cutoff:
             continue
-        autompo.add_term(*site_ops, coeff=coeff)
+        autompo.add_term(*site_ops, coeff=coeff, family="P")
         count += 1
     return count
 
@@ -1093,7 +1101,12 @@ class SpatialSpinFreeERIBuilder:
         )
         correction_terms = int(np.count_nonzero(np.abs(one_body_correction) > cutoff))
         if correction_terms:
-            add_spatial_one_body_terms(autompo, one_body_correction, cutoff=cutoff)
+            add_spatial_one_body_terms(
+                autompo,
+                one_body_correction,
+                cutoff=cutoff,
+                family="Q",
+            )
         term_count = we_product_terms + scalar_product_terms + correction_terms
         if fully_reduced:
             term_count += fully_reduced_density_terms

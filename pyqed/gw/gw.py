@@ -820,6 +820,7 @@ class GW(object):
         self._qp_energy_so = None
         self.evgw_history = []
         self.qsgw_history = []
+        self.scgw_result = None
         self.mo_coeff_qsgw = None
         self.v_qsgw = None
         self.converged = False
@@ -909,14 +910,65 @@ class GW(object):
         elif method in ('qsgw', 'qs-gw', 'quasiparticle-self-consistent'):
             self.e_qp = qsgw_kernel(self, mo_energy, mo_coeff, verbose=self.verbose, **kwargs)
             self.method = 'qsgw'
+        elif method in ('scgw0', 'sc-gw0', 'self-consistent-gw0'):
+            from pyqed.gw.scgw import SCGW
+
+            init_keys = {
+                "nfreq",
+                "wmax",
+                "beta",
+                "adjust_mu",
+                "target_nelec",
+                "density_nfreq",
+                "grid",
+            }
+            init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
+            kwargs.setdefault("update_screening", False)
+            self.scgw_result = SCGW(
+                self._scf,
+                screening=self.screening,
+                eta=self.eta,
+                **init_kwargs,
+            ).run(verbose=self.verbose, **kwargs)
+            self.e_qp = self.scgw_result.e_qp
+            self.converged = self.scgw_result.converged
+            self.method = 'scgw0'
+        elif method in ('scgw', 'sc-gw', 'self-consistent-gw'):
+            from pyqed.gw.scgw import SCGW
+
+            init_keys = {
+                "nfreq",
+                "wmax",
+                "beta",
+                "adjust_mu",
+                "target_nelec",
+                "density_nfreq",
+                "grid",
+            }
+            init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
+            kwargs.setdefault("update_screening", True)
+            self.scgw_result = SCGW(
+                self._scf,
+                screening=self.screening,
+                eta=self.eta,
+                **init_kwargs,
+            ).run(verbose=self.verbose, **kwargs)
+            self.e_qp = self.scgw_result.e_qp
+            self.converged = self.scgw_result.converged
+            self.method = 'scgw'
         else:
-            raise ValueError(f"Unknown GW method {method!r}. Use 'g0w0', 'evgw', or 'qsgw'.")
+            raise ValueError(
+                f"Unknown GW method {method!r}. "
+                "Use 'g0w0', 'evgw', 'qsgw', 'scgw0', or 'scgw'."
+            )
         self.info = {
             "method": self.method,
             "frequency_integration": self.freq_int,
             "converged": self.converged,
             "uses_factorized_eris": self.eri is None and self._pair_factors is not None,
         }
+        if self.scgw_result is not None:
+            self.info["scgw"] = self.scgw_result.info
         logger.log(self, 'GW bandgap = %.15g', self.e_qp[self.nocc//2]-self.e_qp[self.nocc//2-1])
         return self
 
@@ -932,6 +984,24 @@ class GW(object):
 
     def qsgw(self, mo_energy=None, mo_coeff=None, **kwargs):
         return self.run(mo_energy=mo_energy, mo_coeff=mo_coeff, method='qsgw', **kwargs)
+
+    def scgw0(self, mo_energy=None, mo_coeff=None, **kwargs):
+        return self.run(mo_energy=mo_energy, mo_coeff=mo_coeff, method='scgw0', **kwargs)
+
+    def scgw(self, mo_energy=None, mo_coeff=None, **kwargs):
+        return self.run(mo_energy=mo_energy, mo_coeff=mo_coeff, method='scgw', **kwargs)
+
+    def bse(self, **kwargs):
+        """Construct a BSE driver from this GW reference."""
+        from pyqed.gw.bse import BSE
+
+        return BSE(self, **kwargs)
+
+    def tda(self, **kwargs):
+        """Construct a TDA-BSE driver from this GW reference."""
+        from pyqed.gw.bse import TDA
+
+        return TDA(self, **kwargs)
 
     def rpa_correlation_energy(self, mo_energy=None, method='direct', use_qp=False):
         return rpa_correlation_energy(self, mo_energy=mo_energy, method=method, use_qp=use_qp)

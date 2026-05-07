@@ -1105,6 +1105,23 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
             )
         )
 
+    symbolic_transitions = []
+    for core, row_offset, col_offset in (
+        (left_core, left_row_offset, left_col_offset),
+        (right_core, right_row_offset, right_col_offset),
+    ):
+        for record in tuple(getattr(core, "symbolic_transitions", ()) or ()):
+            if len(record) < 4:
+                continue
+            symbolic_transitions.append(
+                (
+                    record[0],
+                    int(record[1]) + int(row_offset),
+                    int(record[2]) + int(col_offset),
+                    record[3],
+                )
+            )
+
     return RankCoupledMPO(
         dense_blocks=dense_blocks,
         phys_out_leg=left_core.phys_out_leg,
@@ -1112,6 +1129,7 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
         left_channel_irreps=left_irreps,
         right_channel_irreps=right_irreps,
         reduced_terms=tuple(reduced_terms),
+        symbolic_transitions=tuple(symbolic_transitions),
     )
 
 

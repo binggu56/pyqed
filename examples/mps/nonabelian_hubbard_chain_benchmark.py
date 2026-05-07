@@ -247,6 +247,7 @@ def _pyqed_ground_state_energy(
     max_nsweeps,
     cutoff,
     energy_tol,
+    profile=False,
 ):
     start = time.perf_counter()
     sites = build_random_spatial_mps(
@@ -266,8 +267,10 @@ def _pyqed_ground_state_energy(
         mpo_factors=mpo,
         max_bond=int(max_bond),
         cutoff=float(cutoff),
+        profile=bool(profile),
     )
     driver.run()
+    profile_summary = _profile_summary(driver.history) if profile else None
     return {
         "energy": driver.last_energy,
         "time_s": time.perf_counter() - start,
@@ -276,6 +279,7 @@ def _pyqed_ground_state_energy(
         "converged": _chain_energy_converged(driver, energy_tol=energy_tol),
         "history": [entry.get("energy") for entry in driver.history],
         "local_solver_kwargs": [entry.get("local_solver_kwargs") for entry in driver.history],
+        "profile": profile_summary,
     }
 
 
@@ -283,6 +287,54 @@ def _energy_error(energy, reference):
     if energy is None or reference is None:
         return None
     return abs(float(energy) - float(reference))
+
+
+def _add_numeric_totals(target, prefix, payload):
+    for key, value in (payload or {}).items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            target[f"{prefix}.{key}"] = target.get(f"{prefix}.{key}", 0.0) + float(value)
+
+
+def _profile_summary(history):
+    """
+    Return compact sweep/bond timing totals for PyQED profiling output.
+    """
+
+    sweep_timing = {}
+    bond_timing = {}
+    worst_bond = None
+    moving_environment = None
+    for entry in history:
+        _add_numeric_totals(sweep_timing, "sweep", entry.get("timing"))
+        moving_environment = entry.get("moving_environment_stats") or moving_environment
+        for objective in entry.get("bond_objectives") or []:
+            local = {}
+            _add_numeric_totals(local, "update", objective.get("update_timing"))
+            _add_numeric_totals(local, "solver", objective.get("solver_timing"))
+            _add_numeric_totals(local, "factory", objective.get("operator_factory_timing"))
+            _add_numeric_totals(local, "build", objective.get("renormalized_operator_build_timing"))
+            for key, value in local.items():
+                bond_timing[key] = bond_timing.get(key, 0.0) + float(value)
+            total = float(sum(local.values()))
+            if worst_bond is None or total > worst_bond["profile_time_s"]:
+                worst_bond = {
+                    "sweep": int(entry.get("sweep", -1)),
+                    "direction": entry.get("direction"),
+                    "bond": int(objective.get("bond", -1)),
+                    "profile_time_s": total,
+                    "energy": objective.get("energy"),
+                    "residual": objective.get("residual"),
+                    "source": objective.get("source"),
+                    "renormalized_operator_storage": objective.get(
+                        "renormalized_operator_storage"
+                    ),
+                }
+    return {
+        "sweep_timing": sweep_timing,
+        "bond_timing": bond_timing,
+        "worst_bond": worst_bond,
+        "moving_environment": moving_environment,
+    }
 
 
 def _iter_cases(lengths, max_bonds, hopping_ts, onsite_us, chemical_potentials):
@@ -314,6 +366,7 @@ def run_case(
     pyqed_max_nsweeps,
     pyqed_cutoff,
     pyqed_energy_tol,
+    pyqed_profile,
     run_ed,
     ed_max_length,
     run_tenpy,
@@ -339,6 +392,7 @@ def run_case(
         max_nsweeps=pyqed_max_nsweeps,
         cutoff=pyqed_cutoff,
         energy_tol=pyqed_energy_tol,
+        profile=pyqed_profile,
     )
     row["pyqed"] = pyqed_result
 
@@ -466,6 +520,34 @@ def _format_table(rows):
             lines.append(
                 "  pyqed_history=[" + ", ".join(f"{float(x):.12f}" for x in pyqed["history"]) + "]"
             )
+        if pyqed.get("profile"):
+            profile = pyqed["profile"]
+            timing = profile.get("bond_timing") or {}
+            top = sorted(timing.items(), key=lambda item: -float(item[1]))[:8]
+            lines.append(
+                "  pyqed_profile_top=["
+                + ", ".join(f"{key}={value:.6f}s" for key, value in top)
+                + "]"
+            )
+            if profile.get("worst_bond") is not None:
+                lines.append(f"  pyqed_profile_worst_bond={profile['worst_bond']}")
+            moving = profile.get("moving_environment") or {}
+            if moving:
+                lines.append(
+                    "  pyqed_moving_environment="
+                    + str(
+                        {
+                            key: moving.get(key)
+                            for key in (
+                                "environment_rebuilds",
+                                "boundary_side_reuses",
+                                "valid_boundary_side",
+                                "hamiltonian_boundary_advances",
+                                "complementary_operator_advances",
+                            )
+                        }
+                    )
+                )
         if tenpy.get("chi"):
             lines.append(
                 "  tenpy_chi=[" + ", ".join(str(int(x)) for x in tenpy["chi"]) + "]"
@@ -496,6 +578,7 @@ def main():
     parser.add_argument("--pyqed-max-nsweeps", type=int, default=2)
     parser.add_argument("--pyqed-cutoff", type=float, default=0.0)
     parser.add_argument("--pyqed-energy-tol", type=float, default=1e-8)
+    parser.add_argument("--pyqed-profile", action="store_true")
     parser.add_argument("--skip-ed", action="store_true")
     parser.add_argument(
         "--ed-max-length",
@@ -532,6 +615,7 @@ def main():
             pyqed_max_nsweeps=args.pyqed_max_nsweeps,
             pyqed_cutoff=args.pyqed_cutoff,
             pyqed_energy_tol=args.pyqed_energy_tol,
+            pyqed_profile=args.pyqed_profile,
             run_ed=not args.skip_ed,
             ed_max_length=args.ed_max_length,
             run_tenpy=not args.skip_tenpy,
@@ -559,6 +643,7 @@ def main():
             "pyqed_max_nsweeps": args.pyqed_max_nsweeps,
             "pyqed_cutoff": args.pyqed_cutoff,
             "pyqed_energy_tol": args.pyqed_energy_tol,
+            "pyqed_profile": args.pyqed_profile,
             "run_ed": not args.skip_ed,
             "ed_max_length": args.ed_max_length,
             "run_tenpy": not args.skip_tenpy,

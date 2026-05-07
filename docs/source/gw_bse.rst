@@ -67,6 +67,7 @@ Available methods include:
 * ``GW(mf).evgw(update_screening=False)`` for eigenvalue-only ``GnW0``.
 * ``GW(mf).evgw(update_screening=True)`` for eigenvalue-only ``GnWn``.
 * ``GW(mf).qsgw()`` for a dense quasiparticle self-consistent reference path.
+* ``SCGW(mf).run()`` for an experimental dense imaginary-axis scGW prototype.
 
 ``GW.run()`` returns the GW object so that downstream code can pass it directly
 to BSE.  It still behaves like the quasiparticle-energy array in common NumPy
@@ -81,6 +82,279 @@ contexts:
    homo = gw[nocc - 1]
    qp_ev = gw * 27.211386245988
 
+Experimental scGW Prototype
+---------------------------
+
+``pyqed.gw.scgw.SCGW`` is a small finite-basis imaginary-axis prototype for
+self-consistent GW.  It stores full matrix Green's functions, polarizabilities,
+screened interactions, and correlation self-energies on a symmetric imaginary
+frequency grid.  The default grid is a tangent-mapped Gauss-Legendre
+quadrature over the full imaginary axis.  The older finite uniform grid remains
+available with ``grid="linear"`` for debugging.  Two modes are available:
+
+* ``scgw0``: update ``G`` and ``Sigma`` while keeping the initial screened
+  interaction ``W0`` fixed.
+* ``scgw``: update ``G``, ``P``, ``W``, and ``Sigma`` every macroiteration.
+
+Both modes can optionally rebuild the bare-exchange part from the current
+Green's-function density matrix.
+
+.. code-block:: python
+
+   from pyqed.gw.scgw import SCGW
+
+   scgw0 = SCGW(mf, nfreq=17, wmax=20.0).scgw0(
+       max_cycle=20,
+       conv_tol=1e-6,
+       damping=0.2,
+   )
+
+   scgw = SCGW(mf, nfreq=17, wmax=20.0).scgw(
+       max_cycle=20,
+       conv_tol=1e-6,
+       damping=0.2,
+   )
+
+   print(scgw.converged)
+   print(scgw.mu, scgw.nelec)
+   print(scgw.e_qp)       # static imaginary-axis diagnostic estimate
+   print(scgw.e_tot)      # Galitskii-Migdal total energy
+   print(scgw.energy_components)
+   print(scgw.G.shape)    # (nfreq, nso, nso)
+
+The same functionality is also exposed through the normal GW driver:
+
+.. code-block:: python
+
+   from pyqed.gw.gw import GW
+
+   gw0 = GW(mf).scgw0(nfreq=17, wmax=20.0, max_cycle=20)
+   gw = GW(mf).scgw(nfreq=17, wmax=20.0, max_cycle=20)
+
+   print(gw0.scgw_result.W0 is not None)
+   print(gw.scgw_result.info["update_screening"])
+
+When the mean-field object carries ``mol.eri_factors``/``mf.eri_factors``,
+the prototype keeps ``P`` and ``W`` in the auxiliary factor space instead of
+expanding the four-index ERI tensor.  Dense integrals are still supported for
+small reference calculations.
+
+For grid checks, use the convergence helper.  The default tangent-mapped
+imaginary-frequency quadrature covers the infinite axis and is usually more
+useful than the small uniform finite-cutoff grid for the convolution prototype.
+The shifted Green's functions in the ``P`` and ``Sigma`` convolutions use the
+large-frequency tail ``G(z) = z^{-1} I + z^{-2} H + O(z^{-3})`` outside the
+explicit grid, avoiding the hard cutoff that made earlier finite grids overly
+sensitive to ``wmax``.
+
+.. code-block:: python
+
+   from pyqed.gw.scgw import frequency_convergence
+
+   rows = frequency_convergence(
+       mf,
+       nfreq_values=(7, 9, 11, 13),
+       wmax=10.0,        # tangent-grid frequency scale
+       method="scgw0",
+       run_kwargs={"max_cycle": 10, "damping": 0.3},
+   )
+
+   for row in rows:
+       print(
+           row["nfreq"],
+           row["e_tot"],
+           row["delta_e_tot"],
+           row["delta_qp_max"],
+           row["grid_converged"],
+       )
+
+Validation status: MOLGW 3.4 provides G0W0, GnW0, GnWn/evGW, and QSGW
+reference paths, and PyQED has smoke tests against those.  MOLGW's public
+input parser does not expose the same fully interacting imaginary-axis scGW
+loop implemented here.  For this prototype, the immediate validation criterion
+is therefore internal stability with respect to ``nfreq``, frequency scale,
+``density_nfreq``, damping, and fixed- versus updated-screening choices.  If
+``delta_e_tot`` and ``delta_qp_max`` do not satisfy the requested tolerances
+and set ``grid_converged=True``, the result should be treated as an
+algorithm/debug diagnostic, not a converged molecular prediction.
+
+This is not yet a production scGW implementation.  In particular, analytic
+continuation and forces are still future work.  The current chemical-potential
+control fixes the electron count with a tail-corrected Matsubara sum of the
+interacting Green's function and expands the chemical-potential bracket when
+the interacting density lies outside the static frontier-orbital window.
+
+scGW Theory
+-----------
+
+Self-consistent GW solves Hedin's equations with the vertex set to one,
+``Gamma = 1``.  In an orthonormal molecular-orbital basis, the central Dyson
+equation is
+
+.. math::
+
+   G(i\omega_n) =
+   \left[
+     (\mu + i\omega_n) I - h_0 - \Sigma_x - \Sigma_c(i\omega_n)
+   \right]^{-1}.
+
+Here ``h0`` is the one-particle Hamiltonian with the mean-field potential
+removed, ``Sigma_x`` is the static exchange self-energy, and ``Sigma_c`` is the
+dynamic correlation self-energy.
+
+The independent-particle polarizability is built from the interacting Green's
+function:
+
+.. math::
+
+   P_{pq,rs}(i\nu_m)
+   =
+   -\frac{1}{\beta}
+   \sum_n
+   G_{pr}(i\omega_n + i\nu_m)
+   G_{sq}(i\omega_n).
+
+The screened Coulomb interaction follows a Dyson-like equation:
+
+.. math::
+
+   W(i\nu_m) = v + v P(i\nu_m) W(i\nu_m)
+             = \left[1 - vP(i\nu_m)\right]^{-1} v.
+
+The GW correlation self-energy is then
+
+.. math::
+
+   \Sigma^c_{pq}(i\omega_n)
+   =
+   -\frac{1}{\beta}
+   \sum_m
+   G_{rs}(i\omega_n - i\nu_m)
+   W^c_{pr,qs}(i\nu_m),
+
+where ``W_c = W - v``.  The total self-energy is
+
+.. math::
+
+   \Sigma(i\omega_n) = \Sigma_x + \Sigma_c(i\omega_n).
+
+The chemical potential is adjusted to conserve particle number.  The density
+matrix is obtained from the interacting Green's function using a high-frequency
+tail correction:
+
+.. math::
+
+   \gamma =
+   \frac{1}{2} I
+   +
+   \frac{1}{\beta}
+   \sum_n
+   \left[
+     G(i\omega_n) - \frac{I}{i\omega_n}
+   \right],
+
+and ``mu`` is solved so that
+
+.. math::
+
+   N = \mathrm{Tr}\,\gamma.
+
+The current PyQED prototype uses dense tensors and numerical interpolation on
+finite imaginary-frequency grids.  It is therefore a reference implementation
+for algorithm development, not yet a high-accuracy production scGW solver.
+
+Galitskii-Migdal and Luttinger-Ward Energies
+-------------------------------------------
+
+For an electronic Hamiltonian
+
+.. math::
+
+   \hat H =
+   \sum_{pq} h_{pq} c_p^\dagger c_q
+   +
+   \frac{1}{2}
+   \sum_{pqrs}
+   v_{pqrs}
+   c_p^\dagger c_r^\dagger c_s c_q,
+
+the one-particle density matrix is
+
+.. math::
+
+   \gamma_{pq} = \langle c_q^\dagger c_p \rangle.
+
+The exact equation of motion for the Green's function gives the
+Galitskii-Migdal interaction-energy identity
+
+.. math::
+
+   E_{\mathrm{int}}
+   =
+   \frac{1}{2\beta}
+   \sum_n
+   e^{i\omega_n 0^+}
+   \mathrm{Tr}
+   \left[
+     \Sigma(i\omega_n) G(i\omega_n)
+   \right].
+
+Separating the self-energy into Hartree, exchange, and dynamic correlation
+parts gives the practical molecular total energy used by ``SCGW``:
+
+.. math::
+
+   E_{\mathrm{GM}}
+   =
+   \mathrm{Tr}[h\gamma]
+   + E_H[\gamma]
+   + \frac{1}{2}\mathrm{Tr}[\Sigma_x \gamma]
+   + \frac{1}{2\beta}
+     \sum_n
+     \mathrm{Tr}
+     [
+       \Sigma_c(i\omega_n)G(i\omega_n)
+     ]
+   + E_{\mathrm{nuc}}.
+
+Here
+
+.. math::
+
+   E_H[\gamma]
+   =
+   \frac{1}{2}
+   \sum_{pqrs}
+   v_{pqrs}
+   \gamma_{qp}\gamma_{sr}.
+
+The factor ``1/2`` in the self-energy trace removes the double counting of
+the two fermion lines attached to the interaction.
+
+The Luttinger-Ward functional ``Phi[G]`` is defined so that
+
+.. math::
+
+   \Sigma = \frac{\delta \Phi[G]}{\delta G}.
+
+For the GW skeleton functional, the correlation contribution satisfies
+
+.. math::
+
+   \Phi_c^{GW}[G]
+   =
+   \frac{1}{2\beta}
+   \sum_n
+   \mathrm{Tr}
+   [
+     \Sigma_c(i\omega_n)G(i\omega_n)
+   ],
+
+at self-consistency.  Therefore the stationary Luttinger-Ward internal energy
+and the Galitskii-Migdal total energy are identical for the self-consistent GW
+solution.  PyQED reports both ``e_tot_gm`` and ``e_tot_lw``; their difference
+is a useful implementation and convergence diagnostic.
+
 BSE and TDA
 -----------
 
@@ -91,6 +365,13 @@ The preferred BSE API takes a completed GW object:
    gw = GW(mf).run()
    bse = BSE(gw).run(nroots=5)
    tda = TDA(gw).run(nroots=5)
+
+Equivalently, use the convenience constructors on the GW object:
+
+.. code-block:: python
+
+   bse = gw.bse().run(nroots=5)
+   tda = gw.tda().run(nroots=5)
 
 ``BSE`` solves the full Bethe-Salpeter eigenproblem and stores stacked
 ``X/Y`` amplitudes in ``bse.xy``.  The views ``bse.x`` and ``bse.y`` return
@@ -146,6 +427,41 @@ PyQED exposes this as:
 The quasiparticle energies ``gw.e_qp`` should not be used directly as neutral
 ground-state or excited-state PES energies; they correspond to charged
 addition/removal quasiparticle levels.
+
+Scanner Interface
+-----------------
+
+``BSE`` and ``TDA`` provide an ``as_scanner()`` helper for PES scans.  The
+default scanner return value is ``[E0, E0 + Omega_1, ...]`` using the SCF
+ground-state reference:
+
+.. code-block:: python
+
+   gw = GW(mf).run()
+   bse = BSE(gw).run(nroots=3)
+
+   scanner = bse.as_scanner(nroots=3)
+   energies = scanner(new_coords)
+
+   e0 = energies[0]
+   excited = energies[1:]
+
+For excitation energies only:
+
+.. code-block:: python
+
+   omega_scanner = bse.as_scanner(nroots=3, energy="excitation")
+   omega = omega_scanner(new_coords)
+
+For an RPA-shifted PES:
+
+.. code-block:: python
+
+   rpa_scanner = bse.as_scanner(nroots=3, energy="rpa")
+   energies = rpa_scanner(new_coords)
+
+After each call, the scanner stores the latest objects as ``scanner.mf``,
+``scanner.gw``, and ``scanner.bse``.
 
 Wavefunction Overlaps
 ---------------------

@@ -18,6 +18,21 @@ import time
 import numpy as np
 
 _ORTHONORMAL_BLOCK_DENSE_MATVEC_MAX_ELEMENTS = 1_000_000
+_COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS = 65536
+
+
+def set_complementary_family_native_kernel_max_elements(value):
+    """
+    Set the dense-kernel threshold for family-table native matvecs.
+
+    :param value: Maximum dense kernel elements. Use ``0`` to disable dense
+        materialization and force factor-native contractions.
+    :returns: The updated threshold.
+    """
+
+    global _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS
+    _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS = max(0, int(value))
+    return int(_COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS)
 
 
 @dataclass
@@ -239,6 +254,7 @@ def build_rank_coupled_left_factor_table(left_blocks_by_ket, W):
     """
 
     w_blocks_by_in = group_rank_coupled_reduced_blocks_by_input(W)
+    family_by_middle = _symbolic_transition_families_by_channel(W, side="right")
     out = {}
     cache = {}
     for q_lk, left_entries in left_blocks_by_ket.items():
@@ -255,7 +271,15 @@ def build_rank_coupled_left_factor_table(left_blocks_by_ket, W):
                         if factor is None:
                             factor = np.asarray(factorize_left_two_site_dense_term(E_block, W_block))
                             cache[key] = factor
-                        values.append((q_lb, q_p1b, middle_idx, factor))
+                        values.append(
+                            (
+                                q_lb,
+                                q_p1b,
+                                middle_idx,
+                                factor,
+                                family_by_middle.get(int(middle_idx), ()),
+                            )
+                        )
             if values:
                 out[(q_lk, q_p1k)] = tuple(values)
     return out
@@ -271,6 +295,7 @@ def build_rank_coupled_right_factor_table(right_blocks_by_ket, W):
     """
 
     w_blocks_by_in = group_rank_coupled_reduced_blocks_by_input(W)
+    family_by_middle = _symbolic_transition_families_by_channel(W, side="left")
     out = {}
     cache = {}
     for q_rk, right_entries in right_blocks_by_ket.items():
@@ -287,10 +312,57 @@ def build_rank_coupled_right_factor_table(right_blocks_by_ket, W):
                         if factor is None:
                             factor = np.asarray(factorize_right_two_site_dense_term(W_block, F_block))
                             cache[key] = factor
-                        values.append((q_rb, q_p2b, middle_idx, factor))
+                        values.append(
+                            (
+                                q_rb,
+                                q_p2b,
+                                middle_idx,
+                                factor,
+                                family_by_middle.get(int(middle_idx), ()),
+                            )
+                        )
             if values:
                 out[(q_rk, q_p2k)] = tuple(values)
     return out
+
+
+def _family_names_from_symbolic_label(label):
+    """Return family labels embedded in an AutoMPO symbolic transition label."""
+
+    if not isinstance(label, tuple) or not label:
+        return ()
+    if all(isinstance(item, str) for item in label):
+        return tuple(sorted({str(item) for item in label if item}))
+    candidate = label[-1]
+    if isinstance(candidate, str):
+        return (candidate,)
+    if isinstance(candidate, (tuple, list, set)):
+        return tuple(sorted({str(item) for item in candidate if item is not None}))
+    return ()
+
+
+def _symbolic_transition_families_by_channel(W, *, side):
+    """
+    Group symbolic transition family labels by one visible MPO channel.
+
+    :param W: MPO core carrying ``symbolic_transitions`` metadata.
+    :param side: ``"left"`` groups by incoming channel; ``"right"`` groups by
+        outgoing channel.
+    :returns: Mapping ``channel -> tuple(family labels)``.
+    """
+
+    channel_index = 1 if str(side) == "left" else 2
+    families = {}
+    for record in tuple(getattr(W, "symbolic_transitions", ()) or ()):
+        if len(record) < 4:
+            continue
+        channel = int(record[channel_index])
+        names = _family_names_from_symbolic_label(record[3])
+        if not names:
+            continue
+        bucket = families.setdefault(channel, set())
+        bucket.update(names)
+    return {channel: tuple(sorted(names)) for channel, names in families.items()}
 
 
 @dataclass(frozen=True)
@@ -707,6 +779,449 @@ class SymbolicRenormalizedOperatorTable:
         )
 
 
+@dataclass(frozen=True)
+class ComplementaryFamilyRenormalizedOperatorBlock:
+    """
+    One stored renormalized boundary-operator family block.
+
+    :param family_name: Complementary family label.
+    :param channels: MPO virtual channels carrying this family.
+    :param symbolic_terms: Multiplicity-counted symbolic path count.
+    :param payload_keys: Numeric payload keys owned by these channels.
+    :param stored_elements: Number of scalar tensor elements in payloads.
+    :param payload_norm: Frobenius norm over owned numeric payload tensors.
+    """
+
+    family_name: str
+    channels: tuple
+    symbolic_terms: int
+    payload_keys: tuple
+    stored_elements: int
+    payload_norm: float
+    coefficient_terms: int = 0
+    coefficient_cross_terms: int = 0
+
+    @property
+    def n_channels(self):
+        """Return the number of active virtual channels."""
+
+        return int(len(self.channels))
+
+    @property
+    def n_payload_blocks(self):
+        """Return the number of numeric payload tensors."""
+
+        return int(len(self.payload_keys))
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this family block."""
+
+        return {
+            "family_name": str(self.family_name),
+            "channels": tuple(int(channel) for channel in self.channels),
+            "n_channels": int(self.n_channels),
+            "symbolic_terms": int(self.symbolic_terms),
+            "n_payload_blocks": int(self.n_payload_blocks),
+            "stored_elements": int(self.stored_elements),
+            "payload_norm": float(self.payload_norm),
+            "coefficient_terms": int(self.coefficient_terms),
+            "coefficient_cross_terms": int(self.coefficient_cross_terms),
+        }
+
+
+@dataclass(frozen=True)
+class ComplementaryFamilyRenormalizedOperatorTable:
+    """
+    Stored family-resolved renormalized boundary operator table.
+
+    This table is the persistent block2-style operator-family layer.  It is
+    derived from the recursive symbolic boundary table and owns a per-family
+    view of the numeric renormalized operator payloads already stored on the
+    boundary.
+
+    :param side: Boundary side.
+    :param bond: Boundary bond index.
+    :param family_blocks: Mapping from family label to stored block metadata.
+    :param source: Diagnostic source label.
+    """
+
+    side: str
+    bond: int
+    family_blocks: dict
+    source: str = "symbolic_renormalized_operator_table"
+
+    @classmethod
+    def from_symbolic_table(cls, symbolic_table, family_names, *, family_payloads=None):
+        """
+        Build a family table from a symbolic renormalized boundary table.
+
+        :param symbolic_table: Boundary symbolic table with numeric payloads.
+        :param family_names: Complementary family labels to expose.
+        :param family_payloads: Optional complementary coefficient payloads.
+        :returns: Family-resolved renormalized operator table.
+        """
+
+        family_names = tuple(str(name) for name in family_names)
+        family_payloads = dict(family_payloads or {})
+        channel_families = {}
+        channel_term_counts = {}
+        for channel, terms in symbolic_table.terms_by_channel.items():
+            families = set()
+            term_count = 0
+            for term in terms:
+                term_count += int(term.multiplicity)
+                for transition_key in tuple(term.path):
+                    if len(transition_key) < 4:
+                        continue
+                    families.update(_family_names_from_symbolic_label(transition_key[3]))
+            if families:
+                channel_families[int(channel)] = families
+                channel_term_counts[int(channel)] = int(term_count)
+
+        payloads_by_channel = {}
+        payload_norms_by_channel = {}
+        payload_elements_by_channel = {}
+        for key, payload in symbolic_table.numeric_payloads.items():
+            channel = None if len(key) < 3 else key[2]
+            if channel is None:
+                continue
+            arr = np.asarray(payload)
+            payloads_by_channel.setdefault(int(channel), []).append(key)
+            payload_norms_by_channel[int(channel)] = (
+                payload_norms_by_channel.get(int(channel), 0.0)
+                + float(np.linalg.norm(arr)) ** 2
+            )
+            payload_elements_by_channel[int(channel)] = (
+                payload_elements_by_channel.get(int(channel), 0)
+                + int(arr.size)
+            )
+
+        blocks = {}
+        for family in family_names:
+            channels = tuple(
+                sorted(
+                    channel
+                    for channel, names in channel_families.items()
+                    if family in names
+                )
+            )
+            coefficient_payload = family_payloads.get(family)
+            payload_keys = tuple(
+                key
+                for channel in channels
+                for key in payloads_by_channel.get(int(channel), ())
+            )
+            payload_norm_sq = sum(
+                payload_norms_by_channel.get(int(channel), 0.0)
+                for channel in channels
+            )
+            blocks[family] = ComplementaryFamilyRenormalizedOperatorBlock(
+                family_name=family,
+                channels=channels,
+                symbolic_terms=sum(
+                    channel_term_counts.get(int(channel), 0)
+                    for channel in channels
+                ),
+                payload_keys=payload_keys,
+                stored_elements=sum(
+                    payload_elements_by_channel.get(int(channel), 0)
+                    for channel in channels
+                ),
+                payload_norm=float(np.sqrt(payload_norm_sq)),
+                coefficient_terms=(
+                    0 if coefficient_payload is None else int(coefficient_payload.n_terms)
+                ),
+                coefficient_cross_terms=(
+                    0
+                    if coefficient_payload is None
+                    else int(coefficient_payload.cross_terms)
+                ),
+            )
+        return cls(
+            side=str(symbolic_table.side),
+            bond=int(symbolic_table.bond),
+            family_blocks=blocks,
+        )
+
+    @property
+    def family_names(self):
+        """Return family labels in this table."""
+
+        return tuple(self.family_blocks)
+
+    @property
+    def active_family_names(self):
+        """Return family labels with at least one symbolic channel."""
+
+        return tuple(
+            name
+            for name, block in self.family_blocks.items()
+            if block.n_channels > 0
+        )
+
+    def active_family_set(self):
+        """Return active family labels as a set."""
+
+        return set(self.active_family_names)
+
+    def supports_family_names(self, family_names):
+        """
+        Return whether this table has an active channel for any label.
+
+        :param family_names: Iterable of family labels from a local term.
+        :returns: ``True`` when any label is active in this boundary table.
+        """
+
+        active = self.active_family_set()
+        return bool(active.intersection(str(name) for name in family_names))
+
+    @property
+    def n_channels(self):
+        """Return total family-channel assignments."""
+
+        return int(sum(block.n_channels for block in self.family_blocks.values()))
+
+    @property
+    def n_payload_blocks(self):
+        """Return total numeric payload blocks assigned to families."""
+
+        return int(sum(block.n_payload_blocks for block in self.family_blocks.values()))
+
+    @property
+    def stored_elements(self):
+        """Return total stored payload tensor elements assigned to families."""
+
+        return int(sum(block.stored_elements for block in self.family_blocks.values()))
+
+    @property
+    def symbolic_terms(self):
+        """Return total multiplicity-counted symbolic family terms."""
+
+        return int(sum(block.symbolic_terms for block in self.family_blocks.values()))
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for the family table."""
+
+        return {
+            "kind": "complementary_family_renormalized_operator_table",
+            "source": str(self.source),
+            "side": str(self.side),
+            "bond": int(self.bond),
+            "family_names": self.family_names,
+            "active_family_names": self.active_family_names,
+            "n_family_blocks": int(len(self.family_blocks)),
+            "n_channels": int(self.n_channels),
+            "n_payload_blocks": int(self.n_payload_blocks),
+            "stored_elements": int(self.stored_elements),
+            "symbolic_terms": int(self.symbolic_terms),
+            "families": {
+                str(name): block.stats
+                for name, block in self.family_blocks.items()
+            },
+        }
+
+
+@dataclass(frozen=True)
+class FamilyNativeFactorKernel:
+    """
+    Family-owned factorized local contraction kernel.
+
+    The kernel owns the numerical left/right stacks needed for one block
+    contraction.  It is independent of ``CompiledFactorizedBlock.apply_block``
+    so family-table matvecs can move toward block2-like native contractions
+    while keeping the same tensor algebra.
+    """
+
+    left_stack: np.ndarray
+    right_stack: np.ndarray
+    input_shape: tuple
+    output_size: int
+    use_direct_contraction: bool
+
+    @classmethod
+    def from_compiled_term(cls, term):
+        """Build a native factor kernel from a compiled factorized term."""
+
+        return cls(
+            left_stack=np.asarray(term.left_stack),
+            right_stack=np.asarray(term.right_stack),
+            input_shape=tuple(int(dim) for dim in term.input_entry.shape),
+            output_size=int(term.output_size),
+            use_direct_contraction=bool(
+                getattr(term, "_use_direct_contraction", False)
+            ),
+        )
+
+    @property
+    def stored_elements(self):
+        """Return the number of scalar elements stored by this kernel."""
+
+        return int(np.asarray(self.left_stack).size + np.asarray(self.right_stack).size)
+
+    def apply_block(self, block_in):
+        """
+        Apply the factor-native contraction to one input block.
+
+        :param block_in: Input sector block.
+        :returns: Flattened output-sector contribution.
+        """
+
+        left_stack = np.asarray(self.left_stack)
+        right_stack = np.asarray(self.right_stack)
+        block_in = np.asarray(block_in)
+        if bool(self.use_direct_contraction):
+            contrib = np.einsum(
+                "tlkwab,kbcr,twqrdc->ladq",
+                left_stack,
+                block_in,
+                right_stack,
+                optimize=False,
+            )
+            return np.asarray(contrib).reshape(int(self.output_size))
+        tmp = np.einsum(
+            "tlkwab,kbcr->tlwacr",
+            left_stack,
+            block_in,
+            optimize=False,
+        )
+        contrib = np.einsum(
+            "tlwacr,twqrdc->ladq",
+            tmp,
+            right_stack,
+            optimize=False,
+        )
+        return np.asarray(contrib).reshape(int(self.output_size))
+
+
+@dataclass(frozen=True)
+class ComplementaryFamilyApplyEntry:
+    """
+    One local application routed by stored family-operator tables.
+
+    The entry already has the component slices needed by the orthonormal
+    matvec.  ``compiled_term`` remains the numerical backend until payload
+    native contractions replace it.
+    """
+
+    in_comp: int
+    out_comp: int
+    in_slice: slice
+    out_slice: slice
+    compiled_term: object
+    family_names: tuple
+    source_tables: tuple = ()
+    backend: str = "compiled_factorized_term"
+    factor_kernel: FamilyNativeFactorKernel | None = None
+    native_kernel: np.ndarray | None = None
+
+    @classmethod
+    def from_plan_entry(cls, entry, *, family_names=None, source_tables=()):
+        """Build an apply entry from a raw component-direct plan tuple."""
+
+        in_comp, out_comp, in_slice, out_slice, term = entry
+        names = tuple(
+            str(name)
+            for name in (
+                family_names
+                if family_names is not None
+                else (getattr(term, "family_names", ()) or ())
+            )
+        )
+        return cls(
+            in_comp=int(in_comp),
+            out_comp=int(out_comp),
+            in_slice=in_slice,
+            out_slice=out_slice,
+            compiled_term=term,
+            family_names=names,
+            source_tables=tuple(source_tables or ()),
+        )
+
+    def with_factor_kernel(self):
+        """
+        Return an entry using a family-native factorized backend.
+
+        :returns: New entry with ``family_table_factor_kernel`` backend.
+        """
+
+        return type(self)(
+            in_comp=self.in_comp,
+            out_comp=self.out_comp,
+            in_slice=self.in_slice,
+            out_slice=self.out_slice,
+            compiled_term=self.compiled_term,
+            family_names=self.family_names,
+            source_tables=self.source_tables,
+            backend="family_table_factor_kernel",
+            factor_kernel=FamilyNativeFactorKernel.from_compiled_term(
+                self.compiled_term
+            ),
+            native_kernel=self.native_kernel,
+        )
+
+    def with_native_kernel(self, *, max_elements=None):
+        """
+        Return an entry with a dense family-native kernel when feasible.
+
+        :param max_elements: Maximum dense kernel size to materialize.
+        :returns: New entry using ``family_table_dense_kernel`` when available.
+        """
+
+        if max_elements is None:
+            max_elements = _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS
+        kernel = self.compiled_term.kernel_matrix(
+            self.compiled_term.input_entry.shape,
+            max_elements=int(max_elements),
+        )
+        if kernel is None:
+            return self
+        return type(self)(
+            in_comp=self.in_comp,
+            out_comp=self.out_comp,
+            in_slice=self.in_slice,
+            out_slice=self.out_slice,
+            compiled_term=self.compiled_term,
+            family_names=self.family_names,
+            source_tables=self.source_tables,
+            backend="family_table_dense_kernel",
+            factor_kernel=self.factor_kernel,
+            native_kernel=np.ascontiguousarray(kernel),
+        )
+
+    @property
+    def input_entry(self):
+        """Return the compiled term input entry."""
+
+        return self.compiled_term.input_entry
+
+    def apply_block(self, block_in):
+        """Apply the current numerical backend to one input block."""
+
+        if self.native_kernel is not None:
+            return np.asarray(self.native_kernel @ np.asarray(block_in).reshape(-1))
+        if self.factor_kernel is not None:
+            return self.factor_kernel.apply_block(block_in)
+        return self.compiled_term.apply_block(block_in)
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this local application entry."""
+
+        return {
+            "family_names": tuple(self.family_names),
+            "backend": str(self.backend),
+            "source_tables": tuple(str(item) for item in self.source_tables),
+            "native_kernel_elements": int(
+                0 if self.native_kernel is None else np.asarray(self.native_kernel).size
+            ),
+            "factor_kernel_elements": int(
+                0 if self.factor_kernel is None else self.factor_kernel.stored_elements
+            ),
+        }
+
+
 def _active_boundary_channels(block):
     channels = set()
     for value in block.values():
@@ -891,6 +1406,7 @@ def _compact_advance_symbolic_terms(terms_by_channel, transitions, *, active=Non
         for term in terms:
             depth = max(depth, len(term.path))
     child_depth = int(depth) + 1
+    family_sets = {}
     for transition in transitions:
         if direction == "left":
             parent_channel = int(transition.left_channel)
@@ -900,17 +1416,31 @@ def _compact_advance_symbolic_terms(terms_by_channel, transitions, *, active=Non
             child_channel = int(transition.left_channel)
         if active is not None and child_channel not in active:
             continue
-        multiplicity = sum(
-            int(term.multiplicity)
-            for term in terms_by_channel.get(parent_channel, ())
-        )
+        parent_terms = tuple(terms_by_channel.get(parent_channel, ()))
+        multiplicity = sum(int(term.multiplicity) for term in parent_terms)
         if multiplicity:
             counts[child_channel] = counts.get(child_channel, 0) + multiplicity
+            families = family_sets.setdefault(child_channel, set())
+            families.update(_family_names_from_symbolic_label(transition.label))
+            for term in parent_terms:
+                for path_item in tuple(term.path):
+                    if len(path_item) >= 4:
+                        families.update(_family_names_from_symbolic_label(path_item[3]))
     return {
         channel: (
             SymbolicRenormalizedOperatorTerm(
                 channel=channel,
-                path=tuple(("compact", step, int(channel)) for step in range(child_depth)),
+                path=(
+                    (
+                        "compact",
+                        int(child_depth),
+                        int(channel),
+                        (
+                            "families",
+                            tuple(sorted(family_sets.get(channel, ()))),
+                        ),
+                    ),
+                ),
                 multiplicity=int(multiplicity),
             ),
         )
@@ -1305,6 +1835,9 @@ class RenormalizedBlockEntry:
     :param parent_key: Optional stack key of the boundary entry absorbed to
         produce this entry.
     :param symbolic_operator_table: Recursive symbolic boundary operator table.
+    :param complementary_operator_entry: Matching complementary-family
+        boundary payload entry, when this block belongs to a complementary
+        qchem Hamiltonian stack.
     :param local_operator_tables: Mutable cache of
         :class:`RenormalizedLocalOperatorTable` objects derived from this
         boundary entry.
@@ -1322,6 +1855,11 @@ class RenormalizedBlockEntry:
     source: str = "stored"
     parent_key: object | None = None
     symbolic_operator_table: SymbolicRenormalizedOperatorTable | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    complementary_operator_entry: object | None = field(
         default=None,
         compare=False,
         repr=False,
@@ -1349,6 +1887,17 @@ class RenormalizedBlockEntry:
         """
 
         object.__setattr__(self, "symbolic_operator_table", table)
+        complementary_entry = getattr(self, "complementary_operator_entry", None)
+        if complementary_entry is not None:
+            object.__setattr__(
+                complementary_entry,
+                "family_operator_table",
+                ComplementaryFamilyRenormalizedOperatorTable.from_symbolic_table(
+                    table,
+                    complementary_entry.family_names,
+                    family_payloads=complementary_entry.family_payloads,
+                ),
+            )
         return table
 
     def get_side_operator_table(self, key):
@@ -1532,6 +2081,11 @@ class RenormalizedBlockEntry:
                 if self.symbolic_operator_table is None
                 else self.symbolic_operator_table.stats
             ),
+            "complementary_operator_entry": (
+                None
+                if self.complementary_operator_entry is None
+                else self.complementary_operator_entry.stats
+            ),
             "n_sector_pairs": int(self.n_sector_pairs),
             "n_arrays": int(self.n_arrays),
             "stored_elements": int(self.stored_elements),
@@ -1561,6 +2115,69 @@ class RenormalizedBlockEntry:
             ),
         }
 
+@dataclass(frozen=True)
+class ComplementaryFamilyBoundaryPayload:
+    """
+    Numeric sparse complementary-family payload owned by one boundary.
+
+    The payload stores integral-side coefficients after classifying each
+    family entry against the sites already absorbed into a left/right block.
+    This is the numeric boundary object that later direct ``S/R/A/P/B/Q``
+    contractions can consume without rewalking the chemistry integral tensor.
+
+    :param family_name: Complementary family label.
+    :param entries: Tuple of ``(index_tuple, coefficient)`` entries.
+    :param internal_terms: Number of entries fully inside the boundary block.
+    :param cross_terms: Number of entries connecting the block and exterior.
+    :param external_terms: Number of entries fully outside the boundary block.
+    """
+
+    family_name: str
+    entries: tuple
+    internal_terms: int
+    cross_terms: int
+    external_terms: int
+
+    @property
+    def n_terms(self):
+        """Return the number of stored sparse coefficients."""
+
+        return int(len(self.entries))
+
+    @property
+    def coefficient_norm(self):
+        """Return the Euclidean norm of stored numeric coefficients."""
+
+        if not self.entries:
+            return 0.0
+        values = np.asarray(
+            [complex(value) for _key, value in self.entries],
+            dtype=complex,
+        )
+        return float(np.linalg.norm(values))
+
+    @property
+    def max_abs_coefficient(self):
+        """Return the largest absolute coefficient in this payload."""
+
+        return float(
+            max((abs(complex(value)) for _key, value in self.entries), default=0.0)
+        )
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this family payload."""
+
+        return {
+            "family_name": str(self.family_name),
+            "n_terms": int(self.n_terms),
+            "internal_terms": int(self.internal_terms),
+            "cross_terms": int(self.cross_terms),
+            "external_terms": int(self.external_terms),
+            "coefficient_norm": float(self.coefficient_norm),
+            "max_abs_coefficient": float(self.max_abs_coefficient),
+        }
+
 
 @dataclass(frozen=True)
 class ComplementaryRenormalizedOperatorEntry:
@@ -1568,10 +2185,9 @@ class ComplementaryRenormalizedOperatorEntry:
     Recursive complementary-operator boundary record.
 
     The record tracks block2-style complementary family ownership alongside
-    the ordinary left/right environment stack.  Numeric complementary tensors
-    are still supplied by the local symbolic/factorized tables, but the sweep
-    now has a first-class recursive stack boundary for future direct
-    ``S/R/A/P/B/Q`` updates.
+    the ordinary left/right environment stack.  Numeric family payloads are
+    stored per boundary so direct ``S/R/A/P/B/Q`` contractions can use the
+    stack without rewalking qchem integrals.
 
     :param side: Boundary side, ``"left"`` or ``"right"``.
     :param bond: Boundary bond index.
@@ -1587,6 +2203,8 @@ class ComplementaryRenormalizedOperatorEntry:
     parent_key: object | None = None
     source: str = "stored"
     signature: object | None = None
+    family_payloads: dict = field(default_factory=dict)
+    family_operator_table: ComplementaryFamilyRenormalizedOperatorTable | None = None
 
     @property
     def key(self):
@@ -1613,6 +2231,21 @@ class ComplementaryRenormalizedOperatorEntry:
             "parent_key": self.parent_key,
             "source": str(self.source),
             "signature": self.signature,
+            "numeric_payloads": {
+                str(name): payload.stats
+                for name, payload in self.family_payloads.items()
+            },
+            "numeric_payload_terms": int(
+                sum(payload.n_terms for payload in self.family_payloads.values())
+            ),
+            "numeric_payload_cross_terms": int(
+                sum(payload.cross_terms for payload in self.family_payloads.values())
+            ),
+            "family_operator_table": (
+                None
+                if self.family_operator_table is None
+                else self.family_operator_table.stats
+            ),
         }
 
 
@@ -1631,6 +2264,12 @@ class ComplementaryRenormalizedOperatorStack:
     advances: int = 0
 
     @property
+    def n_sites(self):
+        """Return the number of spatial sites described by the families."""
+
+        return int(getattr(self.families, "n_sites", 0) or 0)
+
+    @property
     def family_names(self):
         """
         Return complementary family labels.
@@ -1639,6 +2278,69 @@ class ComplementaryRenormalizedOperatorStack:
         """
 
         return tuple(getattr(self.families, "names", ()))
+
+    def _owned_sites(self, side, bond):
+        """
+        Return the spatial sites absorbed into a boundary block.
+
+        Left boundary ``b`` owns sites ``0..b-1``.  Right boundary ``b`` owns
+        sites ``b+1..n_sites-1``; this matches the environment convention used
+        for two-site bond operators.
+        """
+
+        side = str(side).lower()
+        bond = int(bond)
+        n_sites = int(self.n_sites)
+        if n_sites <= 0:
+            return frozenset()
+        if side == "left":
+            return frozenset(range(max(0, min(bond, n_sites))))
+        if side == "right":
+            start = max(0, min(bond + 1, n_sites))
+            return frozenset(range(start, n_sites))
+        raise ValueError(f"Unknown complementary boundary side {side!r}.")
+
+    def _family_payloads_for_boundary(self, side, bond):
+        """Build numeric sparse family payloads for one boundary."""
+
+        owned_sites = self._owned_sites(side, bond)
+        payloads = {}
+        families = getattr(self.families, "families", {}) or {}
+        for name in self.family_names:
+            family = families.get(name)
+            entries = getattr(family, "entries", {}) if family is not None else {}
+            ordered_entries = tuple(
+                (
+                    tuple(int(index) for index in key),
+                    complex(value),
+                )
+                for key, value in sorted(
+                    entries.items(),
+                    key=lambda item: tuple(int(index) for index in item[0]),
+                )
+            )
+            internal_terms = 0
+            cross_terms = 0
+            external_terms = 0
+            for key, _value in ordered_entries:
+                if not key:
+                    external_terms += 1
+                    continue
+                flags = tuple(int(index) in owned_sites for index in key)
+                if all(flags):
+                    internal_terms += 1
+                elif any(flags):
+                    cross_terms += 1
+                else:
+                    external_terms += 1
+            payloads[str(name)] = ComplementaryFamilyBoundaryPayload(
+                family_name=str(name),
+                entries=ordered_entries,
+                internal_terms=int(internal_terms),
+                cross_terms=int(cross_terms),
+                external_terms=int(external_terms),
+            )
+        return payloads
 
     def put(self, side, bond, *, signature=None, source="stored", parent_key=None):
         """
@@ -1659,12 +2361,18 @@ class ComplementaryRenormalizedOperatorStack:
             parent_key=parent_key,
             source=str(source),
             signature=signature,
+            family_payloads=self._family_payloads_for_boundary(side, bond),
         )
         self.entries[entry.key] = entry
         self.puts += 1
         if parent_key is not None:
             self.advances += 1
         return entry
+
+    def get(self, side, bond):
+        """Return a stored complementary boundary entry, if present."""
+
+        return self.entries.get((str(side), int(bond)))
 
     @property
     def stats(self):
@@ -1685,6 +2393,74 @@ class ComplementaryRenormalizedOperatorStack:
             "n_entries": int(len(self.entries)),
             "puts": int(self.puts),
             "advances": int(self.advances),
+            "numeric_payload_terms": int(
+                sum(
+                    payload.n_terms
+                    for entry in self.entries.values()
+                    for payload in entry.family_payloads.values()
+                )
+            ),
+            "numeric_payload_cross_terms": int(
+                sum(
+                    payload.cross_terms
+                    for entry in self.entries.values()
+                    for payload in entry.family_payloads.values()
+                )
+            ),
+            "family_operator_tables": int(
+                sum(
+                    1
+                    for entry in self.entries.values()
+                    if entry.family_operator_table is not None
+                )
+            ),
+            "family_operator_table_payload_blocks": int(
+                sum(
+                    entry.family_operator_table.n_payload_blocks
+                    for entry in self.entries.values()
+                    if entry.family_operator_table is not None
+                )
+            ),
+            "family_operator_table_stored_elements": int(
+                sum(
+                    entry.family_operator_table.stored_elements
+                    for entry in self.entries.values()
+                    if entry.family_operator_table is not None
+                )
+            ),
+            "family_operator_table_symbolic_terms": int(
+                sum(
+                    entry.family_operator_table.symbolic_terms
+                    for entry in self.entries.values()
+                    if entry.family_operator_table is not None
+                )
+            ),
+            "numeric_payload_families": {
+                str(name): {
+                    "n_entries": int(
+                        sum(
+                            1
+                            for entry in self.entries.values()
+                            if name in entry.family_payloads
+                        )
+                    ),
+                    "n_terms": int(
+                        sum(
+                            entry.family_payloads[name].n_terms
+                            for entry in self.entries.values()
+                            if name in entry.family_payloads
+                        )
+                    ),
+                    "cross_terms": int(
+                        sum(
+                            entry.family_payloads[name].cross_terms
+                            for entry in self.entries.values()
+                            if name in entry.family_payloads
+                        )
+                    ),
+                }
+                for name in self.family_names
+            },
             "families": metadata,
         }
 
@@ -1716,6 +2492,15 @@ class RenormalizedBlockStack:
         default_factory=MovingEnvironmentContractionCache
     )
 
+    def __post_init__(self):
+        if (
+            self.complementary_operator_families is not None
+            and self.complementary_operator_stack is None
+        ):
+            self.complementary_operator_stack = ComplementaryRenormalizedOperatorStack(
+                families=self.complementary_operator_families
+            )
+
     def set_complementary_operator_families(self, families):
         """
         Attach block2-style complementary operator families to this stack.
@@ -1725,6 +2510,15 @@ class RenormalizedBlockStack:
         :returns: ``self`` for call chaining.
         """
 
+        if families is None:
+            self.complementary_operator_families = None
+            self.complementary_operator_stack = None
+            return self
+        if (
+            self.complementary_operator_stack is not None
+            and self.complementary_operator_families is families
+        ):
+            return self
         self.complementary_operator_families = families
         self.complementary_operator_stack = ComplementaryRenormalizedOperatorStack(
             families=families
@@ -1795,12 +2589,17 @@ class RenormalizedBlockStack:
         )
         self.entries[self.key(side, bond)] = entry
         if self.complementary_operator_stack is not None:
-            self.complementary_operator_stack.put(
+            complementary_entry = self.complementary_operator_stack.put(
                 normalized_side,
                 normalized_bond,
                 signature=signature,
                 source=str(source),
                 parent_key=parent_key,
+            )
+            object.__setattr__(
+                entry,
+                "complementary_operator_entry",
+                complementary_entry,
             )
         self.puts += 1
         return entry
@@ -2408,6 +3207,245 @@ class CompiledOrthonormalBlockTable:
 
 
 @dataclass(frozen=True)
+class ComplementaryFamilyTensorTable:
+    """
+    Family-resolved direct tensor table for complementary SU(2) operators.
+
+    The table groups component-direct factorized actions by the symbolic
+    complementary family label carried by each local term.  It is intentionally
+    a thin numerical layer over compiled tensor blocks: matvecs still use the
+    exact factorized kernels, but scheduling and diagnostics are resolved into
+    block2-like operator families such as ``R``, ``P``, and ``Q``.
+
+    :param family_blocks: Tuple ``((family, plan_entries), ...)``.
+    :param source: Diagnostic source label for the numerical payloads.
+    :param operator_table_stats: Stored family-operator table diagnostics used
+        to schedule the local tensor plan.
+    :param unmatched_family_groups: Local plan family groups not present in the
+        stored table active-family union.
+    """
+
+    family_blocks: tuple
+    source: str = "compiled_factorized_terms"
+    operator_table_stats: tuple = ()
+    unmatched_family_groups: tuple = ()
+    backend: str = "compiled_factorized_term"
+    native_kernel_elements: int = 0
+    factor_kernel_elements: int = 0
+
+    @classmethod
+    def from_component_direct_plan(cls, plan, *, source="compiled_factorized_terms"):
+        """
+        Build a family table from a component-direct factorized plan.
+
+        :param plan: Plan entries produced by
+            :meth:`DirectOrthonormalFactorizedTable._build_component_direct_plan`.
+        :param source: Diagnostic label for the plan source.
+        :returns: Family table, or ``None`` when no plan is available.
+        """
+
+        if plan is None:
+            return None
+        grouped = OrderedDict()
+        for entry in plan:
+            term = entry[4]
+            names = tuple(getattr(term, "family_names", ()) or ())
+            family = "+".join(str(name) for name in names) if names else "unlabeled"
+            grouped.setdefault(family, []).append(
+                ComplementaryFamilyApplyEntry.from_plan_entry(entry, family_names=names)
+            )
+        return cls(
+            family_blocks=tuple(
+                (str(family), tuple(entries))
+                for family, entries in sorted(grouped.items(), key=lambda item: item[0])
+            ),
+            source=str(source),
+        )
+
+    @classmethod
+    def from_family_operator_tables(cls, plan, family_operator_tables):
+        """
+        Build a tensor table scheduled by stored family operator tables.
+
+        The actual numeric term kernels remain the compiled factorized tensor
+        blocks, but family grouping is now driven by the active family labels
+        carried by the stored left/right renormalized family tables.
+
+        :param plan: Component-direct factorized plan.
+        :param family_operator_tables: Stored boundary family tables.
+        :returns: Family tensor table, or ``None`` when no plan is available.
+        """
+
+        if plan is None:
+            return None
+        tables = tuple(table for table in tuple(family_operator_tables or ()) if table is not None)
+        if not tables:
+            return cls.from_component_direct_plan(plan)
+        active_families = set()
+        family_source_tables = {}
+        for table in tables:
+            for name in table.active_family_names:
+                active_families.add(name)
+                family_source_tables.setdefault(str(name), []).append(
+                    (str(table.side), int(table.bond))
+                )
+        grouped = OrderedDict()
+        unmatched = set()
+        for entry in plan:
+            term = entry[4]
+            names = tuple(str(name) for name in (getattr(term, "family_names", ()) or ()))
+            group_names = tuple(name for name in names if name in active_families)
+            if not group_names:
+                group_names = names
+                if names:
+                    unmatched.add("+".join(names))
+            family = "+".join(group_names) if group_names else "unlabeled"
+            source_tables = tuple(
+                source
+                for name in group_names
+                for source in family_source_tables.get(str(name), ())
+            )
+            grouped.setdefault(family, []).append(
+                ComplementaryFamilyApplyEntry.from_plan_entry(
+                    entry,
+                    family_names=group_names,
+                    source_tables=source_tables,
+                ).with_factor_kernel().with_native_kernel()
+            )
+        factor_kernel_elements = int(
+            sum(
+                0
+                if apply_entry.factor_kernel is None
+                else apply_entry.factor_kernel.stored_elements
+                for entries in grouped.values()
+                for apply_entry in entries
+            )
+        )
+        native_kernel_elements = int(
+            sum(
+                0
+                if apply_entry.native_kernel is None
+                else np.asarray(apply_entry.native_kernel).size
+                for entries in grouped.values()
+                for apply_entry in entries
+            )
+        )
+        return cls(
+            family_blocks=tuple(
+                (str(family), tuple(entries))
+                for family, entries in sorted(grouped.items(), key=lambda item: item[0])
+            ),
+            source="renormalized_family_operator_tables",
+            operator_table_stats=tuple(table.stats for table in tables),
+            unmatched_family_groups=tuple(sorted(unmatched)),
+            backend=(
+                "family_table_hybrid_kernel"
+                if native_kernel_elements > 0 and factor_kernel_elements > 0
+                else (
+                    "family_table_dense_kernel"
+                    if native_kernel_elements > 0
+                    else "family_table_factor_kernel"
+                )
+            ),
+            native_kernel_elements=int(native_kernel_elements),
+            factor_kernel_elements=int(factor_kernel_elements),
+        )
+
+    @property
+    def family_names(self):
+        """Return the table's family labels."""
+
+        names = set()
+        for family, _entries in self.family_blocks:
+            names.update(str(family).split("+"))
+        names.discard("")
+        return tuple(sorted(names))
+
+    @property
+    def family_term_counts(self):
+        """Return per-family direct tensor term counts."""
+
+        counts = {}
+        for family, entries in self.family_blocks:
+            for name in str(family).split("+"):
+                if name:
+                    counts[name] = counts.get(name, 0) + int(len(entries))
+        return dict(sorted(counts.items()))
+
+    @property
+    def n_terms(self):
+        """Return the total number of direct tensor plan entries."""
+
+        return int(sum(len(entries) for _family, entries in self.family_blocks))
+
+    def matvec(self, vector, component_basis):
+        """
+        Apply the family-grouped direct tensor table.
+
+        :param vector: Input vector in orthonormal component coordinates.
+        :param component_basis: Component orthonormal basis owning transforms.
+        :returns: Output vector in orthonormal component coordinates.
+        """
+
+        parent_inputs = []
+        parent_outputs = []
+        for idx, indices in enumerate(component_basis.component_indices):
+            transform = component_basis.component_transforms[idx]
+            start = int(component_basis.orth_offsets[idx])
+            stop = start + int(transform.shape[1])
+            parent_inputs.append(transform @ vector[start:stop])
+            parent_outputs.append(np.zeros(int(np.asarray(indices).size), dtype=complex))
+        for _family, entries in self.family_blocks:
+            for entry in entries:
+                block_in = parent_inputs[int(entry.in_comp)][entry.in_slice].reshape(
+                    entry.input_entry.shape
+                )
+                parent_outputs[int(entry.out_comp)][entry.out_slice] += entry.apply_block(
+                    block_in
+                )
+        out = np.zeros(int(component_basis.orthonormal_dim), dtype=complex)
+        for idx, parent_out in enumerate(parent_outputs):
+            transform = component_basis.component_transforms[idx]
+            start = int(component_basis.orth_offsets[idx])
+            stop = start + int(transform.shape[1])
+            out[start:stop] = transform.conj().T @ parent_out
+        return out
+
+    @property
+    def stats(self):
+        """
+        Return family-table diagnostics.
+
+        :returns: Dictionary describing family labels and payload counts.
+        """
+
+        return {
+            "kind": "complementary_family_tensor_table",
+            "source": str(self.source),
+            "family_names": self.family_names,
+            "family_groups": tuple(family for family, _entries in self.family_blocks),
+            "family_term_counts": self.family_term_counts,
+            "n_family_blocks": int(len(self.family_blocks)),
+            "n_terms": int(self.n_terms),
+            "operator_table_backed": bool(self.operator_table_stats),
+            "operator_tables": self.operator_table_stats,
+            "unmatched_family_groups": tuple(self.unmatched_family_groups),
+            "unmatched_family_group_count": int(len(self.unmatched_family_groups)),
+            "backend": str(self.backend),
+            "payload_native_backend": bool(
+                self.backend
+                in {
+                    "family_table_dense_kernel",
+                    "family_table_factor_kernel",
+                    "family_table_hybrid_kernel",
+                }
+            ),
+            "native_kernel_elements": int(self.native_kernel_elements),
+            "factor_kernel_elements": int(self.factor_kernel_elements),
+        }
+
+
+@dataclass(frozen=True)
 class DirectOrthonormalFactorizedTable:
     """
     Matrix-free transformed Hamiltonian table for factorized local operators.
@@ -2440,8 +3478,23 @@ class DirectOrthonormalFactorizedTable:
         )
         object.__setattr__(
             self,
+            "_complementary_family_tensor_table",
+            (
+                self._build_complementary_family_tensor_table(
+                    getattr(self, "_component_direct_plan", None)
+                )
+                if self.uses_complementary_payload_tensor_kernel
+                else None
+            ),
+        )
+        object.__setattr__(
+            self,
             "_component_parent_blocks",
-            self._build_component_parent_blocks(),
+            (
+                None
+                if self.uses_complementary_payload_tensor_kernel
+                else self._build_component_parent_blocks()
+            ),
         )
 
     @property
@@ -2459,6 +3512,9 @@ class DirectOrthonormalFactorizedTable:
         """
 
         vector = np.asarray(vector, dtype=complex).reshape(self.dim)
+        family_table = getattr(self, "_complementary_family_tensor_table", None)
+        if family_table is not None:
+            return family_table.matvec(vector, self.component_basis)
         parent_blocks = getattr(self, "_component_parent_blocks", None)
         if parent_blocks is not None:
             return self._component_parent_block_matvec(vector, parent_blocks)
@@ -2500,6 +3556,83 @@ class DirectOrthonormalFactorizedTable:
         """
 
         return getattr(self, "_component_parent_blocks", None) is not None
+
+    @property
+    def uses_complementary_payload_tensor_kernel(self):
+        """
+        Return whether complementary payloads force tensor-level contractions.
+
+        This is the direct block2-like experimental path: matvecs consume the
+        payload-backed compiled renormalized tensor factors through
+        ``CompiledFactorizedBlock.apply_block`` instead of first materializing
+        dense parent component kernels.
+        """
+
+        compiled = self.compiled_factorized_terms
+        return bool(
+            compiled is not None
+            and getattr(compiled, "complementary_payload_backed", False)
+            and getattr(compiled, "prefer_complementary_payload_tensor_matvec", False)
+        )
+
+    @property
+    def uses_complementary_family_table_kernel(self):
+        """
+        Return whether matvecs use a family-resolved complementary table.
+
+        :returns: ``True`` when complementary payload tensor terms are grouped
+            and applied through :class:`ComplementaryFamilyTensorTable`.
+        """
+
+        return getattr(self, "_complementary_family_tensor_table", None) is not None
+
+    def _build_complementary_family_tensor_table(self, plan):
+        """
+        Build the family-resolved tensor table for complementary matvecs.
+
+        :param plan: Component-direct factorized application plan.
+        :returns: :class:`ComplementaryFamilyTensorTable` or ``None``.
+        """
+
+        table_objects = getattr(
+            self.compiled_factorized_terms,
+            "complementary_family_operator_table_objects",
+            (),
+        )
+        if table_objects:
+            return ComplementaryFamilyTensorTable.from_family_operator_tables(
+                plan,
+                table_objects,
+            )
+        return ComplementaryFamilyTensorTable.from_component_direct_plan(
+            plan,
+            source=(
+                "renormalized_family_operator_tables"
+                if self.uses_complementary_family_operator_table_source
+                else "compiled_factorized_terms"
+            ),
+        )
+
+    @property
+    def uses_complementary_family_operator_table_source(self):
+        """
+        Return whether complementary matvecs are backed by stored family tables.
+
+        The numerical tensor kernels are still the compiled factorized blocks,
+        but this flag verifies that the boundary stack owns independent
+        family-resolved renormalized operator tables for the same local solve.
+        """
+
+        metadata = getattr(
+            self.compiled_factorized_terms,
+            "complementary_family_operator_tables",
+            None,
+        )
+        return bool(
+            metadata is not None
+            and metadata.get("family_operator_table_backed", False)
+        )
+
 
     def _build_component_direct_plan(self):
         """
@@ -2638,6 +3771,26 @@ class DirectOrthonormalFactorizedTable:
             out[start:stop] = transform.conj().T @ parent_out
         return out
 
+    def complementary_family_table_equivalence_residual(self, seed=0):
+        """
+        Compare family-table matvecs against the raw component-direct plan.
+
+        :param seed: Random seed for the probe vector.
+        :returns: Relative 2-norm residual, or ``None`` when either path is
+            unavailable.
+        """
+
+        family_table = getattr(self, "_complementary_family_tensor_table", None)
+        plan = getattr(self, "_component_direct_plan", None)
+        if family_table is None or plan is None:
+            return None
+        rng = np.random.default_rng(int(seed))
+        probe = rng.normal(size=self.dim) + 1j * rng.normal(size=self.dim)
+        direct = self._component_direct_matvec(probe, plan)
+        grouped = family_table.matvec(probe, self.component_basis)
+        scale = max(float(np.linalg.norm(direct)), 1.0)
+        return float(np.linalg.norm(grouped - direct) / scale)
+
     @property
     def stats(self):
         """
@@ -2646,14 +3799,50 @@ class DirectOrthonormalFactorizedTable:
         :returns: Dictionary describing the direct factorized matvec table.
         """
 
+        complementary_families = getattr(
+            self.compiled_factorized_terms,
+            "complementary_operator_families",
+            None,
+        )
+        complementary_metadata = (
+            complementary_families.as_metadata()
+            if hasattr(complementary_families, "as_metadata")
+            else None
+        )
+        complementary_payloads = getattr(
+            self.compiled_factorized_terms,
+            "complementary_boundary_payloads",
+            None,
+        )
+        complementary_family_operator_tables = getattr(
+            self.compiled_factorized_terms,
+            "complementary_family_operator_tables",
+            None,
+        )
+        complementary_payload_terms = int(
+            0
+            if complementary_payloads is None
+            else complementary_payloads.get("numeric_payload_terms", 0)
+        )
+        family_names = tuple(
+            getattr(self.compiled_factorized_terms, "family_names", ()) or ()
+        )
+        family_term_counts = dict(
+            getattr(self.compiled_factorized_terms, "family_term_counts", {}) or {}
+        )
+        family_table = getattr(self, "_complementary_family_tensor_table", None)
         return {
             "kind": (
                 "recursive_parent_block_factorized"
                 if self.uses_component_parent_block_kernel
                 else (
-                    "direct_component_factorized"
-                    if self.uses_component_direct_kernel
-                    else "direct_factorized"
+                    "complementary_family_table_factorized"
+                    if self.uses_complementary_family_table_kernel
+                    else (
+                        "direct_component_factorized"
+                        if self.uses_component_direct_kernel
+                        else "direct_factorized"
+                    )
                 )
             ),
             "source": str(self.source),
@@ -2681,6 +3870,39 @@ class DirectOrthonormalFactorizedTable:
             "component_parent_block_kernel": bool(
                 self.uses_component_parent_block_kernel
             ),
+            "complementary_payload_tensor_kernel": bool(
+                self.uses_complementary_payload_tensor_kernel
+                and self.uses_component_direct_kernel
+            ),
+            "complementary_family_table_kernel": bool(
+                self.uses_complementary_family_table_kernel
+            ),
+            "complementary_family_table_matvec": bool(
+                self.uses_complementary_family_table_kernel
+            ),
+            "complementary_family_table": (
+                None if family_table is None else family_table.stats
+            ),
+            "complementary_family_table_source": (
+                None if family_table is None else str(family_table.source)
+            ),
+            "complementary_family_operator_table_source": bool(
+                self.uses_complementary_family_operator_table_source
+            ),
+            "complementary_family_operator_tables": (
+                complementary_family_operator_tables
+            ),
+            "complementary_direct_matvec": bool(complementary_metadata is not None),
+            "complementary_operator_families": complementary_metadata,
+            "complementary_payload_backed": bool(
+                complementary_payloads is not None
+                and complementary_payloads.get("payload_backed", False)
+            ),
+            "complementary_boundary_payloads": complementary_payloads,
+            "complementary_payload_terms": int(complementary_payload_terms),
+            "family_resolved_tensor_kernel": bool(family_names),
+            "family_names": family_names,
+            "family_term_counts": family_term_counts,
             "component_parent_block_elements": int(
                 sum(
                     np.asarray(block).size

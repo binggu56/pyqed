@@ -89,6 +89,32 @@ def _spatial_eri_from_gw_reference(gw_ref, ao2mofn):
     return _get_mo_eri(gw_ref._scf, gw_ref.mo_coeff, ao2mofn)
 
 
+def _copy_mf_scan_options(mf):
+    opts = {
+        "verbose": 0,
+        "dm0": None if getattr(mf, "dm", None) is None else np.array(mf.dm, copy=True),
+        "init_guess": "hcore",
+    }
+    if getattr(mf, "density_fit", False):
+        opts["density_fit"] = True
+        opts["auxbasis"] = getattr(mf, "auxbasis", None)
+    elif getattr(mf, "cholesky_jk", False):
+        opts["cholesky_jk"] = True
+        opts["cholesky_tol"] = getattr(mf, "cholesky_tol", None)
+        opts["cholesky_max_rank"] = getattr(mf, "cholesky_max_rank", None)
+    return opts
+
+
+def _rebuild_scan_mol(mol, build_driver=None):
+    driver = build_driver or getattr(mol, "_build_driver", None) or "builtin"
+    if driver == "builtin":
+        options = getattr(mol, "builtin_options", None)
+        mol.build(driver=driver, options=options)
+    else:
+        mol.build(driver=driver)
+    return mol
+
+
 def _pair_factor(gw, p, q):
     if getattr(gw, '_pair_factors', None) is None:
         return None
@@ -207,10 +233,11 @@ def _full_bse_vectors_from_casida(A, B, nroots):
 
 
 class BSE(object):
-    def __init__(self, mf, ao2mofn=pyscf.ao2mo.outcore.general_iofree,
+    def __init__(self, gw_or_mf, ao2mofn=pyscf.ao2mo.outcore.general_iofree,
                  screening='TDH', eta=1e-2):
-        
-        gw_ref = mf if _is_gw_reference(mf) else None
+
+        gw_ref = gw_or_mf if _is_gw_reference(gw_or_mf) else None
+        mf = gw_or_mf
         if gw_ref is not None:
             mf = gw_ref._scf
             screening = getattr(gw_ref, 'screening', screening)
@@ -221,6 +248,7 @@ class BSE(object):
         self.mol = mf.mol
         self._scf = mf
         self.gw = gw_ref
+        self.reference = gw_ref if gw_ref is not None else mf
         self.verbose = getattr(self.mol, 'verbose', getattr(mf, 'verbose', 0))
         self.stdout = getattr(self.mol, 'stdout', getattr(mf, 'stdout', sys.stdout))
         self.max_memory = getattr(mf, 'max_memory',
@@ -286,7 +314,7 @@ class BSE(object):
                           compact=False).reshape(nso,nso,nso,nso)
             self.eri = eri
 
-        print("There are %d spin-orbitals"%(self.nso))
+        print("There are %d spatial orbitals"%(self.nso))
 
         self.screening = screening
         self.eta = eta
@@ -576,6 +604,37 @@ class BSE(object):
             return_vectors=return_vectors,
         )
 
+    def as_scanner(
+        self,
+        nroots=None,
+        energy="pes",
+        build_driver=None,
+        gw_method=None,
+        gw_kwargs=None,
+        mf_kwargs=None,
+        run_kwargs=None,
+        return_object=False,
+    ):
+        """Return a callable scanner for GW/BSE potential-energy scans.
+
+        The default return value is a total-energy PES array
+        ``[E0, E0 + Omega_1, ...]`` using the SCF ground-state reference.
+        Use ``energy="excitation"`` for only BSE/TDA excitation energies, or
+        ``energy="rpa"`` for an RPA-shifted ground-state reference.
+        """
+        return GWBSEScanner(
+            self,
+            nroots=nroots,
+            energy=energy,
+            build_driver=build_driver,
+            gw_method=gw_method,
+            gw_kwargs=gw_kwargs,
+            mf_kwargs=mf_kwargs,
+            run_kwargs=run_kwargs,
+            return_object=return_object,
+            solver_cls=self.__class__,
+        )
+
 
 class TDA(BSE):
     """Tamm-Dancoff approximation to BSE.
@@ -622,6 +681,105 @@ class TDA(BSE):
             ao_overlap=ao_overlap,
             metric=metric,
         )
+
+
+class GWBSEScanner:
+    """Callable GW/BSE scanner for geometry-dependent excitation energies."""
+
+    def __init__(
+        self,
+        base,
+        nroots=None,
+        energy="pes",
+        build_driver=None,
+        gw_method=None,
+        gw_kwargs=None,
+        mf_kwargs=None,
+        run_kwargs=None,
+        return_object=False,
+        solver_cls=BSE,
+    ):
+        self.base = base
+        self.mol = base.mol
+        self.mf = base._scf
+        self.gw = base.gw
+        self.bse = base
+        self.solver_cls = solver_cls
+        self.nroots = nroots
+        self.energy = str(energy).lower()
+        self.build_driver = build_driver
+        self.gw_method = gw_method or getattr(base.gw, "method", None) or "g0w0"
+        self.gw_kwargs = {} if gw_kwargs is None else dict(gw_kwargs)
+        self.mf_kwargs = {} if mf_kwargs is None else dict(mf_kwargs)
+        self.run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
+        self.return_object = return_object
+        self.e_scf = None
+        self.e0 = None
+        self.e = None
+
+    def _prepare_mol(self, mol_or_geom):
+        if isinstance(mol_or_geom, np.ndarray):
+            mol = self.mol
+            mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+            return _rebuild_scan_mol(mol, self.build_driver)
+
+        mol = mol_or_geom
+        if getattr(mol, "hcore", None) is None or (
+            getattr(mol, "eri", None) is None and getattr(mol, "eri_factors", None) is None
+        ):
+            return _rebuild_scan_mol(mol, self.build_driver)
+        return mol
+
+    def _run_mf(self, mol):
+        from pyqed.qchem.hf.rhf import RHF
+
+        kwargs = _copy_mf_scan_options(self.mf)
+        kwargs.update(self.mf_kwargs)
+        mf = RHF(mol, init_guess=getattr(self.mf, "init_guess", "hcore"))
+        mf.max_cycle = getattr(self.mf, "max_cycle", mf.max_cycle)
+        mf.run(**kwargs)
+        return mf
+
+    def _run_gw(self, mf):
+        from pyqed.gw.gw import GW
+
+        freq_int = getattr(self.gw, "freq_int", "exact") if self.gw is not None else "exact"
+        gw = GW(mf, screening=self.base.screening, eta=self.base.eta, freq_int=freq_int)
+        gw.run(method=self.gw_method, **self.gw_kwargs)
+        return gw
+
+    def __call__(self, mol_or_geom):
+        mol = self._prepare_mol(mol_or_geom)
+        mf = self._run_mf(mol)
+        gw = self._run_gw(mf)
+
+        nroots = self.nroots
+        if nroots is None:
+            nroots = len(self.bse.e) if self.bse.e is not None else 5
+        run_kwargs = dict(self.run_kwargs)
+        run_kwargs.setdefault("nroots", nroots)
+
+        bse = self.solver_cls(gw).run(**run_kwargs)
+
+        self.mol = mol
+        self.mf = mf
+        self.gw = gw
+        self.bse = bse
+        self.e_scf = float(mf.e_tot)
+
+        if self.energy in ("excitation", "excited", "omega"):
+            self.e0 = None
+            self.e = np.asarray(bse.e, dtype=float)
+        elif self.energy in ("pes", "scf", "total"):
+            self.e0 = self.e_scf
+            self.e = np.r_[self.e0, self.e0 + np.asarray(bse.e, dtype=float)]
+        elif self.energy in ("rpa", "rpa_pes", "rpa-total", "rpa_total"):
+            self.e0 = float(gw.total_energy(method="rpa"))
+            self.e = np.r_[self.e0, self.e0 + np.asarray(bse.e, dtype=float)]
+        else:
+            raise ValueError("energy must be 'pes', 'excitation', or 'rpa'.")
+
+        return bse if self.return_object else self.e
 
 
 

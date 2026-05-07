@@ -177,6 +177,7 @@ class _ProductTerm:
     sites: tuple[int, ...]
     operators: tuple[SiteOperator, ...]
     coeff: complex
+    family: object = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ class _ReducedBilinearTerm:
     right_operator: object
     middle_operators: tuple[tuple[int, SiteOperator], ...]
     coeff: complex
+    family: object = None
 
     @property
     def components(self):
@@ -203,6 +205,7 @@ class _ReducedBilinearProductTerm:
     right_operator: object
     middle_operators: tuple[tuple[int, SiteOperator], ...]
     coeff: complex
+    family: object = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,7 @@ class _ReducedStringTerm:
     intermediate_irreps: tuple[SU2Irrep, ...]
     middle_operators: tuple[tuple[int, SiteOperator], ...]
     coeff: complex
+    family: object = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,7 @@ class _ReducedStringProductTerm:
     intermediate_irreps: tuple[SU2Irrep, ...]
     middle_operators: tuple[tuple[int, SiteOperator], ...]
     coeff: complex
+    family: object = None
 
 
 class AutoMPO:
@@ -249,14 +254,23 @@ class AutoMPO:
     def from_sites(cls, sites):
         return cls([_site_physical_leg_from_tensor(site) for site in sites])
 
-    def add_onsite(self, site, operator, *, coeff=1.0):
-        return self.add_term((site, operator), coeff=coeff)
+    def add_onsite(self, site, operator, *, coeff=1.0, family=None):
+        return self.add_term((site, operator), coeff=coeff, family=family)
 
-    def add_nearest_neighbor(self, site, left_operator, right_operator, *, coeff=1.0):
+    def add_nearest_neighbor(
+        self,
+        site,
+        left_operator,
+        right_operator,
+        *,
+        coeff=1.0,
+        family=None,
+    ):
         return self.add_term(
             (site, left_operator),
             (site + 1, right_operator),
             coeff=coeff,
+            family=family,
         )
 
     def add_fermionic_bilinear(
@@ -268,6 +282,7 @@ class AutoMPO:
         *,
         coeff=1.0,
         parity_operator=None,
+        family=None,
     ):
         """
         Add a site-ordered fermionic bilinear with Jordan-Wigner string handling.
@@ -339,7 +354,7 @@ class AutoMPO:
         site_operators = [(left_site, _compose_site_operators(left_operator, left_parity))]
         site_operators.extend(sorted(middle_parities.items(), key=lambda item: item[0]))
         site_operators.append((right_site, right_operator))
-        return self.add_term(*site_operators, coeff=coeff)
+        return self.add_term(*site_operators, coeff=coeff, family=family)
 
     def add_fermionic_reduced_bilinear(
         self,
@@ -350,6 +365,7 @@ class AutoMPO:
         *,
         coeff=1.0,
         parity_operator=None,
+        family=None,
     ):
         """
         Add a site-ordered fermionic bilinear using reduced endpoint operators.
@@ -423,6 +439,7 @@ class AutoMPO:
                 right_operator=right_operator,
                 middle_operators=tuple(sorted(middle_parities.items(), key=lambda item: item[0])),
                 coeff=coeff,
+                family=family,
             )
         )
         return self
@@ -436,6 +453,7 @@ class AutoMPO:
         right_operator,
         coeff=1.0,
         parity_operator=None,
+        family=None,
     ):
         """
         Add dense scalar site operators multiplied by a reduced fermionic bilinear.
@@ -507,11 +525,12 @@ class AutoMPO:
                 right_operator=right_operator,
                 middle_operators=tuple(sorted(dense_middle.items(), key=lambda item: item[0])),
                 coeff=coeff,
+                family=family,
             )
         )
         return self
 
-    def add_term(self, *site_operators, coeff=1.0):
+    def add_term(self, *site_operators, coeff=1.0, family=None):
         """
         Add a product term ``coeff * O_i O_j ...`` to the MPO.
 
@@ -553,6 +572,7 @@ class AutoMPO:
                 sites=sites,
                 operators=tuple(operator for _, operator in normalized),
                 coeff=coeff,
+                family=family,
             )
         )
         return self
@@ -563,6 +583,7 @@ class AutoMPO:
         intermediate_irreps,
         coeff=1.0,
         middle_operators=None,
+        family=None,
     ):
         """
         Add a Wigner-Eckart coupled ordered string of reduced local tensors.
@@ -626,6 +647,7 @@ class AutoMPO:
                 intermediate_irreps=intermediate_irreps,
                 middle_operators=tuple(sorted(middle, key=lambda item: item[0])),
                 coeff=coeff,
+                family=family,
             )
         )
         return self
@@ -637,6 +659,7 @@ class AutoMPO:
         dense_site_operators=(),
         coeff=1.0,
         middle_operators=None,
+        family=None,
     ):
         """
         Add scalar local factors multiplied by a Wigner-Eckart reduced string.
@@ -738,6 +761,7 @@ class AutoMPO:
                 intermediate_irreps=intermediate_irreps,
                 middle_operators=(),
                 coeff=coeff,
+                family=family,
             )
         )
         return self
@@ -801,27 +825,55 @@ class AutoMPO:
             if 0 <= site < self.nsites:
                 identity_loops[site].add(int(state))
 
-        def add_dense_transition(site, left, right, operator, coeff, *, accumulate=True):
+        def _family_tuple(family):
+            if family is None:
+                return ()
+            if isinstance(family, str):
+                return (family,)
+            return tuple(str(item) for item in family if item is not None)
+
+        def add_dense_transition(
+            site,
+            left,
+            right,
+            operator,
+            coeff,
+            *,
+            accumulate=True,
+            family=None,
+        ):
             if abs(coeff) <= 0.0:
                 return
             signature = _site_operator_signature(operator)
-            key = (int(left), int(right), signature)
+            family_key = _family_tuple(family)
+            key = (int(left), int(right), signature, family_key)
             if not accumulate and key in dense_transitions[int(site)]:
                 return
             old_coeff, stored_operator = dense_transitions[int(site)].get(key, (0.0, operator))
             dense_transitions[int(site)][key] = (old_coeff + coeff, stored_operator)
 
-        def add_reduced_transition(site, left, right, operator, coeff, *, use_cg_coupling, accumulate=True):
+        def add_reduced_transition(
+            site,
+            left,
+            right,
+            operator,
+            coeff,
+            *,
+            use_cg_coupling,
+            accumulate=True,
+            family=None,
+        ):
             if abs(coeff) <= 0.0:
                 return
             signature = _reduced_operator_signature(operator)
-            key = (int(left), int(right), bool(use_cg_coupling), signature)
+            family_key = _family_tuple(family)
+            key = (int(left), int(right), bool(use_cg_coupling), signature, family_key)
             if not accumulate and key in reduced_transitions[int(site)]:
                 return
             old_coeff, stored_operator = reduced_transitions[int(site)].get(key, (0.0, operator))
             reduced_transitions[int(site)][key] = (old_coeff + coeff, stored_operator)
 
-        def insert_path(steps, coeff):
+        def insert_path(steps, coeff, *, family=None):
             if not steps:
                 return
             prefix = []
@@ -857,6 +909,7 @@ class AutoMPO:
                         step["operator"],
                         transition_coeff,
                         accumulate=is_terminal,
+                        family=family,
                     )
                 elif step["kind"] == "reduced":
                     add_reduced_transition(
@@ -867,6 +920,7 @@ class AutoMPO:
                         transition_coeff,
                         use_cg_coupling=step.get("use_cg_coupling", False),
                         accumulate=is_terminal,
+                        family=family,
                     )
                 else:
                     raise TypeError(f"Unsupported AutoMPO path step kind {step['kind']!r}.")
@@ -1028,7 +1082,7 @@ class AutoMPO:
                 steps = reduced_string_steps(term)
             else:
                 raise TypeError(f"Unsupported AutoMPO term type {type(term).__name__}.")
-            insert_path(steps, term.coeff)
+            insert_path(steps, term.coeff, family=getattr(term, "family", None))
 
         for site in range(self.nsites):
             add_identity_loop(site, start_state)
@@ -1050,7 +1104,7 @@ class AutoMPO:
                         "label": ("dense", ident_signature, np.asarray(1.0, dtype=dtype).item()),
                     }
                 )
-            for (left, right, signature), (coeff, operator) in dense_transitions[site].items():
+            for (left, right, signature, family), (coeff, operator) in dense_transitions[site].items():
                 if abs(coeff) <= 0.0:
                     continue
                 coeff = np.asarray(coeff, dtype=dtype).item()
@@ -1061,10 +1115,11 @@ class AutoMPO:
                         "right": int(right),
                         "operator": operator,
                         "coeff": coeff,
-                        "label": ("dense", signature, coeff),
+                        "family": tuple(family),
+                        "label": ("dense", signature, coeff, tuple(family)),
                     }
                 )
-            for (left, right, use_cg_coupling, signature), (coeff, operator) in reduced_transitions[site].items():
+            for (left, right, use_cg_coupling, signature, family), (coeff, operator) in reduced_transitions[site].items():
                 if abs(coeff) <= 0.0:
                     continue
                 coeff = np.asarray(coeff, dtype=dtype).item()
@@ -1076,7 +1131,8 @@ class AutoMPO:
                         "operator": operator,
                         "coeff": coeff,
                         "use_cg_coupling": bool(use_cg_coupling),
-                        "label": ("reduced", signature, bool(use_cg_coupling), coeff),
+                        "family": tuple(family),
+                        "label": ("reduced", signature, bool(use_cg_coupling), coeff, tuple(family)),
                     }
                 )
 

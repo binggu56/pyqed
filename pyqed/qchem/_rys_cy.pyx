@@ -2497,6 +2497,251 @@ cpdef compute_cartesian_shell_quartet_block_rys(
     return block
 
 
+cdef inline int _is_sp_shell_block(i64_t[:, ::1] shells_v, int start, int stop, int* is_p):
+    cdef int n = stop - start
+    cdef int kind
+    cdef int idx
+    if n == 1:
+        kind = _shell_kind_axis(shells_v, start)
+        if kind == 3:
+            is_p[0] = 0
+            return 1
+        if 0 <= kind <= 2:
+            is_p[0] = 1
+            return 1
+        return 0
+    if n == 3:
+        for idx in range(start, stop):
+            kind = _shell_kind_axis(shells_v, idx)
+            if kind < 0 or kind > 2:
+                return 0
+        is_p[0] = 1
+        return 1
+    return 0
+
+
+cdef int _compute_sp_shell_quartet_direct(
+    double[:, :, :, :] eri_v,
+    i64_t[:, ::1] shells_v,
+    double[:, ::1] origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    i64_t[::1] nprim_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int r0,
+    int r1,
+    int s0,
+    int s1,
+):
+    cdef int p_is_p = 0
+    cdef int q_is_p = 0
+    cdef int r_is_p = 0
+    cdef int s_is_p = 0
+    cdef int np_ = p1 - p0
+    cdef int nq_ = q1 - q0
+    cdef int nr_ = r1 - r0
+    cdef int ns_ = s1 - s0
+    cdef int rank = 0
+    cdef int center_ids[4]
+    cdef int coord_ids[4]
+    cdef double exponent_ids[4]
+    cdef double boys_values[5]
+    cdef double AB[3]
+    cdef double CD[3]
+    cdef double PQ[3]
+    cdef int orders[RYS_FIXED_MAX_TERMS]
+    cdef double scalars[RYS_FIXED_MAX_TERMS]
+    cdef int nvec[RYS_FIXED_MAX_TERMS]
+    cdef int vec_axes[RYS_FIXED_MAX_TERMS][4]
+    cdef int vec_names[RYS_FIXED_MAX_TERMS][4]
+    cdef int ndelta[RYS_FIXED_MAX_TERMS]
+    cdef int delta_axis1[RYS_FIXED_MAX_TERMS][4]
+    cdef int delta_axis2[RYS_FIXED_MAX_TERMS][4]
+    cdef double values[81]
+    cdef Py_ssize_t ia, ib, ic, id_
+    cdef int ip, iq, ir, is_, idx, m, pos, nterms
+    cdef int p_axis, q_axis, r_axis, s_axis
+    cdef double aexp, bexp, cexp, dexp
+    cdef double p, q, alpha, mu_ab, mu_cd, lam_a, lam_b, lam_c, lam_d
+    cdef double Px, Py, Pz, Qx, Qy, Qz
+    cdef double ABx, ABy, ABz, CDx, CDy, CDz, PQx, PQy, PQz
+    cdef double AB2, CD2, PQ2, T, pref, weight_prod, value
+
+    if not _is_sp_shell_block(shells_v, p0, p1, &p_is_p):
+        return 0
+    if not _is_sp_shell_block(shells_v, q0, q1, &q_is_p):
+        return 0
+    if not _is_sp_shell_block(shells_v, r0, r1, &r_is_p):
+        return 0
+    if not _is_sp_shell_block(shells_v, s0, s1, &s_is_p):
+        return 0
+
+    if p_is_p:
+        center_ids[rank] = 0
+        rank += 1
+    if q_is_p:
+        center_ids[rank] = 1
+        rank += 1
+    if r_is_p:
+        center_ids[rank] = 2
+        rank += 1
+    if s_is_p:
+        center_ids[rank] = 3
+        rank += 1
+
+    for idx in range(81):
+        values[idx] = 0.0
+
+    for ia in range(nprim_v[p0]):
+        aexp = exps_v[p0, ia]
+        for ib in range(nprim_v[q0]):
+            bexp = exps_v[q0, ib]
+            p = aexp + bexp
+            mu_ab = aexp * bexp / p
+            lam_a = aexp / p
+            lam_b = bexp / p
+            Px = (aexp * origins_v[p0, 0] + bexp * origins_v[q0, 0]) / p
+            Py = (aexp * origins_v[p0, 1] + bexp * origins_v[q0, 1]) / p
+            Pz = (aexp * origins_v[p0, 2] + bexp * origins_v[q0, 2]) / p
+            ABx = origins_v[p0, 0] - origins_v[q0, 0]
+            ABy = origins_v[p0, 1] - origins_v[q0, 1]
+            ABz = origins_v[p0, 2] - origins_v[q0, 2]
+            AB2 = ABx * ABx + ABy * ABy + ABz * ABz
+            for ic in range(nprim_v[r0]):
+                cexp = exps_v[r0, ic]
+                for id_ in range(nprim_v[s0]):
+                    dexp = exps_v[s0, id_]
+                    q = cexp + dexp
+                    alpha = p * q / (p + q)
+                    mu_cd = cexp * dexp / q
+                    lam_c = cexp / q
+                    lam_d = dexp / q
+                    Qx = (cexp * origins_v[r0, 0] + dexp * origins_v[s0, 0]) / q
+                    Qy = (cexp * origins_v[r0, 1] + dexp * origins_v[s0, 1]) / q
+                    Qz = (cexp * origins_v[r0, 2] + dexp * origins_v[s0, 2]) / q
+                    CDx = origins_v[r0, 0] - origins_v[s0, 0]
+                    CDy = origins_v[r0, 1] - origins_v[s0, 1]
+                    CDz = origins_v[r0, 2] - origins_v[s0, 2]
+                    CD2 = CDx * CDx + CDy * CDy + CDz * CDz
+                    PQx = Px - Qx
+                    PQy = Py - Qy
+                    PQz = Pz - Qz
+                    PQ2 = PQx * PQx + PQy * PQy + PQz * PQz
+                    T = alpha * PQ2
+                    pref = ERI_PREFAC * exp(-mu_ab * AB2) * exp(-mu_cd * CD2) / (p * q * sqrt(p + q))
+                    weight_prod = (
+                        weights_v[p0, ia] * weights_v[q0, ib] * weights_v[r0, ic] * weights_v[s0, id_]
+                    )
+
+                    if rank == 0:
+                        value = weight_prod * pref * _boys_value(0, T)
+                        values[0] += value
+                        continue
+
+                    for m in range(rank + 1):
+                        boys_values[m] = _boys_value(m, T)
+                    pos = 0
+                    if p_is_p:
+                        exponent_ids[pos] = aexp
+                        pos += 1
+                    if q_is_p:
+                        exponent_ids[pos] = bexp
+                        pos += 1
+                    if r_is_p:
+                        exponent_ids[pos] = cexp
+                        pos += 1
+                    if s_is_p:
+                        exponent_ids[pos] = dexp
+                        pos += 1
+
+                    nterms = _build_promoted_terms_fixed(
+                        rank,
+                        center_ids,
+                        exponent_ids,
+                        alpha,
+                        mu_ab,
+                        mu_cd,
+                        lam_a,
+                        lam_b,
+                        lam_c,
+                        lam_d,
+                        orders,
+                        scalars,
+                        nvec,
+                        vec_axes,
+                        vec_names,
+                        ndelta,
+                        delta_axis1,
+                        delta_axis2,
+                    )
+                    if nterms < 0:
+                        return 0
+
+                    AB[0] = ABx; AB[1] = ABy; AB[2] = ABz
+                    CD[0] = CDx; CD[1] = CDy; CD[2] = CDz
+                    PQ[0] = PQx; PQ[1] = PQy; PQ[2] = PQz
+
+                    for ip in range(np_):
+                        p_axis = _shell_kind_axis(shells_v, p0 + ip)
+                        for iq in range(nq_):
+                            q_axis = _shell_kind_axis(shells_v, q0 + iq)
+                            for ir in range(nr_):
+                                r_axis = _shell_kind_axis(shells_v, r0 + ir)
+                                for is_ in range(ns_):
+                                    s_axis = _shell_kind_axis(shells_v, s0 + is_)
+                                    pos = 0
+                                    if p_is_p:
+                                        coord_ids[pos] = p_axis
+                                        pos += 1
+                                    if q_is_p:
+                                        coord_ids[pos] = q_axis
+                                        pos += 1
+                                    if r_is_p:
+                                        coord_ids[pos] = r_axis
+                                        pos += 1
+                                    if s_is_p:
+                                        coord_ids[pos] = s_axis
+                                        pos += 1
+                                    idx = (((ip * nq_) + iq) * nr_ + ir) * ns_ + is_
+                                    values[idx] += weight_prod * _evaluate_fixed_scalar(
+                                        rank,
+                                        coord_ids,
+                                        nterms,
+                                        orders,
+                                        scalars,
+                                        nvec,
+                                        vec_axes,
+                                        vec_names,
+                                        ndelta,
+                                        delta_axis1,
+                                        delta_axis2,
+                                        boys_values,
+                                        pref,
+                                        AB,
+                                        CD,
+                                        PQ,
+                                    )
+
+    for ip in range(np_):
+        for iq in range(nq_):
+            for ir in range(nr_):
+                for is_ in range(ns_):
+                    idx = (((ip * nq_) + iq) * nr_ + ir) * ns_ + is_
+                    value = values[idx]
+                    eri_v[p0 + ip, q0 + iq, r0 + ir, s0 + is_] = value
+                    eri_v[q0 + iq, p0 + ip, r0 + ir, s0 + is_] = value
+                    eri_v[p0 + ip, q0 + iq, s0 + is_, r0 + ir] = value
+                    eri_v[q0 + iq, p0 + ip, s0 + is_, r0 + ir] = value
+                    eri_v[r0 + ir, s0 + is_, p0 + ip, q0 + iq] = value
+                    eri_v[s0 + is_, r0 + ir, p0 + ip, q0 + iq] = value
+                    eri_v[r0 + ir, s0 + is_, q0 + iq, p0 + ip] = value
+                    eri_v[s0 + is_, r0 + ir, q0 + iq, p0 + ip] = value
+    return 1
+
+
 cpdef compute_dense_eri_blocked_rys(
     cnp.ndarray[i64_t, ndim=2] shells,
     cnp.ndarray[f64_t, ndim=2] origins,
@@ -2523,6 +2768,11 @@ cpdef compute_dense_eri_blocked_rys(
     cdef i64_t[::1] shell_starts_v = shell_starts
     cdef i64_t[::1] shell_stops_v = shell_stops
     cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef i64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef i64_t[::1] nprim_v = nprim
     cdef double[:, :, :, :] eri_v = eri
 
     shell_pair_bounds = <double*>malloc(nshell * nshell * sizeof(double))
@@ -2567,21 +2817,37 @@ cpdef compute_dense_eri_blocked_rys(
                         skipped += 1
                         continue
 
-                    for ip in range(p0, p1):
-                        for iq in range(q0, q1):
-                            for ir in range(r0, r1):
-                                for is_ in range(s0, s1):
-                                    value = contracted_eri_indices_rys(
-                                        ip, iq, ir, is_, shells, origins, exps, weights, nprim
-                                    )
-                                    eri_v[ip, iq, ir, is_] = value
-                                    eri_v[iq, ip, ir, is_] = value
-                                    eri_v[ip, iq, is_, ir] = value
-                                    eri_v[iq, ip, is_, ir] = value
-                                    eri_v[ir, is_, ip, iq] = value
-                                    eri_v[is_, ir, ip, iq] = value
-                                    eri_v[ir, is_, iq, ip] = value
-                                    eri_v[is_, ir, iq, ip] = value
+                    if not _compute_sp_shell_quartet_direct(
+                        eri_v,
+                        shells_v,
+                        origins_v,
+                        exps_v,
+                        weights_v,
+                        nprim_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        r0,
+                        r1,
+                        s0,
+                        s1,
+                    ):
+                        for ip in range(p0, p1):
+                            for iq in range(q0, q1):
+                                for ir in range(r0, r1):
+                                    for is_ in range(s0, s1):
+                                        value = contracted_eri_indices_rys(
+                                            ip, iq, ir, is_, shells, origins, exps, weights, nprim
+                                        )
+                                        eri_v[ip, iq, ir, is_] = value
+                                        eri_v[iq, ip, ir, is_] = value
+                                        eri_v[ip, iq, is_, ir] = value
+                                        eri_v[iq, ip, is_, ir] = value
+                                        eri_v[ir, is_, ip, iq] = value
+                                        eri_v[is_, ir, ip, iq] = value
+                                        eri_v[ir, is_, iq, ip] = value
+                                        eri_v[is_, ir, iq, ip] = value
                     if ish == jsh:
                         npair_pq = (np_ * (np_ + 1)) // 2
                     else:

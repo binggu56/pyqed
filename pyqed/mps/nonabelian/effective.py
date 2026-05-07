@@ -226,6 +226,11 @@ class EffectiveBlockOperator:
                 (left_stats is not None and left_stats.get("owns_numeric_payloads", False))
                 or (right_stats is not None and right_stats.get("owns_numeric_payloads", False))
             ),
+            "complementary_boundary_payloads": (
+                self.complementary_boundary_payload_metadata()
+                if self.complementary_operator_families is not None
+                else None
+            ),
         }
 
     def _attach_table_metadata(self, table):
@@ -236,6 +241,9 @@ class EffectiveBlockOperator:
             if self.complementary_operator_families is not None:
                 actions.metadata["complementary_operator_families"] = (
                     self.complementary_operator_family_metadata()
+                )
+                actions.metadata["complementary_boundary_payloads"] = (
+                    self.complementary_boundary_payload_metadata()
                 )
         actions.local_operator_table = table
         self.local_operator_table = table
@@ -255,6 +263,149 @@ class EffectiveBlockOperator:
             return families.as_metadata()
         return {"enabled": True, "type": type(families).__name__}
 
+    def complementary_boundary_payload_metadata(self):
+        """
+        Return numeric complementary payload metadata for local boundaries.
+
+        :returns: Dictionary describing left/right ``S/R/A/P/B/Q`` payloads.
+        """
+
+        def _payload_entry(entry):
+            comp_entry = (
+                None
+                if entry is None
+                else getattr(entry, "complementary_operator_entry", None)
+            )
+            if comp_entry is None:
+                return None
+            return dict(comp_entry.stats)
+
+        left_payload = _payload_entry(self.left_entry)
+        right_payload = _payload_entry(self.right_entry)
+        family_tables = tuple(
+            table
+            for table in (
+                None
+                if left_payload is None
+                else left_payload.get("family_operator_table"),
+                None
+                if right_payload is None
+                else right_payload.get("family_operator_table"),
+            )
+            if table is not None
+        )
+        total_terms = int(
+            (0 if left_payload is None else left_payload.get("numeric_payload_terms", 0))
+            + (0 if right_payload is None else right_payload.get("numeric_payload_terms", 0))
+        )
+        cross_terms = int(
+            (
+                0
+                if left_payload is None
+                else left_payload.get("numeric_payload_cross_terms", 0)
+            )
+            + (
+                0
+                if right_payload is None
+                else right_payload.get("numeric_payload_cross_terms", 0)
+            )
+        )
+        return {
+            "payload_backed": bool(total_terms > 0),
+            "family_operator_table_backed": bool(family_tables),
+            "family_operator_tables": int(len(family_tables)),
+            "family_operator_table_payload_blocks": int(
+                sum(table.get("n_payload_blocks", 0) for table in family_tables)
+            ),
+            "family_operator_table_stored_elements": int(
+                sum(table.get("stored_elements", 0) for table in family_tables)
+            ),
+            "family_operator_table_symbolic_terms": int(
+                sum(table.get("symbolic_terms", 0) for table in family_tables)
+            ),
+            "numeric_payload_terms": int(total_terms),
+            "numeric_payload_cross_terms": int(cross_terms),
+            "left_boundary": left_payload,
+            "right_boundary": right_payload,
+        }
+
+    def complementary_boundary_payload_signature(self):
+        """
+        Return a hashable signature for complementary payload-backed caches.
+
+        :returns: Tuple summarizing boundary payload identity and term counts.
+        """
+
+        def _entry_signature(entry):
+            comp_entry = (
+                None
+                if entry is None
+                else getattr(entry, "complementary_operator_entry", None)
+            )
+            if comp_entry is None:
+                return None
+            return (
+                comp_entry.key,
+                tuple(comp_entry.family_names),
+                (
+                    None
+                    if comp_entry.family_operator_table is None
+                    else (
+                        comp_entry.family_operator_table.family_names,
+                        comp_entry.family_operator_table.active_family_names,
+                        int(comp_entry.family_operator_table.n_payload_blocks),
+                        int(comp_entry.family_operator_table.stored_elements),
+                        int(comp_entry.family_operator_table.symbolic_terms),
+                    )
+                ),
+                int(
+                    sum(
+                        payload.n_terms
+                        for payload in comp_entry.family_payloads.values()
+                    )
+                ),
+                int(
+                    sum(
+                        payload.cross_terms
+                        for payload in comp_entry.family_payloads.values()
+                    )
+                ),
+                tuple(
+                    (
+                        str(name),
+                        int(payload.n_terms),
+                        int(payload.cross_terms),
+                        float(payload.coefficient_norm),
+                    )
+                    for name, payload in sorted(comp_entry.family_payloads.items())
+                ),
+            )
+
+        return (_entry_signature(self.left_entry), _entry_signature(self.right_entry))
+
+    def complementary_family_operator_table_objects(self):
+        """
+        Return live family-operator tables attached to the local boundaries.
+
+        :returns: Tuple of stored family-resolved renormalized operator tables.
+        """
+
+        tables = []
+        for entry in (self.left_entry, self.right_entry):
+            comp_entry = (
+                None
+                if entry is None
+                else getattr(entry, "complementary_operator_entry", None)
+            )
+            table = (
+                None
+                if comp_entry is None
+                else getattr(comp_entry, "family_operator_table", None)
+            )
+            if table is not None:
+                tables.append(table)
+        return tuple(tables)
+
     def _annotate_symbolic_payload_source(self, packed_apply, compiled_terms=None):
         """
         Attach symbolic boundary-payload metadata to a packed matvec.
@@ -268,6 +419,35 @@ class EffectiveBlockOperator:
         packed_apply.symbolic_boundary_payloads = metadata
         if compiled_terms is not None:
             compiled_terms.symbolic_boundary_payloads = metadata
+        return packed_apply
+
+    def _annotate_complementary_payload_source(self, packed_apply, compiled_terms=None):
+        """
+        Attach numeric complementary-boundary payload metadata to a matvec.
+
+        :param packed_apply: Packed matvec callable.
+        :param compiled_terms: Optional compiled factorized term provider.
+        :returns: ``packed_apply``.
+        """
+
+        metadata = self.complementary_boundary_payload_metadata()
+        signature = self.complementary_boundary_payload_signature()
+        table_objects = self.complementary_family_operator_table_objects()
+        packed_apply.complementary_boundary_payloads = metadata
+        packed_apply.complementary_payload_signature = signature
+        packed_apply.complementary_payload_backed = bool(
+            metadata.get("payload_backed", False)
+        )
+        packed_apply.complementary_family_operator_tables = metadata
+        packed_apply.complementary_family_operator_table_objects = table_objects
+        if compiled_terms is not None:
+            compiled_terms.complementary_boundary_payloads = metadata
+            compiled_terms.complementary_payload_signature = signature
+            compiled_terms.complementary_payload_backed = bool(
+                metadata.get("payload_backed", False)
+            )
+            compiled_terms.complementary_family_operator_tables = metadata
+            compiled_terms.complementary_family_operator_table_objects = table_objects
         return packed_apply
 
     def _side_table_key(self, side, representation):
@@ -1176,12 +1356,19 @@ class EffectiveBlockOperator:
         metadata = dict(getattr(packed_apply, "symbolic_boundary_payloads", {}) or {})
         metadata["complementary_operator_source"] = "spatial_S/R/A/P/B/Q"
         metadata["complementary_operator_families"] = self.complementary_operator_family_metadata()
+        metadata["complementary_boundary_payloads"] = (
+            self.complementary_boundary_payload_metadata()
+        )
         packed_apply.symbolic_boundary_payloads = metadata
         compiled_terms = getattr(packed_apply, "compiled_factorized_terms", None)
         if compiled_terms is not None:
             compiled_terms.symbolic_boundary_payloads = metadata
             compiled_terms.complementary_operator_families = (
                 self.complementary_operator_families
+            )
+            self._annotate_complementary_payload_source(
+                packed_apply,
+                compiled_terms,
             )
             compiled_terms.complementary_direct_orthonormal_projection_available = True
             compiled_terms.prefer_direct_orthonormal_projection = bool(
@@ -1204,6 +1391,9 @@ class EffectiveBlockOperator:
                     "prefer_recursive_operator_matvec",
                     False,
                 )
+            )
+            compiled_terms.prefer_complementary_payload_tensor_matvec = bool(
+                getattr(compiled_terms, "complementary_payload_backed", False)
             )
             compiled_terms.direct_orthonormal_projection_source = (
                 "rank_coupled_complementary"

@@ -17,6 +17,9 @@ if str(REPO_ROOT) not in sys.path:
 from pyqed.qchem import Molecule
 from pyqed.qchem.dmrg.dmrg import DMRG
 from pyqed.qchem.hf import RHF
+from pyqed.mps.nonabelian.renormalized import (
+    set_complementary_family_native_kernel_max_elements,
+)
 
 
 PRESETS = {
@@ -54,16 +57,33 @@ def _summarize_history(history):
         kernels = set()
         for objective in entry.get("bond_objectives", []):
             stats = objective.get("renormalized_operator_table_stats") or {}
-            if stats.get("component_parent_block_kernel"):
+            if stats.get("complementary_family_table_kernel"):
+                kernels.add("complementary_family_table")
+            elif stats.get("component_parent_block_kernel"):
                 kernels.add("component_parent_block")
             elif stats.get("component_direct_kernel"):
                 kernels.add("component_direct")
             elif stats.get("kind"):
                 kernels.add(str(stats["kind"]))
+            family_table = stats.get("complementary_family_table") or {}
+            if family_table:
+                build["family_backend:" + str(family_table.get("backend"))] = (
+                    build.get("family_backend:" + str(family_table.get("backend")), 0.0)
+                    + 1.0
+                )
+                build["family_native_kernel_elements"] = build.get(
+                    "family_native_kernel_elements",
+                    0.0,
+                ) + float(family_table.get("native_kernel_elements", 0))
+                build["family_factor_kernel_elements"] = build.get(
+                    "family_factor_kernel_elements",
+                    0.0,
+                ) + float(family_table.get("factor_kernel_elements", 0))
             for key, value in (objective.get("renormalized_operator_build_timing") or {}).items():
                 if (
                     "direct" in key
                     or "recursive" in key
+                    or "family_table" in key
                     or "component_transformed_table" in key
                     or "component_factorized_kernel" in key
                     or key == "component_table_compile"
@@ -190,7 +210,18 @@ def main():
         default=None,
         help="Fail if any default sweep local-matvec time exceeds this threshold.",
     )
+    parser.add_argument(
+        "--family-dense-threshold",
+        type=int,
+        default=None,
+        help="Dense family-kernel element threshold; use 0 for factor-native only.",
+    )
     args = parser.parse_args()
+
+    if args.family_dense_threshold is not None:
+        set_complementary_family_native_kernel_max_elements(
+            args.family_dense_threshold
+        )
 
     case = PRESETS[args.system]
     mol = Molecule(atom=case["atom"], unit="bohr", basis=args.basis)

@@ -751,6 +751,7 @@ class CompiledFactorizedBlock:
     output_entry: object
     left_stack: np.ndarray
     right_stack: np.ndarray
+    family_names: tuple = ()
 
     def __post_init__(self):
         self._use_direct_contraction = self._estimate_direct_contraction()
@@ -759,6 +760,7 @@ class CompiledFactorizedBlock:
             int(self.output_entry.offset),
             int(self.output_entry.offset) + int(self.output_entry.size),
         )
+        self.family_names = tuple(sorted({str(name) for name in self.family_names}))
 
     @property
     def input_shape(self):
@@ -930,6 +932,33 @@ class CompiledFactorizedTerms:
         return self.basis.size
 
     @property
+    def family_names(self):
+        """Return sorted complementary/qchem family labels carried by terms."""
+
+        return tuple(
+            sorted(
+                {
+                    str(name)
+                    for terms in self.items
+                    for term in terms
+                    for name in getattr(term, "family_names", ())
+                }
+            )
+        )
+
+    @property
+    def family_term_counts(self):
+        """Return compiled block counts by family label."""
+
+        counts = {}
+        for terms in self.items:
+            for term in terms:
+                names = tuple(getattr(term, "family_names", ()) or ("unlabeled",))
+                for name in names:
+                    counts[str(name)] = counts.get(str(name), 0) + 1
+        return dict(sorted(counts.items()))
+
+    @property
     def block_matrices(self):
         """
         Return basis-aligned self-block matrices for preconditioning.
@@ -1062,6 +1091,8 @@ class CompiledFactorizedTerms:
         packed_apply.out_entries = out_entries
         packed_apply.block_matrices = block_matrices
         packed_apply.dense_matrix = dense_matrix
+        packed_apply.family_names = self.family_names
+        packed_apply.family_term_counts = self.family_term_counts
         return packed_apply
 
 
@@ -1082,7 +1113,9 @@ def compile_factorized_terms(factorized_terms, basis):
             compiled_items.append(())
             continue
         grouped = {}
-        for out_idx, left_factor, right_factor in terms:
+        for term in terms:
+            out_idx, left_factor, right_factor = term[:3]
+            family_names = term[3] if len(term) > 3 else ()
             shape_key = (
                 out_idx,
                 tuple(np.asarray(left_factor).shape),
@@ -1091,17 +1124,31 @@ def compile_factorized_terms(factorized_terms, basis):
             bucket = grouped.setdefault(shape_key, {"left": [], "right": []})
             bucket["left"].append(np.asarray(left_factor))
             bucket["right"].append(np.asarray(right_factor))
+            bucket.setdefault("families", []).append(family_names)
         compiled_terms = []
         for shape_key in sorted(grouped, key=lambda key: basis[key[0]].offset):
             out_idx = shape_key[0]
             out_entry = basis[out_idx]
             bucket = grouped[shape_key]
+            family_names = tuple(
+                sorted(
+                    {
+                        str(name)
+                        for item in bucket.get("families", ())
+                        for name in (
+                            item if isinstance(item, (tuple, list, set)) else (item,)
+                        )
+                        if name is not None
+                    }
+                )
+            )
             compiled_terms.append(
                 CompiledFactorizedBlock(
                     input_entry=in_entry,
                     output_entry=out_entry,
                     left_stack=np.ascontiguousarray(np.stack(bucket["left"], axis=0)),
                     right_stack=np.ascontiguousarray(np.stack(bucket["right"], axis=0)),
+                    family_names=family_names,
                 )
             )
         compiled_items.append(tuple(compiled_terms))
@@ -1130,7 +1177,8 @@ def diagonal_from_factorized_terms(factorized_terms, basis, *, dtype=float):
             continue
         diag_block = np.zeros(in_entry.shape, dtype=dtype)
         in_idx = entry_index[in_entry.key]
-        for out_idx, left_factor, right_factor in terms:
+        for term in terms:
+            out_idx, left_factor, right_factor = term[:3]
             if out_idx != in_idx:
                 continue
             diag_block += np.einsum(

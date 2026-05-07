@@ -438,17 +438,6 @@ from functools import reduce
 
 
 # from pyqed import eig_asymm, is_positive_def, dag
-<<<<<<<< HEAD:pyqed/qchem/mol.py
-# from lime.optics import Pulse
-
-
-def intertia_moment(mass, coords):
-    mass_center = np.einsum('i,ij->j', mass, coords)/mass.sum()
-    coords = coords - mass_center
-    im = np.einsum('i,ij,ik->jk', mass, coords, coords)
-    im = np.eye(3) * im.trace() - im
-    return im
-========
 
 
 def intertia_moment(mass, coords):
@@ -483,50 +472,6 @@ def intertia_moment(mass, coords):
 
 #     def emission(self):
 #         pass
-
-
-# class Molecule(gto.M):
-class Molecule(Molecule):
-    """
-
-    """
-    def __init__(self, atom=None, dvr_type='sine', spin=0, charge=0):
-
-
-        self.geometry = self.atom = self._atm = atom # proton position
-
-        self.domain = None
-
-        self.spin = spin
-        self.charge = charge
-        # self.atomic_charge = [1, 1, 1]     # Ion charge
-        # self.e = 1     # Electron charge, should be set to actual value in atomic units
-
-        # self.L = 10/au2angstrom
-        # print(self.L)
-        # self.mass = mass  # nuclear mass
-        # self.left = np.array([-self.L/2])
-        # self.right = np.array([self.L/2])
-
-        # self.left = np.array([-self.L/2, 0])
-        # self.right = np.array([self.L/2, 0])
-
-        self.x = None
-        self.y = None
-        self.z = None
-
-        self.nx = None
-        self.ny = None
-        self.nz = None
-
-        self.X = None
-        self.Y = None
-        self.Z = None
-
-        self.dvr_type = dvr_type
-
-
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
 
 
 # class Molecule:
@@ -572,25 +517,18 @@ class Molecule:
 
         self.mol = mol
         # self.atom_coord = mol.atom_coord
-<<<<<<<< HEAD:pyqed/qchem/mol.py
-        self.atom_coords = (mol.atom_coords()) # shape 3, natoms
+        self.atom_coords = mol.atom_coords()
         # print(self.atom_coords.shape)
         self.natom = mol.natm
         self.mass = mol.atom_mass_list()
         self.atom_symbols = [mol.atom_symbol(i) for i in range(self.natom)]
 
-========
-
-        # print(self.atom_coords.shape)
-        self.natom = mol.natm
-        self.mass = None # mol.atom_mass_list()
-        self.atom_symbols = [self.atom_symbol(i) for i in range(self.natom)]
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
-
         self.distmat = None
         # self.e_nuc = None
 
-<<<<<<<< HEAD:pyqed/qchem/mol.py
+        # DVR basis set
+        self.domain = None
+        self.level = None
 
     def com(self):
         '''
@@ -634,12 +572,6 @@ class Molecule:
 
     def principle_axes(self):
         pass
-========
-        # DVR basis set
-        self.domain = None
-        self.level = None
-
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
 
     def create_grid(self, domain, level):
         """
@@ -1140,11 +1072,7 @@ def eckart(reference, changed, mass, option=None):
 
 
 if __name__ == '__main__':
-<<<<<<<< HEAD:pyqed/qchem/mol.py
-    from pyscf import scf, gto, tdscf
-========
     from pyscf import gto, tdscf
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
     # from lime.units import au2fs, au2ev
     import proplot as plt
 
@@ -1160,27 +1088,6 @@ if __name__ == '__main__':
                 
     print(mol.atom_charge(3))
 
-
-<<<<<<<< HEAD:pyqed/qchem/mol.py
-
-
-    mol.basis = 'STO-3G'
-    mol.build()
-
-    geometry2 = [['H' , (0.1,      0., 0.)],
-                ['H', (1.3, 0., 0.)]]
-    
-    mol2 = Molecule(atom=geometry2)
-
-    print(mol2.atom_coords)
-    print(mol2.com())
-    mol2.molecular_frame()
-    print(mol2.eckart_frame(mol.atom_coords()))
-
-    # print(mol.natm)
-========
-
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
 
     # mol.basis = 'STO-3G'
     # mol.build()
@@ -1201,15 +1108,6 @@ if __name__ == '__main__':
     # mole = Molecule(mol)
     # mol.zmat(rvar=True)
     # mf = scf.RHF(mol).run()
-<<<<<<<< HEAD:pyqed/qchem/mol.py
-
-    # td = tdscf.TDRHF(mf)
-    # td.kernel()
-
-
-
-========
->>>>>>>> bg:pyqed/qchem/dvr/mol.py
 
     # td = tdscf.TDRHF(mf)
     # td.kernel()

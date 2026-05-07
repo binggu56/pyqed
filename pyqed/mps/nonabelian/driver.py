@@ -49,11 +49,13 @@ class SweepDriver:
         conv_tol=None,
         measure=None,
         prefer_reduced_local_operator=False,
+        canonical_local_norm=False,
         warm_start_bonds=False,
         mixer_zero_block_noise_scale=0.0,
         mixer_zero_block_noise_seed=None,
         mixer_nsweeps=1,
         record_post_update_energy=False,
+        profile=False,
         verbose=0,
     ):
         self.initial_mps = _as_mps(sites)
@@ -73,11 +75,13 @@ class SweepDriver:
         self.conv_tol = conv_tol
         self.measure = measure
         self.prefer_reduced_local_operator = prefer_reduced_local_operator
+        self.canonical_local_norm = canonical_local_norm
         self.warm_start_bonds = warm_start_bonds
         self.mixer_zero_block_noise_scale = mixer_zero_block_noise_scale
         self.mixer_zero_block_noise_seed = mixer_zero_block_noise_seed
         self.mixer_nsweeps = mixer_nsweeps
         self.record_post_update_energy = record_post_update_energy
+        self.profile = bool(profile)
         self.verbose = int(verbose)
 
         self.history = []
@@ -144,6 +148,10 @@ class SweepDriver:
                 "prefer_reduced_local_operator",
                 self.prefer_reduced_local_operator,
             ),
+            canonical_local_norm=overrides.pop(
+                "canonical_local_norm",
+                self.canonical_local_norm,
+            ),
             warm_start_bonds=overrides.pop(
                 "warm_start_bonds",
                 self.warm_start_bonds,
@@ -163,6 +171,10 @@ class SweepDriver:
             record_post_update_energy=overrides.pop(
                 "record_post_update_energy",
                 self.record_post_update_energy,
+            ),
+            profile=overrides.pop(
+                "profile",
+                self.profile,
             ),
             verbose=overrides.pop(
                 "verbose",

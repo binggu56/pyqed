@@ -1640,22 +1640,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     ):
         trial_U = self._apply_orbital_update(U, float(scale) * kappa)
         h1_trial, eri_trial = self._transform_frozen_integrals(h1_ref, eri_ref, trial_U)
-        base = np.asarray(ci_base, dtype=float)
-        target = np.asarray(ci_target, dtype=float)
-        ci_vec = base + float(scale) * (target - base)
-        ci_vec = self._project_ci_response(ci_vec, [])
-        norm = np.linalg.norm(ci_vec)
-        if norm <= 1.0e-12:
-            ci_vec = base.copy()
-        else:
-            ci_vec = ci_vec / norm
         sigma_mc = self._cached_integral_sigma_casci(mc, h1_trial, eri_trial)
-        active_energy = float(np.real(np.vdot(ci_vec, sigma_mc.ci_sigma(ci_vec))))
-        total_energy = float(sigma_mc.e_core + active_energy)
+        ci_roots = self._scaled_ci_guess_roots(ci_base, ci_target, scale)
+        energies = [
+            float(sigma_mc.e_core + np.real(np.vdot(ci, sigma_mc.ci_sigma(ci))))
+            for ci in ci_roots
+        ]
+        total_energy = self._objective_energy_from_values(energies)
         trial_mc = copy.copy(sigma_mc)
-        trial_mc.ci = [ci_vec]
-        trial_mc.e_tot = np.asarray([total_energy], dtype=float)
-        trial_mc.nstates = 1
+        trial_mc.ci = ci_roots
+        trial_mc.e_tot = np.asarray(energies, dtype=float)
+        trial_mc.nstates = len(ci_roots)
         return trial_U, total_energy, trial_mc
 
     def _factor_joint_ci_orbital_trial(
@@ -1675,23 +1670,63 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             pair_ref,
             trial_U,
         )
-        base = np.asarray(ci_base, dtype=float)
-        target = np.asarray(ci_target, dtype=float)
-        ci_vec = base + float(scale) * (target - base)
-        ci_vec = self._project_ci_response(ci_vec, [])
-        norm = np.linalg.norm(ci_vec)
-        if norm <= 1.0e-12:
-            ci_vec = base.copy()
-        else:
-            ci_vec = ci_vec / norm
         sigma_mc = self._cached_factor_integral_sigma_casci(mc, h1_trial, pair_trial)
-        active_energy = float(np.real(np.vdot(ci_vec, sigma_mc.ci_sigma(ci_vec))))
-        total_energy = float(sigma_mc.e_core + active_energy)
+        ci_roots = self._scaled_ci_guess_roots(ci_base, ci_target, scale)
+        energies = [
+            float(sigma_mc.e_core + np.real(np.vdot(ci, sigma_mc.ci_sigma(ci))))
+            for ci in ci_roots
+        ]
+        total_energy = self._objective_energy_from_values(energies)
         trial_mc = copy.copy(sigma_mc)
-        trial_mc.ci = [ci_vec]
-        trial_mc.e_tot = np.asarray([total_energy], dtype=float)
-        trial_mc.nstates = 1
+        trial_mc.ci = ci_roots
+        trial_mc.e_tot = np.asarray(energies, dtype=float)
+        trial_mc.nstates = len(ci_roots)
         return trial_U, total_energy, trial_mc
+
+    def _ci_guess_root_list(self, roots):
+        if roots is None:
+            return None
+        if isinstance(roots, np.ndarray) and roots.ndim == 1:
+            return [np.asarray(roots, dtype=float)]
+        return [np.asarray(root, dtype=float) for root in roots]
+
+    def _orthonormalize_ci_roots(self, roots, fallback_roots=None):
+        fallback_roots = self._ci_guess_root_list(fallback_roots) or []
+        out = []
+        for idx, root in enumerate(self._ci_guess_root_list(roots) or []):
+            vec = np.asarray(root, dtype=float).copy()
+            for prev in out:
+                vec -= prev * np.dot(prev, vec)
+            norm = np.linalg.norm(vec)
+            if norm <= 1.0e-12 and idx < len(fallback_roots):
+                vec = np.asarray(fallback_roots[idx], dtype=float).copy()
+                for prev in out:
+                    vec -= prev * np.dot(prev, vec)
+                norm = np.linalg.norm(vec)
+            if norm <= 1.0e-12:
+                continue
+            out.append(vec / norm)
+        return out
+
+    def _scaled_ci_guess_roots(self, ci_base, ci_target, scale):
+        base_roots = self._ci_guess_root_list(ci_base) or []
+        target_roots = self._ci_guess_root_list(ci_target) or base_roots
+        nroots = min(len(base_roots), len(target_roots))
+        trial = [
+            base_roots[root] + float(scale) * (target_roots[root] - base_roots[root])
+            for root in range(nroots)
+        ]
+        return self._orthonormalize_ci_roots(trial, fallback_roots=base_roots)
+
+    def _objective_energy_from_values(self, energies):
+        energies = np.asarray(energies, dtype=float)
+        if self.weights is None:
+            return float(energies[min(self.state_id, len(energies) - 1)])
+        weights = np.asarray(self.weights, dtype=float)[: len(energies)]
+        if weights.size == 0:
+            return float(energies[0])
+        weights = weights / float(np.sum(weights))
+        return float(np.dot(weights, energies[: weights.size]))
 
     def _joint_trust_region_micro_search(
         self,
@@ -1706,9 +1741,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         model_linear=None,
         model_quadratic=None,
     ):
-        if self.nstates != 1:
-            raise NotImplementedError("Joint CI-orbital microsearch is state-specific.")
-        ci_base = np.asarray(mc.ci[self.state_id], dtype=float)
+        ci_base = self._ci_guess_root_list(mc.ci[: self.nstates])
         min_scale = 0.125
         best = None
         scale = 1.0
@@ -1763,9 +1796,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         model_linear=None,
         model_quadratic=None,
     ):
-        if self.nstates != 1:
-            raise NotImplementedError("Joint CI-orbital microsearch is state-specific.")
-        ci_base = np.asarray(mc.ci[self.state_id], dtype=float)
+        ci_base = self._ci_guess_root_list(mc.ci[: self.nstates])
         min_scale = 0.125
         best = None
         scale = 1.0
@@ -3162,77 +3193,111 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         pair_factors=None,
     ):
         """
-        Matrix-free state-specific coupled orbital/full-CI-response AH step.
+        Matrix-free coupled orbital/full-CI-response AH step.
         """
-        if self.nstates != 1:
-            raise NotImplementedError(
-                "coupling='full' currently supports state-specific CASSCF only."
-            )
-        c0 = np.asarray(mc.ci[self.state_id], dtype=float)
-        ndet = c0.size
+        nroots = max(1, int(self.nstates))
+        c_roots = [np.asarray(root, dtype=float) for root in mc.ci[:nroots]]
+        if not c_roots:
+            out = (np.asarray(fallback_step, dtype=float), self._copy_ci_guess(mc.ci[:nroots]))
+            if return_info:
+                return out[0], out[1], {"model_reduction": np.nan}
+            return out
+        if self.weights is None:
+            root_weights = np.zeros(len(c_roots), dtype=float)
+            root_weights[min(self.state_id, len(c_roots) - 1)] = 1.0
+        else:
+            root_weights = np.asarray(self.weights, dtype=float)[: len(c_roots)]
+            root_weights = root_weights / float(np.sum(root_weights))
+        ndet = c_roots[0].size
         n_orb = grad_vec.size
         if ndet == 0 or n_orb == 0:
-            out = (np.asarray(fallback_step, dtype=float), self._copy_ci_guess(mc.ci[:1]))
+            out = (np.asarray(fallback_step, dtype=float), self._copy_ci_guess(mc.ci[:nroots]))
             if return_info:
                 return out[0], out[1], {"model_reduction": np.nan}
             return out
 
-        active_energy = float(mc.e_tot[self.state_id] - mc.e_core)
+        active_energies = np.asarray(mc.e_tot[: len(c_roots)], dtype=float) - float(mc.e_core)
         ci_diag = np.asarray(ci_diagonal(mc), dtype=float)
-        ci_hdiag = ci_diag - active_energy
+        ci_hdiags = [ci_diag - float(active_energy) for active_energy in active_energies]
         orb_hdiag = np.maximum(np.abs(np.asarray(hess_diag, dtype=float)), self.level_shift)
-        precond_diag = np.concatenate(
+        ci_precond = [
+            np.maximum(abs(float(weight)) * np.abs(ci_hdiag), self.level_shift)
+            for weight, ci_hdiag in zip(root_weights, ci_hdiags)
+        ]
+        precond_diag = np.concatenate((orb_hdiag, *ci_precond))
+        total_grad = np.concatenate(
             (
-                orb_hdiag,
-                np.maximum(np.abs(ci_hdiag), self.level_shift),
+                np.asarray(grad_vec, dtype=float),
+                np.zeros(ndet * len(c_roots), dtype=float),
             )
         )
-        total_grad = np.concatenate((np.asarray(grad_vec, dtype=float), np.zeros(ndet)))
 
         def split(vec):
             vec = np.asarray(vec, dtype=float)
-            return vec[:n_orb], self._project_ci_response(vec[n_orb:], [c0])
+            orb = vec[:n_orb]
+            ci_flat = vec[n_orb:]
+            ci_parts = []
+            for root in range(len(c_roots)):
+                start = root * ndet
+                stop = start + ndet
+                ci_parts.append(
+                    self._project_ci_response(ci_flat[start:stop], c_roots)
+                )
+            return orb, ci_parts
 
         def matvec(vec):
-            orb_part, ci_part = split(vec)
+            orb_part, ci_parts = split(vec)
             out_orb = np.asarray(hessian_action(orb_part), dtype=float)
-            if pair_factors is None:
-                out_orb += self._orbital_gradient_from_ci_response_adjoint(
-                    mc,
-                    h1_mo,
-                    eri_mo,
-                    c0,
-                    ci_part,
+            out_ci_parts = []
+            for weight, c0, ci_part, active_energy in zip(
+                root_weights,
+                c_roots,
+                ci_parts,
+                active_energies,
+            ):
+                if pair_factors is None:
+                    out_orb += float(weight) * self._orbital_gradient_from_ci_response_adjoint(
+                        mc,
+                        h1_mo,
+                        eri_mo,
+                        c0,
+                        ci_part,
+                    )
+                    out_ci = mc.ci_sigma(ci_part) - float(active_energy) * ci_part
+                    out_ci += self._ci_gradient_from_orbital_response(
+                        mc,
+                        h1_mo,
+                        eri_mo,
+                        c0,
+                        orb_part,
+                    )
+                else:
+                    out_orb += float(weight) * self._factor_orbital_gradient_from_ci_response_adjoint(
+                        mc,
+                        h1_mo,
+                        pair_factors,
+                        c0,
+                        ci_part,
+                    )
+                    out_ci = mc.ci_sigma(ci_part) - float(active_energy) * ci_part
+                    out_ci += self._factor_ci_gradient_from_orbital_response(
+                        mc,
+                        h1_mo,
+                        pair_factors,
+                        c0,
+                        orb_part,
+                    )
+                out_ci_parts.append(
+                    float(weight) * self._project_ci_response(out_ci, c_roots)
                 )
-            else:
-                out_orb += self._factor_orbital_gradient_from_ci_response_adjoint(
-                    mc,
-                    h1_mo,
-                    pair_factors,
-                    c0,
-                    ci_part,
-                )
-            out_ci = mc.ci_sigma(ci_part) - active_energy * ci_part
-            if pair_factors is None:
-                out_ci += self._ci_gradient_from_orbital_response(
-                    mc,
-                    h1_mo,
-                    eri_mo,
-                    c0,
-                    orb_part,
-                )
-            else:
-                out_ci += self._factor_ci_gradient_from_orbital_response(
-                    mc,
-                    h1_mo,
-                    pair_factors,
-                    c0,
-                    orb_part,
-                )
-            out_ci = self._project_ci_response(out_ci, [c0])
-            return np.concatenate((out_orb, out_ci))
+            return np.concatenate((out_orb, *out_ci_parts))
 
-        seed = np.concatenate((np.asarray(fallback_step, dtype=float), np.zeros(ndet)))
+        seed = np.concatenate(
+            (
+                np.asarray(fallback_step, dtype=float),
+                np.zeros(ndet * len(c_roots), dtype=float),
+            )
+        )
         diag_step = -total_grad / precond_diag
         seeds = []
         if (
@@ -3254,7 +3319,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             for col in cols:
                 col = np.asarray(col, dtype=float).copy()
                 orb, ci = split(col)
-                col = np.concatenate((orb, ci))
+                col = np.concatenate((orb, *ci))
                 for prev in clean:
                     col -= prev * np.dot(prev, col)
                 norm = np.linalg.norm(col)
@@ -3289,7 +3354,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     continue
                 raw_step = V @ (coeff / alpha)
                 raw_hv = W @ (coeff / alpha)
-                orb_raw, ci_raw = split(raw_step)
+                orb_raw, _ = split(raw_step)
                 scale = 1.0
                 if max_step is not None and orb_raw.size > 0:
                     peak = np.max(np.abs(orb_raw))
@@ -3351,16 +3416,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 return out[0], out[1], {"model_reduction": np.nan}
             return out
 
-        orb_step, ci_step = split(best["step"])
+        orb_step, ci_steps = split(best["step"])
         if self.coupled_reuse_subspace:
             self._full_coupled_seed = np.asarray(best["step"], dtype=float).copy()
-        ci_guess = c0 + ci_step
-        ci_guess = self._project_ci_response(ci_guess, [])
-        norm = np.linalg.norm(ci_guess)
-        if norm > 1.0e-12:
-            ci_guess = ci_guess / norm
-        else:
-            ci_guess = c0.copy()
+        ci_guess = self._orthonormalize_ci_roots(
+            [
+                c0 + ci_step
+                for c0, ci_step in zip(c_roots, ci_steps)
+            ],
+            fallback_roots=c_roots,
+        )
         info = {
             "model": float(best["model"]),
             "model_reduction": float(-best["model"]),
@@ -3369,11 +3434,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             "residual_norm": float(best["residual_norm"]),
             "eigenvalue": float(best["eigenvalue"]),
             "joint_step_norm": float(np.linalg.norm(best["step"])),
-            "ci_step_norm": float(np.linalg.norm(ci_step)),
+            "ci_step_norm": float(
+                np.sqrt(sum(float(np.dot(step, step)) for step in ci_steps))
+            ),
         }
         if return_info:
-            return np.asarray(orb_step, dtype=float), [ci_guess], info
-        return np.asarray(orb_step, dtype=float), [ci_guess]
+            return np.asarray(orb_step, dtype=float), ci_guess, info
+        return np.asarray(orb_step, dtype=float), ci_guess
 
     def _partial_coupled_step(
         self,
@@ -4868,7 +4935,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 kappa,
                                 energy,
                                 mc,
-                                ci_guess[0],
+                                ci_guess,
                                 predicted,
                                 model_linear=coupled_info.get("model_linear"),
                                 model_quadratic=coupled_info.get("model_quadratic"),
@@ -4881,7 +4948,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 kappa,
                                 energy,
                                 mc,
-                                ci_guess[0],
+                                ci_guess,
                                 predicted,
                                 model_linear=coupled_info.get("model_linear"),
                                 model_quadratic=coupled_info.get("model_quadratic"),

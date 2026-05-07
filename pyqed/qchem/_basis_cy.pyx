@@ -5,12 +5,17 @@ cimport numpy as cnp
 
 from libc.math cimport exp, sqrt, fabs, NAN
 from libc.stdlib cimport malloc, free
-from libc.stdint cimport int64_t
+from libc.stdint cimport int64_t, uint64_t
+from libc.string cimport memset
 from scipy.special.cython_special cimport hyp1f1
 
 
 cdef double PI = 3.141592653589793238462643383279502884
 cdef double ERI_PREFAC = 2.0 * (PI ** 2.5)
+DEF OS_MAX_STATES = 65536
+DEF OS_HASH_CAP = 16384
+DEF OS_VRR_PAIR_MAX_L = 4
+DEF OS_VRR_MAX_CART = 15
 
 
 cdef inline size_t idx3(int i, int j, int t, int jdim, int tdim) noexcept nogil:
@@ -551,6 +556,958 @@ cdef inline double primitive_eri_precomputed(
     return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
 
 
+cdef inline int os_state_matches(
+    int* states,
+    int idx,
+    int ax, int ay, int az,
+    int bx, int by, int bz,
+    int cx, int cy, int cz,
+    int dx, int dy, int dz,
+    int m,
+) noexcept nogil:
+    cdef int off = idx * 13
+    return (
+        states[off] == ax and states[off + 1] == ay and states[off + 2] == az
+        and states[off + 3] == bx and states[off + 4] == by and states[off + 5] == bz
+        and states[off + 6] == cx and states[off + 7] == cy and states[off + 8] == cz
+        and states[off + 9] == dx and states[off + 10] == dy and states[off + 11] == dz
+        and states[off + 12] == m
+    )
+
+
+cdef double os_eri_rec(
+    int ax, int ay, int az,
+    int bx, int by, int bz,
+    int cx, int cy, int cz,
+    int dx, int dy, int dz,
+    int m,
+    double p, double q, double z, double rho, double T, double base_pref,
+    double PAx, double PAy, double PAz,
+    double PBx, double PBy, double PBz,
+    double QCx, double QCy, double QCz,
+    double QDx, double QDy, double QDz,
+    double PQx, double PQy, double PQz,
+    double ABx, double ABy, double ABz,
+    double CDx, double CDy, double CDz,
+    int* states,
+    double* values,
+    int* nstates,
+) noexcept nogil:
+    cdef int idx, off, axis
+    cdef int na = ax + ay + az
+    cdef int nb = bx + by + bz
+    cdef int nc = cx + cy + cz
+    cdef int nd = dx + dy + dz
+    cdef double pq_axis, center_axis, value
+
+    if ax < 0 or ay < 0 or az < 0 or bx < 0 or by < 0 or bz < 0 or cx < 0 or cy < 0 or cz < 0 or dx < 0 or dy < 0 or dz < 0:
+        return 0.0
+
+    for idx in range(nstates[0]):
+        if os_state_matches(states, idx, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m):
+            return values[idx]
+
+    if na == 0 and nb == 0 and nc == 0 and nd == 0:
+        value = base_pref * boys_fn(m, T)
+    elif na > 0:
+        if ax >= ay and ax >= az:
+            axis = 0
+            pq_axis = PQx
+            center_axis = PAx
+            value = center_axis * os_eri_rec(ax - 1, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * pq_axis * os_eri_rec(ax - 1, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if ax - 1 > 0:
+                value += (ax - 1) / (2.0 * p) * (os_eri_rec(ax - 2, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax - 2, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if bx > 0:
+                value += bx / (2.0 * p) * (os_eri_rec(ax - 1, ay, az, bx - 1, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax - 1, ay, az, bx - 1, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if cx > 0:
+                value += cx / (2.0 * z) * os_eri_rec(ax - 1, ay, az, bx, by, bz, cx - 1, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if dx > 0:
+                value += dx / (2.0 * z) * os_eri_rec(ax - 1, ay, az, bx, by, bz, cx, cy, cz, dx - 1, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        elif ay >= az:
+            value = PAy * os_eri_rec(ax, ay - 1, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * PQy * os_eri_rec(ax, ay - 1, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if ay - 1 > 0:
+                value += (ay - 1) / (2.0 * p) * (os_eri_rec(ax, ay - 2, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax, ay - 2, az, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if by > 0:
+                value += by / (2.0 * p) * (os_eri_rec(ax, ay - 1, az, bx, by - 1, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax, ay - 1, az, bx, by - 1, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if cy > 0:
+                value += cy / (2.0 * z) * os_eri_rec(ax, ay - 1, az, bx, by, bz, cx, cy - 1, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if dy > 0:
+                value += dy / (2.0 * z) * os_eri_rec(ax, ay - 1, az, bx, by, bz, cx, cy, cz, dx, dy - 1, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        else:
+            value = PAz * os_eri_rec(ax, ay, az - 1, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * PQz * os_eri_rec(ax, ay, az - 1, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if az - 1 > 0:
+                value += (az - 1) / (2.0 * p) * (os_eri_rec(ax, ay, az - 2, bx, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax, ay, az - 2, bx, by, bz, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if bz > 0:
+                value += bz / (2.0 * p) * (os_eri_rec(ax, ay, az - 1, bx, by, bz - 1, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - q / z * os_eri_rec(ax, ay, az - 1, bx, by, bz - 1, cx, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if cz > 0:
+                value += cz / (2.0 * z) * os_eri_rec(ax, ay, az - 1, bx, by, bz, cx, cy, cz - 1, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if dz > 0:
+                value += dz / (2.0 * z) * os_eri_rec(ax, ay, az - 1, bx, by, bz, cx, cy, cz, dx, dy, dz - 1, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+    elif nc > 0:
+        # Move ket angular momentum up on C.  This is the A recurrence with P/Q swapped signs.
+        if cx >= cy and cx >= cz:
+            value = QCx * os_eri_rec(ax, ay, az, bx, by, bz, cx - 1, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + p / z * PQx * os_eri_rec(ax, ay, az, bx, by, bz, cx - 1, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if cx - 1 > 0:
+                value += (cx - 1) / (2.0 * q) * (os_eri_rec(ax, ay, az, bx, by, bz, cx - 2, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - p / z * os_eri_rec(ax, ay, az, bx, by, bz, cx - 2, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if dx > 0:
+                value += dx / (2.0 * q) * (os_eri_rec(ax, ay, az, bx, by, bz, cx - 1, cy, cz, dx - 1, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) - p / z * os_eri_rec(ax, ay, az, bx, by, bz, cx - 1, cy, cz, dx - 1, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates))
+            if ax > 0:
+                value += ax / (2.0 * z) * os_eri_rec(ax - 1, ay, az, bx, by, bz, cx - 1, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+            if bx > 0:
+                value += bx / (2.0 * z) * os_eri_rec(ax, ay, az, bx - 1, by, bz, cx - 1, cy, cz, dx, dy, dz, m + 1, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        elif cy >= cz:
+            value = os_eri_rec(ax, ay, az, bx, by, bz, cy, cx, cz, dy, dx, dz, m, p, q, z, rho, T, base_pref, PAy, PAx, PAz, PBy, PBx, PBz, QCy, QCx, QCz, QDy, QDx, QDz, PQy, PQx, PQz, ABy, ABx, ABz, CDy, CDx, CDz, states, values, nstates)
+        else:
+            value = os_eri_rec(ax, ay, az, bx, by, bz, cz, cy, cx, dz, dy, dx, m, p, q, z, rho, T, base_pref, PAz, PAy, PAx, PBz, PBy, PBx, QCz, QCy, QCx, QDz, QDy, QDx, PQz, PQy, PQx, ABz, ABy, ABx, CDz, CDy, CDx, states, values, nstates)
+    elif nb > 0:
+        if bx >= by and bx >= bz:
+            value = os_eri_rec(ax + 1, ay, az, bx - 1, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + ABx * os_eri_rec(ax, ay, az, bx - 1, by, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        elif by >= bz:
+            value = os_eri_rec(ax, ay + 1, az, bx, by - 1, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + ABy * os_eri_rec(ax, ay, az, bx, by - 1, bz, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        else:
+            value = os_eri_rec(ax, ay, az + 1, bx, by, bz - 1, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + ABz * os_eri_rec(ax, ay, az, bx, by, bz - 1, cx, cy, cz, dx, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+    else:
+        if dx >= dy and dx >= dz:
+            value = os_eri_rec(ax, ay, az, bx, by, bz, cx + 1, cy, cz, dx - 1, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + CDx * os_eri_rec(ax, ay, az, bx, by, bz, cx, cy, cz, dx - 1, dy, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        elif dy >= dz:
+            value = os_eri_rec(ax, ay, az, bx, by, bz, cx, cy + 1, cz, dx, dy - 1, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + CDy * os_eri_rec(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy - 1, dz, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+        else:
+            value = os_eri_rec(ax, ay, az, bx, by, bz, cx, cy, cz + 1, dx, dy, dz - 1, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates) + CDz * os_eri_rec(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz - 1, m, p, q, z, rho, T, base_pref, PAx, PAy, PAz, PBx, PBy, PBz, QCx, QCy, QCz, QDx, QDy, QDz, PQx, PQy, PQz, ABx, ABy, ABz, CDx, CDy, CDz, states, values, nstates)
+
+    if nstates[0] < OS_MAX_STATES:
+        off = nstates[0] * 13
+        states[off] = ax; states[off + 1] = ay; states[off + 2] = az
+        states[off + 3] = bx; states[off + 4] = by; states[off + 5] = bz
+        states[off + 6] = cx; states[off + 7] = cy; states[off + 8] = cz
+        states[off + 9] = dx; states[off + 10] = dy; states[off + 11] = dz
+        states[off + 12] = m
+        values[nstates[0]] = value
+        nstates[0] += 1
+    return value
+
+
+cdef inline int os_state_matches_arr(int* states, int idx, int* ang, int m) noexcept nogil:
+    cdef int off = idx * 13
+    cdef int i
+    for i in range(12):
+        if states[off + i] != ang[i]:
+            return 0
+    return states[off + 12] == m
+
+
+cdef inline void os_copy_state(int* dst, int* src) noexcept nogil:
+    cdef int i
+    for i in range(12):
+        dst[i] = src[i]
+
+
+cdef inline int os_axis_of_max3(int a, int b, int c) noexcept nogil:
+    if a >= b and a >= c:
+        return 0
+    if b >= c:
+        return 1
+    return 2
+
+
+cdef inline uint64_t os_pack_key(int* ang, int m) noexcept nogil:
+    cdef uint64_t key = <uint64_t>(m & 15)
+    cdef int i
+    for i in range(12):
+        key = (key << 4) | <uint64_t>(ang[i] & 15)
+    return key + 1
+
+
+cdef inline int os_hash_slot(uint64_t key) noexcept nogil:
+    key ^= key >> 33
+    key *= <uint64_t>0xff51afd7ed558ccd
+    key ^= key >> 33
+    return <int>(key & <uint64_t>(OS_HASH_CAP - 1))
+
+
+cdef inline size_t os_vrr_idx(
+    int ax, int ay, int az,
+    int cx, int cy, int cz,
+    int m,
+    int adim,
+    int cdim,
+    int mdim,
+) noexcept nogil:
+    return (
+        (((((<size_t>ax * <size_t>adim + <size_t>ay) * <size_t>adim + <size_t>az)
+        * <size_t>cdim + <size_t>cx) * <size_t>cdim + <size_t>cy)
+        * <size_t>cdim + <size_t>cz) * <size_t>mdim + <size_t>m
+    )
+
+
+cdef inline double os_vrr_get(
+    double* table,
+    int ax, int ay, int az,
+    int cx, int cy, int cz,
+    int m,
+    int max_a,
+    int max_c,
+    int max_m,
+    int adim,
+    int cdim,
+    int mdim,
+) noexcept nogil:
+    if ax < 0 or ay < 0 or az < 0 or cx < 0 or cy < 0 or cz < 0 or m < 0:
+        return 0.0
+    if ax + ay + az > max_a or cx + cy + cz > max_c or m > max_m:
+        return 0.0
+    return table[os_vrr_idx(ax, ay, az, cx, cy, cz, m, adim, cdim, mdim)]
+
+
+cdef inline double os_vrr_get_raw(
+    double* table,
+    int ax, int ay, int az,
+    int cx, int cy, int cz,
+    int m,
+    int adim,
+    int cdim,
+    int mdim,
+) noexcept nogil:
+    return table[os_vrr_idx(ax, ay, az, cx, cy, cz, m, adim, cdim, mdim)]
+
+
+cdef inline void os_vrr_set(
+    double* table,
+    int ax, int ay, int az,
+    int cx, int cy, int cz,
+    int m,
+    int adim,
+    int cdim,
+    int mdim,
+    double value,
+) noexcept nogil:
+    table[os_vrr_idx(ax, ay, az, cx, cy, cz, m, adim, cdim, mdim)] = value
+
+
+cdef void os_fill_vrr_table(
+    double* table,
+    int max_a,
+    int max_c,
+    int max_m,
+    double p,
+    double q,
+    double z,
+    double T,
+    double base_pref,
+    double* PA,
+    double* QC,
+    double* PQ,
+) noexcept nogil:
+    cdef int adim = max_a + 1
+    cdef int cdim = max_c + 1
+    cdef int mdim = max_m + 1
+    cdef int m, total, ax, ay, az, cx, cy, cz, asum, csum, axis
+    cdef double value
+
+    for m in range(max_m + 1):
+        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, base_pref * boys_fn(m, T))
+
+    for total in range(1, max_m + 1):
+        for ax in range(max_a + 1):
+            for ay in range(max_a + 1 - ax):
+                for az in range(max_a + 1 - ax - ay):
+                    asum = ax + ay + az
+                    for cx in range(max_c + 1):
+                        for cy in range(max_c + 1 - cx):
+                            for cz in range(max_c + 1 - cx - cy):
+                                csum = cx + cy + cz
+                                if asum + csum != total:
+                                    continue
+                                for m in range(max_m - total + 1):
+                                    if asum > 0:
+                                        axis = os_axis_of_max3(ax, ay, az)
+                                        if axis == 0:
+                                            value = (
+                                                PA[0] * os_vrr_get_raw(table, ax - 1, ay, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                - q / z * PQ[0] * os_vrr_get_raw(table, ax - 1, ay, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if ax - 1 > 0:
+                                                value += (ax - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax - 2, ay, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - q / z * os_vrr_get_raw(table, ax - 2, ay, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cx > 0:
+                                                value += cx / (2.0 * z) * os_vrr_get_raw(table, ax - 1, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                        elif axis == 1:
+                                            value = (
+                                                PA[1] * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                - q / z * PQ[1] * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if ay - 1 > 0:
+                                                value += (ay - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax, ay - 2, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - q / z * os_vrr_get_raw(table, ax, ay - 2, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cy > 0:
+                                                value += cy / (2.0 * z) * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                        else:
+                                            value = (
+                                                PA[2] * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz, m, adim, cdim, mdim)
+                                                - q / z * PQ[2] * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if az - 1 > 0:
+                                                value += (az - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax, ay, az - 2, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - q / z * os_vrr_get_raw(table, ax, ay, az - 2, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cz > 0:
+                                                value += cz / (2.0 * z) * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                    else:
+                                        axis = os_axis_of_max3(cx, cy, cz)
+                                        if axis == 0:
+                                            value = (
+                                                QC[0] * os_vrr_get_raw(table, ax, ay, az, cx - 1, cy, cz, m, adim, cdim, mdim)
+                                                + p / z * PQ[0] * os_vrr_get_raw(table, ax, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cx - 1 > 0:
+                                                value += (cx - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx - 2, cy, cz, m, adim, cdim, mdim)
+                                                    - p / z * os_vrr_get_raw(table, ax, ay, az, cx - 2, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if ax > 0:
+                                                value += ax / (2.0 * z) * os_vrr_get_raw(table, ax - 1, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                        elif axis == 1:
+                                            value = (
+                                                QC[1] * os_vrr_get_raw(table, ax, ay, az, cx, cy - 1, cz, m, adim, cdim, mdim)
+                                                + p / z * PQ[1] * os_vrr_get_raw(table, ax, ay, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cy - 1 > 0:
+                                                value += (cy - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx, cy - 2, cz, m, adim, cdim, mdim)
+                                                    - p / z * os_vrr_get_raw(table, ax, ay, az, cx, cy - 2, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if ay > 0:
+                                                value += ay / (2.0 * z) * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                        else:
+                                            value = (
+                                                QC[2] * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 1, m, adim, cdim, mdim)
+                                                + p / z * PQ[2] * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cz - 1 > 0:
+                                                value += (cz - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 2, m, adim, cdim, mdim)
+                                                    - p / z * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 2, m + 1, adim, cdim, mdim)
+                                                )
+                                            if az > 0:
+                                                value += az / (2.0 * z) * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                    os_vrr_set(table, ax, ay, az, cx, cy, cz, m, adim, cdim, mdim, value)
+
+
+cdef double os_vrr_hrr_eval(
+    double* table,
+    int ax, int ay, int az,
+    int bx, int by, int bz,
+    int cx, int cy, int cz,
+    int dxx, int dyy, int dzz,
+    int m,
+    int max_a,
+    int max_c,
+    int max_m,
+    double* AB,
+    double* CD,
+) noexcept nogil:
+    cdef int axis
+    cdef int adim = max_a + 1
+    cdef int cdim = max_c + 1
+    cdef int mdim = max_m + 1
+    if bx + by + bz > 0:
+        axis = os_axis_of_max3(bx, by, bz)
+        if axis == 0:
+            return (
+                os_vrr_hrr_eval(table, ax + 1, ay, az, bx - 1, by, bz, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+                + AB[0] * os_vrr_hrr_eval(table, ax, ay, az, bx - 1, by, bz, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+            )
+        if axis == 1:
+            return (
+                os_vrr_hrr_eval(table, ax, ay + 1, az, bx, by - 1, bz, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+                + AB[1] * os_vrr_hrr_eval(table, ax, ay, az, bx, by - 1, bz, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+            )
+        return (
+            os_vrr_hrr_eval(table, ax, ay, az + 1, bx, by, bz - 1, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+            + AB[2] * os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz - 1, cx, cy, cz, dxx, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+        )
+    if dxx + dyy + dzz > 0:
+        axis = os_axis_of_max3(dxx, dyy, dzz)
+        if axis == 0:
+            return (
+                os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx + 1, cy, cz, dxx - 1, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+                + CD[0] * os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx, cy, cz, dxx - 1, dyy, dzz, m, max_a, max_c, max_m, AB, CD)
+            )
+        if axis == 1:
+            return (
+                os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx, cy + 1, cz, dxx, dyy - 1, dzz, m, max_a, max_c, max_m, AB, CD)
+                + CD[1] * os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx, cy, cz, dxx, dyy - 1, dzz, m, max_a, max_c, max_m, AB, CD)
+            )
+        return (
+            os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx, cy, cz + 1, dxx, dyy, dzz - 1, m, max_a, max_c, max_m, AB, CD)
+            + CD[2] * os_vrr_hrr_eval(table, ax, ay, az, bx, by, bz, cx, cy, cz, dxx, dyy, dzz - 1, m, max_a, max_c, max_m, AB, CD)
+        )
+    return os_vrr_get(table, ax, ay, az, cx, cy, cz, m, max_a, max_c, max_m, adim, cdim, mdim)
+
+
+cdef inline double os_pow_small(double x, int n) noexcept nogil:
+    if n == 0:
+        return 1.0
+    if n == 1:
+        return x
+    if n == 2:
+        return x * x
+    if n == 3:
+        return x * x * x
+    return x * x * x * x
+
+
+cdef inline double os_binom_small(int n, int k) noexcept nogil:
+    if k < 0 or k > n:
+        return 0.0
+    if k == 0 or k == n:
+        return 1.0
+    if n == 2:
+        return 2.0
+    if n == 3:
+        if k == 1 or k == 2:
+            return 3.0
+    if n == 4:
+        if k == 1 or k == 3:
+            return 4.0
+        if k == 2:
+            return 6.0
+    return 1.0
+
+
+cdef double os_vrr_hrr_eval_expanded(
+    double* table,
+    int ax, int ay, int az,
+    int bx, int by, int bz,
+    int cx, int cy, int cz,
+    int dxx, int dyy, int dzz,
+    int m,
+    int max_a,
+    int max_c,
+    int max_m,
+    double* AB,
+    double* CD,
+) noexcept nogil:
+    cdef int ix, iy, iz, jx, jy, jz
+    cdef int adim = max_a + 1
+    cdef int cdim = max_c + 1
+    cdef int mdim = max_m + 1
+    cdef double coeff_b, coeff_d, value = 0.0
+
+    for ix in range(bx + 1):
+        for iy in range(by + 1):
+            for iz in range(bz + 1):
+                coeff_b = (
+                    os_binom_small(bx, ix) * os_pow_small(AB[0], bx - ix)
+                    * os_binom_small(by, iy) * os_pow_small(AB[1], by - iy)
+                    * os_binom_small(bz, iz) * os_pow_small(AB[2], bz - iz)
+                )
+                for jx in range(dxx + 1):
+                    for jy in range(dyy + 1):
+                        for jz in range(dzz + 1):
+                            coeff_d = (
+                                os_binom_small(dxx, jx) * os_pow_small(CD[0], dxx - jx)
+                                * os_binom_small(dyy, jy) * os_pow_small(CD[1], dyy - jy)
+                                * os_binom_small(dzz, jz) * os_pow_small(CD[2], dzz - jz)
+                            )
+                            value += coeff_b * coeff_d * os_vrr_get_raw(
+                                table,
+                                ax + ix,
+                                ay + iy,
+                                az + iz,
+                                cx + jx,
+                                cy + jy,
+                                cz + jz,
+                                m,
+                                adim,
+                                cdim,
+                                mdim,
+                            )
+    return value
+
+
+cdef inline void os_add_dep(
+    int dep_ang[8][12],
+    int* dep_m,
+    int* ndep,
+    int* src,
+    int m,
+) noexcept nogil:
+    cdef int i
+    if ndep[0] >= 8:
+        return
+    for i in range(12):
+        dep_ang[ndep[0]][i] = src[i]
+    dep_m[ndep[0]] = m
+    ndep[0] += 1
+
+
+cdef inline int os_state_is_negative(int* ang) noexcept nogil:
+    cdef int i
+    for i in range(12):
+        if ang[i] < 0:
+            return 1
+    return 0
+
+
+cdef inline int os_find_value(
+    uint64_t* keys,
+    double* values,
+    uint64_t key,
+    double* value,
+) noexcept nogil:
+    cdef int slot = os_hash_slot(key)
+    cdef int probe
+    for probe in range(OS_HASH_CAP):
+        if keys[slot] == 0:
+            return 0
+        if keys[slot] == key:
+            value[0] = values[slot]
+            return 1
+        slot = (slot + 1) & (OS_HASH_CAP - 1)
+    return 0
+
+
+cdef inline double os_lookup_value(
+    int* ang,
+    int m,
+    uint64_t* keys,
+    double* values,
+) noexcept nogil:
+    cdef uint64_t key
+    cdef double value[1]
+    if os_state_is_negative(ang):
+        return 0.0
+    key = os_pack_key(ang, m)
+    if os_find_value(keys, values, key, value):
+        return value[0]
+    return 0.0
+
+
+cdef inline void os_store_value(
+    int* ang,
+    int m,
+    double value,
+    uint64_t* keys,
+    double* values,
+    int* nstates,
+) noexcept nogil:
+    cdef uint64_t key = os_pack_key(ang, m)
+    cdef int slot = os_hash_slot(key)
+    cdef int probe
+    for probe in range(OS_HASH_CAP):
+        if keys[slot] == 0:
+            keys[slot] = key
+            values[slot] = value
+            nstates[0] += 1
+            return
+        if keys[slot] == key:
+            values[slot] = value
+            return
+        slot = (slot + 1) & (OS_HASH_CAP - 1)
+
+
+cdef inline int os_fill_deps(
+    int* ang,
+    int m,
+    int dep_ang[8][12],
+    int* dep_m,
+) noexcept nogil:
+    cdef int axis
+    cdef int ndep[1]
+    cdef int na = ang[0] + ang[1] + ang[2]
+    cdef int nb = ang[3] + ang[4] + ang[5]
+    cdef int nc = ang[6] + ang[7] + ang[8]
+    cdef int nd = ang[9] + ang[10] + ang[11]
+    cdef int prev[12]
+    cdef int tmp[12]
+
+    ndep[0] = 0
+    if os_state_is_negative(ang):
+        return 0
+    if na == 0 and nb == 0 and nc == 0 and nd == 0:
+        return 0
+
+    if na > 0:
+        axis = os_axis_of_max3(ang[0], ang[1], ang[2])
+        os_copy_state(prev, ang)
+        prev[axis] -= 1
+        os_add_dep(dep_ang, dep_m, ndep, prev, m)
+        os_add_dep(dep_ang, dep_m, ndep, prev, m + 1)
+        if prev[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+    elif nc > 0:
+        axis = os_axis_of_max3(ang[6], ang[7], ang[8])
+        os_copy_state(prev, ang)
+        prev[6 + axis] -= 1
+        os_add_dep(dep_ang, dep_m, ndep, prev, m)
+        os_add_dep(dep_ang, dep_m, ndep, prev, m + 1)
+        if prev[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            os_add_dep(dep_ang, dep_m, ndep, tmp, m + 1)
+    elif nb > 0:
+        axis = os_axis_of_max3(ang[3], ang[4], ang[5])
+        os_copy_state(prev, ang)
+        prev[3 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[axis] += 1
+        os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+        os_add_dep(dep_ang, dep_m, ndep, prev, m)
+    elif nd > 0:
+        axis = os_axis_of_max3(ang[9], ang[10], ang[11])
+        os_copy_state(prev, ang)
+        prev[9 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[6 + axis] += 1
+        os_add_dep(dep_ang, dep_m, ndep, tmp, m)
+        os_add_dep(dep_ang, dep_m, ndep, prev, m)
+
+    return ndep[0]
+
+
+cdef inline double os_compute_from_table(
+    int* ang,
+    int m,
+    double p, double q, double z, double T, double base_pref,
+    double* PA,
+    double* QC,
+    double* PQ,
+    double* AB,
+    double* CD,
+    uint64_t* keys,
+    double* values,
+) noexcept nogil:
+    cdef int axis
+    cdef int na = ang[0] + ang[1] + ang[2]
+    cdef int nb = ang[3] + ang[4] + ang[5]
+    cdef int nc = ang[6] + ang[7] + ang[8]
+    cdef int nd = ang[9] + ang[10] + ang[11]
+    cdef int prev[12]
+    cdef int tmp[12]
+    cdef double value
+
+    if os_state_is_negative(ang):
+        return 0.0
+    if na == 0 and nb == 0 and nc == 0 and nd == 0:
+        return base_pref * boys_fn(m, T)
+
+    if na > 0:
+        axis = os_axis_of_max3(ang[0], ang[1], ang[2])
+        os_copy_state(prev, ang)
+        prev[axis] -= 1
+        value = (
+            PA[axis] * os_lookup_value(prev, m, keys, values)
+            - q / z * PQ[axis] * os_lookup_value(prev, m + 1, keys, values)
+        )
+        if prev[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            value += prev[axis] / (2.0 * p) * (
+                os_lookup_value(tmp, m, keys, values)
+                - q / z * os_lookup_value(tmp, m + 1, keys, values)
+            )
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            value += ang[3 + axis] / (2.0 * p) * (
+                os_lookup_value(tmp, m, keys, values)
+                - q / z * os_lookup_value(tmp, m + 1, keys, values)
+            )
+        if ang[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            value += ang[6 + axis] / (2.0 * z) * os_lookup_value(tmp, m + 1, keys, values)
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            value += ang[9 + axis] / (2.0 * z) * os_lookup_value(tmp, m + 1, keys, values)
+    elif nc > 0:
+        axis = os_axis_of_max3(ang[6], ang[7], ang[8])
+        os_copy_state(prev, ang)
+        prev[6 + axis] -= 1
+        value = (
+            QC[axis] * os_lookup_value(prev, m, keys, values)
+            + p / z * PQ[axis] * os_lookup_value(prev, m + 1, keys, values)
+        )
+        if prev[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            value += prev[6 + axis] / (2.0 * q) * (
+                os_lookup_value(tmp, m, keys, values)
+                - p / z * os_lookup_value(tmp, m + 1, keys, values)
+            )
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            value += ang[9 + axis] / (2.0 * q) * (
+                os_lookup_value(tmp, m, keys, values)
+                - p / z * os_lookup_value(tmp, m + 1, keys, values)
+            )
+        if ang[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            value += ang[axis] / (2.0 * z) * os_lookup_value(tmp, m + 1, keys, values)
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            value += ang[3 + axis] / (2.0 * z) * os_lookup_value(tmp, m + 1, keys, values)
+    elif nb > 0:
+        axis = os_axis_of_max3(ang[3], ang[4], ang[5])
+        os_copy_state(prev, ang)
+        prev[3 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[axis] += 1
+        value = os_lookup_value(tmp, m, keys, values) + AB[axis] * os_lookup_value(prev, m, keys, values)
+    else:
+        axis = os_axis_of_max3(ang[9], ang[10], ang[11])
+        os_copy_state(prev, ang)
+        prev[9 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[6 + axis] += 1
+        value = os_lookup_value(tmp, m, keys, values) + CD[axis] * os_lookup_value(prev, m, keys, values)
+
+    return value
+
+
+cdef double os_eri_eval_iterative(
+    int* target,
+    int m,
+    double p, double q, double z, double T, double base_pref,
+    double* PA,
+    double* QC,
+    double* PQ,
+    double* AB,
+    double* CD,
+    uint64_t* keys,
+    double* values,
+    int* nstates,
+    int* stack_ang,
+    int* stack_m,
+) noexcept nogil:
+    cdef int sp = 1
+    cdef int i, d, ndep, missing
+    cdef int* cur
+    cdef int* dep
+    cdef uint64_t key
+    cdef double value[1]
+    cdef int dep_ang[8][12]
+    cdef int dep_m[8]
+
+    for i in range(12):
+        stack_ang[i] = target[i]
+    stack_m[0] = m
+
+    while sp > 0:
+        cur = stack_ang + (sp - 1) * 12
+        if os_state_is_negative(cur):
+            sp -= 1
+            continue
+
+        key = os_pack_key(cur, stack_m[sp - 1])
+        if os_find_value(keys, values, key, value):
+            sp -= 1
+            continue
+
+        ndep = os_fill_deps(cur, stack_m[sp - 1], dep_ang, dep_m)
+        missing = 0
+        for d in range(ndep):
+            dep = &dep_ang[d][0]
+            if os_state_is_negative(dep):
+                continue
+            key = os_pack_key(dep, dep_m[d])
+            if not os_find_value(keys, values, key, value):
+                if sp >= OS_HASH_CAP:
+                    return os_eri_rec_generic(
+                        target, m, p, q, z, T, base_pref,
+                        PA, QC, PQ, AB, CD, keys, values, nstates,
+                    )
+                for i in range(12):
+                    stack_ang[sp * 12 + i] = dep[i]
+                stack_m[sp] = dep_m[d]
+                sp += 1
+                missing = 1
+                break
+        if missing:
+            continue
+
+        value[0] = os_compute_from_table(
+            cur, stack_m[sp - 1], p, q, z, T, base_pref,
+            PA, QC, PQ, AB, CD, keys, values,
+        )
+        os_store_value(cur, stack_m[sp - 1], value[0], keys, values, nstates)
+        sp -= 1
+
+    return os_lookup_value(target, m, keys, values)
+
+
+cdef double os_eri_rec_generic(
+    int* ang,
+    int m,
+    double p, double q, double z, double T, double base_pref,
+    double* PA,
+    double* QC,
+    double* PQ,
+    double* AB,
+    double* CD,
+    uint64_t* keys,
+    double* values,
+    int* nstates,
+) noexcept nogil:
+    cdef int i, axis, slot, probe
+    cdef int na = ang[0] + ang[1] + ang[2]
+    cdef int nb = ang[3] + ang[4] + ang[5]
+    cdef int nc = ang[6] + ang[7] + ang[8]
+    cdef int nd = ang[9] + ang[10] + ang[11]
+    cdef int prev[12]
+    cdef int tmp[12]
+    cdef double value
+    cdef uint64_t key
+
+    for i in range(12):
+        if ang[i] < 0:
+            return 0.0
+
+    key = os_pack_key(ang, m)
+    slot = os_hash_slot(key)
+    for probe in range(OS_HASH_CAP):
+        if keys[slot] == 0:
+            break
+        if keys[slot] == key:
+            return values[slot]
+        slot = (slot + 1) & (OS_HASH_CAP - 1)
+
+    if na == 0 and nb == 0 and nc == 0 and nd == 0:
+        value = base_pref * boys_fn(m, T)
+    elif na > 0:
+        axis = os_axis_of_max3(ang[0], ang[1], ang[2])
+        os_copy_state(prev, ang)
+        prev[axis] -= 1
+        value = (
+            PA[axis] * os_eri_rec_generic(prev, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            - q / z * PQ[axis] * os_eri_rec_generic(prev, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        )
+        if prev[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            value += prev[axis] / (2.0 * p) * (
+                os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+                - q / z * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            )
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            value += ang[3 + axis] / (2.0 * p) * (
+                os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+                - q / z * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            )
+        if ang[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            value += ang[6 + axis] / (2.0 * z) * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            value += ang[9 + axis] / (2.0 * z) * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+    elif nc > 0:
+        axis = os_axis_of_max3(ang[6], ang[7], ang[8])
+        os_copy_state(prev, ang)
+        prev[6 + axis] -= 1
+        value = (
+            QC[axis] * os_eri_rec_generic(prev, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            + p / z * PQ[axis] * os_eri_rec_generic(prev, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        )
+        if prev[6 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[6 + axis] -= 1
+            value += prev[6 + axis] / (2.0 * q) * (
+                os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+                - p / z * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            )
+        if ang[9 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[9 + axis] -= 1
+            value += ang[9 + axis] / (2.0 * q) * (
+                os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+                - p / z * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            )
+        if ang[axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[axis] -= 1
+            value += ang[axis] / (2.0 * z) * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        if ang[3 + axis] > 0:
+            os_copy_state(tmp, prev)
+            tmp[3 + axis] -= 1
+            value += ang[3 + axis] / (2.0 * z) * os_eri_rec_generic(tmp, m + 1, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+    elif nb > 0:
+        axis = os_axis_of_max3(ang[3], ang[4], ang[5])
+        os_copy_state(prev, ang)
+        prev[3 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[axis] += 1
+        value = (
+            os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            + AB[axis] * os_eri_rec_generic(prev, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        )
+    else:
+        axis = os_axis_of_max3(ang[9], ang[10], ang[11])
+        os_copy_state(prev, ang)
+        prev[9 + axis] -= 1
+        os_copy_state(tmp, prev)
+        tmp[6 + axis] += 1
+        value = (
+            os_eri_rec_generic(tmp, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+            + CD[axis] * os_eri_rec_generic(prev, m, p, q, z, T, base_pref, PA, QC, PQ, AB, CD, keys, values, nstates)
+        )
+
+    slot = os_hash_slot(key)
+    for probe in range(OS_HASH_CAP):
+        if keys[slot] == 0:
+            keys[slot] = key
+            values[slot] = value
+            nstates[0] += 1
+            break
+        if keys[slot] == key:
+            values[slot] = value
+            break
+        slot = (slot + 1) & (OS_HASH_CAP - 1)
+    return value
+
+
 
 
 cdef inline int precompute_primitive_pair_data(
@@ -941,6 +1898,310 @@ cpdef compute_dense_eri(
     return eri, int(computed), int(skipped)
 
 
+cdef inline void write_shell_block_symmetries(
+    double[:, :, :, ::1] eri_v,
+    double[:, :, :, ::1] block_v,
+    int p0,
+    int q0,
+    int r0,
+    int s0,
+    int np_,
+    int nq_,
+    int nr_,
+    int ns_,
+) noexcept:
+    cdef int ia, ib, ic, id_
+    cdef int p, q, r, s
+    cdef double value
+
+    for ia in range(np_):
+        p = p0 + ia
+        for ib in range(nq_):
+            q = q0 + ib
+            for ic in range(nr_):
+                r = r0 + ic
+                for id_ in range(ns_):
+                    s = s0 + id_
+                    value = block_v[ia, ib, ic, id_]
+                    eri_v[p, q, r, s] = value
+                    eri_v[q, p, r, s] = value
+                    eri_v[p, q, s, r] = value
+                    eri_v[q, p, s, r] = value
+                    eri_v[r, s, p, q] = value
+                    eri_v[s, r, p, q] = value
+                    eri_v[r, s, q, p] = value
+                    eri_v[s, r, q, p] = value
+
+
+cdef inline void write_eri_symmetries(
+    double[:, :, :, ::1] eri_v,
+    int p,
+    int q,
+    int r,
+    int s,
+    double value,
+) noexcept:
+    eri_v[p, q, r, s] = value
+    eri_v[q, p, r, s] = value
+    eri_v[p, q, s, r] = value
+    eri_v[q, p, s, r] = value
+    eri_v[r, s, p, q] = value
+    eri_v[s, r, p, q] = value
+    eri_v[r, s, q, p] = value
+    eri_v[s, r, q, p] = value
+
+
+cdef inline int eri_same4(
+    int a0,
+    int a1,
+    int a2,
+    int a3,
+    int b0,
+    int b1,
+    int b2,
+    int b3,
+) noexcept nogil:
+    return a0 == b0 and a1 == b1 and a2 == b2 and a3 == b3
+
+
+cdef inline void add_eri_symmetries_unique(
+    double[:, :, :, ::1] eri_v,
+    int p,
+    int q,
+    int r,
+    int s,
+    double value,
+) noexcept:
+    if p != q and r != s and not (p == r and q == s):
+        eri_v[p, q, r, s] += value
+        eri_v[q, p, r, s] += value
+        eri_v[p, q, s, r] += value
+        eri_v[q, p, s, r] += value
+        eri_v[r, s, p, q] += value
+        eri_v[s, r, p, q] += value
+        eri_v[r, s, q, p] += value
+        eri_v[s, r, q, p] += value
+        return
+    if p == q:
+        if r == s:
+            eri_v[p, p, r, r] += value
+            if p != r:
+                eri_v[r, r, p, p] += value
+            return
+        eri_v[p, p, r, s] += value
+        eri_v[p, p, s, r] += value
+        eri_v[r, s, p, p] += value
+        eri_v[s, r, p, p] += value
+        return
+    if r == s:
+        eri_v[p, q, r, r] += value
+        eri_v[q, p, r, r] += value
+        eri_v[r, r, p, q] += value
+        eri_v[r, r, q, p] += value
+        return
+    if p == r and q == s:
+        eri_v[p, q, p, q] += value
+        eri_v[q, p, p, q] += value
+        eri_v[p, q, q, p] += value
+        eri_v[q, p, q, p] += value
+        return
+
+    eri_v[p, q, r, s] += value
+    if not eri_same4(q, p, r, s, p, q, r, s):
+        eri_v[q, p, r, s] += value
+    if not eri_same4(p, q, s, r, p, q, r, s) and not eri_same4(p, q, s, r, q, p, r, s):
+        eri_v[p, q, s, r] += value
+    if not eri_same4(q, p, s, r, p, q, r, s) and not eri_same4(q, p, s, r, q, p, r, s) and not eri_same4(q, p, s, r, p, q, s, r):
+        eri_v[q, p, s, r] += value
+    if not eri_same4(r, s, p, q, p, q, r, s) and not eri_same4(r, s, p, q, q, p, r, s) and not eri_same4(r, s, p, q, p, q, s, r) and not eri_same4(r, s, p, q, q, p, s, r):
+        eri_v[r, s, p, q] += value
+    if not eri_same4(s, r, p, q, p, q, r, s) and not eri_same4(s, r, p, q, q, p, r, s) and not eri_same4(s, r, p, q, p, q, s, r) and not eri_same4(s, r, p, q, q, p, s, r) and not eri_same4(s, r, p, q, r, s, p, q):
+        eri_v[s, r, p, q] += value
+    if not eri_same4(r, s, q, p, p, q, r, s) and not eri_same4(r, s, q, p, q, p, r, s) and not eri_same4(r, s, q, p, p, q, s, r) and not eri_same4(r, s, q, p, q, p, s, r) and not eri_same4(r, s, q, p, r, s, p, q) and not eri_same4(r, s, q, p, s, r, p, q):
+        eri_v[r, s, q, p] += value
+    if not eri_same4(s, r, q, p, p, q, r, s) and not eri_same4(s, r, q, p, q, p, r, s) and not eri_same4(s, r, q, p, p, q, s, r) and not eri_same4(s, r, q, p, q, p, s, r) and not eri_same4(s, r, q, p, r, s, p, q) and not eri_same4(s, r, q, p, s, r, p, q) and not eri_same4(s, r, q, p, r, s, q, p):
+        eri_v[s, r, q, p] += value
+
+
+cdef int compute_shell_quartet_vrr_hrr_into_eri(
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] origins_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    double[:, :, :, ::1] eri_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int r0,
+    int r1,
+    int s0,
+    int s1,
+    int pair_cap,
+    double* pq_a,
+    double* pq_b,
+    double* pq_p,
+    double* pq_px,
+    double* pq_py,
+    double* pq_pz,
+    int npq,
+    double* rs_a,
+    double* rs_b,
+    double* rs_p,
+    double* rs_px,
+    double* rs_py,
+    double* rs_pz,
+    int nrs,
+    double* vrr_table,
+    size_t vrr_table_cap,
+) noexcept:
+    cdef int np_ = p1 - p0
+    cdef int nq_ = q1 - q0
+    cdef int nr_ = r1 - r0
+    cdef int ns_ = s1 - s0
+    cdef int lA, lB, lC, lD, max_a_l, max_c_l, max_m_l
+    cdef int ia, ib, ic, id_, idx_pq, idx_rs, ip, iq, ir, is_
+    cdef int ao_p, ao_q, ao_r, ao_s
+    cdef int64_t pair_pq_ao, pair_rs_ao
+    cdef int ax[OS_VRR_MAX_CART]
+    cdef int ay[OS_VRR_MAX_CART]
+    cdef int az[OS_VRR_MAX_CART]
+    cdef int bx[OS_VRR_MAX_CART]
+    cdef int by[OS_VRR_MAX_CART]
+    cdef int bz[OS_VRR_MAX_CART]
+    cdef int cx[OS_VRR_MAX_CART]
+    cdef int cy[OS_VRR_MAX_CART]
+    cdef int cz[OS_VRR_MAX_CART]
+    cdef int dxc[OS_VRR_MAX_CART]
+    cdef int dyc[OS_VRR_MAX_CART]
+    cdef int dzc[OS_VRR_MAX_CART]
+    cdef size_t vrr_table_size
+    cdef double abx, aby, abz, cdx, cdy, cdz
+    cdef double zeta, alpha, dx, dy, dz, pq2, ab2, cd2, T, base_pref
+    cdef double prefac, value
+    cdef double PA[3]
+    cdef double QC[3]
+    cdef double PQ[3]
+    cdef double AB[3]
+    cdef double CD[3]
+
+    lA = <int>shells_v[p0, 0] + <int>shells_v[p0, 1] + <int>shells_v[p0, 2]
+    lB = <int>shells_v[q0, 0] + <int>shells_v[q0, 1] + <int>shells_v[q0, 2]
+    lC = <int>shells_v[r0, 0] + <int>shells_v[r0, 1] + <int>shells_v[r0, 2]
+    lD = <int>shells_v[s0, 0] + <int>shells_v[s0, 1] + <int>shells_v[s0, 2]
+    max_a_l = lA + lB
+    max_c_l = lC + lD
+    max_m_l = max_a_l + max_c_l
+    if max_a_l > OS_VRR_PAIR_MAX_L or max_c_l > OS_VRR_PAIR_MAX_L:
+        return 0
+    if np_ != ncart_for_l(lA) or nq_ != ncart_for_l(lB) or nr_ != ncart_for_l(lC) or ns_ != ncart_for_l(lD):
+        return 0
+
+    vrr_table_size = (
+        <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1)
+        * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1)
+        * <size_t>(max_m_l + 1)
+    )
+    if vrr_table == NULL or vrr_table_size > vrr_table_cap:
+        return 0
+
+    fill_cartesian_components(lA, ax, ay, az)
+    fill_cartesian_components(lB, bx, by, bz)
+    fill_cartesian_components(lC, cx, cy, cz)
+    fill_cartesian_components(lD, dxc, dyc, dzc)
+
+    abx = origins_v[p0, 0] - origins_v[q0, 0]
+    aby = origins_v[p0, 1] - origins_v[q0, 1]
+    abz = origins_v[p0, 2] - origins_v[q0, 2]
+    cdx = origins_v[r0, 0] - origins_v[s0, 0]
+    cdy = origins_v[r0, 1] - origins_v[s0, 1]
+    cdz = origins_v[r0, 2] - origins_v[s0, 2]
+    ab2 = abx * abx + aby * aby + abz * abz
+    cd2 = cdx * cdx + cdy * cdy + cdz * cdz
+    AB[0] = abx; AB[1] = aby; AB[2] = abz
+    CD[0] = cdx; CD[1] = cdy; CD[2] = cdz
+
+    for idx_pq in range(npq):
+        ip = idx_pq // <int>nprim_v[q0]
+        iq = idx_pq - ip * <int>nprim_v[q0]
+        for idx_rs in range(nrs):
+            ir = idx_rs // <int>nprim_v[s0]
+            is_ = idx_rs - ir * <int>nprim_v[s0]
+            zeta = pq_p[idx_pq] + rs_p[idx_rs]
+            alpha = pq_p[idx_pq] * rs_p[idx_rs] / zeta
+            dx = pq_px[idx_pq] - rs_px[idx_rs]
+            dy = pq_py[idx_pq] - rs_py[idx_rs]
+            dz = pq_pz[idx_pq] - rs_pz[idx_rs]
+            pq2 = dx * dx + dy * dy + dz * dz
+            T = alpha * pq2
+            base_pref = (
+                ERI_PREFAC
+                * exp(-(pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]) * ab2)
+                * exp(-(rs_a[idx_rs] * rs_b[idx_rs] / rs_p[idx_rs]) * cd2)
+                / (pq_p[idx_pq] * rs_p[idx_rs] * sqrt(zeta))
+            )
+            PA[0] = pq_px[idx_pq] - origins_v[p0, 0]
+            PA[1] = pq_py[idx_pq] - origins_v[p0, 1]
+            PA[2] = pq_pz[idx_pq] - origins_v[p0, 2]
+            QC[0] = rs_px[idx_rs] - origins_v[r0, 0]
+            QC[1] = rs_py[idx_rs] - origins_v[r0, 1]
+            QC[2] = rs_pz[idx_rs] - origins_v[r0, 2]
+            PQ[0] = dx; PQ[1] = dy; PQ[2] = dz
+            os_fill_vrr_table(
+                vrr_table,
+                max_a_l,
+                max_c_l,
+                max_m_l,
+                pq_p[idx_pq],
+                rs_p[idx_rs],
+                zeta,
+                T,
+                base_pref,
+                PA,
+                QC,
+                PQ,
+            )
+            for ia in range(np_):
+                ao_p = p0 + ia
+                for ib in range(nq_):
+                    ao_q = q0 + ib
+                    for ic in range(nr_):
+                        ao_r = r0 + ic
+                        for id_ in range(ns_):
+                            ao_s = s0 + id_
+                            if ao_p < ao_q:
+                                continue
+                            if ao_r < ao_s:
+                                continue
+                            if p0 == r0 and q0 == s0:
+                                pair_pq_ao = (<int64_t>ao_p * (<int64_t>ao_p + 1)) // 2 + <int64_t>ao_q
+                                pair_rs_ao = (<int64_t>ao_r * (<int64_t>ao_r + 1)) // 2 + <int64_t>ao_s
+                                if pair_pq_ao < pair_rs_ao:
+                                    continue
+                            prefac = (
+                                weights_v[ao_p, ip] * weights_v[ao_q, iq]
+                                * weights_v[ao_r, ir] * weights_v[ao_s, is_]
+                            )
+                            value = prefac * os_vrr_hrr_eval_expanded(
+                                vrr_table,
+                                ax[ia], ay[ia], az[ia],
+                                bx[ib], by[ib], bz[ib],
+                                cx[ic], cy[ic], cz[ic],
+                                dxc[id_], dyc[id_], dzc[id_],
+                                0,
+                                max_a_l,
+                                max_c_l,
+                                max_m_l,
+                                AB,
+                                CD,
+                            )
+                            add_eri_symmetries_unique(
+                                eri_v, ao_p, ao_q, ao_r, ao_s, value
+                            )
+
+    return 1
+
+
 cpdef compute_dense_eri_blocked(
     cnp.ndarray[int64_t, ndim=2] shells,
     cnp.ndarray[double, ndim=2] origins,
@@ -960,10 +2221,33 @@ cpdef compute_dense_eri_blocked(
     cdef int p0, p1, q0, q1, r0, r1, s0, s1
     cdef int ip, iq, ir, is_
     cdef int np_, nq_, nr_, ns_, lsh_max
+    cdef int max_prim = exps.shape[1]
+    cdef int pair_cap = max_prim * max_prim
+    cdef int pair_idx, pq_pair_idx, rs_pair_idx, direct_done
     cdef int64_t computed = 0
     cdef int64_t skipped = 0
     cdef double bound_pq, bound_rs, value
     cdef double* shell_pair_bounds
+    cdef int* shell_pair_n
+    cdef double* shell_pair_a
+    cdef double* shell_pair_b
+    cdef double* shell_pair_p
+    cdef double* shell_pair_px
+    cdef double* shell_pair_py
+    cdef double* shell_pair_pz
+    cdef double* direct_vrr_table
+    cdef size_t pq_offset, rs_offset, pair_storage_size
+    cdef size_t direct_vrr_table_cap = (
+        <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(2 * OS_VRR_PAIR_MAX_L + 1)
+    )
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
     cdef int64_t[::1] shell_starts_v = shell_starts
     cdef int64_t[::1] shell_stops_v = shell_stops
     cdef double[:, ::1] pair_bounds_v = pair_bounds
@@ -971,7 +2255,19 @@ cpdef compute_dense_eri_blocked(
     cdef double[:, :, :, ::1] block_v
 
     shell_pair_bounds = <double*>malloc(nshell * nshell * sizeof(double))
-    if shell_pair_bounds == NULL:
+    shell_pair_n = <int*>malloc(nshell * nshell * sizeof(int))
+    pair_storage_size = <size_t>nshell * <size_t>nshell * <size_t>pair_cap
+    shell_pair_a = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_b = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_p = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_px = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_py = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_pz = <double*>malloc(pair_storage_size * sizeof(double))
+    direct_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    if shell_pair_bounds == NULL or shell_pair_n == NULL or shell_pair_a == NULL or shell_pair_b == NULL or shell_pair_p == NULL or shell_pair_px == NULL or shell_pair_py == NULL or shell_pair_pz == NULL or direct_vrr_table == NULL:
+        free(shell_pair_bounds); free(shell_pair_n)
+        free(shell_pair_a); free(shell_pair_b); free(shell_pair_p); free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+        free(direct_vrr_table)
         return eri, 0, 0
 
     for ish in range(nshell):
@@ -985,7 +2281,22 @@ cpdef compute_dense_eri_blocked(
                 for iq in range(q0, q1):
                     if pair_bounds_v[ip, iq] > bound_pq:
                         bound_pq = pair_bounds_v[ip, iq]
-            shell_pair_bounds[ish * nshell + jsh] = bound_pq
+            pair_idx = ish * nshell + jsh
+            shell_pair_bounds[pair_idx] = bound_pq
+            pq_offset = <size_t>pair_idx * <size_t>pair_cap
+            shell_pair_n[pair_idx] = precompute_primitive_pair_geom(
+                p0,
+                q0,
+                origins_v,
+                exps_v,
+                nprim_v,
+                shell_pair_a + pq_offset,
+                shell_pair_b + pq_offset,
+                shell_pair_p + pq_offset,
+                shell_pair_px + pq_offset,
+                shell_pair_py + pq_offset,
+                shell_pair_pz + pq_offset,
+            )
 
     for ish in range(nshell):
         p0 = <int>shell_starts_v[ish]
@@ -1012,18 +2323,53 @@ cpdef compute_dense_eri_blocked(
                         skipped += 1
                         continue
 
-                    block = compute_cartesian_shell_quartet_block(
-                        shells, origins, exps, weights, nprim,
-                        p0, p1, q0, q1, r0, r1, s0, s1,
+                    pq_pair_idx = ish * nshell + jsh
+                    rs_pair_idx = ksh * nshell + lsh
+                    pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                    rs_offset = <size_t>rs_pair_idx * <size_t>pair_cap
+                    direct_done = compute_shell_quartet_vrr_hrr_into_eri(
+                        shells_v,
+                        origins_v,
+                        weights_v,
+                        nprim_v,
+                        eri_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        r0,
+                        r1,
+                        s0,
+                        s1,
+                        pair_cap,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                        shell_pair_n[pq_pair_idx],
+                        shell_pair_a + rs_offset,
+                        shell_pair_b + rs_offset,
+                        shell_pair_p + rs_offset,
+                        shell_pair_px + rs_offset,
+                        shell_pair_py + rs_offset,
+                        shell_pair_pz + rs_offset,
+                        shell_pair_n[rs_pair_idx],
+                        direct_vrr_table,
+                        direct_vrr_table_cap,
                     )
-                    eri[p0:p1, q0:q1, r0:r1, s0:s1] = block
-                    eri[q0:q1, p0:p1, r0:r1, s0:s1] = block.transpose(1, 0, 2, 3)
-                    eri[p0:p1, q0:q1, s0:s1, r0:r1] = block.transpose(0, 1, 3, 2)
-                    eri[q0:q1, p0:p1, s0:s1, r0:r1] = block.transpose(1, 0, 3, 2)
-                    eri[r0:r1, s0:s1, p0:p1, q0:q1] = block.transpose(2, 3, 0, 1)
-                    eri[s0:s1, r0:r1, p0:p1, q0:q1] = block.transpose(3, 2, 0, 1)
-                    eri[r0:r1, s0:s1, q0:q1, p0:p1] = block.transpose(2, 3, 1, 0)
-                    eri[s0:s1, r0:r1, q0:q1, p0:p1] = block.transpose(3, 2, 1, 0)
+                    if direct_done == 0:
+                        block = compute_cartesian_shell_quartet_block(
+                            shells, origins, exps, weights, nprim,
+                            p0, p1, q0, q1, r0, r1, s0, s1,
+                        )
+                        block_v = block
+                        write_shell_block_symmetries(
+                            eri_v, block_v,
+                            p0, q0, r0, s0,
+                            np_, nq_, nr_, ns_,
+                        )
                     if ish == jsh:
                         npair_pq = (np_ * (np_ + 1)) // 2
                     else:
@@ -1037,7 +2383,9 @@ cpdef compute_dense_eri_blocked(
                     else:
                         computed += npair_pq * npair_rs
 
-    free(shell_pair_bounds)
+    free(shell_pair_bounds); free(shell_pair_n)
+    free(shell_pair_a); free(shell_pair_b); free(shell_pair_p); free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+    free(direct_vrr_table)
     return eri, int(computed), int(skipped)
 
 
@@ -1055,6 +2403,7 @@ cpdef compute_cartesian_shell_quartet_block(
     int r1,
     int s0,
     int s1,
+    bint use_iterative=False,
 ):
     cdef int np_ = p1 - p0
     cdef int nq_ = q1 - q0
@@ -1067,6 +2416,7 @@ cpdef compute_cartesian_shell_quartet_block(
     cdef size_t size_ab, size_cd, size_r, i
     cdef double abx, aby, abz, cdx, cdy, cdz
     cdef double alpha, dx, dy, dz, rpq, prefac, value
+    cdef double zeta, T, base_pref, ab2, cd2, pq2
     cdef double* pq_a
     cdef double* pq_b
     cdef double* pq_p
@@ -1080,13 +2430,18 @@ cpdef compute_cartesian_shell_quartet_block(
     cdef double* rs_px
     cdef double* rs_py
     cdef double* rs_pz
-    cdef double* memo_abx
-    cdef double* memo_aby
-    cdef double* memo_abz
-    cdef double* memo_cdx
-    cdef double* memo_cdy
-    cdef double* memo_cdz
-    cdef double* memo_r
+    cdef uint64_t* os_keys
+    cdef double* os_values
+    cdef int* os_stack_ang = NULL
+    cdef int* os_stack_m = NULL
+    cdef double* vrr_table = NULL
+    cdef int os_nstates[1]
+    cdef int os_ang[12]
+    cdef double PA[3]
+    cdef double QC[3]
+    cdef double PQ[3]
+    cdef double AB[3]
+    cdef double CD[3]
     cdef int* ax
     cdef int* ay
     cdef int* az
@@ -1102,6 +2457,8 @@ cpdef compute_cartesian_shell_quartet_block(
     cdef int max_prim = exps.shape[1]
     cdef int pair_cap = max_prim * max_prim
     cdef int ao_p, ao_q, ao_r, ao_s
+    cdef int max_a_l, max_c_l, max_m_l, use_vrr_hrr
+    cdef size_t vrr_table_size
     cdef int64_t[:, ::1] shells_v = shells
     cdef double[:, ::1] origins_v = origins
     cdef double[:, ::1] exps_v = exps
@@ -1112,6 +2469,10 @@ cpdef compute_cartesian_shell_quartet_block(
     lB = <int>shells_v[q0, 0] + <int>shells_v[q0, 1] + <int>shells_v[q0, 2]
     lC = <int>shells_v[r0, 0] + <int>shells_v[r0, 1] + <int>shells_v[r0, 2]
     lD = <int>shells_v[s0, 0] + <int>shells_v[s0, 1] + <int>shells_v[s0, 2]
+    max_a_l = lA + lB
+    max_c_l = lC + lD
+    max_m_l = max_a_l + max_c_l
+    use_vrr_hrr = (not use_iterative) and max_a_l <= OS_VRR_PAIR_MAX_L and max_c_l <= OS_VRR_PAIR_MAX_L
     if np_ != ncart_for_l(lA) or nq_ != ncart_for_l(lB) or nr_ != ncart_for_l(lC) or ns_ != ncart_for_l(lD):
         return block
 
@@ -1125,10 +2486,23 @@ cpdef compute_cartesian_shell_quartet_block(
     rs_a = <double*>malloc(pair_cap * sizeof(double)); rs_b = <double*>malloc(pair_cap * sizeof(double))
     rs_p = <double*>malloc(pair_cap * sizeof(double)); rs_px = <double*>malloc(pair_cap * sizeof(double))
     rs_py = <double*>malloc(pair_cap * sizeof(double)); rs_pz = <double*>malloc(pair_cap * sizeof(double))
-    if ax == NULL or ay == NULL or az == NULL or bx == NULL or by == NULL or bz == NULL or cx == NULL or cy == NULL or cz == NULL or dxc == NULL or dyc == NULL or dzc == NULL or pq_a == NULL or pq_b == NULL or pq_p == NULL or pq_px == NULL or pq_py == NULL or pq_pz == NULL or rs_a == NULL or rs_b == NULL or rs_p == NULL or rs_px == NULL or rs_py == NULL or rs_pz == NULL:
+    os_keys = <uint64_t*>malloc(OS_HASH_CAP * sizeof(uint64_t))
+    os_values = <double*>malloc(OS_HASH_CAP * sizeof(double))
+    if use_iterative:
+        os_stack_ang = <int*>malloc(OS_HASH_CAP * 12 * sizeof(int))
+        os_stack_m = <int*>malloc(OS_HASH_CAP * sizeof(int))
+    if use_vrr_hrr:
+        vrr_table_size = (
+            <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1)
+            * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1)
+            * <size_t>(max_m_l + 1)
+        )
+        vrr_table = <double*>malloc(vrr_table_size * sizeof(double))
+    if ax == NULL or ay == NULL or az == NULL or bx == NULL or by == NULL or bz == NULL or cx == NULL or cy == NULL or cz == NULL or dxc == NULL or dyc == NULL or dzc == NULL or pq_a == NULL or pq_b == NULL or pq_p == NULL or pq_px == NULL or pq_py == NULL or pq_pz == NULL or rs_a == NULL or rs_b == NULL or rs_p == NULL or rs_px == NULL or rs_py == NULL or rs_pz == NULL or os_keys == NULL or os_values == NULL or (use_iterative and (os_stack_ang == NULL or os_stack_m == NULL)) or (use_vrr_hrr and vrr_table == NULL):
         free(ax); free(ay); free(az); free(bx); free(by); free(bz); free(cx); free(cy); free(cz); free(dxc); free(dyc); free(dzc)
         free(pq_a); free(pq_b); free(pq_p); free(pq_px); free(pq_py); free(pq_pz)
         free(rs_a); free(rs_b); free(rs_p); free(rs_px); free(rs_py); free(rs_pz)
+        free(os_keys); free(os_values); free(os_stack_ang); free(os_stack_m); free(vrr_table)
         return block
 
     fill_cartesian_components(lA, ax, ay, az)
@@ -1145,38 +2519,138 @@ cpdef compute_cartesian_shell_quartet_block(
     cdx = origins_v[r0, 0] - origins_v[s0, 0]
     cdy = origins_v[r0, 1] - origins_v[s0, 1]
     cdz = origins_v[r0, 2] - origins_v[s0, 2]
-    for ia in range(np_):
-        ao_p = p0 + ia
-        for ib in range(nq_):
-            ao_q = q0 + ib
-            for ic in range(nr_):
-                ao_r = r0 + ic
-                for id_ in range(ns_):
-                    ao_s = s0 + id_
-                    value = 0.0
-                    idx_pq = 0
-                    for ip in range(nprim_v[p0]):
-                        for iq in range(nprim_v[q0]):
-                            idx_rs = 0
-                            for ir in range(nprim_v[r0]):
-                                for is_ in range(nprim_v[s0]):
+    idx_pq = 0
+    for ip in range(nprim_v[p0]):
+        for iq in range(nprim_v[q0]):
+            idx_rs = 0
+            for ir in range(nprim_v[r0]):
+                for is_ in range(nprim_v[s0]):
+                    zeta = pq_p[idx_pq] + rs_p[idx_rs]
+                    alpha = pq_p[idx_pq] * rs_p[idx_rs] / zeta
+                    dx = pq_px[idx_pq] - rs_px[idx_rs]
+                    dy = pq_py[idx_pq] - rs_py[idx_rs]
+                    dz = pq_pz[idx_pq] - rs_pz[idx_rs]
+                    pq2 = dx * dx + dy * dy + dz * dz
+                    T = alpha * pq2
+                    ab2 = abx * abx + aby * aby + abz * abz
+                    cd2 = cdx * cdx + cdy * cdy + cdz * cdz
+                    base_pref = (
+                        ERI_PREFAC
+                        * exp(-(pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]) * ab2)
+                        * exp(-(rs_a[idx_rs] * rs_b[idx_rs] / rs_p[idx_rs]) * cd2)
+                        / (pq_p[idx_pq] * rs_p[idx_rs] * sqrt(zeta))
+                    )
+                    PA[0] = pq_px[idx_pq] - origins_v[p0, 0]
+                    PA[1] = pq_py[idx_pq] - origins_v[p0, 1]
+                    PA[2] = pq_pz[idx_pq] - origins_v[p0, 2]
+                    QC[0] = rs_px[idx_rs] - origins_v[r0, 0]
+                    QC[1] = rs_py[idx_rs] - origins_v[r0, 1]
+                    QC[2] = rs_pz[idx_rs] - origins_v[r0, 2]
+                    PQ[0] = dx; PQ[1] = dy; PQ[2] = dz
+                    AB[0] = abx; AB[1] = aby; AB[2] = abz
+                    CD[0] = cdx; CD[1] = cdy; CD[2] = cdz
+                    if use_vrr_hrr:
+                        os_fill_vrr_table(
+                            vrr_table,
+                            max_a_l,
+                            max_c_l,
+                            max_m_l,
+                            pq_p[idx_pq],
+                            rs_p[idx_rs],
+                            zeta,
+                            T,
+                            base_pref,
+                            PA,
+                            QC,
+                            PQ,
+                        )
+                    else:
+                        os_nstates[0] = 0
+                        memset(os_keys, 0, OS_HASH_CAP * sizeof(uint64_t))
+
+                    for ia in range(np_):
+                        ao_p = p0 + ia
+                        for ib in range(nq_):
+                            ao_q = q0 + ib
+                            for ic in range(nr_):
+                                ao_r = r0 + ic
+                                for id_ in range(ns_):
+                                    ao_s = s0 + id_
                                     prefac = (
                                         weights_v[ao_p, ip] * weights_v[ao_q, iq]
                                         * weights_v[ao_r, ir] * weights_v[ao_s, is_]
                                     )
-                                    value += prefac * primitive_eri_precomputed(
-                                        pq_a[idx_pq], pq_b[idx_pq], pq_p[idx_pq], pq_px[idx_pq], pq_py[idx_pq], pq_pz[idx_pq], abx, aby, abz,
-                                        ax[ia], ay[ia], az[ia], bx[ib], by[ib], bz[ib],
-                                        rs_a[idx_rs], rs_b[idx_rs], rs_p[idx_rs], rs_px[idx_rs], rs_py[idx_rs], rs_pz[idx_rs], cdx, cdy, cdz,
-                                        cx[ic], cy[ic], cz[ic], dxc[id_], dyc[id_], dzc[id_],
-                                    )
-                                    idx_rs += 1
-                            idx_pq += 1
-                    block_v[ia, ib, ic, id_] = value
+                                    os_ang[0] = ax[ia]; os_ang[1] = ay[ia]; os_ang[2] = az[ia]
+                                    os_ang[3] = bx[ib]; os_ang[4] = by[ib]; os_ang[5] = bz[ib]
+                                    os_ang[6] = cx[ic]; os_ang[7] = cy[ic]; os_ang[8] = cz[ic]
+                                    os_ang[9] = dxc[id_]; os_ang[10] = dyc[id_]; os_ang[11] = dzc[id_]
+                                    if use_vrr_hrr:
+                                        block_v[ia, ib, ic, id_] += prefac * os_vrr_hrr_eval(
+                                            vrr_table,
+                                            os_ang[0],
+                                            os_ang[1],
+                                            os_ang[2],
+                                            os_ang[3],
+                                            os_ang[4],
+                                            os_ang[5],
+                                            os_ang[6],
+                                            os_ang[7],
+                                            os_ang[8],
+                                            os_ang[9],
+                                            os_ang[10],
+                                            os_ang[11],
+                                            0,
+                                            max_a_l,
+                                            max_c_l,
+                                            max_m_l,
+                                            AB,
+                                            CD,
+                                        )
+                                    elif use_iterative:
+                                        block_v[ia, ib, ic, id_] += prefac * os_eri_eval_iterative(
+                                            os_ang,
+                                            0,
+                                            pq_p[idx_pq],
+                                            rs_p[idx_rs],
+                                            zeta,
+                                            T,
+                                            base_pref,
+                                            PA,
+                                            QC,
+                                            PQ,
+                                            AB,
+                                            CD,
+                                            os_keys,
+                                            os_values,
+                                            os_nstates,
+                                            os_stack_ang,
+                                            os_stack_m,
+                                        )
+                                    else:
+                                        block_v[ia, ib, ic, id_] += prefac * os_eri_rec_generic(
+                                            os_ang,
+                                            0,
+                                            pq_p[idx_pq],
+                                            rs_p[idx_rs],
+                                            zeta,
+                                            T,
+                                            base_pref,
+                                            PA,
+                                            QC,
+                                            PQ,
+                                            AB,
+                                            CD,
+                                            os_keys,
+                                            os_values,
+                                            os_nstates,
+                                        )
+                    idx_rs += 1
+            idx_pq += 1
 
     free(ax); free(ay); free(az); free(bx); free(by); free(bz); free(cx); free(cy); free(cz); free(dxc); free(dyc); free(dzc)
     free(pq_a); free(pq_b); free(pq_p); free(pq_px); free(pq_py); free(pq_pz)
     free(rs_a); free(rs_b); free(rs_p); free(rs_px); free(rs_py); free(rs_pz)
+    free(os_keys); free(os_values); free(os_stack_ang); free(os_stack_m); free(vrr_table)
 
     return block
 

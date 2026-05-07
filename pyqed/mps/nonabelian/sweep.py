@@ -227,6 +227,101 @@ def _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors):
     return identity_factors
 
 
+class MovingEnvironment:
+    """
+    Persistent moving-environment owner for MPO sweeps.
+
+    A completed left-to-right sweep leaves valid left boundary entries for the
+    next right-to-left sweep, and vice versa.  This object tracks that validity
+    so :func:`sweep_once` can skip rebuilding the prebuilt side and consume the
+    boundary stack produced by the previous sweep.
+    """
+
+    def __init__(
+        self,
+        sites,
+        *,
+        mpo_factors,
+        root_target_mpo_factors=None,
+        complementary_operator_families=None,
+        renormalized_operator_cache_max_size=256,
+    ):
+        self.hamiltonian_stack = RenormalizedBlockStack(
+            namespace="hamiltonian",
+            complementary_operator_families=complementary_operator_families,
+        )
+        self.norm_stack = RenormalizedBlockStack(namespace="norm")
+        self.target_stack = (
+            RenormalizedBlockStack(namespace="target")
+            if root_target_mpo_factors is not None
+            else None
+        )
+        self.identity_mpo_factors = _identity_mpo_factors_for_sites_and_mpo(
+            sites,
+            mpo_factors,
+        )
+        self.renormalized_operator_cache = RenormalizedOperatorStack(
+            max_size=renormalized_operator_cache_max_size,
+        )
+        self.valid_boundary_side = None
+        self.environment_rebuilds = 0
+        self.boundary_side_reuses = 0
+        self.boundary_side_rebuilds = 0
+        self.completed_sweeps = 0
+        self.last_reused_prebuilt_side = None
+
+    @staticmethod
+    def needed_prebuilt_side(direction):
+        direction = _normalize_direction(direction)
+        return "right" if direction == "lr" else "left"
+
+    @staticmethod
+    def produced_boundary_side(direction):
+        direction = _normalize_direction(direction)
+        return "left" if direction == "lr" else "right"
+
+    def reuse_side_for(self, direction):
+        """
+        Return the valid prebuilt side to reuse for the requested sweep.
+        """
+
+        needed = self.needed_prebuilt_side(direction)
+        if self.valid_boundary_side == needed:
+            self.boundary_side_reuses += 1
+            self.last_reused_prebuilt_side = needed
+            return needed
+        self.environment_rebuilds += 1
+        self.boundary_side_rebuilds += 1
+        self.last_reused_prebuilt_side = None
+        return None
+
+    def finish_sweep(self, direction):
+        """
+        Mark the side advanced by a completed sweep as reusable.
+        """
+
+        self.valid_boundary_side = self.produced_boundary_side(direction)
+        self.completed_sweeps += 1
+
+    @property
+    def stats(self):
+        h_stats = self.hamiltonian_stack.stats
+        comp_stats = h_stats.get("complementary_operator_stack") or {}
+        return {
+            "completed_sweeps": int(self.completed_sweeps),
+            "valid_boundary_side": self.valid_boundary_side,
+            "last_reused_prebuilt_side": self.last_reused_prebuilt_side,
+            "environment_rebuilds": int(self.environment_rebuilds),
+            "boundary_side_reuses": int(self.boundary_side_reuses),
+            "boundary_side_rebuilds": int(self.boundary_side_rebuilds),
+            "hamiltonian_boundary_entries": int(h_stats.get("size", 0)),
+            "hamiltonian_boundary_advances": int(h_stats.get("advanced_entries", 0)),
+            "complementary_operator_entries": int(comp_stats.get("n_entries", 0)),
+            "complementary_operator_advances": int(comp_stats.get("advances", 0)),
+            "moving_environment_cache": h_stats.get("moving_environment_cache"),
+        }
+
+
 def sweep_once(
     sites,
     *,
@@ -258,6 +353,7 @@ def sweep_once(
     target_renormalized_block_stack=None,
     complementary_operator_families=None,
     identity_mpo_factors=None,
+    reuse_prebuilt_boundary_side=None,
     require_block_sparse_renormalized_operator_table=False,
     require_symbolic_renormalized_operators=False,
     profile=False,
@@ -346,6 +442,10 @@ def sweep_once(
         the Hamiltonian renormalized block stack.
     identity_mpo_factors
         Optional prebuilt identity MPO cores used for the norm environment.
+    reuse_prebuilt_boundary_side
+        Optional side, ``"left"`` or ``"right"``, already valid in the
+        persistent boundary stacks.  The sweep skips rebuilding that side and
+        consumes it as a block2-like moving environment.
     require_block_sparse_renormalized_operator_table
         If True, transformed local operators must use the block-sparse
         renormalized-operator table.
@@ -388,16 +488,17 @@ def sweep_once(
 
     updated_sites = [site.copy() for site in sites]
     if mpo_factors is not None:
-        canonical_center = min(1, len(updated_sites) - 1) if direction == "lr" else max(0, len(updated_sites) - 2)
-        updated_sites = mixed_canonicalize_sites(
-            updated_sites,
-            canonical_center,
-            max_bond=None,
-            cutoff=0.0,
-            max_bond_mode=max_bond_mode or "states",
-            bond_coupling=bond_coupling,
-        )
-        assert_mixed_canonical_sites(updated_sites, canonical_center)
+        if reuse_prebuilt_boundary_side is None:
+            canonical_center = min(1, len(updated_sites) - 1) if direction == "lr" else max(0, len(updated_sites) - 2)
+            updated_sites = mixed_canonicalize_sites(
+                updated_sites,
+                canonical_center,
+                max_bond=None,
+                cutoff=0.0,
+                max_bond_mode=max_bond_mode or "states",
+                bond_coupling=bond_coupling,
+            )
+            assert_mixed_canonical_sites(updated_sites, canonical_center)
     local_solver_kwargs = dict(local_solver_kwargs or {})
     nlocal_states = int(local_solver_kwargs.get("nstates", 1))
     use_root_environment_path = bool(
@@ -431,7 +532,10 @@ def sweep_once(
     local_guess_cache = dict(local_guess_cache or {})
     next_local_guess_cache = {}
     if max_bond_mode is None:
-        max_bond_mode = "states" if mpo_factors is not None else "reduced"
+        # In the reduced non-Abelian representation, ``max_bond`` is most useful
+        # as a multiplet count. Counting full state degeneracies makes moderate
+        # SU(2) bond dimensions overly aggressive and noticeably degrades DMRG.
+        max_bond_mode = "reduced"
     if (local_operator is not None or mpo_factors is not None) and "couple_physical" not in local_solver_kwargs:
         # The uncoupled physical-leg path is currently faster than the coupled
         # basis path for the non-Abelian MPO sweeps in this codebase.
@@ -492,6 +596,7 @@ def sweep_once(
             renormalized_blocks=renormalized_block_stack,
             require_symbolic_payloads=require_symbolic_renormalized_operators,
             sweep_direction=direction,
+            reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
         ).start_sweep(direction)
         if not force_canonical_local_norm and (
             nlocal_states <= 1
@@ -508,6 +613,7 @@ def sweep_once(
                 identity_mpo_factors,
                 renormalized_blocks=norm_renormalized_block_stack,
                 sweep_direction=direction,
+                reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
             ).start_sweep(direction)
         if root_target_mpo_factors is not None:
             target_env_sweep = BlockSparseEnvironmentChain.build(
@@ -515,6 +621,7 @@ def sweep_once(
                 root_target_mpo_factors,
                 renormalized_blocks=target_renormalized_block_stack,
                 sweep_direction=direction,
+                reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
             ).start_sweep(direction)
         if profile:
             timing["environment_build"] += time.perf_counter() - t0
@@ -761,6 +868,7 @@ def sweep_once(
             if isinstance(renormalized_operator_cache, RenormalizedOperatorStack)
             else None
         ),
+        "reused_prebuilt_boundary_side": reuse_prebuilt_boundary_side,
         "renormalized_block_stack_stats": (
             renormalized_block_stack.stats if renormalized_block_stack is not None else None
         ),
@@ -1369,13 +1477,6 @@ def run_sweeps(
     last_root_sites = None
     last_state_energies = None
     local_guess_cache = {}
-    renormalized_operator_cache = (
-        renormalized_operator_cache
-        if renormalized_operator_cache is not None
-        else RenormalizedOperatorStack(max_size=renormalized_operator_cache_max_size)
-    )
-    if isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
-        renormalized_operator_cache.max_size = int(renormalized_operator_cache_max_size)
     mixer_zero_block_noise_scale = float(mixer_zero_block_noise_scale)
     mixer_nsweeps = int(mixer_nsweeps)
     mixer_rng = np.random.default_rng(mixer_zero_block_noise_seed)
@@ -1384,29 +1485,42 @@ def run_sweeps(
         and mpo_factors is not None
         and int((local_solver_kwargs or {}).get("nstates", 1)) > 1
     )
-    persistent_renormalized_block_stack = (
-        RenormalizedBlockStack(
-            namespace="hamiltonian",
+    moving_environment = None
+    if mpo_factors is not None and not run_uses_root_environment_path:
+        moving_environment = MovingEnvironment(
+            current_sites,
+            mpo_factors=mpo_factors,
+            root_target_mpo_factors=root_target_mpo_factors,
             complementary_operator_families=complementary_operator_families,
+            renormalized_operator_cache_max_size=renormalized_operator_cache_max_size,
         )
-        if mpo_factors is not None and not run_uses_root_environment_path
-        else None
-    )
-    persistent_norm_renormalized_block_stack = (
-        RenormalizedBlockStack(namespace="norm")
-        if mpo_factors is not None and not run_uses_root_environment_path
-        else None
-    )
-    persistent_target_renormalized_block_stack = (
-        RenormalizedBlockStack(namespace="target")
-        if root_target_mpo_factors is not None and not run_uses_root_environment_path
-        else None
-    )
-    identity_mpo_factors = (
-        _identity_mpo_factors_for_sites_and_mpo(current_sites, mpo_factors)
-        if mpo_factors is not None
-        else None
-    )
+        if renormalized_operator_cache is not None:
+            moving_environment.renormalized_operator_cache = renormalized_operator_cache
+        if isinstance(moving_environment.renormalized_operator_cache, RenormalizedOperatorStack):
+            moving_environment.renormalized_operator_cache.max_size = int(
+                renormalized_operator_cache_max_size
+            )
+        identity_mpo_factors = moving_environment.identity_mpo_factors
+        persistent_renormalized_block_stack = moving_environment.hamiltonian_stack
+        persistent_norm_renormalized_block_stack = moving_environment.norm_stack
+        persistent_target_renormalized_block_stack = moving_environment.target_stack
+        renormalized_operator_cache = moving_environment.renormalized_operator_cache
+    else:
+        renormalized_operator_cache = (
+            renormalized_operator_cache
+            if renormalized_operator_cache is not None
+            else RenormalizedOperatorStack(max_size=renormalized_operator_cache_max_size)
+        )
+        if isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
+            renormalized_operator_cache.max_size = int(renormalized_operator_cache_max_size)
+        persistent_renormalized_block_stack = None
+        persistent_norm_renormalized_block_stack = None
+        persistent_target_renormalized_block_stack = None
+        identity_mpo_factors = (
+            _identity_mpo_factors_for_sites_and_mpo(current_sites, mpo_factors)
+            if mpo_factors is not None
+            else None
+        )
 
     for sweep_idx in range(int(nsweeps)):
         resolved_schedule = _resolve_local_solver_schedule(
@@ -1426,6 +1540,11 @@ def run_sweeps(
             sweep_local_solver_kwargs = dict(local_solver_kwargs or {})
             sweep_local_solver_kwargs.update(resolved_schedule)
         sweep_nlocal_states = int(sweep_local_solver_kwargs.get("nstates", 1))
+        reuse_prebuilt_boundary_side = (
+            moving_environment.reuse_side_for(direction)
+            if moving_environment is not None
+            else None
+        )
         sweep_result = sweep_once(
             current_sites,
             direction=direction,
@@ -1458,11 +1577,14 @@ def run_sweeps(
             target_renormalized_block_stack=persistent_target_renormalized_block_stack,
             complementary_operator_families=complementary_operator_families,
             identity_mpo_factors=identity_mpo_factors,
+            reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
             require_block_sparse_renormalized_operator_table=require_block_sparse_renormalized_operator_table,
             require_symbolic_renormalized_operators=require_symbolic_renormalized_operators,
             profile=profile,
             verbose=verbose,
         )
+        if moving_environment is not None:
+            moving_environment.finish_sweep(direction)
         last_root_sites = sweep_result.get("root_sites")
         if run_uses_root_environment_path and last_root_sites:
             current_sites = [site.copy() for site in last_root_sites[0]]
@@ -1530,6 +1652,10 @@ def run_sweeps(
                 "timing": sweep_result.get("timing"),
                 "renormalized_operator_cache_size": sweep_result.get("renormalized_operator_cache_size"),
                 "renormalized_operator_cache_stats": sweep_result.get("renormalized_operator_cache_stats"),
+                "reused_prebuilt_boundary_side": sweep_result.get("reused_prebuilt_boundary_side"),
+                "moving_environment_stats": (
+                    moving_environment.stats if moving_environment is not None else None
+                ),
                 "renormalized_block_stack_stats": sweep_result.get("renormalized_block_stack_stats"),
                 "norm_renormalized_block_stack_stats": sweep_result.get(
                     "norm_renormalized_block_stack_stats"
@@ -1583,4 +1709,7 @@ def run_sweeps(
         "last_direction": history[-1]["direction"] if history else direction,
         "ncompleted": len(history),
         "best_energy": best_energy,
+        "moving_environment_stats": (
+            moving_environment.stats if moving_environment is not None else None
+        ),
     }

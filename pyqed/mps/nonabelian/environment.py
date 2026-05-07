@@ -1158,14 +1158,27 @@ def _precompute_two_site_rank_coupled_factorized_terms(
         if left_factor_table is not None and right_factor_table is not None:
             left_entries = left_factor_table.get((q_lk, q_p1k), ())
             right_entries = right_factor_table.get((q_rk, q_p2k), ())
-            for q_lb, q_p1b, middle_idx, left_factor in left_entries:
-                for q_rb, q_p2b, middle_idx_2, right_factor in right_entries:
+            for left_item in left_entries:
+                q_lb, q_p1b, middle_idx, left_factor = left_item[:4]
+                left_families = left_item[4] if len(left_item) > 4 else ()
+                for right_item in right_entries:
+                    q_rb, q_p2b, middle_idx_2, right_factor = right_item[:4]
+                    right_families = right_item[4] if len(right_item) > 4 else ()
                     if middle_idx_2 != middle_idx:
                         continue
                     out_key = (q_lb, q_p1b, q_p2b, q_rb)
                     out_idx = out_index.get(out_key)
                     if out_idx is not None:
-                        in_terms.append((out_idx, left_factor, right_factor))
+                        families = tuple(
+                            sorted(
+                                {
+                                    str(name)
+                                    for name in tuple(left_families) + tuple(right_families)
+                                    if name is not None
+                                }
+                            )
+                        )
+                        in_terms.append((out_idx, left_factor, right_factor, families))
         else:
             for q_lb, E_entries in left_blocks_by_ket.get(q_lk, ()):
                 for q_p1b, W1_blocks in w1_blocks_by_in.get(q_p1k, ()):
@@ -1865,6 +1878,7 @@ class BlockSparseEnvironmentChain:
         renormalized_blocks=None,
         require_symbolic_payloads=False,
         sweep_direction=None,
+        reuse_prebuilt_boundary_side=None,
     ):
         """
         Build block-sparse renormalized environments for a chain.
@@ -1878,6 +1892,11 @@ class BlockSparseEnvironmentChain:
             the right boundary stack and initial left block are prebuilt; when
             ``"rl"``, only the left boundary stack and initial right block are
             prebuilt.  ``None`` preserves the full two-sided build.
+        :param reuse_prebuilt_boundary_side: Optional side, ``"left"`` or
+            ``"right"``, whose boundary entries are already valid in
+            ``renormalized_blocks`` from the previous sweep.  That side is not
+            rebuilt here, making the sweep use the stack as a moving
+            environment.
         :returns: :class:`BlockSparseEnvironmentChain`.
         """
 
@@ -1889,6 +1908,20 @@ class BlockSparseEnvironmentChain:
             sweep_direction = str(sweep_direction).lower()
             if sweep_direction not in {"lr", "rl"}:
                 raise ValueError(f"Unknown sweep direction {sweep_direction!r}.")
+        if reuse_prebuilt_boundary_side is not None:
+            reuse_prebuilt_boundary_side = str(reuse_prebuilt_boundary_side).lower()
+            if reuse_prebuilt_boundary_side not in {"left", "right"}:
+                raise ValueError(
+                    "reuse_prebuilt_boundary_side must be 'left', 'right', or None."
+                )
+            if renormalized_blocks is None:
+                raise ValueError(
+                    "Reusing a prebuilt boundary side requires renormalized_blocks."
+                )
+            if sweep_direction == "lr" and reuse_prebuilt_boundary_side != "right":
+                raise ValueError("A left-to-right sweep can only reuse the right boundary side.")
+            if sweep_direction == "rl" and reuse_prebuilt_boundary_side != "left":
+                raise ValueError("A right-to-left sweep can only reuse the left boundary side.")
         sites = [normalize_site_tensor_layout(site) for site in sites]
 
         site_layouts = [_tensor_dense_layout(site) for site in sites]
@@ -1902,6 +1935,10 @@ class BlockSparseEnvironmentChain:
         nsites = len(sites)
         build_left = sweep_direction is None or sweep_direction == "rl"
         build_right = sweep_direction is None or sweep_direction == "lr"
+        if reuse_prebuilt_boundary_side == "left":
+            build_left = False
+        elif reuse_prebuilt_boundary_side == "right":
+            build_right = False
         if rank_coupled:
             initial_left = LeftBlock(
                 _initial_left_env_blocks_rank_coupled(site_layouts[0], sparse_mpo_factors[0]),

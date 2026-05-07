@@ -11,6 +11,7 @@ import re
 import math
 import ctypes
 import multiprocessing as mp
+import time
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 
@@ -37,6 +38,7 @@ _NATIVE_RI_AUX_SIGNATURES = None
 _NUMBA_AVAILABLE = njit is not None
 _NUMBA_DENSE_ERI_ENABLED = False
 _BASIS_ACCEL = None
+_OS_BLOCKED_MAX_NAO = 32
 try:
     from . import _basis_cy
 except Exception:  # pragma: no cover - optional accelerator
@@ -203,14 +205,35 @@ class ContractedGaussian(object):
     coefs: list of primitive Gaussian coefficients
     norm: list of normalization factors for Gaussian primitives
     '''
-    def __init__(self,origin=[0.0,0.0,0.0],shell=(0,0,0),exps=[],coefs=[]):
+    def __init__(
+        self,
+        origin=None,
+        shell=(0, 0, 0),
+        exps=None,
+        coefs=None,
+        norm=None,
+        prim_weights=None,
+        normalize=True,
+    ):
+        if origin is None:
+            origin = [0.0, 0.0, 0.0]
+        if exps is None:
+            exps = []
+        if coefs is None:
+            coefs = []
         self.origin = np.asarray(origin)
-        self.shell = shell
-        self.exps = exps
-        self.coefs = coefs
-        self.norm = None
-        self.prim_weights = None
-        self.normalize()
+        self.shell = tuple(int(x) for x in shell)
+        self.exps = np.asarray(exps, dtype=float)
+        self.coefs = np.asarray(coefs, dtype=float).copy()
+        if normalize:
+            self.norm = None
+            self.prim_weights = None
+            self.normalize()
+        else:
+            if norm is None or prim_weights is None:
+                raise ValueError("norm and prim_weights are required when normalize=False.")
+            self.norm = np.asarray(norm, dtype=float).copy()
+            self.prim_weights = np.asarray(prim_weights, dtype=float).copy()
 
     def normalize(self):
         ''' Routine to normalize the basis functions, in case they
@@ -240,6 +263,23 @@ class ContractedGaussian(object):
         for ia in range(num_exps):
             self.coefs[ia] *= N
         self.prim_weights = self.norm * self.coefs
+
+
+@lru_cache(maxsize=8192)
+def _normalized_contracted_gaussian_template(shell, exps, coefs):
+    """Return normalized contraction arrays independent of the AO center."""
+    gto = ContractedGaussian(
+        origin=(0.0, 0.0, 0.0),
+        shell=tuple(int(x) for x in shell),
+        exps=np.asarray(exps, dtype=float),
+        coefs=np.asarray(coefs, dtype=float),
+    )
+    return (
+        tuple(float(x) for x in gto.exps),
+        tuple(float(x) for x in gto.coefs),
+        tuple(float(x) for x in gto.norm),
+        tuple(float(x) for x in gto.prim_weights),
+    )
 
 def kinetic(a,lmn1,A,b,lmn2,B):
     ''' Evaluates kinetic energy integral between two Gaussians
@@ -838,7 +878,7 @@ def _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol
     return np.asarray(eri, dtype=np.float64), int(computed), int(skipped)
 
 
-def _compute_cartesian_shell_quartet_block_cython(signatures, shell_block):
+def _compute_cartesian_shell_quartet_block_cython(signatures, shell_block, use_iterative=False):
     if _basis_cy is None:
         return None
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
@@ -851,6 +891,7 @@ def _compute_cartesian_shell_quartet_block_cython(signatures, shell_block):
             np.ascontiguousarray(weights, dtype=np.float64),
             np.ascontiguousarray(nprim, dtype=np.int64),
             p0, p1, q0, q1, r0, r1, s0, s1,
+            bool(use_iterative),
         )
     except Exception:
         return None
@@ -1821,6 +1862,7 @@ def _normalize_basis_lookup_name(name):
     return str(name).replace('-', '').replace(' ', '').lower()
 
 
+@lru_cache(maxsize=256)
 def _basis_path(basis_name):
     if not isinstance(basis_name, str):
         raise NotImplementedError('Customized basis not supported yet.')
@@ -2111,15 +2153,20 @@ def build_builtin(mol):
     """
     Build AO integrals with pyqed's builtin Gaussian integral engine.
     """
+    total_start = time.perf_counter()
+    timings = {}
     _reset_builtin_integral_caches()
     atoms = mol.atom_symbols()
     atcoords = np.asarray(mol.atom_coords(), dtype=float)
     atnums = np.asarray(mol.atom_charges(), dtype=float)
 
+    t0 = time.perf_counter()
     basis_dict = parse_gbs(_basis_path(mol.basis))
     basis_cart = make_contractions(basis_dict, atoms, atcoords, coord_types='c')
+    timings["basis_setup"] = time.perf_counter() - t0
     nao_cart = len(basis_cart)
     signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+    t0 = time.perf_counter()
     one_electron_result = _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums)
     if one_electron_result is not None:
         overlap_mat, kinetic_mat, vnuc_mat = one_electron_result
@@ -2129,6 +2176,7 @@ def build_builtin(mol):
             atcoords,
             atnums,
         )
+    timings["one_electron"] = time.perf_counter() - t0
 
     screen_tol = float(
         getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 0.0)) or 0.0
@@ -2138,7 +2186,6 @@ def build_builtin(mol):
     ).lower()
     if eri_backend not in {"auto", "rys"}:
         raise ValueError("builtin_eri_backend/native_eri_backend must be 'auto' or 'rys'.")
-    pair_bounds = _compute_pair_bounds(signatures)
     eri_representation = getattr(
         mol,
         "builtin_eri_representation",
@@ -2164,12 +2211,30 @@ def build_builtin(mol):
     skipped = 0
     eri = None
     factors = None
+    pair_bounds = None
     dense_builder = None
     factor_builder = None
     ri_info = None
 
     if eri_representation in {"dense", "dense+factors", "dense+ri"}:
-        if eri_backend == "rys":
+        if screen_tol > 0.0:
+            t0 = time.perf_counter()
+            pair_bounds = _compute_pair_bounds(signatures)
+            timings["pair_bounds"] = time.perf_counter() - t0
+        else:
+            pair_bounds = np.zeros((nao_cart, nao_cart), dtype=float)
+            timings["pair_bounds"] = 0.0
+        use_rys = (
+            eri_backend == "rys"
+            or (
+                eri_backend == "auto"
+                and _rys_cy is not None
+                and _signatures_are_sp_only(signatures)
+                and workers == 1
+            )
+        )
+        t0 = time.perf_counter()
+        if use_rys:
             if _rys_cy is not None and _signatures_are_sp_only(signatures):
                 shell_blocks = _cart_shell_blocks(basis_cart)
                 shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
@@ -2187,39 +2252,64 @@ def build_builtin(mol):
                         shell_stops,
                         float(screen_tol),
                     )
-                    dense_builder = "rys-cython-blocked"
+                    dense_builder = (
+                        "rys-cython-blocked"
+                        if eri_backend == "rys"
+                        else "rys-cython-blocked-auto"
+                    )
                 except Exception:
                     eri, computed, skipped = _compute_dense_eri_serial_shellblocked_rys(
                         signatures, pair_bounds, screen_tol
                     )
-                    dense_builder = "rys-screened-mixed"
+                    dense_builder = (
+                        "rys-screened-mixed"
+                        if eri_backend == "rys"
+                        else "rys-screened-mixed-auto"
+                    )
             else:
                 # The current blocked Rys production path is only a win for pure s/p
-                # bases. For mixed d-shell cases, the exact compiled dense builder is
-                # faster than the Python-level hybrid Rys dispatcher.
-                eri, computed, skipped = _compute_dense_eri_serial(
-                    signatures, pair_bounds, screen_tol
-                )
-                dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
+                # bases. Mixed/high-l quartets use the compiled OS shell-block path.
+                blocked = None
+                if nao_cart <= _OS_BLOCKED_MAX_NAO:
+                    blocked = _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol)
+                if blocked is not None:
+                    eri, computed, skipped = blocked
+                    dense_builder = "cython-shell-os-blocked-mixed-d-fallback"
+                else:
+                    eri, computed, skipped = _compute_dense_eri_serial(
+                        signatures, pair_bounds, screen_tol
+                    )
+                    dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
         elif workers > 1:
             eri, computed, skipped = _compute_dense_eri_parallel(
                 signatures, pair_bounds, screen_tol, workers
             )
             dense_builder = "python-parallel"
         else:
-            eri, computed, skipped = _compute_dense_eri_serial(
-                signatures, pair_bounds, screen_tol
-            )
-            dense_builder = _default_dense_builder_name()
+            blocked = None
+            if not _signatures_are_sp_only(signatures) and nao_cart <= _OS_BLOCKED_MAX_NAO:
+                blocked = _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol)
+            if blocked is not None:
+                eri, computed, skipped = blocked
+                dense_builder = "cython-shell-os-blocked"
+            else:
+                eri, computed, skipped = _compute_dense_eri_serial(
+                    signatures, pair_bounds, screen_tol
+                )
+                dense_builder = _default_dense_builder_name()
+        timings["dense_eri"] = time.perf_counter() - t0
 
         if eri_representation == "dense+ri":
+            t0 = time.perf_counter()
             factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+            timings["ri_factors"] = time.perf_counter() - t0
             factor_builder = "native-ri"
         elif eri_representation == "dense+factors" or bool(
             getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False))
         ):
             from pyqed.qchem.hf.rhf import pivoted_cholesky_eri
 
+            t0 = time.perf_counter()
             factors = pivoted_cholesky_eri(
                 eri,
                 tol=float(
@@ -2231,14 +2321,21 @@ def build_builtin(mol):
                     getattr(mol, "native_low_rank_max_rank", None),
                 ),
             )
+            timings["low_rank_factors"] = time.perf_counter() - t0
             factor_builder = "pivoted-cholesky-dense"
     elif eri_representation == "ri":
+        t0 = time.perf_counter()
         factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+        timings["ri_factors"] = time.perf_counter() - t0
         factor_builder = "native-ri"
     else:
+        t0 = time.perf_counter()
+        pair_bounds = _compute_pair_bounds(signatures)
+        timings["pair_bounds"] = time.perf_counter() - t0
         shell_blocks = _cart_shell_blocks(basis_cart)
         shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
         shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+        t0 = time.perf_counter()
         factors = _pivoted_cholesky_from_integral_oracle_cython_blocked(
             signatures,
             pair_bounds,
@@ -2271,7 +2368,9 @@ def build_builtin(mol):
                 screen_tol=screen_tol,
             )
             factor_builder = "cython-kernel" if _basis_cy is not None else "python-oracle"
+        timings["low_rank_factors"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     transform = None
     basis_out = basis_cart
     if coord_type == "spherical":
@@ -2296,6 +2395,7 @@ def build_builtin(mol):
     else:
         hcore_mat = kinetic_mat + vnuc_mat
         mol.cart = True
+    timings["ao_transform"] = time.perf_counter() - t0
 
     mol.nao = overlap_mat.shape[0]
     mol.overlap = overlap_mat
@@ -2321,6 +2421,8 @@ def build_builtin(mol):
         "dense_builder": dense_builder,
         "factor_builder": factor_builder,
         "ri": ri_info,
+        "timings": {key: float(value) for key, value in timings.items()},
+        "build_time": float(time.perf_counter() - total_start),
     }
     mol._native_build_info = mol._builtin_build_info
     return
@@ -2539,14 +2641,26 @@ def make_contractions(basis_dict, atoms, coords, coord_types):
             coeffs = np.asarray(coeffs, dtype=float)
             if coeffs.ndim == 1:
                 coeffs = coeffs[:, None]
+            exps_tuple = tuple(float(x) for x in np.asarray(exps, dtype=float))
             for shell in _shell(angmom):
                 for icontr in range(coeffs.shape[1]):
+                    coefs_tuple = tuple(float(x) for x in coeffs[:, icontr])
+                    tpl_exps, tpl_coefs, tpl_norm, tpl_prim_weights = (
+                        _normalized_contracted_gaussian_template(
+                            tuple(int(x) for x in shell),
+                            exps_tuple,
+                            coefs_tuple,
+                        )
+                    )
                     basis.append(
                         ContractedGaussian(
                             origin=coord,
                             shell=shell,
-                            exps=np.asarray(exps, dtype=float),
-                            coefs=coeffs[:, icontr].copy(),
+                            exps=tpl_exps,
+                            coefs=tpl_coefs,
+                            norm=tpl_norm,
+                            prim_weights=tpl_prim_weights,
+                            normalize=False,
                         )
                     )
     return tuple(basis)
