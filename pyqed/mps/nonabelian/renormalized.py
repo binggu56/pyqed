@@ -19,6 +19,72 @@ import numpy as np
 
 _ORTHONORMAL_BLOCK_DENSE_MATVEC_MAX_ELEMENTS = 1_000_000
 _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS = 65536
+_COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS = 8_000_000
+_COMPLEMENTARY_FAMILY_KERNEL_BACKEND = "auto"
+_COMPLEMENTARY_FAMILY_FACTOR_BATCH_MIN_ENTRIES = 10**9
+_DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS = 16_000_000
+_DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS = 16_000_000
+_UNSET = object()
+
+
+def get_complementary_family_kernel_policy():
+    """
+    Return the current complementary-family matvec kernel policy.
+
+    :returns: Dictionary with ``backend``, ``dense_threshold``, and
+        ``dense_max_total_elements``.
+    """
+
+    return {
+        "backend": str(_COMPLEMENTARY_FAMILY_KERNEL_BACKEND),
+        "dense_threshold": int(_COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS),
+        "dense_max_total_elements": (
+            None
+            if _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS is None
+            else int(_COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS)
+        ),
+    }
+
+
+def configure_complementary_family_kernel_policy(
+    *,
+    backend=None,
+    dense_threshold=None,
+    dense_max_total_elements=_UNSET,
+):
+    """
+    Configure the complementary-family matvec kernel policy.
+
+    :param backend: ``"auto"``, ``"dense"``, or ``"factor"``.
+    :param dense_threshold: Maximum dense elements for one local block.
+    :param dense_max_total_elements: Maximum dense elements materialized by one
+        family table. Use ``None`` for no table-level cap.
+    :returns: Previous policy dictionary, suitable for restoring later.
+    """
+
+    global _COMPLEMENTARY_FAMILY_KERNEL_BACKEND
+    global _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS
+    global _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS
+
+    previous = get_complementary_family_kernel_policy()
+    if backend is not None:
+        normalized = str(backend).lower().replace("-", "_")
+        if normalized in {"factorized", "factor_native"}:
+            normalized = "factor"
+        if normalized in {"hybrid", "default"}:
+            normalized = "auto"
+        if normalized not in {"auto", "dense", "factor"}:
+            raise ValueError("family kernel backend must be 'auto', 'dense', or 'factor'.")
+        _COMPLEMENTARY_FAMILY_KERNEL_BACKEND = normalized
+    if dense_threshold is not None:
+        _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS = max(0, int(dense_threshold))
+    if dense_max_total_elements is not _UNSET:
+        _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS = (
+            None
+            if dense_max_total_elements is None
+            else max(0, int(dense_max_total_elements))
+        )
+    return previous
 
 
 def set_complementary_family_native_kernel_max_elements(value):
@@ -1039,19 +1105,49 @@ class FamilyNativeFactorKernel:
     input_shape: tuple
     output_size: int
     use_direct_contraction: bool
+    matmul_two_step: bool = True
+    left_matrix: np.ndarray | None = None
+    right_matrix: np.ndarray | None = None
+    tmp_shape: tuple = ()
+    output_shape: tuple = ()
 
     @classmethod
     def from_compiled_term(cls, term):
         """Build a native factor kernel from a compiled factorized term."""
 
+        left_stack = np.asarray(term.left_stack)
+        right_stack = np.asarray(term.right_stack)
+        tdim, ldim, kdim, wdim, adim, bdim = (
+            int(dim) for dim in left_stack.shape
+        )
+        _tdim2, _wdim2, qdim, rdim, ddim, cdim = (
+            int(dim) for dim in right_stack.shape
+        )
+        left_matrix = np.ascontiguousarray(
+            left_stack.transpose(0, 1, 3, 4, 2, 5).reshape(
+                tdim * ldim * wdim * adim,
+                kdim * bdim,
+            )
+        )
+        right_matrix = np.ascontiguousarray(
+            right_stack.transpose(0, 1, 3, 5, 4, 2).reshape(
+                tdim * wdim * rdim * cdim,
+                ddim * qdim,
+            )
+        )
         return cls(
-            left_stack=np.asarray(term.left_stack),
-            right_stack=np.asarray(term.right_stack),
+            left_stack=left_stack,
+            right_stack=right_stack,
             input_shape=tuple(int(dim) for dim in term.input_entry.shape),
             output_size=int(term.output_size),
             use_direct_contraction=bool(
                 getattr(term, "_use_direct_contraction", False)
             ),
+            matmul_two_step=True,
+            left_matrix=left_matrix,
+            right_matrix=right_matrix,
+            tmp_shape=(tdim, ldim, wdim, adim, cdim, rdim),
+            output_shape=(ldim, adim, ddim, qdim),
         )
 
     @property
@@ -1059,6 +1155,21 @@ class FamilyNativeFactorKernel:
         """Return the number of scalar elements stored by this kernel."""
 
         return int(np.asarray(self.left_stack).size + np.asarray(self.right_stack).size)
+
+    @property
+    def batch_signature(self):
+        """Return a shape signature for batched factor-native contractions."""
+
+        if self.left_matrix is None or self.right_matrix is None:
+            return None
+        return (
+            tuple(int(dim) for dim in np.asarray(self.left_matrix).shape),
+            tuple(int(dim) for dim in np.asarray(self.right_matrix).shape),
+            tuple(int(dim) for dim in self.tmp_shape),
+            tuple(int(dim) for dim in self.output_shape),
+            tuple(int(dim) for dim in self.input_shape),
+            int(self.output_size),
+        )
 
     def apply_block(self, block_in):
         """
@@ -1071,7 +1182,7 @@ class FamilyNativeFactorKernel:
         left_stack = np.asarray(self.left_stack)
         right_stack = np.asarray(self.right_stack)
         block_in = np.asarray(block_in)
-        if bool(self.use_direct_contraction):
+        if bool(self.use_direct_contraction) and not bool(self.matmul_two_step):
             contrib = np.einsum(
                 "tlkwab,kbcr,twqrdc->ladq",
                 left_stack,
@@ -1080,6 +1191,23 @@ class FamilyNativeFactorKernel:
                 optimize=False,
             )
             return np.asarray(contrib).reshape(int(self.output_size))
+        if bool(self.matmul_two_step):
+            kin, bin_, cin, rin = (int(dim) for dim in block_in.shape)
+            if self.left_matrix is None or self.right_matrix is None:
+                raise RuntimeError("FamilyNativeFactorKernel is missing BLAS matrices.")
+            input_matrix = block_in.reshape(kin * bin_, cin * rin)
+            tmp = (self.left_matrix @ input_matrix).reshape(tuple(self.tmp_shape))
+            ldim, adim, ddim, qdim = (int(dim) for dim in self.output_shape)
+            tmp_matrix = np.ascontiguousarray(
+                tmp.transpose(1, 3, 0, 2, 5, 4).reshape(
+                    ldim * adim,
+                    -1,
+                )
+            )
+            contrib = tmp_matrix @ self.right_matrix
+            return np.asarray(contrib).reshape(ldim, adim, ddim, qdim).reshape(
+                int(self.output_size)
+            )
         tmp = np.einsum(
             "tlkwab,kbcr->tlwacr",
             left_stack,
@@ -1191,10 +1319,28 @@ class ComplementaryFamilyApplyEntry:
         )
 
     @property
+    def dense_kernel_elements(self):
+        """Return the dense kernel elements required for this apply entry."""
+
+        input_size = int(getattr(self.compiled_term.input_entry, "size", 0))
+        output_size = int(getattr(self.compiled_term, "output_size", 0))
+        return int(input_size * output_size)
+
+    @property
     def input_entry(self):
         """Return the compiled term input entry."""
 
         return self.compiled_term.input_entry
+
+    @property
+    def factor_batch_signature(self):
+        """Return a batching signature for this entry, if batchable."""
+
+        if self.native_kernel is not None or self.factor_kernel is None:
+            return None
+        if not self.factor_kernel.matmul_two_step:
+            return None
+        return self.factor_kernel.batch_signature
 
     def apply_block(self, block_in):
         """Apply the current numerical backend to one input block."""
@@ -3232,6 +3378,11 @@ class ComplementaryFamilyTensorTable:
     backend: str = "compiled_factorized_term"
     native_kernel_elements: int = 0
     factor_kernel_elements: int = 0
+    dense_kernel_skipped_total_budget: int = 0
+    dense_kernel_skipped_threshold: int = 0
+    kernel_policy: dict | None = None
+    factor_batch_groups: int = 0
+    factor_batched_entries: int = 0
 
     @classmethod
     def from_component_direct_plan(cls, plan, *, source="compiled_factorized_terms"):
@@ -3289,6 +3440,15 @@ class ComplementaryFamilyTensorTable:
                 family_source_tables.setdefault(str(name), []).append(
                     (str(table.side), int(table.bond))
                 )
+        policy = get_complementary_family_kernel_policy()
+        requested_backend = str(policy["backend"])
+        dense_threshold = int(policy["dense_threshold"])
+        dense_total_cap = policy["dense_max_total_elements"]
+        dense_total_cap = None if dense_total_cap is None else int(dense_total_cap)
+        dense_total_used = 0
+        skipped_total_budget = 0
+        skipped_threshold = 0
+
         grouped = OrderedDict()
         unmatched = set()
         for entry in plan:
@@ -3305,13 +3465,31 @@ class ComplementaryFamilyTensorTable:
                 for name in group_names
                 for source in family_source_tables.get(str(name), ())
             )
-            grouped.setdefault(family, []).append(
-                ComplementaryFamilyApplyEntry.from_plan_entry(
-                    entry,
-                    family_names=group_names,
-                    source_tables=source_tables,
-                ).with_factor_kernel().with_native_kernel()
+            apply_entry = ComplementaryFamilyApplyEntry.from_plan_entry(
+                entry,
+                family_names=group_names,
+                source_tables=source_tables,
             )
+            if requested_backend in {"auto", "factor"}:
+                apply_entry = apply_entry.with_factor_kernel()
+            if requested_backend in {"auto", "dense"} and dense_threshold > 0:
+                dense_elements = apply_entry.dense_kernel_elements
+                if dense_total_cap is not None and dense_total_used + dense_elements > dense_total_cap:
+                    skipped_total_budget += 1
+                else:
+                    with_dense = apply_entry.with_native_kernel(
+                        max_elements=dense_threshold
+                    )
+                    if with_dense.native_kernel is None:
+                        skipped_threshold += 1
+                    else:
+                        apply_entry = with_dense
+                        dense_total_used += int(np.asarray(with_dense.native_kernel).size)
+            elif requested_backend in {"auto", "dense"}:
+                skipped_threshold += 1
+            if requested_backend == "dense" and apply_entry.native_kernel is None:
+                apply_entry = apply_entry.with_factor_kernel()
+            grouped.setdefault(family, []).append(apply_entry)
         factor_kernel_elements = int(
             sum(
                 0
@@ -3349,6 +3527,36 @@ class ComplementaryFamilyTensorTable:
             ),
             native_kernel_elements=int(native_kernel_elements),
             factor_kernel_elements=int(factor_kernel_elements),
+            dense_kernel_skipped_total_budget=int(skipped_total_budget),
+            dense_kernel_skipped_threshold=int(skipped_threshold),
+            kernel_policy={
+                "backend": str(requested_backend),
+                "dense_threshold": int(dense_threshold),
+                "dense_max_total_elements": dense_total_cap,
+                "dense_used_elements": int(native_kernel_elements),
+            },
+            factor_batch_groups=int(
+                sum(
+                    1
+                    for entries in grouped.values()
+                    for _signature, batch_entries in _group_factor_batch_entries(
+                        entries
+                    ).items()
+                    if len(batch_entries)
+                    >= _COMPLEMENTARY_FAMILY_FACTOR_BATCH_MIN_ENTRIES
+                )
+            ),
+            factor_batched_entries=int(
+                sum(
+                    len(batch_entries)
+                    for entries in grouped.values()
+                    for _signature, batch_entries in _group_factor_batch_entries(
+                        entries
+                    ).items()
+                    if len(batch_entries)
+                    >= _COMPLEMENTARY_FAMILY_FACTOR_BATCH_MIN_ENTRIES
+                )
+            ),
         )
 
     @property
@@ -3396,7 +3604,18 @@ class ComplementaryFamilyTensorTable:
             parent_inputs.append(transform @ vector[start:stop])
             parent_outputs.append(np.zeros(int(np.asarray(indices).size), dtype=complex))
         for _family, entries in self.family_blocks:
+            batched = set()
+            for batch_entries in _group_factor_batch_entries(entries).values():
+                if (
+                    len(batch_entries)
+                    < _COMPLEMENTARY_FAMILY_FACTOR_BATCH_MIN_ENTRIES
+                ):
+                    continue
+                self._apply_factor_batch(batch_entries, parent_inputs, parent_outputs)
+                batched.update(id(entry) for entry in batch_entries)
             for entry in entries:
+                if id(entry) in batched:
+                    continue
                 block_in = parent_inputs[int(entry.in_comp)][entry.in_slice].reshape(
                     entry.input_entry.shape
                 )
@@ -3410,6 +3629,49 @@ class ComplementaryFamilyTensorTable:
             stop = start + int(transform.shape[1])
             out[start:stop] = transform.conj().T @ parent_out
         return out
+
+    def _apply_factor_batch(self, entries, parent_inputs, parent_outputs):
+        """
+        Apply a group of same-shape factor-native kernels with batched matmul.
+
+        :param entries: Batchable :class:`ComplementaryFamilyApplyEntry` objects.
+        :param parent_inputs: Component parent input buffers.
+        :param parent_outputs: Component parent output buffers updated in place.
+        """
+
+        kernels = [entry.factor_kernel for entry in entries]
+        first = kernels[0]
+        left_mats = np.stack([kernel.left_matrix for kernel in kernels], axis=0)
+        right_mats = np.stack([kernel.right_matrix for kernel in kernels], axis=0)
+        input_mats = np.stack(
+            [
+                parent_inputs[int(entry.in_comp)][entry.in_slice]
+                .reshape(entry.input_entry.shape)
+                .reshape(
+                    int(np.prod(entry.input_entry.shape[:2], dtype=int)),
+                    int(np.prod(entry.input_entry.shape[2:], dtype=int)),
+                )
+                for entry in entries
+            ],
+            axis=0,
+        )
+        tmp = np.matmul(left_mats, input_mats).reshape(
+            (len(entries),) + tuple(first.tmp_shape)
+        )
+        ldim, adim, ddim, qdim = (int(dim) for dim in first.output_shape)
+        tmp_mats = np.ascontiguousarray(
+            tmp.transpose(0, 2, 4, 1, 3, 6, 5).reshape(
+                len(entries),
+                ldim * adim,
+                -1,
+            )
+        )
+        contribs = np.matmul(tmp_mats, right_mats).reshape(
+            len(entries),
+            ldim * adim * ddim * qdim,
+        )
+        for entry, contrib in zip(entries, contribs):
+            parent_outputs[int(entry.out_comp)][entry.out_slice] += contrib
 
     @property
     def stats(self):
@@ -3442,7 +3704,28 @@ class ComplementaryFamilyTensorTable:
             ),
             "native_kernel_elements": int(self.native_kernel_elements),
             "factor_kernel_elements": int(self.factor_kernel_elements),
+            "dense_kernel_skipped_total_budget": int(
+                self.dense_kernel_skipped_total_budget
+            ),
+            "dense_kernel_skipped_threshold": int(
+                self.dense_kernel_skipped_threshold
+            ),
+            "kernel_policy": dict(self.kernel_policy or {}),
+            "factor_batch_groups": int(self.factor_batch_groups),
+            "factor_batched_entries": int(self.factor_batched_entries),
         }
+
+
+def _group_factor_batch_entries(entries):
+    """Group batchable family apply entries by factor-kernel shape."""
+
+    groups = OrderedDict()
+    for entry in tuple(entries or ()):
+        signature = entry.factor_batch_signature
+        if signature is None:
+            continue
+        groups.setdefault(signature, []).append(entry)
+    return groups
 
 
 @dataclass(frozen=True)
@@ -3471,30 +3754,49 @@ class DirectOrthonormalFactorizedTable:
     components: tuple | None = None
 
     def __post_init__(self):
+        component_direct_plan = self._build_component_direct_plan()
         object.__setattr__(
             self,
             "_component_direct_plan",
-            self._build_component_direct_plan(),
+            component_direct_plan,
         )
+        use_family_tensor = self.uses_complementary_payload_tensor_kernel
         object.__setattr__(
             self,
             "_complementary_family_tensor_table",
             (
                 self._build_complementary_family_tensor_table(
-                    getattr(self, "_component_direct_plan", None)
+                    component_direct_plan
                 )
-                if self.uses_complementary_payload_tensor_kernel
+                if use_family_tensor
                 else None
             ),
+        )
+        component_parent_blocks = (
+            None
+            if use_family_tensor
+            else self._build_component_parent_blocks(component_direct_plan)
+        )
+        component_orthonormal_blocks = self._build_component_orthonormal_blocks(
+            component_parent_blocks,
+        )
+        component_orthonormal_dense_matrix = self._build_component_orthonormal_dense_matrix(
+            component_orthonormal_blocks,
         )
         object.__setattr__(
             self,
             "_component_parent_blocks",
-            (
-                None
-                if self.uses_complementary_payload_tensor_kernel
-                else self._build_component_parent_blocks()
-            ),
+            component_parent_blocks,
+        )
+        object.__setattr__(
+            self,
+            "_component_orthonormal_blocks",
+            component_orthonormal_blocks,
+        )
+        object.__setattr__(
+            self,
+            "_component_orthonormal_dense_matrix",
+            component_orthonormal_dense_matrix,
         )
 
     @property
@@ -3515,6 +3817,12 @@ class DirectOrthonormalFactorizedTable:
         family_table = getattr(self, "_complementary_family_tensor_table", None)
         if family_table is not None:
             return family_table.matvec(vector, self.component_basis)
+        orthonormal_dense = getattr(self, "_component_orthonormal_dense_matrix", None)
+        if orthonormal_dense is not None:
+            return orthonormal_dense @ vector
+        orthonormal_blocks = getattr(self, "_component_orthonormal_blocks", None)
+        if orthonormal_blocks is not None:
+            return self._component_orthonormal_block_matvec(vector, orthonormal_blocks)
         parent_blocks = getattr(self, "_component_parent_blocks", None)
         if parent_blocks is not None:
             return self._component_parent_block_matvec(vector, parent_blocks)
@@ -3556,6 +3864,22 @@ class DirectOrthonormalFactorizedTable:
         """
 
         return getattr(self, "_component_parent_blocks", None) is not None
+
+    @property
+    def uses_component_orthonormal_block_kernel(self):
+        """
+        Return whether matvecs use transformed orthonormal component blocks.
+        """
+
+        return getattr(self, "_component_orthonormal_blocks", None) is not None
+
+    @property
+    def uses_component_orthonormal_dense_kernel(self):
+        """
+        Return whether matvecs use one dense orthonormal local matrix.
+        """
+
+        return getattr(self, "_component_orthonormal_dense_matrix", None) is not None
 
     @property
     def uses_complementary_payload_tensor_kernel(self):
@@ -3676,7 +4000,7 @@ class DirectOrthonormalFactorizedTable:
                 plan.append((int(in_comp), int(out_comp), in_slice, out_slice, term))
         return tuple(plan)
 
-    def _build_component_parent_blocks(self):
+    def _build_component_parent_blocks(self, plan=None):
         """
         Assemble dense parent component blocks for recursive matvecs.
 
@@ -3687,7 +4011,6 @@ class DirectOrthonormalFactorizedTable:
         :returns: Tuple ``((in_comp, out_comp, block), ...)`` or ``None``.
         """
 
-        plan = getattr(self, "_component_direct_plan", None)
         if plan is None:
             return None
         component_dims = tuple(
@@ -3715,6 +4038,62 @@ class DirectOrthonormalFactorizedTable:
             (in_comp, out_comp, np.ascontiguousarray(block))
             for (in_comp, out_comp), block in sorted(blocks.items())
         )
+
+    def _build_component_orthonormal_blocks(self, parent_blocks):
+        """
+        Project moderate parent component blocks into orthonormal coordinates.
+        """
+
+        if parent_blocks is None:
+            return None
+        transforms = self.component_basis.component_transforms
+        total_elements = 0
+        for in_comp, out_comp, _block in parent_blocks:
+            total_elements += (
+                int(transforms[int(out_comp)].shape[1])
+                * int(transforms[int(in_comp)].shape[1])
+            )
+            if total_elements > _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS:
+                return None
+        orthonormal_blocks = []
+        for in_comp, out_comp, parent_block in parent_blocks:
+            X_in = np.asarray(transforms[int(in_comp)], dtype=complex)
+            X_out = np.asarray(transforms[int(out_comp)], dtype=complex)
+            transformed = X_out.conj().T @ np.asarray(parent_block, dtype=complex) @ X_in
+            if np.linalg.norm(transformed.reshape(-1)) > 1.0e-15:
+                orthonormal_blocks.append(
+                    (int(in_comp), int(out_comp), np.ascontiguousarray(transformed))
+                )
+        return tuple(orthonormal_blocks)
+
+    def _build_component_orthonormal_dense_matrix(self, orthonormal_blocks):
+        """
+        Assemble transformed component blocks into one dense local matrix.
+        """
+
+        if orthonormal_blocks is None:
+            return None
+        dim = int(self.dim)
+        if dim <= 0 or dim * dim > _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS:
+            return None
+        matrix = np.zeros((dim, dim), dtype=complex)
+        for in_comp, out_comp, block in orthonormal_blocks:
+            in_slice = self.component_basis._orth_slice(int(in_comp))
+            out_slice = self.component_basis._orth_slice(int(out_comp))
+            matrix[out_slice, in_slice] += np.asarray(block, dtype=complex)
+        return np.ascontiguousarray(matrix)
+
+    def _component_orthonormal_block_matvec(self, vector, orthonormal_blocks):
+        """
+        Apply transformed component blocks directly in orthonormal coordinates.
+        """
+
+        out = np.zeros(self.dim, dtype=complex)
+        for in_comp, out_comp, block in orthonormal_blocks:
+            in_slice = self.component_basis._orth_slice(int(in_comp))
+            out_slice = self.component_basis._orth_slice(int(out_comp))
+            out[out_slice] += block @ vector[in_slice]
+        return out
 
     def _component_parent_block_matvec(self, vector, parent_blocks):
         """
@@ -3831,6 +4210,19 @@ class DirectOrthonormalFactorizedTable:
             getattr(self.compiled_factorized_terms, "family_term_counts", {}) or {}
         )
         family_table = getattr(self, "_complementary_family_tensor_table", None)
+        orthonormal_block_elements = int(
+            sum(
+                np.asarray(block).size
+                for _in_comp, _out_comp, block in (
+                    getattr(self, "_component_orthonormal_blocks", None) or ()
+                )
+            )
+        )
+        orthonormal_dense_elements = int(
+            0
+            if getattr(self, "_component_orthonormal_dense_matrix", None) is None
+            else np.asarray(self._component_orthonormal_dense_matrix).size
+        )
         return {
             "kind": (
                 "recursive_parent_block_factorized"
@@ -3864,11 +4256,19 @@ class DirectOrthonormalFactorizedTable:
                     default=0,
                 )
             ),
-            "stored_kernel_elements": 0,
-            "dense_matvec_elements": 0,
+            "stored_kernel_elements": int(
+                orthonormal_dense_elements or orthonormal_block_elements
+            ),
+            "dense_matvec_elements": int(orthonormal_dense_elements),
             "component_direct_kernel": bool(self.uses_component_direct_kernel),
             "component_parent_block_kernel": bool(
                 self.uses_component_parent_block_kernel
+            ),
+            "component_orthonormal_block_kernel": bool(
+                self.uses_component_orthonormal_block_kernel
+            ),
+            "component_orthonormal_dense_kernel": bool(
+                self.uses_component_orthonormal_dense_kernel
             ),
             "complementary_payload_tensor_kernel": bool(
                 self.uses_complementary_payload_tensor_kernel
@@ -3911,6 +4311,8 @@ class DirectOrthonormalFactorizedTable:
                     )
                 )
             ),
+            "component_orthonormal_block_elements": orthonormal_block_elements,
+            "component_orthonormal_dense_elements": orthonormal_dense_elements,
         }
 
 

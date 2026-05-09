@@ -59,7 +59,6 @@ from scipy.sparse import identity, kron, csr_matrix, diags
 from pyqed.qchem.mcscf.casci import (
     CASCI,
     _get_mf_cholesky_factors,
-    _resolve_use_cholesky_integrals,
     transform_eri_factors_to_mo_pair,
 )
 from pyqed.mps import DMRG as TensorDMRG, MPS, dense_to_symmetric_mpo
@@ -143,6 +142,45 @@ def _normalize_site(site):
     raise ValueError(
         "site must be one of 'spin_orbital' or 'spatial' "
         f"(got {site!r})."
+    )
+
+
+def _normalize_integral_backend(integral_backend):
+    backend = str(integral_backend or "auto").lower().replace("-", "_")
+    aliases = {
+        "cd": "cholesky",
+        "chol": "cholesky",
+        "factor": "cholesky",
+        "factors": "cholesky",
+        "factorized": "cholesky",
+        "density_fitting": "ri",
+        "df": "ri",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in {"auto", "dense", "ri", "cholesky"}:
+        raise ValueError(
+            "integral_backend must be 'auto', 'dense', 'ri', or 'cholesky' "
+            f"(got {integral_backend!r})."
+        )
+    return backend
+
+
+def _mf_has_factorized_eris(mf):
+    return (
+        getattr(mf, "eri_factors", None) is not None
+        or getattr(getattr(mf, "mol", None), "eri_factors", None) is not None
+    )
+
+
+def _mf_has_dense_eris(mf):
+    mol = getattr(mf, "mol", None)
+    return (
+        getattr(mf, "eri", None) is not None
+        or getattr(mf, "eri_s4", None) is not None
+        or getattr(mf, "eri_s8", None) is not None
+        or getattr(mol, "eri", None) is not None
+        or getattr(mol, "eri_s4", None) is not None
+        or getattr(mol, "eri_s8", None) is not None
     )
 
 
@@ -298,6 +336,19 @@ def _mps_to_dense_vector(state):
     psi = np.array([1.0 + 0.0j])
     for site in range(state.L):
         tensor = state._get_std_B(site)
+        psi = np.tensordot(psi, tensor, axes=([-1], [0]))
+    return np.squeeze(psi, axis=-1).reshape(-1)
+
+
+def _nonabelian_mps_to_dense_vector(state):
+    """Contract a small non-Abelian spatial MPS into a full dense vector."""
+
+    from pyqed.mps.nonabelian.environment import _site_to_dense
+
+    sites = list(getattr(state, "sites", state))
+    psi = np.array([1.0 + 0.0j])
+    for site in sites:
+        tensor = _site_to_dense(site)
         psi = np.tensordot(psi, tensor, axes=([-1], [0]))
     return np.squeeze(psi, axis=-1).reshape(-1)
 
@@ -1176,7 +1227,8 @@ class DMRG(CASCI):
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
                  low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',
                  site_basis=None, orbital_layout=None, spatial_reduced_mpo=None,
-                 symmetry=None, spatial_site_basis="canonical"):
+                 symmetry=None, spatial_site_basis="canonical",
+                 integral_backend="auto"):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -1298,6 +1350,7 @@ class DMRG(CASCI):
         self.h2e_factors = None
 
         self.init_guess = init_guess
+        self.integral_backend = _normalize_integral_backend(integral_backend)
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
         self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
@@ -1335,7 +1388,10 @@ class DMRG(CASCI):
         if self.site == "spatial":
             nspin = 2 * self.ncas
             if method == 'hf':
-                configs = [(_spin_config_to_spatial_config(gen_hf_config(self.nelecas, nspin)), 1.0)]
+                configs = [
+                    (_spin_config_to_spatial_config(cfg), amp)
+                    for cfg, amp in gen_cid_configs(self.nelecas, nspin, mixing=1.0e-5)
+                ]
             elif method == 'cid':
                 configs = [
                     (_spin_config_to_spatial_config(cfg), amp)
@@ -1361,8 +1417,7 @@ class DMRG(CASCI):
 
         # 1. Generate Configurations (Physics)
         if method == 'hf':
-            hf_cfg = gen_hf_config(self.nelecas, nsites)
-            configs = [(hf_cfg, 1.0)]
+            configs = gen_cid_configs(self.nelecas, nsites, mixing=1.0e-5)
 
         elif method == 'cid':
             configs = gen_cid_configs(self.nelecas, nsites, mixing=0.5)
@@ -1533,7 +1588,10 @@ class DMRG(CASCI):
         # from pyscf import ao2mo
 
         mf = self.mf
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
+        backend = self.integral_backend
+        use_cholesky = backend in {"ri", "cholesky"} or (
+            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
+        )
 
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
@@ -1558,7 +1616,18 @@ class DMRG(CASCI):
             pair_factors = transform_eri_factors_to_mo_pair(eri_factors, Ca)
             flat_pair_factors = pair_factors.reshape(pair_factors.shape[0], -1)
             eri_aa = (flat_pair_factors.conj().T @ flat_pair_factors).reshape(self.ncas, self.ncas, self.ncas, self.ncas)
-            build_mode = 'cholesky'
+            factor_source = getattr(
+                getattr(mf, "mol", None),
+                "builtin_resolved_eri_representation",
+                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
+            )
+            if factor_source is None:
+                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
+            if str(factor_source).lower() in {"dense+ri"}:
+                factor_source = "ri"
+            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
+                factor_source = "cholesky"
+            build_mode = str(factor_source).lower()
             aux_rank = int(pair_factors.shape[0])
         else:
             eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
@@ -1601,6 +1670,7 @@ class DMRG(CASCI):
         H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
         self._active_integral_build_info = {
             'mode': build_mode,
+            'factorized_integrals': bool(use_cholesky),
             'aux_rank': aux_rank,
             'ncas': self.ncas,
         }
@@ -1628,10 +1698,13 @@ class DMRG(CASCI):
     def _get_active_hamiltonian_inputs(self):
         """
         Return the active-space one-body Hamiltonian together with either the
-        dense active ERI tensor or Cholesky pair factors.
+        dense active ERI tensor or RI/Cholesky pair factors.
         """
         mf = self.mf
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
+        backend = self.integral_backend
+        use_factors = backend in {"ri", "cholesky"} or (
+            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
+        )
 
         H, energy_core = h1e_for_cas(
             mf,
@@ -1641,13 +1714,25 @@ class DMRG(CASCI):
         )
         self.e_core = energy_core
 
-        if use_cholesky:
+        if use_factors:
             pair_factors = transform_eri_factors_to_mo_pair(
                 _get_mf_cholesky_factors(mf),
                 self.mo_cas,
             )
+            factor_source = getattr(
+                getattr(mf, "mol", None),
+                "builtin_resolved_eri_representation",
+                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
+            )
+            if factor_source is None:
+                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
+            if str(factor_source).lower() in {"dense+ri"}:
+                factor_source = "ri"
+            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
+                factor_source = "cholesky"
             self._active_integral_build_info = {
-                "mode": "cholesky",
+                "mode": str(factor_source).lower(),
+                "factorized_integrals": True,
                 "aux_rank": int(pair_factors.shape[0]),
                 "ncas": self.ncas,
             }
@@ -1664,6 +1749,7 @@ class DMRG(CASCI):
         H2 = np.stack((np.stack((eri_aa, eri_aa.copy())), np.stack((eri_aa.copy(), eri_aa.copy()))))
         self._active_integral_build_info = {
             "mode": "dense",
+            "factorized_integrals": False,
             "aux_rank": None,
             "ncas": self.ncas,
         }
@@ -2416,10 +2502,14 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state, "sites"):
+            psi = _nonabelian_mps_to_dense_vector(state)
+        elif hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             state = symmetric_to_dense(state)
-        psi = _mps_to_dense_vector(state)
+            psi = _mps_to_dense_vector(state)
+        else:
+            psi = _mps_to_dense_vector(state)
         norm = np.vdot(psi, psi)
         ops = self._get_spatial_ops_for_rdm()
         holes = {
@@ -2458,10 +2548,14 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state, "sites"):
+            psi = _nonabelian_mps_to_dense_vector(state)
+        elif hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             state = symmetric_to_dense(state)
-        psi = _mps_to_dense_vector(state)
+            psi = _mps_to_dense_vector(state)
+        else:
+            psi = _mps_to_dense_vector(state)
         norm = np.vdot(psi, psi)
         ops = self._get_spatial_ops_for_rdm()
 

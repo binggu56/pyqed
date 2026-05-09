@@ -1577,6 +1577,7 @@ class Molecule:
             unit='bohr',
             charge=self.charge,
             spin=self.spin,
+            cart=bool(getattr(self, "cart", False)),
         )
 
     def atom_mass_list(self):

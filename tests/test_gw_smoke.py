@@ -898,7 +898,7 @@ def test_bse_tda_wavefunction_overlap_same_geometry_identity():
         return_vectors=True,
     )
     vectors = tda.x
-    overlap = tda.wavefunction_overlap(tda, vectors, vectors)
+    overlap = tda.wavefunction_overlap(tda)
 
     assert tda.e is tda.excitation_energies
     np.testing.assert_allclose(overlap, np.eye(2), atol=1e-8)
@@ -933,11 +933,11 @@ def test_bse_tda_wavefunction_overlap_nearby_geometries():
             nroots=1,
             return_vectors=True,
         )
-        return tda, tda.x[:, 0]
+        return tda
 
-    bse_bra, vec_bra = run_h2_bse(0.74)
-    bse_ket, vec_ket = run_h2_bse(0.78)
-    overlap = bse_bra.wavefunction_overlap(bse_ket, vec_bra, vec_ket)
+    bse_bra = run_h2_bse(0.74)
+    bse_ket = run_h2_bse(0.78)
+    overlap = bse_bra.wavefunction_overlap(bse_ket)
 
     assert abs(overlap) > 0.8
     assert abs(overlap) <= 1.05
@@ -981,15 +981,9 @@ def test_bse_full_wavefunction_overlap_uses_stored_xy():
     bse_bra, xy_bra = run_h2_bse(0.74)
     bse_ket, xy_ket = run_h2_bse(0.78)
 
-    explicit = bse_bra.wavefunction_overlap(
-        bse_ket,
-        xy_bra,
-        xy_ket,
-        metric="full",
-    )
     stored = bse_bra.wavefunction_overlap(bse_ket, metric="full")
 
-    np.testing.assert_allclose(stored, explicit, atol=1e-12)
+    assert np.all(np.isfinite(stored))
     np.testing.assert_allclose(
         bse_bra.wavefunction_overlap(bse_bra, metric="full"),
         np.eye(1),

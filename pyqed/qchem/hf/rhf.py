@@ -63,13 +63,24 @@ def _cross_ao_overlap_matrix(mol_bra, mol_ket):
         raise ValueError("Build both molecules before requesting cross AO overlaps.")
 
     try:
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+        from pyqed.qchem.basis import S as native_overlap
 
-        s12 = np.asarray(overlap_integral_asymmetric(basis_bra, basis_ket), dtype=float)
+        s12 = np.empty((len(basis_bra), len(basis_ket)), dtype=float)
+        for i, bra_ao in enumerate(basis_bra):
+            for j, ket_ao in enumerate(basis_ket):
+                s12[i, j] = float(native_overlap(bra_ao, ket_ao))
     except Exception:
-        from pyqed.qchem.mol import intor_cross
+        s12 = None
 
-        s12 = np.asarray(intor_cross('int1e_ovlp', mol_bra.topyscf(), mol_ket.topyscf()), dtype=float)
+    if s12 is None:
+        try:
+            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+
+            s12 = np.asarray(overlap_integral_asymmetric(basis_bra, basis_ket), dtype=float)
+        except Exception as err:
+            raise ValueError(
+                "Cross-AO overlap requires PyQED builtin AO objects or gbasis shells."
+            ) from err
 
     transform_bra = getattr(mol_bra, "_ao_cart2sph", None)
     transform_ket = getattr(mol_ket, "_ao_cart2sph", None)

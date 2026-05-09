@@ -18,14 +18,22 @@ import scipy.linalg
 import sys
 from scipy.optimize import newton
 
-from pyscf.lib import logger
-import pyscf.ao2mo
-import pyscf
-from pyscf import dft
 from functools import reduce
 
 from pyqed import is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
+
+
+class _LoggerFallback:
+    NOTE = 3
+
+    @staticmethod
+    def log(obj, message, *args):
+        if int(getattr(obj, "verbose", 0)) >= _LoggerFallback.NOTE:
+            print(message % args if args else message)
+
+
+logger = _LoggerFallback()
 
 
 def _nelectron(mol):
@@ -47,6 +55,27 @@ def _get_k(mf):
 def _get_mo_eri(mf, mo_coeff, ao2mofn):
     if hasattr(mf, 'get_eri_mo'):
         return np.asarray(mf.get_eri_mo(mo_coeff=mo_coeff, notation='chem'))
+
+    if getattr(mf, "eri", None) is not None:
+        eri_ao = np.asarray(mf.eri)
+    elif getattr(mf.mol, "eri", None) is not None:
+        eri_ao = np.asarray(mf.mol.eri)
+    else:
+        eri_ao = None
+
+    if eri_ao is not None:
+        return np.einsum(
+            "mnkl,mp,nq,kr,ls->pqrs",
+            eri_ao,
+            mo_coeff.conj(),
+            mo_coeff,
+            mo_coeff.conj(),
+            mo_coeff,
+            optimize=True,
+        )
+
+    if ao2mofn is None:
+        raise ValueError("BSE dense ERI build requires native dense AO ERIs or factorized ERIs.")
     nmo = len(mf.mo_energy)
     return ao2mofn(mf.mol, (mo_coeff, mo_coeff, mo_coeff, mo_coeff),
                    compact=False).reshape(nmo, nmo, nmo, nmo)
@@ -233,7 +262,7 @@ def _full_bse_vectors_from_casida(A, B, nroots):
 
 
 class BSE(object):
-    def __init__(self, gw_or_mf, ao2mofn=pyscf.ao2mo.outcore.general_iofree,
+    def __init__(self, gw_or_mf, ao2mofn=None,
                  screening='TDH', eta=1e-2):
 
         gw_ref = gw_or_mf if _is_gw_reference(gw_or_mf) else None
@@ -562,19 +591,16 @@ class BSE(object):
     def wavefunction_overlap(
         self,
         other,
-        bra_vectors=None,
-        ket_vectors=None,
+        *,
         ao_overlap=None,
         metric='auto',
     ):
+        bra_vectors = self.excitation_vectors
+        ket_vectors = self.excitation_vectors if other is self else other.excitation_vectors
         if bra_vectors is None:
-            bra_vectors = self.excitation_vectors
-        if ket_vectors is None and other is not self:
-            ket_vectors = other.excitation_vectors
-        if bra_vectors is None:
-            raise ValueError("No BSE/TDA vectors supplied. Run with return_vectors=True first.")
-        if ket_vectors is None and other is not self:
-            raise ValueError("No ket BSE/TDA vectors supplied. Run with return_vectors=True first.")
+            raise ValueError("No bra BSE/TDA vectors stored. Run with return_vectors=True first.")
+        if ket_vectors is None:
+            raise ValueError("No ket BSE/TDA vectors stored. Run with return_vectors=True first.")
         return bse_wavefunction_overlap(
             self,
             other,
@@ -669,15 +695,12 @@ class TDA(BSE):
     def wavefunction_overlap(
         self,
         other,
-        bra_vectors=None,
-        ket_vectors=None,
+        *,
         ao_overlap=None,
         metric='tda',
     ):
         return super().wavefunction_overlap(
             other,
-            bra_vectors=bra_vectors,
-            ket_vectors=ket_vectors,
             ao_overlap=ao_overlap,
             metric=metric,
         )
@@ -1338,15 +1361,10 @@ def _same_geometry_ao_overlap(bse_obj):
 def _cross_geometry_ao_overlap(bra, ket):
     try:
         return _cross_ao_overlap_matrix(bra.mol, ket.mol)
-    except Exception:
-        try:
-            from pyscf import gto
-
-            return np.asarray(gto.intor_cross("int1e_ovlp", bra.mol, ket.mol), dtype=float)
-        except Exception as err:
-            raise ValueError(
-                "AO overlap was not supplied and could not be built for the two geometries."
-            ) from err
+    except Exception as err:
+        raise ValueError(
+            "AO overlap was not supplied and could not be built for the two geometries."
+        ) from err
 
 
 def _bse_cross_mo_overlap(bra, ket, ao_overlap=None):

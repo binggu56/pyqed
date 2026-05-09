@@ -189,6 +189,15 @@ def _format_verbose_number(value):
         return str(value)
 
 
+def _format_metric_number(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.3e}"
+    except Exception:
+        return str(value)
+
+
 def _format_bond_update_line(bond, update):
     objective = dict(update.get("local_objective") or {})
     return (
@@ -207,7 +216,7 @@ def _format_sweep_line(sweep_idx, direction, history_entry):
         f"dir={direction} | "
         f"E={_format_verbose_number(history_entry.get('energy')):>14} | "
         f"E_obj={_format_verbose_number(history_entry.get('objective_energy')):>14} | "
-        f"metric={_format_verbose_number(history_entry.get('metric')):>10}"
+        f"metric={_format_metric_number(history_entry.get('metric')):>10}"
     )
 
 
@@ -548,6 +557,7 @@ def sweep_once(
     elif isinstance(renormalized_operator_cache, RenormalizedOperatorStack):
         renormalized_operator_cache.max_size = int(renormalized_operator_cache_max_size)
     renormalized_operator_cache_max_size = int(renormalized_operator_cache_max_size)
+    force_canonical_local_norm = str(canonical_local_norm).lower() in {"force", "forced", "unsafe"}
     if mpo_factors is not None and not use_root_environment_path:
         if renormalized_block_stack is None:
             renormalized_block_stack = RenormalizedBlockStack(
@@ -558,7 +568,9 @@ def sweep_once(
             renormalized_block_stack.set_complementary_operator_families(
                 complementary_operator_families
             )
-        if norm_renormalized_block_stack is None:
+        if force_canonical_local_norm:
+            norm_renormalized_block_stack = None
+        elif norm_renormalized_block_stack is None:
             norm_renormalized_block_stack = RenormalizedBlockStack(namespace="norm")
     else:
         renormalized_block_stack = None
@@ -571,7 +583,6 @@ def sweep_once(
     env_sweep = None
     norm_env_sweep = None
     target_env_sweep = None
-    force_canonical_local_norm = str(canonical_local_norm).lower() in {"force", "forced", "unsafe"}
     timing = {
         "environment_build": 0.0,
         "bond_operator": 0.0,
@@ -1485,6 +1496,7 @@ def run_sweeps(
         and mpo_factors is not None
         and int((local_solver_kwargs or {}).get("nstates", 1)) > 1
     )
+    force_canonical_local_norm = str(canonical_local_norm).lower() in {"force", "forced", "unsafe"}
     moving_environment = None
     if mpo_factors is not None and not run_uses_root_environment_path:
         moving_environment = MovingEnvironment(
@@ -1502,7 +1514,9 @@ def run_sweeps(
             )
         identity_mpo_factors = moving_environment.identity_mpo_factors
         persistent_renormalized_block_stack = moving_environment.hamiltonian_stack
-        persistent_norm_renormalized_block_stack = moving_environment.norm_stack
+        persistent_norm_renormalized_block_stack = (
+            None if force_canonical_local_norm else moving_environment.norm_stack
+        )
         persistent_target_renormalized_block_stack = moving_environment.target_stack
         renormalized_operator_cache = moving_environment.renormalized_operator_cache
     else:

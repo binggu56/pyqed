@@ -14,20 +14,42 @@ import numpy as np
 
 
 class DMRGSCF(QCDMRG):
-    def __init__(self, mf, ncas, nelecas, D=20, max_cycles=30, **kwargs):
+    def __init__(
+        self,
+        mf,
+        ncas,
+        nelecas,
+        D=20,
+        max_cycles=30,
+        dmrg_conv_tol=1e-7,
+        integral_backend="auto",
+        **kwargs,
+    ):
        
-        super().__init__(mf, ncas, nelecas, D, **kwargs)
+        super().__init__(
+            mf,
+            ncas,
+            nelecas,
+            D,
+            integral_backend=integral_backend,
+            **kwargs,
+        )
 
         self.max_cycles = max_cycles # macroiterations
         self.tol = 1e-6 # energy tol
+        self.dmrg_conv_tol = float(dmrg_conv_tol)
         self.mo_coeff = None # opt orb
 
 
         self.weights = None
         self.nstates = 1
+        self.converged = False
+        self.macro_converged = False
+        self.solver_converged = False
+        self.macro_iterations = 0
 
 
-    def run(self, nstates=1, weights = None, **kwargs):
+    def run(self, nstates=1, weights = None, require_conv=True, **kwargs):
         mf = self.mf
 
         # canonical molecular orbs
@@ -54,6 +76,10 @@ class DMRGSCF(QCDMRG):
             nelecas=nelecas,
             D=self.D,
             site=getattr(self, "site", getattr(self, "site_basis", "spin_orbital")),
+            spatial_reduced_mpo=getattr(self, "spatial_reduced_mpo", None),
+            symmetry=getattr(self, "symmetry", None),
+            spatial_site_basis=getattr(self, "spatial_site_basis", "canonical"),
+            integral_backend=getattr(self, "integral_backend", "auto"),
             verbose=getattr(self, "verbose", 0),
         )
 
@@ -61,6 +87,8 @@ class DMRGSCF(QCDMRG):
         mc.spin_purification = self.spin_purification
         mc.ss = self.ss
         mc.shift = self.shift
+
+        kwargs.setdefault("conv_tol", self.dmrg_conv_tol)
 
         mc.run(nstates=self.nstates, weights=self.weights, **kwargs)
 
@@ -73,7 +101,17 @@ class DMRGSCF(QCDMRG):
             U0[i, i] = 1.
 
         if nstates == 1: # ground state only
-            C, mc = kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=self.max_cycles)
+            C, mc = kernel(
+                mc,
+                U0,
+                nelecas,
+                ncas,
+                C0,
+                h1e,
+                eri,
+                max_cycles=self.max_cycles,
+                **kwargs,
+            )
 
         elif nstates > 1:
             if self.weights is None:
@@ -81,13 +119,39 @@ class DMRGSCF(QCDMRG):
             if len(self.weights) != nstates: 
                 self.state_average(weights = np.ones(nstates)/nstates)
             mc.nstates = self.nstates
-            C, mc = kernel_state_average(mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
-                                            C0=C0, h1e=h1e, eri=eri)
+            C, mc = kernel_state_average(
+                mc,
+                weights=self.weights,
+                U0=U0,
+                nelecas=nelecas,
+                ncas=ncas,
+                C0=C0,
+                h1e=h1e,
+                eri=eri,
+                max_cycles=self.max_cycles,
+                **kwargs,
+            )
 
         self.mo_coeff = C
         self.e_tot = mc.e_tot
-        self.ci = mc.ci
+        self.ci = getattr(mc, "ci", None)
         self.e_history = getattr(mc, 'e_history', [self.e_tot])
+        self.converged = bool(getattr(mc, "converged", False))
+        self.macro_converged = bool(getattr(mc, "macro_converged", False))
+        self.solver_converged = bool(getattr(mc, "solver_converged", False))
+        self.macro_iterations = int(getattr(mc, "macro_iterations", 0))
+        self.dmrg = getattr(mc, "dmrg", None)
+        self.H = getattr(mc, "H", None)
+        self.H_raw = getattr(mc, "H_raw", None)
+        self.e_core = getattr(mc, "e_core", None)
+        self.casci = mc
+
+        if require_conv and not self.solver_converged:
+            raise RuntimeError(
+                "Final DMRGSCF active-space DMRG did not converge. "
+                "Increase nsweeps or D, loosen conv_tol, or pass "
+                "require_conv=False for debugging."
+            )
 
         return self
 

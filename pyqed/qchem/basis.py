@@ -2787,8 +2787,10 @@ def build_builtin(mol):
         )
     if aosym not in {"s1", "s4", "s8"}:
         raise ValueError("builtin_aosym/native_aosym must be 's1', 's4', or 's8'.")
-    if aosym != "s1" and eri_representation in {"factors", "ri", "dense+ri"}:
-        raise ValueError("builtin_aosym only applies to dense-like or direct builtin ERIs.")
+    if aosym != "s1" and eri_representation in {"factors", "ri"}:
+        aosym = "s1"
+    if aosym != "s1" and eri_representation == "dense+ri":
+        raise ValueError("builtin_aosym does not apply to the RI factors in dense+ri builds.")
 
     workers = _builtin_worker_count(mol, nao_cart)
     computed = 0
@@ -2797,11 +2799,8 @@ def build_builtin(mol):
     eri_s4 = None
     eri_s8 = None
     factors = None
-<<<<<<< HEAD
     pair_bounds = None
-=======
     direct_jk_data = None
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     dense_builder = None
     factor_builder = None
     ri_info = None
@@ -2810,8 +2809,7 @@ def build_builtin(mol):
     pack_s4 = aosym == "s4" and eri_representation in {"dense", "dense+factors"}
     pack_s8 = aosym == "s8" and eri_representation in {"dense", "dense+factors"}
 
-<<<<<<< HEAD
-    if eri_representation in {"dense", "dense+factors", "dense+ri"}:
+    if eri_representation in {"dense", "dense+factors", "dense+ri", "direct"}:
         if screen_tol > 0.0:
             t0 = time.perf_counter()
             pair_bounds = _compute_pair_bounds(signatures)
@@ -2819,18 +2817,7 @@ def build_builtin(mol):
         else:
             pair_bounds = np.zeros((nao_cart, nao_cart), dtype=float)
             timings["pair_bounds"] = 0.0
-        use_rys = (
-            eri_backend == "rys"
-            or (
-                eri_backend == "auto"
-                and _rys_cy is not None
-                and _signatures_are_sp_only(signatures)
-                and workers == 1
-            )
-        )
-        t0 = time.perf_counter()
-        if use_rys:
-=======
+
     if (
         eri_representation == "dense"
         and aosym == "s8"
@@ -2855,6 +2842,16 @@ def build_builtin(mol):
         pack_s8 = False
 
     if eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is None:
+        use_rys = (
+            eri_backend == "rys"
+            or (
+                eri_backend == "auto"
+                and _rys_cy is not None
+                and _signatures_are_sp_only(signatures)
+                and workers == 1
+            )
+        )
+        t0 = time.perf_counter()
         use_shellwise_spherical = bool(
             getattr(mol, "builtin_shellwise_spherical", getattr(mol, "native_shellwise_spherical", False))
         )
@@ -2867,8 +2864,7 @@ def build_builtin(mol):
                 dense_builder = "cython-shellwise-spherical"
                 eri_is_spherical = True
 
-        if eri is None and eri_backend == "rys":
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
+        if eri is None and use_rys:
             if _rys_cy is not None and _signatures_are_sp_only(signatures):
                 shell_blocks = _cart_shell_blocks(basis_cart)
                 shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
@@ -2901,7 +2897,6 @@ def build_builtin(mol):
                         else "rys-screened-mixed-auto"
                     )
             else:
-<<<<<<< HEAD
                 # The current blocked Rys production path is only a win for pure s/p
                 # bases. Mixed/high-l quartets use the compiled OS shell-block path.
                 blocked = None
@@ -2915,20 +2910,12 @@ def build_builtin(mol):
                         signatures, pair_bounds, screen_tol
                     )
                     dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
-        elif workers > 1:
-=======
-                eri, computed, skipped = _compute_dense_eri_serial_shellblocked_rys(
-                    signatures, pair_bounds, screen_tol
-                )
-                dense_builder = "rys-screened-mixed" if _rys_cy is not None else "rys-screened-generic"
         elif eri is None and workers > 1:
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             eri, computed, skipped = _compute_dense_eri_parallel(
                 signatures, pair_bounds, screen_tol, workers
             )
             dense_builder = "python-parallel"
-<<<<<<< HEAD
-        else:
+        elif eri is None:
             blocked = None
             if not _signatures_are_sp_only(signatures) and nao_cart <= _OS_BLOCKED_MAX_NAO:
                 blocked = _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol)
@@ -2941,13 +2928,6 @@ def build_builtin(mol):
                 )
                 dense_builder = _default_dense_builder_name()
         timings["dense_eri"] = time.perf_counter() - t0
-=======
-        elif eri is None:
-            eri, computed, skipped = _compute_dense_eri_serial(
-                signatures, pair_bounds, screen_tol
-            )
-            dense_builder = _default_dense_builder_name()
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
         if eri_representation == "dense+ri":
             t0 = time.perf_counter()

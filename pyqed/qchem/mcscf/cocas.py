@@ -139,6 +139,9 @@ def _fresh_casci_like(source):
             low_rank_mpo_bond=getattr(source, "low_rank_mpo_bond", None),
             low_rank_mpo_batch_size=getattr(source, "low_rank_mpo_batch_size", 4),
             site=getattr(source, "site", getattr(source, "site_basis", "spin_orbital")),
+            spatial_reduced_mpo=getattr(source, "spatial_reduced_mpo", None),
+            symmetry=getattr(source, "symmetry", None),
+            spatial_site_basis=getattr(source, "spatial_site_basis", "canonical"),
             verbose=getattr(source, "verbose", 0),
         )
     else:
@@ -168,6 +171,37 @@ def _fresh_casci_like(source):
     mc.SC1 = getattr(source, 'SC1', None)
     mc.SC2 = getattr(source, 'SC2', None)
     return mc
+
+
+def _run_casci_like(mc, *args, method="direct_ci", **kwargs):
+    """
+    Run either a CI-like CASCI object or a DMRG-backed CASCI object.
+
+    DMRG.run does not accept the CI ``method`` keyword; CASCI.run does.
+    """
+
+    if hasattr(mc, "D"):
+        kwargs.pop("use_cholesky", None)
+        return mc.run(*args, **kwargs)
+    return mc.run(*args, method=method, **kwargs)
+
+
+def _solver_converged(mc):
+    """Return whether the active-space solver attached to ``mc`` converged."""
+
+    dmrg = getattr(mc, "dmrg", None)
+    if dmrg is None:
+        return True
+    return bool(getattr(dmrg, "converged", False))
+
+
+def _set_convergence_metadata(mc, *, macro_converged, macro_iterations):
+    """Store separate macro and active-space solver convergence flags."""
+
+    mc.macro_converged = bool(macro_converged)
+    mc.macro_iterations = int(macro_iterations)
+    mc.solver_converged = _solver_converged(mc)
+    mc.converged = bool(mc.macro_converged and mc.solver_converged)
 
 
 class COCAS(CASCI):
@@ -251,7 +285,12 @@ class COCAS(CASCI):
 
         mc = _fresh_casci_like(self)
         # spin
-        mc.run(nstates, method=self.ci_method, use_cholesky=self.use_cholesky_integrals)
+        _run_casci_like(
+            mc,
+            nstates,
+            method=self.ci_method,
+            use_cholesky=self.use_cholesky_integrals,
+        )
 
 
         # matrix elements in CMOs
@@ -442,7 +481,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         mo_coeff = C0 @ U
 
         current_mc = _fresh_casci_like(mc)
-        current_mc.run(mo_coeff=mo_coeff, method=ci_method, **kwargs)
+        _run_casci_like(current_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
 
         if abs(current_mc.e_tot - e_old) < tol:
             if getattr(mc, "verbose", 0) >= 1:
@@ -480,12 +519,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     # Reusing the same CASCI object across many macroiterations can leave the
     # final reported energy out of sync with the best orbitals, while a fresh
     # CASCI solve at ``mo_coeff`` is consistent.
-    final_mc = CASCI(
-        mc.mf,
-        ncas=ncas,
-        nelecas=nelecas,
-        verbose=getattr(mc, "verbose", 0),
-    )
+    final_mc = _fresh_casci_like(mc)
     final_mc.spin_purification = mc.spin_purification
     final_mc.ss = mc.ss
     final_mc.shift = mc.shift
@@ -499,7 +533,12 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         value = getattr(mc, name, None)
         if value is not None:
             setattr(final_mc, name, value)
-    final_mc.run(mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    _run_casci_like(final_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    _set_convergence_metadata(
+        final_mc,
+        macro_converged=True,
+        macro_iterations=k + 1,
+    )
 
     return mo_coeff, final_mc
 
@@ -553,7 +592,13 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         mo_coeff = C0 @ U
 
         current_mc = _fresh_casci_like(mc)
-        current_mc.run(nstates, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+        _run_casci_like(
+            current_mc,
+            nstates,
+            mo_coeff=mo_coeff,
+            method=ci_method,
+            **kwargs,
+        )
         current_mc.nstates = nstates
 
         e_history.append(current_mc.e_tot)
@@ -600,12 +645,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
 
     # As in the state-specific kernel, build a fresh final CASCI result so the
     # returned state-averaged orbitals and energies are self-consistent.
-    final_mc = CASCI(
-        mc.mf,
-        ncas=ncas,
-        nelecas=nelecas,
-        verbose=getattr(mc, "verbose", 0),
-    )
+    final_mc = _fresh_casci_like(mc)
     final_mc.spin_purification = mc.spin_purification
     final_mc.ss = mc.ss
     final_mc.shift = mc.shift
@@ -620,8 +660,13 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         value = getattr(mc, name, None)
         if value is not None:
             setattr(final_mc, name, value)
-    final_mc.run(nstates, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    _run_casci_like(final_mc, nstates, mo_coeff=mo_coeff, method=ci_method, **kwargs)
     final_mc.e_history = e_history
+    _set_convergence_metadata(
+        final_mc,
+        macro_converged=True,
+        macro_iterations=k + 1,
+    )
 
     return mo_coeff, final_mc
 

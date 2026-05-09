@@ -44,6 +44,61 @@ _IDENTITY_TWO_SITE_KERNEL_PATH = _cached_einsum_path(
 )
 
 
+def _factorized_block_two_step_matrices(left_stack, right_stack):
+    """
+    Return cached matrix views for the two-step factorized block contraction.
+    """
+
+    left_stack = np.asarray(left_stack)
+    right_stack = np.asarray(right_stack)
+    tdim, ldim, kdim, wdim, adim, bdim = left_stack.shape
+    t_right, w_right, qdim, rdim, ddim, cdim = right_stack.shape
+    if tdim != t_right or wdim != w_right:
+        raise ValueError("Incompatible left/right factorized block stacks.")
+    left_matrix = np.ascontiguousarray(
+        np.transpose(left_stack, (0, 1, 3, 4, 2, 5)).reshape(
+            tdim * ldim * wdim * adim,
+            kdim * bdim,
+        )
+    )
+    right_matrix = np.ascontiguousarray(
+        np.transpose(right_stack, (0, 1, 5, 3, 4, 2)).reshape(
+            tdim * wdim * cdim * rdim,
+            ddim * qdim,
+        )
+    )
+    shape_info = (tdim, ldim, kdim, wdim, adim, bdim, qdim, rdim, ddim, cdim)
+    return left_matrix, right_matrix, shape_info
+
+
+def _apply_factorized_block_two_step(left_stack, block_in, right_stack, *, matrices=None):
+    """
+    Apply one factorized block through two BLAS-backed contractions.
+    """
+
+    block_in = np.asarray(block_in)
+    if matrices is None:
+        left_matrix, right_matrix, shape_info = _factorized_block_two_step_matrices(
+            left_stack,
+            right_stack,
+        )
+    else:
+        left_matrix, right_matrix, shape_info = matrices
+    tdim, ldim, kdim, wdim, adim, bdim, qdim, rdim, ddim, cdim = shape_info
+    k_in, b_in, c_in, r_in = block_in.shape
+    if kdim != k_in or bdim != b_in or cdim != c_in or rdim != r_in:
+        raise ValueError("Incompatible factorized block contraction shapes.")
+
+    block_matrix = block_in.reshape(kdim * bdim, cdim * rdim)
+    tmp = left_matrix @ block_matrix
+    tmp = tmp.reshape(tdim, ldim, wdim, adim, cdim, rdim)
+    tmp_matrix = np.transpose(tmp, (1, 3, 0, 2, 4, 5)).reshape(
+        ldim * adim,
+        tdim * wdim * cdim * rdim,
+    )
+    return (tmp_matrix @ right_matrix).reshape(ldim, adim, ddim, qdim)
+
+
 @dataclass
 class CompiledLocalActions:
     """
@@ -761,6 +816,7 @@ class CompiledFactorizedBlock:
             int(self.output_entry.offset) + int(self.output_entry.size),
         )
         self.family_names = tuple(sorted({str(name) for name in self.family_names}))
+        self._two_step_matrix_cache = None
 
     @property
     def input_shape(self):
@@ -781,6 +837,16 @@ class CompiledFactorizedBlock:
     @property
     def output_shape(self):
         return self.output_entry.shape
+
+    def _two_step_matrices(self):
+        cached = self._two_step_matrix_cache
+        if cached is None:
+            cached = _factorized_block_two_step_matrices(
+                self.left_stack,
+                self.right_stack,
+            )
+            self._two_step_matrix_cache = cached
+        return cached
 
     def kernel_matrix(self, input_shape, *, max_elements=_FACTORIZED_BLOCK_DENSE_KERNEL_MAX_ELEMENTS):
         """
@@ -857,17 +923,11 @@ class CompiledFactorizedBlock:
             )
             out[self._output_slice] += np.asarray(contrib).reshape(self._output_size)
             return out
-        tmp = np.einsum(
-            "tlkwab,kbcr->tlwacr",
+        contrib = _apply_factorized_block_two_step(
             left_stack,
             block_in,
-            optimize=False,
-        )
-        contrib = np.einsum(
-            "tlwacr,twqrdc->ladq",
-            tmp,
             right_stack,
-            optimize=False,
+            matrices=self._two_step_matrices(),
         )
         out[self._output_slice] += np.asarray(contrib).reshape(self._output_size)
         return out
@@ -900,17 +960,11 @@ class CompiledFactorizedBlock:
                 optimize=False,
             )
             return np.asarray(contrib).reshape(self._output_size)
-        tmp = np.einsum(
-            "tlkwab,kbcr->tlwacr",
+        contrib = _apply_factorized_block_two_step(
             left_stack,
             block_in,
-            optimize=False,
-        )
-        contrib = np.einsum(
-            "tlwacr,twqrdc->ladq",
-            tmp,
             right_stack,
-            optimize=False,
+            matrices=self._two_step_matrices(),
         )
         return np.asarray(contrib).reshape(self._output_size)
 

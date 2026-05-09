@@ -20,10 +20,6 @@ from pyqed.mps.nonabelian import (
     spatial_target_sector,
 )
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
-from pyqed.mps.nonabelian.renormalized import (
-    configure_complementary_family_kernel_policy,
-    get_complementary_family_kernel_policy,
-)
 
 
 @dataclass
@@ -49,29 +45,6 @@ class _DenseMPOView:
             for core in factors
         ]
         self.dims = [int(core.shape[2]) for core in self.factors]
-
-
-def _qchem_sweep_measure(sweep_result):
-    """
-    Converge qchem sweeps on the local eigensolver objective, not truncation.
-
-    A large enough bond dimension can make the truncation error exactly zero
-    after one pass even when the two-site local residuals are still large.
-    """
-
-    metrics = []
-    for update in sweep_result.get("updates", []):
-        objective = update.get("local_objective") or {}
-        if "metric" in objective:
-            metrics.append(abs(float(objective["metric"])))
-        elif "residual" in objective:
-            metrics.append(abs(float(objective["residual"])))
-    if metrics:
-        return max(metrics)
-    updates = sweep_result.get("updates", [])
-    if not updates:
-        return 0.0
-    return max(float(update.get("trunc_err", 0.0)) for update in updates)
 
 
 def _hf_spatial_labels(nelecas, ncas, spin):
@@ -277,8 +250,6 @@ def _run_dense_state_average_qchem(
     weights,
     max_dense_dim=4096,
     spin_tol=1.0e-7,
-    conv_tol=None,
-    verbose=0,
 ):
     energies, s2_values, states = _spin_adapted_dense_roots(
         qcdmrg,
@@ -297,11 +268,10 @@ def _run_dense_state_average_qchem(
             "state_s2": [float(x) for x in s2_values],
             "backend": "dense_target_sector_su2",
             "target_spin_valid": True,
-            "metric": 0.0,
             "converged": True,
         }
     ]
-    result = NonAbelianDMRGResult(
+    return NonAbelianDMRGResult(
         e_tot=[float(x) for x in energies],
         ground_state=states[0],
         states=states,
@@ -311,17 +281,6 @@ def _run_dense_state_average_qchem(
         target_sector=target_sector,
         backend="nonabelian",
     )
-    if int(verbose) >= 1:
-        tol_text = "-" if conv_tol is None else f"{float(conv_tol):.3e}"
-        print(
-            "  DMRG convergence: "
-            "backend=dense_target_sector_su2 | "
-            "converged=True | "
-            "sweeps=1 | "
-            "metric=0.000e+00 | "
-            f"conv_tol={tol_text}"
-        )
-    return result
 
 
 def _expectation_from_nonabelian_mps(state, mpo_factors):
@@ -496,7 +455,7 @@ def run_spatial_qchem_dmrg(
     target_sector = spatial_target_sector(qcdmrg.nelecas, int(qcdmrg.spin))
     if max_bond is None:
         max_bond = qcdmrg.D
-    state_average_backend = str(sweep_kwargs.pop("state_average_backend", "auto")).lower()
+    state_average_backend = str(sweep_kwargs.pop("state_average_backend", "sweep")).lower()
     state_average_dense_dim = int(sweep_kwargs.pop("state_average_dense_dim", 4096))
     state_average_fallback_dense = bool(sweep_kwargs.pop("state_average_fallback_dense", False))
     state_average_spin_tol = float(sweep_kwargs.pop("state_average_spin_tol", 1.0e-6))
@@ -547,6 +506,7 @@ def run_spatial_qchem_dmrg(
     dense_sa_dim = _fixed_charge_spatial_dim(qcdmrg.ncas, qcdmrg.nelecas)
     use_direct_dense_sa = (
         nstates > 1
+        and qcdmrg.ncas > 4
         and state_average_backend == "auto"
         and dense_sa_dim <= state_average_dense_dim
     )
@@ -560,8 +520,6 @@ def run_spatial_qchem_dmrg(
             weights=weights,
             max_dense_dim=state_average_dense_dim,
             spin_tol=state_average_spin_tol,
-            conv_tol=conv_tol,
-            verbose=verbose,
         )
 
     mps0 = _make_initial_mps(
@@ -680,59 +638,38 @@ def run_spatial_qchem_dmrg(
             else False
         ),
     )
-    family_kernel_backend = sweep_kwargs.pop("family_kernel_backend", None)
-    family_dense_threshold = sweep_kwargs.pop("family_dense_threshold", None)
-    family_dense_total_provided = "family_dense_max_total_elements" in sweep_kwargs
-    family_dense_max_total_elements = sweep_kwargs.pop("family_dense_max_total_elements", None)
-    family_policy_kwargs = {
-        "backend": family_kernel_backend,
-        "dense_threshold": family_dense_threshold,
-    }
-    if family_dense_total_provided:
-        family_policy_kwargs["dense_max_total_elements"] = family_dense_max_total_elements
-    family_policy_previous = configure_complementary_family_kernel_policy(
-        **family_policy_kwargs
-    )
-    family_policy_active = get_complementary_family_kernel_policy()
-    max_bond_mode = sweep_kwargs.pop("max_bond_mode", "reduced")
 
-    try:
-        result = run_sweeps(
-            mps0,
-            nsweeps=int(nsweeps),
-            mpo_factors=mpo_factors,
-            root_target_mpo_factors=root_target_mpo_factors,
-            max_bond=int(max_bond),
-            max_bond_mode=max_bond_mode,
-            canonical_local_norm=canonical_local_norm,
-            prefer_reduced_local_operator=sweep_kwargs.pop("prefer_reduced_local_operator", True),
-            store_orthonormal_renormalized_operators=(
-                local_basis_policy == "orthonormalized_operator"
-            ),
-            require_block_sparse_renormalized_operator_table=(
-                local_basis_policy == "orthonormalized_operator" and nstates > 1
-            ),
-            require_symbolic_renormalized_operators=(
-                local_basis_policy == "orthonormalized_operator"
-            ),
-            complementary_operator_families=complementary_operator_families,
-            warm_start_bonds=sweep_kwargs.pop("warm_start_bonds", True),
-            mixer_zero_block_noise_scale=sweep_kwargs.pop("mixer_zero_block_noise_scale", 1.0e-5),
-            mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
-            mixer_nsweeps=sweep_kwargs.pop("mixer_nsweeps", 2),
-            conv_tol=conv_tol,
-            measure=sweep_kwargs.pop("measure", _qchem_sweep_measure),
-            local_solver_kwargs=solver_kwargs,
-            evaluate_root_energies_each_sweep=False if nstates > 1 else True,
-            verbose=verbose,
-            **sweep_kwargs,
-        )
-    finally:
-        configure_complementary_family_kernel_policy(**family_policy_previous)
+    result = run_sweeps(
+        mps0,
+        nsweeps=int(nsweeps),
+        mpo_factors=mpo_factors,
+        root_target_mpo_factors=root_target_mpo_factors,
+        max_bond=int(max_bond),
+        max_bond_mode=sweep_kwargs.pop("max_bond_mode", "reduced"),
+        canonical_local_norm=canonical_local_norm,
+        prefer_reduced_local_operator=sweep_kwargs.pop("prefer_reduced_local_operator", True),
+        store_orthonormal_renormalized_operators=(
+            local_basis_policy == "orthonormalized_operator"
+        ),
+        require_block_sparse_renormalized_operator_table=(
+            local_basis_policy == "orthonormalized_operator" and nstates > 1
+        ),
+        require_symbolic_renormalized_operators=(
+            local_basis_policy == "orthonormalized_operator"
+        ),
+        complementary_operator_families=complementary_operator_families,
+        warm_start_bonds=sweep_kwargs.pop("warm_start_bonds", True),
+        mixer_zero_block_noise_scale=sweep_kwargs.pop("mixer_zero_block_noise_scale", 1.0e-5),
+        mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
+        mixer_nsweeps=sweep_kwargs.pop("mixer_nsweeps", 2),
+        conv_tol=None if nstates > 1 else conv_tol,
+        local_solver_kwargs=solver_kwargs,
+        evaluate_root_energies_each_sweep=False if nstates > 1 else True,
+        verbose=verbose,
+        **sweep_kwargs,
+    )
     for entry in result.get("history", []):
         entry["local_basis_policy"] = local_basis_policy
-        entry["max_bond_mode"] = max_bond_mode
-        entry["family_kernel_policy"] = dict(family_policy_active)
         for objective in entry.get("bond_objectives", []) or []:
             objective.setdefault("local_basis_policy", local_basis_policy)
     energy = result["best_energy"]
@@ -800,8 +737,6 @@ def run_spatial_qchem_dmrg(
                         weights=weights,
                         max_dense_dim=state_average_dense_dim,
                         spin_tol=state_average_spin_tol,
-                        conv_tol=conv_tol,
-                        verbose=verbose,
                     )
                 except ValueError as exc:
                     raise RuntimeError(
@@ -826,19 +761,6 @@ def run_spatial_qchem_dmrg(
                 "state_average_validate_spin if contaminated roots are acceptable."
             )
     active_energy = state_energies if state_energies is not None else energy
-    if int(verbose) >= 1 and result["history"]:
-        final_metric = result["history"][-1].get("metric")
-        metric_text = "-" if final_metric is None else f"{float(final_metric):.3e}"
-        tol_text = "-" if conv_tol is None else f"{float(conv_tol):.3e}"
-        backend_text = result["history"][-1].get("backend", "sweep")
-        print(
-            "  DMRG convergence: "
-            f"backend={backend_text} | "
-            f"converged={bool(result['converged'])} | "
-            f"sweeps={int(result['ncompleted'])} | "
-            f"metric={metric_text} | "
-            f"conv_tol={tol_text}"
-        )
     return NonAbelianDMRGResult(
         e_tot=active_energy,
         ground_state=ground_state,

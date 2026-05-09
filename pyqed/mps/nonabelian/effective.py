@@ -1394,6 +1394,11 @@ class EffectiveBlockOperator:
             )
             compiled_terms.prefer_complementary_payload_tensor_matvec = bool(
                 getattr(compiled_terms, "complementary_payload_backed", False)
+                and getattr(
+                    self.complementary_operator_families,
+                    "prefer_complementary_payload_tensor_matvec",
+                    False,
+                )
             )
             compiled_terms.direct_orthonormal_projection_source = (
                 "rank_coupled_complementary"

@@ -101,6 +101,11 @@ class SpatialComplementaryOperatorFamilies:
         complementary-operator matvec path.  This avoids building transformed
         local Hamiltonian kernels entirely.  The compiled parent-block backend
         is the default for block2-like SU(2) qchem Hamiltonians.
+    :param prefer_complementary_payload_tensor_matvec: Prefer the experimental
+        payload/family tensor matvec path.  This mirrors the complementary
+        family ownership used by block2, but is currently slower than the
+        compiled parent-block path for small and medium qchem examples, so it
+        remains opt-in.
     """
 
     families: dict
@@ -110,6 +115,7 @@ class SpatialComplementaryOperatorFamilies:
     prefer_direct_orthonormal_projection: bool = False
     prefer_direct_component_transform: bool = False
     prefer_recursive_operator_matvec: bool = True
+    prefer_complementary_payload_tensor_matvec: bool = False
 
     def __getitem__(self, name):
         """Return a named family such as ``"P"`` or ``"Q"``."""
@@ -161,6 +167,9 @@ class SpatialComplementaryOperatorFamilies:
             ),
             "prefer_recursive_operator_matvec": bool(
                 self.prefer_recursive_operator_matvec
+            ),
+            "prefer_complementary_payload_tensor_matvec": bool(
+                self.prefer_complementary_payload_tensor_matvec
             ),
             "families": {
                 name: family.as_metadata()

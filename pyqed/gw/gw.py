@@ -15,10 +15,19 @@ import scipy.linalg
 import sys
 from scipy.optimize import newton
 
-from pyscf.lib import logger
-import pyscf.ao2mo
-import pyscf
 from functools import reduce
+
+
+class _LoggerFallback:
+    NOTE = 3
+
+    @staticmethod
+    def log(obj, message, *args):
+        if int(getattr(obj, "verbose", 0)) >= _LoggerFallback.NOTE:
+            print(message % args if args else message)
+
+
+logger = _LoggerFallback()
 
 
 _SUPPORTED_FREQ_INTEGRATION = {
@@ -156,6 +165,26 @@ def _build_spatial_eri_mo(gw, mo_coeff):
     if hasattr(gw._scf, 'get_eri_mo'):
         return gw._scf.get_eri_mo(mo_coeff=mo_coeff, notation='chem')
 
+    if getattr(gw._scf, "eri", None) is not None:
+        eri_ao = np.asarray(gw._scf.eri)
+    elif getattr(gw.mol, "eri", None) is not None:
+        eri_ao = np.asarray(gw.mol.eri)
+    else:
+        eri_ao = None
+
+    if eri_ao is not None:
+        return np.einsum(
+            "mnkl,mp,nq,kr,ls->pqrs",
+            eri_ao,
+            mo_coeff.conj(),
+            mo_coeff,
+            mo_coeff.conj(),
+            mo_coeff,
+            optimize=True,
+        )
+
+    if gw._ao2mofn is None:
+        raise ValueError("GW dense ERI build requires native dense AO ERIs or factorized ERIs.")
     nmo = mo_coeff.shape[1]
     return gw._ao2mofn(
         gw._scf.mol,
@@ -752,7 +781,7 @@ def is_positive_def(A):
 class GW(object):
     __array_priority__ = 1000
 
-    def __init__(self, mf, ao2mofn=pyscf.ao2mo.outcore.general_iofree,
+    def __init__(self, mf, ao2mofn=None,
                  screening='TDH', eta=1e-2, freq_int='exact'):
 
         assert screening in ('TDH', 'TDHF', 'TDDFT')
@@ -803,9 +832,13 @@ class GW(object):
             self.e_mf = mf.mo_energy
             b = mf.mo_coeff
             self.v_mf = reduce(np.dot, (b.T, v_mf, b))
-            eri = ao2mofn(mf.mol, (b,b,b,b),
-                          compact=False).reshape(nso,nso,nso,nso)
-            self.eri = eri
+            if ao2mofn is None:
+                raise NotImplementedError("UHF/ROHF GW requires an explicit AO2MO callback.")
+            self.eri = ao2mofn(
+                mf.mol,
+                (b, b, b, b),
+                compact=False,
+            ).reshape(nso, nso, nso, nso)
 
         print("There are %d spin-orbitals"%(self.nso))
 
@@ -913,7 +946,6 @@ class GW(object):
         elif method in ('scgw0', 'sc-gw0', 'self-consistent-gw0'):
             from pyqed.gw.scgw import SCGW
 
-<<<<<<< HEAD
             init_keys = {
                 "nfreq",
                 "wmax",
@@ -923,9 +955,6 @@ class GW(object):
                 "density_nfreq",
                 "grid",
             }
-=======
-            init_keys = {"nfreq", "wmax", "beta", "adjust_mu", "target_nelec", "density_nfreq"}
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
             kwargs.setdefault("update_screening", False)
             self.scgw_result = SCGW(
@@ -940,7 +969,6 @@ class GW(object):
         elif method in ('scgw', 'sc-gw', 'self-consistent-gw'):
             from pyqed.gw.scgw import SCGW
 
-<<<<<<< HEAD
             init_keys = {
                 "nfreq",
                 "wmax",
@@ -950,9 +978,6 @@ class GW(object):
                 "density_nfreq",
                 "grid",
             }
-=======
-            init_keys = {"nfreq", "wmax", "beta", "adjust_mu", "target_nelec", "density_nfreq"}
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             init_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in init_keys}
             kwargs.setdefault("update_screening", True)
             self.scgw_result = SCGW(

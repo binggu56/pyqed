@@ -482,6 +482,78 @@ def test_spatial_dmrg_build_can_use_reduced_mpo():
     )
 
 
+def test_dmrg_accepts_ri_active_integrals():
+    atom = "H 0 0 0; H 0 0 0.74"
+    dense_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
+    dense_mol.build(driver="builtin", eri="dense")
+    dense_mf = RHF(dense_mol).run(verbose=0)
+
+    ri_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
+    ri_mol.build(driver="builtin", eri="ri")
+    ri_mf = RHF(ri_mol).run(verbose=0)
+
+    dense = DMRG(dense_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    dense.run(nsweeps=4, symmetry_list=None)
+
+    ri = DMRG(ri_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    ri.run(nsweeps=4, symmetry_list=None)
+
+    assert ri._active_integral_build_info["mode"] == "ri"
+    assert ri._active_integral_build_info["factorized_integrals"] is True
+    assert ri._active_integral_build_info["aux_rank"] == ri_mol.eri_factors.shape[0]
+    assert ri.e_tot == pytest.approx(dense.e_tot, abs=5.0e-5)
+
+
+def test_dmrg_auto_prefers_dense_when_dense_and_factors_exist():
+    atom = "H 0 0 0; H 0 0 0.74"
+    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
+    mol.build(driver="builtin", eri="dense+ri")
+    mf = RHF(mol).run(verbose=0)
+
+    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    dense.run(nsweeps=4, symmetry_list=None)
+
+    ri = DMRG(
+        mf,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        integral_backend="ri",
+        verbose=0,
+    )
+    ri.run(nsweeps=4, symmetry_list=None)
+
+    assert dense._active_integral_build_info["mode"] == "dense"
+    assert dense._active_integral_build_info["factorized_integrals"] is False
+    assert ri._active_integral_build_info["mode"] == "ri"
+    assert ri._active_integral_build_info["factorized_integrals"] is True
+
+
+def test_abelian_sz_hf_guess_can_leave_hf_determinant():
+    atom = "H 0 0 0; H 0 0 0.74"
+    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
+    mol.build(driver="builtin", eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    dense.run(nsweeps=8, symmetry_list=None)
+
+    sz = DMRG(
+        mf,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        verbose=0,
+        symmetry="sz",
+    )
+    sz.run(nsweeps=8, symmetry_list=None)
+
+    assert sz.e_tot == pytest.approx(dense.e_tot, abs=1.0e-8)
+    assert sz.e_tot < mf.e_tot - 1.0e-4
+
+
 def test_autompo_preserves_recursive_symbolic_renormalized_algebra(monkeypatch):
     sites = build_random_spatial_mps(4, seed=11, bond_multiplicity=2)
     mpo = build_spatial_hubbard_mpo(
@@ -879,6 +951,7 @@ def test_spatial_dmrg_routes_su2_to_nonabelian_backend():
     assert su2.dmrg.history[-1]["hamiltonian_system"]["n_elec"] == 2
     assert su2.dmrg.history[-1]["hamiltonian_symmetry"] == "su2"
     assert su2.dmrg.history[-1]["local_basis_policy"] == "mixed_canonical_standard"
+    assert su2.dmrg.history[-1]["max_bond_mode"] == "reduced"
     assert su2.e_tot == pytest.approx(dense.e_tot, abs=1e-7)
     numerator = contract_chain_expectation(su2.dmrg.ground_state.sites, su2.H)
     denominator = contract_chain_expectation(
@@ -951,7 +1024,7 @@ def test_su2_dmrg_target_uses_explicit_charge_and_total_spin():
     assert dmrg.dmrg.ground_state.target_sector == SpinChargeSector(2, SU2Irrep(2))
 
 
-def test_su2_ground_state_uses_standard_problem_when_norm_check_is_identity():
+def test_su2_ground_state_default_trusts_mixed_canonical_norm():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
@@ -970,6 +1043,10 @@ def test_su2_ground_state_uses_standard_problem_when_norm_check_is_identity():
     assert all(objective.get("effective_local_problem") == "standard" for objective in objectives)
     assert all(objective.get("block_preconditioner") is True for objective in objectives)
     assert all(objective.get("block_preconditioner_blocks", 0) > 0 for objective in objectives)
+    assert all(
+        entry.get("norm_renormalized_block_stack_stats") is None
+        for entry in dmrg.dmrg.history
+    )
 
 
 def test_su2_ground_state_can_still_check_local_norm_debug_path():
@@ -989,6 +1066,10 @@ def test_su2_ground_state_can_still_check_local_norm_debug_path():
     ]
     assert objectives
     assert checked.e_tot == pytest.approx(fast.e_tot, abs=1e-10)
+    assert any(
+        entry.get("norm_renormalized_block_stack_stats") is not None
+        for entry in checked.dmrg.history
+    )
 
 
 def test_su2_ground_state_metric_bonds_use_orthonormal_standard_krylov():

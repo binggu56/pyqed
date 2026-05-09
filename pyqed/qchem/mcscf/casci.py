@@ -240,11 +240,11 @@ def _resolve_use_cholesky_integrals(mf, use_cholesky=None):
     """
     Enable the factor/Cholesky CASCI path automatically for factor-only RHF.
     """
-    if use_cholesky is None:
-        use_cholesky = bool(getattr(mf, 'cholesky_jk', False))
-    if use_cholesky:
+    if use_cholesky is not None:
+        return bool(use_cholesky)
+    if bool(getattr(mf, 'cholesky_jk', False)):
         return True
-    return (
+    return getattr(mf, 'eri', None) is None and (
         getattr(mf, 'eri_factors', None) is not None
         or getattr(getattr(mf, 'mol', None), 'eri_factors', None) is not None
     )

@@ -79,6 +79,14 @@ def _summarize_history(history):
                     "family_factor_kernel_elements",
                     0.0,
                 ) + float(family_table.get("factor_kernel_elements", 0))
+                build["family_factor_batch_groups"] = build.get(
+                    "family_factor_batch_groups",
+                    0.0,
+                ) + float(family_table.get("factor_batch_groups", 0))
+                build["family_factor_batched_entries"] = build.get(
+                    "family_factor_batched_entries",
+                    0.0,
+                ) + float(family_table.get("factor_batched_entries", 0))
             for key, value in (objective.get("renormalized_operator_build_timing") or {}).items():
                 if (
                     "direct" in key

@@ -74,6 +74,24 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
     assert mol._builtin_build_info["ri"]["tensor_builder"] == "cython-kernel-packed"
 
 
+def test_builtin_native_ri_ignores_dense_aosym_keyword():
+    _use_source_tree_pyqed()
+    from pyqed.qchem import Molecule
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="cc-pvdz",
+        unit="angstrom",
+    )
+    mol.build(driver="builtin", eri="ri", aosym="s8")
+
+    assert mol.eri is None
+    assert mol.eri_s8 is None
+    assert mol.eri_factors is not None
+    assert mol._builtin_build_info["representation"] == "ri"
+    assert mol._builtin_build_info["aosym"] == "s1"
+
+
 def test_builtin_native_ri_accepts_auxbasis_keyword():
     _use_source_tree_pyqed()
     from pyqed.qchem import Molecule
