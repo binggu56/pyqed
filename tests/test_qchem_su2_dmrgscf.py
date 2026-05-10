@@ -28,7 +28,7 @@ def test_state_averaged_su2_dmrgscf_preserves_nonabelian_backend():
     mc.run(
         nstates=2,
         weights=[0.5, 0.5],
-        nsweeps=1,
+        nsweeps=2,
         mixer_zero_block_noise_scale=0.0,
     )
 

@@ -37,7 +37,7 @@ from pyqed.mps.nonabelian.canonical import mixed_canonical_errors
 from pyqed.mps.nonabelian.environment import contract_chain_expectation
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
 from pyqed.qchem import Molecule
-from pyqed.qchem.dmrg.backends.nonabelian import _spin_adapted_dense_roots
+from pyqed.qchem.dmrg.ed import _spin_adapted_dense_roots
 from pyqed.qchem.dmrg.dmrg import DMRG
 from pyqed.qchem.hf import RHF
 

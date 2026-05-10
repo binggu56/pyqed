@@ -1225,8 +1225,8 @@ class DMRG(CASCI):
     """
     def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
-                 low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',
-                 site_basis=None, orbital_layout=None, spatial_reduced_mpo=None,
+                 low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
+                     orbital_layout=None, spatial_reduced_mpo=None,
                  symmetry=None, spatial_site_basis="canonical",
                  integral_backend="auto"):
         """
@@ -1254,8 +1254,7 @@ class DMRG(CASCI):
         self.verbose = int(verbose)
         normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
 
-        if site_basis is not None:
-            site = site_basis
+
         if orbital_layout is not None:
             site = orbital_layout
         if normalized_symmetry is not None and "su2" in normalized_symmetry:

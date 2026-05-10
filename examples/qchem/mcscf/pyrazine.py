@@ -19,18 +19,18 @@ atom_list = [
     ['H',     0.0000000000,    -3.8979294535,     2.1970704549],
 ]
 
-ncas     = 8
-nelecas  = 8
+ncas     = 4
+nelecas  = 4
 n_states = 3
-weights  = [0, 0.5, 0.5]
+weights  = np.array([1/3, 1/3, 1/3])
 
 mol = Molecule(atom=atom_list, unit='b', basis='6-31g')
-mol.build(driver='builtin', eri='ri')
+mol.build(driver='builtin', eri='dense')
 
 # RHF
-mf = mol.RHF()
-mf.run()
-mc = CASSCF(mf, ncas=ncas, nelecas=nelecas, coupling="qn", verbose=1)
+mf = mol.RHF().run()
+print(mf.e_tot)
+mc = CASSCF(mf, ncas=ncas, nelecas=nelecas, coupling="qn", verbose=3)
 mc.fix_spin(ss=0, shift=0.2).state_average(weights).run(nstates=n_states)
 
 

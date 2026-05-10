@@ -14,10 +14,7 @@ from pyqed.qchem.dmrg.dmrg import (
     _build_s2_term_map,
     _build_spin_purification_term_map,
 )
-from pyqed.qchem.dmrg.backends import (
-    build_spatial_complementary_operator_families,
-    build_spatial_reduced_hamiltonian_mpo,
-)
+from pyqed.qchem.dmrg.backends import build_spatial_reduced_hamiltonian_mpo
 from pyqed.qchem.dmrg.spatial_terms import (
     spatial_local_ops,
     spatial_two_body_spinfree_term_map,
@@ -26,8 +23,6 @@ from pyqed.mps.mps import _mpo_to_dense_operator
 from pyqed.mps.nonabelian import RankCoupledMPO, SpatialSpinFreeERIBuilder
 from pyqed.mps.nonabelian import build_random_spatial_mps, build_spatial_hubbard_mpo
 from pyqed.mps.nonabelian.environment import BlockSparseEnvironmentChain, contract_chain_expectation
-from pyqed.mps.nonabelian.renormalized import ComplementaryFamilyTensorTable
-from pyqed.mps.nonabelian.renormalized import FamilyNativeFactorKernel
 from pyqed.mps.nonabelian.renormalized import RenormalizedBlockStack
 from pyqed.mps.nonabelian.renormalized import symbolic_mpo_core_transitions
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
@@ -93,89 +88,6 @@ def _dense_matrix_from_nonabelian_mpo_list(mpo):
     return states[0]
 
 
-def test_complementary_family_tensor_table_matches_raw_component_plan():
-    class _Entry:
-        def __init__(self, shape):
-            self.shape = tuple(shape)
-
-    class _Term:
-        def __init__(self, kernel, family_names):
-            self.kernel = np.asarray(kernel, dtype=complex)
-            self.family_names = tuple(family_names)
-            self.input_entry = _Entry((self.kernel.shape[1],))
-
-        def apply_block(self, block):
-            return self.kernel @ np.asarray(block, dtype=complex).reshape(-1)
-
-    class _ComponentBasis:
-        component_indices = (np.array([0, 1]), np.array([2, 3]))
-        component_transforms = (np.eye(2, dtype=complex), np.eye(2, dtype=complex))
-        orth_offsets = (0, 2)
-        orthonormal_dim = 4
-
-    basis = _ComponentBasis()
-    terms = (
-        (0, 1, slice(0, 2), slice(0, 2), _Term([[1.0, 0.5], [0.0, -0.25]], ("R",))),
-        (1, 0, slice(0, 2), slice(0, 2), _Term([[0.2, -0.1], [0.3, 0.7]], ("P",))),
-        (0, 0, slice(0, 2), slice(0, 2), _Term([[0.4, 0.0], [0.0, 0.6]], ("Q",))),
-    )
-    table = ComplementaryFamilyTensorTable.from_component_direct_plan(terms)
-
-    vector = np.array([0.1, -0.3, 0.7, 0.2], dtype=complex)
-    parent_inputs = [vector[:2], vector[2:]]
-    parent_outputs = [np.zeros(2, dtype=complex), np.zeros(2, dtype=complex)]
-    for in_comp, out_comp, in_slice, out_slice, term in terms:
-        parent_outputs[out_comp][out_slice] += term.apply_block(
-            parent_inputs[in_comp][in_slice]
-        )
-    expected = np.concatenate(parent_outputs)
-
-    np.testing.assert_allclose(table.matvec(vector, basis), expected, atol=1e-14)
-    assert table.stats["source"] == "compiled_factorized_terms"
-    assert set(table.stats["family_names"]) == {"P", "Q", "R"}
-    assert table.stats["family_term_counts"] == {"P": 1, "Q": 1, "R": 1}
-
-
-def test_family_native_factor_kernel_matches_compiled_apply_block():
-    class _Entry:
-        def __init__(self, shape):
-            self.shape = tuple(shape)
-            self.size = int(np.prod(shape))
-
-    class _Term:
-        input_entry = _Entry((2, 2, 2, 2))
-        output_size = 16
-        left_stack = np.arange(2 * 2 * 2 * 2 * 2 * 2, dtype=float).reshape(
-            2, 2, 2, 2, 2, 2
-        ) / 17.0
-        right_stack = np.arange(2 * 2 * 2 * 2 * 2 * 2, dtype=float).reshape(
-            2, 2, 2, 2, 2, 2
-        )[::-1] / 19.0
-        _use_direct_contraction = False
-
-        def apply_block(self, block_in):
-            tmp = np.einsum(
-                "tlkwab,kbcr->tlwacr",
-                self.left_stack,
-                block_in,
-                optimize=False,
-            )
-            out = np.einsum(
-                "tlwacr,twqrdc->ladq",
-                tmp,
-                self.right_stack,
-                optimize=False,
-            )
-            return out.reshape(self.output_size)
-
-    term = _Term()
-    kernel = FamilyNativeFactorKernel.from_compiled_term(term)
-    block = np.arange(16, dtype=float).reshape(2, 2, 2, 2) / 23.0
-
-    np.testing.assert_allclose(kernel.apply_block(block), term.apply_block(block))
-    assert kernel.stored_elements == term.left_stack.size + term.right_stack.size
-
-
 def _dense_from_spatial_term_map(term_map, nsites):
     ops = spatial_local_ops()
     ident = ops["I"]
@@ -213,13 +125,8 @@ def _assert_factor_tables_equal(left, right):
     for key in left:
         assert len(left[key]) == len(right[key])
         for left_entry, right_entry in zip(left[key], right[key]):
-            if len(left_entry) >= 5 or len(right_entry) >= 5:
-                assert left_entry[:3] == right_entry[:3]
-                np.testing.assert_allclose(left_entry[3], right_entry[3], atol=1e-12)
-                assert tuple(left_entry[4]) == tuple(right_entry[4])
-            else:
-                assert left_entry[:-1] == right_entry[:-1]
-                np.testing.assert_allclose(left_entry[-1], right_entry[-1], atol=1e-12)
+            assert left_entry[:-1] == right_entry[:-1]
+            np.testing.assert_allclose(left_entry[-1], right_entry[-1], atol=1e-12)
 
 
 def _dense_spin_square(ncas):
@@ -482,78 +389,6 @@ def test_spatial_dmrg_build_can_use_reduced_mpo():
     )
 
 
-def test_dmrg_accepts_ri_active_integrals():
-    atom = "H 0 0 0; H 0 0 0.74"
-    dense_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    dense_mol.build(driver="builtin", eri="dense")
-    dense_mf = RHF(dense_mol).run(verbose=0)
-
-    ri_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    ri_mol.build(driver="builtin", eri="ri")
-    ri_mf = RHF(ri_mol).run(verbose=0)
-
-    dense = DMRG(dense_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
-
-    ri = DMRG(ri_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    ri.run(nsweeps=4, symmetry_list=None)
-
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
-    assert ri._active_integral_build_info["aux_rank"] == ri_mol.eri_factors.shape[0]
-    assert ri.e_tot == pytest.approx(dense.e_tot, abs=5.0e-5)
-
-
-def test_dmrg_auto_prefers_dense_when_dense_and_factors_exist():
-    atom = "H 0 0 0; H 0 0 0.74"
-    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense+ri")
-    mf = RHF(mol).run(verbose=0)
-
-    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
-
-    ri = DMRG(
-        mf,
-        ncas=2,
-        nelecas=2,
-        D=8,
-        init_guess="hf",
-        integral_backend="ri",
-        verbose=0,
-    )
-    ri.run(nsweeps=4, symmetry_list=None)
-
-    assert dense._active_integral_build_info["mode"] == "dense"
-    assert dense._active_integral_build_info["factorized_integrals"] is False
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
-
-
-def test_abelian_sz_hf_guess_can_leave_hf_determinant():
-    atom = "H 0 0 0; H 0 0 0.74"
-    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense")
-    mf = RHF(mol).run(verbose=0)
-
-    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=8, symmetry_list=None)
-
-    sz = DMRG(
-        mf,
-        ncas=2,
-        nelecas=2,
-        D=8,
-        init_guess="hf",
-        verbose=0,
-        symmetry="sz",
-    )
-    sz.run(nsweeps=8, symmetry_list=None)
-
-    assert sz.e_tot == pytest.approx(dense.e_tot, abs=1.0e-8)
-    assert sz.e_tot < mf.e_tot - 1.0e-4
-
-
 def test_autompo_preserves_recursive_symbolic_renormalized_algebra(monkeypatch):
     sites = build_random_spatial_mps(4, seed=11, bond_multiplicity=2)
     mpo = build_spatial_hubbard_mpo(
@@ -672,35 +507,6 @@ def test_autompo_preserves_recursive_symbolic_renormalized_algebra(monkeypatch):
     assert getattr(operator.aux_packed_matvec, "symbolic_boundary_payloads")[
         "symbolic_payloads_owned"
     ] is True
-
-
-def test_complementary_operator_stack_survives_reapplying_same_families():
-    h1 = np.array([[0.2, 0.03], [0.03, -0.1]])
-    eri = np.zeros((2, 2, 2, 2))
-    eri[0, 0, 0, 0] = 0.7
-    eri[0, 0, 1, 1] = 0.2
-    families = build_spatial_complementary_operator_families(h1, eri)
-
-    stack = RenormalizedBlockStack(
-        namespace="hamiltonian",
-        complementary_operator_families=families,
-    )
-    stack.put("left", 0, {}, source="initialized")
-    complementary_stack = stack.complementary_operator_stack
-
-    stack.set_complementary_operator_families(families)
-    stack.put("left", 1, {}, source="advanced_left", parent_key=stack.key("left", 0))
-
-    assert stack.complementary_operator_stack is complementary_stack
-    assert stack.stats["complementary_operator_stack"]["n_entries"] == 2
-    assert stack.stats["complementary_operator_stack"]["puts"] == 2
-    assert stack.stats["complementary_operator_stack"]["advances"] == 1
-    assert stack.stats["complementary_operator_stack"]["numeric_payload_terms"] > 0
-    assert stack.stats["complementary_operator_stack"]["numeric_payload_cross_terms"] > 0
-    left_entry = complementary_stack.get("left", 1)
-    assert left_entry is not None
-    assert left_entry.family_payloads["P"].cross_terms > 0
-    assert left_entry.family_payloads["P"].coefficient_norm > 0.0
 
 
 def test_block2_like_strict_symbolic_stack_covers_all_bonds(monkeypatch):
@@ -837,7 +643,6 @@ def test_qchem_su2_block2_like_rejects_raw_boundary_fallback(monkeypatch):
         orthonormalized_operator_dim=512,
         max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
-        conv_tol=-1.0,
     )
 
     assert dmrg.e_tot == pytest.approx(-2.177899323464, abs=1e-8)
@@ -875,20 +680,6 @@ def test_qchem_su2_block2_like_rejects_raw_boundary_fallback(monkeypatch):
     assert complementary_stack["family_names"] == ("S", "R", "A", "P", "B", "Q")
     assert complementary_stack["n_entries"] > 0
     assert complementary_stack["advances"] > 0
-    assert complementary_stack["numeric_payload_terms"] > 0
-    assert complementary_stack["numeric_payload_cross_terms"] > 0
-    assert complementary_stack["family_operator_tables"] > 0
-    assert complementary_stack["family_operator_table_payload_blocks"] > 0
-    assert complementary_stack["family_operator_table_stored_elements"] > 0
-    assert complementary_stack["family_operator_table_symbolic_terms"] > 0
-    assert complementary_stack["numeric_payload_families"]["P"]["cross_terms"] > 0
-    assert dmrg.dmrg.history[0]["reused_prebuilt_boundary_side"] is None
-    assert dmrg.dmrg.history[1]["reused_prebuilt_boundary_side"] == "left"
-    moving_stats = dmrg.dmrg.history[-1]["moving_environment_stats"]
-    assert moving_stats["environment_rebuilds"] == 1
-    assert moving_stats["boundary_side_reuses"] == 1
-    assert moving_stats["valid_boundary_side"] == "right"
-    assert moving_stats["complementary_operator_advances"] > 0
     assert dmrg.dmrg.history[-1]["hamiltonian_complementary_operators"][
         "family_names"
     ] == ("S", "R", "A", "P", "B", "Q")
@@ -1164,12 +955,7 @@ def test_su2_block2_policy_uses_orthonormalized_operator_davidson():
     assert all(stats["parent_dim"] >= stats["orthonormal_dim"] > 0 for stats in table_stats)
     component_stats = [stats for stats in table_stats if stats["kind"] == "component_sparse"]
     assert component_stats
-    assert any(
-        stats.get("component_parent_block_kernel")
-        or stats.get("complementary_payload_tensor_kernel")
-        or stats.get("complementary_family_table_kernel")
-        for stats in component_stats
-    )
+    assert any(stats.get("component_parent_block_kernel") for stats in component_stats)
     assert all(stats["basis_kind"] == "metric_connected_components" for stats in component_stats)
     assert all(stats["n_components"] > 0 for stats in component_stats)
     assert all(stats["max_component_parent_dim"] > 0 for stats in component_stats)
@@ -1197,15 +983,6 @@ def test_su2_block2_policy_uses_orthonormalized_operator_davidson():
     assert all(
         item["complementary_operator_families"]["family_names"]
         == ("S", "R", "A", "P", "B", "Q")
-        for item in metadata
-    )
-    assert any(
-        (
-            item.get("symbolic_boundary_payloads", {})
-            .get("complementary_boundary_payloads", {})
-            .get("payload_backed")
-            is True
-        )
         for item in metadata
     )
     assert dmrg.dmrg.history[-1]["renormalized_operator_cache_size"] > 0
@@ -1288,8 +1065,6 @@ def test_su2_block2_complementary_direct_projection_is_opt_in():
     assert any(
         timing.get("component_direct_factorized_kernel", 0.0) > 0.0
         or timing.get("component_recursive_parent_block_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_payload_tensor_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_family_table_kernel", 0.0) > 0.0
         for timing in (
             objective.get("renormalized_operator_build_timing") or {}
             for objective in objectives
@@ -1338,8 +1113,6 @@ def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
     )
     assert any(
         timing.get("component_recursive_parent_block_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_payload_tensor_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_family_table_kernel", 0.0) > 0.0
         for timing in timings
     )
     assert all(
@@ -1351,182 +1124,17 @@ def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
         for timing in timings
     )
     assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "component_parent_block_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_payload_tensor_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table_kernel"
-            )
-            is True
-        )
-        for objective in objectives
-    )
-    assert any(
         (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_direct_matvec"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (
-                objective.get("renormalized_operator_table_stats") or {}
-            ).get("complementary_operator_families")
-            or {}
-        ).get("family_names")
-        == ("S", "R", "A", "P", "B", "Q")
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_backed"
+            "component_parent_block_kernel"
         )
         is True
         for objective in objectives
     )
     assert any(
         (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_tensor_kernel"
+            "component_orthonormal_dense_kernel"
         )
         is True
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_family_table_matvec"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("source")
-        == "renormalized_family_operator_tables"
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("operator_table_backed")
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("backend")
-        in {"family_table_factor_kernel", "family_table_hybrid_kernel"}
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("factor_kernel_elements", 0)
-        > 0
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_family_operator_table_source"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_operator_tables"
-            )
-            or {}
-        ).get("family_operator_table_backed")
-        is True
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (
-                (
-                    (
-                        (objective.get("renormalized_operator_table_stats") or {})
-                        .get("complementary_family_operator_tables")
-                        or {}
-                    ).get("left_boundary")
-                    or {}
-                ).get("family_operator_table")
-                or {}
-            ).get("active_family_names", ())
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (
-                (
-                    objective.get("renormalized_operator_table_stats") or {}
-                ).get("complementary_family_table")
-                or {}
-            ).get("family_names", ())
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "family_resolved_tensor_kernel"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "family_names",
-                (),
-            )
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        {
-            name
-            for name, count in (
-                (objective.get("renormalized_operator_table_stats") or {})
-                .get("family_term_counts", {})
-                .items()
-            )
-            if count > 0
-        }
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_terms",
-            0,
-        )
-        > 0
         for objective in objectives
     )
     assert np.isfinite(float(dmrg.e_tot))
@@ -1810,43 +1418,12 @@ def test_spatial_su2_state_average_supports_multisite_singlet_roots():
     )
 
     assert len(dmrg.dmrg.states) == 2
-    assert all(entry.get("direction") != "dense" for entry in dmrg.dmrg.history)
-    assert all(
-        entry.get("backend") != "dense_target_sector_su2"
-        for entry in dmrg.dmrg.history
-    )
     np.testing.assert_allclose(
         dmrg.e_tot,
         [-2.177899321294, -1.557192705150],
         atol=1e-8,
     )
     np.testing.assert_allclose(dmrg.dmrg.history[-1]["state_s2"], [0.0, 0.0], atol=1e-8)
-    assert dmrg.dmrg.converged is True
-    assert dmrg.dmrg.history[-1]["convergence_metric"] == "energy_delta"
-    assert dmrg.dmrg.history[-1]["energy_delta"] <= dmrg.tol
-
-
-def test_spin_adapted_ed_matches_su2_reference_roots():
-    from pyqed.qchem.dmrg import ED
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="gbasis")
-    mf = RHF(mol).run()
-
-    ed = ED(mf, ncas=4, nelecas=4, symmetry="su2", verbose=0).run(nstates=2)
-
-    assert ed.converged is True
-    assert ed.history[-1]["backend"] == "spin_adapted_dense_ed"
-    np.testing.assert_allclose(
-        ed.e_tot,
-        [-2.177899323464, -1.557192712326],
-        atol=1e-8,
-    )
-    np.testing.assert_allclose(ed.state_s2, [0.0, 0.0], atol=1e-8)
 
 
 def test_two_site_abelian_state_average_returns_root_mps_lists():

@@ -91,6 +91,12 @@ class DMRGSCF(QCDMRG):
         kwargs.setdefault("conv_tol", self.dmrg_conv_tol)
 
         mc.run(nstates=self.nstates, weights=self.weights, **kwargs)
+        if require_conv and not bool(getattr(getattr(mc, "dmrg", None), "converged", False)):
+            raise RuntimeError(
+                "Initial DMRGSCF active-space DMRG did not converge. "
+                "Increase nsweeps or D, loosen dmrg_conv_tol/conv_tol, or pass "
+                "require_conv=False for debugging."
+            )
 
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo()

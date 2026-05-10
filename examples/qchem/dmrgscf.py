@@ -16,7 +16,7 @@
 
 from pyqed.qchem import Molecule
 from pyqed.qchem import RHF, CASSCF
-from pyqed.qchem.dmrg.dmrgscf import DMRGSCF
+from pyqed.qchem.dmrg import DMRGSCF, DMRG
 
 mol = Molecule(
     atom="Li 0 0 0; F 0 0 1.4",
@@ -27,27 +27,24 @@ mol.build(driver="builtin", eri='dense') # auxbasis='cc-pvdz-jkfit')
 
 mf = RHF(mol).run()
 
+
+mc = DMRG(
+    mf,
+    ncas=4,
+    nelecas=4,
+    D=10,
+    symmetry="su2",
+    init_guess="hf",
+    verbose=1, site='spatial',low_rank_mpo=True).run(nstates=2, nsweeps=8)
+
+print("backend:", mc.backend)
+print("SA-SU2-DMRGSCF energies:", mc.e_tot)
+print("optimized MO coeff shape:", mc.converged)
+
+
 # mc = CASSCF(mf, ncas=6, nelecas=6).fix_spin(ss=0, shift=0.2).run(nstates=2)
 # print(mc.e_tot)
 # [-104.09794657 -103.85656769]
-
-mc = DMRGSCF(
-    mf,
-    ncas=6,
-    nelecas=6,
-    D=10,
-    max_cycles=20,
-    symmetry="su2",
-    init_guess="cid",
-    verbose=1).run(
-    nstates=2,
-    weights=[0.5, 0.5],
-    nsweeps=8
-)
-
-print("backend:", mc.dmrg.backend)
-print("SA-SU2-DMRGSCF energies:", mc.e_tot)
-print("optimized MO coeff shape:", mc.converged)
 
 # mc = CASCI(mf, 8, 8).run()
 
