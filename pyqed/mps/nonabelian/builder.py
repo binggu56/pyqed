@@ -1199,6 +1199,12 @@ class AutoMPO:
             class_maps.append(state_to_index)
             class_irreps.append(tuple(irreps))
 
+        force_rank_coupled_chain = any(
+            irrep.dim != 1
+            for irreps in class_irreps
+            for irrep in irreps
+        )
+
         mpo = []
         for site, phys_leg in enumerate(self.site_legs):
             left_map = class_maps[site]
@@ -1267,7 +1273,7 @@ class AutoMPO:
 
             left_irreps = class_irreps[site]
             right_irreps = class_irreps[site + 1]
-            needs_rank_coupled_core = rank_coupled_terms or any(
+            needs_rank_coupled_core = force_rank_coupled_chain or rank_coupled_terms or any(
                 irrep.dim != 1 for irrep in left_irreps + right_irreps
             )
             if needs_rank_coupled_core:

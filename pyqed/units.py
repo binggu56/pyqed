@@ -1,8 +1,14 @@
-
-import scipy.constants as const
+try:
+    import scipy.constants as const  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    const = None
 
 # proton mass in au
-proton_mass =const.physical_constants["proton-electron mass ratio"][0] 
+if const is None:
+    # CODATA 2018 proton-electron mass ratio (dimensionless).
+    proton_mass = 1836.15267343
+else:
+    proton_mass = const.physical_constants["proton-electron mass ratio"][0]
 
 au2fs = 2.41888432651e-2 # femtoseconds
 

@@ -8,7 +8,6 @@ from pyqed.units import amu2au, au2fs
 from pyqed.phys import gwp
 
 import os
-from ultraplot import pyplot as plt
 from tqdm import tqdm 
 
 
@@ -165,12 +164,18 @@ class LDR2_Curvilinear:
         exp_T = exp_T_flat.reshape(*self.nx, *self.nx)
 
         if self.overlap_matrix is not None:
-
+            expected = (*self.nx, self.nstates, *self.nx, self.nstates)
+            if self.overlap_matrix.shape != expected:
+                raise ValueError(
+                    f"overlap_matrix shape {self.overlap_matrix.shape} != expected {expected}"
+                )
             self.exp_T = np.einsum('abcd,abicdj->abicdj',
                                    exp_T, self.overlap_matrix)
         else:
-
-            self.exp_T = exp_T
+            state_eye = np.eye(self.nstates, dtype=complex)
+            self.exp_T = exp_T[:, :, None, :, :, None] * state_eye[
+                None, None, :, None, None, :
+            ]
 
         return self.exp_T
     

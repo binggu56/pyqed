@@ -888,9 +888,14 @@ def reduced_spatial_fermion_annihilation(site=None, *, dtype=float):
     """
     phys_leg = physical_leg_from_spatial_orbital(site)
     q_empty, q_single, q_double = phys_leg.sectors
+    empty_single_value = (
+        1.0 / np.sqrt(2.0)
+        if phys_leg.dim(q_single) == 1
+        else np.sqrt(2.0)
+    )
     return ReducedTensorOperator(
         reduced_blocks={
-            (q_empty, q_single): np.asarray(np.sqrt(2.0), dtype=dtype),
+            (q_empty, q_single): np.asarray(empty_single_value, dtype=dtype),
             (q_single, q_double): np.asarray(1.0, dtype=dtype),
         },
         phys_out_leg=phys_leg,

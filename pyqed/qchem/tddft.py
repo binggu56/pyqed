@@ -233,6 +233,71 @@ class TDA:
     def nuc_grad_method(self, backend='pyscf'):
         return Gradients(self, backend=backend)
 
+    def _contract_multipole(self, ints, hermi=True, xy=None):
+        """
+        Contract a spin-independent one-electron operator with TD amplitudes.
+
+        This follows the restricted singlet convention used by PySCF:
+        Hermitian operators contract with ``X + Y`` and anti-Hermitian
+        operators with ``X - Y``.  The factor of two is the spin trace.
+        """
+        if xy is None:
+            xy = self.xy
+        if xy is None:
+            raise ValueError("Run TDDFT/TDA before requesting transition moments.")
+
+        ints = np.asarray(ints)
+        if ints.ndim == 2:
+            ints = ints.reshape((1,) + ints.shape)
+        elif ints.ndim == 3 and ints.shape[0] != 3 and ints.shape[-1] == 3:
+            ints = np.moveaxis(ints, -1, 0)
+        if ints.ndim != 3:
+            raise ValueError("Operator integrals must have shape (nao, nao) or (ncomp, nao, nao).")
+
+        _, _, _, _, orbo, orbv = _ov_blocks(self._scf)
+        ints_ov = np.einsum('xpq,pi,qa->xia', ints, orbo, orbv.conj(), optimize=True)
+
+        values = []
+        for x, y in xy:
+            x = np.asarray(x)
+            y = np.asarray(y)
+            norm = np.vdot(x, x).real - np.vdot(y, y).real
+            if norm <= 0.0:
+                raise ValueError("TD amplitudes have non-positive RPA norm.")
+            scale = np.sqrt(0.5 / norm)
+            amp = scale * (x + y if hermi else x - y)
+            values.append(2.0 * np.einsum('xia,ia->x', ints_ov, amp, optimize=True))
+        values = np.asarray(values)
+        return values[:, 0] if values.shape[1] == 1 else values
+
+    def transition_dipole(self, center=None):
+        """
+        Length-gauge transition dipole moments in the PySCF convention.
+
+        The returned operator is the position operator ``r - center`` rather
+        than the electronic dipole ``-r``.
+        """
+        if center is None:
+            center = self.mol.nuc_charge_center()
+        ints = self.mol.moment_integral(center=np.asarray(center, dtype=float))
+        return self._contract_multipole(ints, hermi=True)
+
+    def transition_magnetic_dipole(self, center=None, convention='standard'):
+        """
+        Transition magnetic dipole moments.
+
+        By default this follows the standard orbital magnetic-dipole
+        convention, ``-0.5 * r x grad``.  Use ``convention='pyscf'`` or
+        ``'raw'`` to reproduce PySCF's unhalved transition-vector convention.
+        """
+        if center is None:
+            center = self.mol.nuc_charge_center()
+        ints = self.mol.magnetic_dipole_integral(
+            center=np.asarray(center, dtype=float),
+            convention=convention,
+        )
+        return self._contract_multipole(ints, hermi=False)
+
     def run(self, nstates=None):
         a, _ = self.get_ab()
         dim = self.nocc * self.nvir

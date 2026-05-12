@@ -16,6 +16,7 @@ import numpy as np
 from pyqed.mps.nonabelian import (
     MPS,
     MPO,
+    MultiRootMPS,
     build_spatial_qchem_mpo,
     build_product_spatial_mps,
     build_random_spatial_mps,
@@ -78,6 +79,55 @@ def _initial_sites(qchem_dmrg, *, max_bond, initial_guess=None, seed=7):
     )
 
 
+def _initial_root_sites(qchem_dmrg, *, max_bond, nroots, initial_guess=None, seed=7):
+    nroots = int(nroots)
+    if nroots <= 1:
+        return None
+    roots = [
+        _initial_sites(
+            qchem_dmrg,
+            max_bond=max_bond,
+            initial_guess=initial_guess,
+            seed=seed,
+        )
+    ]
+    for root_idx in range(1, nroots):
+        roots.append(
+            _initial_sites(
+                qchem_dmrg,
+                max_bond=max_bond,
+                initial_guess="random",
+                seed=seed + 104729 * root_idx,
+            )
+        )
+    return [[site.copy() for site in root] for root in roots]
+
+
+def _initial_multiroot_mps(
+    qchem_dmrg,
+    *,
+    max_bond,
+    nroots,
+    weights=None,
+    initial_guess=None,
+    seed=7,
+):
+    root_sites = _initial_root_sites(
+        qchem_dmrg,
+        max_bond=max_bond,
+        nroots=nroots,
+        initial_guess=initial_guess,
+        seed=seed,
+    )
+    if root_sites is None:
+        return None
+    return MultiRootMPS.from_root_sites(
+        root_sites,
+        weights=weights,
+        target_sector=_target_sector(qchem_dmrg),
+    )
+
+
 def _spin_square_for_target(target):
     two_j = int(target.irrep.two_j)
     spin = 0.5 * two_j
@@ -114,6 +164,8 @@ def _small_exact_target_roots(qchem_dmrg, *, nstates, exact_dim_limit=4096, s2_t
         qchem_dmrg.h2e,
         spin_purification=getattr(qchem_dmrg, "spin_purification", False),
         shift=getattr(qchem_dmrg, "shift", None),
+        spin_penalty=getattr(qchem_dmrg, "spin_penalty", "linear"),
+        target_ss=getattr(qchem_dmrg, "ss", 0.0),
     )
     idx = _charge_sector_indices(ncas, qchem_dmrg.nelecas)
     H_sector = H[np.ix_(idx, idx)]
@@ -188,18 +240,43 @@ def run_spatial_qchem_dmrg(
         qchem_dmrg.build(build_mpo=not use_native_mpo)
 
     nstates = int(nstates)
+    allow_experimental_su2_state_average = bool(
+        kwargs.pop("allow_experimental_su2_state_average", False)
+    )
+    if (
+        nstates > 1
+        and int(qchem_dmrg.ncas) > 2
+        and not allow_experimental_su2_state_average
+    ):
+        raise NotImplementedError(
+            "State-averaged SU(2) sweep DMRG is not yet validated for molecular "
+            "active spaces larger than two sites. The current implementation can "
+            "collapse roots and disagree with block2/CASCI. Pass "
+            "allow_experimental_su2_state_average=True only for debugging."
+        )
     target = _target_sector(qchem_dmrg)
     max_bond = int(max_bond if max_bond is not None else qchem_dmrg.D)
     seed = int(kwargs.pop("seed", kwargs.pop("initial_seed", 7)))
     exact_diagonalization_dim = int(kwargs.pop("exact_diagonalization_dim", 4096))
     mpo_cutoff = float(kwargs.pop("mpo_cutoff", 1e-10))
     site_operator_qchem_mpo = bool(kwargs.pop("site_operator_qchem_mpo", False))
+    debug_state_average = bool(kwargs.pop("debug_state_average", False))
+    if debug_state_average and int(verbose) < 2:
+        verbose = 2
     sites = _initial_sites(
         qchem_dmrg,
         max_bond=max_bond,
         initial_guess=initial_guess,
         seed=seed,
     )
+    initial_multiroot_mps = _initial_multiroot_mps(
+        qchem_dmrg,
+        max_bond=max_bond,
+        nroots=nstates,
+        weights=weights,
+        initial_guess=initial_guess,
+        seed=seed,
+    ) if nstates > 1 else None
     if use_native_mpo:
         if site_operator_qchem_mpo:
             mpo_factors = build_spatial_qchem_mpo(
@@ -242,13 +319,22 @@ def run_spatial_qchem_dmrg(
             if weights is None
             else np.asarray(weights, dtype=float)
         )
-        local_solver_kwargs.setdefault("couple_physical", True)
+        # Keep the multi-root path on the direct effective SU(2) problem by
+        # default.  The coupled physical transform is available for diagnostics,
+        # but it does not currently track the molecular MPO sweep energy
+        # reliably for state-averaged roots.
+        local_solver_kwargs.setdefault("couple_physical", False)
     user_local_solver_kwargs = kwargs.pop("local_solver_kwargs", None)
     if user_local_solver_kwargs:
         local_solver_kwargs.update(user_local_solver_kwargs)
 
+    sweep_initial_state = (
+        initial_multiroot_mps
+        if initial_multiroot_mps is not None
+        else MPS(sites, target_sector=target)
+    )
     result = run_sweeps(
-        MPS(sites, target_sector=target),
+        sweep_initial_state,
         nsweeps=int(nsweeps),
         mpo_factors=mpo_factors,
         max_bond=max_bond,
@@ -259,6 +345,8 @@ def run_spatial_qchem_dmrg(
         mixer_zero_block_noise_scale=kwargs.pop("mixer_zero_block_noise_scale", 1e-8),
         mixer_zero_block_noise_seed=kwargs.pop("mixer_zero_block_noise_seed", seed + 17),
         mixer_nsweeps=kwargs.pop("mixer_nsweeps", 2),
+        record_post_update_energy=kwargs.pop("record_post_update_energy", debug_state_average),
+        state_average_local_norm=kwargs.pop("state_average_local_norm", nstates > 1),
         warm_start_bonds=kwargs.pop("warm_start_bonds", False),
         verbose=verbose,
     )
@@ -278,7 +366,13 @@ def run_spatial_qchem_dmrg(
     if state_energies is not None:
         e_active = np.asarray(state_energies, dtype=float)
     else:
-        e_active = np.asarray([result["best_energy"]], dtype=float)
+        best_energy = result["best_energy"]
+        if best_energy is None:
+            for entry in reversed(result.get("history", [])):
+                if "energy" in entry:
+                    best_energy = entry["energy"]
+                    break
+        e_active = np.asarray([np.nan if best_energy is None else best_energy], dtype=float)
     if nstates == 1:
         e_out = float(e_active[0])
     else:
@@ -305,6 +399,7 @@ def run_spatial_qchem_dmrg(
         sites=result["sites"],
         mps=result.get("mps"),
         states=states,
+        multiroot_state=result.get("multiroot_mps"),
         root_mps=result.get("root_mps"),
         root_sites=result.get("root_sites"),
         history=history,

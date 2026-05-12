@@ -23,7 +23,6 @@ from .contraction import merge_mps_sites, normalize_site_tensor_layout
 from .decompose import state_averaged_svd_two_site
 from .linalg import sector_state_weight
 from .mps import MPS
-from .multiroot import MultiRootMPS, fuse_root_center_tensors
 from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
 from .solver import TwoSiteEffectiveH, solve_local_two_site
 from .solver import (
@@ -199,28 +198,13 @@ def _format_metric_number(value):
         return str(value)
 
 
-def _format_verbose_sequence(values, *, max_items=4):
-    if values is None:
-        return "-"
-    try:
-        seq = list(values)
-    except TypeError:
-        return _format_verbose_number(values)
-    shown = ", ".join(_format_verbose_number(value) for value in seq[:max_items])
-    if len(seq) > max_items:
-        shown += ", ..."
-    return "[" + shown + "]"
-
-
 def _format_bond_update_line(bond, update):
     objective = dict(update.get("local_objective") or {})
     return (
         f"  bond {bond:>2} | "
         f"problem={objective.get('effective_local_problem', '-'):>11} | "
         f"E={_format_verbose_number(objective.get('energy')):>14} | "
-        f"Eroots={_format_verbose_sequence(objective.get('state_energies')):>28} | "
         f"E_post={_format_verbose_number(objective.get('post_update_energy')):>14} | "
-        f"root_post={_format_verbose_sequence(objective.get('post_update_root_energies')):>28} | "
         f"kept={str(update.get('kept', '-')):>4} | "
         f"trunc={_format_verbose_number(update.get('trunc_err')):>10}"
     )
@@ -544,8 +528,6 @@ def sweep_once(
         ]
     else:
         root_sites = None
-    root_center_tensor = None
-    root_center_bond = None
     if root_sites is not None and mpo_factors is not None:
         initial_center = min(1, len(updated_sites) - 1) if direction == "lr" else max(0, len(updated_sites) - 2)
         root_sites = [
@@ -830,29 +812,6 @@ def sweep_once(
         updated_sites[bond + 1] = update["right"]
         if root_sites is not None:
             root_pairs = update.get("root_site_pairs") or []
-            optimized_roots = update.get("optimized_roots")
-            if optimized_roots is not None:
-                root_center_tensor = fuse_root_center_tensors([
-                    root.copy() for root in optimized_roots
-                    if isinstance(root, NonabelianTensor)
-                ])
-                root_center_bond = int(bond)
-            if (
-                int(bond_local_solver_kwargs.get("nstates", 1)) > 1
-                and len(root_pairs) < len(root_sites)
-            ):
-                if optimized_roots is not None and root_pairs:
-                    update.setdefault("local_objective", {})
-                    update["local_objective"]["root_site_count_truncated"] = {
-                        "from": int(len(root_sites)),
-                        "to": int(len(root_pairs)),
-                    }
-                    root_sites = root_sites[: len(root_pairs)]
-                else:
-                    raise RuntimeError(
-                        "State-averaged local update did not return one site pair per root; "
-                        "refusing to duplicate the first root into missing roots."
-                    )
             for root_idx, sites_for_root in enumerate(root_sites):
                 if root_idx < len(root_pairs):
                     root_left, root_right = root_pairs[root_idx]
@@ -892,27 +851,11 @@ def sweep_once(
         if record_post_update_energy and mpo_factors is not None:
             t0 = time.perf_counter() if profile else None
             update.setdefault("local_objective", {})
-            post_energy, post_error = _try_compute_state_energy_from_mpo(
+            update["local_objective"]["post_update_energy"] = _compute_state_energy_from_mpo(
                 updated_sites,
                 mpo_factors,
                 identity_mpo_factors=identity_mpo_factors,
             )
-            update["local_objective"]["post_update_energy"] = post_energy
-            if post_error is not None:
-                update["local_objective"]["post_update_energy_error"] = post_error
-            if root_sites is not None:
-                root_energies = []
-                root_errors = []
-                for sites_for_root in root_sites:
-                    energy, error = _try_compute_state_energy_from_mpo(
-                        sites_for_root,
-                        mpo_factors,
-                    )
-                    root_energies.append(energy)
-                    root_errors.append(error)
-                update["local_objective"]["post_update_root_energies"] = root_energies
-                if any(error is not None for error in root_errors):
-                    update["local_objective"]["post_update_root_energy_errors"] = root_errors
             if profile:
                 timing["post_update_energy"] += time.perf_counter() - t0
         if int(verbose) >= 2:
@@ -927,8 +870,6 @@ def sweep_once(
         "sites": updated_sites,
         "mps": MPS(updated_sites, center=(bonds[-1] + 1 if direction == "lr" else bonds[-1])),
         "root_sites": root_sites,
-        "root_center_tensor": root_center_tensor,
-        "root_center_bond": root_center_bond,
         "updates": updates,
         "local_guess_cache": next_local_guess_cache,
         "renormalized_operator_cache": renormalized_operator_cache,
@@ -1205,15 +1146,7 @@ def _state_average_root_environment_update(
     timing = {"canonicalize": 0.0, "environment": 0.0, "solve": 0.0} if profile else None
 
     for root_idx in range(nroots):
-        canonical_sites = mixed_canonicalize_sites(
-            root_sites[root_idx],
-            center,
-            max_bond=None,
-            cutoff=0.0,
-            max_bond_mode=max_bond_mode or "states",
-            bond_coupling=bond_coupling,
-        )
-        root_sites[root_idx] = canonical_sites
+        canonical_sites = root_sites[root_idx]
         merged = merge_mps_sites(canonical_sites[bond], canonical_sites[bond + 1])
         t0 = time.perf_counter() if profile else None
         operator = BlockSparseEnvironmentChain.build(canonical_sites, mpo_factors).bond_operator(
@@ -1395,17 +1328,6 @@ def _compute_state_energy_from_mpo(sites, mpo_factors, *, identity_mpo_factors=N
     return float(np.real(numerator / denominator))
 
 
-def _try_compute_state_energy_from_mpo(sites, mpo_factors, *, identity_mpo_factors=None):
-    try:
-        return _compute_state_energy_from_mpo(
-            sites,
-            mpo_factors,
-            identity_mpo_factors=identity_mpo_factors,
-        ), None
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-
-
 def _infer_converged_from_objectives(
     history,
     *,
@@ -1486,7 +1408,6 @@ def run_sweeps(
     root_target_mpo_factors=None,
     local_solver_kwargs=None,
     local_solver_schedule=None,
-    initial_root_sites=None,
     bond_coupling="left",
     max_bond=None,
     max_bond_mode=None,
@@ -1526,7 +1447,7 @@ def run_sweeps(
     alternate
         If True, alternate the sweep direction after each pass.
     solver, local_operator, mpo_factors, local_solver_kwargs, local_solver_schedule,
-    initial_root_sites, bond_coupling, max_bond, max_bond_mode, cutoff, root_target_mpo_factors,
+    bond_coupling, max_bond, max_bond_mode, cutoff, root_target_mpo_factors,
     prefer_reduced_local_operator, canonical_local_norm, warm_start_bonds
         Passed through to :func:`sweep_once`.
     conv_tol
@@ -1578,16 +1499,9 @@ def run_sweeps(
         trace. Without ``mpo_factors``, ``energy`` falls back to the objective
         trace if available.
     """
-    input_multiroot = sites if isinstance(sites, MultiRootMPS) else None
     input_mps = sites if isinstance(sites, MPS) else None
-    if input_multiroot is not None:
-        target_sector = input_multiroot.target_sector
-        if initial_root_sites is None:
-            initial_root_sites = input_multiroot.root_site_lists()
-        sites = input_multiroot.sites
-    else:
-        target_sector = input_mps.target_sector if input_mps is not None else None
-        sites = input_mps.sites if input_mps is not None else sites
+    target_sector = input_mps.target_sector if input_mps is not None else None
+    sites = input_mps.sites if input_mps is not None else sites
     if nsweeps < 1:
         raise ValueError("run_sweeps requires nsweeps >= 1.")
 
@@ -1598,17 +1512,9 @@ def run_sweeps(
     converged = False
     best_sites = None
     best_root_sites = None
-    best_root_center_tensor = None
-    best_root_center_bond = None
     best_state_energies = None
     best_energy = None
-    last_root_sites = (
-        [[site.copy() for site in root] for root in initial_root_sites]
-        if initial_root_sites is not None
-        else None
-    )
-    last_root_center_tensor = None
-    last_root_center_bond = None
+    last_root_sites = None
     last_state_energies = None
     local_guess_cache = {}
     mixer_zero_block_noise_scale = float(mixer_zero_block_noise_scale)
@@ -1723,8 +1629,6 @@ def run_sweeps(
         if moving_environment is not None:
             moving_environment.finish_sweep(direction)
         last_root_sites = sweep_result.get("root_sites")
-        last_root_center_tensor = sweep_result.get("root_center_tensor")
-        last_root_center_bond = sweep_result.get("root_center_bond")
         if run_uses_root_environment_path and last_root_sites:
             current_sites = [site.copy() for site in last_root_sites[0]]
         else:
@@ -1733,32 +1637,26 @@ def run_sweeps(
         metric = float(measure_fn(sweep_result))
         objective_summary = _summarize_objectives(sweep_result["updates"])
         if mpo_factors is not None and last_root_sites and evaluate_root_energies_each_sweep:
-            root_energies = []
-            root_errors = []
-            for root in last_root_sites:
-                energy, error = _try_compute_state_energy_from_mpo(root, mpo_factors)
-                root_energies.append(energy)
-                root_errors.append(error)
-            if any(error is not None for error in root_errors):
-                objective_summary["state_energy_errors"] = root_errors
-                last_state_energies = None
-            else:
-                last_state_energies = root_energies
-                state_average_weights = _state_average_weights(
-                    sweep_local_solver_kwargs,
-                    len(last_state_energies),
+            last_state_energies = [
+                _compute_state_energy_from_mpo(
+                    root,
+                    mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
                 )
-                objective_summary["state_energies"] = list(last_state_energies)
-                objective_summary["state_average_weights"] = [
-                    float(x) for x in state_average_weights
-                ]
-                objective_summary["state_average_energy"] = float(
-                    np.dot(
-                        state_average_weights,
-                        np.asarray(last_state_energies, dtype=float),
-                    )
-                )
-                objective_summary["energy"] = float(last_state_energies[0])
+                for root in last_root_sites
+            ]
+            state_average_weights = _state_average_weights(
+                sweep_local_solver_kwargs,
+                len(last_state_energies),
+            )
+            objective_summary["state_energies"] = list(last_state_energies)
+            objective_summary["state_average_weights"] = [
+                float(x) for x in state_average_weights
+            ]
+            objective_summary["state_average_energy"] = float(
+                np.dot(state_average_weights, np.asarray(last_state_energies, dtype=float))
+            )
+            objective_summary["energy"] = float(last_state_energies[0])
         if mpo_factors is not None and not run_uses_root_environment_path:
             numerator = sweep_result.get("final_mpo_numerator")
             denominator = sweep_result.get("final_mpo_denominator")
@@ -1783,32 +1681,26 @@ def run_sweeps(
             and run_uses_root_environment_path
             and last_root_sites
         ):
-            root_energies = []
-            root_errors = []
-            for root in last_root_sites:
-                energy, error = _try_compute_state_energy_from_mpo(root, mpo_factors)
-                root_energies.append(energy)
-                root_errors.append(error)
-            if any(error is not None for error in root_errors):
-                objective_summary["state_energy_errors"] = root_errors
-                last_state_energies = None
-            else:
-                last_state_energies = root_energies
-                state_average_weights = _state_average_weights(
-                    sweep_local_solver_kwargs,
-                    len(last_state_energies),
+            last_state_energies = [
+                _compute_state_energy_from_mpo(
+                    root,
+                    mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
                 )
-                objective_summary["state_energies"] = list(last_state_energies)
-                objective_summary["state_average_weights"] = [
-                    float(x) for x in state_average_weights
-                ]
-                objective_summary["state_average_energy"] = float(
-                    np.dot(
-                        state_average_weights,
-                        np.asarray(last_state_energies, dtype=float),
-                    )
-                )
-                objective_summary["energy"] = float(last_state_energies[0])
+                for root in last_root_sites
+            ]
+            state_average_weights = _state_average_weights(
+                sweep_local_solver_kwargs,
+                len(last_state_energies),
+            )
+            objective_summary["state_energies"] = list(last_state_energies)
+            objective_summary["state_average_weights"] = [
+                float(x) for x in state_average_weights
+            ]
+            objective_summary["state_average_energy"] = float(
+                np.dot(state_average_weights, np.asarray(last_state_energies, dtype=float))
+            )
+            objective_summary["energy"] = float(last_state_energies[0])
         elif "objective_energy" in objective_summary:
             objective_summary["energy"] = objective_summary["objective_energy"]
         history.append(
@@ -1859,12 +1751,6 @@ def run_sweeps(
                     if last_root_sites
                     else None
                 )
-                best_root_center_tensor = (
-                    last_root_center_tensor.copy()
-                    if last_root_center_tensor is not None
-                    else None
-                )
-                best_root_center_bond = last_root_center_bond
                 best_state_energies = list(last_state_energies) if last_state_energies else None
             elif best_energy is None or energy < best_energy:
                 best_energy = energy
@@ -1874,23 +1760,16 @@ def run_sweeps(
                     if last_root_sites
                     else None
                 )
-                best_root_center_tensor = (
-                    last_root_center_tensor.copy()
-                    if last_root_center_tensor is not None
-                    else None
-                )
-                best_root_center_bond = last_root_center_bond
                 best_state_energies = list(last_state_energies) if last_state_energies else None
         if conv_tol is not None:
             if (
                 sweep_nlocal_states > 1
                 and energy_delta is not None
                 and energy_delta <= float(conv_tol)
-                and metric <= float(conv_tol)
             ):
                 converged = True
                 history[-1]["converged"] = True
-                history[-1]["convergence_metric"] = "energy_delta+metric"
+                history[-1]["convergence_metric"] = "energy_delta"
                 break
             if sweep_nlocal_states <= 1 and metric <= conv_tol:
                 converged = True
@@ -1905,52 +1784,15 @@ def run_sweeps(
 
     final_sites = best_sites if best_sites is not None else current_sites
     final_root_sites = best_root_sites if best_root_sites is not None else last_root_sites
-    final_root_center_tensor = (
-        best_root_center_tensor
-        if best_root_center_tensor is not None
-        else last_root_center_tensor
-    )
-    final_root_center_bond = (
-        best_root_center_bond
-        if best_root_center_bond is not None
-        else last_root_center_bond
-    )
-    final_root_weights = None
-    if final_root_sites:
-        n_final_roots = len(final_root_sites)
-        if (
-            input_multiroot is not None
-            and input_multiroot.weights is not None
-            and len(input_multiroot.weights) == n_final_roots
-        ):
-            final_root_weights = input_multiroot.weights
-        else:
-            final_root_weights = _state_average_weights(
-                local_solver_kwargs or {},
-                n_final_roots,
-            )
-    multiroot_mps = (
-        MultiRootMPS.from_root_sites(
-            final_root_sites,
-            weights=final_root_weights,
-            center_bond=final_root_center_bond,
-            center_tensor=final_root_center_tensor,
-            target_sector=target_sector,
-        )
-        if final_root_sites
-        else None
-    )
     return {
         "sites": final_sites,
         "mps": MPS(final_sites, target_sector=target_sector),
         "root_sites": final_root_sites,
         "root_mps": (
-            multiroot_mps.roots
+            [MPS(root, target_sector=target_sector) for root in final_root_sites]
             if final_root_sites
             else None
         ),
-        "multiroot_mps": multiroot_mps,
-        "root_center_tensor": final_root_center_tensor,
         "state_energies": best_state_energies if best_state_energies is not None else last_state_energies,
         "history": history,
         "converged": converged,

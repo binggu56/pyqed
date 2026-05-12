@@ -24,6 +24,7 @@ from .basis import (
     TwoSiteBasis,
 )
 from .mps import MPS
+from .multiroot import MultiRootMPS, fuse_root_center_tensors, unfuse_root_center_tensor
 from .coupling import (
     CouplingChannel,
     ReducedBondSpace,

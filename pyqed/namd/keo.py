@@ -20,6 +20,8 @@ import operator
 import jax
 from jax import numpy as jnp
 
+jax.config.update("jax_enable_x64", True)
+
 EPS = jnp.array(
     [
         [[int((i - j) * (j - k) * (k - i) * 0.5) for k in range(3)] for j in range(3)]
@@ -37,8 +39,6 @@ from jax.core import ShapedArray
 from jax.experimental import jet
 from jax.extend.core import Primitive
 from jax.interpreters import ad, batching, mlir
-
-jax.config.update("jax_enable_x64", True)
 
 
 
@@ -1180,15 +1180,29 @@ def build_J_matrices(J, M=None):
 
     np.fill_diagonal(JZ_M, vals)
     for i in range(dim):
-        M = vals[i]
-        if M < J:
-            C_plus = 0.5 * np.sqrt(J * (J + 1) - M * (M + 1))
+        M_quant = vals[i]
+        if M_quant < J:
+            C_plus = 0.5 * np.sqrt(J * (J + 1) - M_quant * (M_quant + 1))
             JX_M[i + 1, i] = C_plus
             JY_M[i + 1, i] = 1j * C_plus  # 空间系正常正号
-        if M > -J:
-            C_minus = 0.5 * np.sqrt(J * (J + 1) - M * (M - 1))
+        if M_quant > -J:
+            C_minus = 0.5 * np.sqrt(J * (J + 1) - M_quant * (M_quant - 1))
             JX_M[i - 1, i] = C_minus
             JY_M[i - 1, i] = -1j * C_minus
+
+    if M is not None:
+        M = int(M)
+        if M < -J or M > J:
+            raise ValueError(f"M={M} is outside the allowed range [-J, J] for J={J}.")
+        I_dim = np.eye(dim)
+        return {
+            "jx": jx_K,
+            "jy": jy_K,
+            "jz": jz_K,
+            "JX": None,
+            "JY": None,
+            "JZ": M * I_dim,
+        }
 
     # ==========================================
     # 3. 扩展到全空间 |J, K, M> = |K> ⊗ |M>
@@ -1213,7 +1227,7 @@ def build_J_matrices(J, M=None):
     }
 
 
-def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0, verbose=True):
+def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0, M_val=None, verbose=True):
     """
     Exact KEO Calculator (支持振动和转动)
 
@@ -1228,6 +1242,9 @@ def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0
             jz|J,K,M> = K|J,K,M>  (from -J to J)
         M : The projection of the total angular momentum onto the laboratory space-fixed Z-axis.
             JZ|J,K,M> = M|J,K,M>  (from -J to J)
+        M_val (int or None): If given, exploit field-free Jz conservation by
+            projecting to a fixed space-fixed M block.  The rotational dimension
+            is then 2J+1 instead of (2J+1)^2.
         verbose (bool): Whether to print construction process information
 
     Returns:
@@ -1242,8 +1259,12 @@ def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0
     n_tot = q_batch.shape[0]
     n_dim = len(dvrs)
 
-    # 【核心修正 1】：由于基底是 |K, M>，转动空间的维度必须是 (2J+1) 的平方！
-    dim_rot = int((2 * J_val + 1) ** 2)
+    if M_val is not None and (M_val < -J_val or M_val > J_val):
+        raise ValueError(f"M_val={M_val} is outside the allowed range [-J, J] for J={J_val}.")
+
+    # Full |K,M> basis has (2J+1)^2 states.  For field-free dynamics, M is
+    # conserved, so a fixed-M block only needs the K ladder.
+    dim_rot = int(2 * J_val + 1) if M_val is not None else int((2 * J_val + 1) ** 2)
 
     if verbose: print(f"[KEO] Total grid points: {n_tot} (Shape: {q_batch.shape})")
     if verbose: print("[KEO] Computing exact G-matrix via JAX AD...")
@@ -1263,8 +1284,8 @@ def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0
     D1s = [d.momentum() for d in dvrs]
 
     if J_val > 0:
-        # 【核心修正 2】：解析返回的字典，提取出动能算符所需的“体定系”角动量矩阵
-        J_matrices_dict = build_J_matrices(J_val)
+        # 解析返回的字典，提取出动能算符所需的“体定系”角动量矩阵
+        J_matrices_dict = build_J_matrices(J_val, M=M_val)
         Jx = J_matrices_dict["jx"]
         Jy = J_matrices_dict["jy"]
         Jz = J_matrices_dict["jz"]

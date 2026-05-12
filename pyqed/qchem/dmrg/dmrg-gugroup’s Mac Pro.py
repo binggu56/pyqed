@@ -59,6 +59,7 @@ from scipy.sparse import identity, kron, csr_matrix, diags
 from pyqed.qchem.mcscf.casci import (
     CASCI,
     _get_mf_cholesky_factors,
+    _resolve_use_cholesky_integrals,
     transform_eri_factors_to_mo_pair,
 )
 from pyqed.mps import DMRG as TensorDMRG, MPS, dense_to_symmetric_mpo
@@ -121,7 +122,16 @@ def _array_digest(arr):
     return h.hexdigest()
 
 
-def _active_hamiltonian_cache_key(h1e, eri, *, spin_purification=False, shift=None):
+def _active_hamiltonian_cache_key(
+    h1e,
+    eri,
+    *,
+    spin_purification=False,
+    shift=None,
+    spin_penalty="linear",
+    target_ss=None,
+    spin_penalty_bond=None,
+):
     """Build a cache key for the active-space Hamiltonian MPO."""
     shift_key = None if shift is None else float(shift)
     return (
@@ -129,6 +139,9 @@ def _active_hamiltonian_cache_key(h1e, eri, *, spin_purification=False, shift=No
         _array_digest(eri),
         bool(spin_purification),
         shift_key,
+        str(spin_penalty),
+        None if target_ss is None else float(target_ss),
+        None if spin_penalty_bond is None else int(spin_penalty_bond),
     )
 
 
@@ -142,45 +155,6 @@ def _normalize_site(site):
     raise ValueError(
         "site must be one of 'spin_orbital' or 'spatial' "
         f"(got {site!r})."
-    )
-
-
-def _normalize_integral_backend(integral_backend):
-    backend = str(integral_backend or "auto").lower().replace("-", "_")
-    aliases = {
-        "cd": "cholesky",
-        "chol": "cholesky",
-        "factor": "cholesky",
-        "factors": "cholesky",
-        "factorized": "cholesky",
-        "density_fitting": "ri",
-        "df": "ri",
-    }
-    backend = aliases.get(backend, backend)
-    if backend not in {"auto", "dense", "ri", "cholesky"}:
-        raise ValueError(
-            "integral_backend must be 'auto', 'dense', 'ri', or 'cholesky' "
-            f"(got {integral_backend!r})."
-        )
-    return backend
-
-
-def _mf_has_factorized_eris(mf):
-    return (
-        getattr(mf, "eri_factors", None) is not None
-        or getattr(getattr(mf, "mol", None), "eri_factors", None) is not None
-    )
-
-
-def _mf_has_dense_eris(mf):
-    mol = getattr(mf, "mol", None)
-    return (
-        getattr(mf, "eri", None) is not None
-        or getattr(mf, "eri_s4", None) is not None
-        or getattr(mf, "eri_s8", None) is not None
-        or getattr(mol, "eri", None) is not None
-        or getattr(mol, "eri_s4", None) is not None
-        or getattr(mol, "eri_s8", None) is not None
     )
 
 
@@ -257,7 +231,16 @@ def _build_spatial_s2_matrix(spatial_ops):
     return sz @ sz + 0.5 * (sp @ sm + sm @ sp)
 
 
-def _build_spatial_active_hamiltonian_matrix(h1e, eri, *, spin_purification=False, shift=None, cutoff=1e-10):
+def _build_spatial_active_hamiltonian_matrix(
+    h1e,
+    eri,
+    *,
+    spin_purification=False,
+    shift=None,
+    spin_penalty="linear",
+    target_ss=0.0,
+    cutoff=1e-10,
+):
     """Build a small dense active-space Hamiltonian in the spatial-site basis."""
     h_spatial = np.asarray(h1e[0], dtype=complex)
     eri_spatial = 0.5 * np.asarray(eri[0, 0], dtype=complex)
@@ -302,7 +285,12 @@ def _build_spatial_active_hamiltonian_matrix(h1e, eri, *, spin_purification=Fals
         )
 
     if spin_purification:
-        hmat += float(shift) * _build_spatial_s2_matrix(spatial_ops)
+        s2 = _build_spatial_s2_matrix(spatial_ops)
+        if str(spin_penalty).lower() in {"quadratic", "target", "targeted", "projector"}:
+            shifted_s2 = s2 - float(target_ss) * np.eye(dim, dtype=complex)
+            hmat += float(shift) * (shifted_s2 @ shifted_s2)
+        else:
+            hmat += float(shift) * s2
 
     hmat = 0.5 * (hmat + hmat.conj().T)
     return hmat, spatial_ops
@@ -334,23 +322,49 @@ def _spatial_hf_guess(nelecas, ncas, *, spin=0, noise=1e-3):
 def _mps_to_dense_vector(state):
     """Contract a small dense MPS into a full state vector."""
     psi = np.array([1.0 + 0.0j])
-    for site in range(state.L):
-        tensor = state._get_std_B(site)
+    if hasattr(state, "L"):
+        nsites = state.L
+    elif hasattr(state, "sites"):
+        nsites = len(state.sites)
+    elif hasattr(state, "Bs"):
+        nsites = len(state.Bs)
+    else:
+        raise TypeError(f"Cannot convert state of type {type(state).__name__} to a dense vector.")
+
+    for site in range(nsites):
+        if hasattr(state, "_get_std_B"):
+            tensor = state._get_std_B(site)
+        elif hasattr(state, "sites"):
+            from pyqed.mps.nonabelian.environment import _site_to_dense
+
+            tensor = _site_to_dense(state.sites[site])
+        elif hasattr(state, "Bs"):
+            tensor = state.Bs[site]
+        else:
+            raise TypeError(f"Cannot read site tensor {site} from {type(state).__name__}.")
         psi = np.tensordot(psi, tensor, axes=([-1], [0]))
     return np.squeeze(psi, axis=-1).reshape(-1)
 
 
-def _nonabelian_mps_to_dense_vector(state):
-    """Contract a small non-Abelian spatial MPS into a full dense vector."""
+def _is_nonabelian_mps_state(state):
+    """Return True for the non-Abelian MPS wrapper, which stores ``sites``."""
+    try:
+        from pyqed.mps.nonabelian.mps import MPS as NonAbelianMPS
+    except Exception:
+        NonAbelianMPS = ()
+    return isinstance(state, NonAbelianMPS)
 
-    from pyqed.mps.nonabelian.environment import _site_to_dense
 
-    sites = list(getattr(state, "sites", state))
-    psi = np.array([1.0 + 0.0j])
-    for site in sites:
-        tensor = _site_to_dense(site)
-        psi = np.tensordot(psi, tensor, axes=([-1], [0]))
-    return np.squeeze(psi, axis=-1).reshape(-1)
+def _state_for_dense_rdm(state):
+    """Normalize supported MPS wrappers before dense-vector RDM evaluation."""
+    if _is_nonabelian_mps_state(state):
+        return state
+    tensors = getattr(state, "Bs", None)
+    if tensors is not None and tensors and hasattr(tensors[0], "qns"):
+        from pyqed.mps.mps import symmetric_to_dense
+
+        return symmetric_to_dense(state)
+    return state
 
 
 def _build_spatial_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
@@ -589,6 +603,50 @@ def _maybe_compress_tensor_mpo(tensor_mpo, *, chi_max=None, trigger_bond=None):
 def _build_spin_purification_term_map(ncas, shift, *, cutoff=1e-10):
     """Build symbolic terms for the first-order spin-purification penalty."""
     return _build_s2_term_map(ncas, scale=shift, cutoff=cutoff)
+
+
+def _identity_tensor_mpo(dims, *, dtype=complex):
+    """Build an identity MPO with ``[left, right, out, in]`` cores."""
+    factors = []
+    for dim in dims:
+        core = np.zeros((1, 1, int(dim), int(dim)), dtype=dtype)
+        for idx in range(int(dim)):
+            core[0, 0, idx, idx] = 1.0
+        factors.append(core)
+    return TensorMPO(factors, homogenous=False)
+
+
+def _build_s2_penalty_tensor_mpo(
+    s2_mpo,
+    *,
+    shift,
+    target_ss=0.0,
+    mode="linear",
+    chi_max=None,
+):
+    """
+    Build a spin-penalty MPO.
+
+    ``linear`` applies ``shift * S^2`` and is appropriate for singlet targeting
+    in an ``Sz=0`` Abelian block. ``quadratic`` applies
+    ``shift * (S^2 - target_ss I)^2`` and is the safer choice for targeting
+    non-lowest spin sectors or spin-specific excited roots.
+    """
+    mode = str(mode).strip().lower().replace("-", "_")
+    shift = float(shift)
+    if mode in {"linear", "first_order", "firstorder"}:
+        return s2_mpo * shift
+    if mode not in {"quadratic", "target", "targeted", "projector"}:
+        raise ValueError(
+            "Unsupported spin penalty mode {!r}. Use 'linear' or 'quadratic'.".format(mode)
+        )
+
+    target_ss = float(target_ss)
+    product = s2_mpo.matmul(s2_mpo, chi_max=chi_max) if chi_max is not None else (s2_mpo @ s2_mpo)
+    penalty = product + (s2_mpo * (-2.0 * target_ss))
+    if abs(target_ss) > 0.0:
+        penalty = penalty + (_identity_tensor_mpo(s2_mpo.dims, dtype=s2_mpo.factors[0].dtype) * (target_ss * target_ss))
+    return _maybe_compress_tensor_mpo(penalty * shift, chi_max=chi_max)
 
 
 def _build_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
@@ -1223,12 +1281,11 @@ class DMRG(CASCI):
     """
     ab initio DRMG quantum chemistry calculation
     """
-    def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
+    def __init__(self, mf, ncas, nelecas, D, init_guess='cid', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
-                 low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
-                     orbital_layout=None, spatial_reduced_mpo=None,
-                 symmetry=None, spatial_site_basis="canonical",
-                 integral_backend="auto"):
+                 low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',
+                 site_basis=None, orbital_layout=None, spatial_reduced_mpo=None,
+                 symmetry=None, spatial_site_basis="canonical"):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -1254,7 +1311,8 @@ class DMRG(CASCI):
         self.verbose = int(verbose)
         normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
 
-
+        if site_basis is not None:
+            site = site_basis
         if orbital_layout is not None:
             site = orbital_layout
         if normalized_symmetry is not None and "su2" in normalized_symmetry:
@@ -1273,10 +1331,7 @@ class DMRG(CASCI):
 
         self.nsites = self.L = ncas
 
-        # assert(mf.eri.shape == (self.L, self.L))
-
         self.spin_purification = False
-
 
         self.D = self.m = D
 
@@ -1318,9 +1373,9 @@ class DMRG(CASCI):
         self.spin = spin
         self.shift = None
         self.ss = None
+        self.spin_penalty = "linear"
+        self.spin_penalty_bond = None
 
-        self.mf = mf
-        # self.chemical_potential = mu
 
         self.mol = mf.mol
 
@@ -1349,7 +1404,6 @@ class DMRG(CASCI):
         self.h2e_factors = None
 
         self.init_guess = init_guess
-        self.integral_backend = _normalize_integral_backend(integral_backend)
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
         self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
@@ -1387,10 +1441,7 @@ class DMRG(CASCI):
         if self.site == "spatial":
             nspin = 2 * self.ncas
             if method == 'hf':
-                configs = [
-                    (_spin_config_to_spatial_config(cfg), amp)
-                    for cfg, amp in gen_cid_configs(self.nelecas, nspin, mixing=1.0e-5)
-                ]
+                configs = [(_spin_config_to_spatial_config(gen_hf_config(self.nelecas, nspin)), 1.0)]
             elif method == 'cid':
                 configs = [
                     (_spin_config_to_spatial_config(cfg), amp)
@@ -1416,7 +1467,8 @@ class DMRG(CASCI):
 
         # 1. Generate Configurations (Physics)
         if method == 'hf':
-            configs = gen_cid_configs(self.nelecas, nsites, mixing=1.0e-5)
+            hf_cfg = gen_hf_config(self.nelecas, nsites)
+            configs = [(hf_cfg, 1.0)]
 
         elif method == 'cid':
             configs = gen_cid_configs(self.nelecas, nsites, mixing=0.5)
@@ -1512,42 +1564,68 @@ class DMRG(CASCI):
     #     # self.eri += ...
     #     return self
 
-    def fix_spin(self, s=None, ss=0, shift=0.2):
+    def fix_spin(self, s=None, ss=None, shift=0.2, method="linear", bond=None):
         """
-        Bias the DMRG optimization toward spin-pure states with a linear ``S^2`` penalty.
+        Bias the DMRG optimization toward spin-pure states.
 
         .. math::
 
             H' = H + \mu \hat{S}^2
 
+        for ``method="linear"``, or
+
+        .. math::
+
+            H' = H + \mu (\hat{S}^2 - S(S+1))^2
+
+        for ``method="quadratic"``.
         Parameters
         ----------
         s : TYPE, optional
             DESCRIPTION. The default is None.
         ss : TYPE, optional
-            DESCRIPTION. The default is 0.
+            Target ``S(S+1)``. The default is 0.
         shift : TYPE, optional
             DESCRIPTION. The default is 0.2.
+        method : {"linear", "quadratic"}, optional
+            ``"linear"`` biases to the lowest total-spin state in the fixed-Sz
+            sector. ``"quadratic"`` targets the requested ``ss`` value.
+        bond : int, optional
+            Optional compression bond for the quadratic penalty MPO.
 
         Returns
         -------
         None.
         """
         if s is None:
+            if ss is None:
+                ss = 0
             s = (np.sqrt(4*ss+1)-1)/2
             if not np.isclose(2*s, round(2*s)):
                 raise Warning("s = {} inconsistent spin value".format(s))
         else:
+            expected_ss = float(s) * (float(s) + 1.0)
             if ss is None:
-                ss = s * (s+1)
-            else:
-                raise ValueError('s and ss cannot be specified simultaneously.')
+                ss = expected_ss
+            elif not np.isclose(float(ss), expected_ss):
+                raise ValueError(
+                    "Received inconsistent spin targets: s={} implies ss={}, "
+                    "but ss={} was given.".format(s, expected_ss, ss)
+                )
         ss = float(ss)
         shift = float(shift)
 
         ms = abs(float(self.spin)) / 2.0
         min_ss = ms * (ms + 1.0)
-        if not np.isclose(ss, min_ss):
+        penalty_method = str(method).strip().lower().replace("-", "_")
+        if penalty_method in {"target", "targeted", "projector"}:
+            penalty_method = "quadratic"
+        if penalty_method in {"first_order", "firstorder"}:
+            penalty_method = "linear"
+        if penalty_method not in {"linear", "quadratic"}:
+            raise ValueError("fix_spin method must be 'linear' or 'quadratic'.")
+
+        if penalty_method == "linear" and not np.isclose(ss, min_ss):
             warnings.warn(
                 "The current DMRG spin-purification path adds a linear +shift*S^2 penalty. "
                 "With fixed Sz symmetry this biases toward the lowest-S state in the selected "
@@ -1563,7 +1641,13 @@ class DMRG(CASCI):
         # would not change the optimized wavefunction.
         self.ss = ss
         self.shift = shift
+        self.spin_penalty = penalty_method
+        self.spin_penalty_bond = None if bond is None else int(bond)
         self.spin_purification = True
+        self.H = None
+        self.H_raw = None
+        self._hamiltonian_mpo_cache_key = None
+        self._symmetric_mpo_cache = {}
 
         return self
 
@@ -1587,10 +1671,7 @@ class DMRG(CASCI):
         # from pyscf import ao2mo
 
         mf = self.mf
-        backend = self.integral_backend
-        use_cholesky = backend in {"ri", "cholesky"} or (
-            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
-        )
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
 
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
@@ -1615,18 +1696,7 @@ class DMRG(CASCI):
             pair_factors = transform_eri_factors_to_mo_pair(eri_factors, Ca)
             flat_pair_factors = pair_factors.reshape(pair_factors.shape[0], -1)
             eri_aa = (flat_pair_factors.conj().T @ flat_pair_factors).reshape(self.ncas, self.ncas, self.ncas, self.ncas)
-            factor_source = getattr(
-                getattr(mf, "mol", None),
-                "builtin_resolved_eri_representation",
-                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
-            )
-            if factor_source is None:
-                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
-            if str(factor_source).lower() in {"dense+ri"}:
-                factor_source = "ri"
-            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
-                factor_source = "cholesky"
-            build_mode = str(factor_source).lower()
+            build_mode = 'cholesky'
             aux_rank = int(pair_factors.shape[0])
         else:
             eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
@@ -1669,7 +1739,6 @@ class DMRG(CASCI):
         H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
         self._active_integral_build_info = {
             'mode': build_mode,
-            'factorized_integrals': bool(use_cholesky),
             'aux_rank': aux_rank,
             'ncas': self.ncas,
         }
@@ -1697,13 +1766,10 @@ class DMRG(CASCI):
     def _get_active_hamiltonian_inputs(self):
         """
         Return the active-space one-body Hamiltonian together with either the
-        dense active ERI tensor or RI/Cholesky pair factors.
+        dense active ERI tensor or Cholesky pair factors.
         """
         mf = self.mf
-        backend = self.integral_backend
-        use_factors = backend in {"ri", "cholesky"} or (
-            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
-        )
+        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky=None)
 
         H, energy_core = h1e_for_cas(
             mf,
@@ -1713,25 +1779,13 @@ class DMRG(CASCI):
         )
         self.e_core = energy_core
 
-        if use_factors:
+        if use_cholesky:
             pair_factors = transform_eri_factors_to_mo_pair(
                 _get_mf_cholesky_factors(mf),
                 self.mo_cas,
             )
-            factor_source = getattr(
-                getattr(mf, "mol", None),
-                "builtin_resolved_eri_representation",
-                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
-            )
-            if factor_source is None:
-                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
-            if str(factor_source).lower() in {"dense+ri"}:
-                factor_source = "ri"
-            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
-                factor_source = "cholesky"
             self._active_integral_build_info = {
-                "mode": str(factor_source).lower(),
-                "factorized_integrals": True,
+                "mode": "cholesky",
                 "aux_rank": int(pair_factors.shape[0]),
                 "ncas": self.ncas,
             }
@@ -1748,7 +1802,6 @@ class DMRG(CASCI):
         H2 = np.stack((np.stack((eri_aa, eri_aa.copy())), np.stack((eri_aa.copy(), eri_aa.copy()))))
         self._active_integral_build_info = {
             "mode": "dense",
-            "factorized_integrals": False,
             "aux_rank": None,
             "ncas": self.ncas,
         }
@@ -1799,6 +1852,9 @@ class DMRG(CASCI):
             eri if pair_factors is None else pair_factors,
             spin_purification=self.spin_purification,
             shift=self.shift,
+            spin_penalty=getattr(self, "spin_penalty", "linear"),
+            target_ss=self.ss,
+            spin_penalty_bond=self.spin_penalty_bond,
         ) + (
             self.site,
             use_low_rank_mpo,
@@ -1871,11 +1927,29 @@ class DMRG(CASCI):
                 h1e,
                 eri,
                 n_spatial,
-                spin_purification=self.spin_purification,
-                shift=self.shift,
+                spin_purification=False,
+                shift=None,
                 cutoff=1e-10,
             )
             tensor_mpo = _group_spin_orbital_mpo_pairs(spin_tensor_mpo)
+            if self.spin_purification:
+                self._log(
+                    "  Adding spin penalty: method={}, shift={}, target <S^2>={}".format(
+                        self.spin_penalty,
+                        self.shift,
+                        self.ss,
+                    )
+                )
+                s2_mpo = _build_grouped_spatial_s2_tensor_mpo(n_spatial)
+                spin_penalty_mpo = _build_s2_penalty_tensor_mpo(
+                    s2_mpo,
+                    shift=self.shift,
+                    target_ss=self.ss,
+                    mode=self.spin_penalty,
+                    chi_max=self.spin_penalty_bond,
+                )
+                tensor_mpo = tensor_mpo + spin_penalty_mpo
+                spin_penalty_term_count = len(_build_s2_term_map(n_spatial, scale=1.0))
             self._spatial_operator_cache = None
             self.H_raw = tensor_mpo.factors
             self.H = tensor_mpo.factors
@@ -1891,6 +1965,9 @@ class DMRG(CASCI):
             )
             if self.spin_purification:
                 self._active_integral_build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
+                self._active_integral_build_info["spin_penalty"] = self.spin_penalty
+                self._active_integral_build_info["spin_penalty_shift"] = float(self.shift)
+                self._active_integral_build_info["spin_penalty_target_s2"] = float(self.ss)
             return self
 
         # 2. Build Hamiltonian (Using Robust JW Builder)
@@ -1967,14 +2044,31 @@ class DMRG(CASCI):
             )
 
         if self.spin_purification:
-            spin_term_map = _build_spin_purification_term_map(ncas, self.shift, cutoff=cutoff)
-            spin_mpo, spin_term_count = _build_tensor_mpo_from_symbolic_terms(
+            self._log(
+                "  Adding spin penalty: method={}, shift={}, target <S^2>={}".format(
+                    self.spin_penalty,
+                    self.shift,
+                    self.ss,
+                )
+            )
+            spin_term_map = _build_s2_term_map(ncas, scale=1.0, cutoff=cutoff)
+            s2_mpo, spin_term_count = _build_tensor_mpo_from_symbolic_terms(
                 basis_sites,
                 spin_term_map,
                 cutoff=cutoff,
             )
+            spin_mpo = _build_s2_penalty_tensor_mpo(
+                s2_mpo,
+                shift=self.shift,
+                target_ss=self.ss,
+                mode=self.spin_penalty,
+                chi_max=self.spin_penalty_bond,
+            )
             tensor_mpo = tensor_mpo + spin_mpo
             self._active_integral_build_info["spin_penalty_terms"] = int(spin_term_count)
+            self._active_integral_build_info["spin_penalty"] = self.spin_penalty
+            self._active_integral_build_info["spin_penalty_shift"] = float(self.shift)
+            self._active_integral_build_info["spin_penalty_target_s2"] = float(self.ss)
 
         self.H_raw = tensor_mpo.factors
         self.H = tensor_mpo.factors
@@ -1982,6 +2076,112 @@ class DMRG(CASCI):
         self._symmetric_mpo_cache = {}
 
         return self
+
+    def _spin_square_tensor_mpo(self):
+        if self.site == "spatial":
+            s2_cache_key = ("spatial_grouped", int(self.ncas))
+            s2_mpo = self._s2_mpo_cache.get(s2_cache_key)
+            if s2_mpo is None:
+                s2_mpo = _build_grouped_spatial_s2_tensor_mpo(self.ncas)
+                self._s2_mpo_cache[s2_cache_key] = s2_mpo
+            return s2_mpo
+
+        ncas = self.ncas
+        s2_term_map = _build_s2_term_map(ncas, scale=1.0)
+        s2_cache_key = int(ncas)
+        mpo_dense = self._s2_mpo_cache.get(s2_cache_key)
+        if mpo_dense is None:
+            basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+            s2_terms = _materialize_symbolic_terms(s2_term_map)
+            model = Model(basis=basis_sites, ham_terms=s2_terms)
+            mpo = Mpo(model, algo="qr")
+            mpo_dense = TensorMPO([w.transpose(0, 3, 1, 2) for w in mpo.matrices], homogenous=False)
+            self._s2_mpo_cache[s2_cache_key] = mpo_dense
+        return mpo_dense
+
+    def _spin_square_mpo_factors(self):
+        return self._spin_square_tensor_mpo().factors
+
+    def _calc_mpo_expectation_for_states(self, states_to_eval, mpo_factors):
+        import pyqed.mps.mps as mps_lib
+
+        values = []
+        for state in states_to_eval:
+            state_for_eval = state
+            if _is_nonabelian_mps_state(state_for_eval):
+                from pyqed.mps.nonabelian import contract_chain_expectation
+                from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
+
+                value = contract_chain_expectation(state_for_eval.sites, mpo_factors)
+                identity = _identity_mpo_factors_for_sites_and_mpo(state_for_eval.sites, mpo_factors)
+                norm = contract_chain_expectation(state_for_eval.sites, identity)
+            elif hasattr(state_for_eval.Bs[0], 'qns'):
+                from pyqed.mps.mps import symmetric_to_dense
+                state_for_eval = symmetric_to_dense(state_for_eval)
+                value = mps_lib.expect_mps(state_for_eval.Bs, mpo_factors, state_for_eval.Bs)
+                norm = state_for_eval.norm()
+            else:
+                state_for_eval = state_for_eval.to_order(['lv', 'p', 'rv'])
+                value = mps_lib.expect_mps(state_for_eval.Bs, mpo_factors, state_for_eval.Bs)
+                norm = state_for_eval.norm()
+
+            if abs(norm) < 1.0e-14:
+                values.append(np.nan)
+            else:
+                values.append(float(np.real(value / norm)))
+        return np.array(values) if len(values) > 1 else values[0]
+
+    def _calc_spin_square_for_states(self, states_to_eval):
+        return self._calc_mpo_expectation_for_states(
+            states_to_eval,
+            self._spin_square_mpo_factors(),
+        )
+
+    def _calc_spin_penalty_for_states(self, states_to_eval):
+        penalty_mpo = _build_s2_penalty_tensor_mpo(
+            self._spin_square_tensor_mpo(),
+            shift=self.shift,
+            target_ss=self.ss,
+            mode=self.spin_penalty,
+            chi_max=self.spin_penalty_bond,
+        )
+        return self._calc_mpo_expectation_for_states(states_to_eval, penalty_mpo.factors)
+
+    def _reconstruct_sweep_states(self, mps_factors, *, gauge, last_i, last_AA_list):
+        labels = ['lv', 'rv', 'p'] if self.sym_mgr is not None and self.sym_mgr.enabled else ['lv', 'p', 'rv']
+        center = (len(mps_factors) - 1) if str(gauge).lower() == "left" else 0
+
+        if self.nstates > 1 and last_AA_list is not None and last_i is not None:
+            from pyqed.mps.mps import svd_symmetric, multiply_U_S
+            sweep_states = []
+            for root_tensor in last_AA_list:
+                root_factors = [B.copy() for B in mps_factors]
+                U, V, S_dict, _, _ = svd_symmetric(root_tensor, m_max=None)
+                root_factors[last_i] = multiply_U_S(U, S_dict).transpose(0, 2, 1)
+                root_factors[last_i + 1] = V
+                sweep_states.append(MPS(root_factors, labels=labels, center=center))
+            return sweep_states
+
+        return [MPS([B.copy() for B in mps_factors], labels=labels, center=center)]
+
+    def _make_spin_square_sweep_callback(self):
+        def callback(**info):
+            states = self._reconstruct_sweep_states(
+                info["mps"],
+                gauge=info.get("gauge", "Right"),
+                last_i=info.get("last_i"),
+                last_AA_list=info.get("last_AA_list"),
+            )
+            s2_val = self._calc_spin_square_for_states(states)
+            if self.nstates > 1:
+                s2_text = ", ".join(
+                    f"root {idx}: <S^2> = {float(val):.6f}"
+                    for idx, val in enumerate(np.atleast_1d(s2_val))
+                )
+            else:
+                s2_text = f"<S^2> = {float(s2_val):.6f}"
+            print(f"  Sweep {int(info['sweep']):3d} {info.get('direction', '')}: {s2_text}")
+        return callback
 
     def calc_spin_square(self):
         """
@@ -1995,65 +2195,11 @@ class DMRG(CASCI):
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             return 0.0
 
-        if self.site == "spatial":
-            import pyqed.mps.mps as mps_lib
-
-            s2_cache_key = ("spatial_grouped", int(self.ncas))
-            s2_mpo = self._s2_mpo_cache.get(s2_cache_key)
-            if s2_mpo is None:
-                s2_mpo = _build_grouped_spatial_s2_tensor_mpo(self.ncas)
-                self._s2_mpo_cache[s2_cache_key] = s2_mpo
-            states_to_eval = self.dmrg.states if getattr(self.dmrg, "states", None) is not None else [self.dmrg.ground_state]
-            s2_vals = []
-            for state in states_to_eval:
-                state_for_eval = state
-                if hasattr(state_for_eval, "sites"):
-                    psi = _nonabelian_mps_to_dense_vector(state_for_eval)
-                    norm = np.vdot(psi, psi)
-                    s2_mat = _build_spatial_s2_matrix(self._get_spatial_ops_for_rdm())
-                    s2_vals.append(float(np.real(np.vdot(psi, s2_mat @ psi) / norm)))
-                    continue
-                if hasattr(state_for_eval.Bs[0], 'qns'):
-                    from pyqed.mps.mps import symmetric_to_dense
-                    state_for_eval = symmetric_to_dense(state)
-                s2 = mps_lib.expect_mps(state_for_eval.Bs, s2_mpo.factors, state_for_eval.Bs)
-                norm = state_for_eval.norm()
-                s2_vals.append(float(np.real(s2 / norm)))
-            return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
-
-        import pyqed.mps.mps as mps_lib
-
-        ncas = self.ncas
-        s2_term_map = _build_s2_term_map(ncas, scale=1.0)
-
-        s2_cache_key = int(ncas)
-        mpo_dense = self._s2_mpo_cache.get(s2_cache_key)
-        if mpo_dense is None:
-            basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
-            s2_terms = _materialize_symbolic_terms(s2_term_map)
-            model = Model(basis=basis_sites, ham_terms=s2_terms)
-            mpo = Mpo(model, algo="qr")
-            mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-            self._s2_mpo_cache[s2_cache_key] = mpo_dense
-
-        states_to_eval = self.dmrg.states
         if (hasattr(self.dmrg, 'states') and self.dmrg.states is not None):
             states_to_eval = self.dmrg.states
         else:
             states_to_eval = [self.dmrg.ground_state]
-        s2_vals = []
-
-        for state in states_to_eval:
-            if hasattr(state.Bs[0], 'qns'):
-                dense_state = mps_lib.symmetric_to_dense(state)
-                psi_for_eval = dense_state.Bs
-            else:
-                psi_for_eval = state.Bs
-
-            s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
-            s2_vals.append(float(np.real(s2)))
-
-        return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
+        return self._calc_spin_square_for_states(states_to_eval)
 
     def overlap(self, other, bra_state_ids=None, ket_state_ids=None, s=None):
         from pyqed.qchem.dmrg.overlap import overlap as dmrg_overlap
@@ -2230,7 +2376,7 @@ class DMRG(CASCI):
         nsweeps_schedule=None,
         initial_guess=None,
         mo_coeff=None,
-        compute_s2=False,
+        compute_s2="auto",
         **kwargs,
     ):
         """
@@ -2250,26 +2396,43 @@ class DMRG(CASCI):
         else:
             self.weights = np.array(weights)
         if symmetry is not None:
-            normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
+            run_symmetry = _normalize_dmrg_symmetry(symmetry)
             if symmetry_list is not None:
                 legacy_symmetry = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
-                if legacy_symmetry != normalized_symmetry:
+                if legacy_symmetry != run_symmetry:
                     raise ValueError(
                         "Received conflicting DMRG symmetry and symmetry_list arguments."
                     )
-            symmetry_list = normalized_symmetry
-            self.symmetry = normalized_symmetry
-            self.saved_symmetry_list = normalized_symmetry
         elif symmetry_list is not None:
-            symmetry_list = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
-            self.symmetry = symmetry_list
-            self.saved_symmetry_list = symmetry_list
+            run_symmetry = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
         else:
-            symmetry_list = getattr(self, 'saved_symmetry_list', None)
-            symmetry_list = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
-            self.symmetry = symmetry_list
+            run_symmetry = _normalize_dmrg_symmetry(
+                symmetry_list=getattr(self, "saved_symmetry_list", None)
+            )
+        symmetry_list = run_symmetry
+        self.symmetry = run_symmetry
+        self.saved_symmetry_list = run_symmetry
+
+        # By default, report <S^2> when it is useful as a diagnostic.
+        #
+        # - SU(2) runs target a fixed spin irrep already, so <S^2> is usually
+        #   redundant.
+        # - Abelian SA-DMRG (charge/Sz) does *not* enforce total spin, so users
+        #   often rely on <S^2> to detect spin contamination.
+        if compute_s2 == "auto":
+            compute_s2 = bool(
+                getattr(self, "spin_purification", False)
+                or (
+                    getattr(self, "verbose", 0) >= 1
+                    and symmetry_list is not None
+                    and "su2" not in symmetry_list
+                )
+            )
         if initial_guess is not None:
             self.init_guess = initial_guess
+        kwargs.pop("method", None)
+        kwargs.pop("ci_method", None)
+        kwargs.pop("use_cholesky", None)
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
         if self.H_raw is None:
@@ -2371,6 +2534,7 @@ class DMRG(CASCI):
         schedule = self._normalize_dmrg_schedule(self.D, nsweeps, D_schedule=D_schedule, nsweeps_schedule=nsweeps_schedule)
         t0 = time.time()
         current_guess = mps0
+        s2_sweep_callback = self._make_spin_square_sweep_callback() if compute_s2 else None
         for stage_idx, (stage_D, stage_sweeps) in enumerate(schedule, start=1):
             if len(schedule) == 1:
                 self._log(f"  Starting Sweeps (D={stage_D})...")
@@ -2388,6 +2552,7 @@ class DMRG(CASCI):
                 nstates=self.nstates,
                 weights=self.weights,
                 verbose=self.verbose,
+                sweep_callback=s2_sweep_callback,
             )
             dmrg.run()
             current_guess = dmrg.ground_state.copy()
@@ -2398,7 +2563,8 @@ class DMRG(CASCI):
             compute_s2 = True
         s2_val = self.calc_spin_square() if compute_s2 else None
         if self.spin_purification:
-            e_dmrg_total -= self.shift * s2_val
+            states_to_eval = dmrg.states if getattr(dmrg, "states", None) is not None else [dmrg.ground_state]
+            e_dmrg_total -= self._calc_spin_penalty_for_states(states_to_eval)
         self.e_tot = e_dmrg_total
         if self.verbose >= 1:
             print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
@@ -2420,9 +2586,6 @@ class DMRG(CASCI):
         if use_symmetry and self.verbose >= 1:
             self.check_abelian_symmetry()
         return dmrg
-
-    def dump(self):
-        pass
 
     def check_abelian_symmetry(self):
         """
@@ -2511,14 +2674,8 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state, "sites"):
-            psi = _nonabelian_mps_to_dense_vector(state)
-        elif hasattr(state.Bs[0], 'qns'):
-            from pyqed.mps.mps import symmetric_to_dense
-            state = symmetric_to_dense(state)
-            psi = _mps_to_dense_vector(state)
-        else:
-            psi = _mps_to_dense_vector(state)
+        state = _state_for_dense_rdm(state)
+        psi = _mps_to_dense_vector(state)
         norm = np.vdot(psi, psi)
         ops = self._get_spatial_ops_for_rdm()
         holes = {
@@ -2557,14 +2714,8 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state, "sites"):
-            psi = _nonabelian_mps_to_dense_vector(state)
-        elif hasattr(state.Bs[0], 'qns'):
-            from pyqed.mps.mps import symmetric_to_dense
-            state = symmetric_to_dense(state)
-            psi = _mps_to_dense_vector(state)
-        else:
-            psi = _mps_to_dense_vector(state)
+        state = _state_for_dense_rdm(state)
+        psi = _mps_to_dense_vector(state)
         norm = np.vdot(psi, psi)
         ops = self._get_spatial_ops_for_rdm()
 
@@ -2856,12 +3007,6 @@ class DMRG(CASCI):
             raise ValueError("Run DMRG first to generate a ground state.")
         return self.dmrg.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
-
-class DMRGSCF(DMRG):
-    """
-    optimize the orbitals
-    """
-    pass
 
 
 if __name__=='__main__':

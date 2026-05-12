@@ -11,13 +11,17 @@ from .geometric import BOHamiltonianDerivatives, GeometricFGTerms, bo_hamiltonia
 from .ci.cisd import *
 from .ci.fci import *
 from .mp.mp2 import COMP2, MP2, UMP2
+from .cd import CD, CDResult
+from .ir import IR
 
 # Optional modules can be temporarily unavailable while adjacent APIs evolve.
 try:
     from .dmrg.dmrg import DMRG, QCDMRG
+    from .dmrg.dmrgscf import DMRGSCF
     from .dmrg.tddmrg import TDDMRG, gaussian_pulse
 except ImportError:
     DMRG = None
+    DMRGSCF = None
     QCDMRG = None
     TDDMRG = None
     gaussian_pulse = None

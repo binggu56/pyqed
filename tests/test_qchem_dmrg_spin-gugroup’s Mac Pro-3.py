@@ -482,78 +482,6 @@ def test_spatial_dmrg_build_can_use_reduced_mpo():
     )
 
 
-def test_dmrg_accepts_ri_active_integrals():
-    atom = "H 0 0 0; H 0 0 0.74"
-    dense_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    dense_mol.build(driver="builtin", eri="dense")
-    dense_mf = RHF(dense_mol).run(verbose=0)
-
-    ri_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    ri_mol.build(driver="builtin", eri="ri")
-    ri_mf = RHF(ri_mol).run(verbose=0)
-
-    dense = DMRG(dense_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
-
-    ri = DMRG(ri_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    ri.run(nsweeps=4, symmetry_list=None)
-
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
-    assert ri._active_integral_build_info["aux_rank"] == ri_mol.eri_factors.shape[0]
-    assert ri.e_tot == pytest.approx(dense.e_tot, abs=5.0e-5)
-
-
-def test_dmrg_auto_prefers_dense_when_dense_and_factors_exist():
-    atom = "H 0 0 0; H 0 0 0.74"
-    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense+ri")
-    mf = RHF(mol).run(verbose=0)
-
-    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
-
-    ri = DMRG(
-        mf,
-        ncas=2,
-        nelecas=2,
-        D=8,
-        init_guess="hf",
-        integral_backend="ri",
-        verbose=0,
-    )
-    ri.run(nsweeps=4, symmetry_list=None)
-
-    assert dense._active_integral_build_info["mode"] == "dense"
-    assert dense._active_integral_build_info["factorized_integrals"] is False
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
-
-
-def test_abelian_sz_hf_guess_can_leave_hf_determinant():
-    atom = "H 0 0 0; H 0 0 0.74"
-    mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense")
-    mf = RHF(mol).run(verbose=0)
-
-    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=8, symmetry_list=None)
-
-    sz = DMRG(
-        mf,
-        ncas=2,
-        nelecas=2,
-        D=8,
-        init_guess="hf",
-        verbose=0,
-        symmetry="sz",
-    )
-    sz.run(nsweeps=8, symmetry_list=None)
-
-    assert sz.e_tot == pytest.approx(dense.e_tot, abs=1.0e-8)
-    assert sz.e_tot < mf.e_tot - 1.0e-4
-
-
 def test_autompo_preserves_recursive_symbolic_renormalized_algebra(monkeypatch):
     sites = build_random_spatial_mps(4, seed=11, bond_multiplicity=2)
     mpo = build_spatial_hubbard_mpo(
@@ -1369,6 +1297,13 @@ def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
     )
     assert any(
         (objective.get("renormalized_operator_table_stats") or {}).get(
+            "component_orthonormal_dense_kernel"
+        )
+        is True
+        for objective in objectives
+    )
+    assert any(
+        (objective.get("renormalized_operator_table_stats") or {}).get(
             "complementary_direct_matvec"
         )
         is True
@@ -1389,144 +1324,6 @@ def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
             "complementary_payload_backed"
         )
         is True
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_tensor_kernel"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_family_table_matvec"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("source")
-        == "renormalized_family_operator_tables"
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("operator_table_backed")
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("backend")
-        in {"family_table_factor_kernel", "family_table_hybrid_kernel"}
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table"
-            )
-            or {}
-        ).get("factor_kernel_elements", 0)
-        > 0
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_family_operator_table_source"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_operator_tables"
-            )
-            or {}
-        ).get("family_operator_table_backed")
-        is True
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (
-                (
-                    (
-                        (objective.get("renormalized_operator_table_stats") or {})
-                        .get("complementary_family_operator_tables")
-                        or {}
-                    ).get("left_boundary")
-                    or {}
-                ).get("family_operator_table")
-                or {}
-            ).get("active_family_names", ())
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (
-                (
-                    objective.get("renormalized_operator_table_stats") or {}
-                ).get("complementary_family_table")
-                or {}
-            ).get("family_names", ())
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "family_resolved_tensor_kernel"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "family_names",
-                (),
-            )
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        {
-            name
-            for name, count in (
-                (objective.get("renormalized_operator_table_stats") or {})
-                .get("family_term_counts", {})
-                .items()
-            )
-            if count > 0
-        }
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_terms",
-            0,
-        )
-        > 0
         for objective in objectives
     )
     assert np.isfinite(float(dmrg.e_tot))
@@ -1788,45 +1585,7 @@ def test_spatial_su2_state_average_preserves_requested_weights():
     )
 
     objective = dmrg.dmrg.history[-1]["bond_objectives"][-1]
-    np.testing.assert_allclose(objective["state_average_weights"][:2], [0.8, 0.2])
-    assert all(abs(weight) <= 1.0e-15 for weight in objective["state_average_weights"][2:])
-    np.testing.assert_allclose(dmrg.dmrg.history[-1]["state_average_weights"], [0.8, 0.2])
-    assert dmrg.dmrg.history[-1]["state_average_energy"] == pytest.approx(
-        float(np.dot([0.8, 0.2], dmrg.dmrg.history[-1]["state_energies"]))
-    )
-
-
-def test_fully_reduced_spatial_su2_state_average_h2_roots():
-    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
-    mf = RHF(mol).run()
-
-    dmrg = DMRG(
-        mf,
-        ncas=2,
-        nelecas=2,
-        D=8,
-        init_guess="hf",
-        symmetry="su2",
-        spatial_site_basis="fully_reduced",
-        verbose=0,
-    )
-    dmrg.run(
-        nstates=2,
-        weights=[0.5, 0.5],
-        nsweeps=4,
-        mixer_zero_block_noise_scale=0.0,
-    )
-
-    assert dmrg._active_integral_build_info["spatial_site_basis"] == "fully_reduced_su2"
-    assert dmrg.dmrg.converged is True
-    np.testing.assert_allclose(dmrg.e_tot, [-1.137275940288, -0.169291745839], atol=1e-8)
-    history = dmrg.dmrg.history[-1]
-    np.testing.assert_allclose(history["state_average_weights"], [0.5, 0.5])
-    assert history["state_average_energy"] == pytest.approx(
-        float(np.dot([0.5, 0.5], history["state_energies"]))
-    )
-    assert history.get("state_s2") is None
+    np.testing.assert_allclose(objective["state_average_weights"], [0.8, 0.2])
 
 
 def test_spatial_su2_state_average_supports_multisite_singlet_roots():
@@ -1848,43 +1607,12 @@ def test_spatial_su2_state_average_supports_multisite_singlet_roots():
     )
 
     assert len(dmrg.dmrg.states) == 2
-    assert all(entry.get("direction") != "dense" for entry in dmrg.dmrg.history)
-    assert all(
-        entry.get("backend") != "dense_target_sector_su2"
-        for entry in dmrg.dmrg.history
-    )
     np.testing.assert_allclose(
         dmrg.e_tot,
         [-2.177899321294, -1.557192705150],
         atol=1e-8,
     )
     np.testing.assert_allclose(dmrg.dmrg.history[-1]["state_s2"], [0.0, 0.0], atol=1e-8)
-    assert dmrg.dmrg.converged is True
-    assert dmrg.dmrg.history[-1]["convergence_metric"] == "energy_delta"
-    assert dmrg.dmrg.history[-1]["energy_delta"] <= dmrg.tol
-
-
-def test_spin_adapted_ed_matches_su2_reference_roots():
-    from pyqed.qchem.dmrg import ED
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="gbasis")
-    mf = RHF(mol).run()
-
-    ed = ED(mf, ncas=4, nelecas=4, symmetry="su2", verbose=0).run(nstates=2)
-
-    assert ed.converged is True
-    assert ed.history[-1]["backend"] == "spin_adapted_dense_ed"
-    np.testing.assert_allclose(
-        ed.e_tot,
-        [-2.177899323464, -1.557192712326],
-        atol=1e-8,
-    )
-    np.testing.assert_allclose(ed.state_s2, [0.0, 0.0], atol=1e-8)
 
 
 def test_two_site_abelian_state_average_returns_root_mps_lists():

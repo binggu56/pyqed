@@ -34,6 +34,8 @@ from .tensor import NonabelianTensor
 
 
 _SQRT3 = float(np.sqrt(3.0))
+_FULLY_REDUCED_PAIR_RECOUPLING = 2.0
+_FULLY_REDUCED_EXCHANGE_RECOUPLING = 1.0
 
 
 def _su2_ranks(*two_j):
@@ -122,6 +124,86 @@ def _normalize_site_legs(sites_or_legs, *, min_sites=2):
     return tuple(site_legs)
 
 
+def _is_fully_reduced_spatial_leg(phys_leg):
+    return physical_leg_from_spatial_orbital(phys_leg) != physical_leg_from_spatial_orbital()
+
+
+def _add_fully_reduced_spinfree_bilinear(
+    autompo,
+    create_site,
+    annihilate_site,
+    coeff,
+    *,
+    phys_leg,
+    dtype,
+    density_site=None,
+    family=None,
+):
+    """
+    Add ``coeff * E_pq`` with ``E_pq = sum_sigma c^dagger[p,sigma] c[q,sigma]``.
+
+    Fully reduced sites must form the spin scalar through an explicit
+    Wigner-Eckart coupling, rather than the componentwise shortcut used by the
+    canonical local basis.
+    """
+
+    create_site = int(create_site)
+    annihilate_site = int(annihilate_site)
+    if create_site == annihilate_site:
+        operator = spatial_number(phys_leg, dtype=dtype)
+        if density_site is not None:
+            density = spatial_number(phys_leg, dtype=dtype)
+            operator = compose_site_operators(density, operator)
+        autompo.add_onsite(create_site, operator, coeff=coeff, family=family)
+        return autompo
+
+    annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
+    creation = annihilation.adjoint()
+    parity = spatial_parity(phys_leg, dtype=dtype)
+    density = spatial_number(phys_leg, dtype=dtype) if density_site is not None else None
+
+    def with_density(operator, site):
+        if density is not None and int(density_site) == int(site):
+            return operator.left_multiply_sector_scalar(density)
+        return operator
+
+    dense_scalars = ()
+    if density is not None and int(density_site) not in {create_site, annihilate_site}:
+        dense_scalars = ((int(density_site), density),)
+
+    if create_site < annihilate_site:
+        autompo.add_reduced_string_product(
+            (
+                create_site,
+                with_density(creation, create_site).right_multiply_sector_scalar(parity),
+            ),
+            (
+                annihilate_site,
+                time_reversed_reduced_operator(with_density(annihilation, annihilate_site)),
+            ),
+            intermediate_irreps=(SU2Irrep(1),),
+            dense_site_operators=dense_scalars,
+            coeff=-np.sqrt(2.0) * coeff,
+            family=family,
+        )
+    else:
+        autompo.add_reduced_string_product(
+            (
+                annihilate_site,
+                with_density(annihilation, annihilate_site).right_multiply_sector_scalar(parity),
+            ),
+            (
+                create_site,
+                time_reversed_reduced_operator(with_density(creation, create_site)),
+            ),
+            intermediate_irreps=(SU2Irrep(1),),
+            dense_site_operators=dense_scalars,
+            coeff=np.sqrt(2.0) * coeff,
+            family=family,
+        )
+    return autompo
+
+
 def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
     """
     Add a spin-summed spatial-orbital one-body Hamiltonian.
@@ -151,6 +233,7 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
     physical_leg_from_spatial_orbital(phys_leg)
 
     dtype = np.result_type(h1e.dtype, float)
+    fully_reduced = _is_fully_reduced_spatial_leg(phys_leg)
     reduced_fermion = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
     reduced_creation = reduced_fermion.adjoint()
 
@@ -167,25 +250,47 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
         for right_site in range(left_site + 1, autompo.nsites):
             forward = h1e[left_site, right_site]
             if abs(forward) > cutoff:
-                autompo.add_fermionic_reduced_bilinear(
-                    left_site,
-                    reduced_creation,
-                    right_site,
-                    reduced_fermion,
-                    coeff=forward,
-                    family=family,
-                )
+                if fully_reduced:
+                    _add_fully_reduced_spinfree_bilinear(
+                        autompo,
+                        left_site,
+                        right_site,
+                        forward,
+                        phys_leg=phys_leg,
+                        dtype=dtype,
+                        family=family,
+                    )
+                else:
+                    autompo.add_fermionic_reduced_bilinear(
+                        left_site,
+                        reduced_creation,
+                        right_site,
+                        reduced_fermion,
+                        coeff=forward,
+                        family=family,
+                    )
             backward = h1e[right_site, left_site]
             if abs(backward) > cutoff:
                 # Ordered-site form: c^dagger_j c_i = - c_i c^dagger_j for i < j.
-                autompo.add_fermionic_reduced_bilinear(
-                    left_site,
-                    reduced_fermion,
-                    right_site,
-                    reduced_creation,
-                    coeff=-backward,
-                    family=family,
-                )
+                if fully_reduced:
+                    _add_fully_reduced_spinfree_bilinear(
+                        autompo,
+                        right_site,
+                        left_site,
+                        backward,
+                        phys_leg=phys_leg,
+                        dtype=dtype,
+                        family=family,
+                    )
+                else:
+                    autompo.add_fermionic_reduced_bilinear(
+                        left_site,
+                        reduced_fermion,
+                        right_site,
+                        reduced_creation,
+                        coeff=-backward,
+                        family=family,
+                    )
 
     return autompo
 
@@ -717,35 +822,15 @@ def _add_fully_reduced_density_bilinear_eri_term(
             dtype=dtype,
             cutoff=cutoff,
         )
-    density = spatial_number(phys_leg, dtype=dtype)
-    annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
-    creation = annihilation.adjoint()
-    dense_scalars = ()
-    if density_site == create_site:
-        creation = creation.left_multiply_sector_scalar(density)
-    elif density_site == annihilate_site:
-        annihilation = annihilation.left_multiply_sector_scalar(density)
-    else:
-        dense_scalars = ((density_site, density),)
-
-    if create_site < annihilate_site:
-        autompo.add_fermionic_reduced_bilinear_product(
-            *dense_scalars,
-            left_site=create_site,
-            left_operator=creation,
-            right_site=annihilate_site,
-            right_operator=annihilation,
-            coeff=coeff,
-        )
-    else:
-        autompo.add_fermionic_reduced_bilinear_product(
-            *dense_scalars,
-            left_site=annihilate_site,
-            left_operator=annihilation,
-            right_site=create_site,
-            right_operator=creation,
-            coeff=-coeff,
-        )
+    _add_fully_reduced_spinfree_bilinear(
+        autompo,
+        create_site,
+        annihilate_site,
+        coeff,
+        phys_leg=phys_leg,
+        dtype=dtype,
+        density_site=density_site,
+    )
     return 1
 
 
@@ -776,6 +861,7 @@ def _add_fully_reduced_pair_eri_term(
     s = int(s)
     if abs(coeff) <= cutoff:
         return 0
+    coeff = coeff * _FULLY_REDUCED_PAIR_RECOUPLING
 
     pair_creation = spatial_pair_creation(phys_leg, dtype=dtype)
     pair_annihilation = spatial_pair_annihilation(phys_leg, dtype=dtype)
@@ -790,7 +876,15 @@ def _add_fully_reduced_pair_eri_term(
 
     parity = spatial_parity(phys_leg, dtype=dtype)
 
-    def add_pair_times_reduced_string(pair_site, pair_operator, first_site, first_operator, second_site, second_operator, term_coeff):
+    def add_pair_times_reduced_string(
+        pair_site,
+        pair_operator,
+        first_site,
+        first_operator,
+        second_site,
+        second_operator,
+        term_coeff,
+    ):
         if first_site == second_site:
             return 0
         if first_site < second_site:
@@ -874,7 +968,7 @@ def _add_fully_reduced_exchange_eri_term(
         dtype=dtype,
     ):
         factor = coeff_by_ranks.get(ranks, 0.0)
-        term_coeff = coeff * factor
+        term_coeff = _FULLY_REDUCED_EXCHANGE_RECOUPLING * coeff * factor
         if abs(term_coeff) <= cutoff:
             continue
         autompo.add_reduced_string(

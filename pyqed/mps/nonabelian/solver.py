@@ -2527,8 +2527,10 @@ def _solve_standard_davidson_roots(
     precond=None,
     use_block_preconditioner=True,
     allow_unconverged=False,
+    profile=False,
 ):
     """Return low roots of a standard local problem without materializing H."""
+    _ = profile
     op = _normalize_local_operator(operator)
     op_resolved, diag = _resolve_davidson_operator(op, template, layout)
     guess_arr = np.asarray(guess_vec, dtype=complex)
@@ -2943,6 +2945,60 @@ def _select_targeted_roots(
     )
 
 
+def _match_selected_roots_to_guesses(
+    energies,
+    root_vecs,
+    residuals,
+    selected_roots,
+    guess_matrix,
+):
+    """Keep state-averaged root identities aligned with the previous MPS roots."""
+
+    if guess_matrix is None or len(root_vecs) <= 1:
+        return energies, root_vecs, residuals, selected_roots, None
+    guesses = np.asarray(guess_matrix, dtype=complex)
+    if guesses.ndim == 1:
+        guesses = guesses.reshape(-1, 1)
+    if guesses.ndim != 2 or guesses.shape[1] == 0:
+        return energies, root_vecs, residuals, selected_roots, None
+    roots = [np.asarray(vec, dtype=complex).reshape(-1) for vec in root_vecs]
+    if guesses.shape[0] != roots[0].size:
+        return energies, root_vecs, residuals, selected_roots, None
+
+    nmatch = min(len(roots), guesses.shape[1])
+    overlap = np.zeros((nmatch, len(roots)), dtype=float)
+    for guess_idx in range(nmatch):
+        guess = guesses[:, guess_idx].reshape(-1)
+        guess_norm = np.linalg.norm(guess)
+        if guess_norm <= 1.0e-15:
+            continue
+        guess = guess / guess_norm
+        for root_idx, root in enumerate(roots):
+            root_norm = np.linalg.norm(root)
+            if root_norm <= 1.0e-15:
+                continue
+            overlap[guess_idx, root_idx] = abs(np.vdot(guess, root / root_norm))
+
+    assigned = []
+    used = set()
+    for guess_idx in range(nmatch):
+        order = np.argsort(overlap[guess_idx])[::-1]
+        for root_idx in order:
+            root_idx = int(root_idx)
+            if root_idx not in used:
+                assigned.append(root_idx)
+                used.add(root_idx)
+                break
+    assigned.extend(idx for idx in range(len(roots)) if idx not in used)
+    return (
+        np.asarray([energies[idx] for idx in assigned], dtype=float),
+        [root_vecs[idx] for idx in assigned],
+        [residuals[idx] for idx in assigned],
+        [selected_roots[idx] for idx in assigned],
+        overlap,
+    )
+
+
 def _solve_orthonormalized_dense(H, N, *, tol, basis=None):
     """
     Solve a generalized local problem by orthonormalizing the metric first.
@@ -3152,6 +3208,222 @@ def _solve_orthonormalized_operator_davidson(
         }
         info_out["matvec_count"] = int(matvec_count)
     return energy, vec, residual, info_out
+
+
+def _solve_orthonormalized_operator_davidson_roots(
+    operator,
+    norm_operator,
+    template,
+    layout,
+    guess_matrix,
+    *,
+    nroots,
+    projector_basis=None,
+    tol,
+    itermax=100,
+    max_space=None,
+    tol_residual=None,
+    lindep=1e-12,
+    allow_unconverged=False,
+    profile=False,
+):
+    """Multi-root standard Davidson in metric-orthonormal local coordinates."""
+
+    guesses = np.asarray(guess_matrix, dtype=complex)
+    if guesses.ndim == 1:
+        guesses = guesses.reshape(-1, 1)
+    dim = int(guesses.shape[0])
+    nroots = int(nroots)
+    timing = {
+        "resolve": 0.0,
+        "metric": 0.0,
+        "davidson": 0.0,
+        "matvec": 0.0,
+        "residual": 0.0,
+    } if profile else None
+    total_t0 = time.perf_counter() if profile else None
+    t0 = time.perf_counter() if profile else None
+    H_resolved, h_diag = _resolve_davidson_operator(operator, template, layout)
+    N_resolved, _ = _resolve_davidson_operator(norm_operator, template, layout)
+    if profile:
+        timing["resolve"] += time.perf_counter() - t0
+        t0 = time.perf_counter()
+    N_matrix = (
+        np.asarray(N_resolved, dtype=complex)
+        if isinstance(N_resolved, np.ndarray)
+        else _materialize_local_matrix(N_resolved, dim)
+    )
+    basis = layout if isinstance(layout, TwoSiteBasis) else _two_site_basis_for_layout(template, layout)
+    if basis is not None:
+        orthonormalization = basis.metric_orthonormalization(N_matrix, tol=tol)
+        X = np.asarray(orthonormalization.transform, dtype=complex)
+
+        def to_orthonormal(vector):
+            return orthonormalization.to_orthonormal_vector(vector)
+
+        def from_orthonormal(vector):
+            return orthonormalization.from_orthonormal_vector(vector)
+    else:
+        N_matrix = 0.5 * (N_matrix + N_matrix.conj().T)
+        eigvals, eigvecs = np.linalg.eigh(N_matrix)
+        keep = eigvals > max(float(tol), 1.0e-12)
+        if not np.any(keep):
+            raise ValueError("Canonical local metric is numerically singular.")
+        X = eigvecs[:, keep] @ np.diag(1.0 / np.sqrt(eigvals[keep]))
+
+        def to_orthonormal(vector):
+            return X.conj().T @ (N_matrix @ np.asarray(vector, dtype=complex).reshape(dim))
+
+        def from_orthonormal(vector):
+            return X @ np.asarray(vector, dtype=complex).reshape(-1)
+
+    ortho_dim = int(X.shape[1])
+    if profile:
+        timing["metric"] += time.perf_counter() - t0
+
+    matvec_count = 0
+
+    def H_full(vector):
+        nonlocal matvec_count
+        matvec_count += 1
+        t0 = time.perf_counter() if profile else None
+        vector = np.asarray(vector, dtype=complex).reshape(dim)
+        out = (
+            np.asarray(H_resolved @ vector, dtype=complex).reshape(dim)
+            if isinstance(H_resolved, np.ndarray)
+            else np.asarray(H_resolved(vector), dtype=complex).reshape(dim)
+        )
+        if profile:
+            timing["matvec"] += time.perf_counter() - t0
+        return out
+
+    def H_orthonormal(y):
+        return X.conj().T @ H_full(from_orthonormal(y))
+
+    if h_diag is None:
+        ortho_diag = np.zeros(ortho_dim, dtype=float)
+        missing_diag = True
+    else:
+        h_diag = np.asarray(h_diag, dtype=float).reshape(dim)
+        ortho_diag = np.real((np.abs(X) ** 2).T @ h_diag)
+        missing_diag = False
+
+    guess_cols = []
+    for idx in range(guesses.shape[1]):
+        y = np.asarray(to_orthonormal(guesses[:, idx]), dtype=complex).reshape(-1)
+        if np.linalg.norm(y) > 1.0e-15:
+            guess_cols.append(y)
+    guess_y = np.column_stack(guess_cols) if guess_cols else None
+
+    projector_y = None
+    if projector_basis is not None:
+        columns = []
+        for idx in range(int(projector_basis.shape[1])):
+            y = np.asarray(to_orthonormal(projector_basis[:, idx]), dtype=complex).reshape(-1)
+            if np.linalg.norm(y) > 1.0e-15:
+                columns.append(y)
+        if columns:
+            projector_y = _orthonormalize_columns_dense(np.column_stack(columns))
+            nroots = min(nroots, int(projector_y.shape[1]))
+
+    dense_fallback = False
+    try:
+        t0 = time.perf_counter() if profile else None
+        energies, vecs, info = davidson(
+            H_orthonormal,
+            nroots,
+            tol=tol,
+            itermax=itermax,
+            diag=ortho_diag,
+            guess=guess_y,
+            max_space=max_space,
+            tol_residual=tol_residual,
+            lindep=lindep,
+            return_info=True,
+            return_partial=allow_unconverged,
+        ) if projector_y is None else davidson(
+            lambda coeff: projector_y.conj().T @ H_orthonormal(projector_y @ coeff),
+            nroots,
+            tol=tol,
+            itermax=itermax,
+            diag=np.real((np.abs(projector_y) ** 2).T @ ortho_diag),
+            guess=(
+                projector_y.conj().T @ guess_y
+                if guess_y is not None and guess_y.shape[0] == projector_y.shape[0]
+                else None
+            ),
+            max_space=max_space,
+            tol_residual=tol_residual,
+            lindep=lindep,
+            return_info=True,
+            return_partial=allow_unconverged,
+        )
+        if projector_y is not None:
+            vecs = projector_y @ np.asarray(vecs, dtype=complex)
+        if profile:
+            timing["davidson"] += time.perf_counter() - t0
+    except (RuntimeError, ValueError, IndexError):
+        t0 = time.perf_counter() if profile else None
+        H_ortho = _materialize_local_matrix(
+            H_orthonormal if projector_y is None else (
+                lambda coeff: projector_y.conj().T @ H_orthonormal(projector_y @ coeff)
+            ),
+            ortho_dim if projector_y is None else int(projector_y.shape[1]),
+        )
+        evals, evecs = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+        if profile:
+            timing["davidson"] += time.perf_counter() - t0
+        energies = np.asarray(evals[:nroots], dtype=float)
+        vecs = np.asarray(evecs[:, :nroots], dtype=complex)
+        if projector_y is not None:
+            vecs = projector_y @ vecs
+        info = {
+            "iterations": 0,
+            "converged": True,
+            "subspace_dim": int(H_ortho.shape[0]),
+            "restarts": 0,
+        }
+        dense_fallback = True
+
+    root_vecs = []
+    residuals = []
+    t0 = time.perf_counter() if profile else None
+    for root_idx in range(int(np.asarray(vecs).shape[1])):
+        y = np.asarray(vecs[:, root_idx], dtype=complex).reshape(ortho_dim)
+        reference = guesses[:, root_idx] if root_idx < guesses.shape[1] else guesses[:, 0]
+        vec = _canonicalize_eigenvector(from_orthonormal(y), reference=reference)
+        nvec = N_matrix @ vec
+        norm = np.sqrt(max(0.0, float(np.real(np.vdot(vec, nvec)))))
+        if norm > 1.0e-15:
+            vec = vec / norm
+            nvec = nvec / norm
+        energy = float(np.real(np.asarray(energies).reshape(-1)[root_idx]))
+        residuals.append(float(np.linalg.norm(H_full(vec) - energy * nvec)))
+        root_vecs.append(vec)
+    if profile:
+        timing["residual"] += time.perf_counter() - t0
+        timing["total"] = time.perf_counter() - total_t0
+    info_out = {
+        "davidson_iterations": int(info.get("iterations", 0)),
+        "davidson_converged": bool(info.get("converged", False)),
+        "subspace_dim": int(info.get("subspace_dim", ortho_dim)),
+        "restarts": int(info.get("restarts", 0)),
+        "orthonormalized_dim": int(ortho_dim),
+        "missing_diagonal_preconditioner": bool(missing_diag),
+        "dense_fallback": bool(dense_fallback),
+    }
+    if profile:
+        info_out["solver_timing"] = {
+            key: float(value)
+            for key, value in timing.items()
+        }
+        info_out["matvec_count"] = int(matvec_count)
+    return (
+        np.asarray(energies[: len(root_vecs)], dtype=float),
+        root_vecs,
+        residuals,
+        info_out,
+    )
 
 
 def build_orthonormalized_local_problem(
@@ -5461,6 +5733,16 @@ def solve_local_two_site(
                 target_value=root_target_value,
                 target_tol=root_target_tol,
             )
+        root_match_overlap = None
+        energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+            _match_selected_roots_to_guesses(
+                energies,
+                root_vecs,
+                residuals,
+                selected_roots,
+                np.column_stack(root_guess_vecs) if root_guess_vecs else None,
+            )
+        )
         optimized_roots = [
             unpack_two_site_state(vec, two_site, layout=layout)
             for vec in root_vecs
@@ -5507,6 +5789,10 @@ def solve_local_two_site(
             "root_target_value": None if root_target_value is None else float(root_target_value),
             "root_selection_used": target_values is not None,
             "root_selection_candidates": int(nsolve),
+            "root_overlap_matching": root_match_overlap is not None,
+            "root_overlap_matrix": (
+                root_match_overlap.tolist() if root_match_overlap is not None else None
+            ),
             "root_projector_dim": int(projector_basis.shape[1]) if projector_basis is not None else None,
             "root_projector_method": projector_method,
             "root_projector_target_values": (
@@ -5711,6 +5997,7 @@ def solve_local_two_site(
                     nsolve = min(nsolve, int(projector_basis.shape[1]))
             if projector_basis is None and coupled_target_operator is not None and root_target_value is not None:
                 nsolve = min(dim, max(nsolve, int(nstates) + max(0, int(root_selection_buffer))))
+            nsolve = min(dim, nsolve)
             solver_info = {}
             if coupled_norm_operator is None:
                 try:
@@ -5803,9 +6090,23 @@ def solve_local_two_site(
                 target_value=root_target_value,
                 target_tol=root_target_tol,
             )
+            root_match_overlap = None
+            energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+                _match_selected_roots_to_guesses(
+                    energies,
+                    root_vecs,
+                    residuals,
+                    selected_roots,
+                    root_coupled_guess_matrix,
+                )
+            )
             optimized_roots = []
             for root_idx, vec in enumerate(root_vecs):
-                reference = guess_coupled_vec if root_idx == 0 else None
+                reference = None
+                if root_coupled_guess_matrix is not None and root_idx < root_coupled_guess_matrix.shape[1]:
+                    reference = root_coupled_guess_matrix[:, root_idx]
+                elif root_idx == 0:
+                    reference = guess_coupled_vec
                 vec = _canonicalize_eigenvector(vec, reference=reference)
                 optimized_coupled = _unpack_tensor_state(vec, coupled_template, layout=coupled_layout)
                 optimized_roots.append(_uncouple_two_site_tensor(optimized_coupled))
@@ -5852,6 +6153,10 @@ def solve_local_two_site(
                     else None
                 ),
                 "root_selection_candidates": int(nsolve),
+                "root_overlap_matching": root_match_overlap is not None,
+                "root_overlap_matrix": (
+                    root_match_overlap.tolist() if root_match_overlap is not None else None
+                ),
                 "nstates": int(nstates),
             }
 
@@ -5899,6 +6204,7 @@ def solve_local_two_site(
                 nsolve = min(nsolve, int(projector_basis.shape[1]))
         if projector_basis is None and root_target_op is not None and root_target_value is not None:
             nsolve = min(dim, max(nsolve, int(nstates) + max(0, int(root_selection_buffer))))
+        nsolve = min(dim, nsolve)
         solver_info = {}
         if effective_norm_op is None:
             try:
@@ -5942,6 +6248,28 @@ def solve_local_two_site(
                     "generalized_dense_fallback": True,
                     "standard_dense_fallback": True,
                 }
+        elif orthonormalize_generalized_operator and (
+            orthonormalize_generalized_dim is None
+            or dim <= int(orthonormalize_generalized_dim)
+        ):
+            energies, root_vecs, residuals, solver_info = (
+                _solve_orthonormalized_operator_davidson_roots(
+                    effective_op,
+                    effective_norm_op,
+                    two_site,
+                    layout,
+                    root_guess_matrix if root_guess_matrix is not None else guess_vec,
+                    nroots=nsolve,
+                    projector_basis=projector_basis,
+                    tol=tol,
+                    itermax=itermax,
+                    max_space=max_space,
+                    tol_residual=tol_residual,
+                    lindep=lindep,
+                    allow_unconverged=allow_unconverged_roots,
+                    profile=profile,
+                )
+            )
         elif dense_fallback_dim is None or dim > int(dense_fallback_dim):
             raise NotImplementedError(
                 "State-averaged non-Abelian local solves currently require "
@@ -5992,9 +6320,23 @@ def solve_local_two_site(
             target_value=root_target_value,
             target_tol=root_target_tol,
         )
+        root_match_overlap = None
+        energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+            _match_selected_roots_to_guesses(
+                energies,
+                root_vecs,
+                residuals,
+                selected_roots,
+                root_guess_matrix,
+            )
+        )
         optimized_roots = []
         for root_idx, vec in enumerate(root_vecs):
-            reference = guess_vec if root_idx == 0 else None
+            reference = None
+            if root_guess_matrix is not None and root_idx < root_guess_matrix.shape[1]:
+                reference = root_guess_matrix[:, root_idx]
+            elif root_idx == 0:
+                reference = guess_vec
             vec = _canonicalize_eigenvector(vec, reference=reference)
             optimized_roots.append(unpack_two_site_state(vec, two_site, layout=layout))
         local_weights = weights[: len(energies)]
@@ -6039,6 +6381,10 @@ def solve_local_two_site(
                 else None
             ),
             "root_selection_candidates": int(nsolve),
+            "root_overlap_matching": root_match_overlap is not None,
+            "root_overlap_matrix": (
+                root_match_overlap.tolist() if root_match_overlap is not None else None
+            ),
             "nstates": int(nstates),
         }
 
@@ -6234,6 +6580,74 @@ def solve_local_two_site(
             )
         if dim <= int(ortho_dim_limit):
             solver_info = {}
+            if orthonormalize_generalized_operator and int(nstates) > 1:
+                guess_columns = (
+                    np.column_stack(root_guess_vecs)
+                    if root_guess_vecs
+                    else np.asarray(guess_vec, dtype=complex).reshape(-1, 1)
+                )
+                energies, root_vecs, residuals, solver_info = (
+                    _solve_orthonormalized_operator_davidson_roots(
+                        effective_op,
+                        effective_norm_op,
+                        two_site,
+                        layout,
+                        guess_columns,
+                        nroots=int(nstates),
+                        tol=tol,
+                        itermax=itermax,
+                        max_space=max_space,
+                        tol_residual=tol_residual,
+                        lindep=lindep,
+                        allow_unconverged=allow_unconverged_roots,
+                        profile=profile,
+                    )
+                )
+                optimized_roots = [
+                    unpack_two_site_state(vec, two_site, layout=layout)
+                    for vec in root_vecs
+                ]
+                local_weights = weights[: len(energies)]
+                local_weights = local_weights / np.sum(local_weights)
+                residual = max(residuals) if residuals else 0.0
+                objective = {
+                    "energy": float(energies[0]),
+                    "state_energies": [float(x) for x in energies],
+                    "state_average_energy": float(np.dot(local_weights, energies)),
+                    "state_average_weights": [float(x) for x in local_weights],
+                    "optimized_roots": optimized_roots,
+                    "metric": float(residual),
+                    "residual": float(residual),
+                    "davidson_iterations": int(solver_info.get("davidson_iterations", 0)),
+                    "davidson_converged": bool(solver_info.get("davidson_converged", False)),
+                    "subspace_dim": int(solver_info.get("subspace_dim", dim)),
+                    "coupled_physical_used": False,
+                    "canonical_norm": canonical_norm,
+                    "dense_fallback": bool(solver_info.get("dense_fallback", False)),
+                    "operator_representation": "orthonormalized_operator",
+                    "norm_operator_representation": "dense",
+                    "orthonormal_basis": "TwoSiteBasis" if isinstance(layout, TwoSiteBasis) else "dense",
+                    "effective_local_problem": "orthonormalized_operator_standard",
+                    "block_davidson": True,
+                    "orthonormalized_dim": solver_info.get("orthonormalized_dim"),
+                    "missing_diagonal_preconditioner": bool(
+                        solver_info.get("missing_diagonal_preconditioner", False)
+                    ),
+                    "solver_timing": solver_info.get("solver_timing"),
+                    "matvec_count": solver_info.get("matvec_count"),
+                    "target_irrep_filtered": False,
+                }
+                if use_uncoupled_canonical_path:
+                    objective["coupled_physical_skipped"] = "uncoupled_canonical_path"
+                elif use_uncoupled_orthonormalized_path:
+                    objective["coupled_physical_skipped"] = "uncoupled_orthonormalized_path"
+                elif orthonormalize_generalized_dim is not None:
+                    objective["coupled_physical_skipped"] = "metric_orthonormalized_generalized_path"
+                elif canonical_norm_requested and coupled_template is not None:
+                    objective["canonical_norm_skipped"] = "coupled_physical_path"
+                if transform_error is not None and coupled_mode == "auto":
+                    objective["coupled_physical_skipped"] = type(transform_error).__name__
+                return optimized_roots[0], objective
             if orthonormalize_generalized_operator:
                 energy, vec, residual, solver_info = _solve_orthonormalized_operator_davidson(
                     effective_op,

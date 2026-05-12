@@ -15,8 +15,16 @@ from pyqed import interval, au2angstrom
 from pyqed.phys import gwp
 from pyqed.qchem.mol import Molecule
 from pyqed.qchem.hf import RHF
-from pyqed.qchem.mcscf import CASCI, spin_square, overlap
-from kinetic import *  # also imports eckart utilities
+from pyqed.qchem.mcscf.casci import CASCI, overlap
+from pyqed.namd.keo import (
+    EPS,
+    calculate_exact_keo as calculate_rovibrational_keo,
+    hess_log_abs_det_gmat,
+    inv,
+    jac_Gmat_vib,
+    jac_log_abs_det_gmat,
+    kron,
+)
 
 
 class Triatom(Molecule):
@@ -35,7 +43,9 @@ class Triatom(Molecule):
                  charge: int = 0,
                  spin: int = 0,
                  unit: str = 'Angstrom',
-                 dvr_type: str = 'sine'):  # 新增 dvr_type 参数
+                 dvr_type: str = 'sine',
+                 J: int = 0,
+                 Jz: int | None = None):  # 新增 dvr_type 参数
 
         # 调用父类初始化
         super().__init__(atom=atom, basis=basis, charge=charge, spin=spin, unit=unit)
@@ -52,6 +62,9 @@ class Triatom(Molecule):
         self.adiabatic_states = None
         self.non_adiabatic_couplings = None
         self.mass = self.atom_mass_list()*amu2au
+        self.J = int(J)
+        self.Jz = self._validate_Jz(Jz, self.J)
+        self.nrot = self._rotational_dimension()
         # 用于存储动力学结果
         self.psi_t = None
 
@@ -62,11 +75,47 @@ class Triatom(Molecule):
         return np.array([elements.isotope(mol.atom_symbol(i)).mass \
                          for i in range(mol.natom)])
 
+    @staticmethod
+    def _validate_Jz(Jz, J):
+        if Jz is None:
+            return None
+        Jz = int(Jz)
+        if Jz < -J or Jz > J:
+            raise ValueError(f"Jz={Jz} is outside the allowed range [-J, J] for J={J}.")
+        return Jz
+
+    def _rotational_dimension(self):
+        if self.J == 0:
+            return 1
+        if self.Jz is not None:
+            return int(2 * self.J + 1)
+        return int((2 * self.J + 1) ** 2)
+
+    def set_rotation(self, J=1, Jz=None):
+        """Set the fixed-J rotational basis for rovibronic propagation.
+
+        The rotational basis is the body-fixed ``|J,K,M>`` basis used by
+        :func:`pyqed.namd.keo.calculate_exact_keo`, with dimension
+        ``(2J + 1)^2``.  If ``Jz`` is supplied, field-free Jz conservation is
+        used and only a single fixed-M block is built, with dimension
+        ``2J + 1``.
+        """
+        J = int(J)
+        if J < 0:
+            raise ValueError("J must be non-negative.")
+        self.J = J
+        self.Jz = self._validate_Jz(Jz, J)
+        self.nrot = self._rotational_dimension()
+        return self
+
+    def _rotation_enabled(self):
+        return self.J > 0
+
     def buildK_todo(self,R_1e,R_2e,theta_e,eta_e):
         """
         Build the analytical kinetic energy operator for ABC
         Where mass are refered as M_1,M_0,M_2, and coordinates are r1,r2,theta (Jacobi coordinates in Eckart frame).
-        \eta_e is the Eckart embedding angle, between the Eckart I2 axis and R1
+        \\eta_e is the Eckart embedding angle, between the Eckart I2 axis and R1
 
         J. Chem. Phys. 107, 9493–9501 (1997)
         J. Chem. Phys. 107, 2813–2818 (1997)
@@ -167,7 +216,33 @@ class Triatom(Molecule):
 
         return T
 
-    def buildK(self):
+    def _internal_to_xyz_jax(self, q):
+        r1, r2, theta = q
+        zero = jnp.asarray(0.0, dtype=q.dtype)
+        B = jnp.array([zero, zero, zero], dtype=q.dtype)
+        A = jnp.array([r1, zero, zero], dtype=q.dtype)
+        C = jnp.array([r2 * jnp.cos(theta), r2 * jnp.sin(theta), zero], dtype=q.dtype)
+        return jnp.stack([A, B, C], axis=0)
+
+    def build_rovibrational_keo(self, J=None, verbose=True):
+        """Build the full vibrational + rotational + Coriolis KEO."""
+        if self.dvrs is None:
+            raise RuntimeError("DVR grids not set. Call set_dvr() first.")
+        J = self.J if J is None else int(J)
+        if J < 0:
+            raise ValueError("J must be non-negative.")
+        Jz = self._validate_Jz(self.Jz, J)
+        return calculate_rovibrational_keo(
+            self.dvrs,
+            np.asarray(self.mass, dtype=float),
+            self._internal_to_xyz_jax,
+            mode='all',
+            J_val=J,
+            M_val=Jz,
+            verbose=verbose,
+        )
+
+    def buildK(self, J=None):
         """Build the analytical kinetic energy operator in bond-distance /
         angle coordinates (Eckart frame).
 
@@ -183,6 +258,10 @@ class Triatom(Molecule):
         1.J. Chem. Phys. 97, 3029–3037 (1992)[An error in Eq.2]
         2.J. Chem. Phys. 88, 4171–4185 (1988)
         """
+        J = self.J if J is None else int(J)
+        if J > 0:
+            return self.build_rovibrational_keo(J=J, verbose=True)
+
         self.M_end1, self.M_center, self.M_end2 = self.mass[0], self.mass[1], self.mass[2]
         M_Y, M_X1, M_X2 = self.M_center, self.M_end1, self.M_end2
         dvrs = self.dvrs
@@ -329,8 +408,13 @@ class Triatom(Molecule):
 
     def buildV(self, dt):
         """Build the potential energy propagator (split-operator)."""
-        self.exp_V = np.exp(-1j * dt * self.apes)
-        self.exp_V_half = np.exp(-1j * 0.5 * dt * self.apes)
+        exp_V = np.exp(-1j * dt * self.apes)
+        exp_V_half = np.exp(-1j * 0.5 * dt * self.apes)
+        if self._rotation_enabled():
+            exp_V = np.expand_dims(exp_V, axis=self.ndim)
+            exp_V_half = np.expand_dims(exp_V_half, axis=self.ndim)
+        self.exp_V = exp_V
+        self.exp_V_half = exp_V_half
 
     def buildH(self, dt):
         """Build the full kinetic propagator exp(-i T dt).
@@ -340,6 +424,7 @@ class Triatom(Molecule):
         import time
         print("Building T_total ...")
         t0 = time.time()
+        has_rotation = self._rotation_enabled()
         T_total = self.buildK()
         print(f"T_total built in {time.time() - t0:.2f} s, shape = {T_total.shape}")
 
@@ -347,8 +432,42 @@ class Triatom(Molecule):
         t0 = time.time()
         exp_T_full = scipy.linalg.expm(-1j * T_total * dt)
         #print(f"exp(T) computed in {time.time() - t0:.2f} s")
-        self.exp_T = exp_T_full.reshape(*self.nx, *self.nx)
-        self.exp_T=np.einsum('abcdef,abcidefj->abcidefj',self.exp_T,self.overlap_matrix)
+        state_eye = np.eye(self.nstates, dtype=complex)
+        if has_rotation:
+            exp_T = exp_T_full.reshape(*self.nx, self.nrot, *self.nx, self.nrot)
+            idx1 = string.ascii_lowercase[:self.ndim]
+            idx2 = string.ascii_lowercase[self.ndim:2 * self.ndim]
+            if self.overlap_matrix is None:
+                self.exp_T = np.expand_dims(exp_T, axis=self.ndim + 1)
+                self.exp_T = np.expand_dims(self.exp_T, axis=-1)
+                eye_shape = [1] * self.exp_T.ndim
+                eye_shape[self.ndim + 1] = self.nstates
+                eye_shape[-1] = self.nstates
+                self.exp_T = self.exp_T * state_eye.reshape(eye_shape)
+            else:
+                expected = (*self.nx, self.nstates, *self.nx, self.nstates)
+                if self.overlap_matrix.shape != expected:
+                    raise ValueError(
+                        f"overlap_matrix shape {self.overlap_matrix.shape} != expected {expected}"
+                    )
+                self.exp_T = np.einsum(
+                    f'{idx1}r{idx2}s,{idx1}y{idx2}x->{idx1}ry{idx2}sx',
+                    exp_T,
+                    self.overlap_matrix,
+                )
+        else:
+            exp_T = exp_T_full.reshape(*self.nx, *self.nx)
+            if self.overlap_matrix is None:
+                self.exp_T = exp_T[:, :, :, None, :, :, :, None] * state_eye[
+                    None, None, None, :, None, None, None, :
+                ]
+            else:
+                expected = (*self.nx, self.nstates, *self.nx, self.nstates)
+                if self.overlap_matrix.shape != expected:
+                    raise ValueError(
+                        f"overlap_matrix shape {self.overlap_matrix.shape} != expected {expected}"
+                    )
+                self.exp_T = np.einsum('abcdef,abcidefj->abcidefj', exp_T, self.overlap_matrix)
 
         self.H = T_total
         return self.exp_T
@@ -378,8 +497,10 @@ class Triatom(Molecule):
         -------
         result : dict with 'times' and 'psilist'.
         """
-        assert psi0.shape == (*self.nx, self.nstates), \
-            f"psi0 shape {psi0.shape} != expected {(*self.nx, self.nstates)}"
+        has_rotation = self._rotation_enabled()
+        expected = (*self.nx, self.nrot, self.nstates) if has_rotation else (*self.nx, self.nstates)
+        if psi0.shape != expected:
+            raise ValueError(f"psi0 shape {psi0.shape} != expected {expected}")
 
         # --- Build required operators if not yet done ---
         if self.apes is None:
@@ -396,7 +517,10 @@ class Triatom(Molecule):
         alphabet = list(string.ascii_lowercase)
         idx1 = "".join(alphabet[:D])
         idx2 = "".join(alphabet[D:2 * D])
-        kin_string = f"{idx1}y{idx2}x,{idx2}x->{idx1}y"
+        if has_rotation:
+            kin_string = f"{idx1}ry{idx2}sx,{idx2}sx->{idx1}ry"
+        else:
+            kin_string = f"{idx1}y{idx2}x,{idx2}x->{idx1}y"
 
         # --- Propagate ---
         psilist = [psi0.copy()]
@@ -690,7 +814,7 @@ if __name__ == '__main__':
     for i in range(nx[0]):
         for j in range(nx[1]):
             for k in range(nx[2]):
-                pt = np.array([mol.x[0][i], mol.x[1][j], mol.x[1][k]])
+                pt = np.array([mol.x[0][i], mol.x[1][j], mol.x[2][k]])
                 # 传入 a_matrix 和动态获取的 center
                 psi0[i, j, k,1] = gwp(pt, x0=center, ndim=3)
 

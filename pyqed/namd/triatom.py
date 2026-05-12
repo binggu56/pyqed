@@ -3,8 +3,8 @@ import numpy as np
 from collections import Counter
 from pyqed.units import atomic_mass, amu2au
 from jax import numpy as jnp
-from eckart import eckart
-from kinetic import *
+from pyqed.qchem.mol import Molecule
+from pyqed.namd.keo import *
 # from pyqed.ldr.ldr import *
 
 
@@ -109,7 +109,7 @@ class Triatom(Molecule):
         r1  /
            / \
           O  | theta
-           \/
+           \\/
         r2  \
              H
 
@@ -246,7 +246,7 @@ class Triatom(Molecule):
             
             .. math::
                 
-                T = 0.5  \sum_{i,j} p_i  G_{ij}(q)  p_j
+                T = 0.5  \\sum_{i,j} p_i  G_{ij}(q)  p_j
 
 
             Args:

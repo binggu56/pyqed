@@ -1,8 +1,17 @@
-from .mps import *
-from .dmrg import DMRG
-from .tdmps import TDMPS
-from .first_quantization import Chain, FiniteDimLocalBasis
-from .su2 import (
+"""
+Convenience re-exports for :mod:`pyqed.mps`.
+
+This package contains both legacy MPS/DMRG code and newer symmetry-adapted
+non-Abelian prototypes.  Some of the legacy modules depend on optional heavy
+dependencies (notably SciPy).  To make ``import pyqed.mps.nonabelian`` usable in
+minimal environments (and in CI jobs that only exercise SU(2) code), we guard
+those imports here.
+"""
+
+from __future__ import annotations
+
+# Lightweight symmetry utilities are safe to export.
+from .su2 import (  # noqa: F401
     SU2Irrep,
     SpinChargeSector,
     SpatialOrbitalSite,
@@ -10,8 +19,17 @@ from .su2 import (
     fuse_irreps,
     fuse_charge_spin_sectors,
 )
-from .symmetry import Sector, AbelianSector, QN, SymmetryManager, is_sector_like, zero_like_sector
-from .nonabelian import (
+from .symmetry import (  # noqa: F401
+    Sector,
+    AbelianSector,
+    QN,
+    SymmetryManager,
+    is_sector_like,
+    zero_like_sector,
+)
+
+# Non-Abelian prototype exports (kept available even without SciPy).
+from .nonabelian import (  # noqa: F401
     NonabelianTensor,
     PhysicalLeg,
     SiteOperator,
@@ -88,4 +106,13 @@ from .nonabelian import (
     SweepDriver,
     Driver,
 )
-# from .fermion import *
+
+# Legacy exports: available only when optional deps exist.
+try:  # pragma: no cover
+    from .mps import *  # noqa: F401,F403
+    from .dmrg import DMRG  # noqa: F401
+    from .tdmps import TDMPS  # noqa: F401
+    from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401
+except ModuleNotFoundError:
+    pass
+

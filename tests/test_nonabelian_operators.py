@@ -6,6 +6,7 @@ from pyqed.mps.nonabelian import (
     ReducedTensorOperator,
     build_random_spatial_mps,
     compose_site_operators,
+    coupled_reduced_tensor_product,
     physical_leg_from_spatial_orbital,
     reduced_spatial_fermion_annihilation,
     spatial_identity,
@@ -20,8 +21,10 @@ from pyqed.mps.nonabelian import (
     spatial_create_up,
     spatial_annihilate_down,
     spatial_create_down,
+    time_reversed_reduced_operator,
 )
-from pyqed.mps.su2 import SpatialOrbitalSite
+from pyqed.mps.nonabelian.states import FullyReducedSpatialOrbitalSite
+from pyqed.mps.su2 import SpatialOrbitalSite, SU2Irrep
 
 
 def test_physical_leg_from_spatial_orbital_matches_site_structure():
@@ -86,6 +89,22 @@ def test_spatial_number_matches_expected_local_matrix():
     np.testing.assert_allclose(
         op.as_dense(),
         np.diag([0.0, 1.0, 1.0, 2.0]),
+    )
+
+
+def test_fully_reduced_spinfree_bilinear_recovers_local_number():
+    leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    annihilation = reduced_spatial_fermion_annihilation(leg)
+    scalar = coupled_reduced_tensor_product(
+        annihilation.adjoint(),
+        time_reversed_reduced_operator(annihilation),
+        SU2Irrep(0),
+    )
+
+    np.testing.assert_allclose(
+        -np.sqrt(2.0) * scalar.component(0).as_dense(),
+        spatial_number(leg).as_dense(),
+        atol=1.0e-12,
     )
 
 

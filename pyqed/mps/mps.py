@@ -3771,7 +3771,7 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
 
 def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
                   not_conv_err=True, sym_mgr=None, nstates=1, weights=None,
-                  verbose=0):
+                  verbose=0, sweep_callback=None):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -3840,10 +3840,25 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     last_i = 0
     last_AA_list = None
     bond_guess_cache = {}
+    def _notify_sweep(sweep_index, direction, energy, truncation, states_kept):
+        if sweep_callback is None:
+            return
+        sweep_callback(
+            sweep=sweep_index,
+            direction=direction,
+            energy=energy,
+            truncation=truncation,
+            states_kept=states_kept,
+            mps=MPS,
+            last_i=last_i,
+            last_AA_list=last_AA_list,
+            gauge="Left" if direction == "lr" else "Right",
+        )
+
     for sweep in range(0, int(sweeps/2)):
         for i in range(0, len(MPS)-2):
             if nstates > 1:
-                init_vecs = bond_guess_cache.get(i, None)
+                # init_vecs = bond_guess_cache.get(i, None)
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
                     MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights, init_vecs=last_AA_list)
                 E_ground_state = Energy[0]
@@ -3864,6 +3879,8 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             e_avg = np.sum(weights * Energy) 
         else:
             e_avg = Energy
+        _notify_sweep(sweep * 2, "lr", Energy, trunc, states)
+        
         if abs(e_avg - Eold) < conv:
             if verbose >= 1:
                 print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
@@ -3888,10 +3905,12 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
             E.pop()
             last_i = i
+            
         if nstates > 1:
             e_avg = np.sum(weights * Energy) 
         else:
             e_avg = Energy
+        _notify_sweep(sweep * 2 + 1, "rl", Energy, trunc, states)
         if abs(e_avg - Eold) < conv:
             if verbose >= 1:
                 print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))

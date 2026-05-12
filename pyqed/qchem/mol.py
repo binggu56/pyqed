@@ -48,8 +48,8 @@ except ImportError:
 # import pyscf.ao2mo
 # import pyscf
 # from functools import reduce
-from pyqed.qchem.basis import build as build_gbasis
-from pyqed.qchem.basis import build_builtin
+from pyqed.qchem.basis import ContractedGaussian, build as build_gbasis
+from pyqed.qchem.basis import build_builtin, overlap
 
 
 
@@ -1478,11 +1478,172 @@ class Molecule:
             orders = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
         basis = self._bas_cart if self._bas_cart is not None else self._bas
-        ints = moment_integral(basis, moment_coord=center, moment_orders=orders)
+        try:
+            ints = moment_integral(basis, moment_coord=center, moment_orders=orders)
+        except Exception:
+            default_orders = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+            if not np.array_equal(np.asarray(orders, dtype=int), default_orders):
+                raise
+            return self.position_integral(center=center)
         transform = getattr(self, "_ao_cart2sph", None)
         if transform is not None:
             ints = np.einsum('pi,xpq,qj->xij', transform, ints, transform, optimize=True)
         return ints
+
+    def _native_cartesian_basis_and_transform(self):
+        basis = self._bas_cart
+        transform = getattr(self, "_ao_cart2sph", None)
+        if basis is None:
+            basis = self._bas
+            transform = None
+        if basis is None:
+            raise ValueError("Build molecular integrals before requesting one-electron integrals.")
+        if not all(isinstance(fn, ContractedGaussian) for fn in basis):
+            raise RuntimeError("Native one-electron integrals require a ContractedGaussian basis.")
+        return list(basis), transform
+
+    @staticmethod
+    def _raise_axis(shell, axis, delta):
+        shell = list(shell)
+        shell[axis] += int(delta)
+        if shell[axis] < 0:
+            return None
+        return tuple(shell)
+
+    @staticmethod
+    def _primitive_overlap(bra, ket, ia, ib, ket_shell=None):
+        ket_shell = ket.shell if ket_shell is None else ket_shell
+        return overlap(
+            float(bra.exps[ia]),
+            tuple(bra.shell),
+            np.asarray(bra.origin, dtype=float),
+            float(ket.exps[ib]),
+            tuple(ket_shell),
+            np.asarray(ket.origin, dtype=float),
+        )
+
+    def _moment_primitive_overlap(self, bra, ket, ia, ib, pos_axis, ket_shell, center):
+        center_shift = float(ket.origin[pos_axis] - center[pos_axis])
+        raised = self._raise_axis(ket_shell, pos_axis, 1)
+        base = self._primitive_overlap(bra, ket, ia, ib, ket_shell=ket_shell)
+        return self._primitive_overlap(bra, ket, ia, ib, ket_shell=raised) + center_shift * base
+
+    def _position_integral_pair(self, bra, ket, pos_axis, center):
+        value = 0.0
+        for ia, wa in enumerate(bra.prim_weights):
+            for ib, wb in enumerate(ket.prim_weights):
+                value += wa * wb * self._moment_primitive_overlap(
+                    bra, ket, ia, ib, pos_axis, tuple(ket.shell), center
+                )
+        return value
+
+    def _rxgrad_integral_pair(self, bra, ket, pos_axis, deriv_axis, center):
+        value = 0.0
+        ket_shell = tuple(ket.shell)
+        deriv_power = ket_shell[deriv_axis]
+        for ia, wa in enumerate(bra.prim_weights):
+            for ib, wb in enumerate(ket.prim_weights):
+                beta = float(ket.exps[ib])
+                term = 0.0
+                lowered = self._raise_axis(ket_shell, deriv_axis, -1)
+                if deriv_power > 0 and lowered is not None:
+                    term += deriv_power * self._moment_primitive_overlap(
+                        bra, ket, ia, ib, pos_axis, lowered, center
+                    )
+                raised = self._raise_axis(ket_shell, deriv_axis, 1)
+                term -= 2.0 * beta * self._moment_primitive_overlap(
+                    bra, ket, ia, ib, pos_axis, raised, center
+                )
+                value += wa * wb * term
+        return value
+
+    @staticmethod
+    def _apply_ao_transform(op, transform):
+        if transform is None:
+            return np.asarray(op)
+        return np.einsum("pi,xpq,qj->xij", transform, op, transform, optimize=True)
+
+    def position_integral(self, center=np.array([0,0,0])):
+        """
+        Native first-moment integrals ``<chi_mu | r - center | chi_nu>``.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape ``(3, nao, nao)`` in the molecule's AO basis.
+        """
+        center = np.asarray(center, dtype=float)
+        if center.shape != (3,):
+            raise ValueError("center must be a length-3 Cartesian vector.")
+        if self._bas is not None and not all(isinstance(fn, ContractedGaussian) for fn in self._bas):
+            from gbasis.integrals.moment import moment_integral
+            ints = moment_integral(
+                self._bas,
+                moment_coord=center,
+                moment_orders=np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
+            )
+            if ints.shape[-1] == 3:
+                ints = np.moveaxis(ints, -1, 0)
+            return ints
+        basis, transform = self._native_cartesian_basis_and_transform()
+        nao = len(basis)
+        op = np.zeros((3, nao, nao), dtype=float)
+        for i, bra in enumerate(basis):
+            for j, ket in enumerate(basis):
+                for axis in range(3):
+                    op[axis, i, j] = self._position_integral_pair(bra, ket, axis, center)
+        return self._apply_ao_transform(op, transform)
+
+    def rxgrad_integral(self, center=np.array([0,0,0])):
+        """
+        Native real angular generator integrals ``<chi_mu | (r-center) x grad | chi_nu>``.
+        """
+        center = np.asarray(center, dtype=float)
+        if center.shape != (3,):
+            raise ValueError("center must be a length-3 Cartesian vector.")
+        basis, transform = self._native_cartesian_basis_and_transform()
+        nao = len(basis)
+        op = np.zeros((3, nao, nao), dtype=float)
+        pairs = ((1, 2), (2, 0), (0, 1))
+        for i, bra in enumerate(basis):
+            for j, ket in enumerate(basis):
+                for component, (pos_a, deriv_b) in enumerate(pairs):
+                    pos_b, deriv_a = deriv_b, pos_a
+                    op[component, i, j] = (
+                        self._rxgrad_integral_pair(bra, ket, pos_a, deriv_b, center)
+                        - self._rxgrad_integral_pair(bra, ket, pos_b, deriv_a, center)
+                    )
+        return self._apply_ao_transform(op, transform)
+
+    def angular_momentum_integral(self, center=np.array([0,0,0])):
+        """
+        Native angular-momentum integrals ``<chi_mu | -i (r-center) x grad | chi_nu>``.
+        """
+        center = np.asarray(center, dtype=float)
+        if center.shape != (3,):
+            raise ValueError("center must be a length-3 Cartesian vector.")
+        return -1j * self.rxgrad_integral(center=center)
+
+    def magnetic_dipole_integral(self, center=np.array([0,0,0]), convention='cd'):
+        """
+        Native magnetic transition-dipole integrals.
+
+        ``convention='cd'`` returns the standard real matrix
+        ``-0.5 * (r-center) x grad`` used with real CI vectors for
+        length-gauge rotatory strengths.  ``'operator'`` returns the physical
+        one-electron magnetic-dipole operator
+        ``-L/2 = 0.5j (r-center) x grad``.  ``'raw'``/``'pyscf'`` returns the
+        historical unhalved real matrix ``-(r-center) x grad``.
+        """
+        rxgrad = self.rxgrad_integral(center=center)
+        key = str(convention).lower()
+        if key in {'cd', 'real', 'standard', 'orca'}:
+            return -0.5 * rxgrad
+        if key in {'raw', 'unhalved', 'pyscf'}:
+            return -rxgrad
+        if key in {'operator', 'physical'}:
+            return 0.5j * rxgrad
+        raise ValueError("convention must be 'cd', 'operator', or 'raw'.")
 
     def momentum_integral(self, orders=(1,0,0), center=(0,0,0)):
 

@@ -255,21 +255,26 @@ def _XYZ_NRG(L=12, L0=4, JX=1, JY=1, JZ=1):
 
 if __name__ == '__main__':
 
-    mol = Heisenberg(L=10)
+    mol = Heisenberg(L=3)
     neel = mol.build_neel_state()
+    
+    H = mol.build_H_mpo()
+    W0, W1, W2 = H.factors # left, right, out, in 
+    
+    print(W0.shape)
     
     # ground state 
     # dmrg = mol.DMRG(D=40, init_guess = neel)
     # dmrg.run()
 
-    # real-time evolution
-    td = mol.TDMPS()
-    td.run(psi0=neel, dt=0.01, steps=10, e_ops=[mol.H])
+    ### real-time evolution
+    # td = mol.TDMPS()
+    # td.run(psi0=neel, dt=0.01, steps=10, e_ops=[mol.H])
     
-    # make plots
-    import ultraplot as plt 
-    fig, ax = plt.subplots()
-    ax.plot(td.times, td.observables[:,0])
+    # # make plots
+    # import ultraplot as plt 
+    # fig, ax = plt.subplots()
+    # ax.plot(td.times, td.observables[:,0])
 
 
     # dmrg = mol.TEBD(D=40, init_guess=psi0)

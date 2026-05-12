@@ -14,6 +14,13 @@ from pyqed.qchem.dmrg.spatial_terms import (
     spatial_two_body_term_map,
     spatial_two_body_spinfree_term_map,
 )
+from pyqed.mps.nonabelian import (
+    AutoMPO,
+    FullyReducedSpatialOrbitalSite,
+    RankCoupledMPO,
+    SpatialSpinFreeERIBuilder,
+    physical_leg_from_spatial_orbital,
+)
 
 
 def _kron_all(operators):
@@ -197,6 +204,19 @@ def test_fully_reduced_spatial_reduced_hamiltonian_builds_pair_eri_terms():
     assert result.info["spatial_site_basis"] == "fully_reduced_su2"
     assert result.info["two_body_fully_reduced_pair_terms"] == 3
     assert result.info["two_body_representation"] == "fully_reduced_pair_eri"
+
+
+def test_fully_reduced_pair_eri_keeps_rank_coupled_chain_with_dense_prefix():
+    leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    eri = np.zeros((3, 3, 3, 3))
+    eri[0, 1, 0, 2] = 0.1
+    autompo = AutoMPO([leg] * 3)
+
+    SpatialSpinFreeERIBuilder([leg] * 3, eri).add_to(autompo)
+    factors = autompo.build()
+
+    assert factors
+    assert all(isinstance(factor, RankCoupledMPO) for factor in factors)
 
 
 def test_fully_reduced_spatial_reduced_hamiltonian_builds_exchange_eri_terms():
