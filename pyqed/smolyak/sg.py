@@ -274,7 +274,7 @@ class SparseGrid:
         of Certain Classes of Functions, Doklady Akademii Nauk SSSR,
         Volume 4, 1963, pages 240-243.
     """
-    def __init__(self, ndim=1, level=1, domain=None):
+    def __init__(self, ndim=1, level=1, domain=None, dim=None):
         """
 
 
@@ -292,6 +292,9 @@ class SparseGrid:
         None.
 
         """
+
+        if dim is not None:
+            ndim = dim
 
         self.ndim = self.dim = ndim
         # if isinstance(level, int):

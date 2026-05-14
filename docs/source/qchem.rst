@@ -42,6 +42,8 @@ Main Components
 * ``pyqed.qchem.mp`` contains MP2 and orbital-optimized MP2 utilities.
 * ``pyqed.qchem.tddft`` contains linear-response TDDFT functionality.
 * ``pyqed.qchem.dft`` contains native DFT and grid functionality.
+* ``pyqed.qchem.semiempirical`` contains semiempirical method interfaces,
+  including the in-progress OM2/MRCI API.
 * ``pyqed.qchem.dmrg`` contains DMRG and spin-adapted/non-Abelian development
   paths.
 * ``pyqed.gw`` contains dense GW, eigenvalue-self-consistent GW, qsGW, and BSE
@@ -105,6 +107,7 @@ dedicated guide for examples:
    :maxdepth: 1
 
    guide/guide_qchem_mcscf
+   guide/guide_qchem_om2_mrci
 
 Related Topics
 --------------

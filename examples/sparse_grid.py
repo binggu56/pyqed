@@ -5,6 +5,16 @@ Created on Fri Dec 29 16:06:06 2023
 
 @author: Bing Gu (gubing@westlake.edu.cn)
 """
+import sys
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from pyqed.smolyak.sg import SparseGrid
 
@@ -13,7 +23,7 @@ if __name__=='__main__':
     level = 4
     dim = 2
     # Sparse grid solver
-    sg = SparseGrid(dim=dim, level=level)
+    sg = SparseGrid(ndim=dim, level=level)
     
     sg.generatePoints()
     # sg.print_points()

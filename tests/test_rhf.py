@@ -659,19 +659,19 @@ def test_cubegen_density_module_function_builtin_h2(tmp_path):
     assert int(lines[5].split()[0]) == 8
 
 
-def test_rhf_sample_density_grid_and_plot_3d_builtin_h2(tmp_path):
+def test_rhf_electron_density_grid_and_plot_density_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='builtin')
     mf = RHF(mol).run()
 
-    grid = mf.sample_density_grid(nx=14, ny=13, nz=12, margin=2.0)
+    grid = mf.electron_density_grid(nx=14, ny=13, nz=12, margin=2.0)
 
     assert grid['values'].shape == (14, 13, 12)
     assert np.isfinite(grid['values']).all()
     assert np.max(grid['values']) > 0.0
 
     out = tmp_path / 'h2_density.png'
-    result = mf.plot_density_3d(nx=14, ny=13, nz=12, margin=2.0, style='bold', save=out)
+    result = mf.plot_density(nx=14, ny=13, nz=12, margin=2.0, style='bold', save=out)
 
     assert result['isovalue'] > 0.0
     assert len(result['isovalues']) >= 1
@@ -727,13 +727,13 @@ def test_rhf_plot_mo_3d_pyvista_builtin_h2(tmp_path):
 
 
 @pytest.mark.skipif(not _HAS_PYVISTA_PLOTTING, reason="pyvista plotting is not supported")
-def test_rhf_plot_density_3d_pyvista_builtin_h2(tmp_path):
+def test_rhf_plot_density_pyvista_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='builtin')
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_density_pyvista.png'
-    result = mf.plot_density_3d(
+    result = mf.plot_density(
         nx=16,
         ny=15,
         nz=14,

@@ -47,6 +47,20 @@ def _fuse_sectors(left, right):
     )
 
 
+def _normalize_contracted_channel_values(value):
+    if isinstance(value, tuple):
+        raw_values = value
+    else:
+        raw_values = (value,)
+    normalized = []
+    for item in raw_values:
+        if isinstance(item, tuple) and len(item) == 1:
+            normalized.append(item[0])
+        else:
+            normalized.append(item)
+    return tuple(normalized)
+
+
 def _expand_two_site_support(A, B, merged):
     """
     Add zero blocks for all symmetry-allowed two-site keys on the current bond.
@@ -62,10 +76,7 @@ def _expand_two_site_support(A, B, merged):
     seeded_channel_map = {}
     channel_map = defaultdict(set)
     for key, value in merged.metadata.get("contracted_channels", {}).items():
-        if isinstance(value, tuple):
-            values = tuple(value)
-        else:
-            values = (value,)
+        values = _normalize_contracted_channel_values(value)
         seeded_channel_map[key] = values
         channel_map[key].update(values)
 

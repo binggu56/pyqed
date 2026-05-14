@@ -1416,7 +1416,7 @@ if __name__ == '__main__':
     ndim = 4    
     mass = [1/(1015. * wavenum2au), 1./(596. * wavenum2au), 1/(1230. * wavenum2au), 1./(919. * wavenum2au)]
     domains = [[-6, 6], ] * ndim 
-    levels = [2， 2， 2， 2] 
+    levels = [2, 2, 2, 2]
     start_time = time.time()
                 
     sol = LDRN(domains, levels, ndim=ndim, nstates=nstates, dvr_type='sinc', mass = mass)

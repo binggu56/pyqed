@@ -43,6 +43,8 @@ class IR:
         intensities=None,
         modes=None,
         reduced_masses=None,
+        coords=None,
+        atom_symbols=None,
         frequency_unit="cm^-1",
         intensity_unit="au",
         hessian_step=1.0e-3,
@@ -57,6 +59,7 @@ class IR:
         self.dipole_step = float(dipole_step)
         self.hessian_kwargs = {} if hessian_kwargs is None else dict(hessian_kwargs)
         self.dipole_fn = dipole_fn
+        self._method_hessian = None
         self._frequencies = None if frequencies is None else np.asarray(frequencies, dtype=float)
         self._dipole_derivatives = (
             None if dipole_derivatives is None else np.asarray(dipole_derivatives, dtype=float)
@@ -64,11 +67,15 @@ class IR:
         self._intensities = None if intensities is None else np.asarray(intensities, dtype=float)
         self._modes = None if modes is None else np.asarray(modes, dtype=float)
         self._reduced_masses = None if reduced_masses is None else np.asarray(reduced_masses, dtype=float)
+        self._coords = None if coords is None else np.asarray(coords, dtype=float)
+        self._atom_symbols = None if atom_symbols is None else tuple(str(sym) for sym in atom_symbols)
         self.frequencies = None
         self.dipole_derivatives = None
         self.intensities = None
         self.modes = None
         self.reduced_masses = None
+        self.coords = None
+        self.atom_symbols = None
 
     @classmethod
     def from_hessian(cls, hessian, dipole_derivatives=None, intensities=None, **kwargs):
@@ -118,12 +125,20 @@ class IR:
             if "reduced_mass_amu" in data
             else data.get("reduced_mass")
         )
+        coords = data.get("coords") if "coords" in data else data.get("atom_coords")
+        atom_symbols = (
+            data.get("atom_symbols")
+            if "atom_symbols" in data
+            else data.get("symbols")
+        )
         return cls(
             frequencies=frequencies,
             dipole_derivatives=dipole_derivatives,
             intensities=intensities,
             modes=None if modes is None else np.asarray(modes, dtype=float),
             reduced_masses=None if reduced_masses is None else np.asarray(reduced_masses, dtype=float),
+            coords=None if coords is None else np.asarray(coords, dtype=float),
+            atom_symbols=atom_symbols,
             **kwargs,
         )
 
@@ -202,6 +217,7 @@ class IR:
                     if key in data:
                         self._reduced_masses = np.asarray(data[key], dtype=float)
                         break
+            self._extract_geometry_from_backend()
             return
 
         if hasattr(self.backend, "normal_modes"):
@@ -214,6 +230,7 @@ class IR:
                 self._modes = np.asarray(values[1], dtype=float)
             if self._reduced_masses is None and len(values) > 2:
                 self._reduced_masses = np.asarray(values[2], dtype=float)
+            self._extract_geometry_from_backend()
             return
 
         if self._frequencies is None and hasattr(self.backend, "frequencies"):
@@ -225,6 +242,7 @@ class IR:
                 self._modes = np.asarray(modes, dtype=float)
         if self._reduced_masses is None and hasattr(self.backend, "reduced_mass"):
             self._reduced_masses = np.asarray(getattr(self.backend, "reduced_mass"), dtype=float)
+        self._extract_geometry_from_backend()
 
     @staticmethod
     def _is_casci_like(obj):
@@ -239,8 +257,23 @@ class IR:
         module = getattr(obj.__class__, "__module__", "")
         return name in {"rhf", "rks"} and module.startswith("pyqed.qchem") and hasattr(obj, "mol")
 
+    def _extract_geometry_from_backend(self):
+        mol = getattr(self.backend, "mol", None)
+        if mol is None and self._method_hessian is not None:
+            mol = getattr(self._method_hessian, "mol", None)
+        if mol is None:
+            return
+        if self._coords is None and hasattr(mol, "atom_coords"):
+            self._coords = np.asarray(mol.atom_coords(), dtype=float)
+        if self._atom_symbols is None and hasattr(mol, "atom_symbols"):
+            self._atom_symbols = tuple(str(sym) for sym in mol.atom_symbols())
+
     def _extract_method_data(self):
         method = self.backend
+        if self._coords is None:
+            self._coords = np.asarray(method.mol.atom_coords(), dtype=float)
+        if self._atom_symbols is None and hasattr(method.mol, "atom_symbols"):
+            self._atom_symbols = tuple(str(sym) for sym in method.mol.atom_symbols())
         if self._frequencies is None or self._modes is None or self._reduced_masses is None:
             vib = self._method_harmonic_analysis(method)
             if self._frequencies is None:
@@ -257,9 +290,14 @@ class IR:
         if self._dipole_derivatives is None and self._intensities is None:
             coords = np.asarray(method.mol.atom_coords(), dtype=float)
             modes = np.asarray(self._modes, dtype=float)
-            dipole_fn = self.dipole_fn
-            if dipole_fn is None:
+            if self.dipole_fn is None:
+                analytic = self._method_analytic_dipole_derivatives(method, modes)
+                if analytic is not None:
+                    self._dipole_derivatives = analytic
+                    return
                 dipole_fn = lambda displaced: self._evaluate_method_dipole(method, displaced)
+            else:
+                dipole_fn = self.dipole_fn
             self._dipole_derivatives = self.finite_difference_dipole_derivatives(
                 dipole_fn,
                 coords,
@@ -270,6 +308,7 @@ class IR:
     def _method_harmonic_analysis(self, method):
         if hasattr(method, "Hessian"):
             hessian = method.Hessian()
+            self._method_hessian = hessian
             if hasattr(hessian, "run"):
                 try:
                     hessian.run(step=self.hessian_step, **self.hessian_kwargs)
@@ -289,6 +328,15 @@ class IR:
             method.mol.atom_mass_list(),
             **self.hessian_kwargs,
         )
+
+    def _method_analytic_dipole_derivatives(self, method, modes):
+        hessian = self._method_hessian
+        if hessian is None and hasattr(method, "Hessian"):
+            hessian = method.Hessian()
+            self._method_hessian = hessian
+        if hessian is None or not hasattr(hessian, "normal_mode_dipole_derivatives"):
+            return None
+        return np.asarray(hessian.normal_mode_dipole_derivatives(modes), dtype=float)
 
     def _finite_difference_energy_hessian(self, method, step):
         coords0 = np.asarray(method.mol.atom_coords(), dtype=float)
@@ -481,6 +529,8 @@ class IR:
         self.intensities = intensities
         self.modes = None if modes is None else np.asarray(modes)
         self.reduced_masses = None if reduced_masses is None else np.asarray(reduced_masses)
+        self.coords = None if self._coords is None else np.asarray(self._coords, dtype=float)
+        self.atom_symbols = self._atom_symbols
         return self
 
     def spectrum(self, x=None, width=10.0, lineshape="gaussian"):
@@ -526,3 +576,274 @@ class IR:
         ax.set_xlabel(f"Frequency ({self.frequency_unit})")
         ax.set_ylabel(f"IR intensity ({self.intensity_unit})")
         return ax, x, signal
+
+    @staticmethod
+    def _element_style(symbol):
+        colors = {
+            "H": "#f2f2f2",
+            "C": "#3a3a3a",
+            "N": "#3b6ff5",
+            "O": "#e23b30",
+            "F": "#38a169",
+            "P": "#d97706",
+            "S": "#f2c94c",
+            "Cl": "#2fb344",
+            "Br": "#8b3a2b",
+            "I": "#6b46c1",
+        }
+        sizes = {
+            "H": 70,
+            "C": 120,
+            "N": 115,
+            "O": 115,
+            "F": 110,
+            "P": 140,
+            "S": 140,
+            "Cl": 150,
+            "Br": 160,
+            "I": 170,
+        }
+        return colors.get(symbol, "#8a8f98"), sizes.get(symbol, 120)
+
+    @staticmethod
+    def _infer_bonds(coords, symbols):
+        radii = {
+            "H": 0.31,
+            "C": 0.76,
+            "N": 0.71,
+            "O": 0.66,
+            "F": 0.57,
+            "P": 1.07,
+            "S": 1.05,
+            "Cl": 1.02,
+            "Br": 1.20,
+            "I": 1.39,
+        }
+        bohr_per_angstrom = 1.889726125
+        coords = np.asarray(coords, dtype=float)
+        bonds = []
+        for i in range(len(coords)):
+            ri = radii.get(symbols[i], 0.8)
+            for j in range(i + 1, len(coords)):
+                rj = radii.get(symbols[j], 0.8)
+                cutoff = 1.25 * (ri + rj) * bohr_per_angstrom
+                if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
+                    bonds.append((i, j))
+        return bonds
+
+    def _mode_displacement(self, mode_index, amplitude):
+        if self.modes is None:
+            self.run()
+        if self.modes is None:
+            raise ValueError("Normal modes are missing.")
+        if self.coords is None:
+            raise ValueError("Atomic coordinates are missing; pass coords=... when constructing IR.")
+        mode = np.asarray(self.modes[int(mode_index)], dtype=float)
+        if mode.shape != np.asarray(self.coords).shape:
+            raise ValueError("Selected normal mode must have shape (natom, 3).")
+        max_norm = float(np.max(np.linalg.norm(mode, axis=1)))
+        if max_norm == 0.0:
+            scale = 0.0
+        elif amplitude == "auto":
+            span = float(np.ptp(np.asarray(self.coords, dtype=float), axis=0).max())
+            scale = (0.25 * max(span, 1.0)) / max_norm
+        else:
+            scale = float(amplitude)
+        return mode * scale
+
+    def plot_mode(
+        self,
+        mode_index=0,
+        amplitude="auto",
+        ax=None,
+        bonds=True,
+        displaced=True,
+        title=None,
+        arrow_color="#2f80ed",
+        view=(24.0, -62.0),
+    ):
+        """Plot one normal mode as a 3D molecule with displacement arrows."""
+        import matplotlib.pyplot as plt
+
+        if self.frequencies is None or self.modes is None:
+            self.run()
+        disp = self._mode_displacement(mode_index, amplitude)
+        coords = np.asarray(self.coords, dtype=float)
+        symbols = self.atom_symbols or tuple("X" for _ in range(coords.shape[0]))
+        mode_index = int(mode_index)
+
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
+
+        if bonds:
+            for i, j in self._infer_bonds(coords, symbols):
+                line = coords[[i, j]]
+                ax.plot(line[:, 0], line[:, 1], line[:, 2], color="#9aa0a6", linewidth=1.4, zorder=1)
+
+        if displaced:
+            plus = coords + disp
+            for i, j in self._infer_bonds(plus, symbols):
+                line = plus[[i, j]]
+                ax.plot(line[:, 0], line[:, 1], line[:, 2], color="#c7d8ff", linewidth=1.0, alpha=0.8)
+            ax.scatter(plus[:, 0], plus[:, 1], plus[:, 2], s=35, color="#c7d8ff", alpha=0.75)
+
+        for idx, (symbol, xyz) in enumerate(zip(symbols, coords)):
+            color, size = self._element_style(symbol)
+            ax.scatter([xyz[0]], [xyz[1]], [xyz[2]], s=size, color=color, edgecolor="#202124", linewidth=0.6)
+            ax.text(xyz[0], xyz[1], xyz[2], f" {symbol}", fontsize=9)
+
+        ax.quiver(
+            coords[:, 0],
+            coords[:, 1],
+            coords[:, 2],
+            disp[:, 0],
+            disp[:, 1],
+            disp[:, 2],
+            color=arrow_color,
+            linewidth=1.6,
+            arrow_length_ratio=0.22,
+        )
+
+        if title is None:
+            if self.frequencies is not None and mode_index < len(self.frequencies):
+                title = f"Mode {mode_index}: {self.frequencies[mode_index]:.1f} {self.frequency_unit}"
+            else:
+                title = f"Mode {mode_index}"
+        ax.set_title(title)
+        ax.set_xlabel("x (bohr)")
+        ax.set_ylabel("y (bohr)")
+        ax.set_zlabel("z (bohr)")
+        self._set_equal_3d_axes(ax, coords, disp)
+        if view is not None:
+            elev, azim = view
+            ax.view_init(elev=float(elev), azim=float(azim))
+        return ax
+
+    def animate_mode(
+        self,
+        mode_index=0,
+        amplitude="auto",
+        frames=36,
+        interval=60,
+        ax=None,
+        bonds=True,
+        title=None,
+        view=(24.0, -62.0),
+        show_arrows=False,
+    ):
+        """Animate one normal mode and return ``matplotlib.animation.FuncAnimation``."""
+        import matplotlib.pyplot as plt
+        from matplotlib import animation
+
+        if self.frequencies is None or self.modes is None:
+            self.run()
+        disp = self._mode_displacement(mode_index, amplitude)
+        coords = np.asarray(self.coords, dtype=float)
+        symbols = self.atom_symbols or tuple("X" for _ in range(coords.shape[0]))
+        mode_index = int(mode_index)
+
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
+
+        if title is None:
+            if self.frequencies is not None and mode_index < len(self.frequencies):
+                title = f"Mode {mode_index}: {self.frequencies[mode_index]:.1f} {self.frequency_unit}"
+            else:
+                title = f"Mode {mode_index}"
+        ax.set_title(title)
+        ax.set_xlabel("x (bohr)")
+        ax.set_ylabel("y (bohr)")
+        ax.set_zlabel("z (bohr)")
+        self._set_equal_3d_axes(ax, coords, disp)
+        if view is not None:
+            elev, azim = view
+            ax.view_init(elev=float(elev), azim=float(azim))
+
+        bond_pairs = self._infer_bonds(coords, symbols) if bonds else []
+        bond_lines = []
+        for i, j in bond_pairs:
+            line_coords = coords[[i, j]]
+            line, = ax.plot(
+                line_coords[:, 0],
+                line_coords[:, 1],
+                line_coords[:, 2],
+                color="#9aa0a6",
+                linewidth=1.5,
+                zorder=1,
+            )
+            bond_lines.append((line, i, j))
+
+        atom_artists = []
+        atom_labels = []
+        for symbol, xyz in zip(symbols, coords):
+            color, size = self._element_style(symbol)
+            atom_artists.append(
+                ax.scatter(
+                    [xyz[0]],
+                    [xyz[1]],
+                    [xyz[2]],
+                    s=size,
+                    color=color,
+                    edgecolor="#202124",
+                    linewidth=0.6,
+                    zorder=3,
+                )
+            )
+            atom_labels.append(ax.text(xyz[0], xyz[1], xyz[2], f" {symbol}", fontsize=9))
+
+        arrows = []
+
+        def update(frame):
+            nonlocal arrows
+            for arrow in arrows:
+                arrow.remove()
+            phase = np.sin(2.0 * np.pi * frame / int(frames))
+            shifted = coords + phase * disp
+
+            for artist, xyz in zip(atom_artists, shifted):
+                artist._offsets3d = ([xyz[0]], [xyz[1]], [xyz[2]])
+            for label, xyz in zip(atom_labels, shifted):
+                label.set_position((xyz[0], xyz[1]))
+                label.set_3d_properties(xyz[2])
+            for line, i, j in bond_lines:
+                line_coords = shifted[[i, j]]
+                line.set_data_3d(line_coords[:, 0], line_coords[:, 1], line_coords[:, 2])
+
+            arrows = []
+            if show_arrows:
+                arrows = [
+                    ax.quiver(
+                        coords[:, 0],
+                        coords[:, 1],
+                        coords[:, 2],
+                        phase * disp[:, 0],
+                        phase * disp[:, 1],
+                        phase * disp[:, 2],
+                        color="#2f80ed",
+                        linewidth=1.4,
+                        arrow_length_ratio=0.22,
+                    )
+                ]
+            return [*atom_artists, *atom_labels, *(line for line, _, _ in bond_lines), *arrows]
+
+        update(0)
+        return animation.FuncAnimation(
+            ax.figure,
+            update,
+            frames=int(frames),
+            interval=int(interval),
+            blit=False,
+        )
+
+    @staticmethod
+    def _set_equal_3d_axes(ax, coords, disp=None):
+        coords = np.asarray(coords, dtype=float)
+        if disp is not None:
+            coords = np.vstack([coords, coords + np.asarray(disp, dtype=float)])
+        center = coords.mean(axis=0)
+        radius = max(float(np.ptp(coords, axis=0).max()) * 0.6, 1.0)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+        if hasattr(ax, "set_box_aspect"):
+            ax.set_box_aspect((1.0, 1.0, 1.0))

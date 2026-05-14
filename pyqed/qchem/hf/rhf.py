@@ -772,6 +772,13 @@ class RHF:
             return self._pyscf_mf.get_ovlp()
         return self.mol.overlap
 
+    def Hessian(self):
+        """
+        Native analytic RHF nuclear Hessian using builtin derivative integrals.
+        """
+        from .hessian import RHFHessian
+        return RHFHessian(self)
+
     def localize_orbitals(
         self,
         method='ibo',
@@ -1014,6 +1021,14 @@ class RHF:
             tol_screen=tol_screen,
         )
 
+    def electron_density(self, coords, dm=None, screen_basis=True, tol_screen=1e-8):
+        return self.analyze().electron_density(
+            coords,
+            dm=dm,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
     def sample_mo_grid(
         self,
         mo_index,
@@ -1036,7 +1051,7 @@ class RHF:
             tol_screen=tol_screen,
         )
 
-    def sample_density_grid(
+    def electron_density_grid(
         self,
         nx=40,
         ny=None,
@@ -1047,7 +1062,7 @@ class RHF:
         screen_basis=True,
         tol_screen=1e-8,
     ):
-        return self.analyze().sample_density_grid(
+        return self.analyze().electron_density_grid(
             nx=nx,
             ny=ny,
             nz=nz,
@@ -1204,7 +1219,7 @@ class RHF:
             **kwargs,
         )
 
-    def plot_density_3d(
+    def plot_density(
         self,
         nx=40,
         ny=None,
@@ -1247,7 +1262,7 @@ class RHF:
         backend='matplotlib',
         save=None,
     ):
-        return self.analyze().plot_density_3d(
+        return self.analyze().plot_density(
             nx=nx,
             ny=ny,
             nz=nz,

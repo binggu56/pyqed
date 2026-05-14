@@ -118,7 +118,14 @@ class _LibXC:
         return out
 
 
-LIBXC = _LibXC()
+_LIBXC = None
+
+
+def _get_libxc():
+    global _LIBXC
+    if _LIBXC is None:
+        _LIBXC = _LibXC()
+    return _LIBXC
 
 
 class RestrictedLibXCFunctional:
@@ -135,11 +142,13 @@ class RestrictedLibXCFunctional:
         libxc_names = info.get('libxc_names')
         if libxc_names is None:
             libxc_names = (info['libxc_name'],)
-        numbers = tuple(LIBXC.functional_number(name) for name in libxc_names)
+        libxc = _get_libxc()
+        self._libxc = libxc
+        numbers = tuple(libxc.functional_number(name) for name in libxc_names)
         if any(number < 0 for number in numbers):
             raise ValueError(f"Unsupported libxc functional '{xc}'.")
 
-        self.handle = LIBXC.init_functional(numbers)
+        self.handle = libxc.init_functional(numbers)
         if self.handle is None:
             raise ValueError(f"Failed to initialize libxc functional '{xc}'.")
 
@@ -154,7 +163,7 @@ class RestrictedLibXCFunctional:
         """
         rho = np.asarray(rho, dtype=float)
         if self.xctype == 'LDA':
-            out = LIBXC.eval_xc(self.handle, self.facs, rho, nvar=1, deriv=1)
+            out = self._libxc.eval_xc(self.handle, self.facs, rho, nvar=1, deriv=1)
             return out[0], out[1]
 
         if grad_rho is None:
@@ -163,7 +172,7 @@ class RestrictedLibXCFunctional:
         if grad_rho.shape[0] != 3:
             raise ValueError("grad_rho must have shape (3, ngrids).")
 
-        out = LIBXC.eval_xc(
+        out = self._libxc.eval_xc(
             self.handle,
             self.facs,
             np.vstack((rho, grad_rho)),
@@ -174,8 +183,9 @@ class RestrictedLibXCFunctional:
 
     def __del__(self):
         handle = getattr(self, 'handle', None)
-        if handle is not None:
-            LIBXC.end_functional(handle)
+        libxc = getattr(self, '_libxc', None)
+        if handle is not None and libxc is not None:
+            libxc.end_functional(handle)
 
 
 @lru_cache(maxsize=16)

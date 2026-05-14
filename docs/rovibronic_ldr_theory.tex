@@ -1,0 +1,483 @@
+\documentclass[11pt]{revtex4-2}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{physics}
+\usepackage{hyperref}
+
+
+
+\begin{document}
+
+\title{Full quantum geometric strongly correlated rovibronic dynamics for triatomic molecules: Theory,
+ Implementation, and applications}
+ \author{Sha Mo}
+\author{Bing Gu}
+\date{\today}
+
+
+\begin{abstract}
+We present a full quantum  strongly correlated rotation-vibrational-electronic (rovibronic) dynamics for triatomic molecules within the framework of the geometric quantum dynamics. 
+
+The rotational invariance of the potential energy surface and rotational covariance of the electronic states are fully exploited. 
+
+THe critical components are the construction of the nuclear kinetic energy operatro in curvilinear coordiantes,
+ and the construction of the electronic overlap matrix in the body-fixed frame using the Eckart conditions. 
+ 
+ In particular, wwe employ the complete active space scf method for the electronic structure calculation and electronic overlap matrix construction.
+
+
+The implementation is based on the  the discrete variable representation (DVR) and the geometric quantum dynamics. 
+
+A detailed application is presented for the LiH$_2$ molecule to demonstrate the effectiveness of the method. 
+ Implementation, and applications to  LiH$_2$
+used for full quantum rovibronic wavepacket dynamics.  Starting from the
+lab-frame molecular wavefunction, we separate internal coordinates from
+overall molecular rotation, transform the electronic basis to a body-fixed
+frame, derive the resulting nuclear kinetic energy operator, and obtain the
+LDR equation of motion in a fixed total angular momentum basis
+\cite{bornhuang1954,bunkerjensen1998,watson1968,zare1988}.  We also state
+the approximation made in the current implementation: body-fixed scalar
+electronic adiabatic states are used, so explicit electronic angular
+momentum gauge terms are neglected.
+\end{abstract}
+\maketitle
+
+\section{Lab-Frame Molecular Wavefunction}
+
+Let the nuclear configuration of an $N$-atom molecule be described by
+Cartesian coordinates $\{\mathbf{R}_A\}$ and masses $\{M_A\}$.  The exact
+field-free molecular Coulomb Hamiltonian is
+\begin{equation}
+  \hat{H}
+  =
+  \hat{T}_\text{N}
+  +
+  \hat{H}_{\rm el}(\{\mathbf{R}_A\}),
+\end{equation}
+with
+\begin{equation}
+  \hat{T}_{\rm nuc}
+  =
+  -\frac{1}{2}
+  \sum_A \frac{1}{M_A}
+  \nabla^2_{A}.
+\end{equation}
+
+In the lab frame (LF), the total rovibronic wavefunction can be expanded as a Born-Huang-type ansatz
+\cite{bornhuang1954}
+\begin{equation}
+  \ket{\Psi(t)}
+  =
+  \sum_a
+  \chi_a(\mathbf{q},\Omega,t)
+  \ket{\Phi_\alpha(\mathbf{q},\Omega)}
+  \label{eq:lab-expansion}
+\end{equation}
+where $\mathbf{q}$ denotes internal coordinates, $\alpha$ labels the electronic state, and
+$
+  \Omega = (\alpha,\beta,\gamma)
+$
+denotes Euler angles specifying the orientation of the molecular body frame
+relative to the lab frame.
+
+For a field-free molecule, the electronic Hamiltonian is rotationally
+covariant:
+\begin{equation}
+  \hat{H}_{\rm el}(q,\Omega)
+  =
+  \hat{U}_{\rm el}(\Omega)
+  \hat{H}_{\rm el}(q,0)
+  \hat{U}_{\rm el}^\dagger(\Omega).
+\end{equation}
+Thus the electronic eigenstates at orientation $\Omega$ are rotated copies
+of body-fixed electronic states:
+\begin{equation}
+  \ket{\Phi_a(q,\Omega)}
+  =
+  \hat{U}_{\rm el}(\Omega)
+  \ket{\phi_a(q)} ,
+  \label{eq:electronic-rotation}
+\end{equation}
+where
+\begin{equation}
+  \hat{H}_{\rm el}(q,0)\ket{\phi_a(q)}
+  =
+  V_a(q)\ket{\phi_a(q)} .
+\end{equation}
+where $V_a(q)$ is the potential energy of the electronic state $\alpha$.
+
+The body-fixed electronic representation is obtained by applying the orientation-dependent unitary transformation
+\begin{equation}
+  \ket{\Psi_{\rm body}}
+  =
+  \hat{U}_{\rm el}^\dagger(\Omega) \ket{\Psi_{\rm lab}} .
+\end{equation}
+Using Eq.~\eqref{eq:electronic-rotation},
+\begin{equation}
+  \ket{\Psi_{\rm body}}
+  =
+  \sum_a
+  \chi_a(q,\Omega,t)
+  \ket{\phi_a(q)} .
+\end{equation}
+The explicit orientation dependence of the electronic basis has therefore
+been removed.  It is now carried by the nuclear rotational wavefunction.
+
+The rotational dependence of $\chi_a$ is expanded in Wigner rotational
+functions \cite{zare1988,varshalovich1988}:
+\begin{equation}
+  \chi_a(q,\Omega,t)
+  =
+  \sum_{J K M}
+  C_{J K M,a}(q,t)
+  D^J_{M K}(\Omega).
+\end{equation}
+Equivalently,
+\begin{equation}
+  \ket{\Psi_{\rm BF}(t)}
+  =
+  \sum_{J K M a}
+  C_{J K M,a}(q,t)
+  \ket{q}
+  \ket{J K M}
+  \ket{\phi_a(q)} .
+  \label{eq:body-expansion-continuous}
+\end{equation}
+Here $J$ is total molecular angular momentum, $M$ is the projection onto the
+lab-fixed $Z$ axis, and $K$ is the projection onto the body-fixed $z$ axis.
+
+\section{Coordinate Transformation of the Nuclear Kinetic Energy}
+
+The nuclear Cartesian coordinates can be written as
+\begin{equation}
+  \mathbf{R}_A
+  =
+  \mathbf{R}_{\rm cm}
+  +
+  \mathbf{R}(\Omega)\,
+  \mathbf{r}_A(q),
+  \label{eq:coordinate-map}
+\end{equation}
+where $\mathbf{R}_{\rm cm}$ is the center of mass, $\mathbf{R}(\Omega)$ is
+the rotation matrix from body to lab frame, and $\mathbf{r}_A(q)$ is the
+position of atom $A$ in the body-fixed frame.
+
+After removing translation, the Cartesian Laplacian becomes the
+Laplace-Beltrami operator on the curvilinear coordinate space $(q,\Omega)$:
+\begin{equation}
+  \hat{T}_{\rm nuc}
+  =
+  -\frac{1}{2}
+  |g|^{-1/2}
+  \partial_\mu
+  \left[
+    |g|^{1/2}
+    G^{\mu\nu}(q)
+    \partial_\nu
+  \right],
+  \label{eq:laplace-beltrami}
+\end{equation}
+where $G=g^{-1}$ is the inverse metric and $\mu,\nu = 1, 2, \ldots, 3N-3$ run over internal and
+rotational coordinates.
+
+In a body-fixed or Eckart frame, the inverse metric has block structure
+\cite{eckart1935,watson1968,bunkerjensen1998,lauvergnat2016}
+\begin{equation}
+  G
+  =
+  \begin{pmatrix}
+    G_{qq} & G_{q r} \\
+    G_{r q} & G_{r r}
+  \end{pmatrix},
+\end{equation}
+where $q$ labels vibrational coordinates and $r$ labels body-fixed
+rotations.  Replacing rotational derivatives by body-fixed angular momentum
+operators gives the rovibrational kinetic energy
+\begin{equation}
+  \hat{T}_{\rm rovib}
+  =
+  \hat{T}_{\rm vib}
+  +
+  \hat{T}_{\rm rot}
+  +
+  \hat{T}_{\rm cor}
+  +
+  V_{\rm extra}(q).
+  \label{eq:t-rovib}
+\end{equation}
+
+The terms are
+\begin{equation}
+  \hat{T}_{\rm vib}
+  =
+  \frac{1}{2}
+  \sum_{ij}
+  \hat{p}_i
+  G_{ij}(q)
+  \hat{p}_j,
+  \label{eq:t-vib}
+\end{equation}
+\begin{equation}
+  \hat{T}_{\rm rot}
+  =
+  \frac{1}{2}
+  \sum_{\alpha\beta}
+  G_{\alpha\beta}(q)
+  \hat{J}_\alpha
+  \hat{J}_\beta,
+  \label{eq:t-rot}
+\end{equation}
+and
+\begin{equation}
+  \hat{T}_{\rm cor}
+  =
+  \frac{1}{2}
+  \sum_{i\alpha}
+  \left[
+    \hat{p}_i G_{i\alpha}(q)
+    +
+    G_{\alpha i}(q) \hat{p}_i
+  \right]
+  \hat{J}_\alpha.
+  \label{eq:t-cor}
+\end{equation}
+Here $\hat{p}_i=-i\partial/\partial q_i$, and
+$\hat{J}_\alpha$ are body-fixed angular momentum operators.  The scalar
+$V_{\rm extra}(q)$ is the curvilinear metric or pseudopotential term caused
+by the volume element and operator ordering \cite{watson1968,lauvergnat2016}.
+
+\section{Effect of the Electronic Body-Frame Unitary on the KEO}
+
+The transformation
+\begin{equation}
+  \hat{H}_{\rm body}
+  =
+  \hat{U}_{\rm el}^\dagger(\Omega)
+  \hat{H}_{\rm lab}
+  \hat{U}_{\rm el}(\Omega)
+\end{equation}
+does not leave the nuclear kinetic energy unchanged, because
+$\hat{T}_{\rm nuc}$ contains derivatives with respect to nuclear coordinates,
+including derivatives with respect to $\Omega$:
+\begin{equation}
+  \hat{U}_{\rm el}^\dagger
+  \partial_\Omega
+  \hat{U}_{\rm el}
+  \neq
+  \partial_\Omega .
+\end{equation}
+Instead, derivatives become covariant derivatives:
+\begin{equation}
+  \partial_\Omega
+  \rightarrow
+  \partial_\Omega
+  +
+  \hat{U}_{\rm el}^\dagger
+  (\partial_\Omega \hat{U}_{\rm el}) .
+\end{equation}
+The connection is related to electronic angular momentum:
+\begin{equation}
+  \hat{U}_{\rm el}^\dagger
+  (\partial_\Omega \hat{U}_{\rm el})
+  \sim
+  -i \hat{\mathbf{j}}_{\rm el}.
+\end{equation}
+Therefore, in the most general body-fixed theory, the rotational angular
+momentum entering the KEO is shifted schematically as
+\begin{equation}
+  \hat{\mathbf{J}}
+  \rightarrow
+  \hat{\mathbf{J}} - \hat{\mathbf{j}}_{\rm el}.
+  \label{eq:j-shift}
+\end{equation}
+For example,
+\begin{equation}
+  \hat{T}_{\rm rot}
+  \sim
+  \frac{1}{2}
+  \sum_{\alpha\beta}
+  G_{\alpha\beta}(q)
+  \left(
+    \hat{J}_\alpha - \hat{j}^{\rm el}_\alpha
+  \right)
+  \left(
+    \hat{J}_\beta - \hat{j}^{\rm el}_\beta
+  \right).
+\end{equation}
+
+The present implementation assumes scalar, body-fixed adiabatic electronic
+states with quenched explicit electronic angular momentum, so
+\begin{equation}
+  \hat{\mathbf{j}}_{\rm el} \approx 0.
+\end{equation}
+Under this approximation, Eqs.~\eqref{eq:t-vib}--\eqref{eq:t-cor} are used
+with $\hat{\mathbf{J}}$ only.
+
+\section{Local Diabatic Representation on a DVR Grid}
+
+Let the internal coordinates be represented by DVR grid points $q_n$.  The
+body-fixed LDR expansion is built on the DVR idea that coordinate-local
+grid functions provide an efficient representation of nuclear kinetic
+operators and local potentials \cite{lightcarrington2000}.  The expansion is
+\begin{equation}
+  \ket{\Psi(t)}
+  =
+  \sum_{n \tau a}
+  C_{n\tau a}(t)
+  \ket{q_n}
+  \ket{J\tau}
+  \ket{\phi_a(q_n)} ,
+  \label{eq:ldr-expansion}
+\end{equation}
+where
+\begin{equation}
+  \tau = (K,M)
+\end{equation}
+for the full $|J K M\rangle$ basis, while
+\begin{equation}
+  \tau = K
+\end{equation}
+for a fixed-$M$ block.
+
+The local electronic overlap matrix is
+\begin{equation}
+  A_{n a, m b}
+  =
+  \braket{\phi_a(q_n)}{\phi_b(q_m)} .
+  \label{eq:electronic-overlap}
+\end{equation}
+This overlap must be evaluated in a consistent body-fixed or Eckart gauge.
+If electronic states are computed in inconsistent lab-frame orientations,
+$A$ contains spurious rotational gauge dependence.
+
+The electronic potential energy is local and diagonal:
+\begin{equation}
+  \bra{\phi_a(q_n)}
+  \hat{H}_{\rm el}(q_n)
+  \ket{\phi_b(q_n)}
+  =
+  E_a(q_n)\delta_{ab}.
+\end{equation}
+
+The rovibrational KEO matrix is
+\begin{equation}
+  T^J_{n\tau,m\tau'}
+  =
+  \mel{q_n,J\tau}
+  {\hat{T}_{\rm rovib}}
+  {q_m,J\tau'} .
+  \label{eq:tj-matrix}
+\end{equation}
+
+Projecting the time-dependent Schrodinger equation gives
+\begin{equation}
+  i\dot{C}_{n\tau a}
+  =
+  E_a(q_n) C_{n\tau a}
+  +
+  \sum_{m\tau' b}
+  T^J_{n\tau,m\tau'}
+  A_{n a,m b}
+  C_{m\tau' b}.
+  \label{eq:ldr-eom-compact}
+\end{equation}
+This is the compact LDR rovibronic equation of motion.
+
+If one separates the derivative part of the KEO from the scalar
+pseudopotential, Eq.~\eqref{eq:ldr-eom-compact} may be written more
+explicitly as
+\begin{align}
+  i\dot{C}_{n\tau a}
+  &=
+  \left[
+    E_a(q_n) + V_{\rm extra}(q_n)
+  \right]
+  C_{n\tau a}
+  \nonumber\\
+  &\quad+
+  \sum_{m\tau' b}
+  T^{J,{\rm deriv+rot+cor}}_{n\tau,m\tau'}
+  A_{n a,m b}
+  C_{m\tau' b}.
+  \label{eq:ldr-eom-explicit}
+\end{align}
+
+\section{Special Cases}
+
+\subsection{$J=0$}
+
+For $J=0$, there is only one rotational state:
+\begin{equation}
+  K = M = 0,
+  \qquad
+  n_{\rm rot}=1.
+\end{equation}
+All angular momentum matrices vanish:
+\begin{equation}
+  \hat{J}_x = \hat{J}_y = \hat{J}_z = 0.
+\end{equation}
+Therefore,
+\begin{equation}
+  \hat{T}_{\rm rot}=0,
+  \qquad
+  \hat{T}_{\rm cor}=0,
+\end{equation}
+and the dynamics reduces to vibronic dynamics with the curvilinear
+vibrational KEO:
+\begin{equation}
+  \hat{T}_{\rm nuc}
+  =
+  \hat{T}_{\rm vib}
+  +
+  V_{\rm extra}.
+\end{equation}
+
+\subsection{Fixed $J_z=M$}
+
+For field-free dynamics, the lab-frame projection $M$ is conserved.  One may
+therefore work in a fixed-$M$ block:
+\begin{equation}
+  \ket{J K M_0},
+  \qquad
+  K=-J,\ldots,J.
+\end{equation}
+The rotational dimension is then
+\begin{equation}
+  n_{\rm rot} = 2J+1,
+\end{equation}
+instead of the full
+\begin{equation}
+  n_{\rm rot} = (2J+1)^2.
+\end{equation}
+This reduction is valid for field-free rovibronic dynamics.  In the presence
+of external fields, whether $M$ remains conserved depends on the polarization
+and selection rules of the light-matter interaction.
+
+\section{Implementation details}
+
+The current PyQED implementation uses the following assumptions:
+\begin{enumerate}
+  \item Electronic states are scalar body-fixed adiabatic states
+  $\ket{\phi_a(q)}$.
+  \item Electronic overlaps $A_{na,mb}$ are computed in a consistent
+  body-fixed or Eckart orientation.
+  \item Explicit electronic angular momentum gauge terms
+  $\hat{\mathbf{j}}_{\rm el}$ are neglected.
+  \item The full rovibrational KEO includes vibrational, rotational,
+  Coriolis, and metric pseudopotential terms.
+  \item Setting $J=0$ gives vibronic dynamics.  Setting $J>0$ gives
+  rovibronic dynamics.  Supplying a fixed $J_z=M$ exploits conservation of
+  lab-frame angular momentum projection in field-free dynamics.
+\end{enumerate}
+
+
+
+
+
+
+
+
+
+
+\end{document}

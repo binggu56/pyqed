@@ -57,6 +57,55 @@ def _n_zero_modes(coords, masses_au, zero_tol=1e-7):
     return 5 if linear else 6
 
 
+def _translation_rotation_vectors(coords, masses_au):
+    coords = np.asarray(coords, dtype=float)
+    masses_au = np.asarray(masses_au, dtype=float)
+    center = np.einsum('i,ij->j', masses_au, coords) / masses_au.sum()
+    centered = coords - center
+    mass_sqrt = np.sqrt(masses_au)
+
+    translations = [
+        np.einsum('i,x->ix', mass_sqrt, [1.0, 0.0, 0.0]).reshape(-1),
+        np.einsum('i,x->ix', mass_sqrt, [0.0, 1.0, 0.0]).reshape(-1),
+        np.einsum('i,x->ix', mass_sqrt, [0.0, 0.0, 1.0]).reshape(-1),
+    ]
+
+    inertia = np.einsum('i,ix,iy->xy', masses_au, centered, centered)
+    inertia = np.eye(3) * np.trace(inertia) - inertia
+    _, axes = np.linalg.eigh(inertia)
+    axes = axes[:, ::-1]
+    ex, ey, ez = axes.T
+
+    rotated = centered.dot(axes)
+    cx, cy, cz = rotated.T
+    rotations = [
+        (mass_sqrt[:, None] * (cy[:, None] * ez - cz[:, None] * ey)).reshape(-1),
+        (mass_sqrt[:, None] * (cz[:, None] * ex - cx[:, None] * ez)).reshape(-1),
+        (mass_sqrt[:, None] * (cx[:, None] * ey - cy[:, None] * ex)).reshape(-1),
+    ]
+    return translations, rotations
+
+
+def _project_vibrational_subspace(mass_hess, coords, masses_au, zero_tol=1e-7):
+    translations, rotations = _translation_rotation_vectors(coords, masses_au)
+    tr_space = list(translations)
+
+    n_zero = _n_zero_modes(coords, masses_au, zero_tol=zero_tol)
+    if n_zero == 5:
+        tr_space.extend(rotations[:2])
+    elif n_zero == 6:
+        tr_space.extend(rotations)
+
+    tr_space = np.asarray(tr_space, dtype=float)
+    q, _ = np.linalg.qr(tr_space.T)
+    projector = np.eye(mass_hess.shape[0]) - q.dot(q.T)
+    eigvals, eigvecs = np.linalg.eigh(projector)
+    basis = eigvecs[:, eigvals > zero_tol]
+    reduced_hess = basis.T.dot(mass_hess).dot(basis)
+    force_const_au, mode = np.linalg.eigh(reduced_hess)
+    return force_const_au, basis.dot(mode)
+
+
 def analyze_cartesian_hessian(
     hess,
     coords,
@@ -72,34 +121,42 @@ def analyze_cartesian_hessian(
     coords = np.asarray(coords, dtype=float)
     natm = coords.shape[0]
 
+    hess = np.asarray(hess, dtype=float)
+    if hess.ndim == 4:
+        hess = hess.transpose(0, 2, 1, 3).reshape(natm * 3, natm * 3)
     factors = np.repeat(masses_au ** -0.5, 3)
-    mass_hess = factors[:, None] * np.asarray(hess, dtype=float) * factors[None, :]
+    mass_hess = factors[:, None] * hess * factors[None, :]
 
-    force_const_au, mode = np.linalg.eigh(mass_hess)
+    if remove_translation_rotation:
+        force_const_au, mode = _project_vibrational_subspace(
+            mass_hess,
+            coords,
+            masses_au,
+            zero_tol=zero_tol,
+        )
+    else:
+        force_const_au, mode = np.linalg.eigh(mass_hess)
     freq_au = np.lib.scimath.sqrt(force_const_au)
     if negative_imaginary and np.iscomplexobj(freq_au):
         freq_au = freq_au.real - np.abs(freq_au.imag)
 
+    masses_amu = np.asarray(masses_amu, dtype=float)
     norm_mode = np.einsum(
         'z,zri->izr',
-        masses_au ** -0.5,
+        masses_amu ** -0.5,
         mode.reshape(natm, 3, -1),
     )
-    reduced_mass = 1.0 / np.einsum('izr,izr->i', norm_mode, norm_mode)
-
-    if remove_translation_rotation:
-        n_remove = _n_zero_modes(coords, masses_au, zero_tol=zero_tol)
-        freq_au = freq_au[n_remove:]
-        norm_mode = norm_mode[n_remove:]
-        reduced_mass = reduced_mass[n_remove:]
-        force_const_au = force_const_au[n_remove:]
+    reduced_mass_amu = 1.0 / np.einsum('izr,izr->i', norm_mode, norm_mode)
 
     return {
         'freq_au': np.asarray(freq_au),
         'freq_cm1': np.asarray(freq_au) * au2wavenumber,
+        'freq_wavenumber': np.asarray(freq_au) * au2wavenumber,
         'modes': np.asarray(norm_mode),
-        'reduced_mass_au': np.asarray(reduced_mass),
-        'reduced_mass_amu': np.asarray(reduced_mass) / amu_to_au,
+        'norm_mode': np.asarray(norm_mode),
+        'reduced_mass_au': np.asarray(reduced_mass_amu) * amu_to_au,
+        'reduced_mass_amu': np.asarray(reduced_mass_amu),
+        'reduced_mass': np.asarray(reduced_mass_amu),
         'force_constants_au': np.asarray(force_const_au),
     }
 

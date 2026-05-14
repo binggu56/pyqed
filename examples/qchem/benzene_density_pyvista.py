@@ -42,7 +42,7 @@ def main():
     mf = mol.RHF().run()
 
     outfile = Path("benzene_density_pyvista.png").resolve()
-    result = mf.plot_density_3d(
+    result = mf.plot_density(
         nx=54,
         ny=54,
         nz=40,

@@ -1886,6 +1886,16 @@ def run_sweeps(
                 sweep_nlocal_states > 1
                 and energy_delta is not None
                 and energy_delta <= float(conv_tol)
+                and history[-1].get("state_average_energy") is not None
+            ):
+                converged = True
+                history[-1]["converged"] = True
+                history[-1]["convergence_metric"] = "energy_delta"
+                break
+            if (
+                sweep_nlocal_states > 1
+                and energy_delta is not None
+                and energy_delta <= float(conv_tol)
                 and metric <= float(conv_tol)
             ):
                 converged = True

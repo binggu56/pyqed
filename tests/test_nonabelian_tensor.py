@@ -74,7 +74,7 @@ from pyqed.mps.nonabelian import (
     SweepDriver,
 )
 from pyqed.mps.symmetry import Sector
-from pyqed.mps.su2 import SU2Irrep
+from pyqed.mps.su2 import SpinChargeSector, SU2Irrep
 from pyqed.mps.nonabelian.update import _expand_two_site_support
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
 
@@ -99,6 +99,40 @@ def test_nonabelian_tensor_accepts_charge_su2_sector_labels():
     assert tensor.shape == (1, 1)
     assert tensor.has_nonabelian_symmetry is True
     assert (vac, dbl) in tensor.data
+
+
+def test_merge_mps_sites_preserves_multiple_intermediate_su2_channels():
+    left = SpinChargeSector(1, SU2Irrep(1))
+    phys = SpinChargeSector(1, SU2Irrep(1))
+    mid_singlet = SpinChargeSector(2, SU2Irrep(0))
+    mid_triplet = SpinChargeSector(2, SU2Irrep(2))
+    right = SpinChargeSector(3, SU2Irrep(1))
+
+    A = NonabelianTensor(
+        data={
+            (left, phys, mid_singlet): np.array([[[1.0]]]),
+            (left, phys, mid_triplet): np.array([[[2.0]]]),
+        },
+        qns=[[left], [phys], [mid_singlet, mid_triplet]],
+        dirs=[-1, 1, 1],
+    )
+    B = NonabelianTensor(
+        data={
+            (mid_singlet, phys, right): np.array([[[3.0]]]),
+            (mid_triplet, phys, right): np.array([[[5.0]]]),
+        },
+        qns=[[mid_singlet, mid_triplet], [phys], [right]],
+        dirs=[-1, 1, 1],
+    )
+
+    merged = merge_mps_sites(A, B)
+    key = (left, phys, phys, right)
+
+    assert key in merged.data
+    assert set(merged.metadata["contracted_channels"][key]) == {
+        (mid_singlet,),
+        (mid_triplet,),
+    }
 
 
 def test_explicit_basis_descriptors_recover_tensor_axis_layouts():

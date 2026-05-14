@@ -9,10 +9,12 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import numpy as np
 
 from .contraction import normalize_site_tensor_layout
+from .coupling import clebsch_gordan, ordered_two_m_values
 from .basis import TwoSiteBasis
 from .local_operator import (
     apply_compiled_transition_reduced,
@@ -41,6 +43,7 @@ from .solver import (
 )
 from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
 from .tensor import NonabelianTensor
+from pyqed.mps.su2 import SU2Irrep
 
 
 def _basis_cache_signature(basis):
@@ -697,6 +700,553 @@ def _flatten_rank_coupled_env_map(env_map):
     return flat
 
 
+def _sector_irrep(sector):
+    irrep = getattr(sector, "irrep", None)
+    if irrep is not None:
+        return irrep
+    if hasattr(sector, "labels") and "su2" in sector.labels:
+        return sector.components[sector.labels.index("su2")]
+    raise TypeError(f"Sector {sector!r} does not carry an SU(2) irrep.")
+
+
+def _rank_coupled_degeneracy_only_physical(W):
+    if not isinstance(W, RankCoupledMPO):
+        return False
+    return all(W.phys_out_leg.dim(sector) == 1 for sector in W.phys_out_leg.sectors) and all(
+        W.phys_in_leg.dim(sector) == 1 for sector in W.phys_in_leg.sectors
+    )
+
+
+def _reduced_operator_rank(operator):
+    base = getattr(operator, "base_operator", operator)
+    rank = getattr(base, "rank_irrep", None)
+    if not isinstance(rank, SU2Irrep):
+        raise TypeError("Reduced tensor operator does not expose a rank_irrep.")
+    return rank
+
+
+def _rank_coupled_component(left_irrep, right_irrep, two_m_left, two_m_right):
+    if left_irrep.two_j == 0 and right_irrep.two_j != 0:
+        return int(two_m_right)
+    if right_irrep.two_j == 0 and left_irrep.two_j != 0:
+        return int(two_m_left)
+    return int(two_m_right - two_m_left)
+
+
+def _virtual_rank_coupling(left_irrep, op_rank, right_irrep, two_m_left, two_m_component, two_m_right):
+    return clebsch_gordan(
+        left_irrep,
+        op_rank,
+        right_irrep,
+        int(two_m_left),
+        int(two_m_component),
+        int(two_m_right),
+    )
+
+
+def _virtual_dual_metric(left_irrep, op_rank, right_irrep):
+    if right_irrep.two_j == 0 and left_irrep.two_j == op_rank.two_j and op_rank.two_j != 0:
+        return -float(op_rank.dim)
+    return 1.0
+
+
+_FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY = "__fully_reduced_one_body_split__"
+
+
+def _rank_coupled_core_has_family(W, family):
+    family = str(family)
+    for transition in getattr(W, "symbolic_transitions", ()) or ():
+        if len(transition) < 4:
+            continue
+        label = transition[3]
+        if (
+            isinstance(label, tuple)
+            and label
+            and isinstance(label[-1], tuple)
+            and family in label[-1]
+        ):
+            return True
+    return False
+
+
+@lru_cache(maxsize=None)
+def _component_basis_matrix(q_out, q_in, rank_irrep, two_m_component):
+    out_irrep = _sector_irrep(q_out)
+    in_irrep = _sector_irrep(q_in)
+    block = np.zeros((out_irrep.dim, in_irrep.dim), dtype=float)
+    for row, two_m_out in enumerate(ordered_two_m_values(out_irrep)):
+        for col, two_m_in in enumerate(ordered_two_m_values(in_irrep)):
+            coeff = clebsch_gordan(
+                in_irrep,
+                rank_irrep,
+                out_irrep,
+                two_m_in,
+                int(two_m_component),
+                two_m_out,
+            )
+            if coeff:
+                block[row, col] = coeff
+    return block
+
+
+@lru_cache(maxsize=None)
+def _dual_component_basis_matrix(q_out, q_in, rank_irrep, two_m_component):
+    phase = (-1.0) ** ((rank_irrep.two_j - int(two_m_component)) // 2)
+    return phase * _component_basis_matrix(q_out, q_in, rank_irrep, -int(two_m_component))
+
+
+@lru_cache(maxsize=None)
+def _physical_component_matrix(q_out, q_in, rank_irrep, two_m_component, diagonal_scalar):
+    out_irrep = _sector_irrep(q_out)
+    in_irrep = _sector_irrep(q_in)
+    if diagonal_scalar:
+        if q_out != q_in:
+            return np.zeros((out_irrep.dim, in_irrep.dim), dtype=float)
+        return np.eye(out_irrep.dim, dtype=float)
+    out_charge = getattr(q_out, "charge", None)
+    in_charge = getattr(q_in, "charge", None)
+    scale = np.sqrt(float(rank_irrep.dim))
+    if out_charge is not None and in_charge is not None and int(out_charge) > int(in_charge):
+        return scale * _component_basis_matrix(q_in, q_out, rank_irrep, int(two_m_component)).T
+    return scale * _component_basis_matrix(q_out, q_in, rank_irrep, int(two_m_component))
+
+
+@lru_cache(maxsize=None)
+def _left_reduced_recoupling_coeff(
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+    left_irrep,
+    right_irrep,
+    op_rank,
+    two_m_left,
+    two_m_right,
+    two_m_component,
+    dual_right_basis=True,
+):
+    """
+    Project one reduced left-environment update through hidden spin components.
+    """
+    left_basis = _component_basis_matrix(q_lb, q_lk, left_irrep, int(two_m_left))
+    local_basis = _physical_component_matrix(
+        q_pb,
+        q_pk,
+        op_rank,
+        int(two_m_component),
+        op_rank.two_j == 0,
+    )
+    right_basis = (
+        _dual_component_basis_matrix(q_rb, q_rk, right_irrep, int(two_m_right))
+        if dual_right_basis
+        else _component_basis_matrix(q_rb, q_rk, right_irrep, int(two_m_right))
+    )
+    if not np.any(left_basis) or not np.any(local_basis) or not np.any(right_basis):
+        return 0.0
+
+    q_lb_irrep = _sector_irrep(q_lb)
+    q_lk_irrep = _sector_irrep(q_lk)
+    q_pb_irrep = _sector_irrep(q_pb)
+    q_pk_irrep = _sector_irrep(q_pk)
+    q_rb_irrep = _sector_irrep(q_rb)
+    q_rk_irrep = _sector_irrep(q_rk)
+    projected = np.zeros((q_rb_irrep.dim, q_rk_irrep.dim), dtype=float)
+
+    for lb_row, two_m_lb in enumerate(ordered_two_m_values(q_lb_irrep)):
+        for lk_col, two_m_lk in enumerate(ordered_two_m_values(q_lk_irrep)):
+            env_coeff = left_basis[lb_row, lk_col]
+            if env_coeff == 0:
+                continue
+            for pb_row, two_m_pb in enumerate(ordered_two_m_values(q_pb_irrep)):
+                for pk_col, two_m_pk in enumerate(ordered_two_m_values(q_pk_irrep)):
+                    op_coeff = local_basis[pb_row, pk_col]
+                    if op_coeff == 0:
+                        continue
+                    for rb_row, two_m_rb in enumerate(ordered_two_m_values(q_rb_irrep)):
+                        bra_cg = clebsch_gordan(
+                            q_lb_irrep,
+                            q_pb_irrep,
+                            q_rb_irrep,
+                            two_m_lb,
+                            two_m_pb,
+                            two_m_rb,
+                        )
+                        if bra_cg == 0:
+                            continue
+                        for rk_col, two_m_rk in enumerate(ordered_two_m_values(q_rk_irrep)):
+                            ket_cg = clebsch_gordan(
+                                q_lk_irrep,
+                                q_pk_irrep,
+                                q_rk_irrep,
+                                two_m_lk,
+                                two_m_pk,
+                                two_m_rk,
+                            )
+                            if ket_cg:
+                                projected[rb_row, rk_col] += (
+                                    env_coeff * op_coeff * bra_cg * ket_cg
+                                )
+
+    norm = np.vdot(right_basis, right_basis)
+    if abs(norm) <= 1.0e-14:
+        return 0.0
+    return np.vdot(right_basis, projected) / norm
+
+
+@lru_cache(maxsize=None)
+def _right_reduced_recoupling_coeff(
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+    left_irrep,
+    right_irrep,
+    op_rank,
+    two_m_left,
+    two_m_right,
+    two_m_component,
+):
+    """Right-environment analogue of :func:`_left_reduced_recoupling_coeff`."""
+    left_basis = _component_basis_matrix(q_lb, q_lk, left_irrep, int(two_m_left))
+    local_basis = _physical_component_matrix(
+        q_pb,
+        q_pk,
+        op_rank,
+        int(two_m_component),
+        op_rank.two_j == 0,
+    )
+    right_basis = _component_basis_matrix(q_rb, q_rk, right_irrep, int(two_m_right))
+    if not np.any(left_basis) or not np.any(local_basis) or not np.any(right_basis):
+        return 0.0
+
+    q_lb_irrep = _sector_irrep(q_lb)
+    q_lk_irrep = _sector_irrep(q_lk)
+    q_pb_irrep = _sector_irrep(q_pb)
+    q_pk_irrep = _sector_irrep(q_pk)
+    q_rb_irrep = _sector_irrep(q_rb)
+    q_rk_irrep = _sector_irrep(q_rk)
+    projected = np.zeros((q_lb_irrep.dim, q_lk_irrep.dim), dtype=float)
+
+    for rb_row, two_m_rb in enumerate(ordered_two_m_values(q_rb_irrep)):
+        for rk_col, two_m_rk in enumerate(ordered_two_m_values(q_rk_irrep)):
+            env_coeff = right_basis[rb_row, rk_col]
+            if env_coeff == 0:
+                continue
+            for pb_row, two_m_pb in enumerate(ordered_two_m_values(q_pb_irrep)):
+                for pk_col, two_m_pk in enumerate(ordered_two_m_values(q_pk_irrep)):
+                    op_coeff = local_basis[pb_row, pk_col]
+                    if op_coeff == 0:
+                        continue
+                    for lb_row, two_m_lb in enumerate(ordered_two_m_values(q_lb_irrep)):
+                        bra_cg = clebsch_gordan(
+                            q_lb_irrep,
+                            q_pb_irrep,
+                            q_rb_irrep,
+                            two_m_lb,
+                            two_m_pb,
+                            two_m_rb,
+                        )
+                        if bra_cg == 0:
+                            continue
+                        for lk_col, two_m_lk in enumerate(ordered_two_m_values(q_lk_irrep)):
+                            ket_cg = clebsch_gordan(
+                                q_lk_irrep,
+                                q_pk_irrep,
+                                q_rk_irrep,
+                                two_m_lk,
+                                two_m_pk,
+                                two_m_rk,
+                            )
+                            if ket_cg:
+                                projected[lb_row, lk_col] += (
+                                    env_coeff * op_coeff * bra_cg * ket_cg
+                                )
+
+    norm = np.vdot(left_basis, left_basis)
+    if abs(norm) <= 1.0e-14:
+        return 0.0
+    return np.vdot(left_basis, projected) / norm
+
+
+def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    reduced = {}
+    dense_block = W.dense_blocks.get((q_pb, q_pk))
+    dtype = _mpo_dtype(W)
+    relaxed_scalar_transfer = _rank_coupled_core_has_family(
+        W,
+        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    )
+    if dense_block is not None:
+        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
+            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
+                local_scalar = np.asarray(dense_block[left_idx, right_idx, 0, 0], dtype=dtype)
+                if local_scalar == 0:
+                    continue
+                block = np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype)
+                for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                    for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
+                        component = _rank_coupled_component(
+                            left_irrep,
+                            right_irrep,
+                            int(two_m_left),
+                            int(two_m_right),
+                        )
+                        if relaxed_scalar_transfer:
+                            virtual_cg = 1.0
+                        else:
+                            virtual_cg = _virtual_rank_coupling(
+                                left_irrep,
+                                SU2Irrep(0),
+                                right_irrep,
+                                int(two_m_left),
+                                component,
+                                int(two_m_right),
+                            )
+                            if virtual_cg == 0:
+                                continue
+                        coeff = (
+                            _left_reduced_recoupling_coeff(
+                                q_lb,
+                                q_lk,
+                                q_pb,
+                                q_pk,
+                                q_rb,
+                                q_rk,
+                                left_irrep,
+                                right_irrep,
+                                SU2Irrep(0),
+                                int(two_m_left),
+                                int(two_m_right),
+                                0,
+                                False,
+                            )
+                            if relaxed_scalar_transfer
+                            else _left_reduced_recoupling_coeff(
+                                q_lb,
+                                q_lk,
+                                q_pb,
+                                q_pk,
+                                q_rb,
+                                q_rk,
+                                left_irrep,
+                                right_irrep,
+                                SU2Irrep(0),
+                                int(two_m_left),
+                                int(two_m_right),
+                                0,
+                            )
+                        )
+                        if coeff:
+                            block[row, col, 0, 0] += local_scalar * virtual_cg * coeff
+                if np.any(block):
+                    reduced[(left_idx, right_idx)] = block
+
+    for term in W.reduced_terms:
+        visible = term.visible_virtual_block
+        op_rank = _reduced_operator_rank(term.reduced_operator)
+        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
+            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
+                visible_coeff = visible[left_idx, right_idx]
+                if visible_coeff == 0:
+                    continue
+                block = reduced.get(
+                    (left_idx, right_idx),
+                    np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype),
+                )
+                for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                    for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
+                        component = (
+                            int(two_m_right) - int(two_m_left)
+                            if getattr(term, "use_cg_coupling", False)
+                            else _rank_coupled_component(
+                                left_irrep,
+                                right_irrep,
+                                int(two_m_left),
+                                int(two_m_right),
+                            )
+                        )
+                        virtual_cg = _virtual_rank_coupling(
+                            left_irrep,
+                            op_rank,
+                            right_irrep,
+                            int(two_m_left),
+                            component,
+                            int(two_m_right),
+                        )
+                        if virtual_cg == 0:
+                            continue
+                        dual_factor = _virtual_dual_metric(left_irrep, op_rank, right_irrep)
+                        op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
+                        if op_block is None:
+                            continue
+                        recoupled = _left_reduced_recoupling_coeff(
+                            q_lb,
+                            q_lk,
+                            q_pb,
+                            q_pk,
+                            q_rb,
+                            q_rk,
+                            left_irrep,
+                            right_irrep,
+                            op_rank,
+                            int(two_m_left),
+                            int(two_m_right),
+                            component,
+                        )
+                        if recoupled:
+                            block[row, col, 0, 0] += (
+                                np.asarray(visible_coeff, dtype=dtype)
+                                * np.asarray(virtual_cg, dtype=dtype)
+                                * np.asarray(op_block[0, 0], dtype=dtype)
+                                * np.asarray(dual_factor, dtype=dtype)
+                                * recoupled
+                            )
+                if np.any(block):
+                    reduced[(left_idx, right_idx)] = block
+    return reduced
+
+
+def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    reduced = {}
+    dense_block = W.dense_blocks.get((q_pb, q_pk))
+    dtype = _mpo_dtype(W)
+    relaxed_scalar_transfer = _rank_coupled_core_has_family(
+        W,
+        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    )
+    if dense_block is not None:
+        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
+            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
+                local_scalar = np.asarray(dense_block[left_idx, right_idx, 0, 0], dtype=dtype)
+                if local_scalar == 0:
+                    continue
+                block = np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype)
+                for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                    for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
+                        component = _rank_coupled_component(
+                            left_irrep,
+                            right_irrep,
+                            int(two_m_left),
+                            int(two_m_right),
+                        )
+                        if relaxed_scalar_transfer:
+                            virtual_cg = 1.0
+                        else:
+                            virtual_cg = _virtual_rank_coupling(
+                                left_irrep,
+                                SU2Irrep(0),
+                                right_irrep,
+                                int(two_m_left),
+                                component,
+                                int(two_m_right),
+                            )
+                            if virtual_cg == 0:
+                                continue
+                        coeff = (
+                            _right_reduced_recoupling_coeff(
+                                q_lb,
+                                q_lk,
+                                q_pb,
+                                q_pk,
+                                q_rb,
+                                q_rk,
+                                left_irrep,
+                                right_irrep,
+                                SU2Irrep(0),
+                                int(two_m_left),
+                                int(two_m_right),
+                                0,
+                            )
+                            if relaxed_scalar_transfer
+                            else _right_reduced_recoupling_coeff(
+                                q_lb,
+                                q_lk,
+                                q_pb,
+                                q_pk,
+                                q_rb,
+                                q_rk,
+                                left_irrep,
+                                right_irrep,
+                                SU2Irrep(0),
+                                int(two_m_left),
+                                int(two_m_right),
+                                0,
+                            )
+                        )
+                        if coeff:
+                            block[row, col, 0, 0] += local_scalar * virtual_cg * coeff
+                if np.any(block):
+                    reduced[(left_idx, right_idx)] = block
+
+    for term in W.reduced_terms:
+        visible = term.visible_virtual_block
+        op_rank = _reduced_operator_rank(term.reduced_operator)
+        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
+            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
+                visible_coeff = visible[left_idx, right_idx]
+                if visible_coeff == 0:
+                    continue
+                block = reduced.get(
+                    (left_idx, right_idx),
+                    np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype),
+                )
+                for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                    for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
+                        component = (
+                            int(two_m_right) - int(two_m_left)
+                            if getattr(term, "use_cg_coupling", False)
+                            else _rank_coupled_component(
+                                left_irrep,
+                                right_irrep,
+                                int(two_m_left),
+                                int(two_m_right),
+                            )
+                        )
+                        virtual_cg = _virtual_rank_coupling(
+                            left_irrep,
+                            op_rank,
+                            right_irrep,
+                            int(two_m_left),
+                            component,
+                            int(two_m_right),
+                        )
+                        if virtual_cg == 0:
+                            continue
+                        dual_factor = _virtual_dual_metric(left_irrep, op_rank, right_irrep)
+                        op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
+                        if op_block is None:
+                            continue
+                        recoupled = _right_reduced_recoupling_coeff(
+                            q_lb,
+                            q_lk,
+                            q_pb,
+                            q_pk,
+                            q_rb,
+                            q_rk,
+                            left_irrep,
+                            right_irrep,
+                            op_rank,
+                            int(two_m_left),
+                            int(two_m_right),
+                            component,
+                        )
+                        if recoupled:
+                            block[row, col, 0, 0] += (
+                                np.asarray(visible_coeff, dtype=dtype)
+                                * np.asarray(virtual_cg, dtype=dtype)
+                                * np.asarray(op_block[0, 0], dtype=dtype)
+                                * np.asarray(dual_factor, dtype=dtype)
+                                * recoupled
+                            )
+                if np.any(block):
+                    reduced[(left_idx, right_idx)] = block
+    return reduced
+
+
 def _environment_map_expectation(env_map, *, rank_coupled):
     value = 0.0 + 0.0j
     if rank_coupled:
@@ -867,6 +1417,7 @@ def _contract_from_left_blocks(W, A, E_map, B, phys_slices):
 def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
+    reduced_physical = not W.reduced_terms
     a_blocks_by_left = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         arr = np.asarray(A_block)
@@ -885,18 +1436,26 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
         b_entries = b_blocks_by_left.get(q_lk)
         if not a_entries or not b_entries:
             continue
-        e_entries = _nonzero_rank_coupled_blocks(E_blocks)
-        if not e_entries:
-            continue
-        e_arrays = tuple(block for _idx, block in e_entries)
-        e_arrays_by_rank = {idx: block for idx, block in e_entries}
+        e_arrays = tuple(np.asarray(block) for block in E_blocks)
         e_dtypes = tuple(block.dtype for block in e_arrays)
         for q_rb, q_pb, A_conj, bra_dim, a_dtype in a_entries:
             for q_rk, q_pk, B_arr, ket_dim, b_dtype in b_entries:
-                reduced_key = (q_pb, q_pk)
+                reduced_key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk) if reduced_physical else (q_pb, q_pk)
                 reduced = reduced_cache.get(reduced_key)
                 if reduced is None:
-                    reduced = W.reduced_block(q_pb, q_pk)
+                    reduced = (
+                        _left_reduced_rank_coupled_block(
+                            W,
+                            q_lb,
+                            q_lk,
+                            q_pb,
+                            q_pk,
+                            q_rb,
+                            q_rk,
+                        )
+                        if reduced_physical
+                        else W.reduced_block(q_pb, q_pk)
+                    )
                     reduced_cache[reduced_key] = reduced
                 if not reduced:
                     continue
@@ -910,11 +1469,10 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                     ]
                     out[key] = target
                 for (left_idx, right_idx), w_block in reduced.items():
-                    e_array = e_arrays_by_rank.get(left_idx)
-                    if e_array is None:
+                    if left_idx >= len(e_arrays):
                         continue
                     target[right_idx] += _contract_rank_coupled_left_step(
-                        e_array,
+                        e_arrays[left_idx],
                         A_conj,
                         np.asarray(w_block),
                         B_arr,
@@ -954,6 +1512,7 @@ def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
 def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
+    reduced_physical = not W.reduced_terms
     a_blocks_by_right = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         arr = np.asarray(A_block)
@@ -972,18 +1531,26 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
         b_entries = b_blocks_by_right.get(q_rk)
         if not a_entries or not b_entries:
             continue
-        f_entries = _nonzero_rank_coupled_blocks(F_blocks)
-        if not f_entries:
-            continue
-        f_arrays = tuple(block for _idx, block in f_entries)
-        f_arrays_by_rank = {idx: block for idx, block in f_entries}
+        f_arrays = tuple(np.asarray(block) for block in F_blocks)
         f_dtypes = tuple(block.dtype for block in f_arrays)
         for q_lb, q_pb, A_conj, bra_dim, a_dtype in a_entries:
             for q_lk, q_pk, B_arr, ket_dim, b_dtype in b_entries:
-                reduced_key = (q_pb, q_pk)
+                reduced_key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk) if reduced_physical else (q_pb, q_pk)
                 reduced = reduced_cache.get(reduced_key)
                 if reduced is None:
-                    reduced = W.reduced_block(q_pb, q_pk)
+                    reduced = (
+                        _right_reduced_rank_coupled_block(
+                            W,
+                            q_lb,
+                            q_lk,
+                            q_pb,
+                            q_pk,
+                            q_rb,
+                            q_rk,
+                        )
+                        if reduced_physical
+                        else W.reduced_block(q_pb, q_pk)
+                    )
                     reduced_cache[reduced_key] = reduced
                 if not reduced:
                     continue
@@ -997,13 +1564,12 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                     ]
                     out[key] = target
                 for (left_idx, right_idx), w_block in reduced.items():
-                    f_array = f_arrays_by_rank.get(right_idx)
-                    if f_array is None:
+                    if right_idx >= len(f_arrays):
                         continue
                     target[left_idx] += _contract_rank_coupled_right_step(
                         A_conj,
                         np.asarray(w_block),
-                        f_array,
+                        f_arrays[right_idx],
                         B_arr,
                     )
     return {key: tuple(blocks) for key, blocks in out.items()}

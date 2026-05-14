@@ -33,7 +33,7 @@ def main():
     mf = mol.RHF().run()
 
     outfile = Path("h2o_density_pyvista.png").resolve()
-    result = mf.plot_density_3d(
+    result = mf.plot_density(
         nx=48,
         ny=48,
         nz=48,

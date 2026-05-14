@@ -424,7 +424,7 @@ def point_charge(a,b,C):
     return v
 
 
-@lru_cache(maxsize=262144)
+@lru_cache(maxsize=1048576)
 def _electron_repulsion_cached(
     a,l1,m1,n1,Ax,Ay,Az,
     b,l2,m2,n2,Bx,By,Bz,

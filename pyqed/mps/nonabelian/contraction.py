@@ -133,7 +133,7 @@ def tensordot(A, B, axes):
         for key_B, block_B in b_map[contracted]:
             block_C = np.tensordot(block_A, block_B, axes=(a_ax, b_ax))
             key_C = tuple(key_A[i] for i in free_A) + tuple(key_B[i] for i in free_B)
-            contracted_channels[key_C] = contracted
+            contracted_channels.setdefault(key_C, set()).add(contracted)
             if key_C in new_data:
                 new_data[key_C] = new_data[key_C] + block_C
             else:
@@ -148,30 +148,41 @@ def tensordot(A, B, axes):
             "right_metadata": B.metadata.copy(),
         }
     if contracted_channels:
-        metadata["contracted_channels"] = contracted_channels
+        metadata["contracted_channels"] = {
+            key: tuple(sorted(channels))
+            for key, channels in contracted_channels.items()
+        }
         if len(a_ax) == 1 and len(b_ax) == 1:
-            fused_sectors = tuple(sorted({contracted[0] for contracted in contracted_channels.values()}))
+            fused_sectors = tuple(
+                sorted(
+                    {
+                        contracted[0]
+                        for channels in contracted_channels.values()
+                        for contracted in channels
+                    }
+                )
+            )
             slot_counts = {sector: 0 for sector in fused_sectors}
             offset_counts = {sector: 0 for sector in fused_sectors}
             pipe_entries = []
             for key_C in sorted(contracted_channels):
-                contracted = contracted_channels[key_C]
-                if len(contracted) != 1:
-                    continue
-                fused_sector = contracted[0]
                 local_dim = int(np.prod(new_data[key_C].shape, dtype=int))
-                pipe_entries.append(
-                    FusionPipeEntry(
-                        child_sectors=tuple(key_C),
-                        fused_sector=fused_sector,
-                        slot=slot_counts[fused_sector],
-                        offset=offset_counts[fused_sector],
-                        local_dim=local_dim,
-                        selected_shape=tuple(int(x) for x in new_data[key_C].shape),
+                for contracted in sorted(contracted_channels[key_C]):
+                    if len(contracted) != 1:
+                        continue
+                    fused_sector = contracted[0]
+                    pipe_entries.append(
+                        FusionPipeEntry(
+                            child_sectors=tuple(key_C),
+                            fused_sector=fused_sector,
+                            slot=slot_counts[fused_sector],
+                            offset=offset_counts[fused_sector],
+                            local_dim=local_dim,
+                            selected_shape=tuple(int(x) for x in new_data[key_C].shape),
+                        )
                     )
-                )
-                slot_counts[fused_sector] += 1
-                offset_counts[fused_sector] += local_dim
+                    slot_counts[fused_sector] += 1
+                    offset_counts[fused_sector] += local_dim
             contracted_pipe = FusionPipe.from_entries(
                 child_legs=tuple(range(len(new_qns))),
                 child_sector_lists=tuple(tuple(leg_qns) for leg_qns in new_qns),

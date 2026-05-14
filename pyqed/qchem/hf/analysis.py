@@ -485,7 +485,7 @@ class RHFAnalysis:
             'backend': 'pyvista',
         }
 
-    def _plot_density_3d_pyvista(
+    def _plot_density_pyvista(
         self,
         *,
         grid,
@@ -1104,16 +1104,19 @@ class RHFAnalysis:
                 ao_values = np.asarray(transform, dtype=float).T @ ao_values
             return ao_values
 
-        return np.asarray(
-            evaluate_basis(
+        try:
+            values = evaluate_basis(
                 basis,
                 points,
                 transform=None,
                 screen_basis=screen_basis,
                 tol_screen=float(tol_screen),
-            ),
-            dtype=float,
-        )
+            )
+        except TypeError as exc:
+            if "screen_basis" not in str(exc) and "tol_screen" not in str(exc):
+                raise
+            values = evaluate_basis(basis, points, transform=None)
+        return np.asarray(values, dtype=float)
 
     def sample_mo(
         self,
@@ -1143,7 +1146,7 @@ class RHFAnalysis:
             raise ValueError("AO real-space evaluation shape does not match the MO coefficient dimension.")
         return np.asarray(coeff[:, mo_index].conj() @ ao_values, dtype=float)
 
-    def sample_density(
+    def electron_density(
         self,
         coords,
         dm=None,
@@ -1227,7 +1230,7 @@ class RHFAnalysis:
             'bounds': np.vstack([lower, upper]),
         }
 
-    def sample_density_grid(
+    def electron_density_grid(
         self,
         nx=40,
         ny=None,
@@ -1264,7 +1267,7 @@ class RHFAnalysis:
         z = np.linspace(lower[2], upper[2], nz)
         X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         points = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-        values = self.sample_density(
+        values = self.electron_density(
             points,
             dm=dm,
             screen_basis=screen_basis,
@@ -1571,7 +1574,7 @@ class RHFAnalysis:
             'backend': 'matplotlib',
         }
 
-    def plot_density_3d(
+    def plot_density(
         self,
         nx=40,
         ny=None,
@@ -1619,7 +1622,7 @@ class RHFAnalysis:
         import matplotlib.colors as mcolors
         from skimage.filters import gaussian
 
-        grid = self.sample_density_grid(
+        grid = self.electron_density_grid(
             nx=nx,
             ny=ny,
             nz=nz,
@@ -1709,7 +1712,7 @@ class RHFAnalysis:
         backend = str(backend).lower()
 
         if backend == 'pyvista':
-            return self._plot_density_3d_pyvista(
+            return self._plot_density_pyvista(
                 grid=grid,
                 values_plot=values_plot,
                 levels=levels,

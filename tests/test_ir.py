@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
 
+import matplotlib
+matplotlib.use("Agg", force=True)
+
 from pyqed.qchem import IR, Molecule, RHF
 from pyqed.qchem.dft import AOGrid, RKS
 
@@ -118,6 +121,37 @@ def test_finite_difference_dipole_derivatives():
     )
 
 
+def test_ir_plot_mode_from_harmonic_data(tmp_path):
+    data = {
+        "freq_cm1": np.array([1200.0]),
+        "modes": np.array([[[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]]]),
+        "reduced_mass_amu": np.array([1.0]),
+        "atom_coords": np.array([[0.0, 0.0, -0.7], [0.0, 0.0, 0.7]]),
+        "atom_symbols": ["H", "H"],
+    }
+    ir = IR.from_harmonic_analysis(data, dipole_derivatives=[[1.0, 0.0, 0.0]]).run()
+
+    ax = ir.plot_mode(0, view=(30.0, -45.0))
+    out = tmp_path / "mode.png"
+    ax.figure.savefig(out)
+
+    assert ax.elev == pytest.approx(30.0)
+    assert ax.azim == pytest.approx(-45.0)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_ir_plot_mode_requires_coordinates():
+    ir = IR(
+        frequencies=[1200.0],
+        dipole_derivatives=[[1.0, 0.0, 0.0]],
+        modes=np.zeros((1, 2, 3)),
+    ).run()
+
+    with pytest.raises(ValueError, match="Atomic coordinates are missing"):
+        ir.plot_mode(0)
+
+
 def test_ir_accepts_native_rhf_method_backend():
     mol = Molecule(atom="H 0 0 -0.7; H 0 0 0.7", unit="bohr", basis="sto-3g")
     mol.build(driver="builtin", eri="s8")
@@ -159,3 +193,34 @@ def test_ir_rejects_casci_like_method_backend():
 
     with pytest.raises(NotImplementedError, match="IR\\(CASCI\\)"):
         IR(CASCI()).run()
+
+
+def test_cartesian_hessian_analysis_matches_pyscf_projection():
+    pyscf = pytest.importorskip("pyscf")
+    from pyscf.hessian import thermo
+    from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+
+    mol = pyscf.M(
+        atom="O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266",
+        unit="Bohr",
+        basis="sto-3g",
+        verbose=0,
+    )
+    rng = np.random.default_rng(12)
+    hess = rng.normal(size=(9, 9))
+    hess = 0.5 * (hess + hess.T)
+    hess4 = hess.reshape(3, 3, 3, 3).transpose(0, 2, 1, 3)
+
+    data = analyze_cartesian_hessian(
+        hess,
+        mol.atom_coords(),
+        mol.atom_mass_list(isotope_avg=True),
+        negative_imaginary=False,
+    )
+    ref = thermo.harmonic_analysis(mol, hess4)
+
+    np.testing.assert_allclose(data["freq_cm1"], ref["freq_wavenumber"], atol=2.0e-5)
+    mode_sign = np.sign(np.einsum("ijk,ijk->i", data["modes"], ref["norm_mode"]))
+    mode_sign[mode_sign == 0.0] = 1.0
+    np.testing.assert_allclose(data["modes"] * mode_sign[:, None, None], ref["norm_mode"], atol=1.0e-10)
+    np.testing.assert_allclose(data["reduced_mass_amu"], ref["reduced_mass"], atol=1.0e-10)

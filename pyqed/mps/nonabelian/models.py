@@ -13,6 +13,8 @@ import numpy as np
 from .builder import AutoMPO
 from .mpo import PhysicalLeg
 from .operators import (
+    ReducedTensorOperator,
+    SiteOperator,
     compose_site_operators,
     coupled_reduced_tensor_product,
     physical_leg_from_spatial_orbital,
@@ -26,6 +28,7 @@ from .operators import (
     spatial_annihilate_up,
     spatial_number,
     spatial_parity,
+    spatial_projector,
     time_reversed_reduced_operator,
 )
 from pyqed.mps.su2 import SU2Irrep
@@ -36,6 +39,7 @@ from .tensor import NonabelianTensor
 _SQRT3 = float(np.sqrt(3.0))
 _FULLY_REDUCED_PAIR_RECOUPLING = 2.0
 _FULLY_REDUCED_EXCHANGE_RECOUPLING = 1.0
+_FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY = "__fully_reduced_one_body_split__"
 
 
 def _su2_ranks(*two_j):
@@ -128,6 +132,31 @@ def _is_fully_reduced_spatial_leg(phys_leg):
     return physical_leg_from_spatial_orbital(phys_leg) != physical_leg_from_spatial_orbital()
 
 
+def _split_spatial_fermion_annihilation_channels(phys_leg, *, dtype):
+    annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
+    q_empty, q_single, q_double = phys_leg.sectors
+    return (
+        ReducedTensorOperator(
+            reduced_blocks={
+                (q_empty, q_single): annihilation.reduced_blocks[(q_empty, q_single)],
+            },
+            phys_out_leg=phys_leg,
+            phys_in_leg=phys_leg,
+            rank_irrep=SU2Irrep(1),
+            component_phases=annihilation.component_phases,
+        ),
+        ReducedTensorOperator(
+            reduced_blocks={
+                (q_single, q_double): annihilation.reduced_blocks[(q_single, q_double)],
+            },
+            phys_out_leg=phys_leg,
+            phys_in_leg=phys_leg,
+            rank_irrep=SU2Irrep(1),
+            component_phases=annihilation.component_phases,
+        ),
+    )
+
+
 def _add_fully_reduced_spinfree_bilinear(
     autompo,
     create_site,
@@ -137,7 +166,9 @@ def _add_fully_reduced_spinfree_bilinear(
     phys_leg,
     dtype,
     density_site=None,
+    density_operator=None,
     family=None,
+    split_channels=True,
 ):
     """
     Add ``coeff * E_pq`` with ``E_pq = sum_sigma c^dagger[p,sigma] c[q,sigma]``.
@@ -152,7 +183,11 @@ def _add_fully_reduced_spinfree_bilinear(
     if create_site == annihilate_site:
         operator = spatial_number(phys_leg, dtype=dtype)
         if density_site is not None:
-            density = spatial_number(phys_leg, dtype=dtype)
+            density = (
+                density_operator
+                if density_operator is not None
+                else spatial_number(phys_leg, dtype=dtype)
+            )
             operator = compose_site_operators(density, operator)
         autompo.add_onsite(create_site, operator, coeff=coeff, family=family)
         return autompo
@@ -160,7 +195,12 @@ def _add_fully_reduced_spinfree_bilinear(
     annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
     creation = annihilation.adjoint()
     parity = spatial_parity(phys_leg, dtype=dtype)
-    density = spatial_number(phys_leg, dtype=dtype) if density_site is not None else None
+    double_phase = _fully_reduced_double_transition_phase(phys_leg, dtype=dtype)
+    density = (
+        density_operator
+        if density_operator is not None
+        else spatial_number(phys_leg, dtype=dtype) if density_site is not None else None
+    )
 
     def with_density(operator, site):
         if density is not None and int(density_site) == int(site):
@@ -170,41 +210,143 @@ def _add_fully_reduced_spinfree_bilinear(
     dense_scalars = ()
     if density is not None and int(density_site) not in {create_site, annihilate_site}:
         dense_scalars = ((int(density_site), density),)
+    if not split_channels:
+        if create_site < annihilate_site:
+            autompo.add_reduced_string_product(
+                (
+                    create_site,
+                    with_density(
+                        creation.left_multiply_sector_scalar(double_phase),
+                        create_site,
+                    ).right_multiply_sector_scalar(parity),
+                ),
+                (
+                    annihilate_site,
+                    time_reversed_reduced_operator(
+                        with_density(annihilation, annihilate_site)
+                    ),
+                ),
+                intermediate_irreps=(SU2Irrep(1),),
+                dense_site_operators=dense_scalars,
+                coeff=-np.sqrt(2.0) * coeff,
+                family=family,
+            )
+        else:
+            autompo.add_reduced_string_product(
+                (
+                    annihilate_site,
+                    with_density(
+                        annihilation.right_multiply_sector_scalar(double_phase),
+                        annihilate_site,
+                    ).right_multiply_sector_scalar(parity),
+                ),
+                (
+                    create_site,
+                    time_reversed_reduced_operator(with_density(creation, create_site)),
+                ),
+                intermediate_irreps=(SU2Irrep(1),),
+                dense_site_operators=dense_scalars,
+                coeff=np.sqrt(2.0) * coeff,
+                family=family,
+            )
+        return autompo
+
+    direct_one_body = density is None
+    split_family = (
+        (family, _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY)
+        if direct_one_body
+        else family
+    )
+    left_site = min(create_site, annihilate_site)
+    right_site = max(create_site, annihilate_site)
+    middle = (
+        {site: parity for site in range(left_site + 1, right_site)}
+        if direct_one_body
+        else {}
+    )
+
+    annihilate_empty_single, annihilate_single_double = (
+        _split_spatial_fermion_annihilation_channels(phys_leg, dtype=dtype)
+    )
+    create_empty_single = annihilate_empty_single.adjoint()
+    create_single_double = annihilate_single_double.adjoint()
 
     if create_site < annihilate_site:
-        autompo.add_reduced_string_product(
-            (
-                create_site,
-                with_density(creation, create_site).right_multiply_sector_scalar(parity),
-            ),
-            (
-                annihilate_site,
-                time_reversed_reduced_operator(with_density(annihilation, annihilate_site)),
-            ),
-            intermediate_irreps=(SU2Irrep(1),),
-            dense_site_operators=dense_scalars,
-            coeff=-np.sqrt(2.0) * coeff,
-            family=family,
+        channel_terms = (
+            (create_empty_single, annihilate_empty_single, -np.sqrt(2.0)),
+            (create_empty_single, annihilate_single_double, -np.sqrt(2.0)),
+            (create_single_double, annihilate_empty_single, -np.sqrt(2.0)),
+            (create_single_double, annihilate_single_double, 1.0 / np.sqrt(2.0)),
         )
+        for creation, annihilation, channel_coeff in channel_terms:
+            autompo.add_reduced_string_product(
+                (
+                    create_site,
+                    with_density(
+                        creation.left_multiply_sector_scalar(double_phase),
+                        create_site,
+                    ).right_multiply_sector_scalar(parity),
+                ),
+                (
+                    annihilate_site,
+                    time_reversed_reduced_operator(
+                        with_density(annihilation, annihilate_site)
+                    ),
+                ),
+                intermediate_irreps=(SU2Irrep(1),),
+                dense_site_operators=dense_scalars,
+                middle_operators=middle,
+                coeff=channel_coeff * coeff,
+                family=split_family,
+            )
     else:
-        autompo.add_reduced_string_product(
-            (
-                annihilate_site,
-                with_density(annihilation, annihilate_site).right_multiply_sector_scalar(parity),
-            ),
-            (
-                create_site,
-                time_reversed_reduced_operator(with_density(creation, create_site)),
-            ),
-            intermediate_irreps=(SU2Irrep(1),),
-            dense_site_operators=dense_scalars,
-            coeff=np.sqrt(2.0) * coeff,
-            family=family,
+        channel_terms = (
+            (annihilate_empty_single, create_empty_single, np.sqrt(2.0)),
+            (annihilate_empty_single, create_single_double, np.sqrt(2.0)),
+            (annihilate_single_double, create_empty_single, np.sqrt(2.0)),
+            (annihilate_single_double, create_single_double, -1.0 / np.sqrt(2.0)),
         )
+        for annihilation, creation, channel_coeff in channel_terms:
+            autompo.add_reduced_string_product(
+                (
+                    annihilate_site,
+                    with_density(
+                        annihilation.right_multiply_sector_scalar(double_phase),
+                        annihilate_site,
+                    ).right_multiply_sector_scalar(parity),
+                ),
+                (
+                    create_site,
+                    time_reversed_reduced_operator(with_density(creation, create_site)),
+                ),
+                intermediate_irreps=(SU2Irrep(1),),
+                dense_site_operators=dense_scalars,
+                middle_operators=middle,
+                coeff=channel_coeff * coeff,
+                family=split_family,
+            )
     return autompo
 
 
-def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
+def _fully_reduced_double_transition_phase(phys_leg, *, dtype):
+    blocks = {}
+    for sector in phys_leg.sectors:
+        scale = -1.0 if int(getattr(sector, "charge", -1)) == 2 else 1.0
+        blocks[(sector, sector)] = np.asarray(scale, dtype=dtype) * np.eye(
+            phys_leg.dim(sector),
+            dtype=dtype,
+        )
+    return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
+
+
+def add_spatial_one_body_terms(
+    autompo,
+    h1e,
+    *,
+    cutoff=1.0e-12,
+    family="R",
+    split_fully_reduced=True,
+):
     """
     Add a spin-summed spatial-orbital one-body Hamiltonian.
 
@@ -259,6 +401,7 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
                         phys_leg=phys_leg,
                         dtype=dtype,
                         family=family,
+                        split_channels=split_fully_reduced,
                     )
                 else:
                     autompo.add_fermionic_reduced_bilinear(
@@ -281,6 +424,7 @@ def add_spatial_one_body_terms(autompo, h1e, *, cutoff=1.0e-12, family="R"):
                         phys_leg=phys_leg,
                         dtype=dtype,
                         family=family,
+                        split_channels=split_fully_reduced,
                     )
                 else:
                     autompo.add_fermionic_reduced_bilinear(
@@ -595,6 +739,12 @@ def _exchange_reduced_string_specs(original_sites, *, phys_leg, dtype):
     annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
     creation = annihilation.adjoint()
     dual_annihilation = time_reversed_reduced_operator(annihilation)
+    fully_reduced = _is_fully_reduced_spatial_leg(phys_leg)
+    double_phase = (
+        _fully_reduced_double_transition_phase(phys_leg, dtype=dtype)
+        if fully_reduced
+        else None
+    )
     original_ops = (creation, dual_annihilation, creation, dual_annihilation)
     original_ranks = (SU2Irrep(1), SU2Irrep(1), SU2Irrep(1), SU2Irrep(1))
     parity = spatial_parity(phys_leg, dtype=dtype)
@@ -616,16 +766,40 @@ def _exchange_reduced_string_specs(original_sites, *, phys_leg, dtype):
     for site in unique_sites:
         originals = site_to_originals[site]
         if len(originals) == 1:
-            choices.append(((original_ops[originals[0]], original_ranks[originals[0]]),))
+            original = originals[0]
+            operator = original_ops[original]
+            if fully_reduced:
+                forward_repeated_exchange = not (
+                    original == 0
+                    and original_sites[1] == original_sites[2]
+                    and original_sites[0] > original_sites[3]
+                )
+                if original in (0, 2) and forward_repeated_exchange:
+                    operator = operator.left_multiply_sector_scalar(double_phase)
+                elif original == 3 and site < original_sites[0]:
+                    operator = operator.right_multiply_sector_scalar(double_phase)
+            choices.append(((operator, original_ranks[original]),))
             continue
         if len(originals) != 2:
             return ()
         first, second = originals
+        other_sites = tuple(
+            original_sites[index]
+            for index in range(len(original_sites))
+            if index not in originals
+        )
+        pair_between_other_sites = min(other_sites) < site < max(other_sites)
+        left_operator = (
+            original_ops[first].right_multiply_sector_scalar(double_phase)
+            if fully_reduced and pair_between_other_sites
+            else original_ops[first]
+        )
+        right_operator = original_ops[second]
         choices.append(tuple(
             (
                 coupled_reduced_tensor_product(
-                    original_ops[first],
-                    original_ops[second],
+                    left_operator,
+                    right_operator,
                     rank,
                 ),
                 rank,
@@ -668,6 +842,16 @@ def _exchange_recoupling_key(original_sites):
     unique_sites = tuple(sorted(set(original_sites)))
     site_positions = {site: position for position, site in enumerate(unique_sites)}
     return tuple(site_positions[site] for site in original_sites)
+
+
+def _fully_reduced_exchange_order_phase(original_sites):
+    """
+    Return the residual exchange-site phase for reduced repeated-index strings.
+    """
+    p, q, r, s = (int(site) for site in original_sites)
+    if p == s and not (min(q, r) < p < max(q, r)):
+        return -1.0
+    return 1.0
 
 
 def _spinfree_exchange_recoupling_coefficients(original_sites, *, cutoff=1.0e-12):
@@ -865,6 +1049,7 @@ def _add_fully_reduced_pair_eri_term(
 
     pair_creation = spatial_pair_creation(phys_leg, dtype=dtype)
     pair_annihilation = spatial_pair_annihilation(phys_leg, dtype=dtype)
+    double_phase = _fully_reduced_double_transition_phase(phys_leg, dtype=dtype)
     annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
     creation = annihilation.adjoint()
 
@@ -887,6 +1072,17 @@ def _add_fully_reduced_pair_eri_term(
     ):
         if first_site == second_site:
             return 0
+        if pair_site < min(first_site, second_site):
+            if pair_operator.block(
+                phys_leg.sectors[2],
+                phys_leg.sectors[0],
+            ) is not None:
+                pair_operator = compose_site_operators(double_phase, pair_operator)
+            elif pair_operator.block(
+                phys_leg.sectors[0],
+                phys_leg.sectors[2],
+            ) is not None:
+                pair_operator = compose_site_operators(pair_operator, double_phase)
         if first_site < second_site:
             left_site, left_operator = first_site, first_operator
             right_site, right_operator = second_site, second_operator
@@ -956,6 +1152,7 @@ def _add_fully_reduced_exchange_eri_term(
     original_sites = (int(p), int(q), int(r), int(s))
     if abs(coeff) <= cutoff:
         return 0
+    order_phase = _fully_reduced_exchange_order_phase(original_sites)
     recoupling = _spinfree_exchange_recoupling_coefficients(
         original_sites,
         cutoff=cutoff,
@@ -968,7 +1165,7 @@ def _add_fully_reduced_exchange_eri_term(
         dtype=dtype,
     ):
         factor = coeff_by_ranks.get(ranks, 0.0)
-        term_coeff = _FULLY_REDUCED_EXCHANGE_RECOUPLING * coeff * factor
+        term_coeff = _FULLY_REDUCED_EXCHANGE_RECOUPLING * order_phase * coeff * factor
         if abs(term_coeff) <= cutoff:
             continue
         autompo.add_reduced_string(
@@ -1086,7 +1283,13 @@ class SpatialSpinFreeERIBuilder:
             fully_reduced_diagonal_density = (
                 fully_reduced and int(p) == int(q) and int(r) == int(s)
             )
-            if q == r and not fully_reduced_diagonal_density:
+            fully_reduced_two_site_exchange = (
+                fully_reduced
+                and int(p) == int(s)
+                and int(q) == int(r)
+                and int(p) != int(q)
+            )
+            if q == r and not fully_reduced_diagonal_density and not fully_reduced_two_site_exchange:
                 one_body_correction[int(p), int(s)] -= val
             if self.reduced_we and len({int(p), int(q), int(r), int(s)}) == 4:
                 added = _accumulate_four_distinct_spinfree_we_product(
@@ -1111,6 +1314,17 @@ class SpatialSpinFreeERIBuilder:
                             dtype=dtype,
                             cutoff=cutoff,
                         )
+                        continue
+                    if fully_reduced_two_site_exchange:
+                        first_site, second_site = sorted((int(p), int(q)))
+                        single_projector = spatial_projector("single", phys_leg, dtype=dtype)
+                        autompo.add_term(
+                            (first_site, single_projector),
+                            (second_site, single_projector),
+                            coeff=val,
+                            family="B",
+                        )
+                        fully_reduced_exchange_terms += 1
                         continue
                     if int(p) == int(q):
                         fully_reduced_density_bilinear_terms += _add_fully_reduced_density_bilinear_eri_term(
@@ -1161,6 +1375,19 @@ class SpatialSpinFreeERIBuilder:
                             dtype=dtype,
                             cutoff=cutoff,
                         )
+                        if int(q) == int(r) and int(p) < min(int(q), int(s)):
+                            _add_fully_reduced_spinfree_bilinear(
+                                autompo,
+                                p,
+                                s,
+                                -val,
+                                phys_leg=phys_leg,
+                                dtype=dtype,
+                                density_site=q,
+                                density_operator=spatial_projector("single", phys_leg, dtype=dtype),
+                                family=("Q", "__prefix_projected_exchange_correction"),
+                            )
+                            fully_reduced_exchange_terms += 1
                         continue
                     raise NotImplementedError(
                         "Fully reduced spin-free ERI support currently covers four-distinct "
@@ -1200,6 +1427,7 @@ class SpatialSpinFreeERIBuilder:
                 one_body_correction,
                 cutoff=cutoff,
                 family="Q",
+                split_fully_reduced=False,
             )
         term_count = we_product_terms + scalar_product_terms + correction_terms
         if fully_reduced:

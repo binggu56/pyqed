@@ -91,6 +91,16 @@ def _internal_bond_entries(two_site):
     )
 
 
+def _internal_bond_channel_map(two_site):
+    channel_map = {}
+    for child_sectors, fused_sector in _internal_bond_entries(two_site):
+        channel_map.setdefault(tuple(child_sectors), set()).add(fused_sector)
+    return {
+        key: tuple(sorted(channels))
+        for key, channels in channel_map.items()
+    }
+
+
 def _get_site_bond_layout(two_site, *, side, axis):
     """
     Recover stored reduced bond-layout metadata for one site/bond axis.
@@ -251,12 +261,13 @@ def svd_two_site(
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
 
     blocks_by_mid = {}
-    bond_entries = dict(_internal_bond_entries(two_site))
+    bond_entries = _internal_bond_channel_map(two_site)
     for key, block in two_site.data.items():
-        q_mid = bond_entries.get(key)
-        if q_mid is None:
+        q_mids = bond_entries.get(key)
+        if not q_mids:
             raise ValueError(f"Missing contracted bond sector for key {key!r}.")
-        blocks_by_mid.setdefault(q_mid, []).append((key, block))
+        for q_mid in q_mids:
+            blocks_by_mid.setdefault(q_mid, []).append((key, block))
 
     sector_svds = {}
     left_source_layouts = _get_site_bond_layout(two_site, side="left", axis=1)
@@ -527,22 +538,23 @@ def state_averaged_svd_two_site(
     blocks_by_mid = {}
     mid_by_key = {}
     for root in roots:
-        bond_entries = dict(_internal_bond_entries(root))
+        bond_entries = _internal_bond_channel_map(root)
         for key, block in root.data.items():
-            q_mid = bond_entries.get(key)
-            if q_mid is None:
+            q_mids = bond_entries.get(key)
+            if not q_mids:
                 raise ValueError(f"Missing contracted bond sector for key {key!r}.")
-            previous_mid = mid_by_key.setdefault(key, q_mid)
-            if previous_mid != q_mid:
+            previous_mids = mid_by_key.setdefault(key, q_mids)
+            if previous_mids != q_mids:
                 raise ValueError(
                     f"State-average roots assign key {key!r} to inconsistent bond sectors."
                 )
-            entries = blocks_by_mid.setdefault(q_mid, {})
-            if key in entries and entries[key].shape != block.shape:
-                raise ValueError(
-                    f"State-average roots use inconsistent block shapes for key {key!r}."
-                )
-            entries.setdefault(key, block)
+            for q_mid in q_mids:
+                entries = blocks_by_mid.setdefault(q_mid, {})
+                if key in entries and entries[key].shape != block.shape:
+                    raise ValueError(
+                        f"State-average roots use inconsistent block shapes for key {key!r}."
+                    )
+                entries.setdefault(key, block)
 
     sector_svds = {}
     root_matrices_by_sector = {}

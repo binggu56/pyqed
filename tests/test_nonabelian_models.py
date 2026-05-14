@@ -33,8 +33,12 @@ from pyqed.mps.nonabelian import (
     spatial_number,
     spatial_parity,
     time_reversed_reduced_operator,
+    FullyReducedSpatialOrbitalSite,
+    spatial_target_sector,
 )
 from pyqed.mps.su2 import SpatialOrbitalSite, SU2Irrep
+from pyqed.mps.nonabelian.coupling import ordered_two_m_values
+from pyqed.mps.nonabelian.states import _fuse_spatial_sectors
 
 
 def _spatial_chain():
@@ -248,6 +252,285 @@ def _dense_spatial_spinfree_eri_hamiltonian(eri_spatial):
                     (p, s),
                 )
     return h
+
+
+def _dense_vector_from_reduced_spatial_mps(sites):
+    site = SpatialOrbitalSite()
+    state_sector = [None] * site.d
+    state_two_m = [None] * site.d
+    for sector_index, sector in enumerate(site.qn):
+        for local_index, state_index in enumerate(site.state_index[sector_index]):
+            state_sector[state_index] = sector
+            state_two_m[state_index] = ordered_two_m_values(sector.irrep)[local_index]
+
+    vector = np.zeros(site.d ** len(sites), dtype=complex)
+    for basis_index in range(vector.size):
+        encoded = basis_index
+        physical_indices = [0] * len(sites)
+        for site_index in range(len(sites) - 1, -1, -1):
+            physical_indices[site_index] = encoded % site.d
+            encoded //= site.d
+        boundary = {(sites[0].qns[0][0], 0, 0): 1.0 + 0.0j}
+        for tensor, physical_index in zip(sites, physical_indices):
+            q_phys = state_sector[physical_index]
+            two_m_phys = state_two_m[physical_index]
+            updated = {}
+            for (q_left, left_slot, two_m_left), amplitude in boundary.items():
+                for (block_left, block_phys, block_right), block in tensor.data.items():
+                    if block_left != q_left or block_phys != q_phys:
+                        continue
+                    arr = np.asarray(block)
+                    for right_slot in range(arr.shape[2]):
+                        for two_m_right in ordered_two_m_values(block_right.irrep):
+                            coeff = clebsch_gordan(
+                                block_left.irrep,
+                                block_phys.irrep,
+                                block_right.irrep,
+                                two_m_left,
+                                two_m_phys,
+                                two_m_right,
+                            )
+                            if coeff:
+                                key = (block_right, right_slot, two_m_right)
+                                updated[key] = updated.get(key, 0.0) + (
+                                    amplitude * arr[left_slot, 0, right_slot] * coeff
+                                )
+            boundary = updated
+        target = sites[-1].qns[2][0]
+        vector[basis_index] = boundary.get((target, 0, 0), 0.0)
+    return vector
+
+
+def _reduced_spatial_path_mps(labels, bonds):
+    site = FullyReducedSpatialOrbitalSite()
+    tensors = []
+    for site_index, label in enumerate(labels):
+        q_left = bonds[site_index]
+        q_phys = site.qn[label]
+        q_right = bonds[site_index + 1]
+        tensors.append(
+            NonabelianTensor(
+                data={(q_left, q_phys, q_right): np.ones((1, 1, 1))},
+                qns=[[q_left], list(site.qn), [q_right]],
+                dirs=[-1, 1, 1],
+                metadata={"physical_basis": "fully_reduced_su2"},
+            )
+        )
+    return tensors
+
+
+def _reduced_spatial_path_basis(path_specs):
+    basis_states = [
+        _reduced_spatial_path_mps(labels, bonds)
+        for labels, bonds in path_specs
+    ]
+    dense_vectors = [
+        _dense_vector_from_reduced_spatial_mps(state)
+        for state in basis_states
+    ]
+    return basis_states, dense_vectors
+
+
+def _reduced_spatial_path_specs(nsites, target):
+    site = FullyReducedSpatialOrbitalSite()
+    vacuum = spatial_target_sector(0, 0)
+    path_specs = []
+
+    def walk(site_index, left, labels, bonds):
+        if site_index == nsites:
+            if left == target:
+                path_specs.append((tuple(labels), tuple(bonds)))
+            return
+        for label, q_phys in enumerate(site.qn):
+            for right in _fuse_spatial_sectors(left, q_phys):
+                if right.charge <= target.charge:
+                    walk(site_index + 1, right, labels + [label], bonds + [right])
+
+    walk(0, vacuum, [], [vacuum])
+    return tuple(path_specs)
+
+
+def _contract_chain_transition(bra_sites, mpo_factors, ket_sites):
+    from pyqed.mps.nonabelian.environment import (
+        _contract_from_left_blocks,
+        _contract_from_left_blocks_rank_coupled,
+        _environment_map_expectation,
+        _initial_left_env_blocks,
+        _initial_left_env_blocks_rank_coupled,
+        _is_rank_coupled_chain,
+        _normalize_block_sparse_mpo_factors,
+        _tensor_dense_layout,
+    )
+
+    site_layouts = [_tensor_dense_layout(site) for site in ket_sites]
+    sparse_mpo_factors = _normalize_block_sparse_mpo_factors(
+        mpo_factors,
+        site_layouts=site_layouts,
+    )
+    rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
+    if rank_coupled:
+        env = _initial_left_env_blocks_rank_coupled(
+            site_layouts[0],
+            sparse_mpo_factors[0],
+        )
+        for idx in range(len(ket_sites)):
+            env = _contract_from_left_blocks_rank_coupled(
+                sparse_mpo_factors[idx],
+                bra_sites[idx],
+                env,
+                ket_sites[idx],
+            )
+    else:
+        phys_slice_maps = [layout["sector_slices"][1] for layout in site_layouts]
+        env = _initial_left_env_blocks(site_layouts[0], sparse_mpo_factors[0])
+        for idx in range(len(ket_sites)):
+            env = _contract_from_left_blocks(
+                sparse_mpo_factors[idx],
+                bra_sites[idx],
+                env,
+                ket_sites[idx],
+                phys_slice_maps[idx],
+            )
+    return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+
+def test_fully_reduced_two_site_exchange_eri_matrix_matches_exact_reduced_cg_reference():
+    nsites = 2
+    vacuum = spatial_target_sector(0, 0)
+    target = spatial_target_sector(2, 0)
+    path_specs = (
+        ((0, 2), (vacuum, vacuum, target)),
+        ((1, 1), (vacuum, spatial_target_sector(1, 1), target)),
+        ((2, 0), (vacuum, target, target)),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+
+    for pattern in ((0, 1, 1, 0), (1, 0, 0, 1)):
+        eri = np.zeros((nsites, nsites, nsites, nsites))
+        eri[pattern] = 1.0
+        autompo = AutoMPO([phys_leg] * nsites)
+        add_spatial_spinfree_eri_terms(autompo, eri, cutoff=1.0e-12)
+        mpo = autompo.build()
+        expected_operator = _dense_spatial_spinfree_eri_hamiltonian(eri)
+
+        for bra_index, bra_state in enumerate(basis_states):
+            for ket_index, ket_state in enumerate(basis_states):
+                expected = np.vdot(
+                    dense_vectors[bra_index],
+                    expected_operator @ dense_vectors[ket_index],
+                )
+                actual = _contract_chain_transition(bra_state, mpo, ket_state)
+                assert actual == pytest.approx(expected, abs=1.0e-12)
+
+
+def test_fully_reduced_exchange_eri_matrix_matches_exact_reduced_cg_reference():
+    nsites = 3
+    vacuum = spatial_target_sector(0, 0)
+    single = spatial_target_sector(1, 1)
+    target = spatial_target_sector(2, 0)
+    path_specs = (
+        ((0, 0, 2), (vacuum, vacuum, vacuum, target)),
+        ((0, 1, 1), (vacuum, vacuum, single, target)),
+        ((0, 2, 0), (vacuum, vacuum, target, target)),
+        ((1, 0, 1), (vacuum, single, single, target)),
+        ((1, 1, 0), (vacuum, single, target, target)),
+        ((2, 0, 0), (vacuum, target, target, target)),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    exchange_patterns = (
+        (0, 1, 1, 2),
+        (0, 1, 2, 0),
+        (0, 2, 1, 0),
+        (0, 2, 2, 1),
+        (1, 0, 0, 2),
+        (1, 0, 2, 1),
+        (1, 2, 0, 1),
+        (1, 2, 2, 0),
+        (2, 0, 0, 1),
+        (2, 0, 1, 2),
+        (2, 1, 0, 2),
+        (2, 1, 1, 0),
+    )
+
+    for pattern in exchange_patterns:
+        eri = np.zeros((nsites, nsites, nsites, nsites))
+        eri[pattern] = 1.0
+        autompo = AutoMPO([phys_leg] * nsites)
+        add_spatial_spinfree_eri_terms(autompo, eri, cutoff=1.0e-12)
+        mpo = autompo.build()
+        expected_operator = _dense_spatial_spinfree_eri_hamiltonian(eri)
+
+        for bra_index, bra_state in enumerate(basis_states):
+            for ket_index, ket_state in enumerate(basis_states):
+                expected = np.vdot(
+                    dense_vectors[bra_index],
+                    expected_operator @ dense_vectors[ket_index],
+                )
+                actual = _contract_chain_transition(bra_state, mpo, ket_state)
+                assert actual == pytest.approx(expected, abs=1.0e-12)
+
+
+def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_reference():
+    nsites = 4
+    path_specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(4, 0),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+
+    for create_site, annihilate_site in ((0, 1), (1, 0)):
+        h1e = np.zeros((nsites, nsites))
+        h1e[create_site, annihilate_site] = 1.0
+        autompo = AutoMPO([phys_leg] * nsites)
+        add_spatial_one_body_terms(autompo, h1e, cutoff=1.0e-12)
+        mpo = autompo.build()
+        expected_operator = _dense_spatial_one_body_hamiltonian(h1e)
+
+        for bra_index, bra_state in enumerate(basis_states):
+            for ket_index, ket_state in enumerate(basis_states):
+                expected = np.vdot(
+                    dense_vectors[bra_index],
+                    expected_operator @ dense_vectors[ket_index],
+                )
+                actual = _contract_chain_transition(bra_state, mpo, ket_state)
+                assert actual == pytest.approx(expected, abs=1.0e-12)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Embedded fully reduced rank-coupled strings still need the block2-like "
+        "CG-projected environment contraction."
+    ),
+    strict=True,
+)
+def test_fully_reduced_one_body_embedded_matrix_matches_exact_reduced_cg_reference():
+    nsites = 4
+    path_specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(4, 0),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+
+    for create_site, annihilate_site in ((0, 1), (0, 2), (1, 3), (3, 0)):
+        h1e = np.zeros((nsites, nsites))
+        h1e[create_site, annihilate_site] = 1.0
+        autompo = AutoMPO([phys_leg] * nsites)
+        add_spatial_one_body_terms(autompo, h1e, cutoff=1.0e-12)
+        mpo = autompo.build()
+        expected_operator = _dense_spatial_one_body_hamiltonian(h1e)
+
+        for bra_index, bra_state in enumerate(basis_states):
+            for ket_index, ket_state in enumerate(basis_states):
+                expected = np.vdot(
+                    dense_vectors[bra_index],
+                    expected_operator @ dense_vectors[ket_index],
+                )
+                actual = _contract_chain_transition(bra_state, mpo, ket_state)
+                assert actual == pytest.approx(expected, abs=1.0e-12)
 
 
 def test_build_spatial_density_mpo_matches_dense_reference():
