@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional
 from scipy.special import ive, i0e, j0, erfc, erfcx
 from scipy.integrate import dblquad, IntegrationWarning, nquad, quad
+import scipy.integrate as integrate
+import scipy.special as sp
+import functools
 # ============================================================
 # Basis labels
 # ============================================================
@@ -332,6 +335,137 @@ def _ven_ss_same_center_exact(alpha_i, alpha_j, dz_abs):
     x = np.sqrt(gamma) * abs(dz_abs)
     return float((np.pi ** 1.5) / np.sqrt(gamma) * erfcx(x))
 
+def _ven_ss_reference(alphaA, alphaB, centerA, centerB, nuc_xy, dz):
+    """
+    Wraps existing _ven_single_numerical to evaluate a pure s-s pair. Delete after full benchmark
+    """
+    class DummyLabel:
+        def __init__(self):
+            self.kind = '2d-s'
+            self.dim = 2
+            self.l = (0,0)
+            
+    dummy_alphas = np.array([alphaA, alphaB], dtype=float)
+    dummy_centers = np.array([centerA, centerB], dtype=float)
+    dummy_labels = [DummyLabel(), DummyLabel()]
+    
+    return _ven_single_numerical(dummy_alphas, dummy_centers, dummy_labels, 0, 1, nuc_xy, dz)
+
+@functools.lru_cache(maxsize=None)
+def _cached_ven_ss_hankel(alphaA, alphaB, cAx, cAy, cBx, cBy, nuc_x, nuc_y, dz):
+    gamma = alphaA + alphaB
+    P_x = (alphaA * cAx + alphaB * cBx) / gamma
+    P_y = (alphaA * cAy + alphaB * cBy) / gamma
+    
+    AB_sq = (cAx - cBx)**2 + (cAy - cBy)**2
+    K_AB = np.exp(- (alphaA * alphaB / gamma) * AB_sq)
+    
+    D = np.sqrt((P_x - nuc_x)**2 + (P_y - nuc_y)**2)
+    
+    def integrand(k):
+        return np.exp(-k * dz) * np.exp(-k**2 / (4.0 * gamma)) * sp.jv(0, k * D)
+    
+    val, _ = integrate.quad(integrand, 0, np.inf, epsabs=1e-10, epsrel=1e-10)
+    return K_AB * val * (np.pi / gamma)
+
+def _ven_ss_hankel(alphaA, alphaB, centerA, centerB, nuc_xy, dz):
+    """
+    Unwraps the arrays to pass to the cached function.
+    """
+    return _cached_ven_ss_hankel(
+        alphaA, alphaB, 
+        centerA[0], centerA[1], 
+        centerB[0], centerB[1], 
+        nuc_xy[0], nuc_xy[1], 
+        dz
+    )
+
+# The Ven FD Engine
+def _fd_ven_recursive(alphas, centers, kinds, nuc_xy, dz, h=5e-4):
+    """
+    Recursively evaluates exact Ven via Finite Differences of the s-orbital baseline.
+    Correctly implements the Gaussian derivative recurrence relation.
+    """
+    # fallback to all s orbitals
+    if all(k == '2d-s' for k in kinds):
+        return _ven_ss_hankel(
+            alphas[0], alphas[1], centers[0], centers[1], nuc_xy, dz
+        )
+        
+    # Find the first orbital that has higher angular momentum
+    for idx, kind in enumerate(kinds):
+        if kind != '2d-s':
+            new_kinds = list(kinds)
+            alpha = alphas[idx]
+            
+            # Helper to evaluate the derivative shift
+            def eval_shifted(shift_x, shift_y):
+                c_shifted = np.copy(centers)
+                c_shifted[idx][0] += shift_x
+                c_shifted[idx][1] += shift_y
+                return _fd_ven_recursive(alphas, c_shifted, new_kinds, nuc_xy, dz, h)
+
+            # Helper to evaluate the lower-order recurrence term
+            def eval_lower(lower_kind):
+                lk_list = list(kinds) # Fresh copy to avoid mutating the current state
+                lk_list[idx] = lower_kind
+                return _fd_ven_recursive(alphas, centers, lk_list, nuc_xy, dz, h)
+            
+            # p-orbitals
+            if kind == '2d-px':
+                new_kinds[idx] = '2d-s'
+                return (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                
+            elif kind == '2d-py':
+                new_kinds[idx] = '2d-s'
+                return (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                
+            # d-orbitals
+            elif kind == '2d-dxy':
+                new_kinds[idx] = '2d-py'
+                return (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                
+            elif kind == '2d-dx2':
+                new_kinds[idx] = '2d-px'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-s') / (2.0 * alpha)
+                
+            elif kind == '2d-dy2':
+                new_kinds[idx] = '2d-py'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-s') / (2.0 * alpha)
+                
+            # f-orbitals
+            elif kind == '2d-fx3':
+                new_kinds[idx] = '2d-dx2'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + 2.0 * eval_lower('2d-px') / (2.0 * alpha)
+                
+            elif kind == '2d-fx2y':
+                # Derived from dxy via x-derivative
+                new_kinds[idx] = '2d-dxy'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-py') / (2.0 * alpha)
+                
+            elif kind == '2d-fxy2':
+                # Derived from dxy via y-derivative
+                new_kinds[idx] = '2d-dxy'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-px') / (2.0 * alpha)
+                
+            elif kind == '2d-fy3':
+                new_kinds[idx] = '2d-dy2'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + 2.0 * eval_lower('2d-py') / (2.0 * alpha)
+                
+    unsupported = [k for k in kinds if k != '2d-s']
+    raise NotImplementedError(
+        f"Unsupported angular momentum in FD engine: {unsupported}. "
+        f"This engine currently only supports s, p, d, and f orbitals. "
+        f"Full input kinds: {kinds}"
+    )
+
+
 def _ven_single_numerical(alphas, centers, labels, i, j, nuc_xy, dz_abs):
     aA = alphas[i]
     xA, yA = centers[i]
@@ -491,35 +625,32 @@ def _V_en_prony_general(alphas, centers, labels, nuc_xy, dz_abs):
 
 
 def V_en_sp_total_at_z(alphas, centers, labels, nuclei_tuples, z):
-    """
-    Hybrid V_en without spline tabulation.
-
-    Logic per matrix element:
-      1. same-center s-s on nuclear axis -> exact analytic
-      2. off-center / non-s pair, small dz -> direct numerical
-      3. off-center / non-s pair, large dz -> Prony
-    """
     alphas = np.asarray(alphas, float)
     centers = np.asarray(centers, float)
     N = len(alphas)
-
     V = np.zeros((N, N), dtype=float)
 
     for (Z, xN, yN, zN) in nuclei_tuples:
         dz = abs(z - zN)
         nuc_xy = np.array([xN, yN], dtype=float)
-
         V_nuc = np.zeros((N, N), dtype=float)
 
         for i in range(N):
             for j in range(i, N):
                 same_axis_center = _pair_is_on_axis_same_center(centers, i, j, nuc_xy)
+                has_higher_l = (labels[i].kind != "2d-s" or labels[j].kind != "2d-s")
 
-                if same_axis_center and labels[i].kind == "2d-s" and labels[j].kind == "2d-s":
+                if same_axis_center and not has_higher_l:
+                    # 1. Exact Analytical Co-centered
                     val = _ven_ss_same_center_exact(alphas[i], alphas[j], dz)
                 elif dz < OFFCENTER_NUMERICAL_CUTOFF:
-                    val = _ven_single_numerical(alphas, centers, labels, i, j, nuc_xy, dz)
+                    pair_alphas = [alphas[i], alphas[j]]
+                    pair_centers = [centers[i], centers[j]]
+                    pair_kinds = [labels[i].kind, labels[j].kind]
+                    # Use the new FD Engine for p/d orbitals!
+                    val = _fd_ven_recursive(pair_alphas, pair_centers, pair_kinds, nuc_xy, dz)
                 else:
+                    # 3. Far-field -> Global Prony Fit
                     val = _ven_single_prony(alphas, centers, labels, i, j, nuc_xy, dz)
 
                 V_nuc[i, j] = val
@@ -527,8 +658,6 @@ def V_en_sp_total_at_z(alphas, centers, labels, nuclei_tuples, z):
 
         V -= Z * V_nuc
     return V
-
-
 # ============================================================
 # ERI helpers
 # ============================================================
@@ -546,6 +675,33 @@ def _assign_eri_symmetry(T, i, j, k, l, val):
     }
     for a, b, c, d in idxs:
         T[a, b, c, d] = val
+
+def _eri_exact_fd_reference(alphas, centers, labels, dz_eff, h=5e-4):
+    """
+    Builds the full ERI tensor using the exact Finite Difference recursive engine.
+    This safely bypasses SciPy's 4D nquad entirely.
+    """
+    n_ao = len(alphas)
+    T = np.zeros((n_ao, n_ao, n_ao, n_ao), dtype=float)
+
+    unique_quartets = []
+    for i in range(n_ao):
+        for j in range(i, n_ao):
+            for k in range(n_ao):
+                for l in range(k, n_ao):
+                    if (i, j) > (k, l):
+                        continue
+                    unique_quartets.append((i, j, k, l))
+
+    for i, j, k, l in unique_quartets:
+        q_alphas = [alphas[i], alphas[j], alphas[k], alphas[l]]
+        q_centers = [centers[i], centers[j], centers[k], centers[l]]
+        q_kinds = [labels[i].kind, labels[j].kind, labels[k].kind, labels[l].kind]
+        
+        val = _fd_eri_recursive(q_alphas, q_centers, q_kinds, dz_eff, h)
+        _assign_eri_symmetry(T, i, j, k, l, val)
+
+    return T
 
 
 def _eri_ssss_same_center_exact(alpha_i, alpha_j, alpha_k, alpha_l, dz_abs):
@@ -592,15 +748,14 @@ def _eri_integrand_general(
     return gA * gB * gC * gD * kern
 
 
-def _eri_ssss_hankel_reference(alpha_a, alpha_b, alpha_c, alpha_d, RA, RB, RC, RD, dz_abs):
-    """
-    Finite-dz numerical reference for the all-s case using the Hankel/Fourier form.
-    Valid for arbitrary in-plane centers.
-    """
-    RA = np.asarray(RA, float)
-    RB = np.asarray(RB, float)
-    RC = np.asarray(RC, float)
-    RD = np.asarray(RD, float)
+@functools.lru_cache(maxsize=None)
+def _cached_eri_ssss_hankel(alpha_a, alpha_b, alpha_c, alpha_d, 
+                            Rax, Ray, Rbx, Rby, Rcx, Rcy, Rdx, Rdy, dz_abs):
+    
+    RA = np.array([Rax, Ray], float)
+    RB = np.array([Rbx, Rby], float)
+    RC = np.array([Rcx, Rcy], float)
+    RD = np.array([Rdx, Rdy], float)
 
     p = alpha_a + alpha_b
     q = alpha_c + alpha_d
@@ -618,23 +773,19 @@ def _eri_ssss_hankel_reference(alpha_a, alpha_b, alpha_c, alpha_d, RA, RB, RC, R
     pref = Kab * Kcd * (np.pi**2 / (p * q))
 
     def integrand(k):
-        return np.exp(
-            -dz_abs * k
-            - k * k / (4.0 * p)
-            - k * k / (4.0 * q)
-        ) * j0(k * RPQ)
+        return np.exp(-dz_abs * k - k * k / (4.0 * p) - k * k / (4.0 * q)) * j0(k * RPQ)
 
-    val, err = quad(
-        integrand,
-        0.0,
-        np.inf,
-        epsabs=1e-10,
-        epsrel=1e-8,
-        limit=300,
-    )
+    val, err = quad(integrand, 0.0, np.inf, epsabs=1e-10, epsrel=1e-8, limit=300)
     return pref * val
 
-
+def _eri_ssss_hankel_reference(alpha_a, alpha_b, alpha_c, alpha_d, RA, RB, RC, RD, dz_abs):
+    """
+    Unwraps the arrays to pass to the cached function.
+    """
+    return _cached_eri_ssss_hankel(
+        alpha_a, alpha_b, alpha_c, alpha_d,
+        RA[0], RA[1], RB[0], RB[1], RC[0], RC[1], RD[0], RD[1], dz_abs
+    )
 def _gaussian_pair_window(alpha_a, alpha_b, Ra, Rb, nsigma=8.0):
     Ra = np.asarray(Ra, float)
     Rb = np.asarray(Rb, float)
@@ -643,6 +794,91 @@ def _gaussian_pair_window(alpha_a, alpha_b, Ra, Rb, nsigma=8.0):
     sigma = 1.0 / np.sqrt(p)
     bound = nsigma * sigma
     return P, bound
+
+def _fd_eri_recursive(alphas, centers, kinds, dz, h=5e-4):
+    """
+    Recursively evaluates exact ERI via Finite Differences of the 1D Hankel transform.
+    Correctly implements the Gaussian derivative recurrence relation for p, d, and f orbitals.
+    """
+    # Base Case: All orbitals are '2d-s'. Evaluate the fast 1D Hankel!
+    if all(k == '2d-s' for k in kinds):
+        return _eri_ssss_hankel_reference(
+            alphas[0], alphas[1], alphas[2], alphas[3],
+            centers[0], centers[1], centers[2], centers[3], dz
+        )
+        
+    # Recursive Case: Find the first orbital that has higher angular momentum
+    for idx, kind in enumerate(kinds):
+        if kind != '2d-s':
+            new_kinds = list(kinds)
+            alpha = alphas[idx]
+            
+            #  Helper to evaluate the derivative shift 
+            def eval_shifted(shift_x, shift_y):
+                c_shifted = np.copy(centers)
+                c_shifted[idx][0] += shift_x
+                c_shifted[idx][1] += shift_y
+                return _fd_eri_recursive(alphas, c_shifted, new_kinds, dz, h)
+
+            #  Helper to evaluate the lower-order recurrence term 
+            def eval_lower(lower_kind):
+                lk_list = list(kinds)
+                lk_list[idx] = lower_kind
+                return _fd_eri_recursive(alphas, centers, lk_list, dz, h)
+            
+            # p-orbitals
+            if kind == '2d-px':
+                new_kinds[idx] = '2d-s'
+                return (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                
+            elif kind == '2d-py':
+                new_kinds[idx] = '2d-s'
+                return (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                
+            # d-orbitals
+            elif kind == '2d-dxy':
+                new_kinds[idx] = '2d-py'
+                return (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                
+            elif kind == '2d-dx2':
+                new_kinds[idx] = '2d-px'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-s') / (2.0 * alpha)
+                
+            elif kind == '2d-dy2':
+                new_kinds[idx] = '2d-py'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-s') / (2.0 * alpha)
+                
+            # f-orbitals
+            elif kind == '2d-fx3':
+                new_kinds[idx] = '2d-dx2'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + 2.0 * eval_lower('2d-px') / (2.0 * alpha)
+                
+            elif kind == '2d-fx2y':
+                # Derived from dxy via x-derivative
+                new_kinds[idx] = '2d-dxy'
+                deriv = (eval_shifted(h, 0) - eval_shifted(-h, 0)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-py') / (2.0 * alpha)
+                
+            elif kind == '2d-fxy2':
+                # Derived from dxy via y-derivative
+                new_kinds[idx] = '2d-dxy'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + eval_lower('2d-px') / (2.0 * alpha)
+                
+            elif kind == '2d-fy3':
+                new_kinds[idx] = '2d-dy2'
+                deriv = (eval_shifted(0, h) - eval_shifted(0, -h)) / (4.0 * alpha * h)
+                return deriv + 2.0 * eval_lower('2d-py') / (2.0 * alpha)
+                
+    unsupported = [k for k in kinds if k != '2d-s']
+    raise NotImplementedError(
+        f"Unsupported angular momentum in FD engine: {unsupported}. "
+        f"This engine currently only supports s, p, d, and f orbitals. "
+        f"Full input kinds: {kinds}"
+    )
 
 
 def _eri_general_numerical_reference(
@@ -1116,38 +1352,74 @@ def _eri_all_s_same_center_tensor(alphas, centers, labels, dz_eff):
 # ============================================================
 
 def eri_2d_cartesian_with_p(alphas, centers, labels, delta_z, dz_tol=None):
+    dz_eff = abs(delta_z)
+    alphas = np.asarray(alphas, float)
+    centers = np.asarray(centers, float)
+
+    has_higher_l = any(lbl.kind != "2d-s" for lbl in labels)
+
+    # 1. Exact Analytical s-s same center
+    if _all_s_same_center_basis(centers, labels):
+        return _eri_all_s_same_center_tensor(alphas, centers, labels, dz_eff)
+
+    # 2. Strictly 2D regime (dz = 0)
+    if dz_eff < 1e-9:
+        return _eri_exact_bessel_tensor(alphas, centers, labels, dz_eff)
+    
+    # 3. Twilight zone (< 0.1)
+    if dz_eff < OFFCENTER_NUMERICAL_CUTOFF:
+        if has_higher_l:
+            # Drop-in FD tensor loop for higher angular momentum
+            n_ao = len(alphas)
+            T = np.zeros((n_ao, n_ao, n_ao, n_ao), dtype=float)
+            for i in range(n_ao):
+                for j in range(i, n_ao):
+                    for k in range(n_ao):
+                        for l in range(k, n_ao):
+                            if (i, j) > (k, l): continue
+                            q_alphas = [alphas[i], alphas[j], alphas[k], alphas[l]]
+                            q_centers = [centers[i], centers[j], centers[k], centers[l]]
+                            q_kinds = [labels[i].kind, labels[j].kind, labels[k].kind, labels[l].kind]
+                            
+                            val = _fd_eri_recursive(q_alphas, q_centers, q_kinds, dz_eff)
+                            _assign_eri_symmetry(T, i, j, k, l, val)
+            return T
+        else:
+            # Pure s-orbitals are safe for numerical/Hankel
+            return _eri_numerical_tensor(alphas, centers, labels, dz_eff)
+
+    # 4. Far-field -> Global Prony Fit
+    return _eri_prony_tensor(alphas, centers, labels, dz_eff)
+
+
+def eri_2d_cartesian_with_p_general_test(alphas, centers, labels, delta_z, dz_tol=None):
     """
-    ERI production dispatch.
-
-    Rules:
-      1. If there is no off-center transverse integral involved and all basis
-         functions are 2d-s at the same transverse center, use the paper's
-         exact analytical formula.
-      2. Otherwise, use the previous strategy:
-           - small dz  -> numerical
-           - large dz  -> Prony
-
-    If dz_tol is not None, force the reference-style evaluation path.
+    STRESS-TEST DISPATCHER: Forces all ERI calculations (even co-centered ones)
+    through the general non-cocentered engines (FD/Hankel and Global Prony).
+    
+    This function explicitly removes the analytical `_eri_all_s_same_center_tensor` 
+    shortcut to validate the numerical stability of the general integrals during SCF.
     """
     dz_eff = abs(delta_z)
     alphas = np.asarray(alphas, float)
     centers = np.asarray(centers, float)
 
-    # Forced/reference mode for debugging or validation
-    if dz_tol is not None:
-        if _all_s_same_center_basis(centers, labels):
-            return _eri_all_s_same_center_tensor(alphas, centers, labels, dz_eff)
-        return _eri_numerical_tensor(alphas, centers, labels, dz_eff)
-
-    # Production mode
-    if _all_s_same_center_basis(centers, labels):
-        return _eri_all_s_same_center_tensor(alphas, centers, labels, dz_eff)
-
+    # 1. Strictly 2D regime (dz = 0)
+    # We MUST retain this block. Both the 1D Hankel transform and the Prony fit 
+    # mathematically divide by dz, so they will physically crash at exactly zero.
+    if dz_eff < 1e-9:
+        return _eri_exact_bessel_tensor(alphas, centers, labels, dz_eff)
+    
+    # 2. Twilight Zone (0 < dz < Cutoff)
+    # FORCED GENERAL ENGINE: We bypass the analytical shortcut.
+    # _eri_exact_fd_reference automatically routes pure s-orbitals to the 1D Hankel
+    # transform, and higher angular momentum to the Recursive FD derivatives.
     if dz_eff < OFFCENTER_NUMERICAL_CUTOFF:
-        return _eri_numerical_tensor(alphas, centers, labels, dz_eff)
+        return _eri_exact_fd_reference(alphas, centers, labels, dz_eff)
 
+    # 3. Far-Field (dz >= Cutoff)
+    # FORCED GENERAL ENGINE: Evaluates everything via the 102-point minimax Prony fit.
     return _eri_prony_tensor(alphas, centers, labels, dz_eff)
-
 # ============================================================
 # Misc helpers used elsewhere
 # ============================================================
