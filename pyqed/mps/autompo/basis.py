@@ -1037,6 +1037,83 @@ class BasisSimpleElectron(BasisSet):
     def copy(self, new_dof):
         return self.__class__(new_dof)
 
+class BasisSpatialOrbital(BasisSet):
+    r"""
+    The basis set for a spatial orbital with 4 states:
+    0: |0> (empty)
+    1: |u> (spin-up occupied)
+    2: |d> (spin-down occupied)
+    3: |ud> (doubly occupied)
+    
+    The local state is defined as |ud> = a^\dagger_u a^\dagger_d |0>.
+    """
+    is_electron = True
+
+    def __init__(self, dof, sigmaqn=None):
+        if sigmaqn is None:
+            sigmaqn = [0, 1, 1, 2]
+        super().__init__(dof, 4, sigmaqn)
+
+    def op_mat(self, op):
+        if not isinstance(op, Op):
+            op = Op(op, None)
+
+        op_symbols = getattr(op, 'split_symbol', op.symbol.split())
+        op_factor = op.factor
+        
+        mat = np.eye(4)
+
+        for sym in op_symbols:
+            loc_mat = np.zeros((4, 4))
+            
+            # Spin-up operators
+            if sym in [r"a^\dagger_u", "a^+_u"]:
+                loc_mat[1, 0] = 1.
+                loc_mat[3, 2] = 1.
+            elif sym == "a_u":
+                loc_mat[0, 1] = 1.
+                loc_mat[2, 3] = 1.
+                
+            # Spin-down operators (includes the local fermionic phase)
+            elif sym in [r"a^\dagger_d", "a^+_d"]:
+                loc_mat[2, 0] = 1.
+                loc_mat[3, 1] = -1.  # Minus sign: a^\dagger_d passes a^\dagger_u
+            elif sym == "a_d":
+                loc_mat[0, 2] = 1.
+                loc_mat[1, 3] = -1.
+                
+            # Number operators
+            elif sym == "n_u":
+                loc_mat[1, 1] = 1.
+                loc_mat[3, 3] = 1.
+            elif sym == "n_d":
+                loc_mat[2, 2] = 1.
+                loc_mat[3, 3] = 1.
+            elif sym in ["n", "n_tot"]:
+                loc_mat[1, 1] = 1.
+                loc_mat[2, 2] = 1.
+                loc_mat[3, 3] = 2.
+                
+            # Parity Operator (Jordan-Wigner Z)
+            elif sym == "Z":
+                loc_mat[0, 0] = 1.
+                loc_mat[1, 1] = -1.
+                loc_mat[2, 2] = -1.
+                loc_mat[3, 3] = 1.
+                
+            # Identity
+            elif sym == "I":
+                loc_mat = np.eye(4)
+                
+            else:
+                raise ValueError(f"op_symbol:{sym} is not supported in BasisSpatialOrbital")
+                
+            mat = mat @ loc_mat
+
+        return mat * op_factor
+
+    def copy(self, new_dof):
+        return self.__class__(new_dof, self.sigmaqn)
 
 class BasisHalfSpin(BasisSet):
     r"""
