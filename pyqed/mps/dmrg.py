@@ -25,7 +25,8 @@ class DMRG:
     def __init__(self, H, D, init_guess=None, nsweeps=50, opt='2site',\
                 symmetry=False, charge=None, spin = None,\
                 target_qn = None, sym_mgr = None, not_conv_err=True,
-                nstates=1, weights=None, verbose=0, sweep_callback=None):
+                nstates=1, weights=None, verbose=0, sweep_callback=None,
+                sweep_tol=1e-6):
         """
         Parameters
         ----------
@@ -45,6 +46,7 @@ class DMRG:
         self.L = len(self.H)
         self.D = D
         self.nsweeps = nsweeps
+        self.sweep_tol = float(sweep_tol)
         self.opt = opt
 
         self.init_guess = init_guess
@@ -53,8 +55,7 @@ class DMRG:
         
 
         self.nstates = nstates
-        if nstates > 1:
-            self.weights = weights if weights is not None else [1.0/nstates]*nstates
+        self.weights = weights if weights is not None else [1.0/nstates]*nstates
 
         # Symmetry Logic
         if target_qn is not None and (sym_mgr is None):
@@ -81,6 +82,7 @@ class DMRG:
         self.converged = False
         self.verbose = int(verbose)
         self.sweep_callback = sweep_callback
+        self.sweep_history = []
 
     def run(self):
 
@@ -116,13 +118,28 @@ class DMRG:
             fDMRG_1site_GS_OBC(mpo_list, self.D, self.nsweeps)
 
         elif self.opt == '2site':
+            self.sweep_history = []
+
+            def cb(**info):
+                row = dict(info)
+                for key in ("energy", "truncation"):
+                    val = row.get(key)
+                    try:
+                        row[key] = float(np.real(np.asarray(val).reshape(-1)[0]))
+                    except Exception:
+                        pass
+                self.sweep_history.append(row)
+                if self.sweep_callback is not None:
+                    self.sweep_callback(**info)
+
             res = two_site_dmrg(
                 mps_list, mpo_list, self.D, self.nsweeps, 
                 U1=self.U1, target_qn=self.target_qn, 
                 not_conv_err=self.not_conv_err, sym_mgr=self.sym_mgr,
                 nstates=self.nstates, weights=self.weights,
                 verbose=self.verbose,
-                sweep_callback=self.sweep_callback,
+                conv=self.sweep_tol,
+                sweep_callback=cb,
             )
             e_elec, mps_out, self.gauge, self.converged = res
 

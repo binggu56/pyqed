@@ -47,3 +47,9 @@ Scan_Results_Nz_32
 *.png
 *.csv
 *.png
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.tex

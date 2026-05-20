@@ -28,6 +28,52 @@ from pyqed.style import set_style
 from pyqed.units import au2ev, wavenumber2hartree, wavenum2au
 
 
+PYRAZINE_2MODE_LVC_CM = {
+    "mode_labels": ("nu_10a_coupling", "nu_6a_tuning"),
+    "frequencies": np.array([952.0, 597.0]),
+    "reference_energies": np.array([0.0, 31800.0, 39000.0]),
+    "diagonal_couplings": np.array(
+        [
+            [0.0, 0.0],
+            [0.0, -847.0],
+            [0.0, 1202.0],
+        ]
+    ),
+    "interstate_coupling": 2110.0,
+}
+
+
+def pyrazine_2mode_lvc(units="hartree"):
+    """Return the standard three-state, two-mode pyrazine LVC model.
+
+    The mode order is ``(nu_10a coupling, nu_6a tuning)``.  Coordinates are
+    dimensionless normal coordinates, matching the legacy ``Pyrazine.dpes``
+    convention in this module.
+    """
+
+    from pyqed.qchem.vibronic import LVC
+
+    units = units.lower()
+    if units in ("hartree", "au", "a.u."):
+        factor = wavenumber2hartree
+    elif units in ("cm^-1", "cm-1", "wavenumber", "wavenumbers"):
+        factor = 1.0
+    else:
+        raise ValueError("units must be 'hartree' or 'cm^-1'.")
+
+    data = PYRAZINE_2MODE_LVC_CM
+    couplings = np.zeros((3, 3, 2), dtype=float)
+    couplings[np.arange(3), np.arange(3)] = data["diagonal_couplings"] * factor
+    couplings[1, 2, 0] = couplings[2, 1, 0] = data["interstate_coupling"] * factor
+
+    return LVC(
+        reference_energies=data["reference_energies"] * factor,
+        mode_frequencies=data["frequencies"] * factor,
+        couplings=couplings,
+        mode_ids=np.array([10, 6]),
+    )
+
+
 
 
 
@@ -545,6 +591,5 @@ if __name__ == '__main__':
     # contour()
     # cut()
     # plot3d()
-
 
 

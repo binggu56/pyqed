@@ -32,14 +32,18 @@ def get_j(mol, dm):
     """
     Coulomb matrix in the AO basis.
     """
-    return np.einsum('rs,pqrs->pq', dm, mol.eri, optimize=True)
+    from pyqed.qchem.hf.rhf import get_jk
+
+    return get_jk(mol, dm, eri_factors=getattr(mol, 'eri_factors', None))[0]
 
 
 def get_k(mol, dm):
     """
     Exchange matrix in the AO basis.
     """
-    return np.einsum('rs,psrq->pq', dm, mol.eri, optimize=True)
+    from pyqed.qchem.hf.rhf import get_jk
+
+    return get_jk(mol, dm, eri_factors=getattr(mol, 'eri_factors', None))[1]
 
 
 def build_xc(dm, grid, xc='lda_x'):

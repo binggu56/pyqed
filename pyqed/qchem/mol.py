@@ -30,7 +30,7 @@ import numpy as np
 
 
 from pyqed import dag, au2angstrom
-from pyqed.qchem.hf import RHF, UHF
+from pyqed.qchem.hf import RHF, ROHF, UHF
 from periodictable import elements
 try:
     from pyscf import dft, scf, gto, ao2mo
@@ -1575,6 +1575,11 @@ class Molecule:
         center = np.asarray(center, dtype=float)
         if center.shape != (3,):
             raise ValueError("center must be a length-3 Cartesian vector.")
+        if getattr(self, "_build_driver", None) == "pyscf":
+            mol = self.topyscf()
+            mol.build()
+            mol.set_common_orig(coord=center)
+            return mol.intor("int1e_r", comp=3)
         if self._bas is not None and not all(isinstance(fn, ContractedGaussian) for fn in self._bas):
             from gbasis.integrals.moment import moment_integral
             ints = moment_integral(
@@ -1601,6 +1606,11 @@ class Molecule:
         center = np.asarray(center, dtype=float)
         if center.shape != (3,):
             raise ValueError("center must be a length-3 Cartesian vector.")
+        if getattr(self, "_build_driver", None) == "pyscf":
+            mol = self.topyscf()
+            mol.build()
+            mol.set_common_orig(coord=center)
+            return mol.intor("int1e_cg_irxp", comp=3)
         basis, transform = self._native_cartesian_basis_and_transform()
         nao = len(basis)
         op = np.zeros((3, nao, nao), dtype=float)
@@ -2035,6 +2045,9 @@ class Molecule:
 
     def RHF(self, verbose=0):
         return RHF(self, verbose=verbose)
+
+    def ROHF(self, verbose=0):
+        return ROHF(self, verbose=verbose)
 
     def UHF(self):
         return UHF(self)

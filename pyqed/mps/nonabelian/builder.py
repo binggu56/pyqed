@@ -142,6 +142,50 @@ def _site_operator_signature(operator):
     )
 
 
+def _sector_charge(sector):
+    charge = getattr(sector, "charge", None)
+    if charge is not None:
+        return int(charge)
+    if hasattr(sector, "labels") and "charge" in sector.labels:
+        return int(sector.components[sector.labels.index("charge")])
+    raise ValueError(f"Cannot infer charge for sector {sector!r}.")
+
+
+def _operator_charge_delta(operator):
+    """
+    Infer the physical charge delta carried by a local operator.
+
+    AutoMPO virtual states mirror block2's operator quantum numbers.  The spin
+    irrep alone is not enough for fully reduced SU(2) paths because distinct
+    charge sectors can carry the same SU(2) rank and must not be minimized
+    into one virtual channel.
+    """
+
+    deltas = set()
+    if isinstance(operator, SiteOperator):
+        block_items = operator.blocks.items()
+        for (q_out, q_in), block in block_items:
+            if np.any(np.asarray(block) != 0):
+                deltas.add(_sector_charge(q_out) - _sector_charge(q_in))
+    elif hasattr(operator, "component_block") and hasattr(operator, "components"):
+        for component in operator.components:
+            for q_out in operator.phys_out_leg.sectors:
+                for q_in in operator.phys_in_leg.sectors:
+                    block = operator.component_block(component, q_out, q_in)
+                    if block is not None and np.any(np.asarray(block) != 0):
+                        deltas.add(_sector_charge(q_out) - _sector_charge(q_in))
+    else:
+        raise TypeError("Cannot infer charge delta for AutoMPO operator.")
+
+    if not deltas:
+        return 0
+    if len(deltas) != 1:
+        raise ValueError(
+            "AutoMPO operator mixes multiple charge deltas; split it into charge-homogeneous terms."
+        )
+    return int(next(iter(deltas)))
+
+
 def _reduced_operator_signature(operator):
     components = tuple(int(component) for component in operator.components)
     phys_out_leg = operator.phys_out_leg
@@ -803,22 +847,26 @@ class AutoMPO:
         start_state = 0
         final_state = 1
         state_irreps = [scalar, scalar]
+        state_charges = [0, 0]
         prefix_states = {}
 
         dense_transitions = [dict() for _ in range(self.nsites)]
         reduced_transitions = [dict() for _ in range(self.nsites)]
         identity_loops = [set() for _ in range(self.nsites)]
 
-        def get_prefix_state(prefix, irrep):
+        def get_prefix_state(prefix, irrep, charge):
             key = tuple(prefix)
             state = prefix_states.get(key)
             if state is not None:
                 if state_irreps[state] != irrep:
                     raise ValueError("Shared AutoMPO prefix resolved to incompatible SU(2) irrep.")
+                if state_charges[state] != int(charge):
+                    raise ValueError("Shared AutoMPO prefix resolved to incompatible charge.")
                 return state
             state = len(state_irreps)
             prefix_states[key] = state
             state_irreps.append(irrep)
+            state_charges.append(int(charge))
             return state
 
         def add_identity_loop(site, state):
@@ -894,7 +942,42 @@ class AutoMPO:
             prefix = []
             prefix_family_key = _prefix_family_tuple(family)
             current_state = start_state
+            current_charge = state_charges[current_state]
             previous_site = None
+            first_step = steps[0]
+            first_site = int(first_step["site"])
+            if first_site > 0 and first_step["kind"] == "reduced":
+                signature = (
+                    _reduced_operator_signature(first_step["operator"]),
+                    bool(first_step.get("use_cg_coupling", False)),
+                )
+                prefix_item = (
+                    "__leading_identity__",
+                    first_site,
+                    first_step["kind"],
+                    signature,
+                    state_irreps[current_state],
+                )
+                if prefix_family_key:
+                    prefix_item = prefix_item + (prefix_family_key,)
+                leading_state = get_prefix_state(
+                    (prefix_item,),
+                    state_irreps[current_state],
+                    current_charge,
+                )
+                add_dense_transition(
+                    0,
+                    current_state,
+                    leading_state,
+                    identity_operator(self.site_legs[0], dtype=dtype),
+                    1.0,
+                    accumulate=False,
+                    family=family,
+                )
+                for gap_site in range(1, first_site):
+                    add_identity_loop(gap_site, leading_state)
+                current_state = leading_state
+                previous_site = first_site - 1
             for index, step in enumerate(steps):
                 site = int(step["site"])
                 if previous_site is not None:
@@ -902,6 +985,7 @@ class AutoMPO:
                         add_identity_loop(gap_site, current_state)
                 is_terminal = index == len(steps) - 1
                 next_irrep = step["next_irrep"]
+                next_charge = current_charge + int(step["charge_delta"])
                 if is_terminal:
                     next_state = final_state
                     transition_coeff = coeff
@@ -917,7 +1001,7 @@ class AutoMPO:
                     if prefix_family_key:
                         prefix_item = prefix_item + (prefix_family_key,)
                     prefix.append(prefix_item)
-                    next_state = get_prefix_state(prefix, next_irrep)
+                    next_state = get_prefix_state(prefix, next_irrep, next_charge)
                     transition_coeff = 1.0
 
                 if step["kind"] == "dense":
@@ -944,6 +1028,7 @@ class AutoMPO:
                 else:
                     raise TypeError(f"Unsupported AutoMPO path step kind {step['kind']!r}.")
                 current_state = next_state
+                current_charge = next_charge
                 previous_site = site
 
         def product_steps(term):
@@ -953,6 +1038,7 @@ class AutoMPO:
                     "kind": "dense",
                     "operator": operator,
                     "next_irrep": scalar,
+                    "charge_delta": _operator_charge_delta(operator),
                 }
                 for site, operator in zip(term.sites, term.operators)
             ]
@@ -970,6 +1056,7 @@ class AutoMPO:
                     "operator": term.left_operator,
                     "next_irrep": rank_irrep,
                     "use_cg_coupling": False,
+                    "charge_delta": _operator_charge_delta(term.left_operator),
                 },
                 int(term.right_site): {
                     "site": int(term.right_site),
@@ -977,6 +1064,7 @@ class AutoMPO:
                     "operator": term.right_operator,
                     "next_irrep": scalar,
                     "use_cg_coupling": False,
+                    "charge_delta": _operator_charge_delta(term.right_operator),
                 },
             }
             middle = {
@@ -994,6 +1082,7 @@ class AutoMPO:
                         "kind": "dense",
                         "operator": middle[site],
                         "next_irrep": current_irrep,
+                        "charge_delta": _operator_charge_delta(middle[site]),
                     }
                 steps.append(step)
             return steps
@@ -1014,6 +1103,7 @@ class AutoMPO:
                         "kind": "dense",
                         "operator": operator,
                         "next_irrep": scalar,
+                        "charge_delta": _operator_charge_delta(operator),
                     }
             ordered = []
             current_irrep = scalar
@@ -1040,6 +1130,7 @@ class AutoMPO:
                     "operator": operator,
                     "next_irrep": next_irrep,
                     "use_cg_coupling": True,
+                    "charge_delta": _operator_charge_delta(operator),
                 }
             middle = {
                 int(site): operator for site, operator in term.middle_operators
@@ -1056,6 +1147,7 @@ class AutoMPO:
                         "kind": "dense",
                         "operator": middle[site],
                         "next_irrep": current_irrep,
+                        "charge_delta": _operator_charge_delta(middle[site]),
                     }
                 steps.append(step)
             return steps
@@ -1076,6 +1168,7 @@ class AutoMPO:
                         "kind": "dense",
                         "operator": operator,
                         "next_irrep": scalar,
+                        "charge_delta": _operator_charge_delta(operator),
                     }
             ordered = []
             current_irrep = scalar
@@ -1176,7 +1269,11 @@ class AutoMPO:
 
         suffix_signatures = [None] * (self.nsites + 1)
         suffix_signatures[self.nsites] = {
-            state: (state_irreps[state], "accept" if state == final_state else "reject")
+            state: (
+                state_irreps[state],
+                state_charges[state],
+                "accept" if state == final_state else "reject",
+            )
             for state in range(nstates)
         }
         for site in range(self.nsites - 1, -1, -1):
@@ -1198,15 +1295,17 @@ class AutoMPO:
                         key=repr,
                         )
                 )
-                signatures[state] = (state_irreps[state], outgoing)
+                signatures[state] = (state_irreps[state], state_charges[state], outgoing)
             suffix_signatures[site] = signatures
 
         class_maps = []
         class_irreps = []
+        class_charges = []
         for site in range(self.nsites + 1):
             sig_to_index = {}
             state_to_index = {}
             irreps = []
+            charges = []
             for state in sorted(active[site]):
                 signature = suffix_signatures[site][state]
                 index = sig_to_index.get(signature)
@@ -1214,9 +1313,11 @@ class AutoMPO:
                     index = len(sig_to_index)
                     sig_to_index[signature] = index
                     irreps.append(state_irreps[state])
+                    charges.append(state_charges[state])
                 state_to_index[state] = index
             class_maps.append(state_to_index)
             class_irreps.append(tuple(irreps))
+            class_charges.append(tuple(charges))
 
         force_rank_coupled_chain = any(
             irrep.dim != 1
@@ -1301,6 +1402,8 @@ class AutoMPO:
                         dense_blocks=visible_blocks,
                         left_channel_irreps=left_irreps,
                         right_channel_irreps=right_irreps,
+                        left_channel_charges=class_charges[site],
+                        right_channel_charges=class_charges[site + 1],
                         reduced_terms=tuple(rank_coupled_terms),
                         phys_out_leg=phys_leg,
                         phys_in_leg=phys_leg,

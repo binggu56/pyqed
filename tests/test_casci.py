@@ -450,6 +450,91 @@ def test_bo_hamiltonian_derivatives_projection_matches_cartesian_contraction():
     np.testing.assert_allclose(terms.G_projected, expected_g, atol=1e-10)
 
 
+def test_casci_vibronic_couplings_return_projected_f_and_g():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    mode = np.zeros((1, mol.natom, 3))
+    mode[0, 0, 2] = -1.0
+    mode[0, 1, 2] = 1.0
+
+    f, g, terms = mc.vibronic_couplings(
+        state_ids=[0, 1],
+        modes=mode,
+        return_terms=True,
+    )
+
+    assert f.shape == (2, 2, 1)
+    assert g.shape == (2, 2, 1, 1)
+    np.testing.assert_allclose(f, np.moveaxis(terms.F_projected, 0, -1), atol=1e-10)
+    np.testing.assert_allclose(
+        g,
+        np.moveaxis(terms.G_projected, (0, 1), (-2, -1)),
+        atol=1e-10,
+    )
+
+
+def test_casci_vibronic_couplings_modes_are_cartesian_displacement_coefficients():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    mass_weighted = np.zeros((1, mol.natom, 3))
+    mass_weighted[0, 0, 2] = -1.0
+    mass_weighted[0, 1, 2] = 1.0
+    masses = np.asarray(mol.atom_mass_list(), dtype=float)
+    cartesian_modes = mass_weighted / np.sqrt(masses)[:, None]
+
+    f, _ = mc.vibronic_couplings(state_ids=[0, 1], modes=cartesian_modes)
+    terms = bo_hamiltonian_derivatives(mc, state_ids=[0, 1])
+
+    expected = np.einsum(
+        "mAx,Axab->abm",
+        cartesian_modes,
+        terms.F_cartesian.reshape(mol.natom, 3, 2, 2),
+        optimize=True,
+    )
+    wrong_mass_weighted = np.einsum(
+        "mAx,Axab->abm",
+        mass_weighted,
+        terms.F_cartesian.reshape(mol.natom, 3, 2, 2),
+        optimize=True,
+    )
+
+    np.testing.assert_allclose(f, expected, atol=1e-10)
+    assert not np.allclose(f, wrong_mass_weighted, atol=1e-8)
+
+
+def test_casci_vibronic_couplings_return_cartesian_f_and_g_without_modes():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    f, g, terms = mc.vibronic_couplings(state_ids=[0, 1], return_terms=True)
+
+    assert f.shape == (2, 2, mol.natom, 3)
+    assert g.shape == (2, 2, mol.natom, 3, mol.natom, 3)
+    expected_f = np.moveaxis(
+        terms.F_cartesian.reshape(mol.natom, 3, 2, 2),
+        (0, 1),
+        (-2, -1),
+    )
+    expected_g = np.moveaxis(
+        terms.G_cartesian.reshape(mol.natom, 3, mol.natom, 3, 2, 2),
+        (0, 1, 2, 3),
+        (-4, -3, -2, -1),
+    )
+    np.testing.assert_allclose(f, expected_f, atol=1e-10)
+    np.testing.assert_allclose(g, expected_g, atol=1e-10)
+
+
 def test_bo_hamiltonian_derivatives_match_fixed_basis_finite_difference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='gbasis')

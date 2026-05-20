@@ -663,6 +663,112 @@ class CASCI:
         self.h2e = None
 
 
+    def PCM(self, solvent_obj=None, dm=None, **kwargs):
+        """
+        Attach a PCM solvent model and return a chainable CASCI+PCM object.
+
+        Examples
+        --------
+        >>> mc = CASCI(mf, ncas=6, nelecas=6).PCM(eps=2.3653).run(nstates=4)
+
+        Parameters
+        ----------
+        solvent_obj
+            Optional preconfigured ``pyqed.qchem.solvent.pcm.PCM`` object.
+            If omitted, a PCM object is created for ``self.mol``.
+        dm
+            Optional density matrix used to freeze the solvent potential.
+        **kwargs
+            PCM attributes to set on the solvent object, such as ``eps``,
+            ``method``, ``state_id``, ``state_average``, ``state_weights``,
+            ``max_cycle``, or ``conv_tol``.
+        """
+        from pyqed.qchem.solvent.pcm import PCM, pcm_for_casci
+
+        if solvent_obj is None:
+            solvent_obj = PCM(self.mol)
+
+        for key, value in kwargs.items():
+            if not hasattr(solvent_obj, key):
+                raise ValueError(f"Unknown PCM option '{key}'.")
+            setattr(solvent_obj, key, value)
+
+        return pcm_for_casci(self, solvent_obj, dm)
+
+    def _make_lr_pcm_fast_solvent(self, eps):
+        if _is_uhf_reference(self.mo_coeff):
+            raise NotImplementedError(
+                "Determinant-space LR-PCM currently supports restricted CASCI references only."
+            )
+        from pyqed.qchem.solvent.pcm import PCM
+
+        solvent = PCM(self.mol)
+        reference = getattr(self, "with_solvent", None)
+        if reference is not None:
+            for key in (
+                "method",
+                "vdw_scale",
+                "r_probe",
+                "radii_table",
+                "lebedev_order",
+                "max_memory",
+                "verbose",
+            ):
+                if hasattr(reference, key):
+                    setattr(solvent, key, getattr(reference, key))
+        solvent.eps = float(eps)
+        solvent.equilibrium_solvation = False
+        return solvent
+
+    def _active_tdm_to_ao(self, active_tdm):
+        full_mo = np.zeros((int(self.mf.nmo), int(self.mf.nmo)), dtype=float)
+        ncore = int(self.ncore)
+        ncas = int(self.ncas)
+        full_mo[ncore:ncore + ncas, ncore:ncore + ncas] = active_tdm
+        coeff = np.asarray(self.mo_coeff)
+        return coeff @ full_mo @ coeff.conj().T
+
+    def _lr_pcm_determinant_kernel(self, ground_ci, eps=1.78):
+        """
+        Build the LR-PCM response kernel in the CAS determinant basis.
+
+        The kernel is constructed from transition densities between each
+        determinant-basis vector and a fixed ground-state CI vector, then
+        projected to leave the reference ground vector unchanged.
+        """
+        solvent = self._make_lr_pcm_fast_solvent(eps)
+        ndet = len(ground_ci)
+        tdms = []
+        potentials = []
+        for idx in range(ndet):
+            unit = np.zeros(ndet, dtype=float)
+            unit[idx] = 1.0
+            active_tdm = make_tdm1(unit, ground_ci, self.binary, self.SC1)
+            tdm_ao = self._active_tdm_to_ao(active_tdm)
+            tdms.append(tdm_ao)
+            potentials.append(solvent._B_dot_x(tdm_ao))
+
+        kernel = np.empty((ndet, ndet), dtype=float)
+        for i, tdm_i in enumerate(tdms):
+            for j, v_j in enumerate(potentials):
+                kernel[i, j] = np.einsum("ij,ji->", v_j, tdm_i, optimize=True).real
+        kernel = 0.5 * (kernel + kernel.T)
+
+        ground_ci = np.asarray(ground_ci, dtype=float)
+        ground_ci = ground_ci / np.linalg.norm(ground_ci)
+        projector = np.eye(ndet) - np.outer(ground_ci, ground_ci)
+        return projector @ kernel @ projector
+
+    @staticmethod
+    def _lowest_dense_eigensystem(matrix, nstates):
+        nstates = int(nstates)
+        if nstates <= 0:
+            raise ValueError("nstates must be positive.")
+        evals, evecs = eigh(np.asarray(matrix))
+        nout = min(nstates, evals.size)
+        return evals[:nout], evecs[:, :nout]
+
+
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None, use_cholesky=None):
         """
         Given a rhf object get Spin-Orbit Matrices
@@ -966,7 +1072,16 @@ class CASCI:
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=None):
+    def run(
+        self,
+        nstates=1,
+        mo_coeff=None,
+        method='direct_ci',
+        ci0=None,
+        use_cholesky=None,
+        solvent_response=None,
+        solvent_response_eps=1.78,
+    ):
         """
         solve the full CI in the active space, more efficient than the JW solver
 
@@ -996,6 +1111,17 @@ class CASCI:
         # print('------------------------------')
         # print("             CASCI              ")
         # print('------------------------------\n')
+        solvent_response_model = None
+        if solvent_response is not None:
+            solvent_response_model = str(solvent_response).lower()
+            if solvent_response_model in {"none", "false"}:
+                solvent_response_model = None
+            elif solvent_response_model not in {"lr", "lr_pcm", "lr-pcm"}:
+                raise ValueError("solvent_response must be None or 'lr_pcm'.")
+            else:
+                solvent_response_model = "lr_pcm"
+                method = "ci"
+
         self.nstates = nstates
         self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
 
@@ -1023,9 +1149,9 @@ class CASCI:
         else:
             binary = self.binary
 
-        if method == 'direct_ci' or (
+        if solvent_response_model is None and (method == 'direct_ci' or (
             method == 'ci' and self.use_cholesky_integrals and not self.spin_purification
-        ):
+        )):
             from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
 
             direct_solver = DirectCASCI(
@@ -1111,7 +1237,19 @@ class CASCI:
 
 
         H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
-        E, X = eigsh(H_CI, k=nstates, which='SA')
+        self.lr_pcm_response_matrix = None
+        self.lr_pcm_response_eps = None
+        self.lr_pcm_raw_e_tot = None
+        if solvent_response_model == "lr_pcm":
+            raw_E, raw_X = self._lowest_dense_eigensystem(H_CI, max(1, nstates))
+            lr_kernel = self._lr_pcm_determinant_kernel(raw_X[:, 0], eps=solvent_response_eps)
+            H_CI = H_CI + lr_kernel
+            E, X = self._lowest_dense_eigensystem(H_CI, nstates)
+            self.lr_pcm_response_matrix = lr_kernel
+            self.lr_pcm_response_eps = float(solvent_response_eps)
+            self.lr_pcm_raw_e_tot = raw_E[:len(E)] + self.e_core
+        else:
+            E, X = eigsh(H_CI, k=nstates, which='SA')
 
 
         # nuclear repulsion energy is included in Ecore
@@ -1401,6 +1539,67 @@ class CASCI:
         ciket = self.ci[ket_id]
 
         return make_tdm1(cibra, ciket, self.binary, self.SC1)
+
+    def vibronic_couplings(
+        self,
+        state_ids=None,
+        modes=None,
+        return_terms=False,
+    ):
+        """
+        First- and second-order electronic Hamiltonian derivatives.
+
+        Parameters
+        ----------
+        state_ids : sequence of int, optional
+            Electronic states to include. If omitted, all available CASCI roots
+            are used.
+        modes : ndarray, optional
+            Normal-mode or other collective-coordinate vectors with shape
+            ``(nmodes, natom, 3)``, ``(nmodes, 3*natom)``, or
+            ``(3*natom, nmodes)``.
+        return_terms : bool, optional
+            If true, also return the underlying ``BOHamiltonianDerivatives``
+            object.
+
+        Returns
+        -------
+        F, G : ndarray
+            If ``modes`` is provided, the shapes are
+            ``(nstates, nstates, nmodes)`` and
+            ``(nstates, nstates, nmodes, nmodes)``.  Otherwise, Cartesian
+            derivatives are returned with shapes ``(nstates, nstates, natom, 3)``
+            and ``(nstates, nstates, natom, 3, natom, 3)``.
+        """
+        from pyqed.qchem.geometric import bo_hamiltonian_derivatives
+
+        terms = bo_hamiltonian_derivatives(
+            self,
+            state_ids=state_ids,
+            mode_vectors=modes,
+        )
+        if modes is not None:
+            f = np.moveaxis(terms.F_projected, 0, -1)
+            g = np.moveaxis(terms.G_projected, (0, 1), (-2, -1))
+        else:
+            natom = self.mol.natom
+            f_cart = terms.F_cartesian.reshape(
+                natom,
+                3,
+                *terms.F_cartesian.shape[1:],
+            )
+            f = np.moveaxis(f_cart, (0, 1), (-2, -1))
+            g_cart = terms.G_cartesian.reshape(
+                natom,
+                3,
+                natom,
+                3,
+                *terms.G_cartesian.shape[2:],
+            )
+            g = np.moveaxis(g_cart, (0, 1, 2, 3), (-4, -3, -2, -1))
+        if return_terms:
+            return f, g, terms
+        return f, g
 
     def make_tdm1s(self, bra_id, ket_id=0):
         """

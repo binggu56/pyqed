@@ -131,6 +131,53 @@ def _lda_kernel_ovov(mf, orbo, orbv):
     return np.einsum('gia,gjb->iajb', rho_ov, w_ov, optimize=True)
 
 
+def _dense_eri(mol):
+    eri = getattr(mol, 'eri', None)
+    if eri is not None:
+        return eri
+
+    eri_s4 = getattr(mol, 'eri_s4', None)
+    if eri_s4 is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+
+        return unpack_eri_s4(eri_s4, mol.nao)
+
+    eri_s8 = getattr(mol, 'eri_s8', None)
+    if eri_s8 is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+
+        return unpack_eri_s8(eri_s8, mol.nao)
+
+    raise ValueError("TDDFT requires mol.eri, mol.eri_s4, or mol.eri_s8.")
+
+
+def _pcm_kernel_ovov(mf, solvent):
+    """
+    Singlet PCM response kernel in the occupied-virtual basis.
+
+    The native TDDFT matrices use the same spin-adapted singlet convention as
+    the Coulomb term in ``get_ab``.  The PCM response is a direct density
+    response and therefore contributes the same ``ovov`` block to A and B.
+    """
+    _, _, _, _, orbo, orbv = _ov_blocks(mf)
+    nocc = orbo.shape[1]
+    nvir = orbv.shape[1]
+
+    kernel = np.empty((nocc, nvir, nocc, nvir), dtype=float)
+    for j in range(nocc):
+        for b in range(nvir):
+            dm_jb = np.einsum("p,q->pq", orbo[:, j], orbv[:, b].conj(), optimize=True)
+            v_jb = solvent._B_dot_x(dm_jb)
+            kernel[:, :, j, b] = np.einsum(
+                "pi,pq,qa->ia",
+                orbo.conj(),
+                v_jb,
+                orbv,
+                optimize=True,
+            ).real
+    return 2.0 * kernel
+
+
 def get_ab(mf):
     """
     Restricted singlet A/B matrices for linear-response TDDFT.
@@ -151,7 +198,7 @@ def get_ab(mf):
     a = np.diag(e_ia.ravel()).reshape(nocc, nvir, nocc, nvir)
     b = np.zeros_like(a)
 
-    eri = mf.mol.eri
+    eri = _dense_eri(mf.mol)
     eri_iajb = np.einsum(
         'pqrs,pi,qa,rj,sb->iajb',
         eri,
@@ -226,9 +273,36 @@ class TDA:
 
     def get_ab(self):
         a, b = get_ab(self._scf)
+        solvent = getattr(self, "with_solvent", None)
+        if solvent is not None:
+            pcm_kernel = _pcm_kernel_ovov(self._scf, solvent)
+            a = a + pcm_kernel
+            b = b + pcm_kernel
+            self.pcm_response_kernel = pcm_kernel
         self.a = a
         self.b = b
         return a, b
+
+    def PCM(self, solvent_obj=None, dm=None, equilibrium_solvation=False, **kwargs):
+        """
+        Attach PCM linear response to TDA/TDDFT.
+
+        By default this follows the non-equilibrium vertical-excitation
+        convention and uses an optical dielectric for the fast solvent
+        response.  Pass ``equilibrium_solvation=True`` to use the equilibrium
+        dielectric from the supplied/reference solvent object.
+        """
+        from pyqed.qchem import solvent
+
+        td = solvent.PCM(
+            self,
+            solvent_obj=solvent_obj,
+            dm=dm,
+            equilibrium_solvation=equilibrium_solvation,
+        )
+        for key, value in kwargs.items():
+            setattr(td.with_solvent, key, value)
+        return td
 
     def nuc_grad_method(self, backend='pyscf'):
         return Gradients(self, backend=backend)

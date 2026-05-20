@@ -56,7 +56,7 @@ def test_topyscf_preserves_geometry_for_angstrom_input():
 
 def test_rks_builds_default_atom_centered_grid():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin')
 
     mf = RKS(mol, xc='lda')
     mf.max_cycle = 80
@@ -66,6 +66,46 @@ def test_rks_builds_default_atom_centered_grid():
     assert mf.grid is not None
     assert mf.grid.ngrids > 0
     assert mf.converged
+
+
+def test_native_aogrid_matches_gbasis_for_values_gradients_and_hessians():
+    pytest.importorskip('gbasis')
+
+    atom = 'O 0 0 0; H 0 1.4 0; H 0 -1.4 0'
+    coords = np.array(
+        [
+            [0.1, 0.2, 0.3],
+            [1.0, -0.4, 0.2],
+            [0.0, 0.0, 0.7],
+            [-0.3, 0.5, -0.2],
+        ],
+        dtype=float,
+    )
+    weights = np.ones(coords.shape[0])
+
+    native_mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    native_mol.build(driver='builtin')
+    native_grid = AOGrid.from_molecule(
+        native_mol,
+        coords,
+        weights,
+        with_grad=True,
+        with_hess=True,
+    )
+
+    gbasis_mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    gbasis_mol.build(driver='gbasis')
+    gbasis_grid = AOGrid.from_molecule(
+        gbasis_mol,
+        coords,
+        weights,
+        with_grad=True,
+        with_hess=True,
+    )
+
+    np.testing.assert_allclose(native_grid.ao, gbasis_grid.ao, atol=1e-12)
+    np.testing.assert_allclose(native_grid.ao_grad, gbasis_grid.ao_grad, atol=1e-12)
+    np.testing.assert_allclose(native_grid.ao_hess, gbasis_grid.ao_hess, atol=1e-11)
 
 
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')

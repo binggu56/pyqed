@@ -85,14 +85,8 @@ def _compare_matrix(path_specs, basis_states, dense_vectors, mpo, expected_opera
     return max_abs
 
 
-def debug_one_body(args):
-    from pyqed.mps.nonabelian import (
-        AutoMPO,
-        FullyReducedSpatialOrbitalSite,
-        add_spatial_one_body_terms,
-        physical_leg_from_spatial_orbital,
-        spatial_target_sector,
-    )
+def _one_body_channel_mpos(args, phys_leg):
+    from pyqed.mps.nonabelian import AutoMPO
     from pyqed.mps.nonabelian.models import (
         _fully_reduced_double_transition_phase,
         _split_spatial_fermion_annihilation_channels,
@@ -102,6 +96,122 @@ def debug_one_body(args):
         time_reversed_reduced_operator,
     )
     from pyqed.mps.su2 import SU2Irrep
+
+    parity = spatial_parity(phys_leg)
+    double_phase = _fully_reduced_double_transition_phase(phys_leg, dtype=float)
+    annihilate_empty_single, annihilate_single_double = (
+        _split_spatial_fermion_annihilation_channels(phys_leg, dtype=float)
+    )
+    create_empty_single = annihilate_empty_single.adjoint()
+    create_single_double = annihilate_single_double.adjoint()
+    left_site = min(args.create, args.annihilate)
+    right_site = max(args.create, args.annihilate)
+    middle = {site: parity for site in range(left_site + 1, right_site)}
+
+    if args.create < args.annihilate:
+        channel_terms = (
+            ("c01/a01", create_empty_single, annihilate_empty_single, -np.sqrt(2.0)),
+            ("c01/a12", create_empty_single, annihilate_single_double, -np.sqrt(2.0)),
+            ("c12/a01", create_single_double, annihilate_empty_single, -np.sqrt(2.0)),
+            ("c12/a12", create_single_double, annihilate_single_double, 1.0 / np.sqrt(2.0)),
+        )
+        channel_mpos = []
+        for label, creation, annihilation, default_coeff in channel_terms:
+            channel_autompo = AutoMPO([phys_leg] * args.nsites)
+            channel_autompo.add_reduced_string_product(
+                (
+                    args.create,
+                    creation.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                ),
+                (args.annihilate, time_reversed_reduced_operator(annihilation)),
+                intermediate_irreps=(SU2Irrep(1),),
+                middle_operators=middle,
+                coeff=1.0,
+                family=("R", "__fully_reduced_one_body_split__"),
+            )
+            channel_mpos.append((label, default_coeff * args.value, channel_autompo.build()))
+        return tuple(channel_mpos)
+
+    channel_terms = (
+        ("a01/c01", annihilate_empty_single, create_empty_single, np.sqrt(2.0)),
+        ("a01/c12", annihilate_empty_single, create_single_double, np.sqrt(2.0)),
+        ("a12/c01", annihilate_single_double, create_empty_single, np.sqrt(2.0)),
+        ("a12/c12", annihilate_single_double, create_single_double, -1.0 / np.sqrt(2.0)),
+    )
+    channel_mpos = []
+    for label, annihilation, creation, default_coeff in channel_terms:
+        channel_autompo = AutoMPO([phys_leg] * args.nsites)
+        channel_autompo.add_reduced_string_product(
+            (
+                args.annihilate,
+                annihilation.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+            ),
+            (args.create, time_reversed_reduced_operator(creation)),
+            intermediate_irreps=(SU2Irrep(1),),
+            middle_operators=middle,
+            coeff=1.0,
+            family=("R", "__fully_reduced_one_body_split__"),
+        )
+        channel_mpos.append((label, default_coeff * args.value, channel_autompo.build()))
+    return tuple(channel_mpos)
+
+
+def _fit_one_body_channels(path_specs, basis_states, dense_vectors, args, phys_leg, expected_operator):
+    helpers = _load_reference_helpers()
+    contract = helpers._contract_chain_transition
+    channel_mpos = _one_body_channel_mpos(args, phys_leg)
+
+    columns = []
+    labels = []
+    default_coeffs = []
+    for label, default_coeff, channel_mpo in channel_mpos:
+        labels.append(label)
+        default_coeffs.append(default_coeff)
+        column = []
+        for bra_state in basis_states:
+            for ket_state in basis_states:
+                column.append(contract(bra_state, channel_mpo, ket_state))
+        columns.append(column)
+    design = np.asarray(columns, dtype=complex).T
+
+    target = []
+    for bra_index, _bra_state in enumerate(basis_states):
+        for ket_index, _ket_state in enumerate(basis_states):
+            target.append(
+                np.vdot(
+                    dense_vectors[bra_index],
+                    expected_operator @ dense_vectors[ket_index],
+                )
+            )
+    target = np.asarray(target, dtype=complex)
+
+    fitted, _residuals, rank, singular_values = np.linalg.lstsq(
+        design,
+        target,
+        rcond=None,
+    )
+    default_coeffs = np.asarray(default_coeffs, dtype=complex)
+    fitted_error = design @ fitted - target
+    default_error = design @ default_coeffs - target
+
+    print("\nchannel span fit:")
+    print(f"  rank: {rank} / {len(labels)}")
+    print(f"  singular values: {', '.join(f'{value:.6g}' for value in singular_values)}")
+    print(f"  default max error: {np.max(np.abs(default_error)):.6e}")
+    print(f"  best-fit max error: {np.max(np.abs(fitted_error)):.6e}")
+    print(f"  best-fit norm error: {np.linalg.norm(fitted_error):.6e}")
+    for label, default_coeff, fit_coeff in zip(labels, default_coeffs, fitted):
+        print(f"  {label:8s} default={default_coeff.real:+.12g} fit={fit_coeff.real:+.12g}")
+
+
+def debug_one_body(args):
+    from pyqed.mps.nonabelian import (
+        AutoMPO,
+        FullyReducedSpatialOrbitalSite,
+        add_spatial_one_body_terms,
+        physical_leg_from_spatial_orbital,
+        spatial_target_sector,
+    )
 
     helpers = _load_reference_helpers()
     target = spatial_target_sector(args.nelec, args.spin_twice)
@@ -126,65 +236,26 @@ def debug_one_body(args):
         tol=args.tol,
         limit=args.limit,
     )
+    if args.fit_channels:
+        _fit_one_body_channels(
+            path_specs,
+            basis_states,
+            dense_vectors,
+            args,
+            phys_leg,
+            expected,
+        )
     if args.channels:
         if args.create == args.annihilate:
             print("\nchannel breakdown: onsite term has no split channels")
         else:
-            parity = spatial_parity(phys_leg)
-            double_phase = _fully_reduced_double_transition_phase(phys_leg, dtype=float)
-            annihilate_empty_single, annihilate_single_double = (
-                _split_spatial_fermion_annihilation_channels(phys_leg, dtype=float)
-            )
-            create_empty_single = annihilate_empty_single.adjoint()
-            create_single_double = annihilate_single_double.adjoint()
-            if args.create < args.annihilate:
-                channel_terms = (
-                    ("c01/a01", create_empty_single, annihilate_empty_single, -np.sqrt(2.0)),
-                    ("c01/a12", create_empty_single, annihilate_single_double, -np.sqrt(2.0)),
-                    ("c12/a01", create_single_double, annihilate_empty_single, -np.sqrt(2.0)),
-                    ("c12/a12", create_single_double, annihilate_single_double, 1.0 / np.sqrt(2.0)),
+            channel_mpos = [
+                (label, default_coeff, channel_mpo)
+                for label, default_coeff, channel_mpo in _one_body_channel_mpos(
+                    args,
+                    phys_leg,
                 )
-                left_site, right_site = args.create, args.annihilate
-                middle = {site: parity for site in range(left_site + 1, right_site)}
-                channel_mpos = []
-                for label, creation, annihilation, coeff in channel_terms:
-                    channel_autompo = AutoMPO([phys_leg] * args.nsites)
-                    channel_autompo.add_reduced_string_product(
-                        (
-                            left_site,
-                            creation.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
-                        ),
-                        (right_site, time_reversed_reduced_operator(annihilation)),
-                        intermediate_irreps=(SU2Irrep(1),),
-                        middle_operators=middle,
-                        coeff=coeff * args.value,
-                        family=("R", "__fully_reduced_one_body_split__"),
-                    )
-                    channel_mpos.append((label, channel_autompo.build()))
-            else:
-                channel_terms = (
-                    ("a01/c01", annihilate_empty_single, create_empty_single, np.sqrt(2.0)),
-                    ("a01/c12", annihilate_empty_single, create_single_double, np.sqrt(2.0)),
-                    ("a12/c01", annihilate_single_double, create_empty_single, np.sqrt(2.0)),
-                    ("a12/c12", annihilate_single_double, create_single_double, -1.0 / np.sqrt(2.0)),
-                )
-                left_site, right_site = args.annihilate, args.create
-                middle = {site: parity for site in range(left_site + 1, right_site)}
-                channel_mpos = []
-                for label, annihilation, creation, coeff in channel_terms:
-                    channel_autompo = AutoMPO([phys_leg] * args.nsites)
-                    channel_autompo.add_reduced_string_product(
-                        (
-                            left_site,
-                            annihilation.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
-                        ),
-                        (right_site, time_reversed_reduced_operator(creation)),
-                        intermediate_irreps=(SU2Irrep(1),),
-                        middle_operators=middle,
-                        coeff=coeff * args.value,
-                        family=("R", "__fully_reduced_one_body_split__"),
-                    )
-                    channel_mpos.append((label, channel_autompo.build()))
+            ]
             print("\nchannel contributions for mismatches:")
             shown = 0
             contract = helpers._contract_chain_transition
@@ -200,8 +271,8 @@ def debug_one_body(args):
                     print()
                     print("bra", _format_state(bra_index, path_specs[bra_index]))
                     print("ket", _format_state(ket_index, path_specs[ket_index]))
-                    for label, channel_mpo in channel_mpos:
-                        value = contract(bra_state, channel_mpo, ket_state)
+                    for label, default_coeff, channel_mpo in channel_mpos:
+                        value = default_coeff * contract(bra_state, channel_mpo, ket_state)
                         if abs(value) > args.tol:
                             print(f"  {label}: {value:+.16g}")
                     shown += 1
@@ -265,6 +336,7 @@ def main(argv=None):
     one_body.add_argument("--create", type=int, default=0)
     one_body.add_argument("--annihilate", type=int, default=1)
     one_body.add_argument("--channels", action="store_true")
+    one_body.add_argument("--fit-channels", action="store_true")
     one_body.set_defaults(func=debug_one_body)
 
     exchange = subparsers.add_parser("exchange", parents=[common])

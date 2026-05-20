@@ -11,9 +11,13 @@ adapted from ASE and PySCF
 """
 
 import numpy as np
-import os
 import warnings
 
+try:
+    from pyscf import data, lib
+    from pyscf.lib import logger
+except ModuleNotFoundError:  # pragma: no cover - optional BOMD dependency
+    data = lib = logger = None
 
 from ase.io.trajectory import PickleTrajectory
 
@@ -80,11 +84,11 @@ class Dynamics:
                 function(*args, **kwargs)
 
 
-class MolecularDynamics:
+class MolecularDynamics(Dynamics):
     """Base-class for all MD classes."""
-    def __init__(self, mol, timestep, trajectory, logfile=None,
+    def __init__(self, mol, timestep, trajectory=None, logfile=None,
                  loginterval=1):
-        # Dynamics.__init__(self, atoms, logfile=None, trajectory=trajectory)
+        Dynamics.__init__(self, mol, logfile=logfile, trajectory=trajectory)
         self.dt = timestep
         self.masses = mol.get_masses()
         if 0 in self.masses:
@@ -99,7 +103,7 @@ class MolecularDynamics:
 
     def run(self, steps=50):
         """Integrate equation of motion."""
-        f = self.atoms.get_forces()
+        f = self.atoms.get_forces(md=True)
 
         if not self.atoms.has('momenta'):
             self.atoms.set_momenta(np.zeros_like(f))
@@ -164,6 +168,13 @@ def _toframe(integrator):
                  coord=integrator.mol.atom_coords(),
                  veloc=integrator.veloc,
                  time=integrator.time)
+
+
+def kernel(integrator, verbose=None):
+    """Run an :class:`_Integrator` instance to completion."""
+    for _ in integrator:
+        pass
+    return integrator
 
 
 class _Integrator:
@@ -260,6 +271,7 @@ class _Integrator:
         self.data_output = None
         self.trajectory_output = None
         self.callback = None
+        self.incore_anyway = False
 
         # Cache the masses into a list, they will be in atomic units
         self._masses = None
@@ -346,6 +358,11 @@ class _Integrator:
             # else:
             #     self.trajectory_output = open(self.trajectory_output, 'w')
 
+        if logger is None or data is None or lib is None:
+            raise ModuleNotFoundError(
+                "PySCF is required for the BOMD integrators in pyqed.md.md"
+            )
+
         log = logger.new_logger(self, verbose)
         self.check_sanity()
 
@@ -353,6 +370,10 @@ class _Integrator:
             self.dump_input()
 
         return kernel(self, verbose=log)
+
+    def check_sanity(self):
+        """Backward-compatible alias used by the BOMD run path."""
+        return self.sanity_test()
 
     def dump_input(self, verbose=None):
         log = logger.new_logger(self, verbose)
@@ -400,6 +421,8 @@ class _Integrator:
     def __iter__(self):
         self._step = 0
         self._log = logger.new_logger(self, self.verbose)
+        if self.incore_anyway and self.frames is None:
+            self.frames = []
         return self
 
     def __next__(self):

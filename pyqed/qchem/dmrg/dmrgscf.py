@@ -8,9 +8,81 @@ DMRGSCF
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
 # TODO: so since we are sharing CASSCF optimization code, currently after the DMRGSCF, final print get E(CASSCF) = xxxxxxx, it might be better if we fix that.
-from pyqed.qchem import QCDMRG, CASSCF
+from pyqed.qchem import CASSCF
+from pyqed.qchem.dmrg.dmrg import QCDMRG
 from pyqed.qchem.mcscf.cocas import kernel, kernel_state_average
 import numpy as np
+
+
+def _ao_overlap(mf):
+    if hasattr(mf, "get_ovlp"):
+        overlap = mf.get_ovlp()
+    else:
+        overlap = getattr(getattr(mf, "mol", None), "overlap", None)
+    if overlap is None:
+        return np.eye(int(getattr(mf, "nao")))
+    return np.asarray(overlap)
+
+
+def _s_orthonormalize(coeff, overlap, *, thresh=1.0e-10, orth_tol=1.0e-8):
+    metric = coeff.conj().T @ overlap @ coeff
+    eye = np.eye(metric.shape[0], dtype=metric.dtype)
+    if metric.shape[0] == metric.shape[1] and np.linalg.norm(metric - eye) < orth_tol:
+        return np.real_if_close(coeff)
+    eig, vec = np.linalg.eigh(metric)
+    if np.all(eig > thresh):
+        chol = np.linalg.cholesky(metric)
+        ortho = coeff @ np.linalg.inv(chol.conj().T)
+        return np.real_if_close(ortho)
+    keep = eig > thresh
+    if not np.any(keep):
+        raise ValueError("No linearly independent MO vectors remain after S-orthogonalization.")
+    ortho = coeff @ (vec[:, keep] / np.sqrt(eig[keep]))
+    return np.real_if_close(ortho)
+
+
+def _complete_mo_basis(mf, mo_coeff):
+    """
+    Return a full MO basis whose leading columns span ``mo_coeff``.
+
+    DMRGSCF stores the optimized core+active block.  When that block is reused
+    as the next orbital-optimization start, complete it with the current HF MO
+    basis so the optimizer can still rotate into the external space.
+    """
+    if mo_coeff is None:
+        return np.asarray(mf.mo_coeff)
+
+    coeff = np.asarray(mo_coeff)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a two-dimensional array.")
+    nao = int(getattr(mf, "nao", coeff.shape[0]))
+    if coeff.shape[0] != nao:
+        raise ValueError(
+            f"mo_coeff row dimension {coeff.shape[0]} does not match mf.nao={nao}."
+        )
+    if coeff.shape[1] > nao:
+        raise ValueError(
+            f"mo_coeff has too many columns ({coeff.shape[1]}) for nao={nao}."
+        )
+
+    overlap = _ao_overlap(mf)
+    coeff = _s_orthonormalize(coeff, overlap)
+    if coeff.shape[1] == nao:
+        return coeff
+
+    reference = np.asarray(mf.mo_coeff)
+    if reference.shape[0] != nao:
+        raise ValueError("mf.mo_coeff row dimension is inconsistent with mf.nao.")
+
+    # Project the reference MO basis into the S-orthogonal complement of the
+    # supplied block, then S-orthonormalize that complement.
+    residual = reference - coeff @ (coeff.conj().T @ overlap @ reference)
+    complement = _s_orthonormalize(residual, overlap)
+    ncomp = nao - coeff.shape[1]
+    if complement.shape[1] < ncomp:
+        raise ValueError("Could not complete mo_coeff to a full-rank MO basis.")
+    full = np.concatenate([coeff, complement[:, :ncomp]], axis=1)
+    return np.real_if_close(full)
 
 
 class DMRGSCF(QCDMRG):
@@ -21,6 +93,7 @@ class DMRGSCF(QCDMRG):
         nelecas,
         D=20,
         max_cycles=30,
+        macro_tol=1e-6,
         dmrg_conv_tol=1e-7,
         integral_backend="auto",
         **kwargs,
@@ -36,7 +109,7 @@ class DMRGSCF(QCDMRG):
         )
 
         self.max_cycles = max_cycles # macroiterations
-        self.tol = 1e-6 # energy tol
+        self.tol = float(macro_tol) # macro energy tol
         self.dmrg_conv_tol = float(dmrg_conv_tol)
         self.mo_coeff = None # opt orb
 
@@ -49,11 +122,25 @@ class DMRGSCF(QCDMRG):
         self.macro_iterations = 0
 
 
-    def run(self, nstates=1, weights = None, require_conv=True, **kwargs):
+    def run(self, nstates=1, weights = None, require_conv=True, mo_coeff=None, **kwargs):
         mf = self.mf
+        rej = kwargs.pop("reject_macro_energy", True)
+        rise = kwargs.pop("macro_energy_rise_tol", 1.0e-8)
+        rmax = kwargs.pop("macro_reject_max", 8)
+        mtol = kwargs.pop("macro_tol", self.tol)
+        gtol = kwargs.pop("orb_grad_tol", None)
+        tr = kwargs.pop("macro_trust_radius", 0.25)
+        tr_min = kwargs.pop("macro_trust_min", 1.0e-4)
+        tr_max = kwargs.pop("macro_trust_max", 1.0)
+        tr_dn = kwargs.pop("macro_trust_shrink", 0.5)
+        tr_up = kwargs.pop("macro_trust_grow", 1.5)
+        warm = kwargs.pop("warm_start_dmrg", True)
+        sw_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.dmrg_conv_tol))
 
-        # canonical molecular orbs
-        C0 = mf.mo_coeff
+        # Starting molecular orbitals for orbital optimization.  By default this
+        # is the HF MO basis; callers can pass a previous DMRGSCF ``mo_coeff``
+        # to continue from optimized orbitals.
+        C0 = _complete_mo_basis(mf, mo_coeff)
 
         # CASCI roots
         if nstates == None:
@@ -88,9 +175,9 @@ class DMRGSCF(QCDMRG):
         mc.ss = self.ss
         mc.shift = self.shift
 
-        kwargs.setdefault("conv_tol", self.dmrg_conv_tol)
+        kwargs.setdefault("sweep_tol", sw_tol)
 
-        mc.run(nstates=self.nstates, weights=self.weights, **kwargs)
+        mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
         if require_conv and not bool(getattr(getattr(mc, "dmrg", None), "converged", False)):
             raise RuntimeError(
                 "Initial DMRGSCF active-space DMRG did not converge. "
@@ -99,8 +186,8 @@ class DMRGSCF(QCDMRG):
             )
 
         # matrix elements in CMOs
-        h1e = mf.get_hcore_mo()
-        eri = mf.get_eri_mo()
+        h1e = mf.get_hcore_mo(C0)
+        eri = mf.get_eri_mo(C0)
 
         U0 = np.zeros((nmo, ncas+ncore))
         for i in range(ncas+ncore):
@@ -116,6 +203,18 @@ class DMRGSCF(QCDMRG):
                 h1e,
                 eri,
                 max_cycles=self.max_cycles,
+                tol=mtol,
+                orb_grad_tol=gtol,
+                reject_macro_energy=rej,
+                macro_energy_rise_tol=rise,
+                macro_reject_max=rmax,
+                macro_trust_radius=tr,
+                macro_trust_min=tr_min,
+                macro_trust_max=tr_max,
+                macro_trust_shrink=tr_dn,
+                macro_trust_grow=tr_up,
+                warm_start_dmrg=warm,
+                raise_on_nonconvergence=require_conv,
                 **kwargs,
             )
 
@@ -135,6 +234,18 @@ class DMRGSCF(QCDMRG):
                 h1e=h1e,
                 eri=eri,
                 max_cycles=self.max_cycles,
+                tol=mtol,
+                orb_grad_tol=gtol,
+                reject_macro_energy=rej,
+                macro_energy_rise_tol=rise,
+                macro_reject_max=rmax,
+                macro_trust_radius=tr,
+                macro_trust_min=tr_min,
+                macro_trust_max=tr_max,
+                macro_trust_shrink=tr_dn,
+                macro_trust_grow=tr_up,
+                warm_start_dmrg=warm,
+                raise_on_nonconvergence=require_conv,
                 **kwargs,
             )
 
@@ -142,6 +253,7 @@ class DMRGSCF(QCDMRG):
         self.e_tot = mc.e_tot
         self.ci = getattr(mc, "ci", None)
         self.e_history = getattr(mc, 'e_history', [self.e_tot])
+        self.macro_diagnostics = getattr(mc, "macro_diagnostics", [])
         self.converged = bool(getattr(mc, "converged", False))
         self.macro_converged = bool(getattr(mc, "macro_converged", False))
         self.solver_converged = bool(getattr(mc, "solver_converged", False))

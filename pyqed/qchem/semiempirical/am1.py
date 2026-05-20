@@ -1309,6 +1309,7 @@ class RAM1:
     def MRCI(self, **kwargs):
         from pyqed.qchem.semiempirical import MRCI
 
+        kwargs.setdefault("spin", getattr(self._mindo_mol, "spin", 0))
         return MRCI(self, **kwargs)
 
     def MECI(self, **kwargs):
@@ -1406,15 +1407,394 @@ class RAM1:
 
 
 class UAM1:
-    '''UHF-AM1 placeholder.'''
+    '''UHF-AM1 for open-shell systems.'''
 
     def __init__(self, mol):
         self.mol = mol
+        self.conv_tol = 1e-5
+        self.conv_tol_grad = None
+        self.max_cycle = 100
+        self.damping = 0.25
+        self.verbose = 0
+        self.e_heat_formation = None
+        self.e_tot = None
+        self.e_nuc = None
+        self.e_elec = None
+        self.mo_energy = None
+        self.mo_coeff = None
+        self.mo_occ = None
+        self.mo_occ_alpha = None
+        self.mo_occ_beta = None
+        self.hcore = None
+        self.vhf = None
+        self.dm = None
+        self.converged = False
+        self.cycles = 0
+        self._mindo_mol = _make_mindo_mol(mol)
+        self._hcore_cache = None
+        self._eri_ao_cache = None
+        self._hcore_mo_cache = None
+        self._eri_mo_cache = None
+        self._ci_hamiltonian_cache = {}
 
-    def run(self, *args, **kwargs):
-        raise NotImplementedError("Native UAM1 is not implemented yet.")
+    @property
+    def nao(self):
+        return self._mindo_mol.nao
+
+    @property
+    def nelec(self):
+        return self._mindo_mol.nelectron
+
+    @property
+    def nelec_alpha_beta(self):
+        nelec = int(self.nelec)
+        spin = int(getattr(self._mindo_mol, "spin", 0))
+        nalpha = (nelec + spin) // 2
+        nbeta = nelec - nalpha
+        if nalpha < 0 or nbeta < 0 or nalpha + nbeta != nelec:
+            raise ValueError("Invalid electron count/spin combination for UAM1.")
+        return nalpha, nbeta
+
+    @property
+    def mo_coeff_alpha(self):
+        return None if self.mo_coeff is None else self.mo_coeff[0]
+
+    @property
+    def mo_coeff_beta(self):
+        return None if self.mo_coeff is None else self.mo_coeff[1]
+
+    def build(self, mol=None):
+        if mol is not None:
+            self.mol = mol
+        self._mindo_mol = _make_mindo_mol(self.mol)
+        self.clear_integral_cache()
+        return self
+
+    def clear_integral_cache(self):
+        self._hcore_cache = None
+        self._eri_ao_cache = None
+        self._hcore_mo_cache = None
+        self._eri_mo_cache = None
+        self._ci_hamiltonian_cache = {}
+        return self
+
+    def clear_mo_integral_cache(self):
+        self._hcore_mo_cache = None
+        self._eri_mo_cache = None
+        self._ci_hamiltonian_cache = {}
+        return self
+
+    def get_ovlp(self, mol=None):
+        return numpy.eye(self._mindo_mol.nao)
+
+    def get_ao_cross_overlap(self, other, orthogonalized=True):
+        if not isinstance(other, (RAM1, UAM1)):
+            raise TypeError("AM1 cross-overlap requires another AM1 reference.")
+        sab = _overlap_matrix_between(self._mindo_mol._basis, other._mindo_mol._basis)
+        if not orthogonalized:
+            return sab
+        xa = _symmetric_inverse_sqrt(self._mindo_mol.overlap)
+        xb = _symmetric_inverse_sqrt(other._mindo_mol.overlap)
+        return xa @ sab @ xb
+
+    def get_mo_cross_overlap(self, other):
+        if self.mo_coeff is None:
+            self.run()
+        if not isinstance(other, UAM1):
+            raise TypeError("UAM1 MO cross-overlap requires another UAM1 reference.")
+        if other.mo_coeff is None:
+            other.run()
+        sao = self.get_ao_cross_overlap(other, orthogonalized=True)
+        return numpy.asarray(
+            [
+                self.mo_coeff[0].T @ sao @ other.mo_coeff[0],
+                self.mo_coeff[1].T @ sao @ other.mo_coeff[1],
+            ]
+        )
+
+    def get_hcore(self, mol=None):
+        if self._hcore_cache is None:
+            self._hcore_cache = get_hcore(self._mindo_mol)
+        return self._hcore_cache
+
+    def get_eri_ao(self):
+        if self._eri_ao_cache is None:
+            self._eri_ao_cache = get_eri(self._mindo_mol)
+        return self._eri_ao_cache
+
+    def get_hcore_mo(self):
+        if self.mo_coeff is None:
+            raise ValueError("Run UAM1 before requesting MO hcore.")
+        if self._hcore_mo_cache is None:
+            hcore = self.get_hcore()
+            self._hcore_mo_cache = numpy.asarray(
+                [c.T @ hcore @ c for c in self.mo_coeff]
+            )
+        return self._hcore_mo_cache
+
+    def get_eri_mo(self, notation="chem"):
+        if notation not in {"chem", "chemist"}:
+            raise ValueError("Only chemist notation is implemented for AM1 MO ERIs.")
+        if self.mo_coeff is None:
+            raise ValueError("Run UAM1 before requesting MO ERIs.")
+        if self._eri_mo_cache is None:
+            eri_ao = self.get_eri_ao()
+            ca, cb = self.mo_coeff
+            eri_aa = numpy.einsum(
+                "pqrs,pi,qj,rk,sl->ijkl", eri_ao, ca, ca, ca, ca, optimize=True
+            )
+            eri_bb = numpy.einsum(
+                "pqrs,pi,qj,rk,sl->ijkl", eri_ao, cb, cb, cb, cb, optimize=True
+            )
+            eri_ab = numpy.einsum(
+                "pqrs,pi,qj,rk,sl->ijkl", eri_ao, ca, ca, cb, cb, optimize=True
+            )
+            eri_ba = numpy.einsum(
+                "pqrs,pi,qj,rk,sl->ijkl", eri_ao, cb, cb, ca, ca, optimize=True
+            )
+            self._eri_mo_cache = numpy.stack(
+                (
+                    numpy.stack((eri_aa, eri_ab)),
+                    numpy.stack((eri_ba, eri_bb)),
+                )
+            )
+        return self._eri_mo_cache
+
+    def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True):
+        if dm is None:
+            dm = self.make_rdm1()
+        dm = numpy.asarray(dm, dtype=float)
+        if dm.shape[-2:] != (self.nao, self.nao):
+            raise ValueError("Density matrix has incompatible AO dimension.")
+        return get_jk(self._mindo_mol, dm)
+
+    def get_veff(self, dm=None):
+        if dm is None:
+            dm = self.make_rdm1()
+        dm = numpy.asarray(dm, dtype=float)
+        if dm.ndim != 3 or dm.shape[0] != 2:
+            raise ValueError("UAM1 density must be spin resolved with shape (2,nao,nao).")
+        vj_total, _ = self.get_jk(dm=dm[0] + dm[1])
+        _, vk = self.get_jk(dm=dm)
+        return numpy.asarray([vj_total - vk[0], vj_total - vk[1]])
+
+    def get_occ(self, mo_energy=None, mo_coeff=None):
+        nalpha, nbeta = self.nelec_alpha_beta
+        occ_alpha = numpy.zeros(self.nao)
+        occ_beta = numpy.zeros(self.nao)
+        occ_alpha[:nalpha] = 1.0
+        occ_beta[:nbeta] = 1.0
+        return occ_alpha, occ_beta
+
+    def get_init_guess(self, mol=None, key='minao', **kwargs):
+        hcore = self.get_hcore()
+        _eps, coeff = eigh(hcore)
+        occ_alpha, occ_beta = self.get_occ()
+        return self._make_spin_rdm1_from_mo(
+            numpy.asarray([coeff, coeff]), occ_alpha, occ_beta
+        )
+
+    def make_rdm1(self, mo_coeff=None, mo_occ=None):
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        if mo_occ is None:
+            occ_alpha, occ_beta = self.mo_occ_alpha, self.mo_occ_beta
+        else:
+            occ = numpy.asarray(mo_occ, dtype=float)
+            if occ.ndim == 1:
+                occ_alpha = numpy.minimum(occ, 1.0)
+                occ_beta = numpy.maximum(occ - 1.0, 0.0)
+            elif occ.shape[0] == 2:
+                occ_alpha, occ_beta = occ
+            else:
+                raise ValueError("mo_occ must be total or spin-resolved occupations.")
+        if mo_coeff is None or occ_alpha is None or occ_beta is None:
+            raise ValueError("MO coefficients and occupations are not available.")
+        return self._make_spin_rdm1_from_mo(mo_coeff, occ_alpha, occ_beta)
+
+    def energy_nuc(self):
+        return energy_nuc(self._mindo_mol)
+
+    def energy_elec(self, dm=None, h1e=None, vhf=None):
+        if dm is None:
+            dm = self.make_rdm1()
+        if h1e is None:
+            h1e = self.get_hcore()
+        if vhf is None:
+            vhf = self.get_veff(dm)
+        dm = numpy.asarray(dm, dtype=float)
+        e1 = numpy.einsum("ij,Sji->", h1e, dm)
+        e2 = 0.5 * numpy.einsum("Sij,Sji->", vhf, dm)
+        return e1 + e2, e2
+
+    energy_tot = energy_tot
+
+    def build_mrci_hamiltonian(self, driver):
+        if self.mo_coeff is None:
+            self.run()
+        config = driver.build_configuration_data(self)
+        cache_key = (
+            tuple(config.active_orbitals),
+            bool(driver.full),
+            bool(driver.singles),
+            bool(driver.doubles),
+            driver.spin,
+            driver.nref,
+            float(driver.selection_threshold),
+        )
+        cached = self._ci_hamiltonian_cache.get(cache_key)
+        if cached is not None:
+            driver.determinants = config.binary
+            driver.active_determinants = config.active_binary
+            driver.determinant_labels = _am1_determinant_labels(config.binary)
+            return cached
+
+        h1 = self.get_hcore_mo()
+        eri = self.get_eri_mo()
+        h2 = numpy.empty_like(eri)
+        h2[0, 0] = eri[0, 0] - eri[0, 0].swapaxes(1, 3)
+        h2[0, 1] = eri[0, 1]
+        h2[1, 0] = eri[1, 0]
+        h2[1, 1] = eri[1, 1] - eri[1, 1].swapaxes(1, 3)
+
+        active = numpy.asarray(config.active_orbitals, dtype=int)
+        if len(active) < h1.shape[-1]:
+            frozen = config.frozen_occ.astype(float)
+            h1_active = numpy.take(numpy.take(h1, active, axis=1), active, axis=2)
+            h2_active_frozen = numpy.take(numpy.take(h2, active, axis=2), active, axis=3)
+            h1_active = h1_active + numpy.einsum(
+                "STpqrr,Tr->Spq", h2_active_frozen, frozen, optimize=True
+            )
+            h2_active = numpy.take(numpy.take(h2_active_frozen, active, axis=4), active, axis=5)
+            e_frozen = numpy.einsum("Spp,Sp->", h1, frozen, optimize=True)
+            e_frozen += 0.5 * numpy.einsum(
+                "STppqq,Sp,Tq->", h2, frozen, frozen, optimize=True
+            )
+            binary_for_ci = config.active_binary
+            sc1, sc2 = SlaterCondon(binary_for_ci)
+            h_ci = CI_H(binary_for_ci, h1_active, h2_active, sc1, sc2)
+            h_ci = h_ci + numpy.eye(h_ci.shape[0]) * e_frozen
+        else:
+            binary_for_ci = config.binary
+            sc1, sc2 = SlaterCondon(binary_for_ci)
+            h_ci = CI_H(binary_for_ci, h1, h2, sc1, sc2)
+
+        driver.determinants = config.binary
+        driver.active_determinants = config.active_binary
+        driver.determinant_labels = _am1_determinant_labels(config.binary)
+        self._ci_hamiltonian_cache[cache_key] = h_ci
+        return h_ci
+
+    def MRCI(self, **kwargs):
+        from pyqed.qchem.semiempirical import MRCI
+
+        return MRCI(self, **kwargs)
+
+    def MECI(self, **kwargs):
+        from pyqed.qchem.semiempirical import MECI
+
+        kwargs.setdefault("spin", getattr(self._mindo_mol, "spin", 0))
+        return MECI(self, **kwargs)
+
+    def run(self, conv_tol=None, max_cycle=None, verbose=None, dm0=None, **kwargs):
+        if conv_tol is None:
+            conv_tol = kwargs.pop("tol", self.conv_tol)
+        if max_cycle is None:
+            max_cycle = kwargs.pop("max_cycle", self.max_cycle)
+        if verbose is None:
+            verbose = kwargs.pop("verbose", self.verbose)
+        damping = float(kwargs.pop("damping", self.damping))
+        self.conv_tol = float(conv_tol)
+        self.max_cycle = int(max_cycle)
+        self.verbose = int(verbose)
+        self.damping = damping
+
+        hcore = self.get_hcore()
+        if dm0 is None:
+            dm = self.get_init_guess()
+        else:
+            dm = numpy.asarray(dm0, dtype=float)
+            if dm.ndim == 2:
+                occ_alpha, occ_beta = self.get_occ()
+                frac_alpha = float(occ_alpha.sum()) / float(occ_alpha.sum() + occ_beta.sum())
+                dm = numpy.asarray([frac_alpha * dm, (1.0 - frac_alpha) * dm])
+        if dm.shape != (2, self.nao, self.nao):
+            raise ValueError("UAM1 initial density must have shape (2,nao,nao).")
+
+        e_last = None
+        mo_energy = None
+        mo_coeff = None
+        occ_alpha, occ_beta = self.get_occ()
+        vhf = None
+        for cycle in range(1, self.max_cycle + 1):
+            vhf = self.get_veff(dm)
+            fock = numpy.asarray([hcore + vhf[0], hcore + vhf[1]])
+            eps_a, coeff_a = eigh(fock[0])
+            eps_b, coeff_b = eigh(fock[1])
+            mo_energy = numpy.asarray([eps_a, eps_b])
+            mo_coeff = numpy.asarray([coeff_a, coeff_b])
+            dm_new = self._make_spin_rdm1_from_mo(mo_coeff, occ_alpha, occ_beta)
+            if damping:
+                dm_new = (1.0 - damping) * dm_new + damping * dm
+            vhf_new = self.get_veff(dm_new)
+            e_elec = self.energy_elec(dm_new, hcore, vhf_new)[0]
+            e_tot = e_elec + self.energy_nuc()
+            ddm = numpy.linalg.norm(dm_new - dm)
+            de = numpy.inf if e_last is None else abs(e_tot - e_last)
+            if self.verbose:
+                print(f"cycle= {cycle} E= {e_tot:.14f} delta_E= {0.0 if e_last is None else e_tot - e_last:.3g} |ddm|= {ddm:.3g}")
+            dm = dm_new
+            vhf = vhf_new
+            e_last = e_tot
+            self.cycles = cycle
+            if de < self.conv_tol and ddm < numpy.sqrt(self.conv_tol):
+                self.converged = True
+                break
+        else:
+            self.converged = False
+            if damping < 0.7:
+                if self.verbose:
+                    print("UAM1 SCF did not converge; retrying with stronger damping")
+                return self.run(
+                    conv_tol=conv_tol,
+                    max_cycle=max(self.max_cycle, 250),
+                    verbose=verbose,
+                    dm0=dm,
+                    damping=0.7,
+                )
+
+        self.e_tot = float(e_last)
+        self.e_nuc = float(self.energy_nuc())
+        self.e_elec = float(self.e_tot - self.e_nuc)
+        self.mo_energy = mo_energy
+        self.mo_coeff = mo_coeff
+        self.mo_occ_alpha = occ_alpha
+        self.mo_occ_beta = occ_beta
+        self.mo_occ = occ_alpha + occ_beta
+        self.clear_mo_integral_cache()
+        self.hcore = hcore
+        self.vhf = vhf
+        self.dm = dm
+        self.energy_tot(dm, hcore, vhf)
+        if self.verbose:
+            print(f"converged UAM1 energy = {self.e_tot:.14f}")
+            print(f"Heat of formation = {self.e_heat_formation:.14f} kcal/mol")
+        return self
 
     kernel = run
+
+    @staticmethod
+    def _make_spin_rdm1_from_mo(mo_coeff, occ_alpha, occ_beta):
+        ca, cb = numpy.asarray(mo_coeff, dtype=float)
+        dm_alpha = (ca[:, occ_alpha > 0] * occ_alpha[occ_alpha > 0]) @ ca[:, occ_alpha > 0].T
+        dm_beta = (cb[:, occ_beta > 0] * occ_beta[occ_beta > 0]) @ cb[:, occ_beta > 0].T
+        return numpy.asarray([dm_alpha, dm_beta])
+
+    density_fit = None
+    x2c = x2c1e = sfx2c1e = None
+
+    def nuc_grad_method(self):
+        raise NotImplementedError
 
 
 def _am1_determinant_labels(binary):

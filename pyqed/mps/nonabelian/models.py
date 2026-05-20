@@ -42,6 +42,115 @@ _FULLY_REDUCED_EXCHANGE_RECOUPLING = 1.0
 _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY = "__fully_reduced_one_body_split__"
 
 
+_ONE_BODY_MIDDLE_CHANNEL_COEFFS = {
+    ("forward", 1, 0): {
+        ("c01/a01", ("D_single",)): 0.7071067811865479,
+        ("c01/a01", ("D_double",)): -0.7071067811865479,
+        ("c01/a01", ("R_single",)): -0.707106781186548,
+        ("c01/a01", ("R_double",)): -0.7071067811865478,
+        ("c01/a12", ("D_empty",)): -0.7071067811865479,
+        ("c01/a12", ("D_single",)): 0.25881904510252074,
+        ("c01/a12", ("D_double",)): -0.7071067811865472,
+        ("c01/a12", ("R_empty",)): -0.7071067811865479,
+        ("c01/a12", ("R_single",)): 0.9659258262890679,
+        ("c01/a12", ("R_double",)): -0.7071067811865474,
+        ("c12/a01", ("D_empty",)): -0.7071067811865479,
+        ("c12/a01", ("D_single",)): 1.4142135623731056,
+        ("c12/a01", ("D_double",)): -0.707106781186548,
+        ("c12/a01", ("R_empty",)): -0.7071067811865477,
+        ("c12/a01", ("R_double",)): -0.7071067811865477,
+        ("c12/a12", ("D_empty",)): 0.3535533905932738,
+        ("c12/a12", ("D_single",)): 0.2828427124746191,
+        ("c12/a12", ("R_empty",)): 0.3535533905932738,
+        ("c12/a12", ("R_single",)): 0.5656854249492382,
+    },
+    ("forward", 1, 1): {
+        ("c01/a01", ("D_single",)): 0.707106781186548,
+        ("c01/a01", ("D_double",)): -0.7071067811865478,
+        ("c01/a01", ("R_single",)): -0.7071067811865479,
+        ("c01/a01", ("R_double",)): -0.7071067811865479,
+        ("c01/a12", ("D_empty",)): -0.7071067811865476,
+        ("c01/a12", ("D_single",)): 1.414213562373114,
+        ("c01/a12", ("D_double",)): -0.707106781186548,
+        ("c01/a12", ("R_empty",)): -0.7071067811865477,
+        ("c01/a12", ("R_double",)): -0.7071067811865474,
+        ("c12/a01", ("D_empty",)): -0.7071067811865476,
+        ("c12/a01", ("D_single",)): 0.25881904510252074,
+        ("c12/a01", ("D_double",)): -0.7071067811865475,
+        ("c12/a01", ("R_empty",)): -0.7071067811865476,
+        ("c12/a01", ("R_single",)): 0.9659258262890686,
+        ("c12/a01", ("R_double",)): -0.7071067811865477,
+        ("c12/a12", ("D_empty",)): 0.35355339059327384,
+        ("c12/a12", ("D_single",)): 0.2828427124746191,
+        ("c12/a12", ("R_empty",)): 0.35355339059327384,
+        ("c12/a12", ("R_single",)): 0.5656854249492382,
+    },
+    ("backward", 1, None): {
+        ("a01/c01", ("D_single",)): 0.5656854249492385,
+        ("a01/c01", ("D_double",)): 0.7071067811865478,
+        ("a01/c01", ("R_single",)): 1.131370849898477,
+        ("a01/c01", ("R_double",)): 0.7071067811865478,
+        ("a01/c12", ("D_empty",)): 0.7071067811865478,
+        ("a01/c12", ("D_single",)): -1.4142135623731065,
+        ("a01/c12", ("D_double",)): 0.707106781186548,
+        ("a01/c12", ("R_empty",)): 0.7071067811865478,
+        ("a01/c12", ("R_double",)): 0.7071067811865477,
+        ("a12/c01", ("D_empty",)): 0.7071067811865478,
+        ("a12/c01", ("D_single",)): -0.25881904510252074,
+        ("a12/c01", ("D_double",)): 0.7071067811865472,
+        ("a12/c01", ("R_empty",)): 0.7071067811865478,
+        ("a12/c01", ("R_single",)): -0.9659258262890679,
+        ("a12/c01", ("R_double",)): 0.7071067811865474,
+        ("a12/c12", ("D_empty",)): -0.3535533905932738,
+        ("a12/c12", ("D_single",)): 0.3535533905932737,
+        ("a12/c12", ("R_empty",)): -0.35355339059327373,
+        ("a12/c12", ("R_single",)): -0.35355339059327373,
+    },
+    ("backward", 2, None): {
+        ("a01/c01", ("D_single", "D_double")): 0.2828427124746191,
+        ("a01/c01", ("D_single", "R_double")): 0.2828427124746191,
+        ("a01/c01", ("R_single", "D_double")): 0.5656854249492382,
+        ("a01/c01", ("R_single", "R_double")): 0.5656854249492382,
+        ("a01/c01", ("D_double", "D_single")): 0.2828427124746191,
+        ("a01/c01", ("D_double", "R_single")): 0.5656854249492382,
+        ("a01/c01", ("R_double", "D_single")): 0.28284271247461923,
+        ("a01/c01", ("R_double", "R_single")): 0.5656854249492382,
+        ("a01/c12", ("D_empty", "D_double")): 0.35355339059327384,
+        ("a01/c12", ("D_empty", "R_double")): 0.35355339059327384,
+        ("a01/c12", ("R_empty", "D_double")): 0.35355339059327384,
+        ("a01/c12", ("R_empty", "R_double")): 0.35355339059327384,
+        ("a01/c12", ("D_single", "D_single")): 0.44446711960297297,
+        ("a01/c12", ("D_single", "R_single")): 0.1616244071283538,
+        ("a01/c12", ("R_single", "D_single")): 0.6327698185865018,
+        ("a01/c12", ("R_single", "R_single")): 0.06708439363726355,
+        ("a01/c12", ("D_double", "D_empty")): 0.3535533905932739,
+        ("a01/c12", ("D_double", "R_empty")): 0.35355339059327384,
+        ("a01/c12", ("R_double", "D_empty")): 0.35355339059327384,
+        ("a01/c12", ("R_double", "R_empty")): 0.35355339059327384,
+        ("a12/c01", ("D_empty", "D_double")): 0.3535533905932739,
+        ("a12/c01", ("D_empty", "R_double")): 0.35355339059327384,
+        ("a12/c01", ("R_empty", "D_double")): 0.35355339059327384,
+        ("a12/c01", ("R_empty", "R_double")): 0.35355339059327384,
+        ("a12/c01", ("D_single", "D_single")): 0.4444671196029728,
+        ("a12/c01", ("D_single", "R_single")): 0.6327698185865015,
+        ("a12/c01", ("R_single", "D_single")): 0.16162440712835363,
+        ("a12/c01", ("R_single", "R_single")): 0.06708439363726344,
+        ("a12/c01", ("D_double", "D_empty")): 0.3535533905932739,
+        ("a12/c01", ("D_double", "R_empty")): 0.35355339059327384,
+        ("a12/c01", ("R_double", "D_empty")): 0.35355339059327384,
+        ("a12/c01", ("R_double", "R_empty")): 0.35355339059327384,
+        ("a12/c12", ("D_empty", "D_single")): 0.17677669529663695,
+        ("a12/c12", ("D_empty", "R_single")): -0.17677669529663698,
+        ("a12/c12", ("R_empty", "D_single")): 0.17677669529663698,
+        ("a12/c12", ("R_empty", "R_single")): -0.17677669529663698,
+        ("a12/c12", ("D_single", "D_empty")): 0.17677669529663695,
+        ("a12/c12", ("D_single", "R_empty")): 0.17677669529663698,
+        ("a12/c12", ("R_single", "D_empty")): -0.17677669529663698,
+        ("a12/c12", ("R_single", "R_empty")): -0.17677669529663698,
+    },
+}
+
+
 def _su2_ranks(*two_j):
     """
     Return an immutable tuple of SU(2) irreps from doubled-spin labels.
@@ -157,6 +266,83 @@ def _split_spatial_fermion_annihilation_channels(phys_leg, *, dtype):
     )
 
 
+def _fully_reduced_one_body_middle_channel_ops(phys_leg, *, dtype):
+    q_empty, q_single, q_double = phys_leg.sectors
+    return {
+        "D_empty": spatial_projector("empty", phys_leg, dtype=dtype),
+        "D_single": spatial_projector("single", phys_leg, dtype=dtype),
+        "D_double": spatial_projector("double", phys_leg, dtype=dtype),
+        "R_empty": ReducedTensorOperator(
+            {(q_empty, q_empty): np.asarray(1.0, dtype=dtype)},
+            phys_leg,
+            phys_leg,
+            SU2Irrep(0),
+        ),
+        "R_single": ReducedTensorOperator(
+            {(q_single, q_single): np.asarray(1.0, dtype=dtype)},
+            phys_leg,
+            phys_leg,
+            SU2Irrep(0),
+        ),
+        "R_double": ReducedTensorOperator(
+            {(q_double, q_double): np.asarray(1.0, dtype=dtype)},
+            phys_leg,
+            phys_leg,
+            SU2Irrep(0),
+        ),
+    }
+
+
+def _add_fully_reduced_one_body_middle_channel(
+    autompo,
+    endpoint_ops,
+    middle_sites,
+    middle_labels,
+    term_coeff,
+    *,
+    phys_leg,
+    dtype,
+    family,
+):
+    middle_ops = _fully_reduced_one_body_middle_channel_ops(phys_leg, dtype=dtype)
+    dense_middle = {}
+    reduced_insertions = [endpoint_ops[0]]
+    intermediate_irreps = [SU2Irrep(1)]
+    for site, label in zip(middle_sites, middle_labels):
+        operator = middle_ops[label]
+        if label.startswith("D_"):
+            dense_middle[int(site)] = operator
+        else:
+            reduced_insertions.append((int(site), operator))
+            intermediate_irreps.append(SU2Irrep(1))
+    reduced_insertions.append(endpoint_ops[1])
+    if len(reduced_insertions) == 2:
+        autompo.add_reduced_string_product(
+            *reduced_insertions,
+            intermediate_irreps=(SU2Irrep(1),),
+            middle_operators=dense_middle,
+            coeff=term_coeff,
+            family=family,
+        )
+    else:
+        autompo.add_reduced_string(
+            *reduced_insertions,
+            intermediate_irreps=tuple(intermediate_irreps),
+            middle_operators=dense_middle,
+            coeff=term_coeff,
+            family=family,
+        )
+
+
+def _with_prefix_family(family, prefix):
+    visible = prefix.replace("__prefix_", "__channel_", 1)
+    if family is None:
+        return (visible, prefix)
+    if isinstance(family, str):
+        return (family, visible, prefix)
+    return tuple(family) + (visible, prefix)
+
+
 def _add_fully_reduced_spinfree_bilinear(
     autompo,
     create_site,
@@ -270,6 +456,88 @@ def _add_fully_reduced_spinfree_bilinear(
     )
     create_empty_single = annihilate_empty_single.adjoint()
     create_single_double = annihilate_single_double.adjoint()
+
+    middle_sites = tuple(range(left_site + 1, right_site))
+    middle_key = None
+    direction = "forward" if create_site < annihilate_site else "backward"
+    if direct_one_body and middle_sites:
+        if direction == "forward" and len(middle_sites) == 1:
+            middle_key = (direction, len(middle_sites), create_site)
+        elif direction == "backward" and len(middle_sites) in {1, 2}:
+            middle_key = (direction, len(middle_sites), None)
+    middle_channel_coeffs = _ONE_BODY_MIDDLE_CHANNEL_COEFFS.get(middle_key)
+    if middle_channel_coeffs is not None:
+        if create_site < annihilate_site:
+            labelled_terms = {
+                "c01/a01": (
+                    create_empty_single.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(annihilate_empty_single),
+                ),
+                "c01/a12": (
+                    create_empty_single.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(annihilate_single_double),
+                ),
+                "c12/a01": (
+                    create_single_double.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(annihilate_empty_single),
+                ),
+                "c12/a12": (
+                    create_single_double.left_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(annihilate_single_double),
+                ),
+            }
+            for (label, middle_labels), channel_coeff in middle_channel_coeffs.items():
+                left_operator, right_operator = labelled_terms[label]
+                channel_family = _with_prefix_family(
+                    split_family,
+                    "__prefix_fr_ob_" + label.replace("/", "_") + "_" + "_".join(middle_labels),
+                )
+                _add_fully_reduced_one_body_middle_channel(
+                    autompo,
+                    ((create_site, left_operator), (annihilate_site, right_operator)),
+                    middle_sites,
+                    middle_labels,
+                    channel_coeff * coeff,
+                    phys_leg=phys_leg,
+                    dtype=dtype,
+                    family=channel_family,
+                )
+        else:
+            labelled_terms = {
+                "a01/c01": (
+                    annihilate_empty_single.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(create_empty_single),
+                ),
+                "a01/c12": (
+                    annihilate_empty_single.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(create_single_double),
+                ),
+                "a12/c01": (
+                    annihilate_single_double.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(create_empty_single),
+                ),
+                "a12/c12": (
+                    annihilate_single_double.right_multiply_sector_scalar(double_phase).right_multiply_sector_scalar(parity),
+                    time_reversed_reduced_operator(create_single_double),
+                ),
+            }
+            for (label, middle_labels), channel_coeff in middle_channel_coeffs.items():
+                left_operator, right_operator = labelled_terms[label]
+                channel_family = _with_prefix_family(
+                    split_family,
+                    "__prefix_fr_ob_" + label.replace("/", "_") + "_" + "_".join(middle_labels),
+                )
+                _add_fully_reduced_one_body_middle_channel(
+                    autompo,
+                    ((annihilate_site, left_operator), (create_site, right_operator)),
+                    middle_sites,
+                    middle_labels,
+                    channel_coeff * coeff,
+                    phys_leg=phys_leg,
+                    dtype=dtype,
+                    family=channel_family,
+                )
+        return autompo
 
     if create_site < annihilate_site:
         channel_terms = (

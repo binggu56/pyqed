@@ -721,6 +721,8 @@ class RankCoupledMPO:
     phys_in_leg: PhysicalLeg
     left_channel_irreps: tuple[SU2Irrep, ...]
     right_channel_irreps: tuple[SU2Irrep, ...]
+    left_channel_charges: tuple[int, ...] | None = None
+    right_channel_charges: tuple[int, ...] | None = None
     reduced_terms: tuple[RankCoupledChannelTerm, ...] = ()
     symbolic_transitions: tuple = ()
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
@@ -749,10 +751,22 @@ class RankCoupledMPO:
             raise TypeError("RankCoupledMPO phys_in_leg must be a PhysicalLeg.")
         left_channel_irreps = tuple(self.left_channel_irreps)
         right_channel_irreps = tuple(self.right_channel_irreps)
+        left_channel_charges = (
+            tuple(int(charge) for charge in self.left_channel_charges)
+            if self.left_channel_charges is not None
+            else tuple(0 for _ in left_channel_irreps)
+        )
+        right_channel_charges = (
+            tuple(int(charge) for charge in self.right_channel_charges)
+            if self.right_channel_charges is not None
+            else tuple(0 for _ in right_channel_irreps)
+        )
         if not left_channel_irreps or not right_channel_irreps:
             raise ValueError("RankCoupledMPO requires at least one left/right virtual channel.")
         if any(not isinstance(irrep, SU2Irrep) for irrep in left_channel_irreps + right_channel_irreps):
             raise TypeError("RankCoupledMPO channel irreps must be SU2Irrep objects.")
+        if len(left_channel_charges) != len(left_channel_irreps) or len(right_channel_charges) != len(right_channel_irreps):
+            raise ValueError("RankCoupledMPO channel charge counts must match channel irrep counts.")
 
         dense_blocks = {
             key: np.asarray(block)
@@ -801,6 +815,8 @@ class RankCoupledMPO:
         object.__setattr__(self, "dense_blocks", dense_blocks)
         object.__setattr__(self, "left_channel_irreps", left_channel_irreps)
         object.__setattr__(self, "right_channel_irreps", right_channel_irreps)
+        object.__setattr__(self, "left_channel_charges", left_channel_charges)
+        object.__setattr__(self, "right_channel_charges", right_channel_charges)
         object.__setattr__(self, "reduced_terms", reduced_terms)
         object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
 
@@ -990,6 +1006,8 @@ def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
             phys_in_leg=core.phys_in_leg,
             left_channel_irreps=scalar_irreps_left,
             right_channel_irreps=scalar_irreps_right,
+            left_channel_charges=tuple(0 for _ in scalar_irreps_left),
+            right_channel_charges=tuple(0 for _ in scalar_irreps_right),
         )
     dense = np.asarray(core)
     if dense.ndim != 4:
@@ -1034,29 +1052,43 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
     if nsites == 1:
         left_irreps = left_core.left_channel_irreps
         right_irreps = left_core.right_channel_irreps
+        left_charges = left_core.left_channel_charges
+        right_charges = left_core.right_channel_charges
         if left_irreps != right_core.left_channel_irreps or right_irreps != right_core.right_channel_irreps:
             raise ValueError("Single-site MPO sum requires matching virtual channels.")
+        if left_charges != right_core.left_channel_charges or right_charges != right_core.right_channel_charges:
+            raise ValueError("Single-site MPO sum requires matching virtual channel charges.")
         left_row_offset = right_row_offset = 0
         left_col_offset = right_col_offset = 0
     elif site == 0:
         left_irreps = left_core.left_channel_irreps
+        left_charges = left_core.left_channel_charges
         if left_irreps != right_core.left_channel_irreps:
             raise ValueError("Left-edge MPO sum requires matching left boundary channels.")
+        if left_charges != right_core.left_channel_charges:
+            raise ValueError("Left-edge MPO sum requires matching left boundary channel charges.")
         right_irreps = left_core.right_channel_irreps + right_core.right_channel_irreps
+        right_charges = left_core.right_channel_charges + right_core.right_channel_charges
         left_row_offset = right_row_offset = 0
         left_col_offset = 0
         right_col_offset = len(left_core.right_channel_irreps)
     elif site == nsites - 1:
         right_irreps = left_core.right_channel_irreps
+        right_charges = left_core.right_channel_charges
         if right_irreps != right_core.right_channel_irreps:
             raise ValueError("Right-edge MPO sum requires matching right boundary channels.")
+        if right_charges != right_core.right_channel_charges:
+            raise ValueError("Right-edge MPO sum requires matching right boundary channel charges.")
         left_irreps = left_core.left_channel_irreps + right_core.left_channel_irreps
+        left_charges = left_core.left_channel_charges + right_core.left_channel_charges
         left_row_offset = 0
         right_row_offset = len(left_core.left_channel_irreps)
         left_col_offset = right_col_offset = 0
     else:
         left_irreps = left_core.left_channel_irreps + right_core.left_channel_irreps
         right_irreps = left_core.right_channel_irreps + right_core.right_channel_irreps
+        left_charges = left_core.left_channel_charges + right_core.left_channel_charges
+        right_charges = left_core.right_channel_charges + right_core.right_channel_charges
         left_row_offset = 0
         right_row_offset = len(left_core.left_channel_irreps)
         left_col_offset = 0
@@ -1128,6 +1160,8 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
         phys_in_leg=left_core.phys_in_leg,
         left_channel_irreps=left_irreps,
         right_channel_irreps=right_irreps,
+        left_channel_charges=left_charges,
+        right_channel_charges=right_charges,
         reduced_terms=tuple(reduced_terms),
         symbolic_transitions=tuple(symbolic_transitions),
     )

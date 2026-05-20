@@ -6,13 +6,12 @@ Created on Tue Nov 19 17:32:16 2024
 @author: bingg
 """
 
-import numpy as np
-from initialize import InitializeSimulation
+import warnings
+
+from .initialize import InitializeSimulation
 
 # from Measurements import Measurements
 # import numpy as np
-import copy
-import os
 
 
 class Measurements(InitializeSimulation):
@@ -33,7 +32,6 @@ class MinimizeEnergy(Measurements):
         super().__init__(*args, **kwargs)
 
 
-import warnings
 warnings.filterwarnings('ignore')
 
 
@@ -73,4 +71,5 @@ class MolecularDynamics(Measurements):
 #     import pytest
 #     pytest.main(["-s", __file__])
 
-mc = MonteCarlo()
+if __name__ == "__main__":
+    mc = MonteCarlo()

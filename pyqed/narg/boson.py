@@ -137,37 +137,91 @@ def ldr():
     return E
 
 
-def NARG(L, D=10, nz=16, nstates=1):
+def NARG(
+        L,
+        D=10,
+        nz=16,
+        nstates=1,
+        omegas=None,
+        g=None,
+        xmax=6.0,
+        adaptive_box=False,
+        box_safety=1.25,
+        min_xmax=6.0):
     """
-    Nonadiabatic RG
+    Nonadiabatic RG for the coupled boson benchmark.
 
     Parameters
     ----------
     L : int
-        number of sites (or modes)
-    D : TYPE, optional
-        number of states kept at each iteration. The default is 10.
-    nz : TYPE, optional
-        DESCRIPTION. The default is 16.
-    nstates: int
-        total number of many-body states. Default 1. The ground state.
+        Number of sites or modes.
+    D : int, optional
+        Number of adiabatic states kept at each iteration.
+    nz : int, optional
+        Number of DVR grid points for each mode.
+    nstates : int, optional
+        Number of final many-body eigenstates to return.
+    omegas : array_like, optional
+        Mode frequencies. Must contain at least ``L`` entries. If omitted,
+        the module-level ``omegas`` value is used for backward compatibility.
+    g : float, optional
+        Coupling strength. If omitted, the module-level ``g`` value is used
+        when available; otherwise 0.05 is used.
+    xmax : float, optional
+        Half-width of the SineDVR box when ``adaptive_box`` is false.
+    adaptive_box : bool, optional
+        If true, choose each DVR half-width from the harmonic turning point
+        implied by the local quadratic PES and DVR mass.
+    box_safety : float, optional
+        Safety factor applied to the adaptive turning-point estimate.
+    min_xmax : float, optional
+        Minimum half-width used by the adaptive box.
 
     Returns
     -------
-    E : TYPE
-        DESCRIPTION.
+    E : ndarray
+        Lowest many-body eigenvalues.
+    U : ndarray
+        Corresponding eigenvectors in the final retained basis.
 
     """
 
-    # g = 0.05 # coupling strength
+    if omegas is None:
+        omegas = globals().get("omegas")
+    if omegas is None:
+        raise ValueError("omegas must be provided when no module-level omegas is defined.")
+    omegas = np.asarray(omegas, dtype=float)
+    if L < 3:
+        raise ValueError("L must be at least 3 for the current recursive boson NARG implementation.")
+    if len(omegas) < L:
+        raise ValueError(f"omegas must contain at least L={L} entries.")
+    if D > nz:
+        raise ValueError(f"D={D} cannot exceed nz={nz} for this DVR implementation.")
+    if g is None:
+        g = globals().get("g", 0.05)
+    g = float(g)
+
+    def dvr_extent(omega, mass=1.0):
+        if not adaptive_box:
+            return float(xmax)
+        nlevel = max(1, min(D, nz) - 1)
+        # For H = p^2/(2m) + 0.5*k*x^2, with k represented here by omega,
+        # E_n = (n + 1/2) sqrt(k/m), so x_turn^2 = (2n + 1) sqrt(k/m) / k.
+        force_constant = float(omega)
+        mass = float(mass)
+        freq = np.sqrt(force_constant / mass)
+        turning_point = np.sqrt((2 * nlevel + 1) * freq / force_constant)
+        return max(float(min_xmax), float(box_safety) * turning_point)
 
     # discrete variable representation of the slow dof
-    dvr_z = SineDVR(-6, 6, nz, mass=1/omegas[1])
+    z_extent = dvr_extent(omegas[1], mass=1/omegas[1])
+    dvr_z = SineDVR(-z_extent, z_extent, nz, mass=1/omegas[1])
     z = dvr_z.x
     Kz = dvr_z.t()
 
     # adiabatic representation of the fast dof
-    dvr = SineDVR(-6, 6, npts=nz)
+    x_extent = dvr_extent(omegas[0], mass=1.0)
+    dvr = SineDVR(-x_extent, x_extent, npts=nz)
     x = dvr.x
 
     orb_energy = np.zeros((nz, D))
@@ -221,7 +275,8 @@ def NARG(L, D=10, nz=16, nstates=1):
     # add another dof
     X = kron(np.diag(z), np.eye(D))
 
-    dvr2 = SineDVR(-6, 6, nz, mass=1/omegas[2])
+    z2_extent = dvr_extent(omegas[2], mass=1/omegas[2])
+    dvr2 = SineDVR(-z2_extent, z2_extent, nz, mass=1/omegas[2])
     z2 = dvr2.x
     K2 = dvr2.t()
 
@@ -240,7 +295,8 @@ def NARG(L, D=10, nz=16, nstates=1):
 
     for k in range(3, L):
         # add another dof
-        dvr2 = SineDVR(-6, 6, nz, mass=1/omegas[k])
+        zk_extent = dvr_extent(omegas[k], mass=1/omegas[k])
+        dvr2 = SineDVR(-zk_extent, zk_extent, nz, mass=1/omegas[k])
         z = dvr2.x
         K2 = dvr2.t()
     
@@ -372,7 +428,7 @@ if __name__=="__main__":
     
     # for D in [2, 4, 8]:
     D = 20
-    E1, U1 = NARG(L=nmodes, D=D, nz=32, nstates=16)
+    E1, U1 = NARG(L=nmodes, D=D, nz=32, nstates=16, omegas=omegas, g=g)
     np.savez('D{}_nmodes{}'.format(D, nmodes), E1, U1)
     # np.savez('normal_modes_nmodes{}'.format(D, nmodes), E1, U1)
     

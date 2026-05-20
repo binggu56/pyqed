@@ -77,6 +77,26 @@ class RKS:
         # atom-centered grid that includes them.
         self.grid = AOGrid.atom_centered(self.mol, with_grad=True)
 
+    def _rebuild_moving_grid(self, xc=None):
+        if not getattr(self.grid, 'moves_with_atoms', False):
+            return
+
+        settings = getattr(self.grid, 'settings', {}) or {}
+        with_grad = bool(getattr(self.grid, 'ao_grad', None) is not None)
+        if xc is not None:
+            with_grad = with_grad or needs_gradients(xc)
+        self.grid = AOGrid.atom_centered(
+            self.mol,
+            n_radial=settings.get('n_radial', 50),
+            n_angular=settings.get('n_angular', 110),
+            radial_scale=settings.get('radial_scale', 1.0),
+            angular_grid=settings.get('angular_grid', 'lebedev'),
+            radial_grid=settings.get('radial_grid', 'treutler_ahlrichs'),
+            screen_basis=settings.get('screen_basis', True),
+            tol_screen=settings.get('tol_screen', 1e-8),
+            with_grad=with_grad,
+        )
+
     def make_rdm1(self):
         if self.mo_coeff is None or self.mo_occ is None:
             raise ValueError("No converged orbitals are available yet.")
@@ -168,6 +188,7 @@ class RKS:
 
     def run(self, dm0=None, **kwargs):
         xc = kwargs.get('xc', self.xc)
+        self._rebuild_moving_grid(xc)
         self._ensure_grid_for_xc(xc)
         out = run_rks(
             self.mol,

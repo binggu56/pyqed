@@ -37,6 +37,9 @@ from pyqed import discretize
 
 import math, copy
 import numpy as np
+import scipy.linalg as la
+import scipy.sparse as sp
+import scipy.sparse.linalg as sla
 try:
     import proplot as plt
 except:
@@ -642,6 +645,483 @@ class AdapativeSparseGrid(SparseGrid):
     """
     def __init__(self):
         pass
+
+
+def _hat_support(index, domain):
+    level, node = index
+    left, right = float(domain[0]), float(domain[1])
+    width = right - left
+    h = width / 2**level
+    center = left + node * h
+    return center - h, center, center + h
+
+
+def _hat_linear_coeff(index, domain, x):
+    """Return m, b for phi(x) = m*x + b on the segment containing x."""
+    left, center, right = _hat_support(index, domain)
+    if x <= left or x >= right:
+        return 0.0, 0.0
+    if x <= center:
+        slope = 1.0 / (center - left)
+        intercept = -left * slope
+    else:
+        slope = -1.0 / (right - center)
+        intercept = right / (right - center)
+    return slope, intercept
+
+
+def _hat_value(index, domain, x):
+    slope, intercept = _hat_linear_coeff(index, domain, x)
+    return slope * x + intercept
+
+
+def _integrate_linear_product(m1, b1, m2, b2, left, right):
+    return (
+        m1 * m2 * (right**3 - left**3) / 3.0
+        + (m1 * b2 + m2 * b1) * (right**2 - left**2) / 2.0
+        + b1 * b2 * (right - left)
+    )
+
+
+def _integrate_linear(m, b, left, right):
+    return m * (right**2 - left**2) / 2.0 + b * (right - left)
+
+
+def _hat_pair_integrals(index_a, index_b, domain):
+    """Exact 1D integrals for two hierarchical linear hat functions.
+
+    Returns ``(s, dd, dv, vd)`` where ``s = int a*b``,
+    ``dd = int a'*b'``, ``dv = int a'*b``, and ``vd = int a*b'``.
+    """
+    knots = sorted(set(_hat_support(index_a, domain) + _hat_support(index_b, domain)))
+    s = dd = dv = vd = 0.0
+    for left, right in zip(knots[:-1], knots[1:]):
+        if right <= left:
+            continue
+        mid = 0.5 * (left + right)
+        ma, ba = _hat_linear_coeff(index_a, domain, mid)
+        mb, bb = _hat_linear_coeff(index_b, domain, mid)
+        if ma == 0.0 and ba == 0.0:
+            continue
+        if mb == 0.0 and bb == 0.0:
+            continue
+        s += _integrate_linear_product(ma, ba, mb, bb, left, right)
+        dd += ma * mb * (right - left)
+        dv += ma * _integrate_linear(mb, bb, left, right)
+        vd += mb * _integrate_linear(ma, ba, left, right)
+    return s, dd, dv, vd
+
+
+def _tensor_legendre_quadrature(domain, order):
+    nodes_1d, weights_1d = np.polynomial.legendre.leggauss(order)
+    grids = []
+    weight_grids = []
+    for left, right in domain:
+        left = float(left)
+        right = float(right)
+        grids.append(0.5 * (right - left) * nodes_1d + 0.5 * (right + left))
+        weight_grids.append(0.5 * (right - left) * weights_1d)
+
+    mesh = np.meshgrid(*grids, indexing="ij")
+    weight_mesh = np.meshgrid(*weight_grids, indexing="ij")
+    points = np.column_stack([item.reshape(-1) for item in mesh])
+    weights = np.prod(np.stack(weight_mesh, axis=0), axis=0).reshape(-1)
+    return points, weights
+
+
+def _cellwise_legendre_quadrature(domain, breakpoints, order):
+    nodes_1d, weights_1d = np.polynomial.legendre.leggauss(order)
+    grids = []
+    weight_grids = []
+    for dim, (left, right) in enumerate(domain):
+        knots = np.asarray(breakpoints[dim], dtype=float)
+        knots = knots[(left - 1e-12 <= knots) & (knots <= right + 1e-12)]
+        knots = np.unique(np.concatenate(([left], knots, [right])))
+        dim_nodes = []
+        dim_weights = []
+        for a, b in zip(knots[:-1], knots[1:]):
+            if b <= a:
+                continue
+            dim_nodes.append(0.5 * (b - a) * nodes_1d + 0.5 * (b + a))
+            dim_weights.append(0.5 * (b - a) * weights_1d)
+        grids.append(np.concatenate(dim_nodes))
+        weight_grids.append(np.concatenate(dim_weights))
+
+    mesh = np.meshgrid(*grids, indexing="ij")
+    weight_mesh = np.meshgrid(*weight_grids, indexing="ij")
+    points = np.column_stack([item.reshape(-1) for item in mesh])
+    weights = np.prod(np.stack(weight_mesh, axis=0), axis=0).reshape(-1)
+    return points, weights
+
+
+class SparseGridLDR(SparseGrid):
+    """Direct sparse-grid Galerkin basis for LDR-style nuclear dynamics.
+
+    The basis functions are tensor products of hierarchical piecewise-linear
+    hat functions.  This class assembles the generalized basis matrices
+    ``S c_dot = -i H c`` directly on the sparse-grid index set, instead of
+    combining full tensor-grid calculations.
+    """
+
+    def __init__(
+        self,
+        ndim=1,
+        level=1,
+        domain=None,
+        mass=1.0,
+        g_matrix=None,
+        dim=None,
+        index_rule="smolyak",
+        extra_indices=None,
+    ):
+        super().__init__(ndim=ndim, level=level, domain=domain, dim=dim)
+        self.index_rule = index_rule.lower().replace("_", "-")
+        if self.index_rule == "smolyak":
+            self.generatePoints()
+            basis_indices = [tuple(index) for index in self.indices]
+        elif self.index_rule == "tensor":
+            basis_indices = self._tensor_basis_indices(self.dim, self.level)
+        else:
+            raise ValueError("index_rule must be 'smolyak' or 'tensor'.")
+        if extra_indices is not None:
+            basis_indices = list(basis_indices) + [tuple(index) for index in extra_indices]
+        self.set_basis_indices(basis_indices)
+        self.mass = np.broadcast_to(np.asarray(mass, dtype=float), (self.dim,))
+        if g_matrix is None:
+            self.g_matrix = np.diag(1.0 / self.mass)
+        else:
+            self.g_matrix = np.asarray(g_matrix, dtype=float)
+            if self.g_matrix.shape != (self.dim, self.dim):
+                raise ValueError("g_matrix must have shape (ndim, ndim).")
+        self.S = None
+        self.T = None
+        self.H = None
+
+    @property
+    def npts(self):
+        return len(self.basis_indices)
+
+    @staticmethod
+    def _one_dimensional_hierarchical_indices(level):
+        return [
+            (lev, node)
+            for lev in range(1, level + 1)
+            for node in range(1, 2**lev, 2)
+        ]
+
+    @classmethod
+    def _tensor_basis_indices(cls, dim, level):
+        one_dim = cls._one_dimensional_hierarchical_indices(level)
+        return [
+            tuple(item for pair in combo for item in pair)
+            for combo in itertools.product(one_dim, repeat=dim)
+        ]
+
+    def _basis_index_position(self, basis_index):
+        coord = []
+        for dim in range(self.dim):
+            level = basis_index[2 * dim]
+            node = basis_index[2 * dim + 1]
+            left, right = self.domain[dim]
+            coord.append((right - left) * node / 2**level + left)
+        return coord
+
+    def set_basis_indices(self, basis_indices):
+        unique = sorted({tuple(index) for index in basis_indices})
+        self.basis_indices = unique
+        self.indices = [list(index) for index in unique]
+        self.nodes = np.asarray(
+            [self._basis_index_position(index) for index in self.basis_indices],
+            dtype=float,
+        )
+        self.gP = {
+            index: gridPoint(list(index), self.domain)
+            for index in self.basis_indices
+        }
+        self.S = None
+        self.T = None
+        self.H = None
+        return self
+
+    def refine_tensor_region(self, level=None, predicate=None):
+        """Add tensor-product hierarchical functions selected by ``predicate``.
+
+        ``predicate`` is called with the physical coordinate of a candidate
+        tensor-grid basis center.  This gives a small adaptive escape hatch for
+        direct sparse-grid dynamics when the Smolyak index set misses important
+        mixed-resolution regions.
+        """
+        if level is None:
+            level = self.level
+        if predicate is None:
+            predicate = lambda point: True
+        additions = []
+        for index in self._tensor_basis_indices(self.dim, level):
+            point = np.asarray(self._basis_index_position(index), dtype=float)
+            if predicate(point):
+                additions.append(index)
+        return self.set_basis_indices(list(self.basis_indices) + additions)
+
+    def _basis_1d_indices(self, basis_index):
+        return tuple(
+            (basis_index[2 * dim], basis_index[2 * dim + 1])
+            for dim in range(self.dim)
+        )
+
+    def quadrature_breakpoints(self):
+        breakpoints = [set(map(float, self.domain[dim])) for dim in range(self.dim)]
+        for basis_index in self.basis_indices:
+            for dim, index_1d in enumerate(self._basis_1d_indices(basis_index)):
+                breakpoints[dim].update(_hat_support(index_1d, self.domain[dim]))
+        return [np.asarray(sorted(points), dtype=float) for points in breakpoints]
+
+    def quadrature_points(self, order=4, cellwise=True):
+        if cellwise:
+            return _cellwise_legendre_quadrature(
+                self.domain,
+                self.quadrature_breakpoints(),
+                order,
+            )
+        return _tensor_legendre_quadrature(self.domain, order)
+
+    def _pair_factor_integrals(self, basis_a, basis_b):
+        idx_a = self._basis_1d_indices(basis_a)
+        idx_b = self._basis_1d_indices(basis_b)
+        return [
+            _hat_pair_integrals(idx_a[dim], idx_b[dim], self.domain[dim])
+            for dim in range(self.dim)
+        ]
+
+    def basis_value(self, basis_index, point):
+        value = 1.0
+        for dim, index_1d in enumerate(self._basis_1d_indices(basis_index)):
+            value *= _hat_value(index_1d, self.domain[dim], point[dim])
+        return value
+
+    def interpolation_matrix(self, points=None):
+        if points is None:
+            points = self.nodes
+        points = np.asarray(points, dtype=float)
+        matrix = np.empty((len(points), self.npts), dtype=float)
+        for row, point in enumerate(points):
+            for col, basis_index in enumerate(self.basis_indices):
+                matrix[row, col] = self.basis_value(basis_index, point)
+        return matrix
+
+    def build_overlap(self):
+        rows, cols, data = [], [], []
+        for a, basis_a in enumerate(self.basis_indices):
+            for b, basis_b in enumerate(self.basis_indices):
+                factors = self._pair_factor_integrals(basis_a, basis_b)
+                value = np.prod([item[0] for item in factors])
+                if abs(value) > 1e-14:
+                    rows.append(a)
+                    cols.append(b)
+                    data.append(value)
+        self.S = sp.csr_matrix((data, (rows, cols)), shape=(self.npts, self.npts))
+        return self.S
+
+    def build_kinetic(self, g_matrix=None):
+        if g_matrix is None:
+            g_matrix = self.g_matrix
+        else:
+            g_matrix = np.asarray(g_matrix, dtype=float)
+        rows, cols, data = [], [], []
+        for a, basis_a in enumerate(self.basis_indices):
+            for b, basis_b in enumerate(self.basis_indices):
+                factors = self._pair_factor_integrals(basis_a, basis_b)
+                value = 0.0
+                for m in range(self.dim):
+                    for n in range(self.dim):
+                        term = g_matrix[m, n]
+                        if term == 0.0:
+                            continue
+                        prod = 1.0
+                        for dim in range(self.dim):
+                            s, dd, dv, vd = factors[dim]
+                            if m == n == dim:
+                                prod *= dd
+                            elif dim == m:
+                                prod *= dv
+                            elif dim == n:
+                                prod *= vd
+                            else:
+                                prod *= s
+                        value += 0.5 * term * prod
+                if abs(value) > 1e-14:
+                    rows.append(a)
+                    cols.append(b)
+                    data.append(value)
+        T = sp.csr_matrix((data, (rows, cols)), shape=(self.npts, self.npts))
+        self.T = 0.5 * (T + T.T)
+        return self.T
+
+    def evaluate_potential(self, potential):
+        if potential is None:
+            return np.zeros(self.npts, dtype=float)
+        values = potential(self.nodes) if callable(potential) else potential
+        values = np.asarray(values)
+        if values.shape == (self.npts,):
+            return values.astype(float)
+        if values.shape[:1] != (self.npts,):
+            raise ValueError("Potential must have leading dimension npts.")
+        if values.shape[-1] != values.shape[-2]:
+            raise ValueError("Matrix-valued potential must have shape (npts, n, n).")
+        return values
+
+    def _interpolate_nodal_values(self, values, points, phi=None):
+        coeffs = self.nodal_values_to_coefficients(values)
+        if phi is None:
+            phi = self.interpolation_matrix(points)
+        trailing = coeffs.shape[1:]
+        interpolated = phi @ coeffs.reshape(self.npts, -1)
+        return interpolated.reshape((len(points),) + trailing)
+
+    def build_potential_quadrature(
+        self,
+        potential,
+        order=4,
+        points=None,
+        weights=None,
+        cellwise=True,
+    ):
+        values = self.evaluate_potential(potential)
+        if points is None or weights is None:
+            points, weights = self.quadrature_points(order=order, cellwise=cellwise)
+        phi = self.interpolation_matrix(points)
+
+        if callable(potential):
+            q_values = np.asarray(potential(points))
+        else:
+            q_values = self._interpolate_nodal_values(values, points, phi=phi)
+
+        if q_values.ndim == 1:
+            weighted_phi = phi * (weights * q_values)[:, None]
+            matrix = phi.T @ weighted_phi
+            matrix = 0.5 * (matrix + matrix.T)
+            matrix[np.abs(matrix) < 1e-14] = 0.0
+            return sp.csr_matrix(matrix)
+
+        nstates = q_values.shape[1]
+        rows, cols, data = [], [], []
+        for i in range(nstates):
+            for j in range(nstates):
+                weighted_phi = phi * (weights * q_values[:, i, j])[:, None]
+                block = phi.T @ weighted_phi
+                nz_a, nz_b = np.nonzero(np.abs(block) > 1e-14)
+                rows.extend((nz_a * nstates + i).tolist())
+                cols.extend((nz_b * nstates + j).tolist())
+                data.extend(block[nz_a, nz_b].tolist())
+        shape = (self.npts * nstates, self.npts * nstates)
+        matrix = sp.csr_matrix((data, (rows, cols)), shape=shape)
+        return 0.5 * (matrix + matrix.T.conj())
+
+    def build_potential(self, potential, quadrature_order=None):
+        if quadrature_order is not None:
+            return self.build_potential_quadrature(potential, order=quadrature_order)
+
+        values = self.evaluate_potential(potential)
+        if self.S is None:
+            self.build_overlap()
+
+        coo = self.S.tocoo()
+        if values.ndim == 1:
+            data = 0.5 * (values[coo.row] + values[coo.col]) * coo.data
+            return sp.csr_matrix((data, (coo.row, coo.col)), shape=self.S.shape)
+
+        nstates = values.shape[1]
+        rows, cols, data = [], [], []
+        for a, b, overlap in zip(coo.row, coo.col, coo.data):
+            block = 0.5 * (values[a] + values[b]) * overlap
+            for i in range(nstates):
+                for j in range(nstates):
+                    if abs(block[i, j]) > 1e-14:
+                        rows.append(a * nstates + i)
+                        cols.append(b * nstates + j)
+                        data.append(block[i, j])
+        shape = (self.npts * nstates, self.npts * nstates)
+        return sp.csr_matrix((data, (rows, cols)), shape=shape)
+
+    def build_hamiltonian(self, potential=None, quadrature_order=None):
+        values = self.evaluate_potential(potential)
+        if self.S is None:
+            self.build_overlap()
+        if self.T is None:
+            self.build_kinetic()
+
+        if values.ndim == 1:
+            self.H = self.T + self.build_potential(
+                values,
+                quadrature_order=quadrature_order,
+            )
+            return self.H
+
+        nstates = values.shape[1]
+        eye_state = sp.eye(nstates, format="csr")
+        self.H = sp.kron(self.T, eye_state, format="csr") + self.build_potential(
+            values,
+            quadrature_order=quadrature_order,
+        )
+        return self.H
+
+    def overlap(self, nstates=1):
+        if self.S is None:
+            self.build_overlap()
+        if nstates == 1:
+            return self.S
+        return sp.kron(self.S, sp.eye(nstates, format="csr"), format="csr")
+
+    def solve(self, potential=None, nstates=6, quadrature_order=None):
+        H = self.build_hamiltonian(potential, quadrature_order=quadrature_order)
+        values = self.evaluate_potential(potential)
+        electronic_states = 1 if values.ndim == 1 else values.shape[1]
+        S = self.overlap(electronic_states)
+        dim = H.shape[0]
+        if nstates >= dim:
+            evals, evecs = la.eigh(H.toarray(), S.toarray())
+            return evals[:nstates], evecs[:, :nstates]
+        evals, evecs = sla.eigsh(H, M=S, k=nstates, which="SA")
+        order = np.argsort(evals)
+        return evals[order], evecs[:, order]
+
+    def nodal_values_to_coefficients(self, values):
+        values = np.asarray(values)
+        leading_shape = values.shape[:1]
+        if leading_shape != (self.npts,):
+            raise ValueError("Nodal values must have leading dimension npts.")
+        interp = self.interpolation_matrix()
+        trailing = values.shape[1:]
+        coeffs = la.solve(interp, values.reshape(self.npts, -1))
+        return coeffs.reshape((self.npts,) + trailing)
+
+    def l2_project(self, function, order=4, cellwise=True):
+        points, weights = self.quadrature_points(order=order, cellwise=cellwise)
+        phi = self.interpolation_matrix(points)
+        values = np.asarray(function(points))
+        if values.shape[:1] != (len(points),):
+            raise ValueError("Projected function must have leading dimension nquad.")
+        rhs = phi.T @ (weights[:, None] * values.reshape(len(points), -1))
+        if self.S is None:
+            self.build_overlap()
+        coeffs = la.solve(self.S.toarray(), rhs)
+        return coeffs.reshape((self.npts,) + values.shape[1:])
+
+    def propagate(self, coeffs, dt, nt=1, potential=None, quadrature_order=None):
+        H = self.build_hamiltonian(potential, quadrature_order=quadrature_order)
+        coeffs = np.asarray(coeffs, dtype=complex)
+        nstates = H.shape[0] // self.npts
+        S = self.overlap(nstates).toarray()
+        H_dense = H.toarray()
+        chol = la.cholesky(S, lower=True)
+        h_orth = la.solve_triangular(
+            chol,
+            H_dense @ la.solve_triangular(chol.T.conj(), np.eye(H.shape[0]), lower=False),
+            lower=True,
+        )
+        y = chol.T.conj() @ coeffs
+        for _ in range(nt):
+            y = sla.expm_multiply(-1j * dt * h_orth, y)
+        return la.solve_triangular(chol.T.conj(), y, lower=False)
 
 
 

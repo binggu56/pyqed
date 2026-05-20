@@ -353,6 +353,194 @@ def _nonabelian_mps_to_dense_vector(state):
     return np.squeeze(psi, axis=-1).reshape(-1)
 
 
+def _spatial_rdm_dense_mps(state):
+    """Return a standard dense d=4 MPS for spatial-site RDM contractions."""
+
+    if hasattr(state, "sites"):
+        return None
+    if hasattr(state.Bs[0], "qns"):
+        from pyqed.mps.mps import symmetric_to_dense
+
+        state = symmetric_to_dense(state)
+    else:
+        state = state.to_order(["lv", "p", "rv"])
+    if state.Bs[0].shape[1] != 4:
+        raise NotImplementedError(
+            f"Spatial-site RDM contractions require d=4 sites, got d={state.Bs[0].shape[1]}."
+        )
+    return state
+
+
+def _apply_spatial_annihilation_mps(state, sigma, site):
+    """Apply one spatial-site annihilation operator, including inter-site JW strings."""
+
+    local = SpinHalfFermionOperators()
+    jw = np.asarray(local["JW"], dtype=complex)
+    op = np.asarray(local["Cu" if sigma == 0 else "Cd"], dtype=complex)
+    eye = np.eye(4, dtype=complex)
+
+    new_Bs = []
+    for i in range(state.L):
+        B = state._get_std_B(i)
+        local_op = jw if i < site else op if i == site else eye
+        new_B = np.tensordot(local_op, B, axes=(1, 1)).transpose(1, 0, 2)
+        new_Bs.append(new_B)
+    return MPS(new_Bs, labels=["lv", "p", "rv"], bc=state.bc)
+
+
+def _two_hole_gram_block(two_hole_states, norm, *, zero_tol=1.0e-14):
+    """Build one Hermitian Gram block for a fixed two-spin annihilation channel."""
+
+    nstates = len(two_hole_states)
+    gram = np.zeros((nstates, nstates), dtype=complex)
+    active = []
+    for i, state_i in enumerate(two_hole_states):
+        diag = state_i._mps_dot(state_i, state_i)
+        if abs(diag) <= zero_tol:
+            continue
+        gram[i, i] = diag / norm
+        active.append(i)
+
+    for pos, i in enumerate(active):
+        state_i = two_hole_states[i]
+        for j in active[pos + 1:]:
+            val = state_i._mps_dot(state_i, two_hole_states[j]) / norm
+            gram[i, j] = val
+            gram[j, i] = val.conjugate()
+    return gram
+
+
+def _spatial_fermion_string_expectation_mps(state, op_specs, norm):
+    """Contract a spatial-site fermion string directly against a dense MPS."""
+
+    from pyqed.mps.mps import expect_mps
+
+    local = SpinHalfFermionOperators()
+    eye = np.eye(4, dtype=complex)
+    jw = np.asarray(local["JW"], dtype=complex)
+    local_by_spec = {
+        ("ann", 0): np.asarray(local["Cu"], dtype=complex),
+        ("ann", 1): np.asarray(local["Cd"], dtype=complex),
+        ("cre", 0): np.asarray(local["Cdu"], dtype=complex),
+        ("cre", 1): np.asarray(local["Cdd"], dtype=complex),
+    }
+
+    mpo = []
+    for i in range(state.L):
+        op_i = eye
+        for kind, sigma, site in op_specs:
+            if i < site:
+                factor = jw
+            elif i == site:
+                factor = local_by_spec[(kind, sigma)]
+            else:
+                factor = eye
+            op_i = op_i @ factor
+        mpo.append(op_i.reshape(1, 1, 4, 4))
+    return expect_mps(state.Bs, mpo, state.Bs) / norm
+
+
+class _SpatialNPDMContractions:
+    """Environment-cached contractions for spatial-site NPDM elements."""
+
+    def __init__(self, state):
+        self.state = state
+        self.L = state.L
+        self.Bs = [state._get_std_B(i) for i in range(self.L)]
+        local = SpinHalfFermionOperators()
+        self.local_ops = {
+            "I": np.eye(4, dtype=complex),
+            "JW": np.asarray(local["JW"], dtype=complex),
+            ("ann", 0): np.asarray(local["Cu"], dtype=complex),
+            ("ann", 1): np.asarray(local["Cd"], dtype=complex),
+            ("cre", 0): np.asarray(local["Cdu"], dtype=complex),
+            ("cre", 1): np.asarray(local["Cdd"], dtype=complex),
+        }
+        self._site_op_cache = {}
+        self._transfer_matrix_cache = {}
+        self.left_env, self.right_env = self._build_identity_envs()
+        self.norm = state._mps_dot(state, state)
+        self._use_transfer_matrices = all(
+            max(B.shape[0] * B.shape[0], B.shape[2] * B.shape[2]) <= 512
+            for B in self.Bs
+        )
+
+    @staticmethod
+    def _transfer(E, B, op):
+        return np.einsum("ab,asr,st,btu->ru", E, B.conj(), op, B, optimize=True)
+
+    def _build_identity_envs(self):
+        left_env = [np.array([[1.0 + 0.0j]])]
+        for i in range(self.L - 1):
+            left_env.append(self._transfer(left_env[-1], self.Bs[i], self.local_ops["I"]))
+
+        right_env = [None] * self.L
+        right_env[-1] = np.array([[1.0 + 0.0j]])
+        for i in range(self.L - 1, 0, -1):
+            B = self.Bs[i]
+            R = right_env[i]
+            right_env[i - 1] = np.einsum(
+                "ru,asr,st,btu->ab",
+                R,
+                B.conj(),
+                self.local_ops["I"],
+                B,
+                optimize=True,
+            )
+        return left_env, right_env
+
+    def _site_op_key(self, op_specs, site):
+        key = []
+        for kind, sigma, op_site in op_specs:
+            if site < op_site:
+                key.append("JW")
+            elif site == op_site:
+                key.append((kind, sigma))
+        return tuple(key)
+
+    def _site_op(self, key):
+        if not key:
+            return self.local_ops["I"]
+        op = self._site_op_cache.get(key)
+        if op is None:
+            op = self.local_ops["I"]
+            for part in key:
+                op = op @ self.local_ops[part]
+            self._site_op_cache[key] = op
+        return op
+
+    def _site_transfer_matrix(self, site, key):
+        cache_key = (site, key)
+        mat = self._transfer_matrix_cache.get(cache_key)
+        if mat is None:
+            B = self.Bs[site]
+            op = self._site_op(key)
+            mat = np.einsum("asr,st,btu->ruab", B.conj(), op, B, optimize=True)
+            mat = mat.reshape(B.shape[2] * B.shape[2], B.shape[0] * B.shape[0])
+            self._transfer_matrix_cache[cache_key] = mat
+        return mat
+
+    def _close_with_right(self, E, site):
+        return np.sum(E * self.right_env[site])
+
+    def expect_string(self, op_specs):
+        sites = [site for _, _, site in op_specs]
+        first = min(sites)
+        last = max(sites)
+        if self._use_transfer_matrices:
+            vec = self.left_env[first].reshape(-1)
+            for site in range(first, last + 1):
+                key = self._site_op_key(op_specs, site)
+                vec = self._site_transfer_matrix(site, key) @ vec
+            return np.dot(vec, self.right_env[last].reshape(-1)) / self.norm
+
+        E = self.left_env[first]
+        for site in range(first, last + 1):
+            key = self._site_op_key(op_specs, site)
+            E = self._transfer(E, self.Bs[site], self._site_op(key))
+        return self._close_with_right(E, last) / self.norm
+
+
 def _build_spatial_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
     """Build symbolic spatial-site terms for total S^2."""
     term_map = {}
@@ -1334,6 +1522,7 @@ class DMRG(CASCI):
         self._symmetric_mpo_cache = {}
         self._s2_mpo_cache = {}
         self._spatial_operator_cache = None
+        self.spatial_rdm2_algorithm = "npdm"
         self._active_hamiltonian = None
         self._active_integral_build_info = None
 
@@ -2274,6 +2463,7 @@ class DMRG(CASCI):
             self.build(mo_coeff=mo_coeff)
         if self.H_raw is None:
             self.build()
+        sweep_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.tol))
         # Initialize Symmetry
         self.sym_mgr = SymmetryManager(symmetry_list)
         if self.sym_mgr.enabled:
@@ -2289,7 +2479,7 @@ class DMRG(CASCI):
                     nsweeps=nsweeps,
                     max_bond=self.D,
                     initial_guess=initial_guess,
-                    conv_tol=kwargs.pop("conv_tol", self.tol),
+                    conv_tol=sweep_tol,
                     nstates=nstates,
                     weights=self.weights,
                     verbose=self.verbose,
@@ -2388,6 +2578,7 @@ class DMRG(CASCI):
                 nstates=self.nstates,
                 weights=self.weights,
                 verbose=self.verbose,
+                sweep_tol=sweep_tol,
             )
             dmrg.run()
             current_guess = dmrg.ground_state.copy()
@@ -2448,17 +2639,21 @@ class DMRG(CASCI):
 
         print(f"{'Orb':<5} {'Spin':<6} {'Occ':<10} {'Sz_local':<10} {'Status'}")
         print("-" * 60)
-        # Iterate over Spatial Orbitals (each splits into 2 Spin-Orbitals)
-        # now still assuming d=2 (Spin-Orbital) mapping: 2*i = Up, 2*i+1 = Down
         for i in range(self.ncas):
-            # Spin Up Site
-            idx_up = 2 * i
-            rho_up = rdms[idx_up]
-            n_up = rho_up[1, 1].real
-            # Spin Down Site
-            idx_dn = 2 * i + 1
-            rho_dn = rdms[idx_dn]
-            n_dn = rho_dn[1, 1].real
+            if self.site == "spatial":
+                rho = rdms[i]
+                if rho.shape[0] < 4:
+                    print("  [Warning] Spatial-site symmetry check requires canonical d=4 sites.")
+                    return
+                n_up = (rho[1, 1] + rho[3, 3]).real
+                n_dn = (rho[2, 2] + rho[3, 3]).real
+            else:
+                idx_up = 2 * i
+                rho_up = rdms[idx_up]
+                n_up = rho_up[1, 1].real
+                idx_dn = 2 * i + 1
+                rho_dn = rdms[idx_dn]
+                n_dn = rho_dn[1, 1].real
 
             # Charge = N_up + N_dn
             n_local = n_up + n_dn
@@ -2511,27 +2706,40 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state, "sites"):
-            psi = _nonabelian_mps_to_dense_vector(state)
-        elif hasattr(state.Bs[0], 'qns'):
-            from pyqed.mps.mps import symmetric_to_dense
-            state = symmetric_to_dense(state)
-            psi = _mps_to_dense_vector(state)
-        else:
-            psi = _mps_to_dense_vector(state)
-        norm = np.vdot(psi, psi)
-        ops = self._get_spatial_ops_for_rdm()
-        holes = {
-            (sigma, p): ops["ann"][sigma][p] @ psi
-            for sigma in range(2)
-            for p in range(self.ncas)
-        }
+        mps_state = _spatial_rdm_dense_mps(state)
+        if mps_state is not None:
+            norm = mps_state._mps_dot(mps_state, mps_state)
+            if abs(norm) < 1e-14:
+                raise ValueError("Cannot build RDMs from a zero-norm MPS.")
+            holes = {
+                (sigma, p): _apply_spatial_annihilation_mps(mps_state, sigma, p)
+                for sigma in range(2)
+                for p in range(self.ncas)
+            }
 
-        p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
-        for sigma in range(2):
-            for p in range(self.ncas):
-                for q in range(self.ncas):
-                    p_raw[2 * p + sigma, 2 * q + sigma] = np.vdot(holes[(sigma, p)], holes[(sigma, q)]) / norm
+            p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
+            for sigma in range(2):
+                for p in range(self.ncas):
+                    for q in range(self.ncas):
+                        p_raw[2 * p + sigma, 2 * q + sigma] = (
+                            holes[(sigma, p)]._mps_dot(holes[(sigma, p)], holes[(sigma, q)])
+                            / norm
+                        )
+        else:
+            psi = _nonabelian_mps_to_dense_vector(state)
+            norm = np.vdot(psi, psi)
+            ops = self._get_spatial_ops_for_rdm()
+            holes = {
+                (sigma, p): ops["ann"][sigma][p] @ psi
+                for sigma in range(2)
+                for p in range(self.ncas)
+            }
+
+            p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
+            for sigma in range(2):
+                for p in range(self.ncas):
+                    for q in range(self.ncas):
+                        p_raw[2 * p + sigma, 2 * q + sigma] = np.vdot(holes[(sigma, p)], holes[(sigma, q)]) / norm
 
         if spatial or with_core:
             p_spatial = np.zeros((self.ncas, self.ncas), dtype=float)
@@ -2557,55 +2765,178 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state, "sites"):
-            psi = _nonabelian_mps_to_dense_vector(state)
-        elif hasattr(state.Bs[0], 'qns'):
-            from pyqed.mps.mps import symmetric_to_dense
-            state = symmetric_to_dense(state)
-            psi = _mps_to_dense_vector(state)
-        else:
-            psi = _mps_to_dense_vector(state)
-        norm = np.vdot(psi, psi)
-        ops = self._get_spatial_ops_for_rdm()
+        mps_state = _spatial_rdm_dense_mps(state)
+        if mps_state is not None:
+            norm = mps_state._mps_dot(mps_state, mps_state)
+            if abs(norm) < 1e-14:
+                raise ValueError("Cannot build RDMs from a zero-norm MPS.")
 
-        double_holes = {}
-        for sigma in range(2):
-            for p in range(self.ncas):
-                first_hole = ops["ann"][sigma][p] @ psi
-                for tau in range(2):
-                    for r in range(self.ncas):
-                        double_holes[(sigma, p, tau, r)] = ops["ann"][tau][r] @ first_hole
+            rdm2_algorithm = getattr(self, "spatial_rdm2_algorithm", "gram")
+            if rdm2_algorithm not in {"gram", "direct", "npdm"}:
+                raise ValueError("spatial_rdm2_algorithm must be 'gram', 'direct', or 'npdm'.")
 
-        if spatial or with_core:
-            g_out = np.zeros((self.ncas, self.ncas, self.ncas, self.ncas), dtype=float)
-            for p in range(self.ncas):
-                for q in range(self.ncas):
-                    for r in range(self.ncas):
-                        for s in range(self.ncas):
-                            val = 0.0j
-                            for sigma in range(2):
-                                for tau in range(2):
-                                    left = double_holes[(sigma, p, tau, r)]
-                                    right = double_holes[(sigma, q, tau, s)]
-                                    val += np.vdot(left, right) / norm
-                            g_out[p, q, r, s] = float(np.real(val))
-        else:
-            nspin = 2 * self.ncas
-            g_out = np.zeros((nspin, nspin, nspin, nspin), dtype=complex)
-            for p in range(self.ncas):
-                for q in range(self.ncas):
-                    for r in range(self.ncas):
-                        for s in range(self.ncas):
-                            for sigma in range(2):
-                                for tau in range(2):
-                                    left = double_holes[(sigma, p, tau, r)]
-                                    right = double_holes[(sigma, q, tau, s)]
+            double_holes = {}
+            if rdm2_algorithm == "gram":
+                single_holes = {
+                    (sigma, p): _apply_spatial_annihilation_mps(mps_state, sigma, p)
+                    for sigma in range(2)
+                    for p in range(self.ncas)
+                }
+                for sigma in range(2):
+                    for p in range(self.ncas):
+                        first_hole = single_holes[(sigma, p)]
+                        for tau in range(2):
+                            for r in range(self.ncas):
+                                double_holes[(sigma, p, tau, r)] = _apply_spatial_annihilation_mps(
+                                    first_hole,
+                                    tau,
+                                    r,
+                                )
+            npdm = _SpatialNPDMContractions(mps_state) if rdm2_algorithm == "npdm" else None
+            if npdm is not None and abs(npdm.norm) < 1e-14:
+                raise ValueError("Cannot build RDMs from a zero-norm MPS.")
+
+            if spatial or with_core:
+                g_out = np.zeros((self.ncas, self.ncas, self.ncas, self.ncas), dtype=float)
+                if rdm2_algorithm in {"direct", "npdm"}:
+                    pairs = [(p, r) for p in range(self.ncas) for r in range(self.ncas)]
+                    for sigma in range(2):
+                        for tau in range(2):
+                            for a, (p, r) in enumerate(pairs):
+                                for b in range(a, len(pairs)):
+                                    q, s = pairs[b]
+                                    op_specs = [
+                                        ("cre", sigma, p),
+                                        ("cre", tau, r),
+                                        ("ann", tau, s),
+                                        ("ann", sigma, q),
+                                    ]
+                                    if rdm2_algorithm == "npdm":
+                                        val = npdm.expect_string(op_specs).real
+                                    else:
+                                        val = _spatial_fermion_string_expectation_mps(
+                                            mps_state,
+                                            op_specs,
+                                            norm,
+                                        ).real
+                                    g_out[p, q, r, s] += val
+                                    if b != a:
+                                        g_out[q, p, s, r] += val
+                else:
+                    for sigma in range(2):
+                        for tau in range(2):
+                            states = [
+                                double_holes[(sigma, p, tau, r)]
+                                for p in range(self.ncas)
+                                for r in range(self.ncas)
+                            ]
+                            gram = _two_hole_gram_block(states, norm)
+                            block = gram.reshape(self.ncas, self.ncas, self.ncas, self.ncas)
+                            g_out += block.transpose(0, 2, 1, 3).real
+            else:
+                nspin = 2 * self.ncas
+                g_out = np.zeros((nspin, nspin, nspin, nspin), dtype=complex)
+                if rdm2_algorithm in {"direct", "npdm"}:
+                    pairs = [(p, r) for p in range(self.ncas) for r in range(self.ncas)]
+                    for sigma in range(2):
+                        for tau in range(2):
+                            for a, (p, r) in enumerate(pairs):
+                                for b in range(a, len(pairs)):
+                                    q, s = pairs[b]
+                                    op_specs = [
+                                        ("cre", sigma, p),
+                                        ("cre", tau, r),
+                                        ("ann", tau, s),
+                                        ("ann", sigma, q),
+                                    ]
+                                    if rdm2_algorithm == "npdm":
+                                        val = npdm.expect_string(op_specs)
+                                    else:
+                                        val = _spatial_fermion_string_expectation_mps(
+                                            mps_state,
+                                            op_specs,
+                                            norm,
+                                        )
                                     g_out[
                                         2 * p + sigma,
                                         2 * r + tau,
                                         2 * s + tau,
                                         2 * q + sigma,
-                                    ] = np.vdot(left, right) / norm
+                                    ] = val
+                                    if b != a:
+                                        g_out[
+                                            2 * q + sigma,
+                                            2 * s + tau,
+                                            2 * r + tau,
+                                            2 * p + sigma,
+                                        ] = val.conjugate()
+                else:
+                    for sigma in range(2):
+                        for tau in range(2):
+                            states = [
+                                double_holes[(sigma, p, tau, r)]
+                                for p in range(self.ncas)
+                                for r in range(self.ncas)
+                            ]
+                            block = _two_hole_gram_block(states, norm).reshape(
+                                self.ncas,
+                                self.ncas,
+                                self.ncas,
+                                self.ncas,
+                            )
+                            for p in range(self.ncas):
+                                for q in range(self.ncas):
+                                    for r in range(self.ncas):
+                                        for s in range(self.ncas):
+                                            g_out[
+                                                2 * p + sigma,
+                                                2 * r + tau,
+                                                2 * s + tau,
+                                                2 * q + sigma,
+                                            ] = block[p, r, q, s]
+        else:
+            psi = _nonabelian_mps_to_dense_vector(state)
+            norm = np.vdot(psi, psi)
+            ops = self._get_spatial_ops_for_rdm()
+
+            double_holes = {}
+            for sigma in range(2):
+                for p in range(self.ncas):
+                    first_hole = ops["ann"][sigma][p] @ psi
+                    for tau in range(2):
+                        for r in range(self.ncas):
+                            double_holes[(sigma, p, tau, r)] = ops["ann"][tau][r] @ first_hole
+
+            if spatial or with_core:
+                g_out = np.zeros((self.ncas, self.ncas, self.ncas, self.ncas), dtype=float)
+                for p in range(self.ncas):
+                    for q in range(self.ncas):
+                        for r in range(self.ncas):
+                            for s in range(self.ncas):
+                                val = 0.0j
+                                for sigma in range(2):
+                                    for tau in range(2):
+                                        left = double_holes[(sigma, p, tau, r)]
+                                        right = double_holes[(sigma, q, tau, s)]
+                                        val += np.vdot(left, right) / norm
+                                g_out[p, q, r, s] = float(np.real(val))
+            else:
+                nspin = 2 * self.ncas
+                g_out = np.zeros((nspin, nspin, nspin, nspin), dtype=complex)
+                for p in range(self.ncas):
+                    for q in range(self.ncas):
+                        for r in range(self.ncas):
+                            for s in range(self.ncas):
+                                for sigma in range(2):
+                                    for tau in range(2):
+                                        left = double_holes[(sigma, p, tau, r)]
+                                        right = double_holes[(sigma, q, tau, s)]
+                                        g_out[
+                                            2 * p + sigma,
+                                            2 * r + tau,
+                                            2 * s + tau,
+                                            2 * q + sigma,
+                                        ] = np.vdot(left, right) / norm
 
         if with_core:
             ncore = self.ncore

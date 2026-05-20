@@ -19,6 +19,9 @@ from pyqed.qchem.mcscf.casci import (
 
 
 from pyqed.optimize import minimize
+from pyqed.optimize import grad as opt_grad
+from pyqed.optimize import gradient as opt_gradient
+from pyqed.optimize import norm as opt_norm
 
 
 def _orthonormalize_columns(U, eps=1.0e-12):
@@ -186,6 +189,50 @@ def _run_casci_like(mc, *args, method="direct_ci", **kwargs):
     return mc.run(*args, method=method, **kwargs)
 
 
+def _wguess(src, dst, state=0):
+    """Reuse the accepted DMRG MPS as the next macroiteration guess."""
+
+    if not hasattr(src, "export_initial_guess"):
+        return
+    try:
+        dst.init_guess = src.export_initial_guess(state=state)
+    except Exception:
+        return
+
+
+def _cap(cap0, tr):
+    if tr is None:
+        return cap0
+    if cap0 is None:
+        return tr
+    return min(float(cap0), float(tr))
+
+
+def _gn(U, h1e, eri, dm1, dm2):
+    g = opt_gradient(U, h1e, eri, dm1, dm2)
+    return float(opt_norm(opt_grad(U, g)))
+
+
+def _sdiag(mc):
+    dmrg = getattr(mc, "dmrg", None)
+    hist = getattr(dmrg, "sweep_history", None)
+    out = {"solver": bool(getattr(dmrg, "converged", False))}
+    if not hist:
+        return out
+    out["nsw"] = len(hist)
+    out["sweep_E"] = hist[-1].get("energy")
+    if len(hist) > 1:
+        e0 = hist[-2].get("energy")
+        e1 = hist[-1].get("energy")
+        try:
+            out["sweep_dE"] = float(e1 - e0)
+        except Exception:
+            pass
+    out["trunc"] = hist[-1].get("truncation")
+    out["kept"] = hist[-1].get("states_kept")
+    return out
+
+
 def _solver_converged(mc):
     """Return whether the active-space solver attached to ``mc`` converged."""
 
@@ -220,13 +267,24 @@ class COCAS(CASCI):
                  optimizer_tol=1.0e-4,
                  optimizer_max_steps=200,
                  optimizer_max_step_norm=None,
+                 macro_tol=1.0e-6,
+                 orb_grad_tol=None,
+                 reject_macro_energy=True,
+                 macro_energy_rise_tol=1.0e-8,
+                 macro_reject_max=8,
+                 macro_trust_radius=0.25,
+                 macro_trust_min=1.0e-4,
+                 macro_trust_max=1.0,
+                 macro_trust_shrink=0.5,
+                 macro_trust_grow=1.5,
+                 warm_start_dmrg=True,
                  use_cholesky=None,
                  verbose=0,
                  **kwargs):
         super().__init__(mf, ncas, nelecas, verbose=verbose, **kwargs)
 
         self.max_cycles = max_cycles # macroiterations
-        self.tol = 1e-6 # energy tol
+        self.tol = float(macro_tol) # macro energy tol
         self.mo_coeff = None # opt orb
         # Orbital optimization backend for the U-matrix formulation.
         self.optimizer = optimizer.upper()
@@ -238,6 +296,20 @@ class COCAS(CASCI):
         self.optimizer_max_step_norm = (
             None if optimizer_max_step_norm is None else float(optimizer_max_step_norm)
         )
+        self.orb_grad_tol = (
+            None if orb_grad_tol is None else float(orb_grad_tol)
+        )
+        self.reject_macro_energy = bool(reject_macro_energy)
+        self.macro_energy_rise_tol = float(macro_energy_rise_tol)
+        self.macro_reject_max = int(macro_reject_max)
+        self.macro_trust_radius = (
+            None if macro_trust_radius is None else float(macro_trust_radius)
+        )
+        self.macro_trust_min = float(macro_trust_min)
+        self.macro_trust_max = float(macro_trust_max)
+        self.macro_trust_shrink = float(macro_trust_shrink)
+        self.macro_trust_grow = float(macro_trust_grow)
+        self.warm_start_dmrg = bool(warm_start_dmrg)
         # Optional DIIS mixing over the optimized U matrices.  This mirrors the
         # main-branch accelerator while keeping it configurable on bg.
         self.diis = diis
@@ -313,6 +385,17 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
+                tol=self.tol,
+                orb_grad_tol=self.orb_grad_tol,
+                reject_macro_energy=self.reject_macro_energy,
+                macro_energy_rise_tol=self.macro_energy_rise_tol,
+                macro_reject_max=self.macro_reject_max,
+                macro_trust_radius=self.macro_trust_radius,
+                macro_trust_min=self.macro_trust_min,
+                macro_trust_max=self.macro_trust_max,
+                macro_trust_shrink=self.macro_trust_shrink,
+                macro_trust_grow=self.macro_trust_grow,
+                warm_start_dmrg=self.warm_start_dmrg,
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
@@ -334,6 +417,17 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
+                tol=self.tol,
+                orb_grad_tol=self.orb_grad_tol,
+                reject_macro_energy=self.reject_macro_energy,
+                macro_energy_rise_tol=self.macro_energy_rise_tol,
+                macro_reject_max=self.macro_reject_max,
+                macro_trust_radius=self.macro_trust_radius,
+                macro_trust_min=self.macro_trust_min,
+                macro_trust_max=self.macro_trust_max,
+                macro_trust_shrink=self.macro_trust_shrink,
+                macro_trust_grow=self.macro_trust_grow,
+                warm_start_dmrg=self.warm_start_dmrg,
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
@@ -345,6 +439,7 @@ class COCAS(CASCI):
         self.e_tot = mc.e_tot
         self.ci = mc.ci
         self.e_history = getattr(mc, 'e_history', [self.e_tot])
+        self.macro_diagnostics = getattr(mc, "macro_diagnostics", [])
         self.e_core = mc.e_core
         self.hcore = mc.hcore
         self.h1e = getattr(mc, 'h1e', None)
@@ -405,7 +500,14 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
            optimizer='RCG', optimizer_history=7, optimizer_tol=1.0e-4,
            optimizer_max_steps=200, optimizer_max_step_norm=None,
            diis=True,
-           diis_space=6, diis_start=2, ci_method='direct_ci', **kwargs):
+           diis_space=6, diis_start=2, ci_method='direct_ci',
+           reject_macro_energy=True, macro_energy_rise_tol=1.0e-8,
+           macro_reject_max=8,
+           orb_grad_tol=None, macro_trust_radius=0.25,
+           macro_trust_min=1.0e-4, macro_trust_max=1.0,
+           macro_trust_shrink=0.5, macro_trust_grow=1.5,
+           warm_start_dmrg=True,
+           raise_on_nonconvergence=True, **kwargs):
     r"""
     complete active space orbital optimization with orthonomality constraint
 
@@ -459,31 +561,84 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     if diis:
         orbital_diis = OrbitalDIIS(max_space=diis_space, start=diis_start)
 
-    # ``U`` is the current orbital subspace transform.  We improve this same
-    # variable across macroiterations instead of restarting every time from the
-    # initial guess ``U0``.
-    U, E = minimize(
-        energy, U0, args=(h1e, eri, dm1, dm2),
-        algorithm=optimizer, history_size=optimizer_history,
-        epsilon=optimizer_tol,
-        max_iterations=optimizer_max_steps,
-        max_step_norm=optimizer_max_step_norm,
-    )
-    U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
+    cap0 = optimizer_max_step_norm
+    gt = optimizer_tol if orb_grad_tol is None else float(orb_grad_tol)
+    tr = None if macro_trust_radius is None else float(macro_trust_radius)
+    tr_min = float(macro_trust_min)
+    tr_max = float(macro_trust_max)
+    tr_dn = float(macro_trust_shrink)
+    tr_up = float(macro_trust_grow)
+    diag = []
+
+    def opt_u(u, d1, d2, st, cap, use_diis=True):
+        u1, e1 = minimize(
+            energy, u, args=(h1e, eri, d1, d2), tau=st,
+            algorithm=optimizer, history_size=optimizer_history,
+            epsilon=optimizer_tol,
+            max_iterations=optimizer_max_steps,
+            max_step_norm=cap,
+        )
+        if use_diis:
+            u1 = _apply_orbital_diis(orbital_diis, u1, h1e, eri, d1, d2, e1)
+        return u1
+
+    U_acc = U0
+    gn = _gn(U_acc, h1e, eri, dm1, dm2)
+    U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
 
     k = 0
 
     e_old = mc.e_tot
+    e_history = [mc.e_tot]
+    last_mo_coeff = C0 @ U_acc
+    best_e = float(np.real(np.asarray(mc.e_tot).reshape(-1)[0]))
+    best_mc = mc
+    best_C = last_mo_coeff
 
     converged = False
     while k < max_cycles:
 
-        mo_coeff = C0 @ U
+        st = 1.0
+        cap = _cap(cap0, tr)
+        ok = False
+        rej = 0
+        for ir in range(int(macro_reject_max) + 1):
+            mo_coeff = C0 @ U
 
-        current_mc = _fresh_casci_like(mc)
-        _run_casci_like(current_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+            current_mc = _fresh_casci_like(mc)
+            if warm_start_dmrg:
+                _wguess(mc, current_mc)
+            _run_casci_like(current_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
 
-        if abs(current_mc.e_tot - e_old) < tol:
+            if (not reject_macro_energy) or current_mc.e_tot <= e_old + macro_energy_rise_tol:
+                ok = True
+                break
+
+            rej += 1
+            st *= 0.5
+            tr = None if tr is None else max(tr_min, tr * tr_dn)
+            cap = _cap(cap0, tr)
+            U = opt_u(U_acc, dm1, dm2, st, cap, use_diis=False)
+
+        if not ok:
+            break
+
+        last_mo_coeff = mo_coeff
+        e_history.append(current_mc.e_tot)
+        de = float(np.real(np.asarray(current_mc.e_tot - e_old).reshape(-1)[0]))
+        e_now = float(np.real(np.asarray(current_mc.e_tot).reshape(-1)[0]))
+        row = {"macro": k + 1, "energy": e_now, "dE": de, "gn": gn, "tr": tr, "rej": rej}
+        row.update(_sdiag(current_mc))
+        diag.append(row)
+        if e_now < best_e:
+            best_e = e_now
+            best_mc = current_mc
+            best_C = mo_coeff
+
+        if tr is not None and rej == 0:
+            tr = min(tr_max, tr * tr_up)
+
+        if abs(current_mc.e_tot - e_old) < tol and gn < gt:
             if getattr(mc, "verbose", 0) >= 1:
                 print('\nCASSCF converged at macroiteration {}'.format(k))
                 print("E(CASSCF) = {}".format(current_mc.e_tot))
@@ -491,29 +646,31 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
             converged = True
             break
 
+        U_acc = U
         mc = current_mc
         e_old = mc.e_tot
 
 
         dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
+        gn = _gn(U_acc, h1e, eri, dm1, dm2)
 
-        # Keep refining the current orbital subspace.  Restarting from ``U0``
-        # here would throw away all previous orbital optimization work and can
-        # bias the macroiterations away from the true CASSCF stationary point.
-        U, E = minimize(
-            energy, U, args=(h1e, eri, dm1, dm2), tau=1,
-            algorithm=optimizer, history_size=optimizer_history,
-            epsilon=optimizer_tol,
-            max_iterations=optimizer_max_steps,
-            max_step_norm=optimizer_max_step_norm,
-        )
-        U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
+        U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
         # print(E + mol.energy_nuc())
 
         k += 1
 
     if not converged:
-        raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        if raise_on_nonconvergence:
+            raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        mc = best_mc
+        mc.e_history = e_history
+        mc.macro_diagnostics = diag
+        _set_convergence_metadata(
+            mc,
+            macro_converged=False,
+            macro_iterations=k,
+        )
+        return best_C, mc
 
     # Rebuild the final CASCI result from scratch at the returned orbitals.
     # Reusing the same CASCI object across many macroiterations can leave the
@@ -533,7 +690,11 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         value = getattr(mc, name, None)
         if value is not None:
             setattr(final_mc, name, value)
+    if warm_start_dmrg:
+        _wguess(mc, final_mc)
     _run_casci_like(final_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    final_mc.e_history = e_history
+    final_mc.macro_diagnostics = diag
     _set_convergence_metadata(
         final_mc,
         macro_converged=True,
@@ -549,7 +710,15 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                          optimizer_max_steps=200,
                          optimizer_max_step_norm=None,
                          diis=True, diis_space=6,
-                         diis_start=2, ci_method='direct_ci', **kwargs):
+                         diis_start=2, ci_method='direct_ci',
+                         reject_macro_energy=True,
+                         macro_energy_rise_tol=1.0e-8,
+                         macro_reject_max=8,
+                         orb_grad_tol=None, macro_trust_radius=0.25,
+                         macro_trust_min=1.0e-4, macro_trust_max=1.0,
+                         macro_trust_shrink=0.5, macro_trust_grow=1.5,
+                         warm_start_dmrg=True,
+                         raise_on_nonconvergence=True, **kwargs):
 
     if mc.ncore > 0:
         with_core = True
@@ -573,39 +742,90 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     # State-averaged CASSCF uses the same ``U`` variable as the state-specific
     # kernel, so it should also keep improving the latest orbital transform
     # rather than restarting from ``U0`` in every macroiteration.
-    U, E = minimize(
-        energy, U0, args=(h1e, eri, dm1, dm2),
-        algorithm=optimizer, history_size=optimizer_history,
-        epsilon=optimizer_tol,
-        max_iterations=optimizer_max_steps,
-        max_step_norm=optimizer_max_step_norm,
-    )
-    U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
+    cap0 = optimizer_max_step_norm
+    gt = optimizer_tol if orb_grad_tol is None else float(orb_grad_tol)
+    tr = None if macro_trust_radius is None else float(macro_trust_radius)
+    tr_min = float(macro_trust_min)
+    tr_max = float(macro_trust_max)
+    tr_dn = float(macro_trust_shrink)
+    tr_up = float(macro_trust_grow)
+    diag = []
+
+    def opt_u(u, d1, d2, st, cap, use_diis=True):
+        u1, e1 = minimize(
+            energy, u, args=(h1e, eri, d1, d2), tau=st,
+            algorithm=optimizer, history_size=optimizer_history,
+            epsilon=optimizer_tol,
+            max_iterations=optimizer_max_steps,
+            max_step_norm=cap,
+        )
+        if use_diis:
+            u1 = _apply_orbital_diis(orbital_diis, u1, h1e, eri, d1, d2, e1)
+        return u1
 
 
     e_old = sum(weights * mc.e_tot)
+    U_acc = U0
+    gn = _gn(U_acc, h1e, eri, dm1, dm2)
+    U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
+    last_mo_coeff = C0 @ U_acc
+    best_e = float(np.real(np.asarray(e_old).reshape(-1)[0]))
+    best_mc = mc
+    best_C = last_mo_coeff
 
     converged = False
     k = 0
     while k < max_cycles:
 
-        mo_coeff = C0 @ U
+        st = 1.0
+        cap = _cap(cap0, tr)
+        ok = False
+        rej = 0
+        for ir in range(int(macro_reject_max) + 1):
+            mo_coeff = C0 @ U
 
-        current_mc = _fresh_casci_like(mc)
-        _run_casci_like(
-            current_mc,
-            nstates,
-            mo_coeff=mo_coeff,
-            method=ci_method,
-            **kwargs,
-        )
-        current_mc.nstates = nstates
+            current_mc = _fresh_casci_like(mc)
+            if warm_start_dmrg:
+                _wguess(mc, current_mc)
+            _run_casci_like(
+                current_mc,
+                nstates,
+                mo_coeff=mo_coeff,
+                method=ci_method,
+                **kwargs,
+            )
+            current_mc.nstates = nstates
 
+            eAve = sum(weights * current_mc.e_tot)
+            if (not reject_macro_energy) or eAve <= e_old + macro_energy_rise_tol:
+                ok = True
+                break
+
+            rej += 1
+            st *= 0.5
+            tr = None if tr is None else max(tr_min, tr * tr_dn)
+            cap = _cap(cap0, tr)
+            U = opt_u(U_acc, dm1, dm2, st, cap, use_diis=False)
+
+        if not ok:
+            break
+
+        last_mo_coeff = mo_coeff
         e_history.append(current_mc.e_tot)
+        de = float(np.real(np.asarray(eAve - e_old).reshape(-1)[0]))
+        e_now = float(np.real(np.asarray(eAve).reshape(-1)[0]))
+        row = {"macro": k + 1, "energy": e_now, "dE": de, "gn": gn, "tr": tr, "rej": rej}
+        row.update(_sdiag(current_mc))
+        diag.append(row)
+        if e_now < best_e:
+            best_e = e_now
+            best_mc = current_mc
+            best_C = mo_coeff
 
-        eAve = sum(weights * current_mc.e_tot)
+        if tr is not None and rej == 0:
+            tr = min(tr_max, tr * tr_up)
 
-        if abs(eAve - e_old) < tol:
+        if abs(eAve - e_old) < tol and gn < gt:
             if getattr(mc, "verbose", 0) >= 1:
                 print('CASSCF converged at macroiteration {}'.format(k))
                 print("E(CASSCF) = {}".format(current_mc.e_tot))
@@ -613,6 +833,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             converged = True
             break
 
+        U_acc = U
         mc = current_mc
         e_old = eAve
 
@@ -623,25 +844,29 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             _dm1, _dm2 = mc.make_rdm12(n, with_core=with_core)
             dm1 += _dm1 * weights[n]
             dm2 += _dm2 * weights[n]
+        gn = _gn(U_acc, h1e, eri, dm1, dm2)
 
         # Reuse the more conservative restart step from the state-specific
         # kernel.  The state-averaged surface is typically flatter, so jumping
         # back to the global default ``tau=2`` every macroiteration is often
         # too aggressive.
-        U, E = minimize(
-            energy, U, args=(h1e, eri, dm1, dm2), tau=1,
-            algorithm=optimizer, history_size=optimizer_history,
-            epsilon=optimizer_tol,
-            max_iterations=optimizer_max_steps,
-            max_step_norm=optimizer_max_step_norm,
-        )
-        U = _apply_orbital_diis(orbital_diis, U, h1e, eri, dm1, dm2, E)
+        U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
         # print(E + mol.energy_nuc())
 
         k += 1
 
     if not converged:
-        raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        if raise_on_nonconvergence:
+            raise RuntimeError('Max macro steps reached. CASSCF not converged.')
+        mc = best_mc
+        mc.e_history = e_history
+        mc.macro_diagnostics = diag
+        _set_convergence_metadata(
+            mc,
+            macro_converged=False,
+            macro_iterations=k,
+        )
+        return best_C, mc
 
     # As in the state-specific kernel, build a fresh final CASCI result so the
     # returned state-averaged orbitals and energies are self-consistent.
@@ -660,8 +885,11 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         value = getattr(mc, name, None)
         if value is not None:
             setattr(final_mc, name, value)
+    if warm_start_dmrg:
+        _wguess(mc, final_mc)
     _run_casci_like(final_mc, nstates, mo_coeff=mo_coeff, method=ci_method, **kwargs)
     final_mc.e_history = e_history
+    final_mc.macro_diagnostics = diag
     _set_convergence_metadata(
         final_mc,
         macro_converged=True,

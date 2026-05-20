@@ -5,10 +5,10 @@ Numerical integration helpers for AO-based DFT.
 """
 
 import numpy as np
-from gbasis.evals.eval import evaluate_basis
-from gbasis.evals.eval_deriv import evaluate_deriv_basis
 from periodictable import elements
 from scipy.integrate._lebedev import get_lebedev_sphere
+
+from pyqed.qchem.basis import ContractedGaussian
 
 
 BOHR_TO_ANGSTROM = 0.529177249
@@ -20,6 +20,8 @@ def _evaluate_basis_compat(basis, coords, screen_basis=True, tol_screen=1e-8):
     """
     Compatibility wrapper for different ``gbasis`` evaluator signatures.
     """
+    from gbasis.evals.eval import evaluate_basis
+
     try:
         return evaluate_basis(
             basis,
@@ -35,6 +37,8 @@ def _evaluate_deriv_basis_compat(basis, coords, orders, screen_basis=True, tol_s
     """
     Compatibility wrapper for different ``gbasis`` derivative-evaluator signatures.
     """
+    from gbasis.evals.eval_deriv import evaluate_deriv_basis
+
     try:
         return evaluate_deriv_basis(
             basis,
@@ -45,6 +49,149 @@ def _evaluate_deriv_basis_compat(basis, coords, orders, screen_basis=True, tol_s
         )
     except TypeError:
         return evaluate_deriv_basis(basis, coords, orders)
+
+
+def _is_native_basis(basis):
+    return basis is not None and len(basis) > 0 and all(
+        isinstance(fn, ContractedGaussian) for fn in basis
+    )
+
+
+def _basis_and_transform(mol):
+    basis = getattr(mol, '_bas_cart', None)
+    transform = getattr(mol, '_ao_cart2sph', None)
+    if basis is None:
+        basis = getattr(mol, '_bas', None)
+        transform = None
+    if basis is None:
+        raise ValueError("mol._bas is not available. Build the molecule before making an AO grid.")
+    return basis, transform
+
+
+def _pow_nonnegative(values, power):
+    if power < 0:
+        return np.zeros_like(values, dtype=float)
+    return np.power(values, power)
+
+
+def _gaussian_axis_derivative_poly(values, exponents, power, order):
+    values = np.asarray(values, dtype=float)[None, :]
+    exponents = np.asarray(exponents, dtype=float)[:, None]
+    power = int(power)
+    if order == 0:
+        poly = _pow_nonnegative(values, power)
+    elif order == 1:
+        poly = (
+            power * _pow_nonnegative(values, power - 1)
+            - 2.0 * exponents * _pow_nonnegative(values, power + 1)
+        )
+    elif order == 2:
+        poly = (
+            power * (power - 1) * _pow_nonnegative(values, power - 2)
+            - 2.0 * exponents * (2 * power + 1) * _pow_nonnegative(values, power)
+            + 4.0 * exponents * exponents * _pow_nonnegative(values, power + 2)
+        )
+    else:
+        raise NotImplementedError("Native AO grid derivatives are implemented up to second order.")
+    return poly
+
+
+def _evaluate_native_basis_derivative(basis, coords, orders):
+    return _evaluate_native_basis_derivatives(basis, coords, [orders])[0]
+
+
+def _evaluate_native_basis_derivatives(basis, coords, orders_list):
+    coords = np.asarray(coords, dtype=float)
+    orders_list = [tuple(int(order) for order in orders) for orders in orders_list]
+    for orders in orders_list:
+        if len(orders) != 3 or any(order < 0 for order in orders):
+            raise ValueError("orders must be a length-3 non-negative derivative order.")
+        if sum(orders) > 2:
+            raise NotImplementedError("Native AO grid derivatives are implemented up to second order.")
+
+    outputs = [
+        np.empty((len(basis), coords.shape[0]), dtype=float)
+        for _orders in orders_list
+    ]
+    for idx, fn in enumerate(basis):
+        rel = coords - np.asarray(fn.origin, dtype=float)
+        shell = tuple(int(v) for v in fn.shell)
+        exponents = np.asarray(fn.exps, dtype=float)
+        radial = np.exp(
+            -exponents[:, None] * np.einsum('gi,gi->g', rel, rel)[None, :]
+        )
+        axis_poly = {}
+        for axis in range(3):
+            for order in {orders[axis] for orders in orders_list}:
+                axis_poly[axis, order] = _gaussian_axis_derivative_poly(
+                    rel[:, axis],
+                    exponents,
+                    shell[axis],
+                    order,
+                )
+
+        weights = np.asarray(fn.prim_weights, dtype=float)
+        for out, orders in zip(outputs, orders_list):
+            primitive_values = radial.copy()
+            for axis in range(3):
+                primitive_values *= axis_poly[axis, orders[axis]]
+            out[idx] = weights @ primitive_values
+    return outputs
+
+
+def _transform_native_ao(values, transform):
+    if transform is None:
+        return np.asarray(values, dtype=float)
+    return np.asarray(transform, dtype=float).T @ np.asarray(values, dtype=float)
+
+
+def _evaluate_ao(mol, coords, screen_basis=True, tol_screen=1e-8):
+    return _evaluate_ao_derivatives(
+        mol,
+        coords,
+        [(0, 0, 0)],
+        screen_basis=screen_basis,
+        tol_screen=tol_screen,
+    )[0]
+
+
+def _evaluate_ao_derivative(mol, coords, orders, screen_basis=True, tol_screen=1e-8):
+    return _evaluate_ao_derivatives(
+        mol,
+        coords,
+        [orders],
+        screen_basis=screen_basis,
+        tol_screen=tol_screen,
+    )[0]
+
+
+def _evaluate_ao_derivatives(mol, coords, orders_list, screen_basis=True, tol_screen=1e-8):
+    basis, transform = _basis_and_transform(mol)
+    if _is_native_basis(basis):
+        return [
+            _transform_native_ao(values, transform).T
+            for values in _evaluate_native_basis_derivatives(basis, coords, orders_list)
+        ]
+
+    out = []
+    for orders in orders_list:
+        if tuple(int(order) for order in orders) == (0, 0, 0):
+            values = _evaluate_basis_compat(
+                basis,
+                coords,
+                screen_basis=screen_basis,
+                tol_screen=tol_screen,
+            ).T
+        else:
+            values = _evaluate_deriv_basis_compat(
+                basis,
+                coords,
+                np.asarray(orders, dtype=int),
+                screen_basis=screen_basis,
+                tol_screen=tol_screen,
+            ).T
+        out.append(values)
+    return out
 
 
 class AOGrid:
@@ -122,63 +269,42 @@ class AOGrid:
                       moves_with_atoms=False, owners=None, local_weights=None,
                       settings=None):
         """
-        Build an AOGrid from a ``pyqed.qchem.Molecule`` with ``mol._bas``.
+        Build an AOGrid from a ``pyqed.qchem.Molecule`` with an attached AO basis.
         """
-        if getattr(mol, '_bas', None) is None:
-            raise ValueError("mol._bas is not available. Call mol.build(driver='gbasis') first.")
-
         coords = np.asarray(coords, dtype=float)
         weights = np.asarray(weights, dtype=float)
-        ao = _evaluate_basis_compat(
-            mol._bas,
+        requested_orders = [(0, 0, 0)]
+        grad_orders = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+        if with_grad:
+            requested_orders.extend(grad_orders)
+        hess_orders = (
+            ((0, 0), (2, 0, 0)),
+            ((0, 1), (1, 1, 0)),
+            ((0, 2), (1, 0, 1)),
+            ((1, 1), (0, 2, 0)),
+            ((1, 2), (0, 1, 1)),
+            ((2, 2), (0, 0, 2)),
+        )
+        if with_hess:
+            requested_orders.extend(orders for _indices, orders in hess_orders)
+
+        evaluated = _evaluate_ao_derivatives(
+            mol,
             coords,
+            requested_orders,
             screen_basis=screen_basis,
             tol_screen=tol_screen,
-        ).T
+        )
+        values_by_order = dict(zip(requested_orders, evaluated))
+        ao = values_by_order[(0, 0, 0)]
         ao_grad = None
         if with_grad:
-            ao_grad = np.stack([
-                _evaluate_deriv_basis_compat(
-                    mol._bas,
-                    coords,
-                    np.array([1, 0, 0]),
-                    screen_basis=screen_basis,
-                    tol_screen=tol_screen,
-                ).T,
-                _evaluate_deriv_basis_compat(
-                    mol._bas,
-                    coords,
-                    np.array([0, 1, 0]),
-                    screen_basis=screen_basis,
-                    tol_screen=tol_screen,
-                ).T,
-                _evaluate_deriv_basis_compat(
-                    mol._bas,
-                    coords,
-                    np.array([0, 0, 1]),
-                    screen_basis=screen_basis,
-                    tol_screen=tol_screen,
-                ).T,
-            ], axis=0)
+            ao_grad = np.stack([values_by_order[orders] for orders in grad_orders], axis=0)
         ao_hess = None
         if with_hess:
             ao_hess = np.empty((3, 3, coords.shape[0], ao.shape[1]), dtype=float)
-            deriv_orders = (
-                ((0, 0), np.array([2, 0, 0])),
-                ((0, 1), np.array([1, 1, 0])),
-                ((0, 2), np.array([1, 0, 1])),
-                ((1, 1), np.array([0, 2, 0])),
-                ((1, 2), np.array([0, 1, 1])),
-                ((2, 2), np.array([0, 0, 2])),
-            )
-            for (i, j), orders in deriv_orders:
-                values = _evaluate_deriv_basis_compat(
-                    mol._bas,
-                    coords,
-                    orders,
-                    screen_basis=screen_basis,
-                    tol_screen=tol_screen,
-                ).T
+            for (i, j), orders in hess_orders:
+                values = values_by_order[orders]
                 ao_hess[i, j] = values
                 ao_hess[j, i] = values
         return cls(
@@ -253,32 +379,18 @@ class AOGrid:
         """
         if self.coords is None:
             raise ValueError("Grid coordinates are required to build AO gradients.")
-        if getattr(mol, '_bas', None) is None:
-            raise ValueError("mol._bas is not available. Call mol.build(driver='gbasis') first.")
 
-        self.ao_grad = np.stack([
-            _evaluate_deriv_basis_compat(
-                mol._bas,
+        grad_orders = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+        self.ao_grad = np.stack(
+            _evaluate_ao_derivatives(
+                mol,
                 self.coords,
-                np.array([1, 0, 0]),
+                grad_orders,
                 screen_basis=screen_basis,
                 tol_screen=tol_screen,
-            ).T,
-            _evaluate_deriv_basis_compat(
-                mol._bas,
-                self.coords,
-                np.array([0, 1, 0]),
-                screen_basis=screen_basis,
-                tol_screen=tol_screen,
-            ).T,
-            _evaluate_deriv_basis_compat(
-                mol._bas,
-                self.coords,
-                np.array([0, 0, 1]),
-                screen_basis=screen_basis,
-                tol_screen=tol_screen,
-            ).T,
-        ], axis=0)
+            ),
+            axis=0,
+        )
         return self
 
     def attach_hessians(self, mol, screen_basis=True, tol_screen=1e-8):
@@ -287,26 +399,24 @@ class AOGrid:
         """
         if self.coords is None:
             raise ValueError("Grid coordinates are required to build AO Hessians.")
-        if getattr(mol, '_bas', None) is None:
-            raise ValueError("mol._bas is not available. Call mol.build(driver='gbasis') first.")
 
         self.ao_hess = np.empty((3, 3, self.coords.shape[0], self.ao.shape[1]), dtype=float)
-        deriv_orders = (
-            ((0, 0), np.array([2, 0, 0])),
-            ((0, 1), np.array([1, 1, 0])),
-            ((0, 2), np.array([1, 0, 1])),
-            ((1, 1), np.array([0, 2, 0])),
-            ((1, 2), np.array([0, 1, 1])),
-            ((2, 2), np.array([0, 0, 2])),
+        hess_orders = (
+            ((0, 0), (2, 0, 0)),
+            ((0, 1), (1, 1, 0)),
+            ((0, 2), (1, 0, 1)),
+            ((1, 1), (0, 2, 0)),
+            ((1, 2), (0, 1, 1)),
+            ((2, 2), (0, 0, 2)),
         )
-        for (i, j), orders in deriv_orders:
-            values = _evaluate_deriv_basis_compat(
-                mol._bas,
-                self.coords,
-                orders,
-                screen_basis=screen_basis,
-                tol_screen=tol_screen,
-            ).T
+        evaluated = _evaluate_ao_derivatives(
+            mol,
+            self.coords,
+            [orders for _indices, orders in hess_orders],
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+        for ((i, j), _orders), values in zip(hess_orders, evaluated):
             self.ao_hess[i, j] = values
             self.ao_hess[j, i] = values
         return self
@@ -422,7 +532,6 @@ def atom_centered_grid(mol, n_radial=DEFAULT_N_RADIAL,
     """
     atom_coords = np.asarray(mol.atom_coords(), dtype=float)
     atom_symbols = mol.atom_symbols()
-    natom = len(atom_symbols)
 
     if angular_grid == 'lebedev':
         directions, angular_weights = lebedev_sphere(n_angular)

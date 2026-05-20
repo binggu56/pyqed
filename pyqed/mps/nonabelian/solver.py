@@ -2431,6 +2431,28 @@ def _solve_generalized_dense(H, N, *, tol):
     return float(np.real(evals[0])), coeff, float(np.linalg.norm(resid))
 
 
+def _generalized_eigh_all(H, N, *, tol=1e-12):
+    """Return all roots of ``H x = e N x`` in the nonsingular metric subspace."""
+
+    H = 0.5 * (np.asarray(H, dtype=complex) + np.asarray(H, dtype=complex).conj().T)
+    N = 0.5 * (np.asarray(N, dtype=complex) + np.asarray(N, dtype=complex).conj().T)
+    if scipy_linalg is not None:
+        try:
+            evals, evecs = scipy_linalg.eigh(H, N, check_finite=False)
+        except Exception:
+            evals = evecs = None
+        else:
+            return np.real(evals).astype(float), np.asarray(evecs, dtype=complex)
+    s, U = np.linalg.eigh(N)
+    keep = s > max(float(tol), 1.0e-12)
+    if not np.any(keep):
+        raise ValueError("Generalized norm operator is numerically singular.")
+    X = U[:, keep] @ np.diag(1.0 / np.sqrt(s[keep]))
+    H_ortho = X.conj().T @ H @ X
+    evals, evecs_ortho = np.linalg.eigh(0.5 * (H_ortho + H_ortho.conj().T))
+    return np.real(evals).astype(float), X @ evecs_ortho
+
+
 def _lowest_hermitian_projected_root(H, *, reference=None, tol=1e-12, subset=4):
     """
     Return the lowest eigenpair of a small Hermitian projected matrix.
@@ -2509,6 +2531,45 @@ def _solve_generalized_dense_roots(H, N=None, *, nroots=1, tol=1e-12):
         roots.append(vec)
         residuals.append(float(np.linalg.norm(H @ vec - evals[i] * (N @ vec))))
     return np.real(evals[idx]).astype(float), roots, residuals
+
+
+def _solve_projected_dense_roots(H, N=None, *, nroots=1, projector_basis=None, tol=1e-12):
+    """
+    Solve a dense local root problem, optionally restricted to a projector basis.
+
+    ``projector_basis`` is expressed in the parent packed basis.  This helper
+    keeps the target-spin projected path honest for generalized local problems:
+    the Hamiltonian and norm are both projected before diagonalization, then
+    roots are lifted back to the parent basis.
+    """
+
+    if projector_basis is None:
+        return _solve_generalized_dense_roots(H, N, nroots=nroots, tol=tol)
+    P = _orthonormalize_columns_dense(np.asarray(projector_basis, dtype=complex))
+    if P.shape[1] == 0:
+        raise ValueError("Projected dense solve received an empty projector basis.")
+    nroots = min(int(nroots), int(P.shape[1]))
+    H = 0.5 * (np.asarray(H, dtype=complex) + np.asarray(H, dtype=complex).conj().T)
+    H_projected = P.conj().T @ H @ P
+    if N is None:
+        N_projected = None
+    else:
+        N = 0.5 * (np.asarray(N, dtype=complex) + np.asarray(N, dtype=complex).conj().T)
+        N_projected = P.conj().T @ N @ P
+    energies, projected_roots, residuals = _solve_generalized_dense_roots(
+        H_projected,
+        N_projected,
+        nroots=nroots,
+        tol=tol,
+    )
+    parent_roots = [P @ np.asarray(root, dtype=complex).reshape(-1) for root in projected_roots]
+    parent_residuals = []
+    for energy, root in zip(energies, parent_roots):
+        if N is None:
+            parent_residuals.append(float(np.linalg.norm(H @ root - float(energy) * root)))
+        else:
+            parent_residuals.append(float(np.linalg.norm(H @ root - float(energy) * (N @ root))))
+    return energies, parent_roots, parent_residuals
 
 
 def _solve_standard_davidson_roots(
@@ -2681,6 +2742,7 @@ def _target_projector_basis(
     template,
     layout,
     *,
+    norm_operator=None,
     target_value,
     target_tol,
     min_dim,
@@ -2691,10 +2753,15 @@ def _target_projector_basis(
     max_space=None,
 ):
     op_resolved, _ = _resolve_davidson_operator(target_operator, template, layout)
+    norm_resolved = None
+    if norm_operator is not None:
+        norm_resolved, _ = _resolve_davidson_operator(norm_operator, template, layout)
     dim = sum(entry.size for entry in layout)
     if dim > int(max_dim):
         return None, None
     if dim > int(dense_dim):
+        if norm_resolved is not None:
+            return None, None
         if target_dim is None:
             return None, None
         target = float(target_value)
@@ -2765,12 +2832,21 @@ def _target_projector_basis(
         else _materialize_local_matrix(op_resolved, dim)
     )
     matrix = 0.5 * (matrix + matrix.conj().T)
-    evals, evecs = np.linalg.eigh(matrix)
+    if norm_resolved is None:
+        evals, evecs = np.linalg.eigh(matrix)
+    else:
+        norm_matrix = (
+            np.asarray(norm_resolved, dtype=complex)
+            if isinstance(norm_resolved, np.ndarray)
+            else _materialize_local_matrix(norm_resolved, dim)
+        )
+        norm_matrix = 0.5 * (norm_matrix + norm_matrix.conj().T)
+        evals, evecs = _generalized_eigh_all(matrix, norm_matrix, tol=max(float(target_tol), 1.0e-12))
     distance = np.abs(np.real(evals) - float(target_value))
     keep = np.where(distance <= float(target_tol))[0]
     if keep.size < int(min_dim):
         return None, None
-    return evecs[:, keep], np.real(evals[keep]).astype(float)
+    return _orthonormalize_columns_dense(evecs[:, keep]), np.real(evals[keep]).astype(float)
 
 
 def _target_projector_basis_by_blocks(
@@ -2778,6 +2854,7 @@ def _target_projector_basis_by_blocks(
     template,
     layout,
     *,
+    norm_operator=None,
     target_value,
     target_tol,
     min_dim,
@@ -2817,6 +2894,9 @@ def _target_projector_basis_by_blocks(
         return None, None
 
     op_resolved, _ = _resolve_davidson_operator(target_operator, template, layout)
+    norm_resolved = None
+    if norm_operator is not None:
+        norm_resolved, _ = _resolve_davidson_operator(norm_operator, template, layout)
     target = float(target_value)
     vectors = []
     target_values = []
@@ -2826,6 +2906,7 @@ def _target_projector_basis_by_blocks(
         if entry.size > max_block_size:
             return None, None
         block = np.zeros((entry.size, entry.size), dtype=complex)
+        norm_block = None if norm_resolved is None else np.zeros((entry.size, entry.size), dtype=complex)
         for col in range(entry.size):
             basis_vec = np.zeros(dim, dtype=complex)
             basis_vec[entry.offset + col] = 1.0
@@ -2840,10 +2921,29 @@ def _target_projector_basis_by_blocks(
             outside_norm = np.linalg.norm(out) ** 2 - np.linalg.norm(out[sl]) ** 2
             if outside_norm > 0.0:
                 max_leakage = max(max_leakage, float(np.sqrt(outside_norm)))
+            if norm_resolved is not None:
+                nout = (
+                    norm_resolved(basis_vec)
+                    if callable(norm_resolved)
+                    else norm_resolved @ basis_vec
+                )
+                nout = np.asarray(nout, dtype=complex).reshape(dim)
+                norm_block[:, col] = nout[sl]
+                noutside_norm = np.linalg.norm(nout) ** 2 - np.linalg.norm(nout[sl]) ** 2
+                if noutside_norm > 0.0:
+                    max_leakage = max(max_leakage, float(np.sqrt(noutside_norm)))
         if max_leakage > float(offdiag_tol):
             return None, None
         block = 0.5 * (block + block.conj().T)
-        evals, evecs = np.linalg.eigh(block)
+        if norm_block is None:
+            evals, evecs = np.linalg.eigh(block)
+        else:
+            norm_block = 0.5 * (norm_block + norm_block.conj().T)
+            evals, evecs = _generalized_eigh_all(
+                block,
+                norm_block,
+                tol=max(float(target_tol), 1.0e-12),
+            )
         distance = np.abs(np.real(evals) - target)
         keep = np.where(distance <= float(target_tol))[0]
         for idx in keep:
@@ -2997,6 +3097,23 @@ def _match_selected_roots_to_guesses(
         [selected_roots[idx] for idx in assigned],
         overlap,
     )
+
+
+def _can_match_all_selected_roots(weights, nroots, *, tol=1.0e-15):
+    """
+    Return whether overlap matching may reorder all selected roots.
+
+    Multiroot SA solves often request extra zero-weight candidates.  Those
+    buffer roots must stay behind the weighted roots after target/energy
+    selection, otherwise the density matrix is built from the wrong states.
+    """
+
+    if weights is None:
+        return True
+    local_weights = np.asarray(weights, dtype=float).reshape(-1)[: int(nroots)]
+    if local_weights.size < int(nroots):
+        return False
+    return bool(np.all(np.abs(local_weights) > float(tol)))
 
 
 def _solve_orthonormalized_dense(H, N, *, tol, basis=None):
@@ -5734,15 +5851,16 @@ def solve_local_two_site(
                 target_tol=root_target_tol,
             )
         root_match_overlap = None
-        energies, root_vecs, residuals, selected_roots, root_match_overlap = (
-            _match_selected_roots_to_guesses(
-                energies,
-                root_vecs,
-                residuals,
-                selected_roots,
-                np.column_stack(root_guess_vecs) if root_guess_vecs else None,
+        if _can_match_all_selected_roots(weights, len(energies)):
+            energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+                _match_selected_roots_to_guesses(
+                    energies,
+                    root_vecs,
+                    residuals,
+                    selected_roots,
+                    np.column_stack(root_guess_vecs) if root_guess_vecs else None,
+                )
             )
-        )
         optimized_roots = [
             unpack_two_site_state(vec, two_site, layout=layout)
             for vec in root_vecs
@@ -5970,6 +6088,7 @@ def solve_local_two_site(
                     coupled_target_operator,
                     coupled_template,
                     coupled_layout,
+                    norm_operator=coupled_norm_operator,
                     target_value=root_target_value,
                     target_tol=root_target_tol,
                     min_dim=projected_min_dim,
@@ -5984,6 +6103,7 @@ def solve_local_two_site(
                         coupled_target_operator,
                         coupled_template,
                         coupled_layout,
+                        norm_operator=coupled_norm_operator,
                         target_value=root_target_value,
                         target_tol=root_target_tol,
                         min_dim=projected_min_dim,
@@ -6026,10 +6146,11 @@ def solve_local_two_site(
                         if isinstance(operator_dense, np.ndarray)
                         else _materialize_local_matrix(operator_dense, dim)
                     )
-                    energies, root_vecs, residuals = _solve_generalized_dense_roots(
+                    energies, root_vecs, residuals = _solve_projected_dense_roots(
                         H_matrix,
                         None,
                         nroots=nsolve,
+                        projector_basis=projector_basis,
                         tol=max(tol, 1e-12),
                     )
                     solver_info = {
@@ -6059,10 +6180,11 @@ def solve_local_two_site(
                     if isinstance(norm_dense, np.ndarray)
                     else _materialize_local_matrix(norm_dense, dim)
                 )
-                energies, root_vecs, residuals = _solve_generalized_dense_roots(
+                energies, root_vecs, residuals = _solve_projected_dense_roots(
                     H_matrix,
                     N_matrix,
                     nroots=nsolve,
+                    projector_basis=projector_basis,
                     tol=max(tol, 1e-12),
                 )
                 solver_info = {
@@ -6091,15 +6213,16 @@ def solve_local_two_site(
                 target_tol=root_target_tol,
             )
             root_match_overlap = None
-            energies, root_vecs, residuals, selected_roots, root_match_overlap = (
-                _match_selected_roots_to_guesses(
-                    energies,
-                    root_vecs,
-                    residuals,
-                    selected_roots,
-                    root_coupled_guess_matrix,
+            if _can_match_all_selected_roots(weights, len(energies)):
+                energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+                    _match_selected_roots_to_guesses(
+                        energies,
+                        root_vecs,
+                        residuals,
+                        selected_roots,
+                        root_coupled_guess_matrix,
+                    )
                 )
-            )
             optimized_roots = []
             for root_idx, vec in enumerate(root_vecs):
                 reference = None
@@ -6177,6 +6300,7 @@ def solve_local_two_site(
                 root_target_op,
                 two_site,
                 layout,
+                norm_operator=effective_norm_op,
                 target_value=root_target_value,
                 target_tol=root_target_tol,
                 min_dim=projected_min_dim,
@@ -6191,6 +6315,7 @@ def solve_local_two_site(
                     root_target_op,
                     two_site,
                     layout,
+                    norm_operator=effective_norm_op,
                     target_value=root_target_value,
                     target_tol=root_target_tol,
                     min_dim=projected_min_dim,
@@ -6234,10 +6359,11 @@ def solve_local_two_site(
                     if isinstance(operator_dense, np.ndarray)
                     else _materialize_local_matrix(operator_dense, dim)
                 )
-                energies, root_vecs, residuals = _solve_generalized_dense_roots(
+                energies, root_vecs, residuals = _solve_projected_dense_roots(
                     H_matrix,
                     None,
                     nroots=nsolve,
+                    projector_basis=projector_basis,
                     tol=max(tol, 1e-12),
                 )
                 solver_info = {
@@ -6289,10 +6415,11 @@ def solve_local_two_site(
                 if isinstance(norm_dense, np.ndarray)
                 else _materialize_local_matrix(norm_dense, dim)
             )
-            energies, root_vecs, residuals = _solve_generalized_dense_roots(
+            energies, root_vecs, residuals = _solve_projected_dense_roots(
                 H_matrix,
                 N_matrix,
                 nroots=nsolve,
+                projector_basis=projector_basis,
                 tol=max(tol, 1e-12),
             )
             solver_info = {
@@ -6321,15 +6448,16 @@ def solve_local_two_site(
             target_tol=root_target_tol,
         )
         root_match_overlap = None
-        energies, root_vecs, residuals, selected_roots, root_match_overlap = (
-            _match_selected_roots_to_guesses(
-                energies,
-                root_vecs,
-                residuals,
-                selected_roots,
-                root_guess_matrix,
+        if _can_match_all_selected_roots(weights, len(energies)):
+            energies, root_vecs, residuals, selected_roots, root_match_overlap = (
+                _match_selected_roots_to_guesses(
+                    energies,
+                    root_vecs,
+                    residuals,
+                    selected_roots,
+                    root_guess_matrix,
+                )
             )
-        )
         optimized_roots = []
         for root_idx, vec in enumerate(root_vecs):
             reference = None

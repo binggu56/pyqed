@@ -655,7 +655,7 @@ def run_spatial_qchem_dmrg(
             ),
             state_average_local_norm=sweep_kwargs.pop(
                 "state_average_local_norm",
-                False,
+                nstates > 1,
             ),
             conv_tol=conv_tol,
             measure=sweep_kwargs.pop("measure", _qchem_sweep_measure),

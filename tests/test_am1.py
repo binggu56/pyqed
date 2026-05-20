@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from pyqed.qchem import Molecule
-from pyqed.qchem.semiempirical.am1 import HARTREE2EV, RAM1
+from pyqed.qchem.semiempirical.am1 import HARTREE2EV, RAM1, UAM1
 
 
 def _am1_mrci_integrals(mf):
@@ -243,6 +243,35 @@ def test_am1_mrci_runs_on_ram1_reference():
     np.testing.assert_allclose(meci.e, via_method.e, atol=1.0e-12)
 
 
+def test_am1_meci_computes_spin_square_for_closed_shell_roots():
+    mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="Angstrom")
+    mf = RAM1(mol).run(conv_tol=1.0e-8, verbose=0)
+
+    fci = mf.MECI(nstates=4, ncas=2).run()
+
+    assert fci.s2.shape == (4,)
+    np.testing.assert_allclose(fci.spin_square(), fci.s2)
+    np.testing.assert_allclose(sorted(np.round(fci.s2, 8)), [0.0, 0.0, 0.0, 2.0])
+
+
+def test_am1_meci_spin_penalty_can_select_triplet_root():
+    mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="Angstrom")
+    mf = RAM1(mol).run(conv_tol=1.0e-8, verbose=0)
+
+    singlet = mf.MECI(nstates=1, ncas=2).run()
+    triplet = mf.MECI(
+        nstates=1,
+        ncas=2,
+        spin_penalty=10.0,
+        target_spin=1.0,
+    ).run()
+
+    np.testing.assert_allclose(singlet.s2[0], 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(triplet.s2[0], 2.0, atol=1.0e-10)
+    assert triplet.e_penalized is not None
+    assert triplet.e[0] > singlet.e[0]
+
+
 def test_am1_mrci_hamiltonian_matches_independent_second_quantization():
     from pyqed.qchem.semiempirical import MRCI
 
@@ -347,6 +376,98 @@ def test_am1_meci_wavefunction_overlap_uses_mo_transport():
     same_geometry = meci_a.wavefunction_overlap(meci_a2)
     np.testing.assert_allclose(same_geometry.T @ same_geometry, np.eye(3), atol=1.0e-8)
     np.testing.assert_allclose(abs(same_geometry[0, 0]), 1.0, atol=1.0e-8)
+    transported = meci_a.wavefunction_overlap(meci_b)
+    pseudo = meci_a.ci.T @ meci_b.ci
+    assert transported.shape == (3, 3)
+    assert not np.allclose(transported, pseudo, atol=1.0e-6)
+
+
+def test_uam1_runs_open_shell_no2_doublet():
+    mol = Molecule(
+        atom="N 0 0 0; O 1.2 0 0; O -0.6 1.0392304845 0",
+        charge=0,
+        spin=1,
+        unit="Angstrom",
+    )
+
+    mf = UAM1(mol).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+
+    assert mf.converged
+    assert mf.nelec_alpha_beta == (9, 8)
+    assert mf.mo_coeff.shape == (2, mf.nao, mf.nao)
+    assert mf.mo_energy.shape == (2, mf.nao)
+    np.testing.assert_allclose(mf.mo_occ.sum(), mf.nelec)
+    np.testing.assert_allclose(np.trace(mf.dm[0]), 9.0, atol=1.0e-10)
+    np.testing.assert_allclose(np.trace(mf.dm[1]), 8.0, atol=1.0e-10)
+    assert np.linalg.norm(mf.dm[0] - mf.dm[1]) > 1.0e-6
+
+
+def test_uam1_meci_runs_on_open_shell_no2():
+    mol = Molecule(
+        atom="N 0 0 0; O 1.2 0 0; O -0.6 1.0392304845 0",
+        charge=0,
+        spin=1,
+        unit="Angstrom",
+    )
+    mf = UAM1(mol).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+
+    meci = mf.MECI(nstates=3, ncas=3).run()
+
+    assert meci.e.shape == (3,)
+    assert meci.ci.shape == (9, 3)
+    assert meci.determinants.shape == (9, 2, mf.nao)
+    assert meci.active_orbitals == (7, 8, 9)
+    np.testing.assert_allclose(meci.determinants[:, 0, :].sum(axis=1), 9)
+    np.testing.assert_allclose(meci.determinants[:, 1, :].sum(axis=1), 8)
+    assert np.all(np.isfinite(meci.e))
+    assert meci.s2.shape == (3,)
+    assert np.all(np.isfinite(meci.s2))
+    assert np.all(meci.s2 >= 0.75 - 1.0e-8)
+
+
+def test_uam1_meci_spin_penalty_reduces_doublet_contamination():
+    mol = Molecule(
+        atom="N 0 0 0; O 1.2 0 0; O -0.6 1.0392304845 0",
+        charge=0,
+        spin=1,
+        unit="Angstrom",
+    )
+    mf = UAM1(mol).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+
+    unfiltered = mf.MECI(nstates=3, ncas=4).run()
+    filtered = mf.MECI(
+        nstates=3,
+        ncas=4,
+        spin_penalty=5.0,
+        target_spin=0.5,
+    ).run()
+
+    assert filtered.e_penalized is not None
+    assert np.max(np.abs(filtered.s2 - 0.75)) < np.max(np.abs(unfiltered.s2 - 0.75))
+
+
+def test_uam1_meci_overlap_uses_spin_resolved_mo_transport():
+    atom_a = "N 0 0 0; O 1.2 0 0; O -0.6 1.0392304845 0"
+    atom_b = "N 0 0 0; O 1.22 0 0; O -0.61 1.0565510 0"
+    mf_a = UAM1(
+        Molecule(atom=atom_a, charge=0, spin=1, unit="Angstrom")
+    ).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+    mf_a2 = UAM1(
+        Molecule(atom=atom_a, charge=0, spin=1, unit="Angstrom")
+    ).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+    mf_b = UAM1(
+        Molecule(atom=atom_b, charge=0, spin=1, unit="Angstrom")
+    ).run(conv_tol=1.0e-7, max_cycle=100, damping=0.35, verbose=0)
+
+    same_mo_overlap = mf_a.get_mo_cross_overlap(mf_a2)
+    np.testing.assert_allclose(same_mo_overlap, np.repeat(np.eye(mf_a.nao)[None], 2, axis=0), atol=1.0e-8)
+
+    meci_a = mf_a.MECI(nstates=3, ncas=3).run()
+    meci_a2 = mf_a2.MECI(nstates=3, ncas=3).run()
+    meci_b = mf_b.MECI(nstates=3, ncas=3).run()
+
+    same_geometry = meci_a.wavefunction_overlap(meci_a2)
+    np.testing.assert_allclose(same_geometry.T @ same_geometry, np.eye(3), atol=1.0e-7)
     transported = meci_a.wavefunction_overlap(meci_b)
     pseudo = meci_a.ci.T @ meci_b.ci
     assert transported.shape == (3, 3)

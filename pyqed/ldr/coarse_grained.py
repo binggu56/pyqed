@@ -7,10 +7,15 @@ import psutil
 import torch
 from matplotlib import pyplot as plt
 from pyqed.dvr.dvr_1d import SineDVR
-from pyqed.mps.tensor import *
 from pyqed.phys import interval, gwp
 from pyqed.units import *
 from torch.autograd.functional import jacobian
+
+try:
+    from pyqed.mps.tensor import *
+    _TT_BACKEND_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    _TT_BACKEND_IMPORT_ERROR = exc
 
 
 def clear_memory():
@@ -18,6 +23,13 @@ def clear_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def require_tt_backend():
+    if _TT_BACKEND_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "TTLDR requires the missing TT backend module 'pyqed.mps.tensor'."
+        ) from _TT_BACKEND_IMPORT_ERROR
 
 
 def gen_einsum_string(D, keyword="kinetic", dr=None, dnr=None):
@@ -95,16 +107,16 @@ def gen_einsum_string(D, keyword="kinetic", dr=None, dnr=None):
         raise ValueError(f"Unknown keyword: {keyword}. Must be 'kinetic' or 'projection'")
 
 
-class LDRMPS:
+class TTLDR:
     """
-    LDR-MPS Taylor expansion class for multi-dimensional quantum dynamics
+    TT-LDR Taylor expansion class for multi-dimensional quantum dynamics.
     """
 
     def __init__(self, domains, npts, nstates=3, dims=[2, 2],
                  ttparamater={'delta': 1e-6, 'max_rank': 100},
                  mass=None, dvr_type='sine', q0=[], reactive_indices=None):
         """
-        Initialize the LDRMPS class for multidimensional quantum dynamics.
+        Initialize the TTLDR class for multidimensional quantum dynamics.
 
         Parameters:
         ----------
@@ -221,7 +233,7 @@ class LDRMPS:
         self.current_time = time.strftime("%Y%m%d_%H%M%S")
         self.output_folder = "."
 
-        # 添加原 LDRMPSResult 的属性
+        # 添加原 TTLDRResult 的属性
         self.psilist = None
         self.population_data = None
         self.time_list = None
@@ -501,6 +513,7 @@ class LDRMPS:
 
     def _build_overlap_mps(self, exp_T):
         """Build electronic overlap in MPS format"""
+        require_tt_backend()
         mps_A = []
         einsum_string = gen_einsum_string(self.dr)
 
@@ -536,6 +549,7 @@ class LDRMPS:
 
     def _build_HBO_mps(self, dt):
         """Build HBO (Hamiltonian Born-Oppenheimer) in MPS format"""
+        require_tt_backend()
         # 1个H00;dnr个F;dnr个Gii（要乘以1/2）;(dnr)(dnr-1)/2个Gij（不要乘以1/2）
         # 不要乘好0.5后在输入
 
@@ -677,6 +691,7 @@ class LDRMPS:
 
     def build_propagator(self, dt):
         """Build the complete time evolution propagator"""
+        require_tt_backend()
         if self.H_matrices is None:
             print('Need to input the Electronic Hamiltonian matrices first.')
         if self.mps_HBO is None:
@@ -737,7 +752,7 @@ class LDRMPS:
 
         Returns
         -------
-        LDRMPSResult
+        TTLDRResult
             Result object containing evolution data
         """
 
@@ -1158,6 +1173,7 @@ def H_val(full_coords):
 
 
 if __name__ == "__main__":
+    require_tt_backend()
     import logging
 
     logging.basicConfig(level=logging.INFO)
@@ -1202,8 +1218,8 @@ if __name__ == "__main__":
     #q0=[1.540,0.008]
     q0 = []
     print('The paramater of TT is:', ttparamater)
-    sol = LDRMPS(domains, npts=npts, dims=dims, ttparamater=ttparamater, q0=q0, nstates=nstates,
-                 dvr_type='sine', mass=mass)
+    sol = TTLDR(domains, npts=npts, dims=dims, ttparamater=ttparamater, q0=q0,
+                nstates=nstates, dvr_type='sine', mass=mass)
 
     current_time_folder = "."
     os.makedirs(current_time_folder, exist_ok=True)

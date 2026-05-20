@@ -7,10 +7,10 @@ Created on Sun Feb  1 21:09:33 2026
 @author: Bing Gu (gubing at westlake dot edu dot cn)
 """
 
-import sys
 import numpy as np
 from numpy.random import standard_normal
 from pyqed.md.md import MolecularDynamics
+from pyqed.units import au2k
 
 
 from ase.parallel import world
@@ -28,7 +28,11 @@ class Langevin(MolecularDynamics):
         The time step.
 
     temperature
-        The desired temperature, in energy units.
+        The desired ``k_B T`` in Hartree.
+
+    temperature_K
+        Optional desired temperature in Kelvin.  If supplied, it is converted
+        to Hartree with ``pyqed.units.au2k``.
 
     friction
         A friction coefficient, typically 1e-4 to 1e-2.
@@ -42,19 +46,29 @@ class Langevin(MolecularDynamics):
 
     This dynamics accesses the atoms using Cartesian coordinates."""
 
-    def __init__(self, atoms, timestep, temperature, friction, fixcm=True,
+    def __init__(self, atoms, timestep, temperature=None, friction=None, fixcm=True,
                  trajectory=None, logfile=None, loginterval=1,
-                 communicator=world):
+                 communicator=world, temperature_K=None):
+        if friction is None:
+            raise TypeError("friction must be supplied.")
         MolecularDynamics.__init__(self, atoms, timestep, trajectory,
                                    logfile, loginterval)
-        self.temp = temperature
+        self.temp = self._temperature_to_au(temperature, temperature_K)
         self.frict = friction
         self.fixcm = fixcm  # will the center of mass be held fixed?
         self.communicator = communicator
         self.updatevars()
 
-    def set_temperature(self, temperature):
-        self.temp = temperature
+    @staticmethod
+    def _temperature_to_au(temperature=None, temperature_K=None):
+        if temperature_K is not None:
+            return float(temperature_K) / au2k
+        if temperature is None:
+            raise TypeError("temperature or temperature_K must be supplied.")
+        return temperature
+
+    def set_temperature(self, temperature=None, temperature_K=None):
+        self.temp = self._temperature_to_au(temperature, temperature_K)
         self.updatevars()
 
     def set_friction(self, friction):
@@ -133,6 +147,6 @@ class Langevin(MolecularDynamics):
         p += self.c3 * f + prnd
         atoms.set_momenta(p)
 
-        f = atoms.get_forces()
+        f = atoms.get_forces(md=True)
         atoms.set_momenta(p + self.c4 * f)
         return f

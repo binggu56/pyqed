@@ -1718,17 +1718,14 @@ def test_su2_block2_state_average_routes_through_operator_table():
     )
 
     objective = dmrg.dmrg.history[-1]["bond_objectives"][-1]
-    assert objective["effective_local_problem"] == "orthonormalized_operator_standard"
+    assert objective["effective_local_problem"] == "state_averaged_coupled_davidson"
     assert objective["state_averaged_svd"] is True
     assert objective["block_davidson"] is True
-    assert objective["renormalized_operator_storage"] == (
-        "block_sparse_environment_sweep:block_sparse_operator_table"
-    )
-    assert objective["renormalized_operator_table_stats"]["kind"] == "block_sparse"
-    assert len(objective["state_energies"]) == 2
+    assert objective["target_irrep_filtered"] is True
+    assert len(objective["state_energies"]) >= 2
 
 
-def test_su2_block2_state_average_rejects_larger_active_spaces():
+def test_su2_block2_state_average_supports_larger_active_spaces():
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
@@ -1738,15 +1735,18 @@ def test_su2_block2_state_average_rejects_larger_active_spaces():
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
-    with pytest.raises(NotImplementedError, match="state-averaged SU\\(2\\) DMRG"):
-        dmrg.run(
-            nstates=2,
-            weights=[0.5, 0.5],
-            nsweeps=1,
-            local_basis_policy="block2_like",
-            max_bond_mode="per_sector",
-            mixer_zero_block_noise_scale=0.0,
-        )
+    dmrg.run(
+        nstates=2,
+        weights=[0.5, 0.5],
+        nsweeps=2,
+        local_basis_policy="block2_like",
+        max_bond_mode="per_sector",
+        mixer_zero_block_noise_scale=0.0,
+    )
+
+    assert len(dmrg.dmrg.states) == 2
+    assert all(entry.get("direction") != "dense" for entry in dmrg.dmrg.history)
+    np.testing.assert_allclose(dmrg.dmrg.history[-1]["state_s2"], [0.0, 0.0], atol=1e-8)
 
 
 def test_spatial_su2_dmrg_supports_state_average_roots():

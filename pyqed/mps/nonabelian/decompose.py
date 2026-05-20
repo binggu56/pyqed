@@ -243,6 +243,68 @@ def _merge_side_pipes(
     )
 
 
+def _irrep_dim(sector):
+    irrep = getattr(sector, "irrep", None)
+    if irrep is not None and hasattr(irrep, "dim"):
+        return int(irrep.dim)
+    labels = getattr(sector, "labels", ())
+    components = getattr(sector, "components", ())
+    if "su2" in labels:
+        irrep = components[labels.index("su2")]
+        if hasattr(irrep, "dim"):
+            return int(irrep.dim)
+    dim = getattr(sector, "dim", None)
+    if dim is not None:
+        return int(dim)
+    return 1
+
+
+def _right_reduced_physical_metric(projection):
+    """
+    Diagonal metric for fully reduced right-side coordinates.
+
+    For a reduced right site channel ``q_mid x q_phys -> q_right`` whose
+    physical leg stores only the multiplet reduced coordinate, summing over
+    hidden spin components contributes ``dim(q_right) / dim(q_mid)``.  Explicit
+    physical-component blocks are already Euclidean and keep unit weight.
+    """
+    weights = []
+    q_mid_dim = max(_irrep_dim(projection.sector), 1)
+    for entry in projection.right_entries:
+        _q_phys, q_right = entry.child_sectors
+        if len(entry.selected_shape) == 2 and int(entry.selected_shape[0]) == 1:
+            weight = _irrep_dim(q_right) / q_mid_dim
+        else:
+            weight = 1.0
+        weights.append(np.full(entry.local_dim, float(weight), dtype=float))
+    if not weights:
+        return np.ones(projection.right_dim, dtype=float)
+    metric = np.concatenate(weights)
+    if metric.size != projection.right_dim:
+        raise ValueError(
+            f"Right reduced metric has size {metric.size}, expected {projection.right_dim}."
+        )
+    metric[np.abs(metric) <= 1.0e-15] = 1.0
+    return metric
+
+
+def _right_metric_weighted_projected_svd(projection, *, full_matrices=False):
+    matrix = projection.as_matrix()
+    right_metric = _right_reduced_physical_metric(projection)
+    if np.allclose(right_metric, 1.0):
+        return projection.svd(full_matrices=full_matrices)
+    sqrt_metric = np.sqrt(right_metric)
+    weighted = matrix * sqrt_metric[None, :]
+    U, S, W_h = np.linalg.svd(weighted, full_matrices=full_matrices)
+    Vh = W_h / sqrt_metric[None, :]
+    return ReducedProjectedSVD(
+        projection=projection,
+        singular_values=S,
+        U=U,
+        Vh=Vh,
+    )
+
+
 def svd_two_site(
     two_site,
     max_bond=None,
@@ -310,7 +372,10 @@ def svd_two_site(
             left_basis_map,
             right_basis_map,
         )
-        svd_result = reduced_sector.svd(full_matrices=False)
+        svd_result = _right_metric_weighted_projected_svd(
+            reduced_sector,
+            full_matrices=False,
+        )
         sector_svds[q_mid] = svd_result
 
     truncation = truncate_reduced_svds(
@@ -607,11 +672,13 @@ def state_averaged_svd_two_site(
                 projection0 = projection
             matrices.append(projection.as_matrix())
         root_matrices_by_sector[q_mid] = matrices
+        right_metric = _right_reduced_physical_metric(projection0)
+        sqrt_right_metric = np.sqrt(right_metric)
 
         if absorb == "right":
             rho = np.zeros((projection0.left_dim, projection0.left_dim), dtype=np.result_type(*matrices))
             for weight, matrix in zip(weights, matrices):
-                rho += weight * (matrix @ matrix.conj().T)
+                rho += weight * ((matrix * right_metric[None, :]) @ matrix.conj().T)
             eigvals, U = np.linalg.eigh(0.5 * (rho + rho.conj().T))
             idx = np.argsort(np.real(eigvals))[::-1]
             eigvals = np.maximum(np.real(eigvals[idx]), 0.0)
@@ -624,17 +691,18 @@ def state_averaged_svd_two_site(
         else:
             rho = np.zeros((projection0.right_dim, projection0.right_dim), dtype=np.result_type(*matrices))
             for weight, matrix in zip(weights, matrices):
-                rho += weight * (matrix.conj().T @ matrix)
-            eigvals, V = np.linalg.eigh(0.5 * (rho + rho.conj().T))
+                weighted_matrix = matrix * sqrt_right_metric[None, :]
+                rho += weight * (weighted_matrix.conj().T @ weighted_matrix)
+            eigvals, W = np.linalg.eigh(0.5 * (rho + rho.conj().T))
             idx = np.argsort(np.real(eigvals))[::-1]
             eigvals = np.maximum(np.real(eigvals[idx]), 0.0)
-            V = V[:, idx]
+            W = W[:, idx]
             singular_values = np.sqrt(eigvals)
             inv_s = np.zeros_like(singular_values)
             mask = singular_values > 1e-12
             inv_s[mask] = 1.0 / singular_values[mask]
-            U = matrices[0] @ V @ np.diag(inv_s)
-            Vh = V.conj().T
+            Vh = W.conj().T / sqrt_right_metric[None, :]
+            U = ((matrices[0] * right_metric[None, :]) @ Vh.conj().T) @ np.diag(inv_s)
 
         sector_svds[q_mid] = ReducedProjectedSVD(
             projection=projection0,
@@ -824,7 +892,8 @@ def state_averaged_svd_two_site(
                 right_reduced[(q_mid, q_mid)] = left_kept.conj().T @ matrix
             else:
                 right_kept = svd_result.right_matrix(idxs)
-                left_reduced[(q_mid, q_mid)] = matrix @ right_kept.conj().T
+                right_metric = _right_reduced_physical_metric(svd_result.projection)
+                left_reduced[(q_mid, q_mid)] = (matrix * right_metric[None, :]) @ right_kept.conj().T
                 right_reduced[(q_mid, q_mid)] = right_kept
         root_site_pairs.append(
             _split_from_reduced(

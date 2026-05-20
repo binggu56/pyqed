@@ -800,15 +800,41 @@ def _physical_component_matrix(q_out, q_in, rank_irrep, two_m_component, diagona
     out_irrep = _sector_irrep(q_out)
     in_irrep = _sector_irrep(q_in)
     if diagonal_scalar:
-        if q_out != q_in:
+        if out_irrep != in_irrep:
             return np.zeros((out_irrep.dim, in_irrep.dim), dtype=float)
-        return np.eye(out_irrep.dim, dtype=float)
+        return np.eye(out_irrep.dim, in_irrep.dim, dtype=float)
     out_charge = getattr(q_out, "charge", None)
     in_charge = getattr(q_in, "charge", None)
     scale = np.sqrt(float(rank_irrep.dim))
     if out_charge is not None and in_charge is not None and int(out_charge) > int(in_charge):
         return scale * _component_basis_matrix(q_in, q_out, rank_irrep, int(two_m_component)).T
     return scale * _component_basis_matrix(q_out, q_in, rank_irrep, int(two_m_component))
+
+
+def _rank_coupled_reduced_terms_block(W, phys_out, phys_in):
+    reduced = {}
+    dtype = _mpo_dtype(W)
+    for operator, i, j, row, col, component, coeff in W._reduced_actions():
+        op_block = operator.component_block(component, phys_out, phys_in)
+        if op_block is None:
+            continue
+        local = reduced.get((i, j))
+        if local is None:
+            local = np.zeros(
+                (
+                    W.left_channel_irreps[i].dim,
+                    W.right_channel_irreps[j].dim,
+                    W.phys_out_leg.dim(phys_out),
+                    W.phys_in_leg.dim(phys_in),
+                ),
+                dtype=dtype,
+            )
+            reduced[(i, j)] = local
+        local[row, col] += np.asarray(coeff, dtype=dtype) * np.asarray(
+            op_block,
+            dtype=dtype,
+        )
+    return reduced
 
 
 @lru_cache(maxsize=None)
@@ -1045,6 +1071,11 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                 if np.any(block):
                     reduced[(left_idx, right_idx)] = block
 
+    if relaxed_scalar_transfer:
+        for key, block in _rank_coupled_reduced_terms_block(W, q_pb, q_pk).items():
+            reduced[key] = reduced.get(key, 0) + block
+        return reduced
+
     for term in W.reduced_terms:
         visible = term.visible_virtual_block
         op_rank = _reduced_operator_rank(term.reduced_operator)
@@ -1181,6 +1212,11 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             block[row, col, 0, 0] += local_scalar * virtual_cg * coeff
                 if np.any(block):
                     reduced[(left_idx, right_idx)] = block
+
+    if relaxed_scalar_transfer:
+        for key, block in _rank_coupled_reduced_terms_block(W, q_pb, q_pk).items():
+            reduced[key] = reduced.get(key, 0) + block
+        return reduced
 
     for term in W.reduced_terms:
         visible = term.visible_virtual_block
@@ -1417,7 +1453,10 @@ def _contract_from_left_blocks(W, A, E_map, B, phys_slices):
 def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
-    reduced_physical = not W.reduced_terms
+    reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
+        W,
+        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    )
     a_blocks_by_left = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         arr = np.asarray(A_block)
@@ -1512,7 +1551,10 @@ def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
 def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
-    reduced_physical = not W.reduced_terms
+    reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
+        W,
+        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    )
     a_blocks_by_right = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         arr = np.asarray(A_block)

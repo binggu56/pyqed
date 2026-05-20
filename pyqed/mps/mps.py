@@ -3339,6 +3339,61 @@ def truncate_SVD(U, S, V, m):
     V = V[0:m, :, :]
     return U,S,V,trunc,m
 
+def sa_svd_dense(AA_list, weights, direction, m_max=None):
+    """
+    State-averaged dense two-site SVD.
+
+    ``AA_list`` contains two-site wavefunctions with shape
+    ``(left, phys_left, phys_right, right)``.  The retained basis is obtained
+    from the weighted reduced density matrix, while state 0 is projected into
+    that basis to keep propagating a single representative MPS.
+    """
+    weights = np.asarray(weights, dtype=float)
+    if len(AA_list) != len(weights):
+        raise ValueError("weights must have the same length as AA_list.")
+    if np.sum(weights) <= 0:
+        raise ValueError("state-average weights must sum to a positive value.")
+    weights = weights / np.sum(weights)
+
+    chi_l, d_l, d_r, chi_r = AA_list[0].shape
+    mats = [AA.reshape(chi_l * d_l, d_r * chi_r) for AA in AA_list]
+
+    if direction == 'right':
+        rho = np.zeros((chi_l * d_l, chi_l * d_l), dtype=np.result_type(*mats, np.complex128))
+        for w, mat in zip(weights, mats):
+            rho += w * (mat @ mat.conj().T)
+        evals, U = np.linalg.eigh(rho)
+        idx = np.argsort(evals)[::-1]
+        evals, U = evals[idx], U[:, idx]
+        all_evals = evals
+        nkeep = len(evals) if m_max is None else min(int(m_max), len(evals))
+        evals, U = evals[:nkeep], U[:, :nkeep]
+        S = np.sqrt(np.clip(evals, 0.0, None))
+        Sinv = np.zeros_like(S)
+        Sinv[S > 1e-12] = 1.0 / S[S > 1e-12]
+        V = (np.diag(Sinv) @ U.conj().T @ mats[0]).reshape(nkeep, d_r, chi_r)
+        A = U.reshape(chi_l, d_l, nkeep)
+        trunc = float(np.sum(np.clip(all_evals[nkeep:], 0.0, None)))
+    else:
+        rho = np.zeros((d_r * chi_r, d_r * chi_r), dtype=np.result_type(*mats, np.complex128))
+        for w, mat in zip(weights, mats):
+            rho += w * (mat.conj().T @ mat)
+        evals, Vcols = np.linalg.eigh(rho)
+        idx = np.argsort(evals)[::-1]
+        evals, Vcols = evals[idx], Vcols[:, idx]
+        all_evals = evals
+        nkeep = len(evals) if m_max is None else min(int(m_max), len(evals))
+        evals, Vcols = evals[:nkeep], Vcols[:, :nkeep]
+        S = np.sqrt(np.clip(evals, 0.0, None))
+        Sinv = np.zeros_like(S)
+        Sinv[S > 1e-12] = 1.0 / S[S > 1e-12]
+        Umat = mats[0] @ Vcols @ np.diag(Sinv)
+        A = Umat.reshape(chi_l, d_l, nkeep)
+        V = Vcols.conj().T.reshape(nkeep, d_r, chi_r)
+        trunc = float(np.sum(np.clip(all_evals[nkeep:], 0.0, None)))
+
+    return A, S, V, trunc, nkeep
+
 # Functor to evaluate the Hamiltonian matrix-vector multiply
 #        +--A--+
 #        |  |  |
@@ -3734,13 +3789,19 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
         AA = coarse_grain_MPS(A,B)
         # Optimize
         H = HamiltonianMultiply(E,W,F)
+        nloc = AA.size
+        if nstates >= nloc:
+            use_dense_solver = True
+        else:
+            use_dense_solver = False
         try:
+            if use_dense_solver:
+                raise ValueError("dense fallback requested")
             E, V_flat = sparse.linalg.eigsh(
-                H, 1, v0=AA, which='SA', tol=1e-9, maxiter=5000
+                H, nstates, v0=AA, which='SA', tol=1e-9, maxiter=5000
             )
-        except sparse.linalg.ArpackNoConvergence:
+        except (sparse.linalg.ArpackNoConvergence, ValueError):
             # Robust fallback for small local spaces when ARPACK stalls.
-            nloc = AA.size
             if nloc > 4096:
                 raise
             H_dense = np.zeros((nloc, nloc), dtype=np.result_type(AA.dtype, np.complex128))
@@ -3750,14 +3811,27 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
                 H_dense[:, col] = H.matvec(e_col)
             H_dense = 0.5 * (H_dense + H_dense.T.conj())
             evals, evecs = np.linalg.eigh(H_dense)
-            E = np.array([evals[0]])
-            V_flat = evecs[:, 0]
-        # Fine Grain (SVD Split)
-        # V_flat is (Left * Phys_A * Phys_B * Right)
-        # We need V_tensor: (Left, Phys_A, Phys_B, Right)
-        AA = V_flat.reshape(A.shape[0], A.shape[1], B.shape[1], B.shape[2])
-        A,S,B = fine_grain_MPS(AA, [A.shape[1], B.shape[1]])
-        A,S,B,trunc,m = truncate_SVD(A,S,B,m)
+            E = evals[:nstates]
+            V_flat = evecs[:, :nstates]
+
+        order = np.argsort(E)
+        E = np.asarray(E)[order]
+        V_flat = np.asarray(V_flat)
+        if V_flat.ndim == 1:
+            V_flat = V_flat[:, np.newaxis]
+        V_flat = V_flat[:, order]
+
+        # Fine Grain (SVD Split).  V_flat columns are
+        # (Left * Phys_A * Phys_B * Right) two-site wavefunctions.
+        AA_list = [
+            V_flat[:, root].reshape(A.shape[0], A.shape[1], B.shape[1], B.shape[2])
+            for root in range(nstates)
+        ]
+        if nstates == 1:
+            A,S,B = fine_grain_MPS(AA_list[0], [A.shape[1], B.shape[1]])
+            A,S,B,trunc,m = truncate_SVD(A,S,B,m)
+        else:
+            A,S,B,trunc,m = sa_svd_dense(AA_list, weights, dir, m_max=m)
         if (dir == 'right'):
             # B = S * B.  S is (m,), B is (m, d, R).
             # Contract S with B[0] (Left bond of B)
@@ -3767,7 +3841,9 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
             # A = A * S.  A is (L, d, m), S is (m,)
             # Contract A[2] (Right bond) with S
             A = np.tensordot(A, np.diag(S), axes=(2, 0))
-        return E[0], A, B, trunc, m
+        if nstates == 1:
+            return E[0], A, B, trunc, m
+        return E, A, B, trunc, m, AA_list
 
 def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
                   not_conv_err=True, sym_mgr=None, nstates=1, weights=None,
@@ -3824,10 +3900,14 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
                     MPS_k[0] = A_US.transpose(0, 2, 1)
                     MPS_k[1] = V
                 else:
-                    # Dense state-average root reconstruction is handled by
-                    # the generic multi-site path; keep the averaged state as
-                    # a conservative fallback for the two-site shortcut.
-                    pass
+                    A_root, S_root, B_root = fine_grain_MPS(
+                        last_AA_list[k], [MPS[0].shape[1], MPS[1].shape[1]]
+                    )
+                    A_root, S_root, B_root, _, _ = truncate_SVD(
+                        A_root, S_root, B_root, m
+                    )
+                    MPS_k[0] = np.tensordot(A_root, np.diag(S_root), axes=(2, 0))
+                    MPS_k[1] = B_root
                 final_states.append(MPS_k)
             return Energy, final_states, "Right", True
         else:
@@ -3967,10 +4047,20 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         for k in range(nstates):
             MPS_k = [B.copy() for B in MPS]
             # Unspool the exact roots found at the last bond
-            U, V, S_dict, _, _ = svd_symmetric(last_AA_list[k], m_max=None)
-            A_US = multiply_U_S(U, S_dict)
-            MPS_k[last_i] = A_US.transpose(0, 2, 1)
-            MPS_k[last_i+1] = V
+            if U1:
+                U, V, S_dict, _, _ = svd_symmetric(last_AA_list[k], m_max=None)
+                A_US = multiply_U_S(U, S_dict)
+                MPS_k[last_i] = A_US.transpose(0, 2, 1)
+                MPS_k[last_i+1] = V
+            else:
+                A_root, S_root, B_root = fine_grain_MPS(
+                    last_AA_list[k], [MPS[last_i].shape[1], MPS[last_i+1].shape[1]]
+                )
+                A_root, S_root, B_root, _, _ = truncate_SVD(
+                    A_root, S_root, B_root, m
+                )
+                MPS_k[last_i] = np.tensordot(A_root, np.diag(S_root), axes=(2, 0))
+                MPS_k[last_i+1] = B_root
             final_states.append(MPS_k)
         return Energy, final_states, gauge, converged
 

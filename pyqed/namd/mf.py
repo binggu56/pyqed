@@ -338,7 +338,16 @@ class TDDFTTrajectory(EhrenfestTrajectory, Molecule):
     #     pass
 
 class TDDFTDriver:
-    def __init__(self, mol, nstates, xc='lda,vwn', build_driver='gbasis', nac_method='none'):
+    def __init__(
+        self,
+        mol,
+        nstates,
+        xc='lda,vwn',
+        build_driver='gbasis',
+        nac_method='none',
+        point_charge_coords=None,
+        point_charges=None,
+    ):
         """
         Thin backend adapter for TDDFT state data used by ``TDDFTEhrenfest``.
 
@@ -346,6 +355,9 @@ class TDDFTDriver:
         - ``evaluate(coords)`` / ``single_point(coords)``
         - ``as_scanner()``
         - ``normal_modes()``
+
+        ``point_charge_coords`` and ``point_charges`` provide a fixed MM
+        electrostatic embedding bath in Bohr and electron-charge units.
         """
         self.mol = mol
         self.xc = xc
@@ -355,6 +367,10 @@ class TDDFTDriver:
         self.fd_step = 1e-3
         self.nac_fd_step = 1e-3
         self.nac_method = nac_method
+        self.point_charge_coords, self.point_charges = _as_point_charges(
+            point_charge_coords,
+            point_charges,
+        )
         self.backend = None
         self.ks = None
         self.td = None
@@ -400,6 +416,15 @@ class TDDFTDriver:
 
     def _build_pyscf_point(self, mol):
         ks = mol.RKS()
+        if self.point_charge_coords is not None:
+            from pyscf import qmmm
+
+            ks = qmmm.mm_charge(
+                ks,
+                self.point_charge_coords,
+                self.point_charges,
+                unit='Bohr',
+            )
         ks.xc = self.xc
         ks.kernel()
         td = ks.apply("TDRKS")
@@ -413,7 +438,21 @@ class TDDFTDriver:
     def _build_pyqed_point(self, mol):
         from pyqed.qchem.dft import RKS
 
-        ks = RKS(mol, xc=self.xc).run(verbose=0)
+        ks = RKS(mol, xc=self.xc)
+        if self.point_charge_coords is not None:
+            from pyqed.qchem import embed_point_charges
+
+            embedded = embed_point_charges(
+                ks,
+                self.point_charge_coords,
+                self.point_charges,
+                build_driver=self.build_driver,
+                run_kwargs={'verbose': 0},
+            )
+            embedded.run()
+            ks = embedded.mf
+        else:
+            ks.run(verbose=0)
         td = ks.TDDFT().run(nstates=self.nexc) if self.nexc > 0 else None
         return ks, td
 
@@ -582,6 +621,8 @@ class TDDFTDriver:
         return energies, grads, self._zero_nac(coords)
 
     def _pyqed_gradients(self, coords, ks, td):
+        if self.point_charge_coords is not None:
+            return self._finite_difference_gradients(coords)
         try:
             grads = np.zeros((self.nstates, coords.size), dtype=float)
             grads[0] = np.asarray(ks.nuc_grad_method().kernel(), dtype=float).reshape(-1)
@@ -1212,6 +1253,28 @@ def _get_atom_masses(mol):
     if masses.shape != (natom,):
         raise ValueError(f"atom_mass_list must return shape ({natom},), got {masses.shape}.")
     return masses
+
+
+def _as_point_charges(coords, charges):
+    if coords is None and charges is None:
+        return None, None
+    if coords is None or charges is None:
+        raise ValueError("Provide point_charge_coords and point_charges together.")
+
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim == 1:
+        if coords.size != 3:
+            raise ValueError("point_charge_coords must have shape (ncharge, 3).")
+        coords = coords.reshape(1, 3)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("point_charge_coords must have shape (ncharge, 3).")
+
+    charges = np.asarray(charges, dtype=float).reshape(-1)
+    if charges.shape != (coords.shape[0],):
+        raise ValueError(
+            f"point_charges must have shape ({coords.shape[0]},), got {charges.shape}."
+        )
+    return coords.copy(), charges.copy()
 
 
 def _is_linear_geometry(coords, tol=1e-10):

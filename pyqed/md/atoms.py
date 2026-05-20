@@ -10,10 +10,12 @@ from pyqed import Molecule
 import numpy as np
 from math import pi
 import warnings
+from pyqed.units import amu2au, au2k
 
 #TODO: TO BE REMOVED
 from ase.utils import string2index
 from ase.cell import Cell
+from ase.geometry import find_mic
 
 class Atoms(Molecule):
     """
@@ -24,14 +26,107 @@ class Atoms(Molecule):
                  constraint=None, **kwargs):
         super().__init__(atom, *args, **kwargs)
         
-        # self.cell = cell
-        # if cell is None:
-        #     cell = np.zeros((3, 3))
-        #     self.set_cell(cell)
+        self.arrays = {}
+        self._constraints = []
+        self.cell = Cell.new(np.zeros((3, 3)) if cell is None else cell)
+        self._pbc = np.zeros(3, dtype=bool)
+        if pbc is not None:
+            self.set_pbc(pbc)
         self.positions = self.atom_coords()
         self.symbols = self.atom_symbols()
-        
-        
+        self._calc = None
+        if constraint is not None:
+            if isinstance(constraint, (list, tuple)):
+                self._constraints = list(constraint)
+            else:
+                self._constraints = [constraint]
+        if calculator is not None:
+            self.calc = calculator
+
+    def __len__(self):
+        return self.natom
+
+    @classmethod
+    def from_molecule(cls, molecule, **kwargs):
+        """Build MD atoms from a qchem-style ``Molecule`` geometry."""
+        atom = [
+            [symbol, tuple(coord)]
+            for symbol, coord in zip(molecule.atom_symbols(), molecule.atom_coords())
+        ]
+        return cls(atom, **kwargs)
+
+    def to_molecule(self, charge=0, spin=0, basis=None, unit="bohr"):
+        """Return a qchem ``Molecule`` snapshot from the current MD geometry."""
+        from pyqed.qchem import Molecule as QChemMolecule
+
+        atom = [
+            [symbol, tuple(coord)]
+            for symbol, coord in zip(self.atom_symbols(), self.get_positions())
+        ]
+        return QChemMolecule(atom=atom, charge=charge, spin=spin, basis=basis, unit=unit)
+
+    @property
+    def constraints(self):
+        return self._constraints
+
+    @constraints.setter
+    def constraints(self, constraints):
+        if constraints is None:
+            self._constraints = []
+        elif isinstance(constraints, (list, tuple)):
+            self._constraints = list(constraints)
+        else:
+            self._constraints = [constraints]
+
+    def has(self, name):
+        return name in self.arrays
+
+    def set_array(self, name, array, dtype=None, shape=None):
+        if array is None:
+            self.arrays.pop(name, None)
+            return
+        array = np.asarray(array, dtype=dtype)
+        if shape is not None and array.shape[1:] != shape:
+            raise ValueError(
+                f"Array {name!r} has trailing shape {array.shape[1:]}, "
+                f"expected {shape}"
+            )
+        if len(array) != len(self):
+            raise ValueError(
+                f"Array {name!r} has length {len(array)}, expected {len(self)}"
+            )
+        self.arrays[name] = array.copy()
+
+    def get_array(self, name):
+        return self.arrays[name].copy()
+
+    def get_positions(self):
+        return self.positions.copy()
+
+    def set_positions(self, positions, apply_constraint=True):
+        positions = np.asarray(positions, dtype=float)
+        if positions.shape != (len(self), 3):
+            raise ValueError(
+                f"positions must have shape {(len(self), 3)}, got {positions.shape}"
+            )
+        if apply_constraint:
+            for constraint in self.constraints:
+                if hasattr(constraint, "adjust_positions"):
+                    constraint.adjust_positions(self, positions)
+        self.positions[:] = positions
+        for i, xyz in enumerate(self.positions):
+            self._atom[i][1] = list(xyz)
+
+    def get_cell(self):
+        return self.cell.copy()
+
+    def get_masses(self):
+        """Get atomic masses in atomic units."""
+        return self.atom_mass_list() * amu2au
+
+    def get_masses_amu(self):
+        """Get atomic masses in unified atomic mass units."""
+        return self.atom_mass_list()
 
     def set_cell(self, cell, scale_atoms=False, apply_constraint=True):
         """Set unit cell vectors.
@@ -110,7 +205,9 @@ class Atoms(Molecule):
 
     def set_pbc(self, pbc):
         """Set periodic boundary condition flags."""
-        self.pbc = pbc
+        if isinstance(pbc, bool):
+            pbc = (pbc, pbc, pbc)
+        self.pbc = np.asarray(pbc, dtype=bool)
 
     def get_pbc(self):
         """Get periodic boundary condition flags."""
@@ -149,6 +246,30 @@ class Atoms(Molecule):
         if momenta is None:
             return 0.0
         return 0.5 * np.vdot(momenta, self.get_velocities())
+
+    def get_temperature(self, remove_center_of_mass=False):
+        """Get instantaneous temperature in Kelvin.
+
+        The internal kinetic energy is in Hartree, so ``pyqed.units.au2k`` is
+        used to convert the corresponding ``k_B T`` from atomic units to K.
+        """
+        natoms = len(self)
+        dof = 3 * natoms
+        if remove_center_of_mass and natoms > 1:
+            dof -= 3
+        for constraint in self.constraints:
+            if hasattr(constraint, "get_removed_degrees_of_freedom"):
+                dof -= constraint.get_removed_degrees_of_freedom(self)
+        if dof <= 0:
+            return 0.0
+        kinetic = self.get_kinetic_energy()
+        if remove_center_of_mass and natoms > 1:
+            momenta = self.get_momenta()
+            total_momentum = momenta.sum(axis=0)
+            total_mass = self.get_masses().sum()
+            kinetic -= 0.5 * np.dot(total_momentum, total_momentum) / total_mass
+            kinetic = max(kinetic, 0.0)
+        return 2.0 * kinetic * au2k / dof
 
     def get_center_of_mass(self, scaled=False, indices=None):
          """Get the center of mass.
@@ -195,8 +316,11 @@ class Atoms(Molecule):
         """Get the total energy - potential plus kinetic energy."""
         return self.get_potential_energy() + self.get_kinetic_energy()
 
-    def get_kinetic_energy(self):
-        pass
+    def get_potential_energy(self):
+        """Calculate potential energy using the attached calculator."""
+        if self._calc is None:
+            raise RuntimeError('Atoms object has no calculator.')
+        return self._calc.get_potential_energy(self)
 
     @property
     def calc(self):
@@ -291,7 +415,7 @@ class Atoms(Molecule):
         b = self.positions[a3] - self.positions[a2]
         c = self.positions[a4] - self.positions[a3]
         if mic:
-            a, b, c = find_mic([a, b, c], self._cell, self._pbc)[0]
+            a, b, c = find_mic([a, b, c], self.cell, self.pbc)[0]
         bxa = np.cross(b, a)
         bxa /= np.linalg.norm(bxa)
         cxb = np.cross(c, b)

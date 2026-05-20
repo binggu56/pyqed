@@ -521,6 +521,22 @@ def two_site_update(
             _expand_two_site_support(A, B, root) if root is not merged else root
             for root in optimized_roots
         ]
+        state_average_weights = local_objective.get("state_average_weights")
+        if state_average_weights is not None:
+            state_average_weights = np.asarray(state_average_weights, dtype=float).reshape(-1)
+            if state_average_weights.size == len(optimized_roots):
+                active = np.abs(state_average_weights) > 1.0e-14
+                if np.any(active) and not np.all(active):
+                    local_objective["optimized_root_candidates"] = int(len(optimized_roots))
+                    optimized_roots = [
+                        root for root, keep in zip(optimized_roots, active)
+                        if bool(keep)
+                    ]
+                    state_average_weights = state_average_weights[active]
+                    state_average_weights = state_average_weights / np.sum(state_average_weights)
+                    local_objective["state_average_weights"] = [
+                        float(weight) for weight in state_average_weights
+                    ]
         left, right, singular_values, trunc_err, kept, root_site_pairs = state_averaged_svd_two_site(
             optimized_roots,
             local_objective.get("state_average_weights"),

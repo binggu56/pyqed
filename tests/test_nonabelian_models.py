@@ -31,10 +31,13 @@ from pyqed.mps.nonabelian import (
     spatial_create_up,
     spatial_double_occupancy,
     spatial_number,
+    spatial_pair_annihilation,
+    spatial_pair_creation,
     spatial_parity,
     time_reversed_reduced_operator,
     FullyReducedSpatialOrbitalSite,
     spatial_target_sector,
+    as_rank_coupled_mpo,
 )
 from pyqed.mps.su2 import SpatialOrbitalSite, SU2Irrep
 from pyqed.mps.nonabelian.coupling import ordered_two_m_values
@@ -424,6 +427,44 @@ def test_fully_reduced_two_site_exchange_eri_matrix_matches_exact_reduced_cg_ref
                 assert actual == pytest.approx(expected, abs=1.0e-12)
 
 
+def test_fully_reduced_scalar_pair_hopping_survives_rank_coupled_embedding():
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    vacuum = spatial_target_sector(0, 0)
+    target = spatial_target_sector(2, 0)
+    path_specs = (
+        ((0, 2), (vacuum, vacuum, target)),
+        ((2, 0), (vacuum, target, target)),
+    )
+    basis_states, _dense_vectors = _reduced_spatial_path_basis(path_specs)
+
+    autompo = AutoMPO([phys_leg] * 2)
+    autompo.add_term(
+        (0, spatial_pair_creation(phys_leg)),
+        (1, spatial_pair_annihilation(phys_leg)),
+        coeff=1.0,
+    )
+    scalar_mpo = autompo.build()
+    rank_coupled_mpo = [as_rank_coupled_mpo(core) for core in scalar_mpo]
+
+    np.testing.assert_allclose(
+        [
+            [
+                _contract_chain_transition(bra_state, scalar_mpo, ket_state)
+                for ket_state in basis_states
+            ]
+            for bra_state in basis_states
+        ],
+        [
+            [
+                _contract_chain_transition(bra_state, rank_coupled_mpo, ket_state)
+                for ket_state in basis_states
+            ]
+            for bra_state in basis_states
+        ],
+        atol=1.0e-12,
+    )
+
+
 def test_fully_reduced_exchange_eri_matrix_matches_exact_reduced_cg_reference():
     nsites = 3
     vacuum = spatial_target_sector(0, 0)
@@ -499,13 +540,6 @@ def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_referen
                 assert actual == pytest.approx(expected, abs=1.0e-12)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Embedded fully reduced rank-coupled strings still need the block2-like "
-        "CG-projected environment contraction."
-    ),
-    strict=True,
-)
 def test_fully_reduced_one_body_embedded_matrix_matches_exact_reduced_cg_reference():
     nsites = 4
     path_specs = _reduced_spatial_path_specs(

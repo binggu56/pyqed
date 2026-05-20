@@ -32,6 +32,14 @@ def pcm_for_casscf(mc, solvent_obj=None, dm=None):
             solvent_obj = PCM(mc.mol)
     return _attach_solvent._for_casscf(mc, solvent_obj, dm)
 
+def pcm_for_tdscf(td, solvent_obj=None, dm=None, equilibrium_solvation=False):
+    return _attach_solvent._for_tdscf(
+        td,
+        solvent_obj=solvent_obj,
+        dm=dm,
+        equilibrium_solvation=equilibrium_solvation,
+    )
+
 
 
 # TABLE II,  J. Chem. Phys. 122, 194110 (2005)
@@ -247,6 +255,15 @@ class PCM:
         `state_id=0` corresponds to the ground state, while `state_id=1` corresponds
         to the first excited state. Default is 0.
 
+    state_average : bool
+        If True, update the solvent from an equal-weight average of all requested
+        electronic-state densities. This is useful for state-averaged CASSCF/CASCI
+        benchmarks.
+
+    state_weights : array_like or None
+        Optional explicit state weights for the solvent density. If set, this
+        overrides state_average.
+
     Saved Results:
     --------------
     e_tot : float
@@ -268,7 +285,8 @@ class PCM:
     _keys = {
         'method', 'vdw_scale', 'surface', 'r_probe',
         'mol', 'radii_table', 'lebedev_order',
-        'eps', 'max_cycle', 'conv_tol', 'state_id', 'frozen',
+        'eps', 'max_cycle', 'conv_tol', 'state_id', 'state_average',
+        'state_weights', 'frozen',
         'equilibrium_solvation', 'e', 'v', 'v_grids_n',
     }
 
@@ -298,6 +316,8 @@ class PCM:
         self.max_cycle = 20
         self.conv_tol = 1e-7
         self.state_id = 0
+        self.state_average = False
+        self.state_weights = None
 
         self.frozen = False
         self.equilibrium_solvation = False

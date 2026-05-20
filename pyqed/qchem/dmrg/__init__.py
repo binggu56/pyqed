@@ -1,4 +1,5 @@
-from .dmrg import DMRG, DMRGSCF, QCDMRG
+from .dmrg import DMRG, QCDMRG
+from .dmrgscf import DMRGSCF
 from .ed import ED
 from .tddmrg import TDDMRG, gaussian_pulse
 from .overlap import (

@@ -68,6 +68,29 @@ except (ImportError, OSError):
     IR = None
 
 try:
+    from .vibronic import (
+        LVC,
+        build_linear_vibronic_model,
+        build_lvc,
+        compare_lvc_to_sharc,
+        load_sharc_lvc_template,
+        lvc_from_sharc_template,
+        mode_derivative_couplings_from_overlaps,
+        project_cartesian_to_modes,
+        vibronic_couplings_from_derivative_couplings,
+    )
+except (ImportError, OSError):
+    LVC = None
+    build_linear_vibronic_model = None
+    build_lvc = None
+    compare_lvc_to_sharc = None
+    load_sharc_lvc_template = None
+    lvc_from_sharc_template = None
+    mode_derivative_couplings_from_overlaps = None
+    project_cartesian_to_modes = None
+    vibronic_couplings_from_derivative_couplings = None
+
+try:
     from .semiempirical import (
         DEFAULT_OM2_PARAMETERS,
         MRCI as SemiempiricalMRCI,
@@ -144,3 +167,14 @@ try:
 except (ImportError, OSError):
     SOCStateInteractionResult = None
     soc_state_interaction = None
+
+try:
+    from .qmmm import (
+        PointChargeEmbeddedPostSCF,
+        PointChargeEmbeddedSCF,
+        embed_point_charges,
+    )
+except (ImportError, OSError):
+    PointChargeEmbeddedPostSCF = None
+    PointChargeEmbeddedSCF = None
+    embed_point_charges = None

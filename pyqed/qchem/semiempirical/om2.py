@@ -1022,6 +1022,15 @@ def _determinant_overlap_matrix(left_binary, right_binary, mo_overlap):
     left_binary = np.asarray(left_binary, dtype=np.int8)
     right_binary = np.asarray(right_binary, dtype=np.int8)
     mo_overlap = np.asarray(mo_overlap, dtype=float)
+    if mo_overlap.ndim == 2:
+        mo_overlap_alpha = mo_overlap_beta = mo_overlap
+    elif mo_overlap.ndim == 3 and mo_overlap.shape[0] == 2:
+        mo_overlap_alpha, mo_overlap_beta = mo_overlap
+    else:
+        raise ValueError(
+            "mo_overlap must be either a spin-independent (nmo,nmo) matrix "
+            "or spin-resolved (2,nmo,nmo) matrices."
+        )
     out = np.zeros((len(left_binary), len(right_binary)), dtype=float)
 
     for i, left in enumerate(left_binary):
@@ -1032,11 +1041,95 @@ def _determinant_overlap_matrix(left_binary, right_binary, mo_overlap):
             right_beta = np.flatnonzero(right[1])
             if len(left_alpha) != len(right_alpha) or len(left_beta) != len(right_beta):
                 continue
-            s_alpha = mo_overlap[np.ix_(left_alpha, right_alpha)]
-            s_beta = mo_overlap[np.ix_(left_beta, right_beta)]
+            s_alpha = mo_overlap_alpha[np.ix_(left_alpha, right_alpha)]
+            s_beta = mo_overlap_beta[np.ix_(left_beta, right_beta)]
             out[i, j] = np.linalg.det(s_alpha) * np.linalg.det(s_beta)
 
     return out
+
+
+def _apply_spin_flip_plus(det, p_alpha, q_beta, amplitude):
+    """Apply ``amplitude * a^+_{p alpha} a_{q beta}`` to one determinant."""
+    if abs(amplitude) == 0.0:
+        return None, 0.0
+    alpha = np.asarray(det[0], dtype=np.int8)
+    beta = np.asarray(det[1], dtype=np.int8)
+    if beta[q_beta] == 0 or alpha[p_alpha] == 1:
+        return None, 0.0
+
+    beta_phase = -1.0 if int(np.sum(beta[:q_beta])) % 2 else 1.0
+    alpha_phase = -1.0 if int(np.sum(alpha[:p_alpha])) % 2 else 1.0
+    new_alpha = alpha.copy()
+    new_beta = beta.copy()
+    new_beta[q_beta] = 0
+    new_alpha[p_alpha] = 1
+    key = (tuple(new_alpha.tolist()), tuple(new_beta.tolist()))
+    return key, alpha_phase * beta_phase * amplitude
+
+
+def _reference_alpha_beta_overlap(reference, nmo):
+    """Return the alpha/beta MO overlap used in the spin-flip operator."""
+    coeff = getattr(reference, "mo_coeff", None)
+    if coeff is None:
+        return np.eye(nmo)
+    coeff = np.asarray(coeff)
+    if coeff.ndim == 2:
+        return np.eye(nmo)
+    if coeff.ndim == 3 and coeff.shape[0] == 2:
+        ca, cb = coeff
+        if ca.shape[1] != nmo or cb.shape[1] != nmo:
+            raise ValueError("Spin-resolved MO coefficients do not match determinant basis.")
+        return ca.T @ cb
+    raise ValueError("Unsupported MO coefficient shape for spin-square diagnostic.")
+
+
+def _spin_square_matrix(binary, alpha_beta_overlap=None):
+    """Build the determinant-basis ``S^2`` matrix for a fixed-``M_S`` sector.
+
+    For restricted references, ``alpha_beta_overlap`` is the identity and this
+    is the standard determinant spin operator.  For unrestricted references,
+    the spin-flip operator uses ``C_alpha.T @ C_beta`` so the diagnostic follows
+    the non-orthogonal alpha/beta orbital representation.
+    """
+    binary = np.asarray(binary, dtype=np.int8)
+    if binary.ndim != 3 or binary.shape[1] != 2:
+        raise ValueError("binary determinants must have shape (ndet,2,nmo).")
+    ndet, _, nmo = binary.shape
+    if ndet == 0:
+        return np.zeros((0, 0), dtype=float)
+    nalpha = np.sum(binary[:, 0, :], axis=1)
+    nbeta = np.sum(binary[:, 1, :], axis=1)
+    if np.any(nalpha != nalpha[0]) or np.any(nbeta != nbeta[0]):
+        raise ValueError("Spin-square diagnostic requires a fixed N_alpha/N_beta sector.")
+
+    ms = 0.5 * float(nalpha[0] - nbeta[0])
+    s_ab = np.eye(nmo) if alpha_beta_overlap is None else np.asarray(alpha_beta_overlap)
+    if s_ab.shape != (nmo, nmo):
+        raise ValueError("alpha_beta_overlap must have shape (nmo,nmo).")
+
+    plus_columns = []
+    for det in binary:
+        column = {}
+        for p in range(nmo):
+            for q in range(nmo):
+                key, value = _apply_spin_flip_plus(det, p, q, s_ab[p, q])
+                if key is None:
+                    continue
+                column[key] = column.get(key, 0.0) + value
+        plus_columns.append(column)
+
+    out = np.eye(ndet, dtype=complex) * (ms * (ms + 1.0))
+    for i, left in enumerate(plus_columns):
+        for j in range(i, ndet):
+            right = plus_columns[j]
+            if len(left) < len(right):
+                value = sum(np.conjugate(v) * right.get(key, 0.0) for key, v in left.items())
+            else:
+                value = sum(np.conjugate(left.get(key, 0.0)) * v for key, v in right.items())
+            out[i, j] += value
+            if i != j:
+                out[j, i] += np.conjugate(value)
+    return np.real_if_close(out)
 
 
 class MRCI:
@@ -1055,6 +1148,9 @@ class MRCI:
         spin=None,
         full=False,
         active_orbitals=None,
+        spin_penalty=None,
+        target_spin=None,
+        target_s2=None,
         verbose=0,
     ):
         self.reference = reference
@@ -1066,10 +1162,16 @@ class MRCI:
         self.spin = spin
         self.full = bool(full)
         self.active_orbitals = None if active_orbitals is None else tuple(int(i) for i in active_orbitals)
+        self.spin_penalty = None if spin_penalty is None else float(spin_penalty)
+        self.target_spin = None if target_spin is None else float(target_spin)
+        self.target_s2 = None if target_s2 is None else float(target_s2)
         self.verbose = verbose
         self.e = None
         self.e_elec = None
+        self.e_penalized = None
         self.ci = None
+        self.s2 = None
+        self.spin_multiplicity = None
         self.determinants = None
         self.active_determinants = None
         self.determinant_labels = None
@@ -1149,27 +1251,101 @@ class MRCI:
             raise ValueError("MRCI Hamiltonian must be a square matrix.")
         return 0.5 * (h + h.T), ref
 
+    def _resolved_target_s2(self, ref=None):
+        if self.target_s2 is not None:
+            return float(self.target_s2)
+        if self.target_spin is not None:
+            s = float(self.target_spin)
+        else:
+            spin = self.spin
+            if spin is None and ref is not None:
+                spin = getattr(getattr(ref, "mol", None), "spin", None)
+                if spin is None:
+                    spin = getattr(ref, "spin", None)
+                if spin is None:
+                    spin = getattr(getattr(ref, "_mindo_mol", None), "spin", None)
+            s = 0.5 * abs(float(spin or 0.0))
+        if s < 0.0:
+            raise ValueError("target_spin must be non-negative.")
+        return s * (s + 1.0)
+
+    def _spin_penalty_matrix(self, ref):
+        if self.spin_penalty is None or self.spin_penalty == 0.0:
+            return None, None, None
+        if self.determinants is None:
+            raise ValueError("Build CI determinants before applying spin penalty.")
+        s_ab = _reference_alpha_beta_overlap(ref, self.determinants.shape[-1])
+        s2_matrix = _spin_square_matrix(self.determinants, s_ab)
+        target_s2 = self._resolved_target_s2(ref)
+        delta = s2_matrix - np.eye(s2_matrix.shape[0]) * target_s2
+        penalty = float(self.spin_penalty) * (delta @ delta)
+        return np.real_if_close(penalty), np.real_if_close(s2_matrix), target_s2
+
     def run(self, nstates=None):
         if nstates is not None:
             self.nstates = int(nstates)
         h, ref = self._dense_hamiltonian()
+        penalty, _s2_for_penalty, target_s2 = self._spin_penalty_matrix(ref)
+        h_diag = h if penalty is None else h + penalty
         nroots = min(self.nstates, h.shape[0])
-        if nroots == h.shape[0] or h.shape[0] <= max(4, nroots + 1):
-            e, v = np.linalg.eigh(h)
-            e = e[:nroots]
+        if nroots == h_diag.shape[0] or h_diag.shape[0] <= max(4, nroots + 1):
+            e_diag, v = np.linalg.eigh(h_diag)
+            e_diag = e_diag[:nroots]
             v = v[:, :nroots]
         else:
-            e, v = eigsh(h, k=nroots, which="SA")
-            order = np.argsort(e)
-            e = e[order]
+            e_diag, v = eigsh(h_diag, k=nroots, which="SA")
+            order = np.argsort(e_diag)
+            e_diag = e_diag[order]
             v = v[:, order]
 
-        self.e_elec = np.asarray(e)
+        e = np.einsum("ir,ij,jr->r", v.conj(), h, v, optimize=True)
+        self.e_elec = np.real_if_close(e).astype(float)
+        self.e_penalized = None if penalty is None else np.asarray(e_diag)
         enuc = float(ref.energy_nuc()) if hasattr(ref, "energy_nuc") else 0.0
         self.e = self.e_elec + enuc
         self.ci = np.asarray(v)
         self.nstates = int(len(self.e))
+        self.s2 = self._compute_spin_square_values(ref)
+        spin = 0.5 * (np.sqrt(1.0 + 4.0 * np.maximum(self.s2, 0.0)) - 1.0)
+        self.spin_multiplicity = 2.0 * spin + 1.0
+        if self.verbose:
+            if penalty is not None:
+                print(
+                    f"spin penalty lambda={self.spin_penalty:g}, "
+                    f"target <S^2>={target_s2:.8f}"
+                )
+            for root, value in enumerate(self.s2):
+                print(
+                    f"root {root}: <S^2> = {value:.8f}, "
+                    f"2S+1 ~= {self.spin_multiplicity[root]:.6f}"
+                )
         return self
+
+    def spin_square_matrix(self):
+        """Return the determinant-basis ``S^2`` matrix for this CI space."""
+        if self.determinants is None:
+            raise ValueError("Run the CI calculation before requesting S^2.")
+        ref = self._ensure_reference()
+        s_ab = _reference_alpha_beta_overlap(ref, self.determinants.shape[-1])
+        return _spin_square_matrix(self.determinants, s_ab)
+
+    def _compute_spin_square_values(self, ref):
+        if self.ci is None or self.determinants is None:
+            return None
+        s_ab = _reference_alpha_beta_overlap(ref, self.determinants.shape[-1])
+        s2_matrix = _spin_square_matrix(self.determinants, s_ab)
+        values = np.einsum("ir,ij,jr->r", self.ci.conj(), s2_matrix, self.ci, optimize=True)
+        return np.real_if_close(values).astype(float)
+
+    def spin_square(self, state_id=None):
+        """Return ``<S^2>`` for one root or all computed roots."""
+        if self.s2 is None:
+            if self.ci is None:
+                raise ValueError("Run the CI calculation before requesting <S^2>.")
+            self.s2 = self._compute_spin_square_values(self._ensure_reference())
+        if state_id is None:
+            return self.s2.copy()
+        return float(self.s2[int(state_id)])
 
     def wavefunction_overlap(self, other):
         """Return CI-state overlap between two MRCI calculations.

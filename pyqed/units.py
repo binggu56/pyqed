@@ -17,6 +17,8 @@ au2as = 24.1888432651 # attoseconds
 au2k = 315775.13 #K
 
 au2ev = 27.2116
+au2kcalmol = 627.5094740631
+kcalmol2au = 1.0 / au2kcalmol
 
 au2tesla = 2.35051756758e5
 tesla = 1/au2tesla

@@ -29,6 +29,22 @@ def _site_dense_matrix(site, *, mode):
     return grouped
 
 
+def _irrep_dim(sector):
+    irrep = getattr(sector, "irrep", None)
+    if irrep is not None and hasattr(irrep, "dim"):
+        return int(irrep.dim)
+    labels = getattr(sector, "labels", ())
+    components = getattr(sector, "components", ())
+    if "su2" in labels:
+        irrep = components[labels.index("su2")]
+        if hasattr(irrep, "dim"):
+            return int(irrep.dim)
+    dim = getattr(sector, "dim", None)
+    if dim is not None:
+        return int(dim)
+    return 1
+
+
 def _site_full_dense_matrix(site, *, mode):
     if not isinstance(site, NonabelianTensor) or site.rank != 3:
         raise ValueError("_site_full_dense_matrix expects a rank-3 NonabelianTensor site tensor.")
@@ -132,11 +148,25 @@ def right_canonical_error(site):
     """
     Return the maximum isometry error for a right-canonical site tensor.
     """
-    grouped = _site_dense_matrix(site, mode="right")
+    if not isinstance(site, NonabelianTensor) or site.rank != 3:
+        raise ValueError("right_canonical_error expects a rank-3 NonabelianTensor site tensor.")
+    grouped = {}
+    for (q_left, _q_phys, q_right), block in site.data.items():
+        arr = np.asarray(block)
+        matrix = arr.reshape(arr.shape[0], -1)
+        if arr.shape[1] == 1:
+            weight = _irrep_dim(q_right) / max(_irrep_dim(q_left), 1)
+        else:
+            weight = 1.0
+        grouped.setdefault(q_left, []).append((matrix, float(weight)))
     err = 0.0
-    for mats in grouped.values():
-        M = np.concatenate(mats, axis=1)
-        gram = M @ M.conj().T
+    for weighted_mats in grouped.values():
+        gram = None
+        for matrix, weight in weighted_mats:
+            block_gram = weight * (matrix @ matrix.conj().T)
+            gram = block_gram if gram is None else gram + block_gram
+        if gram is None:
+            continue
         err = max(err, float(np.linalg.norm(gram - np.eye(gram.shape[0], dtype=gram.dtype))))
     return err
 

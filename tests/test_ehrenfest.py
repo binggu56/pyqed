@@ -181,7 +181,7 @@ def test_tddft_ehrenfest_can_load_modes_from_hessian():
 
 
 def test_tddft_ehrenfest_real_h2_thermal_wigner_sampling_matches_mode_variances():
-    pyscf = pytest.importorskip("pyscf")
+    pytest.importorskip("pyscf")
     from pyscf import gto
 
     from pyqed.namd.mf import TDDFTDriver
@@ -343,6 +343,46 @@ def test_native_tddft_driver_as_scanner_returns_ehrenfest_shapes():
     assert grad.shape == (2, 6)
     assert nac.shape == (2, 2, 6)
     assert energy[1] > energy[0]
+    np.testing.assert_allclose(nac, 0.0, atol=1e-12)
+
+
+def test_native_tddft_driver_supports_builtin_point_charge_embedding():
+    pytest.importorskip("pyscf")
+
+    from pyqed.namd.mf import TDDFTDriver
+    from pyqed.qchem import Molecule, embed_point_charges
+    from pyqed.qchem.dft import RKS
+
+    pc_coords = np.array([[0.0, 0.0, 3.0]])
+    pc_charges = np.array([-0.2])
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    driver = TDDFTDriver(
+        mol,
+        2,
+        xc="lda",
+        build_driver="builtin",
+        point_charge_coords=pc_coords,
+        point_charges=pc_charges,
+    )
+
+    ref_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    ref_mol.build(driver="builtin")
+    ref_energy = embed_point_charges(
+        RKS(ref_mol, xc="lda"),
+        pc_coords,
+        pc_charges,
+        run_kwargs={"verbose": 0},
+    ).kernel()
+
+    energy, grad, nac = driver.evaluate(mol.atom_coords())
+
+    assert driver.backend == "pyqed"
+    np.testing.assert_allclose(energy[0], ref_energy, atol=1e-10)
+    assert energy.shape == (2,)
+    assert grad.shape == (2, 6)
+    assert nac.shape == (2, 2, 6)
+    assert energy[1] > energy[0]
+    assert np.all(np.isfinite(grad))
     np.testing.assert_allclose(nac, 0.0, atol=1e-12)
 
 
