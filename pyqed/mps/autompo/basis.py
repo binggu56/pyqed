@@ -1081,7 +1081,6 @@ class BasisSpatialOrbital(BasisSet):
             elif sym == "a_d":
                 loc_mat[0, 2] = 1.
                 loc_mat[1, 3] = -1.
-                
             # Number operators
             elif sym == "n_u":
                 loc_mat[1, 1] = 1.
@@ -1093,14 +1092,12 @@ class BasisSpatialOrbital(BasisSet):
                 loc_mat[1, 1] = 1.
                 loc_mat[2, 2] = 1.
                 loc_mat[3, 3] = 2.
-                
             # Parity Operator (Jordan-Wigner Z)
             elif sym == "Z":
                 loc_mat[0, 0] = 1.
                 loc_mat[1, 1] = -1.
                 loc_mat[2, 2] = -1.
                 loc_mat[3, 3] = 1.
-                
             # Identity
             elif sym == "I":
                 loc_mat = np.eye(4)
