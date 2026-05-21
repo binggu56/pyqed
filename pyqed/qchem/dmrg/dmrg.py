@@ -512,35 +512,13 @@ class QCDMRG(CASCI):
     def get_initial_guess_dense(self, noise=1e-3):
         return get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=noise)
 
-    def fix_nelec(self, shift):
-        """
-        fix the number of electrons by energy penalty
-
-        .. math::
-
-            \mathcal{H} = H + \lambda (\hat{N} - N)^2
-
-        Parameters
-        ----------
-        shift : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        None.
-
-        """
-        # self.h1e += ...
-        # self.eri += ...
-        return
-
-    # def fix_spin(self, shift, spin=0, ss = 0):
+    # def fix_nelec(self, shift):
     #     """
     #     fix the number of electrons by energy penalty
 
     #     .. math::
 
-    #         \mathcal{H} = H + \lambda (\hat{S}^2 - S(S+1))^2
+    #         \mathcal{H} = H + \lambda (\hat{N} - N)^2
 
     #     Parameters
     #     ----------
@@ -554,7 +532,7 @@ class QCDMRG(CASCI):
     #     """
     #     # self.h1e += ...
     #     # self.eri += ...
-    #     return self
+    #     return
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
         """
@@ -691,7 +669,7 @@ class QCDMRG(CASCI):
         #     return H1, H2
         return H1, H2
 
-    def build(self, mo_coeff=None, orbital_type='spin'):
+    def build(self, mo_coeff=None, orbital_type='spatial'):
         """
         Build the Hamiltonian MPO.
         
@@ -894,7 +872,6 @@ class QCDMRG(CASCI):
         s2_vals = []
         
         for state in states_to_eval:
-            # RESTORED: Your original working dense conversion
             if hasattr(state.Bs[0], 'qns'):
                 dense_state = mps_lib.symmetric_to_dense(state)
                 psi_for_eval = dense_state.Bs
@@ -1143,26 +1120,185 @@ class QCDMRG(CASCI):
                 label = f"Unknown ({sym_type})"
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
-    def make_rdm1(self, state_id=0, spatial=False, with_core=False):
+    def _uncompress_d4_to_d2(self, state_d4):
         """
-        Calculates the 1-RDM. 
-        If spatial=True, spin-traces to the spatial MO basis.
-        If with_core=True, re-embeds the frozen core electrons on the diagonal.
-        \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
-        Parameters
-        ----------
-        state_id : int, optional
-            _description_, by default 0
-        spatial : bool, optional
-            _description_, by default False
-        with_core : bool, optional
-            _description_, by default False
+        Mathematically splits an N-site d=4 spatial MPS into a 2N-site d=2 spin MPS.
+        """
+        import numpy as np
+        from pyqed.mps.mps import MPS
+        
+        new_Bs = []
+        for B in state_d4.Bs:
+            D_L, d, D_R = B.shape
+            if d == 2:
+                return state_d4 # already d=2
+            
+            # Map spatial states back to (Up, Down) spin-orbitals
+            B_reshaped = np.zeros((D_L, 2, 2, D_R), dtype=B.dtype)
+            B_reshaped[:, 0, 0, :] = B[:, 0, :] # Emp
+            B_reshaped[:, 1, 0, :] = B[:, 1, :] # Up
+            B_reshaped[:, 0, 1, :] = B[:, 2, :] # Dn
+            B_reshaped[:, 1, 1, :] = B[:, 3, :] # Docc
+            
+            # SVD to split the single site into two sites
+            B_mat = B_reshaped.reshape(D_L * 2, 2 * D_R)
+            U, S, Vh = np.linalg.svd(B_mat, full_matrices=False)
+            
+            # Truncate exact zero singular values
+            tol = 1e-12
+            keep = S > tol
+            if not np.any(keep): keep[0] = True
+                
+            U = U[:, keep]
+            S = S[keep]
+            Vh = Vh[keep, :]
+            
+            # Left node gets Up, Right node gets Down
+            B_up = U.reshape(D_L, 2, -1)
+            B_dn = (S[:, None] * Vh).reshape(-1, 2, D_R)
+            
+            new_Bs.append(B_up)
+            new_Bs.append(B_dn)
+            
+        return MPS(new_Bs)
 
-        Returns
-        -------
-        _type_
-            _description_
-        """
+    # def make_rdm1(self, state_id=0, spatial=False, with_core=False):
+    #     """
+    #     Calculates the 1-RDM. 
+    #     If spatial=True, spin-traces to the spatial MO basis.
+    #     If with_core=True, re-embeds the frozen core electrons on the diagonal.
+    #     \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
+    #     Parameters
+    #     ----------
+    #     state_id : int, optional
+    #         _description_, by default 0
+    #     spatial : bool, optional
+    #         _description_, by default False
+    #     with_core : bool, optional
+    #         _description_, by default False
+
+    #     Returns
+    #     -------
+    #     _type_
+    #         _description_
+    #     """
+    #     if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+    #         raise ValueError("Run DMRG first to generate a state.")
+    #     if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+    #         state = self.dmrg.states[state_id]
+    #     else:
+    #         state = self.dmrg.ground_state
+        
+    #     # Get Spin-Orbital RDM
+    #     if hasattr(state.Bs[0], 'qns'):
+    #         from pyqed.mps.mps import symmetric_to_dense
+    #         dense_state = symmetric_to_dense(state)
+    #         dense_state.dim = 2 
+    #         P_raw = dense_state.make_rdm1()
+    #     else:
+    #         P_raw = state.make_rdm1()
+            
+    #     # Convert to Spatial MO basis if requested (or if with_core is True)
+    #     if spatial or with_core:
+    #         ncas = self.ncas
+    #         P_spatial = np.zeros((ncas, ncas), dtype=float)
+    #         for p in range(ncas):
+    #             for q in range(ncas):
+    #                 val = P_raw[2*p, 2*q] + P_raw[2*p+1, 2*q+1]
+    #                 P_spatial[q,p] = float(np.real(val))
+    #         P_out = P_spatial
+    #     else:
+    #         P_out = P_raw
+
+    #     # Embed Frozen Core for CASSCF optimizations
+    #     if with_core:
+    #         ncore = self.ncore
+    #         norb = ncore + self.ncas
+    #         D = np.zeros((norb, norb), dtype=float)
+    #         if ncore > 0:
+    #             np.fill_diagonal(D[:ncore, :ncore], 2.0)
+    #         D[ncore:norb, ncore:norb] = P_out
+    #         return D
+            
+    #     return P_out
+
+    # def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
+    #     """
+    #     Calculates the 2-RDM.
+    #     If spatial=True, spin-traces to the spatial MO basis.
+
+    #     Parameters
+    #     ----------
+    #     state_id : int, optional
+    #         _description_, by default 0
+    #     spatial : bool, optional
+    #         _description_, by default False
+    #     with_core : bool, optional
+    #         _description_, by default False
+    #     idx_pairs : _type_, optional
+    #         _description_, by default None
+
+    #     Returns
+    #     -------
+    #     _type_
+    #         _description_
+    #     """
+    #     if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+    #         raise ValueError("Run DMRG first to generate a state.")
+    #     if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+    #         state = self.dmrg.states[state_id]
+    #     else:
+    #         state = self.dmrg.ground_state
+        
+    #     # Get Spin-Orbital RDM
+    #     if hasattr(state.Bs[0], 'qns'):
+    #         from pyqed.mps.mps import symmetric_to_dense
+    #         dense_state = symmetric_to_dense(state)
+    #         dense_state.dim = 2 
+    #         G_raw = dense_state.make_rdm2()
+    #     else:
+    #         G_raw = state.make_rdm2()
+            
+    #     # Convert to Spatial MO basis if requested
+    #     if spatial or with_core:
+    #         ncas = self.ncas
+    #         D_spatial = np.zeros((ncas, ncas, ncas, ncas), dtype=float)
+    #         for p in range(ncas):
+    #             for q in range(ncas):
+    #                 for r in range(ncas):
+    #                     for s in range(ncas):
+    #                         # p^dag r^dag sq Spatial Convention: dm2[p,q,r,s] = sum_{sig, tau} <p_sig^dag r_tau^dag s_tau q_sig>
+    #                         val = G_raw[2*p,   2*r,   2*s,   2*q] + \
+    #                               G_raw[2*p,   2*r+1, 2*s+1, 2*q] + \
+    #                               G_raw[2*p+1, 2*r,   2*s,   2*q+1] + \
+    #                               G_raw[2*p+1, 2*r+1, 2*s+1, 2*q+1]
+    #                         D_spatial[p, q, r, s] = float(np.real(val))
+    #         G_out = D_spatial
+    #     else:
+    #         G_out = G_raw
+            
+    #     # Embed Frozen Core 
+    #     if with_core:
+    #         ncore = self.ncore
+    #         norb = ncore + self.ncas
+    #         D2 = np.zeros((norb, norb, norb, norb), dtype=float)
+    #         if ncore > 0:
+    #             I = np.eye(ncore)
+    #             D2[:ncore, :ncore, :ncore, :ncore] = 4 * np.einsum('ij,kl->ijkl', I, I) - 2 * np.einsum('ps,rq->pqrs', I, I)
+                
+    #             dm1 = self.make_rdm1(state_id, spatial=True, with_core=False)
+    #             for i in range(ncore):
+    #                 D2[i, i, ncore:norb, ncore:norb] = 2 * dm1
+    #                 D2[ncore:norb, ncore:norb, i, i] = 2 * dm1
+    #                 D2[i, ncore:norb, i, ncore:norb] = -dm1
+    #                 D2[ncore:norb, i, ncore:norb, i] = -dm1
+                    
+    #         D2[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = G_out
+    #         return D2
+            
+    #     return G_out
+
+    def make_rdm1(self, state_id=0, spatial=False, with_core=False):
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
@@ -1170,16 +1306,22 @@ class QCDMRG(CASCI):
         else:
             state = self.dmrg.ground_state
         
-        # Get Spin-Orbital RDM
+        # 1. Convert to Dense Array MPS
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
-            P_raw = dense_state.make_rdm1()
         else:
-            P_raw = state.make_rdm1()
+            dense_state = state
             
-        # Convert to Spatial MO basis if requested (or if with_core is True)
+        # 2. Uncompress d=4 to d=2 if needed
+        d_local = dense_state.Bs[0].shape[1]
+        if d_local == 4:
+            dense_state = self._uncompress_d4_to_d2(dense_state)
+            
+        # 3. Calculate RDM safely in d=2 space
+        P_raw = dense_state.make_rdm1()
+        
+        # 4. Map back to spatial and add core
         if spatial or with_core:
             ncas = self.ncas
             P_spatial = np.zeros((ncas, ncas), dtype=float)
@@ -1191,7 +1333,6 @@ class QCDMRG(CASCI):
         else:
             P_out = P_raw
 
-        # Embed Frozen Core for CASSCF optimizations
         if with_core:
             ncore = self.ncore
             norb = ncore + self.ncas
@@ -1204,26 +1345,6 @@ class QCDMRG(CASCI):
         return P_out
 
     def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
-        """
-        Calculates the 2-RDM.
-        If spatial=True, spin-traces to the spatial MO basis.
-
-        Parameters
-        ----------
-        state_id : int, optional
-            _description_, by default 0
-        spatial : bool, optional
-            _description_, by default False
-        with_core : bool, optional
-            _description_, by default False
-        idx_pairs : _type_, optional
-            _description_, by default None
-
-        Returns
-        -------
-        _type_
-            _description_
-        """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
@@ -1231,16 +1352,22 @@ class QCDMRG(CASCI):
         else:
             state = self.dmrg.ground_state
         
-        # Get Spin-Orbital RDM
+        # 1. Convert to Dense Array MPS
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
-            G_raw = dense_state.make_rdm2()
         else:
-            G_raw = state.make_rdm2()
+            dense_state = state
             
-        # Convert to Spatial MO basis if requested
+        # 2. Uncompress d=4 to d=2 if needed
+        d_local = dense_state.Bs[0].shape[1]
+        if d_local == 4:
+            dense_state = self._uncompress_d4_to_d2(dense_state)
+            
+        # 3. Calculate RDM safely in d=2 space
+        G_raw = dense_state.make_rdm2()
+            
+        # 4. Map back to spatial and add core
         if spatial or with_core:
             ncas = self.ncas
             D_spatial = np.zeros((ncas, ncas, ncas, ncas), dtype=float)
@@ -1248,7 +1375,6 @@ class QCDMRG(CASCI):
                 for q in range(ncas):
                     for r in range(ncas):
                         for s in range(ncas):
-                            # p^dag r^dag sq Spatial Convention: dm2[p,q,r,s] = sum_{sig, tau} <p_sig^dag r_tau^dag s_tau q_sig>
                             val = G_raw[2*p,   2*r,   2*s,   2*q] + \
                                   G_raw[2*p,   2*r+1, 2*s+1, 2*q] + \
                                   G_raw[2*p+1, 2*r,   2*s,   2*q+1] + \
@@ -1258,7 +1384,6 @@ class QCDMRG(CASCI):
         else:
             G_out = G_raw
             
-        # Embed Frozen Core 
         if with_core:
             ncore = self.ncore
             norb = ncore + self.ncas
