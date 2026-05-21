@@ -40,7 +40,7 @@ from pyqed.qchem.mcscf.casci import CASCI, h1e_for_cas
 from pyqed.mps import DMRG, MPS, dense_to_symmetric_mpo
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSimpleElectron
+from pyqed.mps.autompo.basis import BasisSimpleElectron, BasisSpatialOrbital
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
 try:
     import pyqed.mps.symmetry as sym_module
@@ -104,43 +104,46 @@ def get_jw_term_robust(op_str_list, indices, factor):
     final_op_string = " ".join(final_ops_str)
     return Op(final_op_string, final_indices, factor=factor * ((-1) ** swaps) * extra_sign)
 
-
-class SymmetryManager:
-    def __init__(self, sym_list):
-        if sym_list is True: sym_list = ['charge', 'sz']
-        if sym_list is False or sym_list is None: sym_list = []
-        self.sym_types = [s.lower() for s in sym_list]
-        self.rank = len(self.sym_types)
-        self.enabled = self.rank > 0
-
-    def get_vac_qn(self):
-        return QN(*[0]*self.rank)
-
-    def get_phys_qn(self, site_idx, state_str):
-        """Map physical state ('emp', 'occ') to QN based on active symmetries."""
-        vals = []
-        for sym in self.sym_types:
-            if sym in ['charge', 'n', 'particle']:
-                if state_str == 'emp': vals.append(0)
-                else: vals.append(1) 
-            
-            elif sym in ['sz', 'spin', 's_z']:
-                # Even=Up(+1), Odd=Down(-1) -> Returns 2*Sz integers
-                if state_str == 'emp': 
-                    vals.append(0)
-                elif state_str == 'occ':
-                    if site_idx % 2 == 0: vals.append(1)  # Up
-                    else: vals.append(-1) # Down
-        return QN(*vals)
+def get_jw_term_spatial(symbols, sites, value):
+    """
+    Creates an MPO term for spatial orbitals using exact JW strings.
+    Automatically handles intra-site multiplication and inter-site Z-strings.
     
-    def get_target_qn(self, nelec, spin):
-        vals = []
-        for sym in self.sym_types:
-            if sym in ['charge', 'n', 'particle']:
-                vals.append(int(nelec))
-            elif sym in ['sz', 'spin', 's_z']:
-                vals.append(int(spin))
-        return QN(*vals)
+    symbols: list of strings (e.g., [r"a^\dagger_u", "a_u"])
+    sites: list of spatial orbital indices (e.g., [p, q])
+    value: float or complex weight
+    """
+    if not symbols:
+        return None
+        
+    min_site = min(sites)
+    max_site = max(sites)
+    
+    term = value
+    
+    for x in range(min_site, max_site + 1):
+        local_op = None
+        
+        # Multiply the contributions of all operators acting on site x
+        for sym, s in zip(symbols, sites):
+            op_to_multiply = None
+            if x < s:
+                op_to_multiply = Op("Z", x)
+            elif x == s:
+                op_to_multiply = Op(sym, x)
+            # if x > s, it contributes nothing
+            
+            if op_to_multiply is not None:
+                if local_op is None:
+                    local_op = op_to_multiply
+                else:
+                    # handles intra-site fermion signs
+                    local_op = local_op * op_to_multiply
+                    
+        if local_op is not None:
+            term = term * local_op
+            
+    return term
 
 # Configuration generators helpers for initial guess
 # non-normalized in those configs is fine. it is handeled in build_mps_from_configs.
@@ -216,38 +219,43 @@ def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
         
     return configs
 
-def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5):
+def build_mps_from_configs(configs_with_amps, site_qn_maps, nsites, noise_scale=1e-5):
     """
     Constructs an entangled U(1) symmetric MPS from a list of determinant configurations.
     
     Args:
         configs_with_amps: List of tuples (occupation_list, amplitude).
-        sym_mgr: SymmetryManager instance.
-        nsites: Total number of sites.
+        site_qn_maps: List of dicts mapping integer states to QNs for each site.
+        nsites: Total number of sites (N for spatial, 2N for spin).
         noise_scale: Magnitude of random noise to inject for symmetry breaking.
         
     Returns:
         List[BlockTensor]: The resulting MPS in (Left, Right, Phys) convention.
     """
-    # Pre-calculate QN Trajectories for all configurations
-    # traj[k] is a list of bond QNs [BoundL, Q1, Q2, ..., BoundR] for config k
     trajectories = []
-    vac_qn = sym_mgr.get_vac_qn()
+    
+    # Extract the Vacuum QN from the first site's '0' (Empty) state
+    vac_qn = site_qn_maps[0][0]
+    if isinstance(vac_qn, tuple):
+        vac_qn = vac_qn * 0 # Ensure it's a zeroed QN object
+    else:
+        vac_qn = 0
 
+    # 1. Pre-calculate QN Trajectories
     for cfg, _ in configs_with_amps:
         curr_q = vac_qn
         traj = [curr_q]
-        for site_i, occ in enumerate(cfg):
-            state_str = 'occ' if occ > 0 else 'emp'
-            phys_q = sym_mgr.get_phys_qn(site_i, state_str)
+        for site_i, occ_state in enumerate(cfg):
+            # occ_state is an integer (0, 1 for d=2) or (0, 1, 2, 3 for d=4)
+            phys_q = site_qn_maps[site_i][occ_state]
             curr_q = curr_q + phys_q
             traj.append(curr_q)
         trajectories.append(traj)
+
     mps = []
+    
     # 2. Build Tensors Site by Site
     for i in range(nsites):
-        # Grouping Logic 
-        # Map QN -> List of configuration indices passing through this sector
         left_groups = defaultdict(list)
         right_groups = defaultdict(list)
         
@@ -256,56 +264,40 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
             qR = trajectories[k][i+1]
             left_groups[qL].append(k)
             right_groups[qR].append(k)
-        # Fill Block Data
+            
         data = {}
         for k, (cfg, amp) in enumerate(configs_with_amps):
             qL = trajectories[k][i]
             qR = trajectories[k][i+1]
-            state_str = 'occ' if cfg[i] > 0 else 'emp'
-            qP = sym_mgr.get_phys_qn(i, state_str)
+            occ_state = cfg[i]
+            qP = site_qn_maps[i][occ_state]
             key = (qL, qR, qP)
-            # Determine Matrix Coordinates (Fan-Out / Fan-In boundaries)
-            # At i=0 (Left Boundary), all configs share row 0.
-            # At i=L-1 (Right Boundary), all configs share col 0.
+            
             row = 0 if i == 0 else left_groups[qL].index(k)
             col = 0 if i == nsites - 1 else right_groups[qR].index(k)
             
-            # Initialize Block if missing
             if key not in data:
                 dL = 1 if i == 0 else len(left_groups[qL])
                 dR = 1 if i == nsites - 1 else len(right_groups[qR])
-                # Phys dimension is always 1 per sector for spin-orbitals
                 data[key] = np.zeros((dL, dR, 1), dtype=complex)
             
-            # value = Amplitude (only applied at first site) + Noise
             val = amp if i == 0 else 1.0
             noise = (np.random.rand() - 0.5) * noise_scale
             data[key][row, col, 0] += val + noise
 
-        # get basis data
         # Construct flat lists of QNs for the BlockTensor axes
-        # Left Bond QNs
-        if i == 0:
-            final_qns_L = [trajectories[0][0]] # [Vacuum]
-        else:
-            # Repeat QN 'n' times if 'n' configs pass through it
-            final_qns_L = [q for q in sorted(left_groups.keys()) for _ in left_groups[q]]
-        # Right Bond QNs
-        if i == nsites - 1:
-            final_qns_R = [trajectories[0][-1]] # [Target]
-        else:
-            final_qns_R = [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
-        # Physical QNs (Generic from Manager)
-        final_qns_P = [sym_mgr.get_phys_qn(i, 'emp'), sym_mgr.get_phys_qn(i, 'occ')]
-        # Create BlockTensor 
+        final_qns_L = [trajectories[0][0]] if i == 0 else [q for q in sorted(left_groups.keys()) for _ in left_groups[q]]
+        final_qns_R = [trajectories[0][-1]] if i == nsites - 1 else [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
+        final_qns_P = list(site_qn_maps[i].values()) # All possible physical QNs for this site
+        
         bt = BlockTensor(data, [final_qns_L, final_qns_R, final_qns_P], [-1, 1, 1])
-        # Normalize 
+        
         nrm = bt.norm()
         if nrm > 1e-12:
             bt = bt * (1.0 / nrm)
         mps.append(bt)
+        
     return mps
-
 
 def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     """
@@ -472,70 +464,61 @@ class QCDMRG(CASCI):
 
     def get_initial_guess_symmetric(self, method='cid'):
         """
-        New Robust Initial Guess Dispatcher.
+        Robust Initial Guess Dispatcher.
+        Handles both d=2 (spin-orbital) and d=4 (spatial-orbital) mappings.
         """
         method = method.lower()
-        nsites = 2 * self.ncas
+        d_local = self.H[0].shape[2] 
+        nsites_spin = 2 * self.ncas # Generators always output 2N spin-orbitals
         
-        # Ensure Manager exists (created in run())
-        if not hasattr(self, 'sym_mgr'):
-            self.sym_mgr = SymmetryManager(['charge', 'sz']) # Default fallback
-            
-        print(f"  [InitGuess] Generating guess: '{method}' with {self.sym_mgr.sym_types}")
+        print(f"  [InitGuess] Generating guess '{method}' for d={d_local}")
 
-        # 1. Generate Configurations (Physics)
+        # 1. Generate Configurations (Always 2N length initially)
         if method == 'hf':
-            hf_cfg = gen_hf_config(self.nelecas, nsites)
-            configs = [(hf_cfg, 1.0)]
-            
+            configs = [(gen_hf_config(self.nelecas, nsites_spin), 1.0)]
         elif method == 'cid':
-            configs = gen_cid_configs(self.nelecas, nsites, mixing=0.5)
-            
+            configs = gen_cid_configs(self.nelecas, nsites_spin, mixing=0.5)
         elif method == 'cisd' or method == 'random':
-            configs = gen_random_cisd_configs(self.nelecas, nsites, n_states=20)
-            
+            configs = gen_random_cisd_configs(self.nelecas, nsites_spin, n_states=20)
         else:
-            # Fallback to HF
             print(f"  [Warning] Method {method} not found. Defaulting to HF.")
-            hf_cfg = gen_hf_config(self.nelecas, nsites)
-            configs = [(hf_cfg, 1.0)]
+            configs = [(gen_hf_config(self.nelecas, nsites_spin), 1.0)]
 
-        # 2. Build Tensor (Math)
-        mps = build_mps_from_configs(configs, self.sym_mgr, nsites)
+        # 2. Compress to Spatial Basis if d=4
+        if d_local == 4:
+            spatial_configs = []
+            for spin_cfg, amp in configs:
+                spatial_cfg = []
+                for i in range(0, len(spin_cfg), 2):
+                    occ_up = spin_cfg[i]      # 0 or 1
+                    occ_dn = spin_cfg[i+1]    # 0 or 1
+                    # Math maps perfectly: 0(Emp), 1(Up), 2(Dn), 3(Docc)
+                    spatial_state = occ_up + (2 * occ_dn) 
+                    spatial_cfg.append(spatial_state)
+                spatial_configs.append((tuple(spatial_cfg), amp))
+                
+            configs_to_build = spatial_configs
+            nsites_build = self.ncas
+        else:
+            # Leave as d=2
+            configs_to_build = configs
+            nsites_build = nsites_spin
+
+        # 3. Build Tensor
+        # Pass site_qn_maps instead of sym_mgr so it knows how to translate integers to QNs
+        mps = build_mps_from_configs(configs_to_build, self.site_qn_maps, nsites_build)
         return mps
-
+    
     def get_initial_guess_dense(self, noise=1e-3):
         return get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=noise)
 
-    def fix_nelec(self, shift):
-        """
-        fix the number of electrons by energy penalty
-
-        .. math::
-
-            \mathcal{H} = H + \lambda (\hat{N} - N)^2
-
-        Parameters
-        ----------
-        shift : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        None.
-
-        """
-        # self.h1e += ...
-        # self.eri += ...
-        return
-
-    # def fix_spin(self, shift, spin=0, ss = 0):
+    # def fix_nelec(self, shift):
     #     """
     #     fix the number of electrons by energy penalty
 
     #     .. math::
 
-    #         \mathcal{H} = H + \lambda (\hat{S}^2 - S(S+1))^2
+    #         \mathcal{H} = H + \lambda (\hat{N} - N)^2
 
     #     Parameters
     #     ----------
@@ -549,7 +532,7 @@ class QCDMRG(CASCI):
     #     """
     #     # self.h1e += ...
     #     # self.eri += ...
-    #     return self
+    #     return
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
         """
@@ -686,60 +669,59 @@ class QCDMRG(CASCI):
         #     return H1, H2
         return H1, H2
 
-    def build(self, mo_coeff=None):
-
-        # 1. Extract Integrals & dims
-        # mol = mf.mol
-        # mf = self.mf
-        # if self.ncore == 0:
-        #     h1 = mf.get_hcore_mo()
-        #     eri = mf.get_eri_mo(notation='chem') # (pq|rs)
-        # else:
-        #     h1e, eri = self.get_SO_matrix()
+    def build(self, mo_coeff=None, orbital_type='spatial'):
+        """
+        Build the Hamiltonian MPO.
         
-        # self.nstates = nstates
-
-        # if method == 'ci':
+        Parameters
+        ----------
+        mo_coeff : ndarray, optional
+            Molecular orbital coefficients. Defaults to self.mf.mo_coeff.
+        orbital_type : str, optional
+            'spin' for 2N spin-orbital basis (d=2).
+            'spatial' for N spatial-orbital basis (d=4).
+            Defaults to 'spin'.
+        """
+        self.orbital_type = orbital_type.lower()
+        if self.orbital_type not in ['spin', 'spatial']:
+            raise ValueError("orbital_type must be either 'spin' or 'spatial'")
 
         ncore = self.ncore
         ncas = self.ncas
 
-        # define the core and active space orbitals
+        # Define the core and active space orbitals
         if mo_coeff is None:
-            self.mo_coeff = self.mf.mo_coeff # use HF MOs
+            self.mo_coeff = self.mf.mo_coeff
         else:
             self.mo_coeff = mo_coeff
 
         self.mo_core = self.mo_coeff[:, :ncore]
         self.mo_cas = self.mo_coeff[:, ncore:ncore+ncas]
 
-
-        # effective H for CAS
+        # Effective H for CAS
         h1e, eri = self.get_SO_matrix()
         
-
-
-        # h2e[0,0] -= h2e[0,0].swapaxes(1,3)
-        # h2e[1,1] -= h2e[1,1].swapaxes(1,3)
-        
-
-        n_spatial = self.ncas
-        nso = 2 * n_spatial
-        print(f"  System: {n_spatial} spatial orbitals, {nso} spin-orbitals")
-
-        # 2. Build Hamiltonian (Using Robust JW Builder)
+        if self.orbital_type == 'spin':
+            print(f"  System: {ncas} spatial orbitals, {2*ncas} spin-orbitals (2-state basis)")
+        else:
+            print(f"  System: {ncas} spatial orbitals (4-state basis)")
+            
         print("  Building Hamiltonian MPO...")
+        
         ham_terms = []
         cutoff = 1e-10
+        
         # --- One-Body Terms: h_pq a+_p a_q ---
         for p in range(ncas):
             for q in range(ncas):
                 val = h1e[0][p, q]
                 if abs(val) > cutoff:
-                    # Spin Up (Indices 2p, 2q)
-                    ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p, 2*q], val))
-                    # Spin Down (Indices 2p+1, 2q+1)
-                    ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p+1, 2*q+1], val))
+                    if self.orbital_type == 'spin':
+                        ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p, 2*q], val))         # Up
+                        ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*p+1, 2*q+1], val))     # Down
+                    else:
+                        ham_terms.append(get_jw_term_spatial([r"a^\dagger_u", "a_u"], [p, q], val))        # Up
+                        ham_terms.append(get_jw_term_spatial([r"a^\dagger_d", "a_d"], [p, q], val))        # Down
 
         # --- Two-Body Terms: 0.5 * (pq|rs) a+_p a+_r a_s a_q ---
         for p in range(ncas):
@@ -749,77 +731,79 @@ class QCDMRG(CASCI):
                         val = 0.5 * eri[0, 0, p, q, r, s]
                         if abs(val) < cutoff: continue
 
-                        # p,r creation; s,q annihilation
-
-                        # Same Spin (Pauli Exclusion p!=r)
+                        # Same Spin (Pauli Exclusion p!=r and s!=q)
                         if p != r and s != q:
-                            # Up-Up
-                            ham_terms.append(get_jw_term_robust(
-                                [r"a^\dagger", r"a^\dagger", "a", "a"],
-                                [2*p, 2*r, 2*s, 2*q], val
-                            ))
-                            # Dn-Dn
-                            ham_terms.append(get_jw_term_robust(
-                                [r"a^\dagger", r"a^\dagger", "a", "a"],
-                                [2*p+1, 2*r+1, 2*s+1, 2*q+1], val
-                            ))
+                            if self.orbital_type == 'spin':
+                                ham_terms.append(get_jw_term_robust([r"a^\dagger", r"a^\dagger", "a", "a"], [2*p, 2*r, 2*s, 2*q], val))         # Up-Up
+                                ham_terms.append(get_jw_term_robust([r"a^\dagger", r"a^\dagger", "a", "a"], [2*p+1, 2*r+1, 2*s+1, 2*q+1], val)) # Dn-Dn
+                            else:
+                                ham_terms.append(get_jw_term_spatial([r"a^\dagger_u", r"a^\dagger_u", "a_u", "a_u"], [p, r, s, q], val))        # Up-Up
+                                ham_terms.append(get_jw_term_spatial([r"a^\dagger_d", r"a^\dagger_d", "a_d", "a_d"], [p, r, s, q], val))        # Dn-Dn
 
                         # Mixed Spin (No Pauli restriction on spatial indices)
-                        # Up-Dn (p Up, r Dn, s Dn, q Up)
-                        ham_terms.append(get_jw_term_robust(
-                            [r"a^\dagger", r"a^\dagger", "a", "a"],
-                            [2*p, 2*r+1, 2*s+1, 2*q], val
-                        ))
-                        # Dn-Up (p Dn, r Up, s Up, q Dn)
-                        ham_terms.append(get_jw_term_robust(
-                            [r"a^\dagger", r"a^\dagger", "a", "a"],
-                            [2*p+1, 2*r, 2*s, 2*q+1], val
-                        ))
-        if self.spin_purification:
+                        if self.orbital_type == 'spin':
+                            ham_terms.append(get_jw_term_robust([r"a^\dagger", r"a^\dagger", "a", "a"], [2*p, 2*r+1, 2*s+1, 2*q], val))         # Up-Dn
+                            ham_terms.append(get_jw_term_robust([r"a^\dagger", r"a^\dagger", "a", "a"], [2*p+1, 2*r, 2*s, 2*q+1], val))         # Dn-Up
+                        else:
+                            ham_terms.append(get_jw_term_spatial([r"a^\dagger_u", r"a^\dagger_d", "a_d", "a_u"], [p, r, s, q], val))             # Up-Dn
+                            ham_terms.append(get_jw_term_spatial([r"a^\dagger_d", r"a^\dagger_u", "a_u", "a_d"], [p, r, s, q], val))             # Dn-Up
+                        
+        # --- Spin Purification Terms ---
+        if getattr(self, 'spin_purification', False):
             J = self.shift
             
-            # On-site terms (p == q)
+            # On-site terms
             for p in range(ncas):
-                # 3/4 J * (n_{p, up} + n_{p, dn})
-                ham_terms.append(Op("n", 2*p) * (0.75 * J))
-                ham_terms.append(Op("n", 2*p+1) * (0.75 * J))
-                # -3/2 J * n_{p, up} n_{p, dn}
-                ham_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5 * J))
+                if self.orbital_type == 'spin':
+                    ham_terms.append(Op("n", 2*p) * (0.75 * J))
+                    ham_terms.append(Op("n", 2*p+1) * (0.75 * J))
+                    ham_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5 * J))
+                else:
+                    ham_terms.append(Op("n_u", p) * (0.75 * J))
+                    ham_terms.append(Op("n_d", p) * (0.75 * J))
+                    ham_terms.append(Op("n_u", p) * Op("n_d", p) * (-1.5 * J))
                 
             # Cross-site terms (p != q)
             for p in range(ncas):
                 for q in range(ncas):
                     if p == q: continue
-                    # S_z^2 
-                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q) * (0.25 * J))
-                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * (0.25 * J))
-                    ham_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25 * J))
-                    ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25 * J))
-                    # S_+ S_- (Spin Flip)
-                    # 1.0 * J * a^+_{p, up} a_{p, dn} a^+_{q, dn} a_{q, up}
-                    ham_terms.append(get_jw_term_robust(
-                        [r"a^\dagger", "a", r"a^\dagger", "a"],
-                        [2*p, 2*p+1, 2*q+1, 2*q], J
-                    ))
-        basis_sites = [BasisSimpleElectron(i) for i in range(nso)]
+                    
+                    if self.orbital_type == 'spin':
+                        # S_z^2 
+                        ham_terms.append(Op("n", 2*p) * Op("n", 2*q) * (0.25 * J))
+                        ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * (0.25 * J))
+                        ham_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25 * J))
+                        ham_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25 * J))
+                        # S_+ S_- (Spin Flip)
+                        ham_terms.append(get_jw_term_robust([r"a^\dagger", "a", r"a^\dagger", "a"], [2*p, 2*p+1, 2*q+1, 2*q], J))
+                    else:
+                        # S_z^2 
+                        ham_terms.append(Op("n_u", p) * Op("n_u", q) * (0.25 * J))
+                        ham_terms.append(Op("n_d", p) * Op("n_d", q) * (0.25 * J))
+                        ham_terms.append(Op("n_u", p) * Op("n_d", q) * (-0.25 * J))
+                        ham_terms.append(Op("n_d", p) * Op("n_u", q) * (-0.25 * J))
+                        # S_+ S_- (Spin Flip)
+                        ham_terms.append(get_jw_term_spatial([r"a^\dagger_u", "a_d", r"a^\dagger_d", "a_u"], [p, p, q, q], J))
+                    
+        # --- Basis Construction & MPO Assembly ---
+        if self.orbital_type == 'spin':
+            basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+        else:
+            basis_sites = [BasisSpatialOrbital(i) for i in range(ncas)]
+            
         model = Model(basis=basis_sites, ham_terms=ham_terms)
         mpo = Mpo(model, algo="qr")
 
-        # get it transposed for solver in PyQED: (L, R, P, P) -> (L, P, R, P)
+        # Get it transposed for solver in PyQED: (L, R, P, P) -> (L, P, R, P)
         self.H_raw = mpo.matrices
-        H = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-        self.H = H
+        self.H = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
 
         return self
 
     def calc_spin_square(self):
         """
         Builds the S^2 MPO and evaluates its expectation value.
-
-        Returns
-        -------
-        _type_
-            _description_
+        Adapts to spin-orbital (d=2) or spatial-orbital (d=4) basis.
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             return 0.0
@@ -827,28 +811,55 @@ class QCDMRG(CASCI):
         import pyqed.mps.mps as mps_lib
         
         ncas = self.ncas
+        orbital_type = getattr(self, 'orbital_type', 'spin')
         s2_terms = []
         
-        # On-site terms
-        for p in range(ncas):
-            s2_terms.append(Op("n", 2*p) * 0.75)
-            s2_terms.append(Op("n", 2*p+1) * 0.75)
-            s2_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5))
-            
-        # Cross-site terms
-        for p in range(ncas):
-            for q in range(ncas):
-                if p == q: continue
-                s2_terms.append(Op("n", 2*p) * Op("n", 2*q) * 0.25)
-                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * 0.25)
-                s2_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25))
-                s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25))
-                s2_terms.append(get_jw_term_robust(
-                    [r"a^\dagger", "a", r"a^\dagger", "a"],
-                    [2*p, 2*p+1, 2*q+1, 2*q], 1.0
-                ))
+        if orbital_type == 'spin':
+            # --- Spin-Orbital Basis (d=2, 2N sites) ---
+            # On-site terms
+            for p in range(ncas):
+                s2_terms.append(Op("n", 2*p) * 0.75)
+                s2_terms.append(Op("n", 2*p+1) * 0.75)
+                s2_terms.append(Op("n", 2*p) * Op("n", 2*p+1) * (-1.5))
                 
-        basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+            # Cross-site terms
+            for p in range(ncas):
+                for q in range(ncas):
+                    if p == q: continue
+                    s2_terms.append(Op("n", 2*p) * Op("n", 2*q) * 0.25)
+                    s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q+1) * 0.25)
+                    s2_terms.append(Op("n", 2*p) * Op("n", 2*q+1) * (-0.25))
+                    s2_terms.append(Op("n", 2*p+1) * Op("n", 2*q) * (-0.25))
+                    s2_terms.append(get_jw_term_robust(
+                        [r"a^\dagger", "a", r"a^\dagger", "a"],
+                        [2*p, 2*p+1, 2*q+1, 2*q], 1.0
+                    ))
+                    
+            basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
+            
+        else:
+            # --- Spatial-Orbital Basis (d=4, N sites) ---
+            # On-site terms
+            for p in range(ncas):
+                s2_terms.append(Op("n_u", p) * 0.75)
+                s2_terms.append(Op("n_d", p) * 0.75)
+                s2_terms.append(Op("n_u", p) * Op("n_d", p) * (-1.5))
+                
+            # Cross-site terms
+            for p in range(ncas):
+                for q in range(ncas):
+                    if p == q: continue
+                    s2_terms.append(Op("n_u", p) * Op("n_u", q) * 0.25)
+                    s2_terms.append(Op("n_d", p) * Op("n_d", q) * 0.25)
+                    s2_terms.append(Op("n_u", p) * Op("n_d", q) * (-0.25))
+                    s2_terms.append(Op("n_d", p) * Op("n_u", q) * (-0.25))
+                    s2_terms.append(get_jw_term_spatial(
+                        [r"a^\dagger_u", "a_d", r"a^\dagger_d", "a_u"], 
+                        [p, p, q, q], 1.0
+                    ))
+                    
+            basis_sites = [BasisSpatialOrbital(i) for i in range(ncas)]
+
         model = Model(basis=basis_sites, ham_terms=s2_terms)
         mpo = Mpo(model, algo="qr")
         mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
@@ -870,77 +881,145 @@ class QCDMRG(CASCI):
             s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
             s2_vals.append(float(np.real(s2)))
             
-        return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
+        return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]    
 
-    def run(self, nstates=1, weights=None, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff = None, **kwargs):
+    def run(self, nstates=1, weights=None, symmetry_list=None, nsweeps=50, initial_guess=None, mo_coeff=None, site_qn_maps=None, target_qn=None, phys_qns=None, **kwargs):
         """
+        Run the DMRG optimization.
+        
         Parameters
         ----------
-        symmetry_list : list of strings or bool
-            ['charge', 'sz'] or True/False.
+        site_qn_maps : list of dicts, optional
+            Explicit mapping of physical indices to QN objects for each site. 
+            Overrides auto-generation.
+        target_qn : QN, optional
+            Explicit target quantum number for the right boundary.
+        phys_qns : list of QN, optional
+            List of all possible physical QN states in the system.
         """
         self.nstates = nstates
         if weights is None:
             self.weights = np.ones(nstates) / nstates
         else:
             self.weights = np.array(weights)
+            
         if symmetry_list is not None:
             self.saved_symmetry_list = symmetry_list
         else:
             symmetry_list = getattr(self, 'saved_symmetry_list', None)
+            
         if initial_guess is not None:
             self.init_guess = initial_guess
+            
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
+            
         if self.H_raw is None:
             self.build()
-        # Initialize Symmetry 
-        self.sym_mgr = SymmetryManager(symmetry_list)
-        # Setup site QN, We are still assuming spin-orbitals (d=2) here TODO: make it more tobust
-        if self.sym_mgr.enabled:
-            print(f"  [Symmetry] Enabled: {self.sym_mgr.sym_types}")
-            site_qn_maps = []
-            for i in range(self.ncas):
-                # even (up) sites
-                map_up = {
-                    0: self.sym_mgr.get_phys_qn(2*i, 'emp'), 
-                    1: self.sym_mgr.get_phys_qn(2*i, 'occ')
-                }
-                site_qn_maps.append(map_up)
-                # Odd (Down) Site
-                map_dn = {
-                    0: self.sym_mgr.get_phys_qn(2*i+1, 'emp'), 
-                    1: self.sym_mgr.get_phys_qn(2*i+1, 'occ')
-                }
-                site_qn_maps.append(map_dn)
-            # get MPO in symmetric form with QN index
+
+        # Auto-detect local physical dimension from the Hamiltonian
+        d_local = self.H[0].shape[2]
+
+        # Determine if symmetry is active
+        if symmetry_list or (site_qn_maps is not None) or (target_qn is not None):
+            use_symmetry = True
+            
+            # --- 1. Dynamic Symmetry Mapping ---
+            # If the user didn't explicitly provide the mapping, we auto-build it.
+            if site_qn_maps is None:
+                site_qn_maps = []
+                sym_types = [s.lower() for s in (symmetry_list or ['charge', 'sz'])]
+                
+                # Auto-build Target QN
+                if target_qn is None:
+                    t_vals = []
+                    if 'charge' in sym_types: t_vals.append(int(self.nelecas))
+                    if 'sz' in sym_types: t_vals.append(int(self.mf.mol.spin))
+                    target_qn = QN(*t_vals)
+                    
+                # Auto-build maps based on local dimension
+                if d_local == 2:
+                    print(f"  [Symmetry] Auto-detected d=2 (Spin-Orbitals). Symmetries: {sym_types}")
+                    for i in range(self.ncas):
+                        # Up site
+                        up_vals_emp = [0 for _ in sym_types]
+                        up_vals_occ = [1 if sym == 'charge' else (1 if sym == 'sz' else 0) for sym in sym_types]
+                        site_qn_maps.append({0: QN(*up_vals_emp), 1: QN(*up_vals_occ)})
+                        
+                        # Down site
+                        dn_vals_emp = [0 for _ in sym_types]
+                        dn_vals_occ = [1 if sym == 'charge' else (-1 if sym == 'sz' else 0) for sym in sym_types]
+                        site_qn_maps.append({0: QN(*dn_vals_emp), 1: QN(*dn_vals_occ)})
+                        
+                elif d_local == 4:
+                    print(f"  [Symmetry] Auto-detected d=4 (Spatial-Orbitals). Symmetries: {sym_types}")
+                    for i in range(self.ncas):
+                        vals_emp  = [0 for _ in sym_types]
+                        vals_up   = [1 if sym == 'charge' else (1 if sym == 'sz' else 0) for sym in sym_types]
+                        vals_dn   = [1 if sym == 'charge' else (-1 if sym == 'sz' else 0) for sym in sym_types]
+                        vals_docc = [2 if sym == 'charge' else (0 if sym == 'sz' else 0) for sym in sym_types]
+                        site_qn_maps.append({
+                            0: QN(*vals_emp),
+                            1: QN(*vals_up),
+                            2: QN(*vals_dn),
+                            3: QN(*vals_docc)
+                        })
+                else:
+                    raise ValueError(f"Unsupported local dimension d={d_local}. Please pass site_qn_maps explicitly.")
+            
+            # Validation: target_qn is required if taking over manually
+            if target_qn is None:
+                raise ValueError("target_qn must be provided if explicitly passing site_qn_maps.")
+                
+            # Collect unique physical QNs while preserving sequence order!
+            if phys_qns is None:
+                phys_qns = []
+                for smap in site_qn_maps:
+                    for qn in smap.values():
+                        if qn not in phys_qns:
+                            phys_qns.append(qn)
+                            
+            # Save the map to self so the guess generator can use it later
+            self.site_qn_maps = site_qn_maps
+            
+            # --- 2. Initialize the New Algebraic Manager ---
+            self.sym_mgr = SymmetryManager(phys_qns=phys_qns, target_qn=target_qn)
+            print(f"  [Symmetry] Manager Initialized.")
+            print(f"             Target QN: {target_qn}")
+            print(f"             Available Phys QNs: {phys_qns}")
+
+            # --- 3. Convert MPO ---
             print("  Converting MPO to BlockTensors...")
             final_H = dense_to_symmetric_mpo(self.H, site_qn_maps)
             print(f"  MPO Converted. Sites: {len(final_H)}")
-            # Calculate Target QN
-            target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
-            print(f"  Target QN set to: {target_qn}")
-            # get Initial Guess
+
+            # --- 4. Initial Guess ---
             print(f"  Generating Initial Guess ({self.init_guess})...")
             mps0 = self.get_initial_guess_symmetric(method=self.init_guess.lower())
             use_symmetry = True
-        else: # dense branch without U(1) symmetry
+            
+        else: 
+            # Dense branch without U(1) symmetry
             final_H = self.H
             mps0 = self.get_initial_guess_dense(noise=1e-3)
             target_qn = None
             use_symmetry = False
             self.sym_mgr = None
+
         t0 = time.time()
         print(f"  Starting Sweeps (D={self.D})...")
         dmrg = DMRG(final_H, D=self.D, nsweeps=nsweeps, init_guess=mps0, symmetry=use_symmetry, target_qn=target_qn, sym_mgr=self.sym_mgr, not_conv_err=False, nstates=self.nstates, weights=self.weights)
         dmrg.run()
         self.dmrg = dmrg
+
         # Report
         e_dmrg_total = dmrg.e_tot + self.e_core
         s2_val = self.calc_spin_square()
+        
         if self.spin_purification:
             e_dmrg_total -= self.shift * s2_val
         self.e_tot = e_dmrg_total
+        
         print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
         if self.nstates == 1:
             print(f"  E(DMRG) =           {e_dmrg_total:.8f} Ha")
@@ -948,11 +1027,13 @@ class QCDMRG(CASCI):
             print(f"  <S^2> =             {s2_val:.6f}")
         else:
             for i in range(self.nstates):
-                print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha")
                 print(f"  Root {i} E(DMRG) = {e_dmrg_total[i]:.8f} Ha, <S^2> = {s2_val[i]:.6f}")
+                
         print(f"  Time:               {time.time()-t0:.2f} s")
+        
         if use_symmetry:
             self.check_abelian_symmetry()
+            
         return dmrg
 
     def dump(self):
@@ -963,35 +1044,42 @@ class QCDMRG(CASCI):
         Post-run analysis: Checks conservation of all active symmetries 
         (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
         """
-        if self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             print("  [Error] No ground state found. Run DMRG first.")
             return
+
         print("\n" + "="*60)
         print("  Symmetry Conservation Check")
         print("="*60)
+
         # Calculate local site RDMs, returns a dict {site_idx: rho_dense (d,d)}
         try:
             rdms = self.dmrg.make_local_site_rdm()
         except Exception as e:
             print(f"  [Error] Failed to calculate RDM: {e}")
             return
-        # initialize storage for quantum number
+
         total_N_calc = 0.0
         total_Sz_calc = 0.0
+        orbital_type = getattr(self, 'orbital_type', 'spin')
         
         print(f"{'Orb':<5} {'Spin':<6} {'Occ':<10} {'Sz_local':<10} {'Status'}")
         print("-" * 60)
-        # Iterate over Spatial Orbitals (each splits into 2 Spin-Orbitals)
-        # now still assuming d=2 (Spin-Orbital) mapping: 2*i = Up, 2*i+1 = Down
+
         for i in range(self.ncas):
-            # Spin Up Site
-            idx_up = 2 * i
-            rho_up = rdms[idx_up]
-            n_up = rho_up[1, 1].real 
-            # Spin Down Site
-            idx_dn = 2 * i + 1
-            rho_dn = rdms[idx_dn]
-            n_dn = rho_dn[1, 1].real
+            if orbital_type == 'spin':
+                # --- Spin-Orbital Basis (d=2) ---
+                idx_up = 2 * i
+                n_up = rdms[idx_up][1, 1].real 
+                
+                idx_dn = 2 * i + 1
+                n_dn = rdms[idx_dn][1, 1].real
+            else:
+                # --- Spatial-Orbital Basis (d=4) ---
+                # Basis index: 0=Empty, 1=Up, 2=Down, 3=Doubly Occupied
+                rho = rdms[i]
+                n_up = rho[1, 1].real + rho[3, 3].real
+                n_dn = rho[2, 2].real + rho[3, 3].real
             
             # Charge = N_up + N_dn
             n_local = n_up + n_dn
@@ -1000,17 +1088,21 @@ class QCDMRG(CASCI):
             
             total_N_calc += n_local
             total_Sz_calc += sz_local
-            # get print nice looking 
+            
             def status(n):
                 if n > 0.98: return "Full"
                 if n < 0.02: return "."
                 return "~" # Entangled
+                
             print(f"{i:<5} {'Up':<6} {n_up:<10.5f} {0.5*n_up:<10.5f} {status(n_up)}")
             print(f"{i:<5} {'Down':<6} {n_dn:<10.5f} {-0.5*n_dn:<10.5f} {status(n_dn)}")
+            
         print("-" * 60)
+        
         # compare with Targets 
         target_qns = self.sym_mgr.get_target_qn(self.nelecas, self.mf.mol.spin)
         print(f"\n  Global Conservation Summary:")
+        
         # iterate over the active symmetries in the manager
         for idx, sym_type in enumerate(self.sym_mgr.sym_types):
             target_val = target_qns[idx]
@@ -1028,26 +1120,185 @@ class QCDMRG(CASCI):
                 label = f"Unknown ({sym_type})"
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
-    def make_rdm1(self, state_id=0, spatial=False, with_core=False):
+    def _uncompress_d4_to_d2(self, state_d4):
         """
-        Calculates the 1-RDM. 
-        If spatial=True, spin-traces to the spatial MO basis.
-        If with_core=True, re-embeds the frozen core electrons on the diagonal.
-        \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
-        Parameters
-        ----------
-        state_id : int, optional
-            _description_, by default 0
-        spatial : bool, optional
-            _description_, by default False
-        with_core : bool, optional
-            _description_, by default False
+        Mathematically splits an N-site d=4 spatial MPS into a 2N-site d=2 spin MPS.
+        """
+        import numpy as np
+        from pyqed.mps.mps import MPS
+        
+        new_Bs = []
+        for B in state_d4.Bs:
+            D_L, d, D_R = B.shape
+            if d == 2:
+                return state_d4 # already d=2
+            
+            # Map spatial states back to (Up, Down) spin-orbitals
+            B_reshaped = np.zeros((D_L, 2, 2, D_R), dtype=B.dtype)
+            B_reshaped[:, 0, 0, :] = B[:, 0, :] # Emp
+            B_reshaped[:, 1, 0, :] = B[:, 1, :] # Up
+            B_reshaped[:, 0, 1, :] = B[:, 2, :] # Dn
+            B_reshaped[:, 1, 1, :] = B[:, 3, :] # Docc
+            
+            # SVD to split the single site into two sites
+            B_mat = B_reshaped.reshape(D_L * 2, 2 * D_R)
+            U, S, Vh = np.linalg.svd(B_mat, full_matrices=False)
+            
+            # Truncate exact zero singular values
+            tol = 1e-12
+            keep = S > tol
+            if not np.any(keep): keep[0] = True
+                
+            U = U[:, keep]
+            S = S[keep]
+            Vh = Vh[keep, :]
+            
+            # Left node gets Up, Right node gets Down
+            B_up = U.reshape(D_L, 2, -1)
+            B_dn = (S[:, None] * Vh).reshape(-1, 2, D_R)
+            
+            new_Bs.append(B_up)
+            new_Bs.append(B_dn)
+            
+        return MPS(new_Bs)
 
-        Returns
-        -------
-        _type_
-            _description_
-        """
+    # def make_rdm1(self, state_id=0, spatial=False, with_core=False):
+    #     """
+    #     Calculates the 1-RDM. 
+    #     If spatial=True, spin-traces to the spatial MO basis.
+    #     If with_core=True, re-embeds the frozen core electrons on the diagonal.
+    #     \gamma[p,q] = <q_alpha^\dagger p_alpha> + <q_beta^\dagger p_beta>, same as CASCI make_rdm1
+    #     Parameters
+    #     ----------
+    #     state_id : int, optional
+    #         _description_, by default 0
+    #     spatial : bool, optional
+    #         _description_, by default False
+    #     with_core : bool, optional
+    #         _description_, by default False
+
+    #     Returns
+    #     -------
+    #     _type_
+    #         _description_
+    #     """
+    #     if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+    #         raise ValueError("Run DMRG first to generate a state.")
+    #     if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+    #         state = self.dmrg.states[state_id]
+    #     else:
+    #         state = self.dmrg.ground_state
+        
+    #     # Get Spin-Orbital RDM
+    #     if hasattr(state.Bs[0], 'qns'):
+    #         from pyqed.mps.mps import symmetric_to_dense
+    #         dense_state = symmetric_to_dense(state)
+    #         dense_state.dim = 2 
+    #         P_raw = dense_state.make_rdm1()
+    #     else:
+    #         P_raw = state.make_rdm1()
+            
+    #     # Convert to Spatial MO basis if requested (or if with_core is True)
+    #     if spatial or with_core:
+    #         ncas = self.ncas
+    #         P_spatial = np.zeros((ncas, ncas), dtype=float)
+    #         for p in range(ncas):
+    #             for q in range(ncas):
+    #                 val = P_raw[2*p, 2*q] + P_raw[2*p+1, 2*q+1]
+    #                 P_spatial[q,p] = float(np.real(val))
+    #         P_out = P_spatial
+    #     else:
+    #         P_out = P_raw
+
+    #     # Embed Frozen Core for CASSCF optimizations
+    #     if with_core:
+    #         ncore = self.ncore
+    #         norb = ncore + self.ncas
+    #         D = np.zeros((norb, norb), dtype=float)
+    #         if ncore > 0:
+    #             np.fill_diagonal(D[:ncore, :ncore], 2.0)
+    #         D[ncore:norb, ncore:norb] = P_out
+    #         return D
+            
+    #     return P_out
+
+    # def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
+    #     """
+    #     Calculates the 2-RDM.
+    #     If spatial=True, spin-traces to the spatial MO basis.
+
+    #     Parameters
+    #     ----------
+    #     state_id : int, optional
+    #         _description_, by default 0
+    #     spatial : bool, optional
+    #         _description_, by default False
+    #     with_core : bool, optional
+    #         _description_, by default False
+    #     idx_pairs : _type_, optional
+    #         _description_, by default None
+
+    #     Returns
+    #     -------
+    #     _type_
+    #         _description_
+    #     """
+    #     if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+    #         raise ValueError("Run DMRG first to generate a state.")
+    #     if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
+    #         state = self.dmrg.states[state_id]
+    #     else:
+    #         state = self.dmrg.ground_state
+        
+    #     # Get Spin-Orbital RDM
+    #     if hasattr(state.Bs[0], 'qns'):
+    #         from pyqed.mps.mps import symmetric_to_dense
+    #         dense_state = symmetric_to_dense(state)
+    #         dense_state.dim = 2 
+    #         G_raw = dense_state.make_rdm2()
+    #     else:
+    #         G_raw = state.make_rdm2()
+            
+    #     # Convert to Spatial MO basis if requested
+    #     if spatial or with_core:
+    #         ncas = self.ncas
+    #         D_spatial = np.zeros((ncas, ncas, ncas, ncas), dtype=float)
+    #         for p in range(ncas):
+    #             for q in range(ncas):
+    #                 for r in range(ncas):
+    #                     for s in range(ncas):
+    #                         # p^dag r^dag sq Spatial Convention: dm2[p,q,r,s] = sum_{sig, tau} <p_sig^dag r_tau^dag s_tau q_sig>
+    #                         val = G_raw[2*p,   2*r,   2*s,   2*q] + \
+    #                               G_raw[2*p,   2*r+1, 2*s+1, 2*q] + \
+    #                               G_raw[2*p+1, 2*r,   2*s,   2*q+1] + \
+    #                               G_raw[2*p+1, 2*r+1, 2*s+1, 2*q+1]
+    #                         D_spatial[p, q, r, s] = float(np.real(val))
+    #         G_out = D_spatial
+    #     else:
+    #         G_out = G_raw
+            
+    #     # Embed Frozen Core 
+    #     if with_core:
+    #         ncore = self.ncore
+    #         norb = ncore + self.ncas
+    #         D2 = np.zeros((norb, norb, norb, norb), dtype=float)
+    #         if ncore > 0:
+    #             I = np.eye(ncore)
+    #             D2[:ncore, :ncore, :ncore, :ncore] = 4 * np.einsum('ij,kl->ijkl', I, I) - 2 * np.einsum('ps,rq->pqrs', I, I)
+                
+    #             dm1 = self.make_rdm1(state_id, spatial=True, with_core=False)
+    #             for i in range(ncore):
+    #                 D2[i, i, ncore:norb, ncore:norb] = 2 * dm1
+    #                 D2[ncore:norb, ncore:norb, i, i] = 2 * dm1
+    #                 D2[i, ncore:norb, i, ncore:norb] = -dm1
+    #                 D2[ncore:norb, i, ncore:norb, i] = -dm1
+                    
+    #         D2[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = G_out
+    #         return D2
+            
+    #     return G_out
+
+    def make_rdm1(self, state_id=0, spatial=False, with_core=False):
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
@@ -1055,16 +1306,22 @@ class QCDMRG(CASCI):
         else:
             state = self.dmrg.ground_state
         
-        # Get Spin-Orbital RDM
+        # 1. Convert to Dense Array MPS
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
-            P_raw = dense_state.make_rdm1()
         else:
-            P_raw = state.make_rdm1()
+            dense_state = state
             
-        # Convert to Spatial MO basis if requested (or if with_core is True)
+        # 2. Uncompress d=4 to d=2 if needed
+        d_local = dense_state.Bs[0].shape[1]
+        if d_local == 4:
+            dense_state = self._uncompress_d4_to_d2(dense_state)
+            
+        # 3. Calculate RDM safely in d=2 space
+        P_raw = dense_state.make_rdm1()
+        
+        # 4. Map back to spatial and add core
         if spatial or with_core:
             ncas = self.ncas
             P_spatial = np.zeros((ncas, ncas), dtype=float)
@@ -1076,7 +1333,6 @@ class QCDMRG(CASCI):
         else:
             P_out = P_raw
 
-        # Embed Frozen Core for CASSCF optimizations
         if with_core:
             ncore = self.ncore
             norb = ncore + self.ncas
@@ -1089,26 +1345,6 @@ class QCDMRG(CASCI):
         return P_out
 
     def make_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
-        """
-        Calculates the 2-RDM.
-        If spatial=True, spin-traces to the spatial MO basis.
-
-        Parameters
-        ----------
-        state_id : int, optional
-            _description_, by default 0
-        spatial : bool, optional
-            _description_, by default False
-        with_core : bool, optional
-            _description_, by default False
-        idx_pairs : _type_, optional
-            _description_, by default None
-
-        Returns
-        -------
-        _type_
-            _description_
-        """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
@@ -1116,16 +1352,22 @@ class QCDMRG(CASCI):
         else:
             state = self.dmrg.ground_state
         
-        # Get Spin-Orbital RDM
+        # 1. Convert to Dense Array MPS
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
-            dense_state.dim = 2 
-            G_raw = dense_state.make_rdm2()
         else:
-            G_raw = state.make_rdm2()
+            dense_state = state
             
-        # Convert to Spatial MO basis if requested
+        # 2. Uncompress d=4 to d=2 if needed
+        d_local = dense_state.Bs[0].shape[1]
+        if d_local == 4:
+            dense_state = self._uncompress_d4_to_d2(dense_state)
+            
+        # 3. Calculate RDM safely in d=2 space
+        G_raw = dense_state.make_rdm2()
+            
+        # 4. Map back to spatial and add core
         if spatial or with_core:
             ncas = self.ncas
             D_spatial = np.zeros((ncas, ncas, ncas, ncas), dtype=float)
@@ -1133,7 +1375,6 @@ class QCDMRG(CASCI):
                 for q in range(ncas):
                     for r in range(ncas):
                         for s in range(ncas):
-                            # p^dag r^dag sq Spatial Convention: dm2[p,q,r,s] = sum_{sig, tau} <p_sig^dag r_tau^dag s_tau q_sig>
                             val = G_raw[2*p,   2*r,   2*s,   2*q] + \
                                   G_raw[2*p,   2*r+1, 2*s+1, 2*q] + \
                                   G_raw[2*p+1, 2*r,   2*s,   2*q+1] + \
@@ -1143,7 +1384,6 @@ class QCDMRG(CASCI):
         else:
             G_out = G_raw
             
-        # Embed Frozen Core 
         if with_core:
             ncore = self.ncore
             norb = ncore + self.ncas
@@ -1273,7 +1513,7 @@ if __name__=='__main__':
     mf = mol.RHF().run()
 
 
-    dmrg = QCDMRG(mf, ncas=10, nelecas=6, D=40) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+    dmrg = QCDMRG(mf, ncas=10, nelecas=6, D=100) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
     dmrg.build().run(symmetry_list=['charge','sz'], initial_guess='cid')
 
     # mc = CASCI(mf, ncas=8, nelecas=4)
