@@ -4,235 +4,33 @@ from collections import defaultdict
 import time
 from scipy.sparse.linalg import LinearOperator, eigsh
 import copy
-from pyqed.mps.su2 import SU2Irrep, SpinChargeSector, fuse_irreps, fuse_charge_spin_sectors
 
-
-U1_LABELS = {'u1', 'charge', 'n', 'particle'}
-SZ_LABELS = {'sz', 'spin', 's_z'}
-SU2_LABELS = {'su2', 'spin_irrep', 'total_spin'}
-PG_LABELS = {'pg', 'point_group', 'abelianpg', 'abelian_pg', 'irrep', 'orb_sym'}
-
-
-def _normalize_sym_label(label):
-    label = str(label).lower()
-    if label in U1_LABELS:
-        return 'charge'
-    if label in SZ_LABELS:
-        return 'sz'
-    if label in SU2_LABELS:
-        return 'su2'
-    if label in PG_LABELS:
-        return 'pg'
-    return label
-
-
-def _is_abelian_label(label):
-    return _normalize_sym_label(label) in {'charge', 'sz', 'pg'}
-
-
-def _component_sort_key(value):
-    if isinstance(value, SU2Irrep):
-        return ('su2', value.two_j)
-    if isinstance(value, SpinChargeSector):
-        return ('charge_spin', value.charge, value.two_j)
-    if isinstance(value, np.generic):
-        return ('scalar', value.item())
-    return (type(value).__name__, value)
-
-
-def _zero_component(label, value):
-    label = _normalize_sym_label(label)
-    if isinstance(value, SpinChargeSector):
-        return SpinChargeSector(0, SU2Irrep(0))
-    if isinstance(value, SU2Irrep) or label == 'su2':
-        return SU2Irrep(0)
-    return type(value)(0) if isinstance(value, np.generic) else 0
-
-
-def _add_component(label, left, right):
-    label = _normalize_sym_label(label)
-    if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
-        raise TypeError("SU(2) irreps do not support unique additive composition; use fuse() instead.")
-    if label == 'pg':
-        return int(left) ^ int(right)
-    return left + right
-
-
-def _sub_component(label, left, right):
-    label = _normalize_sym_label(label)
-    if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
-        raise TypeError("SU(2) irreps do not support subtraction; non-Abelian flux must be handled by fusion rules.")
-    if label == 'pg':
-        return int(left) ^ int(right)
-    return left - right
-
-
-def _neg_component(label, value):
-    label = _normalize_sym_label(label)
-    if label == 'su2' or isinstance(value, SU2Irrep):
-        raise TypeError("SU(2) irreps do not support additive negation.")
-    if label == 'pg':
-        return int(value)
-    return -value
-
-
-def _mul_component(label, value, scalar):
-    label = _normalize_sym_label(label)
-    if label == 'su2' or isinstance(value, SU2Irrep):
-        raise TypeError("SU(2) irreps do not support scalar multiplication.")
-    if label == 'pg':
-        return 0 if scalar == 0 else int(value)
-    return value * scalar
-
-
-def _fuse_component(label, left, right):
-    label = _normalize_sym_label(label)
-    if isinstance(left, SpinChargeSector) and isinstance(right, SpinChargeSector):
-        return fuse_charge_spin_sectors(left, right)
-    if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
-        return fuse_irreps(left, right)
-    return (_add_component(label, left, right),)
-
-
-class Sector:
-    """
-    Symmetry-agnostic product sector.
-
-    A :class:`Sector` stores labelled symmetry components and can therefore host
-    either purely Abelian labels such as ``charge x sz`` or mixed spaces such as
-    ``charge x SU(2)``.
-    """
-
-    __slots__ = ("labels", "components")
-
-    def __init__(self, labels, components):
-        labels = tuple(_normalize_sym_label(label) for label in labels)
-        components = tuple(components)
-        if len(labels) != len(components):
-            raise ValueError(
-                f"Sector labels/components length mismatch: {len(labels)} != {len(components)}"
-            )
-        self.labels = labels
-        self.components = components
-
-    def __iter__(self):
-        return iter(self.components)
-
-    def __len__(self):
-        return len(self.components)
-
-    def __getitem__(self, idx):
-        return self.components[idx]
-
-    def __hash__(self):
-        return hash((self.labels, self.components))
-
-    def __eq__(self, other):
-        return isinstance(other, Sector) and self.labels == other.labels and self.components == other.components
-
-    def __lt__(self, other):
-        if not isinstance(other, Sector):
-            return NotImplemented
-        return (self.labels, tuple(_component_sort_key(v) for v in self.components)) < (
-            other.labels,
-            tuple(_component_sort_key(v) for v in other.components),
-        )
-
-    def __repr__(self):
-        if len(self.labels) == 0:
-            return "Sector()"
-        parts = ", ".join(f"{label}={value}" for label, value in zip(self.labels, self.components))
-        return f"Sector({parts})"
-
-    @property
-    def is_abelian(self):
-        return all(_is_abelian_label(label) for label in self.labels)
-
-    def _with_components(self, components):
-        return Sector(self.labels, components)
-
-    def zero(self):
-        return self._with_components(tuple(_zero_component(label, value) for label, value in zip(self.labels, self.components)))
-
-    def __add__(self, other):
-        if not isinstance(other, Sector) or self.labels != other.labels:
-            return NotImplemented
-        return self._with_components(
-            tuple(_add_component(label, left, right) for label, left, right in zip(self.labels, self.components, other.components))
-        )
-
-    def __sub__(self, other):
-        if not isinstance(other, Sector) or self.labels != other.labels:
-            return NotImplemented
-        return self._with_components(
-            tuple(_sub_component(label, left, right) for label, left, right in zip(self.labels, self.components, other.components))
-        )
-
-    def __neg__(self):
-        return self._with_components(tuple(_neg_component(label, value) for label, value in zip(self.labels, self.components)))
-
-    def __mul__(self, scalar):
-        return self._with_components(tuple(_mul_component(label, value, scalar) for label, value in zip(self.labels, self.components)))
-
-    def __rmul__(self, scalar):
-        return self.__mul__(scalar)
-
-    def fuse(self, other):
-        if not isinstance(other, Sector) or self.labels != other.labels:
-            raise TypeError("Can only fuse sectors with matching labels.")
-        fused_components = [
-            _fuse_component(label, left, right)
-            for label, left, right in zip(self.labels, self.components, other.components)
-        ]
-        return tuple(
-            self._with_components(combo)
-            for combo in itertools.product(*fused_components)
-        )
-
-
-class AbelianSector(Sector):
-    """Labelled Abelian product sector, e.g. ``charge x sz``."""
-
-    def __init__(self, labels, components):
-        super().__init__(labels, components)
-        if not self.is_abelian:
-            raise ValueError("AbelianSector can only contain Abelian symmetry labels.")
-
-    def _with_components(self, components):
-        return AbelianSector(self.labels, components)
-
-    def __repr__(self):
-        if len(self.labels) == 0:
-            return "AbelianSector()"
-        parts = ", ".join(f"{label}={value}" for label, value in zip(self.labels, self.components))
-        return f"AbelianSector({parts})"
-
-
-class QN(AbelianSector):
+class QN(tuple):
     """
     Quantum Number class supporting vector addition for U(1) x U(1) x ...
     Example: QN(1, 0) + QN(1, 1) = QN(2, 1)
     """
-    def __init__(self, *args):
-        super().__init__(('u1',) * len(args), tuple(args))
+    def __new__(cls, *args):
+        return super(QN, cls).__new__(cls, tuple(args))
 
-    def _with_components(self, components):
-        return QN(*components)
+    def __add__(self, other):
+        return QN(*(x + y for x, y in zip(self, other)))
 
+    def __sub__(self, other):
+        return QN(*(x - y for x, y in zip(self, other)))
+        
+    def __neg__(self):
+        return QN(*(-x for x in self))
+
+    def __mul__(self, other):
+        # Scalar multiplication
+        return QN(*(x * other for x in self))
+        
     def __repr__(self):
-        return f"QN{self.components!r}"
-
-
-def is_sector_like(value):
-    return isinstance(value, (Sector, tuple))
-
-
-def zero_like_sector(value):
-    if isinstance(value, Sector):
-        return value.zero()
-    if isinstance(value, tuple):
-        return QN(*([0] * len(value)))
-    return 0
+        return f"QN{super().__repr__()}"
+    
+    def __lt__(self, other):
+        return super().__lt__(other)
 
 class BlockTensor:
     """
@@ -243,7 +41,6 @@ class BlockTensor:
         self.qns = qns    # List of [qn_sector_1, qn_sector_2, ...] for each leg
         self.dirs = dirs  # List of [+1 (Out), -1 (In)]
         self.rank = len(dirs)
-        self._contract_cache = {}
 
     @property
     def shape(self):
@@ -337,21 +134,12 @@ def tensordot(A, B, axes):
     new_dirs = [A.dirs[i] for i in free_A] + [B.dirs[i] for i in free_B]
     new_qns = [A.qns[i] for i in free_A] + [B.qns[i] for i in free_B]
 
-    # 2. Pre-group B blocks for faster lookup.  The same immutable MPO and
-    # environment tensors are contracted many times inside local Davidson.
-    cache_key = tuple(b_ax)
-    cache_token = (id(B.data), len(B.data))
-    cached = getattr(B, "_contract_cache", {}).get(cache_key)
-    if cached is not None and cached[0] == cache_token:
-        B_map = cached[1]
-    else:
-        B_map = defaultdict(list)
-        for qn_B, block_B in B.data.items():
-            key_contract = tuple(qn_B[i] for i in b_ax)
-            B_map[key_contract].append((qn_B, block_B))
-        if not hasattr(B, "_contract_cache"):
-            B._contract_cache = {}
-        B._contract_cache[cache_key] = (cache_token, B_map)
+    # 2. Pre-group B blocks for faster lookup
+    # Key: Tuple of QNs on the contraction legs
+    B_map = defaultdict(list)
+    for qn_B, block_B in B.data.items():
+        key_contract = tuple(qn_B[i] for i in b_ax)
+        B_map[key_contract].append((qn_B, block_B))
 
     # 3. Contract
     new_data = {}
@@ -380,106 +168,80 @@ def tensordot(A, B, axes):
                     
     return BlockTensor(new_data, new_qns, new_dirs)
 
-class SymmetryManager:
-    def __init__(self, sym_list, orb_sym=None):
-        if sym_list is True: sym_list = ['charge', 'sz']
-        if sym_list is False or sym_list is None: sym_list = []
-        self.sym_types = [_normalize_sym_label(s) for s in sym_list]
-        self.rank = len(self.sym_types)
-        self.enabled = self.rank > 0
-        self.has_nonabelian = any(sym == 'su2' for sym in self.sym_types)
-        self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
+# class SymmetryManager:
+    # """this old version check strings and apply symmetry by physical meaning, we delete the string check at this point, maybe later could let them co-exist
+    # """
+#     def __init__(self, sym_list):
+#         if sym_list is True: sym_list = ['charge', 'sz']
+#         if sym_list is False or sym_list is None: sym_list = []
+#         self.sym_types = [s.lower() for s in sym_list]
+#         self.rank = len(self.sym_types)
+#         self.enabled = self.rank > 0
 
-    def _build_sector(self, components):
-        if not self.enabled:
-            return AbelianSector((), ())
-        if self.has_nonabelian:
-            return Sector(self.sym_types, tuple(components))
-        return AbelianSector(self.sym_types, tuple(components))
+#     def get_vac_qn(self):
+#         return QN(*[0]*self.rank)
+
+#     def get_phys_qn(self, site_idx, state_str):
+#         """Map physical state ('emp', 'occ') to QN."""
+#         vals = []
+#         for sym in self.sym_types:
+#             if sym in ['charge', 'n', 'particle']:
+#                 if state_str == 'emp': vals.append(0)
+#                 else: vals.append(1) # Occ (both Up and Down count as 1 charge)
+            
+#             elif sym in ['sz', 'spin', 's_z']:
+#                 # Spin-Orbital logic: Even=Up(+1), Odd=Down(-1)
+#                 # Note: We return 2*Sz (integers) to allow QN class to work with ints. TODO: is it actually better to just return physical value? or change that when presenting to other people
+#                 if state_str == 'emp': 
+#                     vals.append(0)
+#                 elif state_str == 'occ':
+#                     if site_idx % 2 == 0: vals.append(1)  # Up
+#                     else: vals.append(-1) # Down
+#         return QN(*vals)
+
+#     def get_target_qn(self, nelec, spin):
+#         """
+#         nelec: Total electrons (int)
+#         spin: 2*S (int), e.g. 0 for singlet
+#         """
+#         vals = []
+#         for sym in self.sym_types:
+#             if sym in ['charge', 'n', 'particle']:
+#                 vals.append(int(nelec))
+#             elif sym in ['sz', 'spin', 's_z']:
+#                 vals.append(int(spin))
+#         return QN(*vals)
+
+class SymmetryManager:
+    def __init__(self, phys_qns, target_qn, sym_types=None):
+        """
+        phys_qns: list of QN objects representing the local Hilbert space basis.
+        target_qn: The global target QN object for the right boundary.
+        sym_types: Metadata list for legacy reporting (e.g., ['charge', 'sz']).
+        """
+        self.phys_qns = phys_qns
+        self.target_qn = target_qn
+        # We store sym_types to satisfy the legacy check_abelian_symmetry method
+        self.sym_types = sym_types if sym_types is not None else ['charge', 'sz']
+        
+        self.rank = len(target_qn) if target_qn else 0
+        self.enabled = self.rank > 0
 
     def get_vac_qn(self):
-        if not self.enabled:
-            return AbelianSector((), ())
-        comps = [SU2Irrep(0) if sym == 'su2' else 0 for sym in self.sym_types]
-        return self._build_sector(comps)
-
-    def get_phys_qn(self, site_idx, state_str, site_model='spin_orbital'):
-        """Map a local physical state to a sector label."""
-        state = str(state_str).lower()
-        vals = []
-        for sym in self.sym_types:
-            if sym == 'charge':
-                if state in {'emp', 'empty'}:
-                    vals.append(0)
-                elif state in {'double', 'dbl', 'full'}:
-                    vals.append(2)
-                else:
-                    vals.append(1)
-
-            elif sym == 'sz':
-                # Spin-Orbital logic: Even=Up(+1), Odd=Down(-1)
-                # Note: We return 2*Sz (integers) to allow QN class to work with ints. TODO: is it actually better to just return physical value? or change that when presenting to other people
-                if state in {'emp', 'empty', 'double', 'dbl', 'full'}:
-                    vals.append(0)
-                elif state in {'occ', 'occupied', 'single', 'up', 'down'}:
-                    if state == 'up':
-                        vals.append(1)
-                    elif state == 'down':
-                        vals.append(-1)
-                    else:
-                        if site_idx % 2 == 0: vals.append(1)  # Up
-                        else: vals.append(-1) # Down
-            elif sym == 'su2':
-                if state in {'emp', 'empty', 'double', 'dbl', 'full'}:
-                    vals.append(SU2Irrep(0))
-                elif state in {'occ', 'occupied', 'single', 'up', 'down'}:
-                    vals.append(SU2Irrep(1))
-                else:
-                    raise ValueError(f"Unsupported SU(2) local state {state_str!r} for site model {site_model!r}.")
-            elif sym == 'pg':
-                if self.orb_sym is None:
-                    raise ValueError("Point-group symmetry requires orb_sym labels on SymmetryManager.")
-                orb_idx = int(site_idx) if site_model == 'spatial' else int(site_idx) // 2
-                if orb_idx < 0 or orb_idx >= len(self.orb_sym):
-                    raise ValueError(f"orb_sym missing label for orbital/site {orb_idx}.")
-                if state in {'emp', 'empty', 'double', 'dbl', 'full'}:
-                    vals.append(0)
-                elif state in {'occ', 'occupied', 'single', 'up', 'down'}:
-                    vals.append(int(self.orb_sym[orb_idx]))
-                else:
-                    raise ValueError(f"Unsupported point-group local state {state_str!r}.")
-        return self._build_sector(vals)
-
-    def get_target_qn(self, nelec=0, spin=0):
+        return QN(*[0] * self.rank)
+    
+    def get_target_qn(self, nelec, spin):
         """
-        nelec: Total electrons (int)
-        spin: Abelian branch interprets this as ``2Sz``; SU(2) branch interprets
-              it as ``2S`` for the target irrep.
+        Calculates the target QN vector based on the active symmetries.
+        Uses the metadata in sym_types to construct the QN.
         """
         vals = []
         for sym in self.sym_types:
-            if sym == 'charge':
+            if sym in ['charge', 'n', 'particle']:
                 vals.append(int(nelec))
-            elif sym == 'sz':
+            elif sym in ['sz', 'spin', 's_z']:
                 vals.append(int(spin))
-            elif sym == 'su2':
-                vals.append(SU2Irrep(int(spin)))
-            elif sym == 'pg':
-                vals.append(0)
-        return self._build_sector(vals)
-
-    def fuse(self, left, right):
-        if isinstance(left, Sector):
-            return left.fuse(right)
-        return (left + right,)
-
-    def combine(self, left, right):
-        fused = self.fuse(left, right)
-        if len(fused) != 1:
-            raise ValueError(f"Fusion of {left!r} and {right!r} is non-unique: {fused!r}")
-        return fused[0]
-
-
+        return QN(*vals)
 
 def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
     norm_val = v0.norm()

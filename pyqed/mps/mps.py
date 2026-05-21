@@ -3010,6 +3010,12 @@ class MPS:
                 rho /= tr
             rdm[i] = rho
         return rdm
+    
+    def make_local_site_rdm(self, idx=None):
+        """
+        Wrapper for local one-site reduced density matrices.
+        """
+        return self._calc_local_site_rdms(idx=idx)
 
     def make_diagonal_rdm2(self, idx_pairs=None):
         """
@@ -3155,29 +3161,36 @@ class MPS:
         """
         L = self.L
         
-        # 1. Symmetric Branch (Requires sym_mgr)
+        # 1. Symmetric Branch
         if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
             if sym_mgr is None:
                 raise ValueError("[Error] Symmetric RDM requires sym_mgr.")
             
-            P = np.zeros((L, L), dtype=complex)
-            vac_qn = sym_mgr.get_vac_qn()
+            d_local = len(sym_mgr.phys_qns)
+            norbs_spin = 2 * L if d_local == 4 else L
+            P = np.zeros((norbs_spin, norbs_spin), dtype=complex)
             
             # Pre-calculate hole states: |phi_j> = a_j |Psi>
-            phis = [None] * L
-            for j in range(L):
-                spin = 'up' if j % 2 == 0 else 'down'
-                W_a = build_annihilation_mpo_symmetric(j, L, sym_mgr, spin)
+            phis = [None] * norbs_spin
+            for spin_idx in range(norbs_spin):
+                if d_local == 2:
+                    spatial_idx = spin_idx
+                    spin = 'up' if spin_idx % 2 == 0 else 'down'
+                else:
+                    spatial_idx = spin_idx // 2
+                    spin = 'up' if spin_idx % 2 == 0 else 'down'
+                    
+                W_a = build_annihilation_mpo_symmetric(spatial_idx, L, sym_mgr, spin)
                 try:
                     phi_data = apply_mpo_symmetric(W_a, self.Bs) 
                     if phi_data:
-                        phis[j] = MPS(phi_data, labels=self.labels, bc=self.bc)
+                        phis[spin_idx] = MPS(phi_data, labels=self.labels, bc=self.bc)
                 except Exception:
-                    phis[j] = None
+                    phis[spin_idx] = None
 
             # Compute Overlaps <phi_i | phi_j>
-            for i in range(L):
-                for j in range(i, L):
+            for i in range(norbs_spin):
+                for j in range(i, norbs_spin):
                     if (i % 2) != (j % 2): continue # Spin conservation
                     if phis[i] is None or phis[j] is None: continue
                     
@@ -5340,10 +5353,6 @@ def optimize_site(A, W, E, F, tol=1E-8):
 def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
     """
     Injects noise into ALL valid symmetry sectors.
-    Args:
-        AA: The BlockTensor to perturb
-        sym_mgr: SymmetryManager instance to get valid physical QNs
-        noise_val: Magnitude of noise
     """
     if not hasattr(AA, 'qns'):
         return AA
@@ -5358,28 +5367,17 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
         valid_qL[qL] = blk.shape[0]
         valid_qR[qR] = blk.shape[1]
 
-    # get valid physical QNs
-    # generate the QNs for standard spin-orbital states: Emp, Occ(Up), Occ(Dn)
-    # The manager knows if 'Occ' means QN(1) or QN(1,1) or QN(1,1,-1).
-    possible_phys_qns = set()
-    # Always include Vacuum
-    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'emp'))
-    # Include Occupied states
-    # We check both "Even-like" (Up) and "Odd-like" (Down) indices
-    # to cover all bases for spin-orbitals.
-    possible_phys_qns.add(sym_mgr.get_phys_qn(0, 'occ')) # "Up"
-    possible_phys_qns.add(sym_mgr.get_phys_qn(1, 'occ')) # "Down"
-    possible_phys_qns = list(possible_phys_qns)
-    # Iterate and Inject (Same logic as before)
+    # Get valid physical QNs directly from the manager (works for d=2 and d=4)
+    possible_phys_qns = sym_mgr.phys_qns
+
+    # Iterate and Inject
     for qL, dL in valid_qL.items():
         for qP1 in possible_phys_qns:
             for qP2 in possible_phys_qns:
-                # Calculate required Right Sector
                 target_qR = qL + qP1 + qP2
                 if target_qR in valid_qR:
                     dR = valid_qR[target_qR]
                     key = (qL, target_qR, qP1, qP2)
-                    # Dimensions for spin-orbitals are 1
                     dP1, dP2 = 1, 1
                     if key not in AA.data:
                         noise = (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
@@ -5387,6 +5385,7 @@ def inject_noise_symmetric(AA, sym_mgr, noise_val=1e-4):
                             noise = noise + 1j * (np.random.rand(dL, dR, dP1, dP2) - 0.5) * noise_val
                         AA.data[key] = noise.astype(dtype)
     return AA
+
 
 # Helper to contract Diagonal S into U
 # U is (L, P_L, Bond). S is (Bond, Bond).
@@ -6578,75 +6577,63 @@ def fDMRG_1site_GS_OBC(H,D,Nsweeps):
 def build_annihilation_mpo_symmetric(site_idx, L, sym_mgr, spin_sector):
     """    
     Constructs U(1) symmetric MPO for annihilation operator a_k.
-    Includes Jordan-Wigner strings (Z) for sites i < k.
-
-    Parameters
-    ----------
-    site_idx : _type_
-        _description_
-    L : _type_
-        _description_
-    sym_mgr : _type_
-        _description_
-    spin_sector : _type_
-        _description_
-
-    Returns
-    -------
-    _type_
-        _description_
-
-    Raises
-    ------
-    ImportError
-        _description_
+    Handles both d=2 (spin-orbital) and d=4 (spatial-orbital) mappings.
     """
     if not SYMMETRY_AVAILABLE: raise ImportError("Symmetry required")
     
     vac_qn = sym_mgr.get_vac_qn()
-    # Determine Particle QN (The charge removed by annihilation)
-    # Spin-Orbital Mapping: If spin_sector='up', we look for site 0 (Even).
-    q_particle = sym_mgr.get_phys_qn(0 if spin_sector=='up' else 1, 'occ')
+    d_local = len(sym_mgr.phys_qns)
     
+    # Identify standard QNs from the list
+    if d_local == 2:
+        q_emp, q_occ = sym_mgr.phys_qns[0], sym_mgr.phys_qns[1]
+        q_particle = q_occ
+    elif d_local == 4:
+        q_emp, q_up, q_dn, q_docc = sym_mgr.phys_qns
+        q_particle = q_up if spin_sector == 'up' else q_dn
+    else:
+        raise NotImplementedError(f"Unsupported d={d_local} in annihilation builder.")
+        
     tensors = []
     
     for i in range(L):
         data = {}
-        # Physical QNs for this site
-        q_emp = sym_mgr.get_phys_qn(i, 'emp')
-        q_occ = sym_mgr.get_phys_qn(i, 'occ')
-        
-        if i < site_idx:
-            # Jordan-Wigner String (Z): Occ -> -Occ, Emp -> Emp
-            # Bond is Vacuum -> Vacuum
-            data[(vac_qn, vac_qn, q_emp, q_emp)] = np.array([[[[1.0]]]])
-            data[(vac_qn, vac_qn, q_occ, q_occ)] = np.array([[[[-1.0]]]])
-            
-        elif i == site_idx:
-            # Annihilation (a): Occ -> Emp
-            # Bond: Left(Vac) + Flux(Particle) = Right(Particle)
-            # Flux = Q_In - Q_Out = Occ - Emp = Particle
-            is_up = (i % 2 == 0)
-            valid_spin = (spin_sector == 'up' and is_up) or (spin_sector == 'down' and not is_up)
-            
-            if valid_spin:
-                # Key: (Left, Right, Out, In)
-                data[(vac_qn, q_particle, q_emp, q_occ)] = np.array([[[[1.0]]]])
-            
-        else: # i > site_idx
-            # Identity (I)
-            # Bond must carry the Particle charge to the right boundary
-            data[(q_particle, q_particle, q_emp, q_emp)] = np.array([[[[1.0]]]])
-            data[(q_particle, q_particle, q_occ, q_occ)] = np.array([[[[1.0]]]])
+        if d_local == 2:
+            if i < site_idx:
+                data[(vac_qn, vac_qn, q_emp, q_emp)] = np.array([[[[1.0]]]])
+                data[(vac_qn, vac_qn, q_occ, q_occ)] = np.array([[[[-1.0]]]])
+            elif i == site_idx:
+                is_up = (i % 2 == 0)
+                if (spin_sector == 'up' and is_up) or (spin_sector == 'down' and not is_up):
+                    data[(vac_qn, q_particle, q_emp, q_occ)] = np.array([[[[1.0]]]])
+            else: 
+                data[(q_particle, q_particle, q_emp, q_emp)] = np.array([[[[1.0]]]])
+                data[(q_particle, q_particle, q_occ, q_occ)] = np.array([[[[1.0]]]])
+                
+        elif d_local == 4:
+            if i < site_idx:
+                data[(vac_qn, vac_qn, q_emp, q_emp)] = np.array([[[[1.0]]]])
+                data[(vac_qn, vac_qn, q_up, q_up)] = np.array([[[[-1.0]]]])
+                data[(vac_qn, vac_qn, q_dn, q_dn)] = np.array([[[[-1.0]]]])
+                data[(vac_qn, vac_qn, q_docc, q_docc)] = np.array([[[[1.0]]]])
+            elif i == site_idx:
+                if spin_sector == 'up':
+                    data[(vac_qn, q_particle, q_emp, q_up)] = np.array([[[[1.0]]]])
+                    data[(vac_qn, q_particle, q_dn, q_docc)] = np.array([[[[1.0]]]])
+                elif spin_sector == 'down':
+                    data[(vac_qn, q_particle, q_emp, q_dn)] = np.array([[[[1.0]]]])
+                    data[(vac_qn, q_particle, q_up, q_docc)] = np.array([[[[-1.0]]]])
+            else:
+                data[(q_particle, q_particle, q_emp, q_emp)] = np.array([[[[1.0]]]])
+                data[(q_particle, q_particle, q_up, q_up)] = np.array([[[[1.0]]]])
+                data[(q_particle, q_particle, q_dn, q_dn)] = np.array([[[[1.0]]]])
+                data[(q_particle, q_particle, q_docc, q_docc)] = np.array([[[[1.0]]]])
 
-        # If data is empty (e.g. wrong spin sector), create a zero-block to maintain MPO connectivity
         if not data:
-             if i < site_idx: qL, qR = vac_qn, vac_qn
-             elif i == site_idx: qL, qR = vac_qn, q_particle
-             else: qL, qR = q_particle, q_particle
-             data[(qL, qR, q_emp, q_occ)] = np.zeros((1,1,1,1))
+             qL = vac_qn if i <= site_idx else q_particle
+             qR = vac_qn if i < site_idx else q_particle
+             data[(qL, qR, q_emp, q_occ if d_local==2 else q_up)] = np.zeros((1,1,1,1))
 
-        # Infer basis lists from keys
         used_L = sorted(list(set(k[0] for k in data)))
         used_R = sorted(list(set(k[1] for k in data)))
         used_Out = sorted(list(set(k[2] for k in data)))
@@ -6655,6 +6642,7 @@ def build_annihilation_mpo_symmetric(site_idx, L, sym_mgr, spin_sector):
         tensors.append(BlockTensor(data, [used_L, used_R, used_Out, used_In], [1, -1, 1, -1]))
         
     return tensors
+
 
 def apply_mpo_symmetric(W_list, M_list):
     """
