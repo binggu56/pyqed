@@ -129,7 +129,7 @@ def main():
         nt=args.nt,
         nout=args.nout,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
+        kinetic_action="matrix-free",
     )
     pop_png = args.outdir / "h3plus_am1_meci_ldr_populations.png"
     plot_populations(solver, result, pop_png)

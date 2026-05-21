@@ -29,6 +29,8 @@ from pyqed.md import (
     XYZTrajectoryWriter,
     combine_systems,
     load_forcefield,
+    pme_reciprocal_potential,
+    pme_reciprocal_potential_grid,
     read_restart,
     radial_distribution,
     run_solvent_equilibration,
@@ -160,6 +162,92 @@ def test_qmmm_electrostatic_embedding_maps_qm_and_mm_forces():
     assert np.isfinite(components["point_charge_force_max"])
     np.testing.assert_allclose(forces[:2], -reference_qm_grad)
     np.testing.assert_allclose(forces[2:], reference_mm_forces)
+
+
+def test_qmmm_periodic_embedding_uses_nearest_mm_image():
+    qm_positions = np.array([[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]])
+    atoms = Atoms(
+        [
+            ["H", tuple(qm_positions[0])],
+            ["H", tuple(qm_positions[1])],
+            ["He", (9.0, 0.0, 0.0)],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    atoms.set_array("charges", [0.0, 0.0, -0.2], float, ())
+    atoms.calc = QMMM(
+        qm=_builtin_h2_rhf(qm_positions),
+        qm_indices=[0, 1],
+        mm_indices=[2],
+        electrostatic_embedding=True,
+        embedding_pbc="nearest",
+        qm_run_kwargs={"verbose": 0, "max_cycle": 100},
+    )
+
+    energy = atoms.get_potential_energy()
+    forces = atoms.get_forces(apply_constraint=False)
+    components = atoms.calc.results
+    reference = embed_point_charges(
+        _builtin_h2_rhf(qm_positions),
+        coords=[[-1.0, 0.0, 0.0]],
+        charges=[-0.2],
+        run_kwargs={"verbose": 0, "max_cycle": 100},
+    )
+    reference_energy, reference_qm_grad, reference_mm_forces = reference.energy_and_gradients()
+
+    np.testing.assert_allclose(energy, reference_energy)
+    np.testing.assert_allclose(forces[:2], -reference_qm_grad)
+    np.testing.assert_allclose(forces[2:], reference_mm_forces)
+    np.testing.assert_allclose(components["embedding_coords"], [[-1.0, 0.0, 0.0]])
+    np.testing.assert_allclose(components["embedding_shifts"], [[-10.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(components["embedding_owners"], [0])
+
+
+def test_qmmm_periodic_embedding_expands_images_and_sums_forces():
+    qm_positions = np.array([[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]])
+    atoms = Atoms(
+        [
+            ["H", tuple(qm_positions[0])],
+            ["H", tuple(qm_positions[1])],
+            ["He", (9.0, 0.0, 0.0)],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    atoms.set_array("charges", [0.0, 0.0, -0.2], float, ())
+    atoms.calc = QMMM(
+        qm=_builtin_h2_rhf(qm_positions),
+        qm_indices=[0, 1],
+        mm_indices=[2],
+        electrostatic_embedding=True,
+        embedding_pbc="images",
+        embedding_cutoff=9.5,
+        qm_run_kwargs={"verbose": 0, "max_cycle": 100},
+    )
+
+    energy = atoms.get_potential_energy()
+    forces = atoms.get_forces(apply_constraint=False)
+    components = atoms.calc.results
+    reference_coords = np.array([[-1.0, 0.0, 0.0], [9.0, 0.0, 0.0]])
+    reference = embed_point_charges(
+        _builtin_h2_rhf(qm_positions),
+        coords=reference_coords,
+        charges=[-0.2, -0.2],
+        run_kwargs={"verbose": 0, "max_cycle": 100},
+    )
+    reference_energy, reference_qm_grad, reference_image_forces = reference.energy_and_gradients()
+
+    order = np.argsort(components["embedding_coords"][:, 0])
+    np.testing.assert_allclose(components["embedding_coords"][order], reference_coords)
+    np.testing.assert_array_equal(components["embedding_owners"], [0, 0])
+    np.testing.assert_allclose(energy, reference_energy)
+    np.testing.assert_allclose(forces[:2], -reference_qm_grad)
+    np.testing.assert_allclose(forces[2], np.sum(reference_image_forces, axis=0))
+    np.testing.assert_allclose(
+        components["point_charge_forces"],
+        np.sum(components["embedding_point_charge_forces"], axis=0, keepdims=True),
+    )
 
 
 def test_qmmm_electrostatic_embedding_runs_one_step_with_water_mm():
@@ -344,6 +432,27 @@ def _mm_from_topology(system, lj_cutoff=None, coulomb_cutoff=None):
         exclude_bonded=True,
         exclude_angles=True,
     )
+
+
+def _pme_charge_grid_for_test(positions, charges, cell, mesh):
+    lengths = np.diag(np.asarray(cell, dtype=float))
+    mesh = np.asarray(mesh, dtype=int)
+    grid = np.zeros(tuple(mesh), dtype=float)
+    for position, charge in zip(positions, charges):
+        scaled = np.mod(position / lengths, 1.0) * mesh
+        base = np.floor(scaled).astype(int)
+        frac = scaled - base
+        for dx in (0, 1):
+            wx = (1.0 - frac[0]) if dx == 0 else frac[0]
+            ix = (base[0] + dx) % mesh[0]
+            for dy in (0, 1):
+                wy = (1.0 - frac[1]) if dy == 0 else frac[1]
+                iy = (base[1] + dy) % mesh[1]
+                for dz in (0, 1):
+                    wz = (1.0 - frac[2]) if dz == 0 else frac[2]
+                    iz = (base[2] + dz) % mesh[2]
+                    grid[ix, iy, iz] += charge * wx * wy * wz
+    return grid
 
 
 def test_atoms_mass_velocity_and_temperature_use_atomic_units():
@@ -850,6 +959,49 @@ def test_pme_coulomb_is_close_to_direct_ewald():
     )
     assert np.all(np.isfinite(pme.get_forces()))
     np.testing.assert_allclose(pme.get_forces().sum(axis=0), np.zeros(3), atol=1e-12)
+
+
+def test_pme_reciprocal_potential_matches_reciprocal_energy():
+    positions = np.array([[1.0, 1.0, 1.0], [3.2, 2.7, 2.9]])
+    charges = np.array([1.0, -1.0])
+    cell = np.diag([8.0, 8.0, 8.0])
+    mesh = (16, 16, 16)
+
+    potential_grid = pme_reciprocal_potential_grid(
+        positions,
+        charges,
+        cell,
+        pbc=True,
+        alpha=0.35,
+        mesh=mesh,
+    )
+    potential = pme_reciprocal_potential(
+        positions,
+        charges,
+        positions,
+        cell,
+        pbc=True,
+        alpha=0.35,
+        mesh=mesh,
+    )
+
+    assert potential_grid.shape == mesh
+    assert np.all(np.isfinite(potential_grid))
+    np.testing.assert_allclose(
+        0.5 * np.dot(charges, potential),
+        0.5
+        * np.sum(
+            pme_reciprocal_potential_grid(
+                positions,
+                charges,
+                cell,
+                pbc=True,
+                alpha=0.35,
+                mesh=mesh,
+            )
+            * _pme_charge_grid_for_test(positions, charges, cell, mesh)
+        ),
+    )
 
 
 def test_pme_coulomb_rejects_non_neutral_cells():

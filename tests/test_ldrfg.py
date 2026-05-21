@@ -97,3 +97,50 @@ def test_ldrfg_force_from_overlap_gradient():
     # <C|dH/dq|C> = 1 for C=(1,1)/sqrt(2), so pdot = -1.
     np.testing.assert_allclose(rhs.p_dot, [-1.0])
 
+
+def test_ldrfg_accepts_full_local_electronic_hamiltonian():
+    _prefer_source_package()
+    from pyqed.namd import LDRFG
+
+    tx = np.zeros((1, 1))
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    local = np.array([[[0.0, 0.3], [0.3, 1.0]]])
+    grad_local = np.array([[[[0.0, 0.2], [0.2, 0.5]]]])
+
+    solver = LDRFG(
+        tx,
+        masses_y=[1.0],
+        energies=np.zeros((1, 2)),
+        overlap=overlap,
+        electronic_hamiltonian=lambda q: local + q[0] * grad_local[0],
+        grad_electronic_hamiltonian=lambda q: grad_local,
+    )
+
+    h = solver.hamiltonian_tensor(q=[0.0], p=[0.0])
+    np.testing.assert_allclose(h[0, :, 0, :], local[0])
+
+    c = np.array([[1.0, 1.0]], dtype=complex) / np.sqrt(2.0)
+    rhs = solver.rhs(c, q=[0.0], p=[0.0])
+    expected_force = -np.vdot(c.ravel(), grad_local[0, 0] @ c.ravel()).real
+    np.testing.assert_allclose(rhs.p_dot, [expected_force])
+
+
+def test_grad_overlap_from_derivative_couplings():
+    _prefer_source_package()
+    from pyqed.namd import grad_overlap_from_derivative_couplings
+
+    theta = 0.2
+    overlap = np.zeros((2, 2, 2, 2), dtype=complex)
+    overlap[0, :, 0, :] = np.eye(2)
+    overlap[1, :, 1, :] = np.eye(2)
+    overlap[0, :, 1, :] = [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
+    overlap[1, :, 0, :] = overlap[0, :, 1, :].T
+
+    d = np.zeros((1, 2, 2, 2), dtype=complex)
+    d[0, 1] = [[0.0, 1.0], [-1.0, 0.0]]
+
+    grad = grad_overlap_from_derivative_couplings(overlap, d)
+
+    expected = overlap[0, :, 1, :] @ d[0, 1]
+    np.testing.assert_allclose(grad[0, 0, :, 1, :], expected)
+    np.testing.assert_allclose(grad[0, 0, :, 0, :], 0.0)

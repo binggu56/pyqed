@@ -13,6 +13,11 @@ from periodictable import elements
 import jax
 import jax.numpy as jnp
 
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - optional acceleration dependency
+    njit = None
+
 from pyqed.units import amu2au, au2fs, au2wavenumber
 from pyqed.dvr.dvr_1d import FEDVR, LegendreDVR, PODVR, SineDVR
 from pyqed import interval, au2angstrom
@@ -36,6 +41,42 @@ from pyqed.namd.keo import (
 warnings.filterwarnings("ignore", message="AM1 model is under testing")
 
 
+if njit is not None:
+    @njit(cache=True)
+    def _compiled_rovibronic_block_matvec(
+        vec,
+        edge_bra,
+        edge_ket,
+        rot_blocks,
+        overlap_blocks,
+        ng,
+        nrot,
+        nstates,
+    ):
+        out = np.zeros(vec.shape, dtype=np.complex128)
+        nedges = edge_bra.shape[0]
+        for edge in range(nedges):
+            bra = edge_bra[edge]
+            ket = edge_ket[edge]
+            for r in range(nrot):
+                for a in range(nstates):
+                    acc = 0.0 + 0.0j
+                    for s in range(nrot):
+                        rot_coeff = rot_blocks[edge, r, s]
+                        if rot_coeff != 0.0:
+                            base = (ket * nrot + s) * nstates
+                            for b in range(nstates):
+                                acc += (
+                                    rot_coeff
+                                    * vec[base + b]
+                                    * overlap_blocks[edge, a, b]
+                                )
+                    out[(bra * nrot + r) * nstates + a] += acc
+        return out
+else:
+    _compiled_rovibronic_block_matvec = None
+
+
 def _normalize_triatomic_electronic_method(method):
     method = str(method).lower().replace("_", "-")
     aliases = {
@@ -52,6 +93,59 @@ def _normalize_triatomic_electronic_method(method):
         "uhf-am1/meci": "uam1-meci",
     }
     return aliases.get(method, method)
+
+
+def _normalize_rovibronic_kinetic_method(method):
+    if method is None or method is False:
+        return None
+    if method is True:
+        return "compiled"
+    key = str(method).strip().lower().replace("_", "-")
+    aliases = {
+        "compiled": "compiled",
+        "compile": "compiled",
+        "numba": "compiled",
+        "jit": "compiled",
+        "matrix-free": "compiled",
+        "matrixfree": "compiled",
+        "sparse": "sparse",
+        "bsr": "sparse",
+        "sparse-bsr": "sparse",
+        "python": "python",
+        "py": "python",
+        "fused": "python",
+        "none": None,
+        "false": None,
+        "off": None,
+    }
+    if key not in aliases:
+        raise ValueError(
+            "rovibronic_kinetic must be one of None, 'compiled', 'sparse', or 'python'."
+        )
+    return aliases[key]
+
+
+def _normalize_kinetic_action(method):
+    if method is None or method is False:
+        return "dense"
+    if method is True:
+        return "matrix-free"
+    key = str(method).strip().lower().replace("_", "-")
+    aliases = {
+        "dense": "dense",
+        "flat": "dense",
+        "matrix-free": "matrix-free",
+        "matrixfree": "matrix-free",
+        "linear-operator": "matrix-free",
+        "linearoperator": "matrix-free",
+        "operator": "matrix-free",
+        "none": "dense",
+        "false": "dense",
+        "off": "dense",
+    }
+    if key not in aliases:
+        raise ValueError("kinetic_action must be one of 'dense' or 'matrix-free'.")
+    return aliases[key]
 
 
 def _set_worker_thread_limits(worker_threads):
@@ -727,6 +821,7 @@ class Triatom(Molecule):
         *,
         threshold=0.0,
         sparse=False,
+        compiled=False,
         verbose=True,
     ):
         """Return a fused factorized rovibronic LDR kinetic action.
@@ -738,6 +833,10 @@ class Triatom(Molecule):
         """
         from scipy.sparse.linalg import LinearOperator
 
+        if sparse and compiled:
+            raise ValueError("sparse=True and compiled=True are mutually exclusive.")
+        if compiled and _compiled_rovibronic_block_matvec is None:
+            raise RuntimeError("compiled=True requires numba to be installed.")
         if not self._rotation_enabled():
             raise RuntimeError("Fused factorized rovibronic LDR action requires J > 0.")
         if self.dvrs is None:
@@ -988,6 +1087,11 @@ class Triatom(Molecule):
             )
         if verbose:
             print(f"[KEO-factorized-LDR] Cached {len(edge_items)} product edges")
+        trace_value = sum(
+            np.trace(rot_block) * np.trace(Aij)
+            for bra_flat, ket_flat, rot_block, Aij in edge_items
+            if bra_flat == ket_flat
+        )
 
         if sparse:
             block_rows = np.empty(len(edge_items), dtype=np.int64)
@@ -1011,7 +1115,57 @@ class Triatom(Molecule):
                 dtype=complex,
             )
             matrix.sum_duplicates()
+            matrix.trace_value = trace_value
+            matrix.edge_count = len(edge_items)
             return matrix
+
+        if compiled:
+            edge_bra = np.empty(len(edge_items), dtype=np.int64)
+            edge_ket = np.empty(len(edge_items), dtype=np.int64)
+            rot_blocks = np.empty((len(edge_items), nrot, nrot), dtype=np.complex128)
+            overlap_blocks = np.empty(
+                (len(edge_items), nstates, nstates),
+                dtype=np.complex128,
+            )
+            for item, (bra_flat, ket_flat, rot_block, Aij) in enumerate(edge_items):
+                edge_bra[item] = bra_flat
+                edge_ket[item] = ket_flat
+                rot_blocks[item] = rot_block
+                overlap_blocks[item] = Aij
+
+            def matvec(vec):
+                vec = np.ascontiguousarray(np.asarray(vec, dtype=np.complex128).reshape(-1))
+                return _compiled_rovibronic_block_matvec(
+                    vec,
+                    edge_bra,
+                    edge_ket,
+                    rot_blocks,
+                    overlap_blocks,
+                    ng,
+                    nrot,
+                    nstates,
+                )
+
+            def matmat(mat):
+                mat = np.asarray(mat)
+                return np.column_stack([matvec(mat[:, col]) for col in range(mat.shape[1])])
+
+            operator = LinearOperator(
+                shape=(nflat, nflat),
+                matvec=matvec,
+                rmatvec=matvec,
+                matmat=matmat,
+                dtype=complex,
+            )
+            operator.trace_value = trace_value
+            operator.edge_count = len(edge_items)
+            operator.block_storage_mib = (
+                edge_bra.nbytes
+                + edge_ket.nbytes
+                + rot_blocks.nbytes
+                + overlap_blocks.nbytes
+            ) / 1024**2
+            return operator
 
         def matvec(vec):
             psi = np.asarray(vec, dtype=complex).reshape(ng, nrot, nstates)
@@ -1024,13 +1178,16 @@ class Triatom(Molecule):
             mat = np.asarray(mat)
             return np.column_stack([matvec(mat[:, col]) for col in range(mat.shape[1])])
 
-        return LinearOperator(
+        operator = LinearOperator(
             shape=(nflat, nflat),
             matvec=matvec,
             rmatvec=matvec,
             matmat=matmat,
             dtype=complex,
         )
+        operator.trace_value = trace_value
+        operator.edge_count = len(edge_items)
+        return operator
 
     def build_sparse_factorized_rovibronic_ldr_matrix(
         self,
@@ -1048,6 +1205,25 @@ class Triatom(Molecule):
         return self.build_fused_factorized_rovibronic_ldr_action(
             threshold=threshold,
             sparse=True,
+            verbose=verbose,
+        )
+
+    def build_compiled_factorized_rovibronic_ldr_action(
+        self,
+        *,
+        threshold=0.0,
+        verbose=True,
+    ):
+        """Return the factorized rovibronic LDR kinetic action as a compiled matvec.
+
+        The returned ``LinearOperator`` stores edge-wise rotational and
+        electronic blocks and applies the product action in a Numba-compiled
+        loop.  It is intended for larger ``J`` values where explicit BSR
+        storage becomes expensive.
+        """
+        return self.build_fused_factorized_rovibronic_ldr_action(
+            threshold=threshold,
+            compiled=True,
             verbose=verbose,
         )
 
@@ -2230,9 +2406,8 @@ class Triatom(Molecule):
         chebyshev_tol=1e-12,
         chebyshev_max_order=4096,
         chebyshev_bounds="gershgorin",
-        matrix_free_kinetic=False,
-        factorized_rovibronic_kinetic=False,
-        sparse_factorized_rovibronic_kinetic=False,
+        kinetic_action=None,
+        rovibronic_kinetic=None,
     ):
         """Build the full kinetic propagator exp(-i T dt).
 
@@ -2241,30 +2416,36 @@ class Triatom(Molecule):
         import time
         kinetic_propagator = self._canonical_kinetic_propagator(kinetic_propagator)
         has_rotation = self._rotation_enabled()
+        rovibronic_kinetic = _normalize_rovibronic_kinetic_method(rovibronic_kinetic)
+        use_operator_kinetic = _normalize_kinetic_action(kinetic_action) == "matrix-free"
 
-        if factorized_rovibronic_kinetic:
+        if rovibronic_kinetic is not None:
             if not has_rotation:
-                raise ValueError("factorized_rovibronic_kinetic=True requires J > 0.")
-            if not matrix_free_kinetic:
-                raise ValueError(
-                    "factorized_rovibronic_kinetic=True requires matrix_free_kinetic=True."
-                )
+                raise ValueError("rovibronic_kinetic requires J > 0.")
             if kinetic_propagator == "dense":
                 raise ValueError(
-                    "factorized_rovibronic_kinetic=True requires kinetic_propagator="
-                    "'expm_multiply' or 'chebyshev'."
+                    "rovibronic_kinetic requires kinetic_propagator='expm_multiply' "
+                    "or 'chebyshev'."
                 )
-            if sparse_factorized_rovibronic_kinetic:
+            if rovibronic_kinetic == "sparse":
                 print("Building sparse factorized rovibronic LDR matrix ...")
+            elif rovibronic_kinetic == "compiled":
+                print("Building compiled factorized rovibronic LDR LinearOperator ...")
             else:
                 print("Building factorized rovibronic LDR LinearOperator ...")
             t0 = time.time()
-            if sparse_factorized_rovibronic_kinetic:
+            if rovibronic_kinetic == "sparse":
                 self.H = self.build_sparse_factorized_rovibronic_ldr_matrix(verbose=True)
+            elif rovibronic_kinetic == "compiled":
+                self.H = self.build_compiled_factorized_rovibronic_ldr_action(verbose=True)
             else:
                 self.H = self.build_fused_factorized_rovibronic_ldr_action(verbose=True)
             self.T_total = None
-            self.kinetic_trace = self.H.diagonal().sum() if sp.issparse(self.H) else None
+            self.kinetic_trace = (
+                self.H.diagonal().sum()
+                if sp.issparse(self.H)
+                else getattr(self.H, "trace_value", None)
+            )
             print(
                 f"Factorized rovibronic kinetic built in {time.time() - t0:.2f} s, "
                 f"shape = {self.H.shape}"
@@ -2291,10 +2472,10 @@ class Triatom(Molecule):
         print("Building T_total ...")
         t0 = time.time()
         try:
-            if has_rotation and matrix_free_kinetic:
+            if has_rotation and use_operator_kinetic:
                 T_total = self.buildK(sparse=False)
             else:
-                T_total = self.buildK(sparse=matrix_free_kinetic)
+                T_total = self.buildK(sparse=use_operator_kinetic)
         except TypeError:
             T_total = self.buildK()
         if sp.issparse(T_total):
@@ -2305,10 +2486,10 @@ class Triatom(Molecule):
         self.kinetic_trace = self._kinetic_trace_from_nuclear_operator(T_total)
         print(f"T_total built in {time.time() - t0:.2f} s, shape = {T_total.shape}")
 
-        if matrix_free_kinetic:
+        if use_operator_kinetic:
             if kinetic_propagator == "dense":
                 raise ValueError(
-                    "matrix_free_kinetic=True requires kinetic_propagator="
+                    "kinetic_action='matrix-free' requires kinetic_propagator="
                     "'expm_multiply' or 'chebyshev'."
                 )
             print("Building matrix-free kinetic LinearOperator ...")
@@ -2407,9 +2588,8 @@ class Triatom(Molecule):
         chebyshev_tol=1e-12,
         chebyshev_max_order=4096,
         chebyshev_bounds="gershgorin",
-        matrix_free_kinetic=False,
-        factorized_rovibronic_kinetic=False,
-        sparse_factorized_rovibronic_kinetic=False,
+        kinetic_action=None,
+        rovibronic_kinetic=None,
     ):
         """Run wavepacket propagation using split-operator.
 
@@ -2449,9 +2629,8 @@ class Triatom(Molecule):
             chebyshev_tol=chebyshev_tol,
             chebyshev_max_order=chebyshev_max_order,
             chebyshev_bounds=chebyshev_bounds,
-            matrix_free_kinetic=matrix_free_kinetic,
-            factorized_rovibronic_kinetic=factorized_rovibronic_kinetic,
-            sparse_factorized_rovibronic_kinetic=sparse_factorized_rovibronic_kinetic,
+            kinetic_action=kinetic_action,
+            rovibronic_kinetic=rovibronic_kinetic,
         )
 
 

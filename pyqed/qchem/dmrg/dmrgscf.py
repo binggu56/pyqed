@@ -136,6 +136,7 @@ class DMRGSCF(QCDMRG):
         tr_up = kwargs.pop("macro_trust_grow", 1.5)
         warm = kwargs.pop("warm_start_dmrg", True)
         sw_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.dmrg_conv_tol))
+        ldense = kwargs.pop("local_dense_max_dim", 0)
 
         # Starting molecular orbitals for orbital optimization.  By default this
         # is the HF MO basis; callers can pass a previous DMRGSCF ``mo_coeff``
@@ -166,6 +167,42 @@ class DMRGSCF(QCDMRG):
             spatial_reduced_mpo=getattr(self, "spatial_reduced_mpo", None),
             symmetry=getattr(self, "symmetry", None),
             spatial_site_basis=getattr(self, "spatial_site_basis", "canonical"),
+            spatial_abelian_mpo=getattr(self, "spatial_abelian_mpo", "grouped"),
+            spatial_abelian_symbolic_algo=getattr(
+                self,
+                "spatial_abelian_symbolic_algo",
+                "Hopcroft-Karp",
+            ),
+            spatial_family_environment_backend=getattr(
+                self,
+                "spatial_family_environment_backend",
+                "block2",
+            ),
+            spatial_complementary_payload_tensor_matvec=getattr(
+                self,
+                "spatial_complementary_payload_tensor_matvec",
+                True,
+            ),
+            spatial_precontracted_family_environment=getattr(
+                self,
+                "spatial_precontracted_family_environment",
+                False,
+            ),
+            debug_complementary_action_check=getattr(
+                self,
+                "debug_complementary_action_check",
+                False,
+            ),
+            debug_complementary_action_check_tol=getattr(
+                self,
+                "debug_complementary_action_check_tol",
+                1.0e-10,
+            ),
+            debug_complementary_action_check_limit=getattr(
+                self,
+                "debug_complementary_action_check_limit",
+                32,
+            ),
             integral_backend=getattr(self, "integral_backend", "auto"),
             verbose=getattr(self, "verbose", 0),
         )
@@ -176,6 +213,7 @@ class DMRGSCF(QCDMRG):
         mc.shift = self.shift
 
         kwargs.setdefault("sweep_tol", sw_tol)
+        kwargs.setdefault("local_dense_max_dim", ldense)
 
         mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
         if require_conv and not bool(getattr(getattr(mc, "dmrg", None), "converged", False)):

@@ -293,9 +293,10 @@ def main():
         help="Use dense expm precomputation, expm_multiply, or Chebyshev action propagation.",
     )
     parser.add_argument(
-        "--matrix-free-kinetic",
-        action="store_true",
-        help="Use a LinearOperator kinetic action; requires expm_multiply or chebyshev.",
+        "--kinetic-action",
+        choices=["dense", "matrix-free"],
+        default="dense",
+        help="Use a dense flat kinetic matrix or a LinearOperator kinetic action.",
     )
     parser.add_argument("--chebyshev-tol", type=float, default=1e-12)
     parser.add_argument("--chebyshev-max-order", type=int, default=4096)
@@ -396,7 +397,7 @@ def main():
         chebyshev_tol=args.chebyshev_tol,
         chebyshev_max_order=args.chebyshev_max_order,
         chebyshev_bounds=args.chebyshev_bounds,
-        matrix_free_kinetic=args.matrix_free_kinetic,
+        kinetic_action=args.kinetic_action,
     )
     pops = solver.get_population(result, plot=False)
     print("[result] times/fs =", result["times"] * au2fs)

@@ -72,7 +72,10 @@ from pyqed.qchem.dmrg.spatial_terms import (
     BasisSpatialFermion,
     accumulate_spatial_jw_term as _accumulate_spatial_jw_term,
     merge_term_maps as _merge_spatial_term_maps,
+    spatial_complementary_family_hamiltonian_term_map as _spatial_family_hamiltonian_term_map,
+    spatial_complementary_family_term_maps as _spatial_family_term_maps,
     spatial_one_body_term_map as _spatial_one_body_term_map,
+    spatial_two_body_spinfree_term_map as _spatial_two_body_spinfree_term_map,
     spatial_two_body_term_map as _spatial_two_body_term_map,
 )
 try:
@@ -163,6 +166,60 @@ def _normalize_integral_backend(integral_backend):
             f"(got {integral_backend!r})."
         )
     return backend
+
+
+def _normalize_spatial_abelian_symbolic_algo(algo):
+    key = str(algo or "Hopcroft-Karp").strip().lower().replace("_", "-")
+    aliases = {
+        "qr": "qr",
+        "hopcroft-karp": "Hopcroft-Karp",
+        "hopcroft": "Hopcroft-Karp",
+        "hk": "Hopcroft-Karp",
+        "hungarian": "Hungarian",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "spatial_abelian_symbolic_algo must be one of "
+            "'qr', 'Hopcroft-Karp', or 'Hungarian'."
+        )
+    return aliases[key]
+
+
+def _normalize_spatial_family_environment_backend(backend):
+    key = str(backend or "block2").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "none",
+        "none": "none",
+        "false": "none",
+        "0": "none",
+        "block2": "block2",
+        "block2_like": "block2",
+        "renormalized": "block2",
+        "renormalized_generators": "block2",
+        "block2_adaptive": "block2_adaptive",
+        "adaptive_block2": "block2_adaptive",
+        "block2_native": "block2_native",
+        "native_block2": "block2_native",
+        "native_generators": "block2_native",
+        "autompo": "block2",
+        "mpo": "block2",
+        "generic_mpo": "block2",
+        "direct": "direct_terms",
+        "direct_terms": "direct_terms",
+        "term": "direct_terms",
+        "terms": "direct_terms",
+        "generator": "generator_terms",
+        "generators": "generator_terms",
+        "generator_terms": "generator_terms",
+        "raw_generators": "generator_terms",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "spatial_family_environment_backend must be 'block2', "
+            "'block2_native', 'none', 'autompo', 'direct_terms', "
+            "or 'generator_terms'."
+        )
+    return aliases[key]
 
 
 def _mf_has_factorized_eris(mf):
@@ -574,14 +631,22 @@ def _build_spatial_s2_term_map(ncas, *, scale=1.0, cutoff=1e-10):
     return term_map
 
 
-def _build_spatial_hamiltonian_tensor_mpo(h1e, eri, *, spin_purification=False, shift=None, cutoff=1e-10):
+def _build_spatial_hamiltonian_tensor_mpo(
+    h1e,
+    eri,
+    *,
+    spin_purification=False,
+    shift=None,
+    cutoff=1e-10,
+    symbolic_algo="qr",
+):
     """Build the spatial-orbital Hamiltonian directly as a d=4 symbolic MPO."""
     h_spatial = np.asarray(h1e[0])
     eri_spatial = np.asarray(eri[0, 0])
     ncas = h_spatial.shape[0]
     term_map = _merge_spatial_term_maps(
         _spatial_one_body_term_map(h_spatial, cutoff=cutoff),
-        _spatial_two_body_term_map(eri_spatial, cutoff=cutoff),
+        _spatial_two_body_spinfree_term_map(eri_spatial, cutoff=cutoff),
         cutoff=cutoff,
     )
 
@@ -597,8 +662,116 @@ def _build_spatial_hamiltonian_tensor_mpo(h1e, eri, *, spin_purification=False, 
         basis_sites,
         term_map,
         cutoff=cutoff,
+        algo=symbolic_algo,
     )
     return tensor_mpo, int(term_count), int(spin_term_count)
+
+
+def _dense_cores_from_nonabelian_mpo(mpo):
+    return [
+        np.asarray(core.as_dense() if hasattr(core, "as_dense") else core, dtype=complex)
+        for core in mpo
+    ]
+
+
+def _build_spatial_native_generator_family_mpos(
+    complementary,
+    n_sites,
+    *,
+    cutoff=1e-10,
+):
+    """Build R/P family MPOs from spin-free generator families."""
+    from pyqed.mps.nonabelian import AutoMPO, physical_leg_from_spatial_orbital
+    from pyqed.mps.nonabelian.models import (
+        add_spatial_one_body_terms,
+        add_spatial_two_generator_product_terms,
+    )
+
+    leg = physical_leg_from_spatial_orbital()
+    site_legs = [leg] * int(n_sites)
+    family_tensor_mpos = {}
+    family_mpo_info = {}
+
+    r_family = complementary.get("R")
+    r_entries = dict(getattr(r_family, "entries", {}) or {})
+    if r_entries:
+        r_matrix = np.zeros((int(n_sites), int(n_sites)), dtype=complex)
+        for (p, q), coeff in r_entries.items():
+            if abs(coeff) > cutoff:
+                r_matrix[int(p), int(q)] += complex(coeff)
+        if np.any(np.abs(r_matrix) > cutoff):
+            builder = AutoMPO(site_legs)
+            add_spatial_one_body_terms(
+                builder,
+                r_matrix,
+                cutoff=cutoff,
+                family="R",
+            )
+            mpo = builder.build()
+            if mpo:
+                cores = _dense_cores_from_nonabelian_mpo(mpo)
+                family_tensor_mpos["R"] = cores
+                family_mpo_info["R"] = {
+                    "source": "native_spinfree_generator_autompo",
+                    "generator_terms": int(len(r_entries)),
+                    "mpo_max_bond": int(max(core.shape[1] for core in cores)),
+                }
+
+    p_family = complementary.get("P")
+    p_entries = dict(getattr(p_family, "entries", {}) or {})
+    if p_entries:
+        builder = AutoMPO(site_legs)
+        p_info = add_spatial_two_generator_product_terms(
+            builder,
+            p_entries,
+            cutoff=cutoff,
+            family="P",
+            return_info=True,
+        )
+        mpo = builder.build()
+        if mpo:
+            cores = _dense_cores_from_nonabelian_mpo(mpo)
+            family_tensor_mpos["P"] = cores
+            family_mpo_info["P"] = {
+                "source": "native_spinfree_two_generator_autompo",
+                "generator_terms": int(len(p_entries)),
+                "symbolic_product_terms": int(
+                    p_info.get("symbolic_product_terms", 0)
+                ),
+                "we_product_terms": int(p_info.get("we_product_terms", 0)),
+                "total_product_terms": int(p_info.get("total_product_terms", 0)),
+                "raw_spin_component_terms": int(
+                    p_info.get("raw_spin_component_terms", 0)
+                ),
+                "mpo_max_bond": int(max(core.shape[1] for core in cores)),
+            }
+
+    return family_tensor_mpos, family_mpo_info
+
+
+def _compare_spatial_family_term_map(reference, family, *, cutoff=1e-10):
+    """Return compact diagnostics comparing canonical and family term maps."""
+    keys = set(reference) | set(family)
+    max_abs = 0.0
+    l2 = 0.0
+    mismatches = 0
+    for key in keys:
+        diff = complex(family.get(key, 0.0)) - complex(reference.get(key, 0.0))
+        adiff = abs(diff)
+        if adiff > cutoff:
+            mismatches += 1
+        max_abs = max(max_abs, float(adiff))
+        l2 += float(adiff) ** 2
+    return {
+        "enabled": True,
+        "reference_terms": int(len(reference)),
+        "family_terms": int(len(family)),
+        "mismatched_terms": int(mismatches),
+        "max_abs_diff": float(max_abs),
+        "l2_diff": float(np.sqrt(l2)),
+        "tol": float(cutoff),
+        "ok": bool(mismatches == 0),
+    }
 
 
 def _build_spin_orbital_dense_hamiltonian_tensor_mpo(h1e, eri, ncas, *, spin_purification=False, shift=None, cutoff=1e-10):
@@ -718,11 +891,11 @@ def _materialize_symbolic_terms(term_map, tol=1e-14):
     return terms
 
 
-def _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, *, cutoff=1e-14):
+def _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, *, cutoff=1e-14, algo="qr"):
     """Build a dense MPO from symbolic terms and wrap it in the high-level MPO class."""
     terms = _materialize_symbolic_terms(term_map, tol=cutoff)
     model = Model(basis=basis_sites, ham_terms=terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = Mpo(model, algo=algo)
     factors = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
     return TensorMPO(factors, homogenous=False), len(terms)
 
@@ -1060,6 +1233,11 @@ def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
         "su2": ["charge", "su2"],
         "s2": ["charge", "su2"],
         "spin": ["charge", "su2"],
+        "pg": ["charge", "sz", "pg"],
+        "pointgroup": ["charge", "sz", "pg"],
+        "point_group": ["charge", "sz", "pg"],
+        "abelianpg": ["charge", "sz", "pg"],
+        "abelian_pg": ["charge", "sz", "pg"],
         "nonabelian": ["charge", "su2"],
         "non-abelian": ["charge", "su2"],
     }
@@ -1073,8 +1251,10 @@ def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
             return ["charge", "sz"]
         if key in {"charge_su2", "charge,su2"}:
             return ["charge", "su2"]
+        if key in {"charge_sz_pg", "charge,sz,pg", "sz_pg"}:
+            return ["charge", "sz", "pg"]
         raise ValueError(
-            "Unknown DMRG symmetry {!r}. Use None, 'charge', 'sz', 'u1', or 'su2'.".format(spec)
+            "Unknown DMRG symmetry {!r}. Use None, 'charge', 'sz', 'u1', 'su2', or 'pg'.".format(spec)
         )
 
     labels = []
@@ -1089,9 +1269,11 @@ def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
     for label in labels:
         if label == "s2":
             label = "su2"
-        if label not in {"charge", "sz", "su2"}:
+        if label in {"point_group", "abelianpg", "abelian_pg", "irrep", "orb_sym"}:
+            label = "pg"
+        if label not in {"charge", "sz", "su2", "pg"}:
             raise ValueError(
-                "Unknown DMRG symmetry label {!r}. Use 'charge', 'sz', or 'su2'.".format(label)
+                "Unknown DMRG symmetry label {!r}. Use 'charge', 'sz', 'su2', or 'pg'.".format(label)
             )
         if label not in normalized:
             normalized.append(label)
@@ -1099,8 +1281,14 @@ def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
         normalized.insert(0, "charge")
     if "sz" in normalized and "charge" not in normalized:
         normalized.insert(0, "charge")
+    if "pg" in normalized and "charge" not in normalized:
+        normalized.insert(0, "charge")
+    if "pg" in normalized and "sz" not in normalized and "su2" not in normalized:
+        normalized.insert(1, "sz")
     if "su2" in normalized and "sz" in normalized:
         raise ValueError("DMRG symmetry cannot combine 'su2' and 'sz'.")
+    if "su2" in normalized and "pg" in normalized:
+        raise NotImplementedError("DMRG SU(2)+AbelianPG is not wired yet; use Abelian symmetry='pg'.")
     return normalized or None
 
 
@@ -1414,9 +1602,17 @@ class DMRG(CASCI):
     def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
                  low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
-                     orbital_layout=None, spatial_reduced_mpo=None,
+                 orbital_layout=None, spatial_reduced_mpo=None,
                  symmetry=None, spatial_site_basis="canonical",
-                 integral_backend="auto"):
+                 integral_backend="auto", spatial_abelian_mpo="grouped",
+                 spatial_abelian_symbolic_algo="Hopcroft-Karp",
+                 spatial_family_environment_backend="block2",
+                 spatial_complementary_payload_tensor_matvec=True,
+                 spatial_precontracted_family_environment=False,
+                 debug_complementary_action_check=False,
+                 debug_complementary_action_check_tol=1.0e-10,
+                 debug_complementary_action_check_limit=32,
+                 orb_sym=None):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -1524,6 +1720,10 @@ class DMRG(CASCI):
         self._spatial_operator_cache = None
         self.spatial_rdm2_algorithm = "npdm"
         self._active_hamiltonian = None
+        self.complementary_operators = None
+        self.complementary_operator_mpos = None
+        self.complementary_operator_term_maps = None
+        self.complementary_operator_generator_entries = None
         self._active_integral_build_info = None
 
 
@@ -1539,9 +1739,35 @@ class DMRG(CASCI):
 
         self.init_guess = init_guess
         self.integral_backend = _normalize_integral_backend(integral_backend)
+        self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
         self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
+        self.spatial_complementary_payload_tensor_matvec = bool(
+            spatial_complementary_payload_tensor_matvec
+        )
+        self.spatial_precontracted_family_environment = bool(
+            spatial_precontracted_family_environment
+        )
+        self.debug_complementary_action_check = bool(debug_complementary_action_check)
+        self.debug_complementary_action_check_tol = float(
+            debug_complementary_action_check_tol
+        )
+        self.debug_complementary_action_check_limit = int(
+            debug_complementary_action_check_limit
+        )
+        spatial_abelian_mpo = str(spatial_abelian_mpo).lower().replace("-", "_")
+        if spatial_abelian_mpo not in {"direct", "grouped"}:
+            raise ValueError("spatial_abelian_mpo must be 'direct' or 'grouped'.")
+        self.spatial_abelian_mpo = spatial_abelian_mpo
+        self.spatial_abelian_symbolic_algo = _normalize_spatial_abelian_symbolic_algo(
+            spatial_abelian_symbolic_algo
+        )
+        self.spatial_family_environment_backend = (
+            _normalize_spatial_family_environment_backend(
+                spatial_family_environment_backend
+            )
+        )
         if spatial_reduced_mpo is None:
             spatial_reduced_mpo = normalized_symmetry is not None and "su2" in normalized_symmetry
         self.spatial_reduced_mpo = bool(spatial_reduced_mpo)
@@ -1599,7 +1825,7 @@ class DMRG(CASCI):
 
         # Ensure Manager exists (created in run())
         if not hasattr(self, 'sym_mgr'):
-            self.sym_mgr = SymmetryManager(['charge', 'sz']) # Default fallback
+            self.sym_mgr = SymmetryManager(['charge', 'sz'], orb_sym=getattr(self, "orb_sym", None)) # Default fallback
 
         self._log(f"  [InitGuess] Generating guess: '{method}' with {self.sym_mgr.sym_types}")
 
@@ -1973,6 +2199,10 @@ class DMRG(CASCI):
 
         # effective H for CAS
         h1e, eri, pair_factors = self._get_active_hamiltonian_inputs()
+        self.complementary_operators = None
+        self.complementary_operator_mpos = None
+        self.complementary_operator_term_maps = None
+        self.complementary_operator_generator_entries = None
         use_low_rank_mpo = bool(self.low_rank_mpo)
         if self.site == "spatial":
             use_low_rank_mpo = False
@@ -1995,6 +2225,14 @@ class DMRG(CASCI):
             self.low_rank_mpo_batch_size,
             self.spatial_reduced_mpo,
             self.spatial_site_basis,
+            self.spatial_abelian_mpo,
+            self.spatial_abelian_symbolic_algo,
+            self.spatial_family_environment_backend,
+            self.spatial_complementary_payload_tensor_matvec,
+            self.spatial_precontracted_family_environment,
+            self.debug_complementary_action_check,
+            self.debug_complementary_action_check_tol,
+            self.debug_complementary_action_check_limit,
         )
         if cache_key == self._hamiltonian_mpo_cache_key and self.H is not None and self.H_raw is not None:
             self._log("  Reusing Hamiltonian MPO cache.")
@@ -2021,6 +2259,11 @@ class DMRG(CASCI):
                     self._log("  Reusing global spatial reduced Hamiltonian MPO cache.")
                     self._spatial_operator_cache = None
                     self._active_hamiltonian = cached.get("hamiltonian")
+                    self.complementary_operators = getattr(
+                        self._active_hamiltonian,
+                        "complementary_operators",
+                        None,
+                    )
                     self.H_raw = cached["factors"]
                     self.H = cached["factors"]
                     self._hamiltonian_mpo_cache_key = cache_key
@@ -2041,6 +2284,7 @@ class DMRG(CASCI):
                 )
                 self._spatial_operator_cache = None
                 self._active_hamiltonian = reduced_hamiltonian
+                self.complementary_operators = reduced_hamiltonian.complementary_operators
                 self.H_raw = reduced_hamiltonian.factors
                 self.H = reduced_hamiltonian.factors
                 self._hamiltonian_mpo_cache_key = cache_key
@@ -2054,6 +2298,171 @@ class DMRG(CASCI):
                 )
                 return self
 
+            if self.spatial_abelian_mpo == "direct":
+                self._log("  Building spatial-orbital Hamiltonian MPO directly in d=4 channels...")
+                tensor_mpo, spatial_term_count, spin_penalty_term_count = _build_spatial_hamiltonian_tensor_mpo(
+                    h1e,
+                    eri,
+                    spin_purification=self.spin_purification,
+                    shift=self.shift,
+                    cutoff=1e-10,
+                    symbolic_algo=self.spatial_abelian_symbolic_algo,
+                )
+                from pyqed.qchem.dmrg.backends.reduced import build_spatial_complementary_operator_families
+
+                complementary = build_spatial_complementary_operator_families(
+                    np.asarray(h1e[0]),
+                    eri,
+                    cutoff=1e-10,
+                    include_half=True,
+                    prefer_complementary_payload_tensor_matvec=(
+                        self.spatial_complementary_payload_tensor_matvec
+                    ),
+                    prefer_precontracted_family_environment=(
+                        self.spatial_precontracted_family_environment
+                    ),
+                    debug_complementary_action_check=self.debug_complementary_action_check,
+                    debug_complementary_action_check_tol=self.debug_complementary_action_check_tol,
+                    debug_complementary_action_check_limit=self.debug_complementary_action_check_limit,
+                )
+                reference_family_terms = _merge_spatial_term_maps(
+                    _spatial_one_body_term_map(np.asarray(h1e[0]), cutoff=1e-10),
+                    _spatial_two_body_spinfree_term_map(np.asarray(eri[0, 0]), cutoff=1e-10),
+                    cutoff=1e-10,
+                )
+                family_term_maps = _spatial_family_term_maps(complementary, cutoff=1e-10)
+                family_hamiltonian_terms = _spatial_family_hamiltonian_term_map(
+                    complementary,
+                    cutoff=1e-10,
+                )
+                family_decomposition_check = _compare_spatial_family_term_map(
+                    reference_family_terms,
+                    family_hamiltonian_terms,
+                    cutoff=1e-10,
+                )
+                family_tensor_mpos = {}
+                family_mpo_info = {}
+                if self.spatial_family_environment_backend in {"block2_adaptive", "block2_native"}:
+                    try:
+                        (
+                            family_tensor_mpos,
+                            family_mpo_info,
+                        ) = _build_spatial_native_generator_family_mpos(
+                            complementary,
+                            self.ncas,
+                            cutoff=1e-10,
+                        )
+                    except Exception as exc:
+                        if self.spatial_family_environment_backend == "block2_native":
+                            raise RuntimeError(
+                                "Native spin-free generator family MPO build failed."
+                            ) from exc
+                        warnings.warn(
+                            "Falling back to symbolic R/P family MPOs after native "
+                            f"spin-free generator build failed: {exc}",
+                            RuntimeWarning,
+                        )
+                        family_tensor_mpos = {}
+                        family_mpo_info = {}
+                if self.spatial_family_environment_backend in {"block2", "block2_adaptive"}:
+                    family_basis_sites = [BasisSpatialFermion(i) for i in range(self.ncas)]
+                    for family_name, family_terms in family_term_maps.items():
+                        family_mpo, family_term_count = _build_tensor_mpo_from_symbolic_terms(
+                            family_basis_sites,
+                            family_terms,
+                            cutoff=1e-10,
+                            algo=self.spatial_abelian_symbolic_algo,
+                        )
+                        symbolic_info = {
+                            "source": "symbolic_spatial_term_map",
+                            "symbolic_terms": int(family_term_count),
+                            "mpo_max_bond": int(max(family_mpo.bond_orders())),
+                        }
+                        name = str(family_name)
+                        native_info = family_mpo_info.get(name)
+                        native_bond = (
+                            None
+                            if native_info is None
+                            else int(native_info.get("mpo_max_bond", 0))
+                        )
+                        if (
+                            self.spatial_family_environment_backend == "block2"
+                            or native_bond is None
+                            or symbolic_info["mpo_max_bond"] < native_bond
+                        ):
+                            family_tensor_mpos[name] = family_mpo.factors
+                            family_mpo_info[name] = {
+                                "source": (
+                                    "symbolic_spatial_term_map"
+                                    if self.spatial_family_environment_backend == "block2"
+                                    else "symbolic_spatial_term_map_selected"
+                                ),
+                                "symbolic_terms": symbolic_info["symbolic_terms"],
+                                "mpo_max_bond": symbolic_info["mpo_max_bond"],
+                            }
+                            if native_info is not None:
+                                family_mpo_info[name]["native_candidate"] = native_info
+                        else:
+                            family_mpo_info[name] = {
+                                **native_info,
+                                "symbolic_candidate": symbolic_info,
+                            }
+                self.complementary_operator_mpos = family_tensor_mpos or None
+                self.complementary_operator_term_maps = (
+                    family_term_maps
+                    if self.spatial_family_environment_backend == "direct_terms"
+                    else None
+                )
+                if self.spatial_family_environment_backend == "generator_terms":
+                    r_family = complementary.get("R")
+                    p_family = complementary.get("P")
+                    self.complementary_operator_generator_entries = {
+                        "R": dict(getattr(r_family, "entries", {})),
+                        "P": dict(getattr(p_family, "entries", {})),
+                    }
+                else:
+                    self.complementary_operator_generator_entries = None
+                self._spatial_operator_cache = None
+                self._active_hamiltonian = None
+                self.complementary_operators = complementary
+                self.H_raw = tensor_mpo.factors
+                self.H = tensor_mpo.factors
+                self._hamiltonian_mpo_cache_key = cache_key
+                self._symmetric_mpo_cache = {}
+                self._active_integral_build_info.update(
+                    {
+                        "representation": "spatial_direct_symbolic_mpo",
+                        "symbolic_terms": int(spatial_term_count),
+                        "mpo_max_bond": int(max(tensor_mpo.bond_orders())),
+                        "site": "spatial",
+                        "spatial_abelian_mpo": "direct",
+                        "spatial_abelian_symbolic_algo": self.spatial_abelian_symbolic_algo,
+                        "spatial_family_environment_backend": (
+                            self.spatial_family_environment_backend
+                        ),
+                        "pipeline": (
+                            "qchem_integrals->spatial_d4_symbolic_terms"
+                            f"->autompo_{self.spatial_abelian_symbolic_algo}"
+                        ),
+                        "spatial_direct_term_representation": "spinfree_R/P_compatible",
+                        "complementary_operator_families": complementary.as_metadata(),
+                        "complementary_operator_family_names": complementary.names,
+                        "complementary_operator_total_terms": int(complementary.n_terms),
+                        "complementary_operator_builder": "spatial_spinfree_sparse_S/R/A/P/B/Q",
+                        "complementary_operator_family_term_counts": {
+                            str(name): int(len(term_map))
+                            for name, term_map in family_term_maps.items()
+                        },
+                        "complementary_operator_family_hamiltonian_check": (
+                            family_decomposition_check
+                        ),
+                        "complementary_operator_family_mpos": family_mpo_info,
+                    }
+                )
+                if self.spin_purification:
+                    self._active_integral_build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
+                return self
+
             self._log("  Building spatial-orbital Hamiltonian MPO by grouping spin-orbital pairs...")
             self._active_hamiltonian = None
             spin_tensor_mpo, spin_term_count, spin_penalty_term_count = _build_spin_orbital_dense_hamiltonian_tensor_mpo(
@@ -2065,7 +2474,40 @@ class DMRG(CASCI):
                 cutoff=1e-10,
             )
             tensor_mpo = _group_spin_orbital_mpo_pairs(spin_tensor_mpo)
+            from pyqed.qchem.dmrg.backends.reduced import build_spatial_complementary_operator_families
+
+            complementary = build_spatial_complementary_operator_families(
+                np.asarray(h1e[0]),
+                eri,
+                cutoff=1e-10,
+                include_half=True,
+                prefer_complementary_payload_tensor_matvec=(
+                    self.spatial_complementary_payload_tensor_matvec
+                ),
+                prefer_precontracted_family_environment=(
+                    self.spatial_precontracted_family_environment
+                ),
+                debug_complementary_action_check=self.debug_complementary_action_check,
+                debug_complementary_action_check_tol=self.debug_complementary_action_check_tol,
+                debug_complementary_action_check_limit=self.debug_complementary_action_check_limit,
+            )
+            reference_family_terms = _merge_spatial_term_maps(
+                _spatial_one_body_term_map(np.asarray(h1e[0]), cutoff=1e-10),
+                _spatial_two_body_spinfree_term_map(np.asarray(eri[0, 0]), cutoff=1e-10),
+                cutoff=1e-10,
+            )
+            family_term_maps = _spatial_family_term_maps(complementary, cutoff=1e-10)
+            family_hamiltonian_terms = _spatial_family_hamiltonian_term_map(
+                complementary,
+                cutoff=1e-10,
+            )
+            family_decomposition_check = _compare_spatial_family_term_map(
+                reference_family_terms,
+                family_hamiltonian_terms,
+                cutoff=1e-10,
+            )
             self._spatial_operator_cache = None
+            self.complementary_operators = complementary
             self.H_raw = tensor_mpo.factors
             self.H = tensor_mpo.factors
             self._hamiltonian_mpo_cache_key = cache_key
@@ -2076,6 +2518,18 @@ class DMRG(CASCI):
                     "symbolic_terms": int(spin_term_count),
                     "mpo_max_bond": int(max(tensor_mpo.bond_orders())),
                     "site": "spatial",
+                    "spatial_abelian_mpo": "grouped",
+                    "complementary_operator_families": complementary.as_metadata(),
+                    "complementary_operator_family_names": complementary.names,
+                    "complementary_operator_total_terms": int(complementary.n_terms),
+                    "complementary_operator_builder": "spatial_spinfree_sparse_S/R/A/P/B/Q",
+                    "complementary_operator_family_term_counts": {
+                        str(name): int(len(term_map))
+                        for name, term_map in family_term_maps.items()
+                    },
+                    "complementary_operator_family_hamiltonian_check": (
+                        family_decomposition_check
+                    ),
                 }
             )
             if self.spin_purification:
@@ -2464,8 +2918,14 @@ class DMRG(CASCI):
         if self.H_raw is None:
             self.build()
         sweep_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.tol))
+        davidson_tol = kwargs.pop("davidson_tol", 1.0e-5)
+        davidson_max_iter = kwargs.pop("davidson_max_iter", 30)
+        noise = kwargs.pop("noise", 1.0e-4)
+        noise_decay = kwargs.pop("noise_decay", 0.1)
+        noise_cutoff = kwargs.pop("noise_cutoff", 1.0e-9)
+        local_dense_max_dim = kwargs.pop("local_dense_max_dim", "auto")
         # Initialize Symmetry
-        self.sym_mgr = SymmetryManager(symmetry_list)
+        self.sym_mgr = SymmetryManager(symmetry_list, orb_sym=getattr(self, "orb_sym", None))
         if self.sym_mgr.enabled:
             if getattr(self.sym_mgr, "has_nonabelian", False):
                 if self.site != "spatial":
@@ -2548,12 +3008,39 @@ class DMRG(CASCI):
                 self._log(f"  MPO Converted. Sites: {len(final_H)}")
             else:
                 self._log("  Reusing symmetric MPO cache.")
+            final_complementary_mpos = None
+            if getattr(self, "complementary_operator_mpos", None):
+                final_complementary_mpos = {}
+                for family_name, family_mpo in self.complementary_operator_mpos.items():
+                    family_cache_key = (
+                        sym_cache_key,
+                        "complementary_family",
+                        str(family_name),
+                    )
+                    family_final = self._symmetric_mpo_cache.get(family_cache_key)
+                    if family_final is None:
+                        family_final = dense_to_symmetric_mpo(family_mpo, site_qn_maps)
+                        self._symmetric_mpo_cache[family_cache_key] = family_final
+                    final_complementary_mpos[str(family_name)] = family_final
+            final_complementary_term_maps = getattr(
+                self,
+                "complementary_operator_term_maps",
+                None,
+            )
+            final_complementary_generator_entries = getattr(
+                self,
+                "complementary_operator_generator_entries",
+                None,
+            )
             # Calculate Target QN
             target_qn = self.sym_mgr.get_target_qn(self.nelecas, self.spin)
             self._log(f"  Target QN set to: {target_qn}")
             use_symmetry = True
         else: # dense branch without U(1) symmetry
             final_H = self.H
+            final_complementary_mpos = None
+            final_complementary_term_maps = None
+            final_complementary_generator_entries = None
             target_qn = None
             use_symmetry = False
             self.sym_mgr = None
@@ -2579,6 +3066,17 @@ class DMRG(CASCI):
                 weights=self.weights,
                 verbose=self.verbose,
                 sweep_tol=sweep_tol,
+                davidson_tol=davidson_tol,
+                davidson_max_iter=davidson_max_iter,
+                noise=noise,
+                noise_decay=noise_decay,
+                noise_cutoff=noise_cutoff,
+                local_dense_max_dim=local_dense_max_dim,
+                complementary_operator_families=getattr(self, "complementary_operators", None),
+                complementary_operator_mpos=final_complementary_mpos,
+                complementary_operator_term_maps=final_complementary_term_maps,
+                complementary_operator_generator_entries=final_complementary_generator_entries,
+                site_qn_maps=site_qn_maps if use_symmetry else None,
             )
             dmrg.run()
             current_guess = dmrg.ground_state.copy()

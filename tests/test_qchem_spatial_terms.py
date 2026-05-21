@@ -1,7 +1,10 @@
 import numpy as np
 import pytest
 
-from pyqed.qchem.dmrg.dmrg import _build_spatial_active_hamiltonian_matrix
+from pyqed.qchem.dmrg.dmrg import (
+    _build_spatial_active_hamiltonian_matrix,
+    _normalize_spatial_family_environment_backend,
+)
 from pyqed.qchem.dmrg.backends.reduced import (
     build_spatial_complementary_operator_families,
     build_spatial_reduced_hamiltonian_mpo,
@@ -10,7 +13,12 @@ from pyqed.qchem.dmrg.spatial_terms import (
     accumulate_symbolic_term,
     merge_term_maps,
     spatial_local_ops,
+    spatial_complementary_local_matrices,
+    spatial_complementary_local_matrix,
+    spatial_complementary_family_hamiltonian_term_map,
+    spatial_complementary_family_term_maps,
     spatial_one_body_term_map,
+    spatial_two_generator_family_term_map,
     spatial_two_body_term_map,
     spatial_two_body_spinfree_term_map,
 )
@@ -20,6 +28,11 @@ from pyqed.mps.nonabelian import (
     RankCoupledMPO,
     SpatialSpinFreeERIBuilder,
     physical_leg_from_spatial_orbital,
+)
+from pyqed.mps.nonabelian.models import (
+    _dense_matrix_from_local_mpo,
+    add_spatial_one_body_terms,
+    add_spatial_two_generator_product_terms,
 )
 
 
@@ -42,6 +55,25 @@ def _dense_from_spatial_term_map(term_map, nsites):
     return dense
 
 
+def test_spatial_family_environment_backend_block2_aliases_use_family_mpos():
+    assert _normalize_spatial_family_environment_backend(None) == "block2"
+    assert _normalize_spatial_family_environment_backend("block2") == "block2"
+    assert _normalize_spatial_family_environment_backend("autompo") == "block2"
+    assert (
+        _normalize_spatial_family_environment_backend("native_generators")
+        == "block2_native"
+    )
+    assert (
+        _normalize_spatial_family_environment_backend("adaptive_block2")
+        == "block2_adaptive"
+    )
+    assert (
+        _normalize_spatial_family_environment_backend("renormalized_generators")
+        == "block2"
+    )
+    assert _normalize_spatial_family_environment_backend("none") == "none"
+
+
 def test_spatial_complementary_operator_families_group_integrals():
     h1 = np.zeros((3, 3))
     h1[0, 2] = 0.05
@@ -58,6 +90,36 @@ def test_spatial_complementary_operator_families_group_integrals():
     assert (0, 1) in families["A"].entries
     assert (1, 2) in families["A"].entries
     assert families.as_metadata()["families"]["P"]["n_terms"] == 2
+
+
+def test_spatial_complementary_local_matrix_matches_two_site_hamiltonian():
+    h1 = np.array(
+        [
+            [0.2, -0.03],
+            [-0.03, -0.1],
+        ]
+    )
+    eri = np.zeros((2, 2, 2, 2))
+    eri[0, 0, 0, 0] = 0.7
+    eri[1, 1, 1, 1] = 0.5
+    eri[0, 0, 1, 1] = 0.2
+    eri[1, 1, 0, 0] = 0.2
+    h2 = np.stack((np.stack((eri, eri.copy())), np.stack((eri.copy(), eri.copy()))))
+
+    families = build_spatial_complementary_operator_families(h1, h2, cutoff=1.0e-12)
+    dense_ref, _ = _build_spatial_active_hamiltonian_matrix([h1, h1], h2)
+    dense_local = spatial_complementary_local_matrix(families, 0)
+    channel_mats = spatial_complementary_local_matrices(families, 0)
+
+    np.testing.assert_allclose(dense_local, dense_ref, atol=1.0e-12)
+    np.testing.assert_allclose(
+        sum(channel_mats.values()),
+        dense_local,
+        atol=1.0e-12,
+    )
+    assert set(channel_mats) == {"R", "P"}
+    assert np.linalg.norm(channel_mats["R"]) > 0.0
+    assert np.linalg.norm(channel_mats["P"]) > 0.0
 
 
 def test_spatial_one_body_term_map_matches_dense_reference():
@@ -102,6 +164,77 @@ def test_spatial_two_body_spinfree_term_map_matches_component_reference():
     )
 
     np.testing.assert_allclose(dense_spinfree, dense_component, atol=1.0e-12)
+
+
+def test_spatial_complementary_family_term_maps_reconstruct_hamiltonian_terms():
+    rng = np.random.default_rng(19)
+    h1 = rng.normal(size=(3, 3))
+    h1 = 0.5 * (h1 + h1.T)
+    eri = rng.normal(size=(3, 3, 3, 3))
+    h2 = np.stack((np.stack((eri, eri.copy())), np.stack((eri.copy(), eri.copy()))))
+    families = build_spatial_complementary_operator_families(
+        h1,
+        h2,
+        cutoff=1.0e-12,
+        include_half=True,
+    )
+
+    family_terms = spatial_complementary_family_hamiltonian_term_map(families)
+    reference_terms = merge_term_maps(
+        spatial_one_body_term_map(h1),
+        spatial_two_body_spinfree_term_map(eri),
+    )
+
+    assert len(family_terms) == len(reference_terms)
+    np.testing.assert_allclose(
+        _dense_from_spatial_term_map(family_terms, 3),
+        _dense_from_spatial_term_map(reference_terms, 3),
+        atol=1.0e-12,
+    )
+    family_counts = {
+        name: len(term_map)
+        for name, term_map in spatial_complementary_family_term_maps(families).items()
+    }
+    assert set(family_counts) == {"R", "P"}
+    assert family_counts["R"] > 0
+    assert family_counts["P"] > 0
+
+
+def test_native_spatial_generator_family_mpos_match_term_maps():
+    h1 = np.array(
+        [
+            [0.2, -0.03],
+            [0.04, -0.1],
+        ]
+    )
+    p_entries = {
+        (0, 0, 1, 1): 0.35,
+        (0, 1, 1, 0): -0.2,
+    }
+    leg = physical_leg_from_spatial_orbital()
+
+    r_builder = AutoMPO([leg, leg])
+    add_spatial_one_body_terms(r_builder, h1, cutoff=1.0e-12, family="R")
+    r_dense = _dense_matrix_from_local_mpo(r_builder.build())
+    np.testing.assert_allclose(
+        r_dense,
+        _dense_from_spatial_term_map(spatial_one_body_term_map(h1), 2),
+        atol=1.0e-12,
+    )
+
+    p_builder = AutoMPO([leg, leg])
+    add_spatial_two_generator_product_terms(
+        p_builder,
+        p_entries,
+        cutoff=1.0e-12,
+        family="P",
+    )
+    p_dense = _dense_matrix_from_local_mpo(p_builder.build())
+    np.testing.assert_allclose(
+        p_dense,
+        _dense_from_spatial_term_map(spatial_two_generator_family_term_map(p_entries), 2),
+        atol=1.0e-12,
+    )
 
 
 def test_merge_term_maps_cancels_near_zero_terms():

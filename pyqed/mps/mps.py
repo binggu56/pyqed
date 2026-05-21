@@ -233,17 +233,817 @@ def svd_symmetric(AA, cutoff=1e-10, m_max=None):
 
 
 
+def _make_complementary_boundary_stack(families, nsites):
+    if families is None:
+        return None, {}
+    try:
+        from pyqed.mps.nonabelian.renormalized import (
+            ComplementaryFamilyRenormalizedOperatorBlock,
+            ComplementaryFamilyRenormalizedOperatorTable,
+            ComplementaryRenormalizedOperatorStack,
+        )
+    except Exception:
+        return None, {}
+
+    stack = ComplementaryRenormalizedOperatorStack(families=families)
+    payloads = {}
+
+    def _attach_family_table(entry):
+        blocks = {}
+        for channel, name in enumerate(entry.family_names):
+            payload = entry.family_payloads.get(str(name))
+            n_terms = 0 if payload is None else int(payload.n_terms)
+            cross_terms = 0 if payload is None else int(payload.cross_terms)
+            channels = (int(channel),) if cross_terms > 0 else ()
+            payload_keys = () if payload is None else tuple(key for key, _value in payload.entries)
+            blocks[str(name)] = ComplementaryFamilyRenormalizedOperatorBlock(
+                family_name=str(name),
+                channels=channels,
+                symbolic_terms=int(cross_terms),
+                payload_keys=payload_keys,
+                stored_elements=int(n_terms),
+                payload_norm=0.0 if payload is None else float(payload.coefficient_norm),
+                coefficient_terms=int(n_terms),
+                coefficient_cross_terms=int(cross_terms),
+            )
+        object.__setattr__(
+            entry,
+            "family_operator_table",
+            ComplementaryFamilyRenormalizedOperatorTable(
+                side=entry.side,
+                bond=entry.bond,
+                family_blocks=blocks,
+                source="abelian_complementary_payload_table",
+            ),
+        )
+        return entry
+
+    parent = None
+    for bond in range(max(0, int(nsites) - 1)):
+        entry = _attach_family_table(stack.put(
+            "left",
+            bond,
+            signature=("abelian_complementary_boundary", "left", int(bond)),
+            source="abelian_sweep_boundary",
+            parent_key=parent,
+        ))
+        payloads[("left", int(bond))] = entry
+        parent = entry.key
+
+    parent = None
+    for bond in range(max(0, int(nsites) - 1), 0, -1):
+        entry = _attach_family_table(stack.put(
+            "right",
+            bond,
+            signature=("abelian_complementary_boundary", "right", int(bond)),
+            source="abelian_sweep_boundary",
+            parent_key=parent,
+        ))
+        payloads[("right", int(bond))] = entry
+        parent = entry.key
+
+    return stack, payloads
+
+
+class AbelianComplementaryBoundaryActionTable:
+    """Dense callable boundary table for one Abelian two-site local layout."""
+
+    def __init__(
+        self,
+        matrix,
+        layout,
+        qns,
+        dirs,
+        *,
+        bond=None,
+        source="exact_residual_table",
+        boundary_family_tables=None,
+        channel_matrices=None,
+    ):
+        self.matrix = np.asarray(matrix, dtype=complex)
+        self.layout = tuple(layout)
+        self.qns = [list(q) for q in qns]
+        self.dirs = list(dirs)
+        self.bond = None if bond is None else int(bond)
+        self.source = str(source)
+        self.boundary_family_tables = tuple(boundary_family_tables or ())
+        self.channel_matrices = {
+            str(name): np.asarray(value, dtype=complex)
+            for name, value in (channel_matrices or {}).items()
+        }
+
+    @staticmethod
+    def _size(layout):
+        return int(sum(np.prod(shape, dtype=int) for _key, shape in layout))
+
+    def flatten(self, A):
+        chunks = []
+        for key, shape in self.layout:
+            blk = A.data.get(key)
+            if blk is None:
+                chunks.append(np.zeros(int(np.prod(shape, dtype=int)), dtype=complex))
+            else:
+                chunks.append(np.asarray(blk).reshape(-1))
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=complex)
+
+    def unflatten(self, vec):
+        data = {}
+        pos = 0
+        for key, shape in self.layout:
+            n = int(np.prod(shape, dtype=int))
+            data[key] = np.asarray(vec[pos:pos + n]).reshape(shape).copy()
+            pos += n
+        return BlockTensor(data, [q[:] for q in self.qns], self.dirs[:])
+
+    def apply(self, A):
+        return self.unflatten(self.matrix @ self.flatten(A))
+
+    def apply_channels(self, A):
+        vec = self.flatten(A)
+        return {
+            name: self.unflatten(matrix @ vec)
+            for name, matrix in self.channel_matrices.items()
+        }
+
+    @property
+    def dim(self):
+        return int(self.matrix.shape[0])
+
+    @property
+    def nnz(self):
+        return int(np.count_nonzero(np.abs(self.matrix) > 1.0e-14))
+
+    @property
+    def stats(self):
+        active = []
+        table_stats = []
+        for table in self.boundary_family_tables:
+            if table is None:
+                continue
+            active.extend(str(name) for name in table.active_family_names)
+            table_stats.append({
+                "side": str(table.side),
+                "bond": int(table.bond),
+                "active_family_names": table.active_family_names,
+                "n_channels": int(table.n_channels),
+                "symbolic_terms": int(table.symbolic_terms),
+                "stored_elements": int(table.stored_elements),
+            })
+        return {
+            "kind": "abelian_complementary_boundary_action_table",
+            "source": self.source,
+            "bond": self.bond,
+            "dim": int(self.dim),
+            "nnz": int(self.nnz),
+            "stored_elements": int(np.asarray(self.matrix).size),
+            "layout_blocks": int(len(self.layout)),
+            "norm": float(np.linalg.norm(self.matrix)),
+            "active_family_names": tuple(sorted(set(active))),
+            "boundary_family_tables": tuple(table_stats),
+            "boundary_channel_tables": tuple(
+                {
+                    "name": str(name),
+                    "dim": int(matrix.shape[0]),
+                    "nnz": int(np.count_nonzero(np.abs(matrix) > 1.0e-14)),
+                    "stored_elements": int(matrix.size),
+                    "norm": float(np.linalg.norm(matrix)),
+                }
+                for name, matrix in self.channel_matrices.items()
+            ),
+        }
+
+
 class HamiltonianMultiplyU1:
     """
     Symmetric version of HamiltonianMultiply using BlockTensor.
     """
-    def __init__(self, E, W, F):
+    _GLOBAL_BOUNDARY_EINSUM_EXPR_CACHE = {}
+    _GLOBAL_BOUNDARY_BATCHED_EINSUM_EXPR_CACHE = {}
+    _GLOBAL_BOUNDARY_DIRECT_EINSUM_EXPR_CACHE = {}
+    _GLOBAL_LOCAL_COMPLEMENTARY_MATRIX_CACHE = {}
+    _GLOBAL_LOCAL_COMPLEMENTARY_CHANNEL_MATRIX_CACHE = {}
+
+    def __init__(
+        self,
+        E,
+        W,
+        F,
+        complementary_operator_families=None,
+        bond=None,
+        complementary_boundary_payloads=None,
+        complementary_split_stats=None,
+        complementary_family_environments=None,
+        complementary_direct_family_environments=None,
+    ):
         self.E = E
         self.W = W
         self.F = F
+        self.complementary_operator_families = complementary_operator_families
+        self.bond = None if bond is None else int(bond)
+        self.complementary_boundary_payloads = complementary_boundary_payloads or {}
+        self.complementary_split_stats = complementary_split_stats
+        self.complementary_family_environments = complementary_family_environments or {}
+        self.complementary_direct_family_environments = (
+            complementary_direct_family_environments or {}
+        )
+        self._prefer_boundary_factorized = bool(
+            getattr(
+                complementary_operator_families,
+                "prefer_complementary_payload_tensor_matvec",
+                False,
+            )
+        )
+        self._debug_boundary_channel_matrices = bool(
+            getattr(
+                complementary_operator_families,
+                "debug_boundary_channel_matrices",
+                False,
+            )
+        )
+        self._debug_complementary_split_metadata = bool(
+            getattr(
+                complementary_operator_families,
+                "debug_complementary_split_metadata",
+                False,
+            )
+        )
+        self._debug_complementary_action_check = bool(
+            getattr(
+                complementary_operator_families,
+                "debug_complementary_action_check",
+                False,
+            )
+        )
+        self._debug_complementary_action_check_tol = float(
+            getattr(
+                complementary_operator_families,
+                "debug_complementary_action_check_tol",
+                1.0e-10,
+            )
+        )
+        self._debug_complementary_action_check_limit = int(
+            getattr(
+                complementary_operator_families,
+                "debug_complementary_action_check_limit",
+                32,
+            )
+        )
+        self._prefer_precontracted_family_environment = bool(
+            getattr(
+                complementary_operator_families,
+                "prefer_precontracted_family_environment",
+                False,
+            )
+        )
         self.dtype = np.float64
+        self._dense_cache = {}
+        self._action_cache = {}
+        self._compiled_action_cap = 4
+        self._boundary_factorized_cache = {}
+        self._boundary_factorized_action_cap = 8192
+        self._w12_cache = None
+        self._local_complementary_cache = {}
+        self._local_complementary_channel_cache = {}
+        self._boundary_table_cache = {}
+        self._boundary_table_max_dim = 32
+        self._boundary_einsum_path_cache = {}
+        self._boundary_einsum_expr_cache = self._GLOBAL_BOUNDARY_EINSUM_EXPR_CACHE
+        self._boundary_batched_einsum_expr_cache = (
+            self._GLOBAL_BOUNDARY_BATCHED_EINSUM_EXPR_CACHE
+        )
+        self._boundary_direct_einsum_expr_cache = (
+            self._GLOBAL_BOUNDARY_DIRECT_EINSUM_EXPR_CACHE
+        )
 
-    def matvec(self, A):
+    @staticmethod
+    def _component_action_token(E, W, F):
+        return (
+            HamiltonianMultiplyU1._tensor_token(E),
+            HamiltonianMultiplyU1._tensor_token(W[0]),
+            HamiltonianMultiplyU1._tensor_token(W[1]),
+            HamiltonianMultiplyU1._tensor_token(F),
+        )
+
+    def _build_direct_operator_plan(self, A, E, W, F, label):
+        layout = self._layout(A)
+        cache_key = (
+            self._component_action_token(E, W, F),
+            layout,
+            "direct_operator",
+            str(label),
+        )
+        if cache_key in self._boundary_factorized_cache:
+            return self._boundary_factorized_cache[cache_key]
+
+        e_by_ket_l = self._block_index(E, (2,))
+        w1_by_left_in = self._block_index(W[0], (0, 3))
+        w2_by_left_in = self._block_index(W[1], (0, 3))
+        f_by_mpo_ket_r = self._block_index(F, (0, 2))
+
+        left_operator_cache = {}
+        right_operator_cache = {}
+        entries = []
+        out_shapes = {}
+        channels = set()
+        dtype_args = []
+        left_eq = "aij,abux->bijux"
+        right_eq = "bcvy,clk->bvylk"
+        action_eq = "bijux,jkxy,bvylk->iluv"
+
+        def _left_operator(e_key, e_blk, w1_key, w1_blk):
+            key = (id(e_blk), id(w1_blk))
+            cached = left_operator_cache.get(key)
+            if cached is not None:
+                return cached
+            op = np.einsum(left_eq, e_blk, w1_blk, optimize="greedy")
+            left_operator_cache[key] = op
+            return op
+
+        def _right_operator(w2_key, w2_blk, f_key, f_blk):
+            key = (id(w2_blk), id(f_blk))
+            cached = right_operator_cache.get(key)
+            if cached is not None:
+                return cached
+            op = np.einsum(right_eq, w2_blk, f_blk, optimize="greedy")
+            right_operator_cache[key] = op
+            return op
+
+        for a_key, a_blk in A.data.items():
+            if a_blk.ndim != 4:
+                self._boundary_factorized_cache[cache_key] = None
+                return None
+            dtype_args.append(a_blk.dtype)
+            left_qn, right_qn, p1_in, p2_in = a_key
+            for e_key, e_blk in e_by_ket_l.get((left_qn,), ()):
+                if e_blk.ndim != 3:
+                    self._boundary_factorized_cache[cache_key] = None
+                    return None
+                for w1_key, w1_blk in w1_by_left_in.get((e_key[0], p1_in), ()):
+                    if w1_blk.ndim != 4:
+                        self._boundary_factorized_cache[cache_key] = None
+                        return None
+                    channel = w1_key[1]
+                    left_op = _left_operator(e_key, e_blk, w1_key, w1_blk)
+                    for w2_key, w2_blk in w2_by_left_in.get((channel, p2_in), ()):
+                        if w2_blk.ndim != 4:
+                            self._boundary_factorized_cache[cache_key] = None
+                            return None
+                        for f_key, f_blk in f_by_mpo_ket_r.get((w2_key[1], right_qn), ()):
+                            if f_blk.ndim != 3:
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+                            right_op = _right_operator(w2_key, w2_blk, f_key, f_blk)
+                            if left_op.shape[0] != right_op.shape[0]:
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+                            out_key = (e_key[1], f_key[1], w1_key[2], w2_key[2])
+                            out_shape = (
+                                left_op.shape[1],
+                                right_op.shape[3],
+                                left_op.shape[3],
+                                right_op.shape[1],
+                            )
+                            old_shape = out_shapes.get(out_key)
+                            if old_shape is not None and old_shape != out_shape:
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+                            out_shapes[out_key] = out_shape
+                            expr_key = (left_op.shape, a_blk.shape, right_op.shape)
+                            expr = self._boundary_direct_einsum_expr_cache.get(expr_key)
+                            if expr is None:
+                                try:
+                                    import opt_einsum as oe
+
+                                    expr = oe.contract_expression(
+                                        action_eq,
+                                        left_op.shape,
+                                        a_blk.shape,
+                                        right_op.shape,
+                                        optimize="greedy",
+                                    )
+                                except Exception:
+                                    try:
+                                        expr = np.einsum_path(
+                                            action_eq,
+                                            left_op,
+                                            a_blk,
+                                            right_op,
+                                            optimize="greedy",
+                                        )[0]
+                                    except ValueError:
+                                        self._boundary_factorized_cache[cache_key] = None
+                                        return None
+                                self._boundary_direct_einsum_expr_cache[expr_key] = expr
+                            dtype_args.extend((left_op.dtype, right_op.dtype))
+                            channels.add(channel)
+                            entries.append((channel, a_key, out_key, left_op, right_op, expr))
+
+        if not entries:
+            plan = ((), (), {}, A.qns[:], A.dirs[:], np.result_type(*dtype_args, complex))
+            self._boundary_factorized_cache[cache_key] = plan
+            return plan
+        out_qns = self._qns_from_layout(tuple((k, out_shapes[k]) for k in sorted(out_shapes)))
+        dtype = np.result_type(*dtype_args, complex)
+        plan = (
+            tuple(sorted(channels, key=lambda item: repr(item))),
+            tuple(entries),
+            out_shapes,
+            out_qns,
+            A.dirs[:],
+            dtype,
+        )
+        self._boundary_factorized_cache[cache_key] = plan
+        return plan
+
+    def _build_boundary_direct_operator_plan(self, A):
+        return self._build_direct_operator_plan(
+            A,
+            self.E,
+            self.W,
+            self.F,
+            "boundary_direct_operator",
+        )
+
+    def _apply_direct_operator_plan(self, A, plan):
+        if plan is None:
+            return None
+        channels, entries, out_shapes, out_qns, out_dirs, dtype = plan
+        action_eq = "bijux,jkxy,bvylk->iluv"
+        total_data = {
+            key: np.zeros(shape, dtype=dtype)
+            for key, shape in out_shapes.items()
+        }
+        for _channel, a_key, out_key, left_op, right_op, expr in entries:
+            if callable(expr):
+                contribution = expr(left_op, A.data[a_key], right_op)
+            else:
+                contribution = np.einsum(
+                    action_eq,
+                    left_op,
+                    A.data[a_key],
+                    right_op,
+                    optimize=expr,
+                )
+            total_data[out_key] += contribution
+        return BlockTensor(total_data, out_qns, out_dirs), channels, entries
+
+    def _matvec_boundary_direct_operator(self, A, *, local_channels=None):
+        plan = self._build_boundary_direct_operator_plan(A)
+        applied = self._apply_direct_operator_plan(A, plan)
+        if applied is None:
+            return None
+        total, channels, entries = applied
+        local_channels = local_channels or {}
+        for tensor in local_channels.values():
+            total = total - tensor
+        return {
+            "total": total,
+            "channels": {},
+            "stats": {
+                "kind": "abelian_complementary_boundary_direct_operator_action",
+                "source": "precontracted_left_right_middle_channel_operators",
+                "bond": self.bond,
+                "n_entries": int(len(entries)),
+                "n_mpo_middle_channels": int(len(channels)),
+                "n_channels": int(len(channels) + len(local_channels)),
+                "channel_names": tuple(
+                    f"mpo_middle:{repr(channel)}" for channel in channels
+                )
+                + tuple(f"subtract_local:{name}" for name in local_channels),
+                "channels_materialized": False,
+            },
+        }
+
+    def _record_complementary_split(
+        self,
+        mode,
+        *,
+        local=None,
+        local_channels=None,
+        boundary=None,
+        boundary_table=None,
+        boundary_operator=None,
+    ):
+        stats = self.complementary_split_stats
+        if stats is None:
+            return
+        mode = str(mode)
+        stats["calls"] = int(stats.get("calls", 0)) + 1
+        modes = stats.setdefault("modes", {})
+        modes[mode] = int(modes.get(mode, 0)) + 1
+        table_stats = None if boundary_table is None else boundary_table.stats
+        entry = {
+            "bond": self.bond,
+            "mode": mode,
+            "local_norm": None if local is None else float(local.norm()),
+            "local_channels": {
+                str(name): float(value.norm())
+                for name, value in (local_channels or {}).items()
+            },
+            "boundary_norm": None if boundary is None else float(boundary.norm()),
+            "boundary_table": table_stats,
+            "boundary_operator": boundary_operator,
+            "metadata": (
+                self._compact_complementary_split_metadata()
+                if self._debug_complementary_split_metadata
+                else None
+            ),
+        }
+        stats["last"] = entry
+        if self.bond is not None:
+            bonds = stats.setdefault("bonds", {})
+            bond_key = int(self.bond)
+            bond_stats = bonds.setdefault(bond_key, {"calls": 0, "modes": {}})
+            bond_stats["calls"] = int(bond_stats.get("calls", 0)) + 1
+            bond_modes = bond_stats.setdefault("modes", {})
+            bond_modes[mode] = int(bond_modes.get(mode, 0)) + 1
+            bond_stats["last"] = entry
+
+    def _audit_complementary_action(self, A, candidate, mode):
+        if not self._debug_complementary_action_check:
+            return None
+        stats = self.complementary_split_stats
+        if stats is not None:
+            audits = stats.setdefault(
+                "action_audits",
+                {
+                    "enabled": True,
+                    "calls": 0,
+                    "checked": 0,
+                    "max_abs_diff": 0.0,
+                    "max_rel_diff": 0.0,
+                    "tol": float(self._debug_complementary_action_check_tol),
+                    "failures": 0,
+                },
+            )
+            if int(audits.get("checked", 0)) >= self._debug_complementary_action_check_limit:
+                audits["calls"] = int(audits.get("calls", 0)) + 1
+                return None
+        else:
+            audits = None
+
+        exact = self._matvec_generic(A)
+        diff = candidate - exact
+        abs_diff = float(diff.norm())
+        ref_norm = max(float(exact.norm()), 1.0e-30)
+        rel_diff = abs_diff / ref_norm
+        record = {
+            "bond": self.bond,
+            "mode": str(mode),
+            "abs_diff": abs_diff,
+            "rel_diff": rel_diff,
+            "tol": float(self._debug_complementary_action_check_tol),
+        }
+        if audits is not None:
+            audits["calls"] = int(audits.get("calls", 0)) + 1
+            audits["checked"] = int(audits.get("checked", 0)) + 1
+            audits["max_abs_diff"] = max(float(audits.get("max_abs_diff", 0.0)), abs_diff)
+            audits["max_rel_diff"] = max(float(audits.get("max_rel_diff", 0.0)), rel_diff)
+            audits["last"] = record
+            if abs_diff > self._debug_complementary_action_check_tol:
+                audits["failures"] = int(audits.get("failures", 0)) + 1
+        if abs_diff > self._debug_complementary_action_check_tol:
+            raise AssertionError(
+                "Complementary local action mismatch on bond {} in mode {}: "
+                "abs_diff={:.6e}, rel_diff={:.6e}, tol={:.6e}".format(
+                    self.bond,
+                    mode,
+                    abs_diff,
+                    rel_diff,
+                    self._debug_complementary_action_check_tol,
+                )
+            )
+        return record
+
+    @staticmethod
+    def _layout(A):
+        keys = tuple(sorted(A.data))
+        return tuple((key, A.data[key].shape) for key in keys)
+
+    @staticmethod
+    def _qns_from_layout(layout):
+        if not layout:
+            return []
+        rank = len(layout[0][0])
+        return [sorted({key[axis] for key, _shape in layout}) for axis in range(rank)]
+
+    @staticmethod
+    def _size(layout):
+        return int(sum(np.prod(shape, dtype=int) for _key, shape in layout))
+
+    @staticmethod
+    def _dense_policy(max_dim):
+        if isinstance(max_dim, str):
+            policy = max_dim.strip().lower()
+            if policy == "auto":
+                return True, 256, 32
+            if policy in {"off", "none", "false", "0"}:
+                return False, 0, 0
+            try:
+                max_dim = int(policy)
+            except ValueError as exc:
+                raise ValueError("local_dense_max_dim must be an integer, 0, or 'auto'.") from exc
+        max_dim = int(max_dim)
+        return False, max_dim, 0
+
+    @staticmethod
+    def _flatten(A, layout):
+        chunks = []
+        for key, shape in layout:
+            blk = A.data.get(key)
+            if blk is None:
+                chunks.append(np.zeros(int(np.prod(shape, dtype=int)), dtype=complex))
+            else:
+                chunks.append(np.asarray(blk).reshape(-1))
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=complex)
+
+    @staticmethod
+    def _unflatten(vec, proto, layout):
+        data = {}
+        pos = 0
+        for key, shape in layout:
+            n = int(np.prod(shape, dtype=int))
+            data[key] = np.asarray(vec[pos:pos + n]).reshape(shape).copy()
+            pos += n
+        return BlockTensor(data, HamiltonianMultiplyU1._qns_from_layout(layout), proto.dirs[:])
+
+    def _closed_layout(self, proto, max_dim):
+        _auto, cap, _min_dim = self._dense_policy(max_dim)
+        max_dim = cap
+        layout_map = {key: shape for key, shape in self._layout(proto)}
+        dirs = proto.dirs[:]
+        for _ in range(4):
+            layout = tuple((key, layout_map[key]) for key in sorted(layout_map))
+            if self._size(layout) > int(max_dim):
+                return None
+            data = {}
+            rng = np.random.default_rng(123)
+            for key, shape in layout:
+                data[key] = rng.standard_normal(shape).astype(complex)
+            qns = self._qns_from_layout(layout)
+            y = self._matvec_generic(BlockTensor(data, qns, dirs))
+            changed = False
+            for key, blk in y.data.items():
+                if key not in layout_map:
+                    layout_map[key] = blk.shape
+                    changed = True
+                elif layout_map[key] != blk.shape:
+                    return None
+            if not changed:
+                return tuple((key, layout_map[key]) for key in sorted(layout_map))
+        return None
+
+    def dense_matrix(self, proto, max_dim=256):
+        auto, cap, min_dim = self._dense_policy(max_dim)
+        if cap <= 0:
+            return None, None
+        max_dim = cap
+        layout = self._closed_layout(proto, max_dim)
+        if layout is None:
+            return None, None
+        dim = self._size(layout)
+        if dim <= 0 or dim > int(max_dim):
+            return None, None
+        if auto and dim < int(min_dim):
+            return None, None
+        cache_key = layout
+        cached = self._dense_cache.get(cache_key)
+        if cached is not None:
+            return cached, layout
+
+        H = np.zeros((dim, dim), dtype=complex)
+        offsets = []
+        pos = 0
+        for key, shape in layout:
+            n = int(np.prod(shape, dtype=int))
+            offsets.append((key, shape, pos, n))
+            pos += n
+
+        qns = proto.qns[:]
+        dtype = np.result_type(*[blk.dtype for blk in proto.data.values()], complex)
+        for col in range(dim):
+            data = {}
+            for key, shape, start, n in offsets:
+                if start <= col < start + n:
+                    arr = np.zeros(shape, dtype=dtype)
+                    arr.reshape(-1)[col - start] = 1.0
+                    data[key] = arr
+                    break
+            basis = BlockTensor(data, qns, proto.dirs[:])
+            H[:, col] = self._flatten(self.matvec(basis), layout)
+        H = 0.5 * (H + H.conj().T)
+        self._dense_cache[cache_key] = H
+        return H, layout
+
+    @staticmethod
+    def _tensor_token(T):
+        return (id(T.data), len(T.data))
+
+    def _action_token(self):
+        return (
+            self._tensor_token(self.E),
+            self._tensor_token(self.W[0]),
+            self._tensor_token(self.W[1]),
+            self._tensor_token(self.F),
+        )
+
+    @staticmethod
+    def _block_index(T, axes):
+        idx = defaultdict(list)
+        for key, blk in T.data.items():
+            idx[tuple(key[ax] for ax in axes)].append((key, blk))
+        return idx
+
+    def _build_action_plan(self, A):
+        layout = self._layout(A)
+        cache_key = (self._action_token(), layout)
+        if cache_key in self._action_cache:
+            return self._action_cache[cache_key]
+
+        e_by_ket_l = self._block_index(self.E, (2,))
+        w1_by_left_in = self._block_index(self.W[0], (0, 3))
+        w2_by_left_in = self._block_index(self.W[1], (0, 3))
+        f_by_mpo_ket_r = self._block_index(self.F, (0, 2))
+
+        entries = []
+        out_shapes = {}
+        dtype_args = []
+        eq = "aij,jkxy,abux,bcvy,clk->iluv"
+
+        for a_key, a_blk in A.data.items():
+            if a_blk.ndim != 4:
+                self._action_cache[cache_key] = None
+                return None
+            dtype_args.append(a_blk.dtype)
+            left_qn, right_qn, p1_in, p2_in = a_key
+            for e_key, e_blk in e_by_ket_l.get((left_qn,), ()):
+                if e_blk.ndim != 3:
+                    self._action_cache[cache_key] = None
+                    return None
+                for w1_key, w1_blk in w1_by_left_in.get((e_key[0], p1_in), ()):
+                    if w1_blk.ndim != 4:
+                        self._action_cache[cache_key] = None
+                        return None
+                    for w2_key, w2_blk in w2_by_left_in.get((w1_key[1], p2_in), ()):
+                        if w2_blk.ndim != 4:
+                            self._action_cache[cache_key] = None
+                            return None
+                        for f_key, f_blk in f_by_mpo_ket_r.get((w2_key[1], right_qn), ()):
+                            if f_blk.ndim != 3:
+                                self._action_cache[cache_key] = None
+                                return None
+                            try:
+                                path = np.einsum_path(
+                                    eq, e_blk, a_blk, w1_blk, w2_blk, f_blk,
+                                    optimize="greedy",
+                                )[0]
+                            except ValueError:
+                                self._action_cache[cache_key] = None
+                                return None
+                            out_key = (e_key[1], f_key[1], w1_key[2], w2_key[2])
+                            out_shape = (
+                                e_blk.shape[1],
+                                f_blk.shape[1],
+                                w1_blk.shape[2],
+                                w2_blk.shape[2],
+                            )
+                            old_shape = out_shapes.get(out_key)
+                            if old_shape is not None and old_shape != out_shape:
+                                self._action_cache[cache_key] = None
+                                return None
+                            out_shapes[out_key] = out_shape
+                            dtype_args.extend((e_blk.dtype, w1_blk.dtype, w2_blk.dtype, f_blk.dtype))
+                            entries.append((a_key, out_key, e_blk, w1_blk, w2_blk, f_blk, path))
+                            if len(entries) > self._compiled_action_cap:
+                                self._action_cache[cache_key] = None
+                                return None
+
+        if not entries:
+            plan = ((), {}, A.qns[:], A.dirs[:], np.result_type(*dtype_args, complex))
+            self._action_cache[cache_key] = plan
+            return plan
+
+        out_qns = self._qns_from_layout(tuple((k, out_shapes[k]) for k in sorted(out_shapes)))
+        dtype = np.result_type(*dtype_args, complex)
+        plan = (entries, out_shapes, out_qns, A.dirs[:], dtype)
+        self._action_cache[cache_key] = plan
+        return plan
+
+    def _matvec_compiled(self, A):
+        plan = self._build_action_plan(A)
+        if plan is None:
+            return None
+        entries, out_shapes, out_qns, out_dirs, dtype = plan
+        out = {key: np.zeros(shape, dtype=dtype) for key, shape in out_shapes.items()}
+        eq = "aij,jkxy,abux,bcvy,clk->iluv"
+        for a_key, out_key, e_blk, w1_blk, w2_blk, f_blk, path in entries:
+            out[out_key] += np.einsum(
+                eq, e_blk, A.data[a_key], w1_blk, w2_blk, f_blk,
+                optimize=path,
+            )
+        return BlockTensor(out, out_qns, out_dirs)
+
+    def _matvec_generic(self, A):
         # A is BlockTensor with indices (Left, Right, Phys_L, Phys_R)
         # E: (MPO_L, MPS_L, MPS_L')
         # W: (MPO_L, MPO_R, Phys_Out, Phys_In)
@@ -287,6 +1087,1011 @@ class HamiltonianMultiplyU1:
 
         return A_new
 
+    @staticmethod
+    def _matvec_generic_components(E, W, F, A):
+        R = tensordot(E, A, axes=([2], [0]))
+        T2 = tensordot(R, W[0], axes=([0, 3], [0, 3]))
+        T3 = tensordot(T2, W[1], axes=([3, 2], [0, 3]))
+        T4 = tensordot(T3, F, axes=([3, 1], [0, 2]))
+        return T4.transpose(0, 3, 1, 2)
+
+    def _matvec_named_family_channels(self, A):
+        if not self.complementary_family_environments:
+            return None
+        channels = {}
+        stats = {}
+        for name, env in self.complementary_family_environments.items():
+            try:
+                E, W, F = env
+            except Exception:
+                continue
+            if E is None or F is None or W is None or len(W) != 2:
+                continue
+            if self._prefer_precontracted_family_environment:
+                plan = self._build_direct_operator_plan(
+                    A,
+                    E,
+                    W,
+                    F,
+                    ("named_family", str(name)),
+                )
+                applied = self._apply_direct_operator_plan(A, plan)
+            else:
+                applied = None
+            if applied is None:
+                tensor = self._matvec_generic_components(E, W, F, A)
+                n_entries = None
+                n_channels = None
+                source = "generic_tensordot_family_environment"
+            else:
+                tensor, family_channels, entries = applied
+                n_entries = int(len(entries))
+                n_channels = int(len(family_channels))
+                source = "precontracted_family_environment"
+            if tensor is not None:
+                key = str(name)
+                channels[key] = tensor
+                stats[key] = {
+                    "source": source,
+                    "n_entries": n_entries,
+                    "n_mpo_middle_channels": n_channels,
+                }
+        if not channels:
+            return None
+        return channels, stats
+
+    def _matvec_direct_symbolic_family_channels(self, A):
+        if not self.complementary_direct_family_environments:
+            return None
+        channels = {}
+        stats = {}
+        for name, entries in self.complementary_direct_family_environments.items():
+            total = None
+            n_entries = 0
+            for E, W, F in entries:
+                tensor = self._matvec_generic_components(E, W, F, A)
+                total = tensor if total is None else total + tensor
+                n_entries += 1
+            if total is not None:
+                key = str(name)
+                channels[key] = total
+                stats[key] = {
+                    "source": "direct_symbolic_term_environments",
+                    "n_entries": int(n_entries),
+                }
+        if not channels:
+            return None
+        return channels, stats
+
+    def _matvec_middle_mpo_channel(self, A, channel):
+        w1_data = {
+            key: value
+            for key, value in self.W[0].data.items()
+            if key[1] == channel
+        }
+        w2_data = {
+            key: value
+            for key, value in self.W[1].data.items()
+            if key[0] == channel
+        }
+        if not w1_data or not w2_data:
+            return None
+        W1 = BlockTensor(w1_data, self.W[0].qns[:], self.W[0].dirs[:])
+        W2 = BlockTensor(w2_data, self.W[1].qns[:], self.W[1].dirs[:])
+        original = self.W
+        try:
+            self.W = [W1, W2]
+            return self._matvec_generic(A)
+        finally:
+            self.W = original
+
+    def _middle_mpo_channels(self):
+        channels = {
+            key[1]
+            for key in self.W[0].data
+        }.intersection({
+            key[0]
+            for key in self.W[1].data
+        })
+        return tuple(sorted(channels, key=lambda item: repr(item)))
+
+    def _build_boundary_factorized_plan(self, A):
+        layout = self._layout(A)
+        cache_key = (self._action_token(), layout, "boundary_factorized")
+        if cache_key in self._boundary_factorized_cache:
+            return self._boundary_factorized_cache[cache_key]
+
+        e_by_ket_l = self._block_index(self.E, (2,))
+        w1_by_left_in = self._block_index(self.W[0], (0, 3))
+        w2_by_left_in = self._block_index(self.W[1], (0, 3))
+        f_by_mpo_ket_r = self._block_index(self.F, (0, 2))
+
+        entries = []
+        out_shapes = {}
+        dtype_args = []
+        channels = set()
+        eq = "aij,jkxy,abux,bcvy,clk->iluv"
+
+        for a_key, a_blk in A.data.items():
+            if a_blk.ndim != 4:
+                self._boundary_factorized_cache[cache_key] = None
+                return None
+            dtype_args.append(a_blk.dtype)
+            left_qn, right_qn, p1_in, p2_in = a_key
+            for e_key, e_blk in e_by_ket_l.get((left_qn,), ()):
+                if e_blk.ndim != 3:
+                    self._boundary_factorized_cache[cache_key] = None
+                    return None
+                for w1_key, w1_blk in w1_by_left_in.get((e_key[0], p1_in), ()):
+                    if w1_blk.ndim != 4:
+                        self._boundary_factorized_cache[cache_key] = None
+                        return None
+                    channel = w1_key[1]
+                    for w2_key, w2_blk in w2_by_left_in.get((channel, p2_in), ()):
+                        if w2_blk.ndim != 4:
+                            self._boundary_factorized_cache[cache_key] = None
+                            return None
+                        for f_key, f_blk in f_by_mpo_ket_r.get((w2_key[1], right_qn), ()):
+                            if f_blk.ndim != 3:
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+                            expr_key = (
+                                e_blk.shape,
+                                a_blk.shape,
+                                w1_blk.shape,
+                                w2_blk.shape,
+                                f_blk.shape,
+                            )
+                            expr = self._boundary_einsum_expr_cache.get(expr_key)
+                            if expr is None:
+                                try:
+                                    import opt_einsum as oe
+
+                                    expr = oe.contract_expression(
+                                        eq,
+                                        e_blk.shape,
+                                        a_blk.shape,
+                                        w1_blk.shape,
+                                        w2_blk.shape,
+                                        f_blk.shape,
+                                        optimize="greedy",
+                                    )
+                                except Exception:
+                                    try:
+                                        expr = np.einsum_path(
+                                            eq,
+                                            e_blk,
+                                            a_blk,
+                                            w1_blk,
+                                            w2_blk,
+                                            f_blk,
+                                            optimize="greedy",
+                                        )[0]
+                                    except ValueError:
+                                        self._boundary_factorized_cache[cache_key] = None
+                                        return None
+                                self._boundary_einsum_expr_cache[expr_key] = expr
+                            out_key = (e_key[1], f_key[1], w1_key[2], w2_key[2])
+                            out_shape = (
+                                e_blk.shape[1],
+                                f_blk.shape[1],
+                                w1_blk.shape[2],
+                                w2_blk.shape[2],
+                            )
+                            old_shape = out_shapes.get(out_key)
+                            if old_shape is not None and old_shape != out_shape:
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+                            out_shapes[out_key] = out_shape
+                            dtype_args.extend((e_blk.dtype, w1_blk.dtype, w2_blk.dtype, f_blk.dtype))
+                            channels.add(channel)
+                            entries.append((channel, a_key, out_key, e_blk, w1_blk, w2_blk, f_blk, expr))
+                            if len(entries) > int(self._boundary_factorized_action_cap):
+                                self._boundary_factorized_cache[cache_key] = None
+                                return None
+
+        if not entries:
+            plan = ((), (), (), {}, A.qns[:], A.dirs[:], np.result_type(*dtype_args, complex))
+            self._boundary_factorized_cache[cache_key] = plan
+            return plan
+
+        batch_sources = {}
+        for channel, a_key, out_key, e_blk, w1_blk, w2_blk, f_blk, _expr in entries:
+            batch_key = (
+                out_key,
+                e_blk.shape,
+                A.data[a_key].shape,
+                w1_blk.shape,
+                w2_blk.shape,
+                f_blk.shape,
+            )
+            batch_sources.setdefault(batch_key, []).append(
+                (channel, a_key, e_blk, w1_blk, w2_blk, f_blk)
+            )
+
+        batched_groups = []
+        batch_eq = "zaij,zjkxy,zabux,zbcvy,zclk->iluv"
+        for batch_key, members in batch_sources.items():
+            out_key, e_shape, a_shape, w1_shape, w2_shape, f_shape = batch_key
+            if len(members) < 2:
+                continue
+            expr_key = (len(members), e_shape, a_shape, w1_shape, w2_shape, f_shape)
+            expr = self._boundary_batched_einsum_expr_cache.get(expr_key)
+            if expr is None:
+                try:
+                    import opt_einsum as oe
+
+                    expr = oe.contract_expression(
+                        batch_eq,
+                        (len(members),) + tuple(e_shape),
+                        (len(members),) + tuple(a_shape),
+                        (len(members),) + tuple(w1_shape),
+                        (len(members),) + tuple(w2_shape),
+                        (len(members),) + tuple(f_shape),
+                        optimize="greedy",
+                    )
+                except Exception:
+                    expr = None
+                self._boundary_batched_einsum_expr_cache[expr_key] = expr
+            if expr is None:
+                continue
+            try:
+                e_stack = np.stack([entry[2] for entry in members], axis=0)
+                w1_stack = np.stack([entry[3] for entry in members], axis=0)
+                w2_stack = np.stack([entry[4] for entry in members], axis=0)
+                f_stack = np.stack([entry[5] for entry in members], axis=0)
+            except ValueError:
+                continue
+            batched_groups.append(
+                (
+                    out_key,
+                    tuple(entry[0] for entry in members),
+                    tuple(entry[1] for entry in members),
+                    e_stack,
+                    w1_stack,
+                    w2_stack,
+                    f_stack,
+                    expr,
+                )
+            )
+
+        batched_entry_ids = {
+            (out_key, a_key, channel)
+            for out_key, channels, a_keys, *_rest in batched_groups
+            for channel, a_key in zip(channels, a_keys)
+        }
+        scalar_entries = tuple(
+            entry
+            for entry in entries
+            if (entry[2], entry[1], entry[0]) not in batched_entry_ids
+        )
+
+        out_qns = self._qns_from_layout(tuple((k, out_shapes[k]) for k in sorted(out_shapes)))
+        dtype = np.result_type(*dtype_args, complex)
+        plan = (
+            tuple(sorted(channels, key=lambda item: repr(item))),
+            scalar_entries,
+            tuple(batched_groups),
+            out_shapes,
+            out_qns,
+            A.dirs[:],
+            dtype,
+        )
+        self._boundary_factorized_cache[cache_key] = plan
+        return plan
+
+    def _matvec_boundary_factorized(
+        self,
+        A,
+        *,
+        local_channels=None,
+        collect_channels=False,
+    ):
+        plan = self._build_boundary_factorized_plan(A)
+        if plan is None:
+            return None
+        channels, entries, batched_groups, out_shapes, out_qns, out_dirs, dtype = plan
+        batched_entries = sum(len(group[2]) for group in batched_groups)
+        scalar_entries = len(entries)
+        if (
+            not collect_channels
+            and scalar_entries
+            and batched_entries <= scalar_entries
+        ):
+            return None
+        eq = "aij,jkxy,abux,bcvy,clk->iluv"
+        total_data = {
+            key: np.zeros(shape, dtype=dtype)
+            for key, shape in out_shapes.items()
+        }
+        channel_data = None
+        if collect_channels:
+            channel_data = {
+                channel: {
+                    key: np.zeros(shape, dtype=dtype)
+                    for key, shape in out_shapes.items()
+                }
+                for channel in channels
+            }
+        if not collect_channels:
+            for out_key, _channels, a_keys, e_stack, w1_stack, w2_stack, f_stack, expr in batched_groups:
+                a_stack = np.stack([A.data[a_key] for a_key in a_keys], axis=0)
+                total_data[out_key] += expr(
+                    e_stack,
+                    a_stack,
+                    w1_stack,
+                    w2_stack,
+                    f_stack,
+                )
+        for channel, a_key, out_key, e_blk, w1_blk, w2_blk, f_blk, expr in entries:
+            if callable(expr):
+                contribution = expr(e_blk, A.data[a_key], w1_blk, w2_blk, f_blk)
+            else:
+                contribution = np.einsum(
+                    eq,
+                    e_blk,
+                    A.data[a_key],
+                    w1_blk,
+                    w2_blk,
+                    f_blk,
+                    optimize=expr,
+                )
+            total_data[out_key] += contribution
+            if channel_data is not None:
+                channel_data[channel][out_key] += contribution
+
+        total = BlockTensor(total_data, out_qns, out_dirs)
+        if not total.data:
+            return None
+
+        channel_tensors = {}
+        if channel_data is not None:
+            channel_tensors = {
+                f"mpo_middle:{repr(channel)}": BlockTensor(data, out_qns, out_dirs)
+                for channel, data in channel_data.items()
+            }
+
+        local_channels = local_channels or {}
+        for name, tensor in local_channels.items():
+            if collect_channels:
+                channel_tensors[f"subtract_local:{name}"] = tensor * -1.0
+            total = total - tensor
+
+        return {
+            "total": total,
+            "channels": channel_tensors,
+            "stats": {
+                "kind": "abelian_complementary_boundary_factorized_action",
+                "source": "middle_mpo_channels_minus_local_RP",
+                "bond": self.bond,
+                "n_entries": int(
+                    len(entries)
+                    + sum(len(group[2]) for group in batched_groups)
+                ),
+                "n_batched_groups": int(len(batched_groups)),
+                "n_scalar_entries": int(len(entries)),
+                "n_mpo_middle_channels": int(len(channels)),
+                "n_channels": int(len(channels) + len(local_channels)),
+                "channel_names": tuple(
+                    f"mpo_middle:{repr(channel)}" for channel in channels
+                )
+                + tuple(f"subtract_local:{name}" for name in local_channels),
+                "channels_materialized": bool(collect_channels),
+            },
+        }
+
+    def _two_site_mpo(self):
+        if self._w12_cache is not None:
+            return self._w12_cache
+        W12 = tensordot(self.W[0], self.W[1], axes=([1], [0]))
+        W12 = W12.transpose(0, 3, 1, 4, 2, 5)
+        self._w12_cache = W12
+        return W12
+
+    def _matvec_fused_mpo(self, A):
+        W12 = self._two_site_mpo()
+        R = tensordot(self.E, A, axes=([2], [0]))
+        T = tensordot(R, W12, axes=([0, 3, 4], [0, 4, 5]))
+        T = tensordot(T, self.F, axes=([2, 1], [0, 2]))
+        return T.transpose(0, 3, 1, 2)
+
+    @staticmethod
+    def _sector_components(sector):
+        labels = tuple(getattr(sector, "labels", ()))
+        comps = tuple(getattr(sector, "components", ()))
+        return dict(zip(labels, comps))
+
+    @classmethod
+    def _spatial_state_indices_from_qns(cls, qns):
+        found = {}
+        for idx, qn in enumerate(qns):
+            comps = cls._sector_components(qn)
+            if "charge" not in comps or "sz" not in comps:
+                return None
+            key = (int(comps["charge"]), int(comps["sz"]))
+            if key in found:
+                return None
+            found[key] = int(idx)
+        required = ((0, 0), (1, 1), (1, -1), (2, 0))
+        if any(key not in found for key in required):
+            return None
+        return tuple(found[key] for key in required)
+
+    @staticmethod
+    def _axis_dims(A, axis):
+        dims = {}
+        for key, block in A.data.items():
+            qn = key[axis]
+            dim = int(block.shape[axis])
+            old = dims.get(qn)
+            if old is not None and old != dim:
+                return None
+            dims[qn] = dim
+        return dims
+
+    def local_complementary_matrix(self, A=None):
+        if self.complementary_operator_families is None or self.bond is None:
+            return None
+        cache_key = (id(self.complementary_operator_families), int(self.bond))
+        mat = self._local_complementary_cache.get(cache_key)
+        if mat is None:
+            mat = self._GLOBAL_LOCAL_COMPLEMENTARY_MATRIX_CACHE.get(cache_key)
+        if mat is None:
+            try:
+                from pyqed.qchem.dmrg.spatial_terms import (
+                    spatial_complementary_local_matrix,
+                )
+            except Exception:
+                return None
+            mat = spatial_complementary_local_matrix(
+                self.complementary_operator_families,
+                int(self.bond),
+            )
+            self._local_complementary_cache[cache_key] = mat
+            self._GLOBAL_LOCAL_COMPLEMENTARY_MATRIX_CACHE[cache_key] = mat
+        if A is None:
+            return mat
+        left_order = self._spatial_state_indices_from_qns(A.qns[2])
+        right_order = self._spatial_state_indices_from_qns(A.qns[3])
+        if left_order is None or right_order is None:
+            return None
+        order = [4 * i + j for i in left_order for j in right_order]
+        return mat[np.ix_(order, order)]
+
+    def local_complementary_channel_matrices(self, A=None):
+        if self.complementary_operator_families is None or self.bond is None:
+            return None
+        cache_key = (id(self.complementary_operator_families), int(self.bond))
+        mats = self._local_complementary_channel_cache.get(cache_key)
+        if mats is None:
+            mats = self._GLOBAL_LOCAL_COMPLEMENTARY_CHANNEL_MATRIX_CACHE.get(cache_key)
+        if mats is None:
+            try:
+                from pyqed.qchem.dmrg.spatial_terms import (
+                    spatial_complementary_local_matrices,
+                )
+            except Exception:
+                return None
+            mats = spatial_complementary_local_matrices(
+                self.complementary_operator_families,
+                int(self.bond),
+            )
+            self._local_complementary_channel_cache[cache_key] = mats
+            self._GLOBAL_LOCAL_COMPLEMENTARY_CHANNEL_MATRIX_CACHE[cache_key] = mats
+        if A is None:
+            return mats
+        left_order = self._spatial_state_indices_from_qns(A.qns[2])
+        right_order = self._spatial_state_indices_from_qns(A.qns[3])
+        if left_order is None or right_order is None:
+            return None
+        order = [4 * i + j for i in left_order for j in right_order]
+        return {
+            name: np.asarray(mat, dtype=complex)[np.ix_(order, order)]
+            for name, mat in mats.items()
+        }
+
+    @property
+    def complementary_local_metadata(self):
+        mat = self.local_complementary_matrix()
+        if mat is None:
+            return None
+        return {
+            "enabled": True,
+            "bond": self.bond,
+            "matrix_shape": tuple(int(x) for x in mat.shape),
+            "nnz": int(np.count_nonzero(np.abs(mat) > 1.0e-14)),
+            "norm": float(np.linalg.norm(mat)),
+            "channels": {
+                str(name): {
+                    "matrix_shape": tuple(int(x) for x in np.asarray(channel_mat).shape),
+                    "nnz": int(np.count_nonzero(np.abs(channel_mat) > 1.0e-14)),
+                    "norm": float(np.linalg.norm(channel_mat)),
+                }
+                for name, channel_mat in (
+                    self.local_complementary_channel_matrices() or {}
+                ).items()
+            },
+        }
+
+    def _apply_local_complementary_matrix(self, A, mat, tol=1.0e-14):
+        if mat is None:
+            return None
+        left_order = self._spatial_state_indices_from_qns(A.qns[2])
+        right_order = self._spatial_state_indices_from_qns(A.qns[3])
+        if left_order is None or right_order is None:
+            return None
+        p1_dims = self._axis_dims(A, 2)
+        p2_dims = self._axis_dims(A, 3)
+        if p1_dims is None or p2_dims is None:
+            return None
+        p1_qns = tuple(A.qns[2])
+        p2_qns = tuple(A.qns[3])
+        pair_qns = tuple((q1, q2) for q1 in p1_qns for q2 in p2_qns)
+        n_pair = len(pair_qns)
+        mat = np.asarray(mat, dtype=complex).reshape(n_pair, n_pair)
+        out = {}
+        for in_key, block in A.data.items():
+            ql, qr, p1_in, p2_in = in_key
+            try:
+                in_col = pair_qns.index((p1_in, p2_in))
+            except ValueError:
+                continue
+            for out_row, (p1_out, p2_out) in enumerate(pair_qns):
+                coeff = mat[out_row, in_col]
+                if abs(coeff) <= tol:
+                    continue
+                p1_dim = int(p1_dims.get(p1_out, block.shape[2]))
+                p2_dim = int(p2_dims.get(p2_out, block.shape[3]))
+                if p1_dim != block.shape[2]:
+                    continue
+                if p2_dim != block.shape[3]:
+                    continue
+                out_key = (ql, qr, p1_out, p2_out)
+                contrib = coeff * block
+                if out_key in out:
+                    out[out_key] += contrib
+                else:
+                    out[out_key] = contrib.copy()
+        return BlockTensor(out, A.qns[:], A.dirs[:])
+
+    def _matvec_local_complementary_channels(self, A, tol=1.0e-14):
+        mats = self.local_complementary_channel_matrices(A)
+        if mats is None:
+            return None
+        out = {}
+        for name, mat in mats.items():
+            applied = self._apply_local_complementary_matrix(A, mat, tol=tol)
+            if applied is not None and applied.norm() > tol:
+                out[str(name)] = applied
+        return out
+
+    def _matvec_local_complementary(self, A, tol=1.0e-14):
+        return self._apply_local_complementary_matrix(
+            A,
+            self.local_complementary_matrix(A),
+            tol=tol,
+        )
+
+    def split_local_action(self, A):
+        """
+        Return the exact complementary split for this local problem.
+
+        When complementary payload matvecs are enabled, the boundary term is
+        applied through the factorized middle-channel plan and local R/P
+        channels are subtracted explicitly.  Otherwise, small local spaces may
+        use a dense boundary table before falling back to the exact residual
+        ``full - local``.
+        """
+        if self._prefer_boundary_factorized:
+            local_channels = self._matvec_local_complementary_channels(A)
+            if local_channels is None:
+                local = None
+            else:
+                local = None
+                for value in local_channels.values():
+                    local = value if local is None else local + value
+            direct_symbolic = self._matvec_direct_symbolic_family_channels(A)
+            if direct_symbolic is not None:
+                direct_channels, direct_stats = direct_symbolic
+                total = None
+                boundary_channels = {}
+                for name, tensor in direct_channels.items():
+                    total = tensor if total is None else total + tensor
+                    boundary = tensor
+                    if local_channels is not None and name in local_channels:
+                        boundary = boundary - local_channels[name]
+                    boundary_channels[f"{name}:boundary"] = boundary
+                if total is not None:
+                    mode = (
+                        "direct_RP_symbolic_environment"
+                        if local is not None
+                        else "direct_symbolic_environment"
+                    )
+                    self._audit_complementary_action(A, total, mode)
+                    stats = {
+                        "kind": "abelian_direct_symbolic_family_environment_action",
+                        "source": "direct_symbolic_term_environments",
+                        "bond": self.bond,
+                        "family_names": tuple(direct_channels),
+                        "n_channels": int(
+                            len(direct_channels)
+                            + len(local_channels or {})
+                        ),
+                        "channel_names": tuple(
+                            f"{name}:full" for name in direct_channels
+                        )
+                        + tuple(
+                            f"{name}:local" for name in (local_channels or {})
+                        ),
+                        "channels_materialized": True,
+                        "family_channel_stats": direct_stats,
+                    }
+                    self._record_complementary_split(
+                        mode,
+                        local=local,
+                        local_channels=local_channels,
+                        boundary=None if local is None else total - local,
+                        boundary_operator=stats,
+                    )
+                    return {
+                        "total": total,
+                        "local": local,
+                        "local_channels": local_channels,
+                        "boundary": None if local is None else total - local,
+                        "boundary_channels": boundary_channels,
+                        "boundary_operator": stats,
+                        "family_channels": direct_channels,
+                        "mode": mode,
+                    }
+            named_family = self._matvec_named_family_channels(A)
+            if named_family is not None:
+                named_family_channels, named_family_stats = named_family
+                total = None
+                boundary_channels = {}
+                for name, tensor in named_family_channels.items():
+                    total = tensor if total is None else total + tensor
+                    boundary = tensor
+                    if local_channels is not None and name in local_channels:
+                        boundary = boundary - local_channels[name]
+                    boundary_channels[f"{name}:boundary"] = boundary
+                if total is not None:
+                    mode = (
+                        "named_RP_family_environment"
+                        if local is not None
+                        else "named_family_environment"
+                    )
+                    self._audit_complementary_action(A, total, mode)
+                    stats = {
+                        "kind": "abelian_named_family_environment_action",
+                        "source": "family_mpo_environments",
+                        "bond": self.bond,
+                        "family_names": tuple(named_family_channels),
+                        "n_channels": int(
+                            len(named_family_channels)
+                            + len(local_channels or {})
+                        ),
+                        "channel_names": tuple(
+                            f"{name}:full" for name in named_family_channels
+                        )
+                        + tuple(
+                            f"{name}:local" for name in (local_channels or {})
+                        ),
+                        "channels_materialized": True,
+                        "family_channel_stats": named_family_stats,
+                    }
+                    self._record_complementary_split(
+                        mode,
+                        local=local,
+                        local_channels=local_channels,
+                        boundary=None if local is None else total - local,
+                        boundary_operator=stats,
+                    )
+                    return {
+                        "total": total,
+                        "local": local,
+                        "local_channels": local_channels,
+                        "boundary": None if local is None else total - local,
+                        "boundary_channels": boundary_channels,
+                        "boundary_operator": stats,
+                        "family_channels": named_family_channels,
+                        "mode": mode,
+                    }
+        else:
+            local_channels = None
+            local = self._matvec_local_complementary(A)
+        if local is None:
+            local = None
+        if self._prefer_boundary_factorized:
+            boundary_direct = self._matvec_boundary_direct_operator(
+                A,
+                local_channels=local_channels,
+            )
+            if boundary_direct is not None:
+                boundary = boundary_direct["total"]
+                mode = (
+                    "local_RP_plus_boundary_direct_operator_table"
+                    if local is not None
+                    else "boundary_direct_operator_no_local_complementary"
+                )
+                total = boundary if local is None else boundary + local
+                self._audit_complementary_action(A, total, mode)
+                self._record_complementary_split(
+                    mode,
+                    local=local,
+                    local_channels=local_channels,
+                    boundary=boundary,
+                    boundary_operator=boundary_direct["stats"],
+                )
+                return {
+                    "total": total,
+                    "local": local,
+                    "local_channels": local_channels,
+                    "boundary": boundary,
+                    "boundary_channels": boundary_direct["channels"],
+                    "boundary_operator": boundary_direct["stats"],
+                    "mode": mode,
+                }
+            boundary_factorized = self._matvec_boundary_factorized(
+                A,
+                local_channels=local_channels,
+            )
+            if boundary_factorized is not None:
+                boundary = boundary_factorized["total"]
+                mode = (
+                    "local_RP_plus_boundary_factorized_operator_table"
+                    if local is not None
+                    else "boundary_factorized_no_local_complementary"
+                )
+                total = boundary if local is None else boundary + local
+                self._audit_complementary_action(A, total, mode)
+                self._record_complementary_split(
+                    mode,
+                    local=local,
+                    local_channels=local_channels,
+                    boundary=boundary,
+                    boundary_operator=boundary_factorized["stats"],
+                )
+                return {
+                    "total": total,
+                    "local": local,
+                    "local_channels": local_channels,
+                    "boundary": boundary,
+                    "boundary_channels": boundary_factorized["channels"],
+                    "boundary_operator": boundary_factorized["stats"],
+                    "mode": mode,
+                }
+        if local is not None:
+            boundary_table = self._boundary_table(A)
+            if boundary_table is not None:
+                boundary = boundary_table.apply(A)
+                mode = "local_RP_plus_boundary_operator_table"
+                self._record_complementary_split(
+                    mode,
+                    local=local,
+                    local_channels=local_channels,
+                    boundary=boundary,
+                    boundary_table=boundary_table,
+                )
+                return {
+                    "total": boundary + local,
+                    "local": local,
+                    "local_channels": local_channels,
+                    "boundary": boundary,
+                    "boundary_table": boundary_table,
+                    "mode": mode,
+                }
+
+        full = self._matvec_generic(A)
+        if local is None:
+            mode = "full_mpo_no_local_complementary"
+            self._record_complementary_split(mode, local=None, boundary=full)
+            return {
+                "total": full,
+                "local": None,
+                "local_channels": None,
+                "boundary": full,
+                "mode": mode,
+            }
+        boundary = full - local
+        mode = "local_RP_plus_boundary_residual"
+        self._record_complementary_split(
+            mode,
+            local=local,
+            local_channels=local_channels,
+            boundary=boundary,
+        )
+        return {
+            "total": boundary + local,
+            "local": local,
+            "local_channels": local_channels,
+            "boundary": boundary,
+            "mode": mode,
+        }
+
+    def _boundary_table(self, proto):
+        cap = int(self._boundary_table_max_dim)
+        layout = self._closed_layout(proto, cap)
+        if layout is None:
+            return None
+        dim = self._size(layout)
+        if dim <= 0 or dim > cap:
+            return None
+        cache_key = (int(self.bond or 0), layout)
+        cached = self._boundary_table_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        H = np.zeros((dim, dim), dtype=complex)
+        channel_matrices = {}
+        if self._debug_boundary_channel_matrices:
+            middle_channels = self._middle_mpo_channels()
+            channel_matrices = {
+                f"mpo_middle:{repr(channel)}": np.zeros((dim, dim), dtype=complex)
+                for channel in middle_channels
+            }
+            local_channel_names = tuple(
+                (self.local_complementary_channel_matrices(proto) or {}).keys()
+            )
+            for name in local_channel_names:
+                channel_matrices[f"subtract_local:{name}"] = np.zeros((dim, dim), dtype=complex)
+        else:
+            middle_channels = ()
+        offsets = []
+        pos = 0
+        for key, shape in layout:
+            n = int(np.prod(shape, dtype=int))
+            offsets.append((key, shape, pos, n))
+            pos += n
+        qns = proto.qns[:]
+        dtype = np.result_type(*[blk.dtype for blk in proto.data.values()], complex)
+        for col in range(dim):
+            data = {}
+            for key, shape, start, n in offsets:
+                if start <= col < start + n:
+                    arr = np.zeros(shape, dtype=dtype)
+                    arr.reshape(-1)[col - start] = 1.0
+                    data[key] = arr
+                    break
+            basis = BlockTensor(data, qns, proto.dirs[:])
+            full = self._matvec_generic(basis)
+            local = self._matvec_local_complementary(basis)
+            if local is None:
+                return None
+            H[:, col] = self._flatten(full - local, layout)
+            if self._debug_boundary_channel_matrices:
+                for channel in middle_channels:
+                    contribution = self._matvec_middle_mpo_channel(basis, channel)
+                    if contribution is not None:
+                        channel_matrices[f"mpo_middle:{repr(channel)}"][:, col] = (
+                            self._flatten(contribution, layout)
+                        )
+                local_channels = self._matvec_local_complementary_channels(basis) or {}
+                for name, contribution in local_channels.items():
+                    channel_matrices[f"subtract_local:{name}"][:, col] = -self._flatten(
+                        contribution,
+                        layout,
+                    )
+        if channel_matrices:
+            channel_sum = sum(channel_matrices.values(), np.zeros_like(H))
+            unresolved = H - channel_sum
+            if np.linalg.norm(unresolved) > 1.0e-10:
+                channel_matrices["unresolved_residual"] = unresolved
+        table = AbelianComplementaryBoundaryActionTable(
+            H,
+            layout,
+            qns,
+            proto.dirs[:],
+            bond=self.bond,
+            source="exact_full_mpo_minus_local_RP",
+            boundary_family_tables=self._boundary_family_tables(),
+            channel_matrices=channel_matrices,
+        )
+        self._boundary_table_cache[cache_key] = table
+        return table
+
+    def _matvec_boundary_table(self, A):
+        table = self._boundary_table(A)
+        if table is None:
+            return None
+        return table.apply(A)
+
+    def _boundary_family_tables(self):
+        payloads = self.complementary_boundary_payloads or {}
+        tables = []
+        for side in ("left", "right"):
+            entry = payloads.get(side)
+            table = None if entry is None else entry.family_operator_table
+            if table is not None:
+                tables.append(table)
+        return tuple(tables)
+
+    def _compact_complementary_split_metadata(self):
+        def _table_summary(entry):
+            table = None if entry is None else entry.family_operator_table
+            if table is None:
+                return None
+            return {
+                "side": str(table.side),
+                "bond": int(table.bond),
+                "active_family_names": table.active_family_names,
+                "n_channels": int(table.n_channels),
+                "symbolic_terms": int(table.symbolic_terms),
+                "stored_elements": int(table.stored_elements),
+            }
+
+        def _payload_summary(entry):
+            if entry is None:
+                return None
+            return {
+                "side": str(entry.side),
+                "bond": int(entry.bond),
+                "numeric_payload_terms": int(
+                    sum(payload.n_terms for payload in entry.family_payloads.values())
+                ),
+                "numeric_payload_cross_terms": int(
+                    sum(payload.cross_terms for payload in entry.family_payloads.values())
+                ),
+            }
+
+        payloads = self.complementary_boundary_payloads or {}
+        left = payloads.get("left")
+        right = payloads.get("right")
+        local = self.complementary_local_metadata
+        local_summary = None if local is None else {
+            "bond": local.get("bond"),
+            "matrix_shape": local.get("matrix_shape"),
+            "nnz": local.get("nnz"),
+            "norm": local.get("norm"),
+            "channels": local.get("channels", {}),
+        }
+        return {
+            "enabled": self.complementary_operator_families is not None,
+            "bond": self.bond,
+            "local": local_summary,
+            "boundary_table_cache_entries": int(len(self._boundary_table_cache)),
+            "left_family_operator_table": _table_summary(left),
+            "right_family_operator_table": _table_summary(right),
+            "left_payload": _payload_summary(left),
+            "right_payload": _payload_summary(right),
+        }
+
+    @property
+    def complementary_split_metadata(self):
+        payloads = self.complementary_boundary_payloads or {}
+        left = payloads.get("left")
+        right = payloads.get("right")
+        return {
+            "enabled": self.complementary_operator_families is not None,
+            "bond": self.bond,
+            "local": self.complementary_local_metadata,
+            "boundary_source": "cached_boundary_table_or_full_mpo_residual",
+            "boundary_table_max_dim": int(self._boundary_table_max_dim),
+            "boundary_table_cache_entries": int(len(self._boundary_table_cache)),
+            "boundary_action_tables": tuple(
+                table.stats for table in self._boundary_table_cache.values()
+            ),
+            "left_family_operator_table": (
+                None
+                if left is None or left.family_operator_table is None
+                else left.family_operator_table.stats
+            ),
+            "right_family_operator_table": (
+                None
+                if right is None or right.family_operator_table is None
+                else right.family_operator_table.stats
+            ),
+            "left_payload": None if left is None else left.stats,
+            "right_payload": None if right is None else right.stats,
+        }
+
+    def matvec(self, A):
+        if self.complementary_operator_families is not None:
+            return self.split_local_action(A)["total"]
+        A_new = self._matvec_compiled(A)
+        if A_new is not None:
+            return A_new
+        return self._matvec_generic(A)
+
 def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
     """
     General converter from Dense MPO (L, R, Out, In) to Symmetric BlockTensor.
@@ -309,6 +2114,72 @@ def dense_to_symmetric_mpo(dense_mpo_list, site_qn_maps, tol=1e-12):
         # Metadata for BlockTensor
         all_phys_out = sorted(list(set(phys_qns.values())))
         all_phys_in = sorted(list(set(phys_qns.values())))
+        unique_phys_qns = len(all_phys_out) == len(phys_qns)
+        if unique_phys_qns:
+            curr_by_q = defaultdict(list)
+            for l_idx, q_l in current_nodes:
+                if not is_sector_like(q_l):
+                    raise TypeError(
+                        f"Site {site_idx}: q_l became {type(q_l)} ({q_l})! Expected sector-like symmetry label."
+                    )
+                curr_by_q[q_l].append(int(l_idx))
+            curr_by_q = {q: sorted(rows) for q, rows in curr_by_q.items()}
+            phys_items = sorted(phys_qns.items())
+            n_right = int(W.shape[1])
+            all_right = np.arange(n_right)
+            transition_cache = []
+            for out_s, q_out in phys_items:
+                for in_s, q_in in phys_items:
+                    try:
+                        flux = q_out - q_in
+                    except TypeError as exc:
+                        raise TypeError(
+                            "dense_to_symmetric_mpo currently requires Abelian sector differences on physical legs. "
+                            "The new symmetry layer can host U(1)xSU(2) sectors, but non-Abelian MPO conversion "
+                            "still needs a reduced-tensor implementation."
+                        ) from exc
+                    transition_cache.append((int(out_s), int(in_s), q_out, q_in, flux))
+
+            for q_l, rows in curr_by_q.items():
+                row_arr = np.asarray(rows, dtype=int)
+                for out_s, in_s, _q_out, _q_in, flux in transition_cache:
+                    q_r = q_l - flux
+                    sub = W[np.ix_(row_arr, all_right)][:, :, out_s, in_s]
+                    if sub.size == 0:
+                        continue
+                    cols = np.nonzero(np.any(np.abs(sub) > tol, axis=0))[0]
+                    for r in cols:
+                        next_nodes.add((int(r), q_r))
+
+            l_map = {q: [(int(l), q) for l in rows] for q, rows in curr_by_q.items()}
+            r_map = {q: sorted([x for x in next_nodes if x[1] == q]) for q in set(x[1] for x in next_nodes)}
+            final_blocks = {}
+            for q_l, row_nodes in l_map.items():
+                row_idx = np.asarray([node[0] for node in row_nodes], dtype=int)
+                for out_s, in_s, q_out, q_in, flux in transition_cache:
+                    q_r = q_l - flux
+                    col_nodes = r_map.get(q_r)
+                    if not col_nodes:
+                        continue
+                    col_idx = np.asarray([node[0] for node in col_nodes], dtype=int)
+                    mat = W[np.ix_(row_idx, col_idx)][:, :, out_s, in_s]
+                    if not np.any(np.abs(mat) > tol):
+                        continue
+                    final_blocks[(q_l, q_r, q_out, q_in)] = mat[:, :, None, None].copy()
+
+            qns_L = sorted(list(l_map.keys()))
+            qns_R = sorted(list(r_map.keys()))
+            qns_Out = all_phys_out
+            qns_In = all_phys_in
+            bt = BlockTensor(final_blocks, [qns_L, qns_R, qns_Out, qns_In], [-1, 1, 1, -1])
+            sym_H.append(bt)
+            if site_idx == 0 and len(final_blocks) > 0:
+                sample_key = next(iter(final_blocks.keys()))
+                if not is_sector_like(sample_key[0]):
+                     print(f"  [ERROR] Site 0 generated invalid sector keys: {sample_key}.")
+            current_nodes = next_nodes
+            continue
+
         # Optimize lookup
         valid_incoming = {}
         for l_idx, q_l in current_nodes:
@@ -3660,7 +5531,31 @@ def compatible_blocktensor_structure(x, y):
             return False
     return True
 
-def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstates=1, weights=None, init_vecs = None):
+def optimize_two_sites(
+    A,
+    B,
+    W1,
+    W2,
+    E,
+    F,
+    m,
+    dir,
+    U1=False,
+    sym_mgr=None,
+    nstates=1,
+    weights=None,
+    init_vecs=None,
+    davidson_tol=1e-5,
+    davidson_max_iter=30,
+    noise=1e-4,
+    local_dense_max_dim=0,
+    complementary_operator_families=None,
+    bond=None,
+    complementary_boundary_payloads=None,
+    complementary_split_stats=None,
+    complementary_family_environments=None,
+    complementary_direct_family_environments=None,
+):
     """
     two-site optimization of MPS A,B with respect to MPO W1,W2 and
     environment tensors E,F
@@ -3712,16 +5607,38 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
             AA = tensordot(A, B, axes=([1], [0])) # this will return as BlockTensor Object
             AA = AA.transpose(0, 2, 1, 3) # standard MPO bond index currently is (L,R,out,in). TODO: reshape to (L, out, in, R) (note that currently dense branch is (L, R, out, in), better also fix that one)
 
-            # # add noise to AA. TODO: maby make noise decay as round goes? that should be done by injecting a smaller noise_val as dmrg sweep goes. fix and test for optimal value if have time
-            AA = inject_noise_symmetric(AA, noise_val=1e-4, sym_mgr=sym_mgr)
+            if noise is not None and float(noise) > 0.0:
+                AA = inject_noise_symmetric(AA, noise_val=float(noise), sym_mgr=sym_mgr)
         else:
             raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
-        H_op = HamiltonianMultiplyU1(E, [W1, W2], F)
+        H_op = HamiltonianMultiplyU1(
+            E,
+            [W1, W2],
+            F,
+            complementary_operator_families=complementary_operator_families,
+            bond=bond,
+            complementary_boundary_payloads=complementary_boundary_payloads,
+            complementary_split_stats=complementary_split_stats,
+            complementary_family_environments=complementary_family_environments,
+            complementary_direct_family_environments=complementary_direct_family_environments,
+        )
         norm = AA.norm()
         AA = AA * (1.0/norm)
 
         if nstates == 1:
-            energy, AA_new = solve_davidson(H_op, AA, n_eig=1, tol=1e-5)
+            H_dense, dense_layout = H_op.dense_matrix(AA, max_dim=local_dense_max_dim)
+            if H_dense is not None:
+                evals, evecs = np.linalg.eigh(H_dense)
+                energy = evals[0]
+                AA_new = H_op._unflatten(evecs[:, 0], AA, dense_layout)
+            else:
+                energy, AA_new = solve_davidson(
+                    H_op,
+                    AA,
+                    n_eig=1,
+                    tol=float(davidson_tol),
+                    max_iter=int(davidson_max_iter),
+                )
             # AA_new is (L, R, Phys_L, Phys_R)
             # We need to return A(L, M, P_L) and B(M, R, P_R)
             U, V, S_dict, trunc, m_kept = svd_symmetric(AA_new, m_max=m)
@@ -3772,8 +5689,8 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
                 H_op,
                 guess_list,
                 n_eig=nstates,
-                tol=1e-5,
-                max_iter=30,
+                tol=float(davidson_tol),
+                max_iter=int(davidson_max_iter),
                 max_subspace=max(8, 4 * nstates),
             )
 
@@ -3845,9 +5762,32 @@ def optimize_two_sites(A, B, W1, W2, E, F, m, dir, U1=False, sym_mgr=None, nstat
             return E[0], A, B, trunc, m
         return E, A, B, trunc, m, AA_list
 
-def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
-                  not_conv_err=True, sym_mgr=None, nstates=1, weights=None,
-                  verbose=0, sweep_callback=None):
+def two_site_dmrg(
+    mps,
+    mpo,
+    m,
+    sweeps=50,
+    conv=1e-6,
+    U1=False,
+    target_qn=None,
+    not_conv_err=True,
+    sym_mgr=None,
+    nstates=1,
+    weights=None,
+    verbose=0,
+    sweep_callback=None,
+    davidson_tol=1e-5,
+    davidson_max_iter=30,
+    noise=1e-4,
+    noise_decay=0.1,
+    noise_cutoff=1e-9,
+    local_dense_max_dim=0,
+    complementary_operator_families=None,
+    complementary_operator_mpos=None,
+    complementary_operator_term_maps=None,
+    complementary_operator_generator_entries=None,
+    site_qn_maps=None,
+):
     """
     Driver function to perform sweeps of 2-site DMRG
 
@@ -3879,18 +5819,293 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
     E = construct_E(MPS, MPO, MPS)
     F = construct_F(MPS, MPO, MPS, target_qn=target_qn)
     F.pop()
+    complementary_operator_mpos = {
+        str(name): factors
+        for name, factors in (complementary_operator_mpos or {}).items()
+    }
+    complementary_operator_term_maps = {
+        str(name): dict(term_map)
+        for name, term_map in (complementary_operator_term_maps or {}).items()
+    }
+    complementary_operator_generator_entries = {
+        str(name): dict(entries)
+        for name, entries in (complementary_operator_generator_entries or {}).items()
+    }
+    comp_family_E = {
+        name: construct_E(MPS, factors, MPS)
+        for name, factors in complementary_operator_mpos.items()
+    }
+    comp_family_F = {
+        name: construct_F(MPS, factors, MPS, target_qn=target_qn)
+        for name, factors in complementary_operator_mpos.items()
+    }
+    for stack in comp_family_F.values():
+        stack.pop()
 
     # Skip dense expectation check for U1 to avoid crash
     Eold = 0.0
     converged = False
     gauge = None
 
+    def _noise(half_sweep):
+        nz = float(noise or 0.0)
+        if nz <= 0.0:
+            return 0.0
+        nz *= float(noise_decay) ** int(half_sweep)
+        return 0.0 if nz < float(noise_cutoff) else nz
+
+    comp_stack, comp_payload_map = _make_complementary_boundary_stack(
+        complementary_operator_families,
+        len(MPS),
+    )
+    comp_split_stats = {
+        "enabled": comp_stack is not None,
+        "calls": 0,
+        "modes": {},
+        "bonds": {},
+    }
+
+    def _comp_payload(bond):
+        if comp_stack is None:
+            return None
+        bond = int(bond)
+        return {
+            "stack": comp_stack,
+            "left": comp_payload_map.get(("left", bond)),
+            "right": comp_payload_map.get(("right", bond + 1)),
+        }
+
+    def _comp_split_snapshot():
+        if comp_stack is None:
+            return None
+        return deepcopy(comp_split_stats)
+
+    def _comp_family_env(bond):
+        bond = int(bond)
+        envs = {}
+        for name, factors in complementary_operator_mpos.items():
+            try:
+                envs[name] = (
+                    comp_family_E[name][-1],
+                    [factors[bond], factors[bond + 1]],
+                    comp_family_F[name][-1],
+                )
+            except (KeyError, IndexError):
+                continue
+        return envs or None
+
+    def _one_site_operator_mpo(symbol):
+        from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+        ops = spatial_local_ops()
+        return np.asarray(ops[str(symbol)], dtype=complex).reshape(1, 1, 4, 4)
+
+    generator_expansion_cache = {}
+    generator_term_map_cache = None
+    direct_family_sym_pattern_cache = {}
+    direct_family_left_env_cache = {}
+    direct_family_right_env_cache = {}
+    direct_family_env_revision = [0]
+    direct_family_pattern_terms_cache = None
+
+    def _invalidate_direct_family_env_cache():
+        direct_family_env_revision[0] += 1
+        direct_family_left_env_cache.clear()
+        direct_family_right_env_cache.clear()
+
+    def _generator_expansion(p, q):
+        key = ("E", int(p), int(q))
+        cached = generator_expansion_cache.get(key)
+        if cached is not None:
+            return cached
+        from pyqed.qchem.dmrg.spatial_terms import spatial_jw_term_spec
+
+        terms = []
+        for create, destroy in (("cdu", "cu"), ("cdd", "cd")):
+            symbol, dofs, factor = spatial_jw_term_spec(
+                [create, destroy],
+                [int(p), int(q)],
+                1.0,
+            )
+            if symbol and abs(factor) > 1.0e-14:
+                terms.append((symbol, tuple(dofs), complex(factor)))
+        generator_expansion_cache[key] = tuple(terms)
+        return generator_expansion_cache[key]
+
+    def _two_generator_expansion(p, q, r, s):
+        key = ("EE", int(p), int(q), int(r), int(s))
+        cached = generator_expansion_cache.get(key)
+        if cached is not None:
+            return cached
+        from pyqed.qchem.dmrg.spatial_terms import spatial_jw_term_spec
+
+        terms = []
+        for left_create, left_destroy in (("cdu", "cu"), ("cdd", "cd")):
+            for right_create, right_destroy in (("cdu", "cu"), ("cdd", "cd")):
+                symbol, dofs, factor = spatial_jw_term_spec(
+                    [left_create, left_destroy, right_create, right_destroy],
+                    [int(p), int(q), int(r), int(s)],
+                    1.0,
+                )
+                if symbol and abs(factor) > 1.0e-14:
+                    terms.append((symbol, tuple(dofs), complex(factor)))
+        generator_expansion_cache[key] = tuple(terms)
+        return generator_expansion_cache[key]
+
+    def _iter_direct_family_terms():
+        if complementary_operator_term_maps:
+            for family_name, term_map in complementary_operator_term_maps.items():
+                for (symbol, dofs), coeff in term_map.items():
+                    yield str(family_name), str(symbol), tuple(dofs), complex(coeff)
+        if complementary_operator_generator_entries:
+            nonlocal generator_term_map_cache
+            if generator_term_map_cache is None:
+                from pyqed.qchem.dmrg.spatial_terms import accumulate_symbolic_term
+
+                generator_term_map_cache = {"R": {}, "P": {}}
+                for (p, q), coeff in complementary_operator_generator_entries.get("R", {}).items():
+                    for symbol, dofs, factor in _generator_expansion(p, q):
+                        accumulate_symbolic_term(
+                            generator_term_map_cache["R"],
+                            symbol,
+                            dofs,
+                            complex(coeff) * factor,
+                        )
+                for (p, q, r, s), coeff in complementary_operator_generator_entries.get("P", {}).items():
+                    for symbol, dofs, factor in _two_generator_expansion(p, q, r, s):
+                        accumulate_symbolic_term(
+                            generator_term_map_cache["P"],
+                            symbol,
+                            dofs,
+                            complex(coeff) * factor,
+                        )
+            for family_name, term_map in generator_term_map_cache.items():
+                for (symbol, dofs), coeff in term_map.items():
+                    yield str(family_name), str(symbol), tuple(dofs), complex(coeff)
+
+    def _direct_family_pattern_terms():
+        nonlocal direct_family_pattern_terms_cache
+        if direct_family_pattern_terms_cache is not None:
+            return direct_family_pattern_terms_cache
+        L = len(MPS)
+        grouped = {}
+        for family_name, symbol, dofs, coeff in _iter_direct_family_terms():
+            per_site = ["I"] * L
+            for piece, site in zip(str(symbol).split(), dofs):
+                per_site[int(site)] = str(piece)
+            grouped.setdefault(str(family_name), []).append(
+                (tuple(per_site), complex(coeff))
+            )
+        direct_family_pattern_terms_cache = {
+            name: tuple(terms)
+            for name, terms in grouped.items()
+        }
+        return direct_family_pattern_terms_cache
+
+    def _direct_family_env(bond):
+        if not complementary_operator_term_maps and not complementary_operator_generator_entries:
+            return None
+        if site_qn_maps is None:
+            return None
+        bond = int(bond)
+        out = {}
+        L = len(MPS)
+
+        def _sym_mpo_for_pattern(pattern):
+            cached = direct_family_sym_pattern_cache.get(pattern)
+            if cached is not None:
+                return cached
+            dense_pattern_mpo = [
+                _one_site_operator_mpo(piece).copy()
+                for piece in pattern
+            ]
+            sym_pattern_mpo = dense_to_symmetric_mpo(
+                dense_pattern_mpo,
+                site_qn_maps,
+            )
+            direct_family_sym_pattern_cache[pattern] = sym_pattern_mpo
+            return sym_pattern_mpo
+
+        def _left_env(pattern, sym_pattern_mpo):
+            key = (direct_family_env_revision[0], bond, tuple(pattern[:bond]))
+            cached = direct_family_left_env_cache.get(key)
+            if cached is not None:
+                return cached
+            if bond == 0:
+                env = initial_E(sym_pattern_mpo[0])
+            else:
+                env = initial_E(sym_pattern_mpo[0])
+                for site in range(bond):
+                    env = contract_from_left(
+                        sym_pattern_mpo[site],
+                        MPS[site],
+                        env,
+                        MPS[site],
+                    )
+            direct_family_left_env_cache[key] = env
+            return env
+
+        def _right_env(pattern, sym_pattern_mpo):
+            key = (direct_family_env_revision[0], bond, tuple(pattern[bond + 2:]))
+            cached = direct_family_right_env_cache.get(key)
+            if cached is not None:
+                return cached
+            if bond + 2 >= L:
+                env = initial_F(
+                    sym_pattern_mpo[bond + 1],
+                    target_qn=target_qn if target_qn is not None else 0,
+                )
+            else:
+                env = initial_F(
+                    sym_pattern_mpo[-1],
+                    target_qn=target_qn if target_qn is not None else 0,
+                )
+                for site in range(L - 1, bond + 1, -1):
+                    env = contract_from_right(
+                        sym_pattern_mpo[site],
+                        MPS[site],
+                        env,
+                        MPS[site],
+                )
+            direct_family_right_env_cache[key] = env
+            return env
+
+        for family_name, terms in _direct_family_pattern_terms().items():
+            entries = []
+            for pattern, coeff in terms:
+                try:
+                    sym_term_mpo = _sym_mpo_for_pattern(pattern)
+                    E_term = _left_env(pattern, sym_term_mpo)
+                    F_term = _right_env(pattern, sym_term_mpo)
+                except Exception:
+                    entries = None
+                    break
+                entries.append((
+                    E_term,
+                    [sym_term_mpo[bond] * complex(coeff), sym_term_mpo[bond + 1]],
+                    F_term,
+                ))
+            if entries:
+                out[str(family_name)] = tuple(entries)
+        return out or None
+
     if len(MPS) == 2:
         if nstates > 1:
             Energy, MPS[0], MPS[1], trunc, states, last_AA_list = optimize_two_sites(
                 MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
                 U1=U1, sym_mgr=sym_mgr, nstates=nstates, weights=weights,
+                davidson_tol=davidson_tol,
+                davidson_max_iter=davidson_max_iter,
+                noise=_noise(0),
+                local_dense_max_dim=local_dense_max_dim,
+                complementary_operator_families=complementary_operator_families,
+                bond=0,
+                complementary_boundary_payloads=_comp_payload(0),
+                complementary_split_stats=comp_split_stats,
+                complementary_family_environments=_comp_family_env(0),
+                complementary_direct_family_environments=_direct_family_env(0),
             )
+            _invalidate_direct_family_env_cache()
             final_states = []
             for k in range(nstates):
                 MPS_k = [B.copy() for B in MPS]
@@ -3914,7 +6129,18 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             Energy, MPS[0], MPS[1], trunc, states = optimize_two_sites(
                 MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
                 U1=U1, sym_mgr=sym_mgr,
+                davidson_tol=davidson_tol,
+                davidson_max_iter=davidson_max_iter,
+                noise=_noise(0),
+                local_dense_max_dim=local_dense_max_dim,
+                complementary_operator_families=complementary_operator_families,
+                bond=0,
+                complementary_boundary_payloads=_comp_payload(0),
+                complementary_split_stats=comp_split_stats,
+                complementary_family_environments=_comp_family_env(0),
+                complementary_direct_family_environments=_direct_family_env(0),
             )
+            _invalidate_direct_family_env_cache()
         return Energy, MPS, "Right", True
     
     last_i = 0
@@ -3933,24 +6159,51 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
             last_i=last_i,
             last_AA_list=last_AA_list,
             gauge="Left" if direction == "lr" else "Right",
+            complementary_operator_stack=(
+                None if comp_stack is None else comp_stack.stats
+            ),
+            complementary_split_stats=_comp_split_snapshot(),
         )
 
     for sweep in range(0, int(sweeps/2)):
+        nz = _noise(sweep * 2)
         for i in range(0, len(MPS)-2):
             if nstates > 1:
                 # init_vecs = bond_guess_cache.get(i, None)
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights, init_vecs=last_AA_list)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights,
+                    init_vecs=last_AA_list, davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=nz, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
                 E_ground_state = Energy[0]
                 bond_guess_cache[i] = last_AA_list
             else:
                 Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1=U1, sym_mgr=sym_mgr,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=nz, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
                 E_ground_state = Energy
             logging.info("Sweep {:} Sites {:},{:}    Energy {:16.12f}    States {:4} Truncation {:16.12f}".format(sweep*2,i,i+1, E_ground_state, states, trunc))
 
             E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
+            for name, factors in complementary_operator_mpos.items():
+                comp_family_E[name].append(
+                    contract_from_left(factors[i], MPS[i], comp_family_E[name][-1], MPS[i])
+                )
             F.pop()
+            for stack in comp_family_F.values():
+                stack.pop()
             last_i = i
 
         if nstates > 1:
@@ -3970,20 +6223,48 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         else:
             Eold = e_avg
 
+        nz = _noise(sweep * 2 + 1)
         for i in range(len(MPS)-2, 0, -1):
             if nstates > 1:
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr, nstates=nstates, weights=weights)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr,
+                    nstates=nstates, weights=weights, davidson_tol=davidson_tol,
+                    davidson_max_iter=davidson_max_iter, noise=nz, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
                 E_ground_state = Energy[0]
             else:
                 Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1=U1, sym_mgr=sym_mgr,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=nz, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
                 
                 E_ground_state = Energy
             logging.info("Sweep {} Sites {},{}    Energy {:16.12f}    States {:4} Truncation {:16.12f}"
                      .format(sweep*2+1, i, i+1, E_ground_state, states, trunc))
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
+            for name, factors in complementary_operator_mpos.items():
+                comp_family_F[name].append(
+                    contract_from_right(
+                        factors[i + 1],
+                        MPS[i + 1],
+                        comp_family_F[name][-1],
+                        MPS[i + 1],
+                    )
+                )
             E.pop()
+            for stack in comp_family_E.values():
+                stack.pop()
             last_i = i
             
         if nstates > 1:
@@ -4017,13 +6298,40 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         for i in range(len(MPS)-2, center_i - 1, -1):
             if nstates > 1:
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr, nstates, weights)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr, nstates, weights,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=0.0, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
             else:
                 Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=0.0, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
             if i > center_i: # Don't shift environments on the final stop
                 F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
+                for name, factors in complementary_operator_mpos.items():
+                    comp_family_F[name].append(
+                        contract_from_right(
+                            factors[i + 1],
+                            MPS[i + 1],
+                            comp_family_F[name][-1],
+                            MPS[i + 1],
+                        )
+                    )
                 E.pop()
+                for stack in comp_family_E.values():
+                    stack.pop()
             last_i = i
 
     elif gauge == "Right" and last_i < center_i: 
@@ -4031,13 +6339,40 @@ def two_site_dmrg(mps, mpo, m, sweeps=50, conv=1e-6, U1=False, target_qn=None,\
         for i in range(0, center_i + 1):
             if nstates > 1:
                 Energy, MPS[i], MPS[i+1], trunc, states, last_AA_list = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr, nstates, weights,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=0.0, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
             else:
                 Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr)
+                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr,
+                    davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
+                    noise=0.0, local_dense_max_dim=local_dense_max_dim,
+                    complementary_operator_families=complementary_operator_families, bond=i,
+                    complementary_boundary_payloads=_comp_payload(i),
+                    complementary_split_stats=comp_split_stats,
+                    complementary_family_environments=_comp_family_env(i),
+                    complementary_direct_family_environments=_direct_family_env(i))
+                _invalidate_direct_family_env_cache()
             if i < center_i: # Don't shift environments on the final stop
                 E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
+                for name, factors in complementary_operator_mpos.items():
+                    comp_family_E[name].append(
+                        contract_from_left(
+                            factors[i],
+                            MPS[i],
+                            comp_family_E[name][-1],
+                            MPS[i],
+                        )
+                    )
                 F.pop()
+                for stack in comp_family_F.values():
+                    stack.pop()
             last_i = i
             
     if nstates == 1:

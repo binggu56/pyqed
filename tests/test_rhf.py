@@ -375,10 +375,30 @@ def test_rhf_print_mo_components_builtin_h2(capsys):
     captured = capsys.readouterr()
 
     assert captured.out == text + '\n'
+    assert text.startswith('Main AO components of molecular orbitals')
     assert 'MO 0:' in text
     assert '0 H 1s' in text
     assert '1 H 1s' in text
     assert 'contribution=+0.5000000000' in text
+
+
+def test_rhf_print_mo_components_limits_to_main_ao_components(capsys):
+    mol = Molecule(
+        atom='O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266',
+        unit='bohr',
+        basis='sto-3g',
+    )
+    mol.build(driver='builtin')
+    mf = RHF(mol).run()
+    capsys.readouterr()
+
+    text = mf.print_mo_components(mo_indices=4, metric='mulliken', max_components=1)
+    captured = capsys.readouterr()
+
+    assert captured.out == text + '\n'
+    assert text.startswith('Main AO components of molecular orbitals')
+    assert text.count('\n  AO') == 1
+    assert '0 O 2p' in text
 
 
 def test_rhf_analyze_returns_rhfanalysis():

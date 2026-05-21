@@ -390,7 +390,7 @@ def main():
         nt=args.nt,
         nout=args.nout,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
+        kinetic_action="matrix-free",
     )
     print(f"[timing] matrix-free Krylov propagation: {time.perf_counter() - prop_start:.2f} s")
 

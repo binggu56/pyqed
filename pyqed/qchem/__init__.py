@@ -63,6 +63,12 @@ except (ImportError, OSError):
     CDResult = None
 
 try:
+    from .xas import XAS, XASResult
+except (ImportError, OSError):
+    XAS = None
+    XASResult = None
+
+try:
     from .ir import IR
 except (ImportError, OSError):
     IR = None
@@ -154,6 +160,45 @@ try:
     from .mcscf.casci import CASCI
 except (ImportError, OSError):
     CASCI = None
+
+try:
+    from .mcscf.nac import (
+        AnalyticNACDriver,
+        MCSCFNACDriver,
+        MCSCFNACScanner,
+        MCSCFResponseBackend,
+        NACResponseResult,
+        analytic_nac,
+        mo_derivs,
+        nac_from_displaced_overlaps,
+        nac_from_hamiltonian_derivatives,
+        nac_rhs_cartesian,
+        nac_rhs_from_hamiltonian_derivative,
+        nac_rhs_from_integrals,
+        relaxed_nac,
+    )
+except (ImportError, OSError):
+    AnalyticNACDriver = None
+    MCSCFNACDriver = None
+    MCSCFNACScanner = None
+    MCSCFResponseBackend = None
+    NACResponseResult = None
+    analytic_nac = None
+    mo_derivs = None
+    nac_from_displaced_overlaps = None
+    nac_from_hamiltonian_derivatives = None
+    nac_rhs_cartesian = None
+    nac_rhs_from_hamiltonian_derivative = None
+    nac_rhs_from_integrals = None
+    relaxed_nac = None
+
+try:
+    from .mcscf.zvector import MCSCFZVector, MCSCFZVectorResult, NACRHS, PropertyRHS
+except (ImportError, OSError):
+    MCSCFZVectorResult = None
+    MCSCFZVector = None
+    NACRHS = None
+    PropertyRHS = None
 
 try:
     from .mcscf.casscf import CASSCF, FirstOrderCASSCF, SecondOrderCASSCF

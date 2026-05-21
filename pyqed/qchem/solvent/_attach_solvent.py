@@ -2,14 +2,8 @@
 Attach ddCOSMO to SCF, MCSCF, and post-SCF methods.
 '''
 
-import copy
-import numpy
-from pyscf import lib
-from pyscf.lib import logger
 from functools import reduce
-from pyscf import scf
 import numpy as np
-from functools import reduce
 
 
 _registered_classes = {}
@@ -127,6 +121,7 @@ def _copy_solvent_settings(target, source):
         "lebedev_order",
         "max_memory",
         "verbose",
+        "integral_backend",
     ):
         if hasattr(source, key):
             setattr(target, key, getattr(source, key))
@@ -172,7 +167,7 @@ def _for_tdscf(method, solvent_obj=None, dm=None, equilibrium_solvation=False):
 
     sol_td = TDSCFWithSolvent(method, solvent_obj)
     name = solvent_obj.__class__.__name__ + method.__class__.__name__
-    return lib.set_class(sol_td, (TDSCFWithSolvent, method.__class__), name)
+    return set_class(sol_td, (TDSCFWithSolvent, method.__class__), name)
 
 
 class TDSCFWithSolvent(_Solvation):
@@ -212,7 +207,7 @@ def _for_casci(mc, solvent_obj, dm=None):
 
     sol_mc = CASCIWithSolvent(mc, solvent_obj)
     name = solvent_obj.__class__.__name__ + mc.__class__.__name__
-    new_cls = lib.set_class(sol_mc, (CASCIWithSolvent, mc.__class__), name)
+    new_cls = set_class(sol_mc, (CASCIWithSolvent, mc.__class__), name)
     return new_cls
 
 class CASCIWithSolvent(_Solvation):
@@ -454,7 +449,7 @@ def _for_casscf(mc, solvent_obj, dm=None):
 
     sol_cas = CASSCFWithSolvent(mc, solvent_obj)
     name = solvent_obj.__class__.__name__ + mc.__class__.__name__
-    return lib.set_class(sol_cas, (CASSCFWithSolvent, mc.__class__), name)
+    return set_class(sol_cas, (CASSCFWithSolvent, mc.__class__), name)
 
 
 

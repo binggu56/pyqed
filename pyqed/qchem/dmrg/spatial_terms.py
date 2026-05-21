@@ -228,6 +228,98 @@ def spatial_two_body_spinfree_term_map(eri_spatial, *, cutoff=1.0e-14, include_h
     return term_map
 
 
+def spatial_generator_family_term_map(entries, *, cutoff=1.0e-14):
+    """
+    Build a spin-summed one-generator family term map.
+
+    ``entries`` maps ``(p, q)`` to the coefficient multiplying
+    ``E_pq = sum_sigma c^dagger[p,sigma] c[q,sigma]``.
+    """
+    term_map = {}
+    spin_terms = (("cdu", "cu"), ("cdd", "cd"))
+    for (p, q), value in dict(entries or {}).items():
+        p = int(p)
+        q = int(q)
+        value = complex(value)
+        if abs(value) <= cutoff:
+            continue
+        for create, destroy in spin_terms:
+            accumulate_spatial_jw_term(
+                term_map,
+                [create, destroy],
+                [p, q],
+                value,
+                tol=cutoff,
+            )
+    return term_map
+
+
+def spatial_two_generator_family_term_map(entries, *, cutoff=1.0e-14):
+    """
+    Build a spin-free two-generator family term map.
+
+    ``entries`` maps ``(p, q, r, s)`` to the coefficient multiplying
+    ``E_pq E_rs`` with ``E`` spin-summed.
+    """
+    term_map = {}
+    spin_terms = (("cdu", "cu"), ("cdd", "cd"))
+    for (p, q, r, s), value in dict(entries or {}).items():
+        p = int(p)
+        q = int(q)
+        r = int(r)
+        s = int(s)
+        value = complex(value)
+        if abs(value) <= cutoff:
+            continue
+        for left_create, left_destroy in spin_terms:
+            for right_create, right_destroy in spin_terms:
+                accumulate_spatial_jw_term(
+                    term_map,
+                    [left_create, left_destroy, right_create, right_destroy],
+                    [p, q, r, s],
+                    value,
+                    tol=cutoff,
+                )
+    return term_map
+
+
+def spatial_complementary_family_term_maps(families, *, cutoff=1.0e-14):
+    """
+    Build Hamiltonian term maps from block2-style complementary families.
+
+    The current Abelian spatial Hamiltonian uses the spin-free identity
+
+        H = sum_ps R_ps E_ps + sum_pqrs P_pqrs E_pq E_rs
+
+    where ``R`` already includes the one-body ``Q`` correction.  Structural
+    families ``S/A/B/Q`` remain available as metadata/operator-build inputs,
+    but only ``R`` and ``P`` carry scalar Hamiltonian coefficients here.
+    """
+    if families is None:
+        return {}
+    r_family = families.get("R") if hasattr(families, "get") else None
+    p_family = families.get("P") if hasattr(families, "get") else None
+    maps = {
+        "R": spatial_generator_family_term_map(
+            getattr(r_family, "entries", {}) if r_family is not None else {},
+            cutoff=cutoff,
+        ),
+        "P": spatial_two_generator_family_term_map(
+            getattr(p_family, "entries", {}) if p_family is not None else {},
+            cutoff=cutoff,
+        ),
+    }
+    return {name: term_map for name, term_map in maps.items() if term_map}
+
+
+def spatial_complementary_family_hamiltonian_term_map(families, *, cutoff=1.0e-14):
+    """Return the merged Hamiltonian term map represented by ``R`` and ``P``."""
+    return merge_term_maps(
+        *spatial_complementary_family_term_maps(families, cutoff=cutoff).values(),
+        cutoff=cutoff,
+    )
+
+
 def merge_term_maps(*term_maps, cutoff=1.0e-14):
     """Merge symbolic term maps using the same cancellation rule as accumulation."""
     merged = {}
@@ -235,3 +327,107 @@ def merge_term_maps(*term_maps, cutoff=1.0e-14):
         for (symbol, dofs), factor in term_map.items():
             accumulate_symbolic_term(merged, symbol, dofs, factor, tol=cutoff)
     return merged
+
+
+def _kron_all(operators):
+    out = np.asarray(operators[0], dtype=complex)
+    for operator in operators[1:]:
+        out = np.kron(out, np.asarray(operator, dtype=complex))
+    return out
+
+
+def dense_from_spatial_term_map(term_map, nsites):
+    """Materialize a spatial-site symbolic term map as a dense operator."""
+    ops = spatial_local_ops()
+    ident = ops["I"]
+    dense = np.zeros((4 ** int(nsites), 4 ** int(nsites)), dtype=complex)
+    for (symbol, dofs), factor in term_map.items():
+        local = [ident.copy() for _ in range(int(nsites))]
+        for piece, site in zip(str(symbol).split(), dofs):
+            local[int(site)] = ops[piece]
+        dense += complex(factor) * _kron_all(local)
+    return dense
+
+
+def spatial_complementary_local_term_maps(families, bond, *, cutoff=1.0e-14):
+    """
+    Build channel-resolved purely two-site R/P complementary terms.
+
+    This is the local physical-site piece of the block2-style family
+    decomposition.  It intentionally includes only terms whose orbital indices
+    are fully inside the active two-site window ``(bond, bond + 1)``.  Boundary
+    terms crossing into the left or right renormalized blocks require separate
+    S/R/A/P/B/Q operator tables.
+    """
+    if families is None:
+        return {}
+    active = {int(bond), int(bond) + 1}
+    maps = {"R": {}, "P": {}}
+    spin_terms = (("cdu", "cu"), ("cdd", "cd"))
+
+    r_family = families.get("R") if hasattr(families, "get") else None
+    r_entries = getattr(r_family, "entries", {}) if r_family is not None else {}
+    for (p, q), value in r_entries.items():
+        p = int(p)
+        q = int(q)
+        if {p, q} - active:
+            continue
+        for create, destroy in spin_terms:
+            symbol, dofs, factor = spatial_jw_term_spec(
+                [create, destroy],
+                [p, q],
+                complex(value),
+            )
+            if set(dofs) <= active:
+                shifted = [int(site) - int(bond) for site in dofs]
+                accumulate_symbolic_term(maps["R"], symbol, shifted, factor, tol=cutoff)
+
+    p_family = families.get("P") if hasattr(families, "get") else None
+    p_entries = getattr(p_family, "entries", {}) if p_family is not None else {}
+    for (p, q, r, s), value in p_entries.items():
+        p = int(p)
+        q = int(q)
+        r = int(r)
+        s = int(s)
+        if {p, q, r, s} - active:
+            continue
+        for left_create, left_destroy in spin_terms:
+            for right_create, right_destroy in spin_terms:
+                symbol, dofs, factor = spatial_jw_term_spec(
+                    [left_create, left_destroy, right_create, right_destroy],
+                    [p, q, r, s],
+                    complex(value),
+                )
+                if set(dofs) <= active:
+                    shifted = [int(site) - int(bond) for site in dofs]
+                    accumulate_symbolic_term(maps["P"], symbol, shifted, factor, tol=cutoff)
+
+    return {name: term_map for name, term_map in maps.items() if term_map}
+
+
+def spatial_complementary_local_term_map(families, bond, *, cutoff=1.0e-14):
+    """Build the summed purely two-site R/P complementary contribution."""
+    return merge_term_maps(
+        *spatial_complementary_local_term_maps(families, bond, cutoff=cutoff).values(),
+        cutoff=cutoff,
+    )
+
+
+def spatial_complementary_local_matrices(families, bond, *, cutoff=1.0e-14):
+    """Return dense two-site matrices for local R and P channels."""
+    return {
+        name: dense_from_spatial_term_map(term_map, 2)
+        for name, term_map in spatial_complementary_local_term_maps(
+            families,
+            bond,
+            cutoff=cutoff,
+        ).items()
+    }
+
+
+def spatial_complementary_local_matrix(families, bond, *, cutoff=1.0e-14):
+    """Return the dense two-site matrix for local R/P complementary terms."""
+    return dense_from_spatial_term_map(
+        spatial_complementary_local_term_map(families, bond, cutoff=cutoff),
+        2,
+    )

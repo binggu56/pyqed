@@ -67,6 +67,18 @@ def parse_args():
     )
     parser.add_argument("--xc", default="svwn", help="XC functional used when --qm-method=rks.")
     parser.add_argument(
+        "--embedding-pbc",
+        choices=("none", "nearest", "images"),
+        default="none",
+        help="Periodic MM-charge embedding mode for the QM Hamiltonian.",
+    )
+    parser.add_argument(
+        "--embedding-cutoff-angstrom",
+        type=float,
+        default=None,
+        help="Real-space image cutoff for --embedding-pbc=images.",
+    )
+    parser.add_argument(
         "--pyscf-every",
         type=int,
         default=0,
@@ -84,6 +96,11 @@ def main():
     box_length = args.box_angstrom / au2angstrom
     spacing = args.spacing_angstrom / au2angstrom
     cutoff = args.cutoff_angstrom / au2angstrom
+    embedding_cutoff = (
+        None
+        if args.embedding_cutoff_angstrom is None
+        else args.embedding_cutoff_angstrom / au2angstrom
+    )
     timestep = args.timestep_fs * fs
 
     if args.qm_method == "rks" and args.solute != "h2":
@@ -115,6 +132,8 @@ def main():
         qm_indices=qm_indices,
         mm_indices=mm_indices,
         electrostatic_embedding=True,
+        embedding_pbc=None if args.embedding_pbc == "none" else args.embedding_pbc,
+        embedding_cutoff=embedding_cutoff,
         qm_run_kwargs={"verbose": 0, "max_cycle": 100},
     )
     set_maxwell_boltzmann_velocities(system, temperature=args.temperature, seed=args.seed)
@@ -157,19 +176,20 @@ def main():
             pyscf_energy_error = np.nan
             pyscf_force_error = np.nan
             if args.pyscf_every > 0 and step % args.pyscf_every == 0:
-                pyscf_energy, pyscf_forces = pyscf_water_embedding(
+                pyscf_energy, pyscf_qm_forces, pyscf_pc_forces = pyscf_embedding(
                     system,
                     qm_indices,
-                    mm_indices,
-                    force_shape=forces.shape,
+                    components["embedding_coords"],
+                    components["embedding_charges"],
                     method=args.qm_method,
                     xc=args.xc,
                 )
-                embedding_forces = np.zeros_like(forces)
-                embedding_forces[qm_indices] = components["qm_forces"]
-                embedding_forces[mm_indices] = components["point_charge_forces"]
                 pyscf_energy_error = abs(components["qm_energy"] - pyscf_energy)
-                pyscf_force_error = float(np.max(np.abs(embedding_forces - pyscf_forces)))
+                qm_force_error = np.max(np.abs(components["qm_forces"] - pyscf_qm_forces))
+                pc_force_error = np.max(
+                    np.abs(components["embedding_point_charge_forces"] - pyscf_pc_forces)
+                )
+                pyscf_force_error = float(max(qm_force_error, pc_force_error))
                 max_pyscf_energy_error = max(max_pyscf_energy_error, pyscf_energy_error)
                 max_pyscf_force_error = max(max_pyscf_force_error, pyscf_force_error)
                 pyscf_comparisons += 1
@@ -196,6 +216,9 @@ def main():
     print(f"qm_method: {args.qm_method}")
     if args.qm_method == "rks":
         print(f"xc: {args.xc}")
+    print(f"embedding_pbc: {args.embedding_pbc}")
+    if embedding_cutoff is not None:
+        print(f"embedding_cutoff_bohr: {embedding_cutoff:.12e}")
     print(f"mm_atoms: {len(mm_indices)}")
     print(f"steps: {dynamics.get_number_of_steps()}")
     print(f"time_fs: {dynamics.get_time() * au2fs:.6f}")
@@ -235,7 +258,7 @@ def qm_method(positions, symbols, method="rhf", xc="svwn"):
     raise ValueError(f"Unknown QM method {method!r}.")
 
 
-def pyscf_water_embedding(system, qm_indices, mm_indices, force_shape, method="rhf", xc="svwn"):
+def pyscf_embedding(system, qm_indices, embedding_coords, embedding_charges, method="rhf", xc="svwn"):
     from pyscf import dft, gto, qmmm, scf
 
     positions = system.get_positions()
@@ -255,8 +278,8 @@ def pyscf_water_embedding(system, qm_indices, mm_indices, force_shape, method="r
         raise ValueError(f"Unknown QM method {method!r}.")
     pyscf_mf = qmmm.mm_charge(
         base,
-        positions[mm_indices],
-        system.get_array("charges")[mm_indices],
+        embedding_coords,
+        embedding_charges,
         unit="Bohr",
     ).run(verbose=0)
     pyscf_grad = pyscf_mf.nuc_grad_method()
@@ -265,10 +288,7 @@ def pyscf_water_embedding(system, qm_indices, mm_indices, force_shape, method="r
         pyscf_grad.grad_hcore_mm(pyscf_mf.make_rdm1())
         + pyscf_grad.grad_nuc_mm()
     )
-    forces = np.zeros(force_shape)
-    forces[qm_indices] = -pyscf_qm_grad
-    forces[mm_indices] = -pyscf_mm_grad
-    return pyscf_mf.e_tot, forces
+    return pyscf_mf.e_tot, -pyscf_qm_grad, -pyscf_mm_grad
 
 
 if __name__ == "__main__":

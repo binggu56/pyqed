@@ -26,10 +26,18 @@ def test_rovibronic_modules_import():
 
 def test_triatomic_normalizes_uam1_meci_aliases():
     _prefer_source_package()
-    from pyqed.namd.triatomic import _normalize_triatomic_electronic_method
+    from pyqed.namd.triatomic import (
+        _normalize_kinetic_action,
+        _normalize_rovibronic_kinetic_method,
+        _normalize_triatomic_electronic_method,
+    )
 
     assert _normalize_triatomic_electronic_method("UAM1/MECI") == "uam1-meci"
     assert _normalize_triatomic_electronic_method("uhf_am1/meci") == "uam1-meci"
+    assert _normalize_rovibronic_kinetic_method("numba") == "compiled"
+    assert _normalize_rovibronic_kinetic_method("bsr") == "sparse"
+    assert _normalize_rovibronic_kinetic_method("fused") == "python"
+    assert _normalize_kinetic_action("linear_operator") == "matrix-free"
 
 
 def test_triatomic_scan_worker_accepts_uam1_meci():
@@ -542,7 +550,7 @@ def test_triatomic_matrix_free_expm_multiply_matches_dense_linked_overlap():
         nt=1,
         nout=1,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
+        kinetic_action="matrix-free",
     )
 
     np.testing.assert_allclose(
@@ -666,7 +674,7 @@ def test_triatomic_factorized_rovibrational_keo_matches_dense():
 
 def test_triatomic_factorized_rovibronic_ldr_action_matches_dense():
     _prefer_source_package()
-    from pyqed.namd.triatomic import Triatom
+    from pyqed.namd.triatomic import Triatom, _compiled_rovibronic_block_matvec
 
     atom = [
         ["H", (1.0, 0.0, 0.0)],
@@ -693,10 +701,22 @@ def test_triatomic_factorized_rovibronic_ldr_action_matches_dense():
     dense_t = mol.build_rovibrational_keo(verbose=False)
     dense_h = mol._build_flat_kinetic_matrix(dense_t)
     factorized_h = mol.build_fused_factorized_rovibronic_ldr_action(verbose=False)
+    compiled_factorized_h = (
+        mol.build_compiled_factorized_rovibronic_ldr_action(verbose=False)
+        if _compiled_rovibronic_block_matvec is not None
+        else None
+    )
     sparse_factorized_h = mol.build_sparse_factorized_rovibronic_ldr_matrix(verbose=False)
 
     vec = rng.normal(size=dense_h.shape[0]) + 1j * rng.normal(size=dense_h.shape[0])
     np.testing.assert_allclose(factorized_h @ vec, dense_h @ vec, rtol=1e-11, atol=1e-11)
+    if compiled_factorized_h is not None:
+        np.testing.assert_allclose(
+            compiled_factorized_h @ vec,
+            dense_h @ vec,
+            rtol=1e-11,
+            atol=1e-11,
+        )
     np.testing.assert_allclose(
         sparse_factorized_h @ vec,
         dense_h @ vec,
@@ -707,7 +727,7 @@ def test_triatomic_factorized_rovibronic_ldr_action_matches_dense():
 
 def test_triatomic_factorized_rovibronic_propagation_matches_dense():
     _prefer_source_package()
-    from pyqed.namd.triatomic import Triatom
+    from pyqed.namd.triatomic import Triatom, _compiled_rovibronic_block_matvec
 
     atom = [
         ["H", (1.0, 0.0, 0.0)],
@@ -716,8 +736,23 @@ def test_triatomic_factorized_rovibronic_propagation_matches_dense():
     ]
     dense = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr", J=1, Jz=0)
     factorized = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr", J=1, Jz=0)
+    compiled_factorized = (
+        Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr", J=1, Jz=0)
+        if _compiled_rovibronic_block_matvec is not None
+        else None
+    )
+    compiled_alias = (
+        Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr", J=1, Jz=0)
+        if _compiled_rovibronic_block_matvec is not None
+        else None
+    )
     sparse_factorized = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr", J=1, Jz=0)
-    for mol in (dense, factorized, sparse_factorized):
+    mols = [dense, factorized, sparse_factorized]
+    if compiled_factorized is not None:
+        mols.append(compiled_factorized)
+    if compiled_alias is not None:
+        mols.append(compiled_alias)
+    for mol in mols:
         mol.set_dvr(domains=[[1.0, 1.4], [1.0, 1.4], [1.1, 1.5]], npts=[2, 2, 2])
         mol.apes = np.zeros((*mol.nx, mol.nstates))
 
@@ -732,6 +767,20 @@ def test_triatomic_factorized_rovibronic_propagation_matches_dense():
         *factorized.nx,
         factorized.nstates,
     )
+    if compiled_factorized is not None:
+        compiled_factorized.overlap_matrix = overlap.reshape(
+            *compiled_factorized.nx,
+            compiled_factorized.nstates,
+            *compiled_factorized.nx,
+            compiled_factorized.nstates,
+        )
+    if compiled_alias is not None:
+        compiled_alias.overlap_matrix = overlap.reshape(
+            *compiled_alias.nx,
+            compiled_alias.nstates,
+            *compiled_alias.nx,
+            compiled_alias.nstates,
+        )
     sparse_factorized.overlap_matrix = overlap.reshape(
         *sparse_factorized.nx,
         sparse_factorized.nstates,
@@ -755,18 +804,35 @@ def test_triatomic_factorized_rovibronic_propagation_matches_dense():
         nt=1,
         nout=1,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
-        factorized_rovibronic_kinetic=True,
+        rovibronic_kinetic="python",
     )
+    compiled_factorized_result = None
+    if compiled_factorized is not None:
+        compiled_factorized_result = compiled_factorized.run(
+            psi0,
+            dt=1e-4,
+            nt=1,
+            nout=1,
+            kinetic_propagator="expm_multiply",
+            rovibronic_kinetic="compiled",
+        )
+    compiled_alias_result = None
+    if compiled_alias is not None:
+        compiled_alias_result = compiled_alias.run(
+            psi0,
+            dt=1e-4,
+            nt=1,
+            nout=1,
+            kinetic_propagator="expm_multiply",
+            rovibronic_kinetic="compiled",
+        )
     sparse_factorized_result = sparse_factorized.run(
         psi0,
         dt=1e-4,
         nt=1,
         nout=1,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
-        factorized_rovibronic_kinetic=True,
-        sparse_factorized_rovibronic_kinetic=True,
+        rovibronic_kinetic="sparse",
     )
 
     np.testing.assert_allclose(
@@ -775,6 +841,20 @@ def test_triatomic_factorized_rovibronic_propagation_matches_dense():
         rtol=1e-11,
         atol=1e-11,
     )
+    if compiled_factorized_result is not None:
+        np.testing.assert_allclose(
+            compiled_factorized_result["psilist"][-1],
+            dense_result["psilist"][-1],
+            rtol=1e-11,
+            atol=1e-11,
+        )
+    if compiled_alias_result is not None:
+        np.testing.assert_allclose(
+            compiled_alias_result["psilist"][-1],
+            dense_result["psilist"][-1],
+            rtol=1e-11,
+            atol=1e-11,
+        )
     np.testing.assert_allclose(
         sparse_factorized_result["psilist"][-1],
         dense_result["psilist"][-1],

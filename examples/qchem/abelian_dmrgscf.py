@@ -37,10 +37,19 @@ def parse_args():
     parser.add_argument("--macro-cycles", type=int, default=3)
     parser.add_argument("--macro-tol", type=float, default=1.0e-6)
     parser.add_argument("--site", choices=("spatial", "spin_orbital"), default="spatial")
+    parser.add_argument("--symmetry", choices=("sz", "pg"), default="sz")
+    parser.add_argument("--spatial-abelian-mpo", choices=("grouped", "direct"), default="grouped")
+    parser.add_argument("--orb-sym", default=None, help="Comma-separated AbelianPG orbital irreps, e.g. 0,1,0,1")
     parser.add_argument("--nstates", type=int, default=1)
     parser.add_argument("--conv-tol", type=float, default=None)
     parser.add_argument("--sweep-tol", type=float, default=None)
     parser.add_argument("--dmrg-conv-tol", type=float, default=1.0e-7)
+    parser.add_argument("--davidson-tol", type=float, default=1.0e-5)
+    parser.add_argument("--davidson-max-iter", type=int, default=30)
+    parser.add_argument("--local-dense-max-dim", default="0")
+    parser.add_argument("--noise", type=float, default=1.0e-4)
+    parser.add_argument("--noise-decay", type=float, default=0.1)
+    parser.add_argument("--noise-cutoff", type=float, default=1.0e-9)
     parser.add_argument("--optimizer", default="RCG", choices=("RCG", "SD", "LBFGS", "NEWTON", "AH"))
     parser.add_argument("--orb-grad-tol", type=float, default=None)
     parser.add_argument("--optimizer-max-steps", type=int, default=200)
@@ -83,13 +92,20 @@ def main():
 
     print("[3/4] Abelian DMRGSCF constrained orbital optimization")
     print(f"      CAS        : ({args.nelecas}e, {args.ncas}o)")
-    print("      symmetry   : charge + Sz")
+    print(f"      symmetry   : {args.symmetry}")
     print(f"      site       : {args.site}")
+    print(f"      MPO        : {args.spatial_abelian_mpo}")
+    orb_sym = None if args.orb_sym is None else tuple(int(x) for x in args.orb_sym.split(",") if x.strip())
+    if orb_sym is not None:
+        print(f"      orb sym    : {orb_sym}")
     print(f"      DMRG       : D={args.D}, sweeps={args.sweeps}")
     sweep_tol = args.sweep_tol
     if sweep_tol is None:
         sweep_tol = args.conv_tol if args.conv_tol is not None else args.dmrg_conv_tol
     print(f"      sweep tol  : {sweep_tol:g}")
+    print(f"      local tol  : {args.davidson_tol:g}")
+    print(f"      local dense: {args.local_dense_max_dim}")
+    print(f"      noise      : {args.noise:g} decay={args.noise_decay:g}")
     print(f"      macro tol  : {args.macro_tol:g}")
     print(f"      macro max  : {args.macro_cycles}")
     mc = DMRGSCF(
@@ -101,7 +117,9 @@ def main():
         macro_tol=args.macro_tol,
         init_guess="hf",
         site=args.site,
-        symmetry="sz",
+        spatial_abelian_mpo=args.spatial_abelian_mpo,
+        orb_sym=orb_sym,
+        symmetry=args.symmetry,
         spin=0,
         verbose=args.verbose,
         dmrg_conv_tol=args.dmrg_conv_tol,
@@ -113,9 +131,15 @@ def main():
     mc.run(
         nstates=args.nstates,
         nsweeps=args.sweeps,
-        symmetry="sz",
+        symmetry=args.symmetry,
         compute_s2=True,
         sweep_tol=sweep_tol,
+        davidson_tol=args.davidson_tol,
+        davidson_max_iter=args.davidson_max_iter,
+        local_dense_max_dim=args.local_dense_max_dim,
+        noise=args.noise,
+        noise_decay=args.noise_decay,
+        noise_cutoff=args.noise_cutoff,
         require_conv=not args.allow_unconverged,
         optimizer=args.optimizer,
         orb_grad_tol=args.orb_grad_tol,

@@ -47,27 +47,27 @@ for i, e in enumerate(e_tot):
 HARTREE2EV = 27.211386245988
 e0 = e_tot[0]
 
-gbasis_shells_cart = mol._get_or_build_gbasis_shells_cart()
-ao_cart2sph        = mol._ao_cart2sph
+# gbasis_shells_cart = mol._get_or_build_gbasis_shells_cart()
+# ao_cart2sph        = mol._ao_cart2sph
 
-data = {
-    'spin_label':         'singlet',
-    'spin':               0,
-    'ncas':               ncas,
-    'nelecas':            nelecas,
-    'ncore':              mc.ncore,
-    'mo_coeff':           mc.mo_coeff,
-    'ci':                 mc.ci,
-    'binary':             mc.casci.binary,
-    'e_tot':              e_tot,
-    'weights':            np.array(weights, dtype=float),
-    'converged':          bool(mc.converged),
-    'gbasis_shells_cart': gbasis_shells_cart,
-    'ao_cart2sph':        ao_cart2sph,
-    'atom_list':          atom_list,
-    'basis':              '6-31g',
-    'comment':            "q2=-4.5882, q6=0.0000",
-}
+# data = {
+#     'spin_label':         'singlet',
+#     'spin':               0,
+#     'ncas':               ncas,
+#     'nelecas':            nelecas,
+#     'ncore':              mc.ncore,
+#     'mo_coeff':           mc.mo_coeff,
+#     'ci':                 mc.ci,
+#     'binary':             mc.casci.binary,
+#     'e_tot':              e_tot,
+#     'weights':            np.array(weights, dtype=float),
+#     'converged':          bool(mc.converged),
+#     'gbasis_shells_cart': gbasis_shells_cart,
+#     'ao_cart2sph':        ao_cart2sph,
+#     'atom_list':          atom_list,
+#     'basis':              '6-31g',
+#     'comment':            "q2=-4.5882, q6=0.0000",
+# }
 
-with open("casscf_157_1212.pkl", "wb") as f:
-    pickle.dump(data, f)
+# with open("casscf_157_1212.pkl", "wb") as f:
+#     pickle.dump(data, f)

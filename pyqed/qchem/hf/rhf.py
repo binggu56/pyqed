@@ -937,12 +937,14 @@ class RHF:
         metric='mulliken',
         min_contribution=0.0,
         sort=True,
+        max_components=None,
     ):
         return self.analyze().mo_components(
             mo_indices=mo_indices,
             metric=metric,
             min_contribution=min_contribution,
             sort=sort,
+            max_components=max_components,
         )
 
     def print_mo_components(
@@ -951,12 +953,14 @@ class RHF:
         metric='mulliken',
         min_contribution=0.0,
         sort=True,
+        max_components=None,
     ):
         return self.analyze().print_mo_components(
             mo_indices=mo_indices,
             metric=metric,
             min_contribution=min_contribution,
             sort=sort,
+            max_components=max_components,
         )
 
     def mulliken_charges(self, dm=None):

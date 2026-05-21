@@ -757,14 +757,18 @@ def _add_pme_coulomb(
 
 
 def _add_pme_reciprocal(positions, lengths, forces, charges, coulomb_constant, alpha, mesh):
-    charge_grid = _assign_charges_cic(positions, charges, lengths, mesh)
-    rho_hat = np.fft.fftn(charge_grid)
-    kx, ky, kz, influence, grid_size = _pme_reciprocal_data(
-        lengths, mesh, coulomb_constant, alpha
+    potential_grid = pme_reciprocal_potential_grid(
+        positions,
+        charges,
+        np.diag(lengths),
+        (True, True, True),
+        coulomb_constant=coulomb_constant,
+        alpha=alpha,
+        mesh=mesh,
     )
-
-    phi_hat = grid_size * influence * rho_hat
-    potential_grid = np.fft.ifftn(phi_hat).real
+    charge_grid = _assign_charges_cic(positions, charges, lengths, mesh)
+    kx, ky, kz, influence, grid_size = _pme_reciprocal_data(lengths, mesh, coulomb_constant, alpha)
+    rho_hat = np.fft.fftn(charge_grid)
     field_grids = [
         np.fft.ifftn(grid_size * (-1j * axis_grid) * influence * rho_hat).real
         for axis_grid in (kx, ky, kz)
@@ -779,6 +783,71 @@ def _add_pme_reciprocal(positions, lengths, forces, charges, coulomb_constant, a
     )
     forces += charges[:, None] * electric_field
     return energy
+
+
+def pme_reciprocal_potential_grid(
+    positions,
+    charges,
+    cell,
+    pbc=True,
+    coulomb_constant=1.0,
+    alpha=0.35,
+    mesh=(16, 16, 16),
+):
+    """Return the smooth reciprocal-space PME potential on the PME mesh.
+
+    The returned grid uses the same CIC assignment and reciprocal influence
+    function as :class:`PMECoulomb`.  The zero Fourier mode is omitted, so the
+    potential follows the usual neutral-cell PME convention.
+    """
+    pbc = np.asarray((pbc, pbc, pbc) if isinstance(pbc, bool) else pbc, dtype=bool)
+    if not np.all(pbc):
+        raise ValueError("PME reciprocal potential requires 3D periodic boundary conditions.")
+    lengths = _orthorhombic_lengths(cell)
+    if lengths is None:
+        raise ValueError("PME reciprocal potential currently requires an orthorhombic cell.")
+    charges = np.asarray(charges, dtype=float)
+    if abs(float(np.sum(charges))) > 1e-10:
+        raise ValueError("PME reciprocal potential requires a neutral unit cell.")
+    if alpha <= 0.0:
+        raise ValueError("PME alpha must be positive.")
+    mesh = np.asarray(mesh, dtype=int)
+    if mesh.shape != (3,) or np.any(mesh < 4):
+        raise ValueError("PME mesh must be a length-3 sequence with values >= 4.")
+
+    charge_grid = _assign_charges_cic(positions, charges, lengths, mesh)
+    rho_hat = np.fft.fftn(charge_grid)
+    _, _, _, influence, grid_size = _pme_reciprocal_data(
+        lengths,
+        mesh,
+        coulomb_constant,
+        alpha,
+    )
+    return np.fft.ifftn(grid_size * influence * rho_hat).real
+
+
+def pme_reciprocal_potential(
+    positions,
+    charges,
+    points,
+    cell,
+    pbc=True,
+    coulomb_constant=1.0,
+    alpha=0.35,
+    mesh=(16, 16, 16),
+):
+    """Interpolate the smooth reciprocal-space PME potential to ``points``."""
+    lengths = _orthorhombic_lengths(cell)
+    potential_grid = pme_reciprocal_potential_grid(
+        positions,
+        charges,
+        cell,
+        pbc,
+        coulomb_constant=coulomb_constant,
+        alpha=alpha,
+        mesh=mesh,
+    )
+    return _interpolate_cic(points, potential_grid, lengths, np.asarray(mesh, dtype=int))
 
 
 def _pme_reciprocal_data(lengths, mesh, coulomb_constant, alpha):

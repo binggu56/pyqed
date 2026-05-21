@@ -897,6 +897,167 @@ cdef inline double _contracted_cartesian_scalar_fixed_mv(
     return value
 
 
+cdef inline double _contracted_surface_scalar_fixed_mv(
+    double[:, ::1] origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    i64_t[::1] nprim_v,
+    int a,
+    int b,
+    int kind_a,
+    int kind_b,
+    double Cx,
+    double Cy,
+    double Cz,
+    double cexp,
+) noexcept nogil:
+    cdef Py_ssize_t ia, ib
+    cdef double aexp, bexp
+    cdef double p, q, alpha, mu_ab, lam_a, lam_b
+    cdef double Px, Py, Pz
+    cdef double ABx, ABy, ABz, PQx, PQy, PQz
+    cdef double AB2, PQ2, T, pref, weight_prod, charge_weight
+    cdef double coeff_a, coeff_b, coeff_prod
+    cdef double term_total
+    cdef int nterm_a, nterm_b
+    cdef int na, nb, rank, pos
+    cdef int ta, tb, m
+    cdef int axa0, axa1, axb0, axb1
+    cdef int center_ids[4]
+    cdef int coord_ids[4]
+    cdef double exponent_ids[4]
+    cdef double boys_values[5]
+    cdef double AB[3]
+    cdef double CD[3]
+    cdef double PQ[3]
+    cdef int orders[RYS_FIXED_MAX_TERMS]
+    cdef double scalars[RYS_FIXED_MAX_TERMS]
+    cdef int nvec[RYS_FIXED_MAX_TERMS]
+    cdef int vec_axes[RYS_FIXED_MAX_TERMS][4]
+    cdef int vec_names[RYS_FIXED_MAX_TERMS][4]
+    cdef int ndelta[RYS_FIXED_MAX_TERMS]
+    cdef int delta_axis1[RYS_FIXED_MAX_TERMS][4]
+    cdef int delta_axis2[RYS_FIXED_MAX_TERMS][4]
+    cdef int nterms
+    cdef double value = 0.0
+
+    nterm_a = _shell_kind_term_count(kind_a)
+    nterm_b = _shell_kind_term_count(kind_b)
+    if nterm_a == 0 or nterm_b == 0:
+        return 1.0e300
+
+    q = cexp
+    charge_weight = pow(cexp / PI, 1.5)
+    CD[0] = 0.0
+    CD[1] = 0.0
+    CD[2] = 0.0
+
+    for ia in range(nprim_v[a]):
+        aexp = exps_v[a, ia]
+        for ib in range(nprim_v[b]):
+            bexp = exps_v[b, ib]
+            p = aexp + bexp
+            alpha = p * q / (p + q)
+            mu_ab = aexp * bexp / p
+            lam_a = aexp / p
+            lam_b = bexp / p
+            Px = (aexp * origins_v[a, 0] + bexp * origins_v[b, 0]) / p
+            Py = (aexp * origins_v[a, 1] + bexp * origins_v[b, 1]) / p
+            Pz = (aexp * origins_v[a, 2] + bexp * origins_v[b, 2]) / p
+            ABx = origins_v[a, 0] - origins_v[b, 0]
+            ABy = origins_v[a, 1] - origins_v[b, 1]
+            ABz = origins_v[a, 2] - origins_v[b, 2]
+            AB2 = ABx * ABx + ABy * ABy + ABz * ABz
+            PQx = Px - Cx
+            PQy = Py - Cy
+            PQz = Pz - Cz
+            PQ2 = PQx * PQx + PQy * PQy + PQz * PQz
+            T = alpha * PQ2
+            pref = ERI_PREFAC * exp(-mu_ab * AB2) / (p * q * sqrt(p + q))
+            AB[0] = ABx; AB[1] = ABy; AB[2] = ABz
+            PQ[0] = PQx; PQ[1] = PQy; PQ[2] = PQz
+            weight_prod = weights_v[a, ia] * weights_v[b, ib] * charge_weight
+            term_total = 0.0
+
+            for ta in range(nterm_a):
+                _shell_kind_fill_term(kind_a, aexp, ta, &coeff_a, &na, &axa0, &axa1)
+                for tb in range(nterm_b):
+                    _shell_kind_fill_term(kind_b, bexp, tb, &coeff_b, &nb, &axb0, &axb1)
+                    coeff_prod = coeff_a * coeff_b
+                    rank = na + nb
+                    if rank == 0:
+                        term_total += coeff_prod * pref * _boys_value(0, T)
+                        continue
+                    if rank > 4:
+                        return 1.0e300
+                    for m in range(rank + 1):
+                        boys_values[m] = _boys_value(m, T)
+                    pos = 0
+                    if na > 0:
+                        center_ids[pos] = 0
+                        coord_ids[pos] = axa0
+                        exponent_ids[pos] = aexp
+                        pos += 1
+                        if na > 1:
+                            center_ids[pos] = 0
+                            coord_ids[pos] = axa1
+                            exponent_ids[pos] = aexp
+                            pos += 1
+                    if nb > 0:
+                        center_ids[pos] = 1
+                        coord_ids[pos] = axb0
+                        exponent_ids[pos] = bexp
+                        pos += 1
+                        if nb > 1:
+                            center_ids[pos] = 1
+                            coord_ids[pos] = axb1
+                            exponent_ids[pos] = bexp
+                            pos += 1
+
+                    nterms = _build_promoted_terms_fixed(
+                        rank,
+                        center_ids,
+                        exponent_ids,
+                        alpha,
+                        mu_ab,
+                        0.0,
+                        lam_a,
+                        lam_b,
+                        1.0,
+                        0.0,
+                        orders,
+                        scalars,
+                        nvec,
+                        vec_axes,
+                        vec_names,
+                        ndelta,
+                        delta_axis1,
+                        delta_axis2,
+                    )
+                    if nterms < 0:
+                        return 1.0e300
+                    term_total += coeff_prod * _evaluate_fixed_scalar(
+                        rank,
+                        coord_ids,
+                        nterms,
+                        orders,
+                        scalars,
+                        nvec,
+                        vec_axes,
+                        vec_names,
+                        ndelta,
+                        delta_axis1,
+                        delta_axis2,
+                        boys_values,
+                        pref,
+                        AB,
+                        CD,
+                        PQ,
+                    )
+            value += weight_prod * term_total
+    return value
+
+
 cdef int _build_promoted_terms_fixed(
     int rank,
     int* center_ids,
@@ -1024,6 +1185,64 @@ cdef int _build_promoted_terms_fixed(
         nterms = next_terms
 
     return nterms
+
+
+cpdef compute_surface_charge_ao_coulomb_rys(
+    cnp.ndarray[i64_t, ndim=2] shells,
+    cnp.ndarray[f64_t, ndim=2] origins,
+    cnp.ndarray[f64_t, ndim=2] exps,
+    cnp.ndarray[f64_t, ndim=2] weights,
+    cnp.ndarray[i64_t, ndim=1] nprim,
+    cnp.ndarray[f64_t, ndim=2] grid_coords,
+    cnp.ndarray[f64_t, ndim=1] charge_exponents,
+):
+    cdef i64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef i64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] grid_v = grid_coords
+    cdef double[::1] charge_exp_v = charge_exponents
+    cdef int nao = shells.shape[0]
+    cdef int ngrids = grid_coords.shape[0]
+    cdef cnp.ndarray[f64_t, ndim=3] tensor = np.zeros((nao, nao, ngrids), dtype=np.float64)
+    cdef double[:, :, ::1] tensor_v = tensor
+    cdef int i, j, l
+    cdef int kind_i, kind_j
+    cdef double value
+
+    if charge_exponents.shape[0] != ngrids:
+        raise ValueError("charge_exponents length must match grid_coords.")
+
+    for i in range(nao):
+        kind_i = _shell_kind_axis(shells_v, i)
+        if kind_i < 0:
+            raise NotImplementedError("Compiled PCM Rys integrals support Cartesian s/p/d shells.")
+        for j in range(i + 1):
+            kind_j = _shell_kind_axis(shells_v, j)
+            if kind_j < 0:
+                raise NotImplementedError("Compiled PCM Rys integrals support Cartesian s/p/d shells.")
+            for l in range(ngrids):
+                value = _contracted_surface_scalar_fixed_mv(
+                    origins_v,
+                    exps_v,
+                    weights_v,
+                    nprim_v,
+                    i,
+                    j,
+                    kind_i,
+                    kind_j,
+                    grid_v[l, 0],
+                    grid_v[l, 1],
+                    grid_v[l, 2],
+                    charge_exp_v[l],
+                )
+                if value == 1.0e300:
+                    raise NotImplementedError("Compiled PCM Rys integral term storage was exceeded.")
+                tensor_v[i, j, l] = value
+                if i != j:
+                    tensor_v[j, i, l] = value
+    return tensor
 
 
 cpdef object evaluate_block(

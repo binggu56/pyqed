@@ -33,6 +33,47 @@ def _zeros_like_q_shape(q: np.ndarray, shape: tuple[int, ...], dtype=complex) ->
     return np.zeros((q.size, *shape), dtype=dtype)
 
 
+def grad_overlap_from_derivative_couplings(overlap: ArrayLike, derivative_couplings: ArrayLike) -> np.ndarray:
+    r"""Return LDR overlap gradients from local derivative couplings.
+
+    The convention is
+
+    ``derivative_couplings[j, n, beta, alpha] =
+    <phi_beta(R_n)|d phi_alpha(R_n)/dq_j>``.
+
+    For each LDR block \(A_{mn}\),
+
+    \[
+        \partial_j A_{mn} = -D_j(R_m) A_{mn} + A_{mn} D_j(R_n).
+    \]
+    """
+
+    overlap = np.asarray(overlap, dtype=complex)
+    derivative_couplings = np.asarray(derivative_couplings, dtype=complex)
+    if overlap.ndim != 4 or overlap.shape[0] != overlap.shape[2] or overlap.shape[1] != overlap.shape[3]:
+        raise ValueError(
+            "overlap must have shape (ngrid, nstates, ngrid, nstates); "
+            f"got {overlap.shape}."
+        )
+    expected = (derivative_couplings.shape[0], overlap.shape[0], overlap.shape[1], overlap.shape[1])
+    if derivative_couplings.shape != expected:
+        raise ValueError(
+            "derivative_couplings must have shape (ncoord, ngrid, nstates, nstates); "
+            f"got {derivative_couplings.shape}, expected {expected}."
+        )
+
+    ncoord, ngrid, _, _ = derivative_couplings.shape
+    grad = np.empty((ncoord, *overlap.shape), dtype=complex)
+    for j in range(ncoord):
+        for m in range(ngrid):
+            left = derivative_couplings[j, m]
+            for n in range(ngrid):
+                right = derivative_couplings[j, n]
+                block = overlap[m, :, n, :]
+                grad[j, m, :, n, :] = -left @ block + block @ right
+    return grad
+
+
 @dataclass
 class LDRFGRHS:
     """Right-hand side of the LDRFG TDVP equations."""
@@ -55,6 +96,10 @@ class LDRFG:
     energies
         Adiabatic energies \(E_\alpha(x_n,q)\), shape ``(ngrid, nstates)``,
         or a callable ``energies(q)`` returning that shape.
+    electronic_hamiltonian
+        Optional full local electronic Hamiltonian
+        \(V_{\beta\alpha}(x_n,q)\), shape ``(ngrid, nstates, nstates)``.
+        If omitted, ``energies`` are used as diagonal local Hamiltonians.
     overlap
         LDR electronic overlap
         \(A_{m\beta,n\alpha}(q)=\langle\phi_\beta(x_m,q)|\phi_\alpha(x_n,q)\rangle\),
@@ -86,6 +131,8 @@ class LDRFG:
         overlap: QDependent,
         *,
         grad_energies: QDependent | None = None,
+        electronic_hamiltonian: QDependent | None = None,
+        grad_electronic_hamiltonian: QDependent | None = None,
         grad_overlap: QDependent | None = None,
         berry: QDependent | None = None,
         gamma: ArrayLike | None = None,
@@ -103,6 +150,8 @@ class LDRFG:
 
         self.inv_masses_y = 1.0 / self.masses_y
         self.energies = energies
+        self.electronic_hamiltonian = electronic_hamiltonian
+        self.grad_electronic_hamiltonian = grad_electronic_hamiltonian
         self.overlap = overlap
         self.grad_energies = grad_energies
         self.grad_overlap = grad_overlap
@@ -129,8 +178,8 @@ class LDRFG:
         return self.masses_y.size
 
     def electronic_shape(self, q: ArrayLike) -> tuple[int, int]:
-        energies = self.energies_at(q)
-        return energies.shape
+        electronic_h = self.electronic_hamiltonian_at(q)
+        return electronic_h.shape[:2]
 
     def energies_at(self, q: ArrayLike) -> np.ndarray:
         q = self._validate_q(q)
@@ -145,11 +194,28 @@ class LDRFG:
     def overlap_at(self, q: ArrayLike) -> np.ndarray:
         q = self._validate_q(q)
         overlap = _asarray_or_call(self.overlap, q, dtype=complex)
-        energies = self.energies_at(q)
-        expected = (self.ngrid, energies.shape[1], self.ngrid, energies.shape[1])
+        _, nstates = self.electronic_shape(q)
+        expected = (self.ngrid, nstates, self.ngrid, nstates)
         if overlap.shape != expected:
             raise ValueError(f"overlap(q) shape {overlap.shape} != expected {expected}.")
         return overlap
+
+    def electronic_hamiltonian_at(self, q: ArrayLike) -> np.ndarray:
+        q = self._validate_q(q)
+        if self.electronic_hamiltonian is None:
+            energies = self.energies_at(q)
+            local = np.zeros((*energies.shape, energies.shape[1]), dtype=complex)
+            for n in range(self.ngrid):
+                local[n] = np.diag(energies[n])
+            return local
+
+        local = _asarray_or_call(self.electronic_hamiltonian, q, dtype=complex)
+        if local.ndim != 3 or local.shape[0] != self.ngrid or local.shape[1] != local.shape[2]:
+            raise ValueError(
+                "electronic_hamiltonian(q) must have shape "
+                f"(ngrid, nstates, nstates); got {local.shape}."
+            )
+        return local
 
     def grad_energies_at(self, q: ArrayLike) -> np.ndarray:
         q = self._validate_q(q)
@@ -160,6 +226,25 @@ class LDRFG:
         expected = (self.ny, *energies.shape)
         if grad.shape != expected:
             raise ValueError(f"grad_energies(q) shape {grad.shape} != expected {expected}.")
+        return grad
+
+    def grad_electronic_hamiltonian_at(self, q: ArrayLike) -> np.ndarray:
+        q = self._validate_q(q)
+        local = self.electronic_hamiltonian_at(q)
+        expected = (self.ny, *local.shape)
+        if self.grad_electronic_hamiltonian is None:
+            grad_e = self.grad_energies_at(q)
+            grad_local = np.zeros(expected, dtype=complex)
+            for j in range(self.ny):
+                for n in range(self.ngrid):
+                    grad_local[j, n] = np.diag(grad_e[j, n])
+            return grad_local
+
+        grad = _asarray_or_call(self.grad_electronic_hamiltonian, q, dtype=complex)
+        if grad.shape != expected:
+            raise ValueError(
+                f"grad_electronic_hamiltonian(q) shape {grad.shape} != expected {expected}."
+            )
         return grad
 
     def grad_overlap_at(self, q: ArrayLike) -> np.ndarray:
@@ -188,16 +273,16 @@ class LDRFG:
         r"""Return \(H_{m\beta,n\alpha}(q,p)\)."""
         q = self._validate_q(q)
         p = self._validate_p(p)
-        energies = self.energies_at(q)
+        electronic_h = self.electronic_hamiltonian_at(q)
         overlap = self.overlap_at(q)
-        nstates = energies.shape[1]
+        nstates = electronic_h.shape[1]
 
         h_tensor = np.einsum("mn,mbna->mbna", self.kinetic_x, overlap)
         kinetic_y = 0.5 * np.sum(self.inv_masses_y * p**2)
-        diagonal = energies + kinetic_y + self.width_energy
         for n in range(self.ngrid):
+            h_tensor[n, :, n, :] += electronic_h[n]
             for alpha in range(nstates):
-                h_tensor[n, alpha, n, alpha] += diagonal[n, alpha]
+                h_tensor[n, alpha, n, alpha] += kinetic_y + self.width_energy
         return h_tensor
 
     def hamiltonian(self, q: ArrayLike, p: ArrayLike) -> np.ndarray:
@@ -209,16 +294,15 @@ class LDRFG:
     def grad_hamiltonian_tensor(self, q: ArrayLike, p: ArrayLike | None = None) -> np.ndarray:
         r"""Return \(\partial H_{m\beta,n\alpha}/\partial q_j\)."""
         q = self._validate_q(q)
-        energies = self.energies_at(q)
-        grad_e = self.grad_energies_at(q)
+        electronic_h = self.electronic_hamiltonian_at(q)
+        grad_electronic_h = self.grad_electronic_hamiltonian_at(q)
         grad_a = self.grad_overlap_at(q)
-        nstates = energies.shape[1]
+        nstates = electronic_h.shape[1]
 
         grad_h = np.einsum("mn,jmbna->jmbna", self.kinetic_x, grad_a)
         for j in range(self.ny):
             for n in range(self.ngrid):
-                for alpha in range(nstates):
-                    grad_h[j, n, alpha, n, alpha] += grad_e[j, n, alpha]
+                grad_h[j, n, :, n, :] += grad_electronic_h[j, n]
         return grad_h
 
     def grad_hamiltonian(self, q: ArrayLike, p: ArrayLike | None = None) -> np.ndarray:

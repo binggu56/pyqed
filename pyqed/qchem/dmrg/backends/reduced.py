@@ -116,6 +116,10 @@ class SpatialComplementaryOperatorFamilies:
     prefer_direct_component_transform: bool = False
     prefer_recursive_operator_matvec: bool = True
     prefer_complementary_payload_tensor_matvec: bool = False
+    prefer_precontracted_family_environment: bool = False
+    debug_complementary_action_check: bool = False
+    debug_complementary_action_check_tol: float = 1.0e-10
+    debug_complementary_action_check_limit: int = 32
 
     def __getitem__(self, name):
         """Return a named family such as ``"P"`` or ``"Q"``."""
@@ -171,6 +175,18 @@ class SpatialComplementaryOperatorFamilies:
             "prefer_complementary_payload_tensor_matvec": bool(
                 self.prefer_complementary_payload_tensor_matvec
             ),
+            "prefer_precontracted_family_environment": bool(
+                self.prefer_precontracted_family_environment
+            ),
+            "debug_complementary_action_check": bool(
+                self.debug_complementary_action_check
+            ),
+            "debug_complementary_action_check_tol": float(
+                self.debug_complementary_action_check_tol
+            ),
+            "debug_complementary_action_check_limit": int(
+                self.debug_complementary_action_check_limit
+            ),
             "families": {
                 name: family.as_metadata()
                 for name, family in self.families.items()
@@ -186,6 +202,11 @@ def build_spatial_complementary_operator_families(
     *,
     cutoff=1.0e-10,
     include_half=True,
+    prefer_complementary_payload_tensor_matvec=False,
+    prefer_precontracted_family_environment=False,
+    debug_complementary_action_check=False,
+    debug_complementary_action_check_tol=1.0e-10,
+    debug_complementary_action_check_limit=32,
 ):
     """
     Build sparse block2-style ``S/R/A/P/B/Q`` families from active integrals.
@@ -207,6 +228,15 @@ def build_spatial_complementary_operator_families(
     :param cutoff: Absolute screening threshold.
     :param include_half: Whether to apply the conventional two-electron
         prefactor ``1/2`` to ERI coefficients.
+    :param prefer_complementary_payload_tensor_matvec: Whether downstream
+        sweep kernels should prefer the family/payload boundary matvec over
+        the generic residual split.
+    :param prefer_precontracted_family_environment: Whether downstream sweep
+        kernels should precontract named family environments before the local
+        center action.  This is useful for profiling but not the default on
+        small and medium Abelian benchmarks.
+    :param debug_complementary_action_check: Enable live local-action checks
+        against the exact MPO action in sweep kernels.
     :returns: :class:`SpatialComplementaryOperatorFamilies`.
     """
 
@@ -309,6 +339,15 @@ def build_spatial_complementary_operator_families(
         n_sites=n_sites,
         cutoff=cutoff,
         include_half=bool(include_half),
+        prefer_complementary_payload_tensor_matvec=bool(
+            prefer_complementary_payload_tensor_matvec
+        ),
+        prefer_precontracted_family_environment=bool(
+            prefer_precontracted_family_environment
+        ),
+        debug_complementary_action_check=bool(debug_complementary_action_check),
+        debug_complementary_action_check_tol=float(debug_complementary_action_check_tol),
+        debug_complementary_action_check_limit=int(debug_complementary_action_check_limit),
     )
 
 

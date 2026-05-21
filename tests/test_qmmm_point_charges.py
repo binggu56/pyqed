@@ -4,10 +4,14 @@ from pyqed import Molecule
 from pyqed.qchem import embed_point_charges
 from pyqed.qchem.qmmm import (
     nuclear_point_charge_energy,
+    pme_potential_hcore_from_grid,
+    pme_reciprocal_hcore,
     point_charge_forces,
     point_charge_hcore,
     point_charge_hcore_derivatives,
 )
+from pyqed.qchem.dft import AOGrid
+from pyqed.md import pme_reciprocal_potential
 
 
 def test_point_charge_hcore_and_nuclear_energy_are_finite():
@@ -26,6 +30,41 @@ def test_point_charge_hcore_and_nuclear_energy_are_finite():
     assert np.all(np.isfinite(hcore_deriv))
     assert np.isfinite(energy)
     assert np.linalg.norm(hcore) > 0.0
+
+
+def test_pme_reciprocal_hcore_contracts_smooth_periodic_potential():
+    mol = Molecule(atom="H 1 1 1; H 1 1 2.4", unit="b", basis="sto3g")
+    mol.build(driver="builtin")
+    mm_coords = np.array([[2.0, 2.0, 2.0], [5.0, 5.0, 5.0]])
+    mm_charges = np.array([0.2, -0.2])
+    cell = np.diag([8.0, 8.0, 8.0])
+    grid = AOGrid.atom_centered(mol, n_radial=4, n_angular=6, with_grad=False)
+
+    hcore = pme_reciprocal_hcore(
+        mol,
+        mm_coords,
+        mm_charges,
+        cell,
+        pbc=True,
+        alpha=0.35,
+        mesh=(16, 16, 16),
+        grid=grid,
+    )
+    potential = pme_reciprocal_potential(
+        mm_coords,
+        mm_charges,
+        grid.coords,
+        cell,
+        pbc=True,
+        alpha=0.35,
+        mesh=(16, 16, 16),
+    )
+    reference = pme_potential_hcore_from_grid(grid, potential)
+
+    assert hcore.shape == mol.hcore.shape
+    assert np.all(np.isfinite(hcore))
+    np.testing.assert_allclose(hcore, hcore.T, atol=1e-12)
+    np.testing.assert_allclose(hcore, reference)
 
 
 def test_embed_point_charges_returns_energy_gradients_and_charge_forces():

@@ -450,7 +450,7 @@ def main():
         nt=args.nt,
         nout=args.nout,
         kinetic_propagator="expm_multiply",
-        matrix_free_kinetic=True,
+        kinetic_action="matrix-free",
     )
     prop_time = time.perf_counter() - prop_start
     times_fs = np.asarray(result["times"]) * au2fs

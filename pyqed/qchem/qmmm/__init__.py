@@ -12,6 +12,7 @@ from .qmmmscf import (
     point_charge_hcore,
     point_charge_hcore_derivatives,
 )
+from .pme import pme_potential_hcore_from_grid, pme_reciprocal_hcore
 
 __all__ = [
     "PointChargeEmbeddedSCF",
@@ -24,4 +25,6 @@ __all__ = [
     "point_charge_forces",
     "point_charge_hcore",
     "point_charge_hcore_derivatives",
+    "pme_potential_hcore_from_grid",
+    "pme_reciprocal_hcore",
 ]

@@ -26,7 +26,13 @@ class DMRG:
                 symmetry=False, charge=None, spin = None,\
                 target_qn = None, sym_mgr = None, not_conv_err=True,
                 nstates=1, weights=None, verbose=0, sweep_callback=None,
-                sweep_tol=1e-6):
+                sweep_tol=1e-6, davidson_tol=1e-5, davidson_max_iter=30,
+                noise=1e-4, noise_decay=0.1, noise_cutoff=1e-9,
+                local_dense_max_dim="auto", complementary_operator_families=None,
+                complementary_operator_mpos=None,
+                complementary_operator_term_maps=None,
+                complementary_operator_generator_entries=None,
+                site_qn_maps=None):
         """
         Parameters
         ----------
@@ -47,6 +53,17 @@ class DMRG:
         self.D = D
         self.nsweeps = nsweeps
         self.sweep_tol = float(sweep_tol)
+        self.davidson_tol = float(davidson_tol)
+        self.davidson_max_iter = int(davidson_max_iter)
+        self.noise = 0.0 if noise is None else float(noise)
+        self.noise_decay = float(noise_decay)
+        self.noise_cutoff = float(noise_cutoff)
+        self.local_dense_max_dim = local_dense_max_dim
+        self.complementary_operator_families = complementary_operator_families
+        self.complementary_operator_mpos = complementary_operator_mpos
+        self.complementary_operator_term_maps = complementary_operator_term_maps
+        self.complementary_operator_generator_entries = complementary_operator_generator_entries
+        self.site_qn_maps = site_qn_maps
         self.opt = opt
 
         self.init_guess = init_guess
@@ -83,6 +100,8 @@ class DMRG:
         self.verbose = int(verbose)
         self.sweep_callback = sweep_callback
         self.sweep_history = []
+        self.complementary_operator_stack_stats = None
+        self.complementary_split_stats = None
 
     def run(self):
 
@@ -140,8 +159,26 @@ class DMRG:
                 verbose=self.verbose,
                 conv=self.sweep_tol,
                 sweep_callback=cb,
+                davidson_tol=self.davidson_tol,
+                davidson_max_iter=self.davidson_max_iter,
+                noise=self.noise,
+                noise_decay=self.noise_decay,
+                noise_cutoff=self.noise_cutoff,
+                local_dense_max_dim=self.local_dense_max_dim,
+                complementary_operator_families=self.complementary_operator_families,
+                complementary_operator_mpos=self.complementary_operator_mpos,
+                complementary_operator_term_maps=self.complementary_operator_term_maps,
+                complementary_operator_generator_entries=self.complementary_operator_generator_entries,
+                site_qn_maps=self.site_qn_maps,
             )
             e_elec, mps_out, self.gauge, self.converged = res
+            if self.sweep_history:
+                self.complementary_operator_stack_stats = self.sweep_history[-1].get(
+                    "complementary_operator_stack"
+                )
+                self.complementary_split_stats = self.sweep_history[-1].get(
+                    "complementary_split_stats"
+                )
 
             shift = getattr(self.H, 'constant', 0.0)
             

@@ -10,6 +10,7 @@ from pyqed.mps.su2 import SU2Irrep, SpinChargeSector, fuse_irreps, fuse_charge_s
 U1_LABELS = {'u1', 'charge', 'n', 'particle'}
 SZ_LABELS = {'sz', 'spin', 's_z'}
 SU2_LABELS = {'su2', 'spin_irrep', 'total_spin'}
+PG_LABELS = {'pg', 'point_group', 'abelianpg', 'abelian_pg', 'irrep', 'orb_sym'}
 
 
 def _normalize_sym_label(label):
@@ -20,11 +21,13 @@ def _normalize_sym_label(label):
         return 'sz'
     if label in SU2_LABELS:
         return 'su2'
+    if label in PG_LABELS:
+        return 'pg'
     return label
 
 
 def _is_abelian_label(label):
-    return _normalize_sym_label(label) in {'charge', 'sz'}
+    return _normalize_sym_label(label) in {'charge', 'sz', 'pg'}
 
 
 def _component_sort_key(value):
@@ -50,6 +53,8 @@ def _add_component(label, left, right):
     label = _normalize_sym_label(label)
     if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
         raise TypeError("SU(2) irreps do not support unique additive composition; use fuse() instead.")
+    if label == 'pg':
+        return int(left) ^ int(right)
     return left + right
 
 
@@ -57,6 +62,8 @@ def _sub_component(label, left, right):
     label = _normalize_sym_label(label)
     if label == 'su2' or isinstance(left, SU2Irrep) or isinstance(right, SU2Irrep):
         raise TypeError("SU(2) irreps do not support subtraction; non-Abelian flux must be handled by fusion rules.")
+    if label == 'pg':
+        return int(left) ^ int(right)
     return left - right
 
 
@@ -64,6 +71,8 @@ def _neg_component(label, value):
     label = _normalize_sym_label(label)
     if label == 'su2' or isinstance(value, SU2Irrep):
         raise TypeError("SU(2) irreps do not support additive negation.")
+    if label == 'pg':
+        return int(value)
     return -value
 
 
@@ -71,6 +80,8 @@ def _mul_component(label, value, scalar):
     label = _normalize_sym_label(label)
     if label == 'su2' or isinstance(value, SU2Irrep):
         raise TypeError("SU(2) irreps do not support scalar multiplication.")
+    if label == 'pg':
+        return 0 if scalar == 0 else int(value)
     return value * scalar
 
 
@@ -232,6 +243,7 @@ class BlockTensor:
         self.qns = qns    # List of [qn_sector_1, qn_sector_2, ...] for each leg
         self.dirs = dirs  # List of [+1 (Out), -1 (In)]
         self.rank = len(dirs)
+        self._contract_cache = {}
 
     @property
     def shape(self):
@@ -325,12 +337,21 @@ def tensordot(A, B, axes):
     new_dirs = [A.dirs[i] for i in free_A] + [B.dirs[i] for i in free_B]
     new_qns = [A.qns[i] for i in free_A] + [B.qns[i] for i in free_B]
 
-    # 2. Pre-group B blocks for faster lookup
-    # Key: Tuple of QNs on the contraction legs
-    B_map = defaultdict(list)
-    for qn_B, block_B in B.data.items():
-        key_contract = tuple(qn_B[i] for i in b_ax)
-        B_map[key_contract].append((qn_B, block_B))
+    # 2. Pre-group B blocks for faster lookup.  The same immutable MPO and
+    # environment tensors are contracted many times inside local Davidson.
+    cache_key = tuple(b_ax)
+    cache_token = (id(B.data), len(B.data))
+    cached = getattr(B, "_contract_cache", {}).get(cache_key)
+    if cached is not None and cached[0] == cache_token:
+        B_map = cached[1]
+    else:
+        B_map = defaultdict(list)
+        for qn_B, block_B in B.data.items():
+            key_contract = tuple(qn_B[i] for i in b_ax)
+            B_map[key_contract].append((qn_B, block_B))
+        if not hasattr(B, "_contract_cache"):
+            B._contract_cache = {}
+        B._contract_cache[cache_key] = (cache_token, B_map)
 
     # 3. Contract
     new_data = {}
@@ -360,13 +381,14 @@ def tensordot(A, B, axes):
     return BlockTensor(new_data, new_qns, new_dirs)
 
 class SymmetryManager:
-    def __init__(self, sym_list):
+    def __init__(self, sym_list, orb_sym=None):
         if sym_list is True: sym_list = ['charge', 'sz']
         if sym_list is False or sym_list is None: sym_list = []
         self.sym_types = [_normalize_sym_label(s) for s in sym_list]
         self.rank = len(self.sym_types)
         self.enabled = self.rank > 0
         self.has_nonabelian = any(sym == 'su2' for sym in self.sym_types)
+        self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
 
     def _build_sector(self, components):
         if not self.enabled:
@@ -414,6 +436,18 @@ class SymmetryManager:
                     vals.append(SU2Irrep(1))
                 else:
                     raise ValueError(f"Unsupported SU(2) local state {state_str!r} for site model {site_model!r}.")
+            elif sym == 'pg':
+                if self.orb_sym is None:
+                    raise ValueError("Point-group symmetry requires orb_sym labels on SymmetryManager.")
+                orb_idx = int(site_idx) if site_model == 'spatial' else int(site_idx) // 2
+                if orb_idx < 0 or orb_idx >= len(self.orb_sym):
+                    raise ValueError(f"orb_sym missing label for orbital/site {orb_idx}.")
+                if state in {'emp', 'empty', 'double', 'dbl', 'full'}:
+                    vals.append(0)
+                elif state in {'occ', 'occupied', 'single', 'up', 'down'}:
+                    vals.append(int(self.orb_sym[orb_idx]))
+                else:
+                    raise ValueError(f"Unsupported point-group local state {state_str!r}.")
         return self._build_sector(vals)
 
     def get_target_qn(self, nelec=0, spin=0):
@@ -430,6 +464,8 @@ class SymmetryManager:
                 vals.append(int(spin))
             elif sym == 'su2':
                 vals.append(SU2Irrep(int(spin)))
+            elif sym == 'pg':
+                vals.append(0)
         return self._build_sector(vals)
 
     def fuse(self, left, right):

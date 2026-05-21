@@ -1,6 +1,18 @@
 """QM/MM calculator glue for :mod:`pyqed.md`."""
 
+from dataclasses import dataclass
+
 import numpy as np
+
+from .neighborlist import minimum_image as _minimum_image
+
+
+@dataclass
+class _EmbeddingCharges:
+    coords: np.ndarray
+    charges: np.ndarray
+    owners: np.ndarray
+    shifts: np.ndarray
 
 
 class QMMM:
@@ -28,6 +40,8 @@ class QMMM:
         qm_build_driver=None,
         exclude_qm_coulomb=True,
         exclude_qm_qm_lj=True,
+        embedding_pbc=None,
+        embedding_cutoff=None,
     ):
         self.qm = qm
         self.mm = mm
@@ -40,6 +54,8 @@ class QMMM:
         self.qm_build_driver = qm_build_driver
         self.exclude_qm_coulomb = bool(exclude_qm_coulomb)
         self.exclude_qm_qm_lj = bool(exclude_qm_qm_lj)
+        self.embedding_pbc = _normalize_embedding_pbc(embedding_pbc)
+        self.embedding_cutoff = None if embedding_cutoff is None else float(embedding_cutoff)
         self.atoms = None
         self.results = {}
 
@@ -120,10 +136,22 @@ class QMMM:
 
         self.qm.mol.set_geom(positions[qm_indices])
         point_charges = self._point_charges(atoms, mm_indices)
-        embedded = self._embed_point_charges(positions[mm_indices], point_charges)
-        qm_energy, qm_grad, point_charge_forces = embedded.energy_and_gradients()
+        embedding = self._embedding_point_charges(
+            atoms,
+            positions,
+            qm_indices,
+            mm_indices,
+            point_charges,
+        )
+        embedded = self._embed_point_charges(embedding.coords, embedding.charges)
+        qm_energy, qm_grad, embedding_point_charge_forces = embedded.energy_and_gradients()
         qm_forces = -np.asarray(qm_grad, dtype=float)
-        point_charge_forces = np.asarray(point_charge_forces, dtype=float)
+        embedding_point_charge_forces = np.asarray(embedding_point_charge_forces, dtype=float)
+        point_charge_forces = _sum_image_forces(
+            embedding_point_charge_forces,
+            embedding.owners,
+            len(mm_indices),
+        )
 
         energy += qm_energy
         forces[qm_indices] += qm_forces
@@ -138,15 +166,55 @@ class QMMM:
             "qm_indices": qm_indices.copy(),
             "mm_indices": mm_indices.copy(),
             "mm_charges": np.asarray(point_charges, dtype=float).copy(),
+            "embedding_pbc": self.embedding_pbc,
+            "embedding_cutoff": self.embedding_cutoff,
+            "embedding_coords": embedding.coords.copy(),
+            "embedding_charges": embedding.charges.copy(),
+            "embedding_owners": embedding.owners.copy(),
+            "embedding_shifts": embedding.shifts.copy(),
             "mm_forces": np.asarray(mm_forces, dtype=float).copy(),
             "qm_forces": np.asarray(qm_forces, dtype=float).copy(),
             "point_charge_forces": point_charge_forces.copy(),
+            "embedding_point_charge_forces": embedding_point_charge_forces.copy(),
             "qm_force_max": _max_force_norm(qm_forces),
             "mm_force_max": _max_force_norm(mm_forces),
             "point_charge_force_max": _max_force_norm(point_charge_forces),
             "total_force_max": _max_force_norm(forces),
         }
         return energy, forces
+
+    def _embedding_point_charges(self, atoms, positions, qm_indices, mm_indices, charges):
+        mm_coords = np.asarray(positions[mm_indices], dtype=float)
+        owners = np.arange(len(mm_indices), dtype=int)
+        shifts = np.zeros_like(mm_coords)
+        if self.embedding_pbc == "none" or len(mm_coords) == 0:
+            return _EmbeddingCharges(mm_coords, charges, owners, shifts)
+
+        cell = np.asarray(atoms.get_cell(), dtype=float)
+        pbc = np.asarray(atoms.get_pbc(), dtype=bool)
+        _validate_periodic_embedding_cell(cell, pbc)
+        qm_coords = np.asarray(positions[qm_indices], dtype=float)
+        if self.embedding_pbc == "nearest":
+            center = np.mean(qm_coords, axis=0)
+            nearest = np.array(
+                [center + _minimum_image(coord - center, cell, pbc) for coord in mm_coords],
+                dtype=float,
+            )
+            return _EmbeddingCharges(nearest, charges, owners, nearest - mm_coords)
+
+        if self.embedding_pbc == "images":
+            if self.embedding_cutoff is None or self.embedding_cutoff <= 0.0:
+                raise ValueError("embedding_cutoff must be positive for embedding_pbc='images'.")
+            return _image_expanded_embedding_charges(
+                mm_coords,
+                charges,
+                qm_coords,
+                cell,
+                pbc,
+                self.embedding_cutoff,
+            )
+
+        raise ValueError(f"Unknown embedding_pbc mode {self.embedding_pbc!r}.")
 
     def _embed_point_charges(self, coords, charges):
         from pyqed.qchem import embed_point_charges
@@ -234,6 +302,98 @@ def _accepts_extra_exclusions(calculator):
         "extra_lj_exclusions",
         "extra_coulomb_exclusions",
     }.issubset(signature.parameters)
+
+
+def _normalize_embedding_pbc(mode):
+    if mode is None or mode is False:
+        return "none"
+    if mode is True:
+        return "nearest"
+    mode = str(mode).lower()
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "no": "none",
+        "minimum_image": "nearest",
+        "minimum-image": "nearest",
+        "image": "images",
+        "cutoff": "images",
+        "real_space": "images",
+        "real-space": "images",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"none", "nearest", "images"}:
+        raise ValueError("embedding_pbc must be one of None, 'nearest', or 'images'.")
+    return mode
+
+
+def _validate_periodic_embedding_cell(cell, pbc):
+    if not np.any(pbc):
+        raise ValueError("Periodic embedding requires atoms.pbc to be enabled.")
+    if np.linalg.matrix_rank(cell) < 3:
+        raise ValueError("Periodic embedding requires a full 3D cell.")
+
+
+def _image_expanded_embedding_charges(mm_coords, charges, qm_coords, cell, pbc, cutoff):
+    shifts = _lattice_shifts(cell, pbc, cutoff)
+    coords = []
+    expanded_charges = []
+    owners = []
+    expanded_shifts = []
+    cutoff2 = float(cutoff) ** 2
+    for owner, (coord, charge) in enumerate(zip(mm_coords, charges)):
+        for shift in shifts:
+            image = coord + shift
+            deltas = qm_coords - image
+            if np.min(np.einsum("ax,ax->a", deltas, deltas)) > cutoff2:
+                continue
+            coords.append(image)
+            expanded_charges.append(charge)
+            owners.append(owner)
+            expanded_shifts.append(shift)
+
+    if not coords:
+        return _EmbeddingCharges(
+            np.empty((0, 3), dtype=float),
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=int),
+            np.empty((0, 3), dtype=float),
+        )
+    return _EmbeddingCharges(
+        np.asarray(coords, dtype=float),
+        np.asarray(expanded_charges, dtype=float),
+        np.asarray(owners, dtype=int),
+        np.asarray(expanded_shifts, dtype=float),
+    )
+
+
+def _lattice_shifts(cell, pbc, cutoff):
+    cell = np.asarray(cell, dtype=float)
+    pbc = np.asarray(pbc, dtype=bool)
+    ranges = []
+    for axis in range(3):
+        if not pbc[axis]:
+            ranges.append(range(0, 1))
+            continue
+        length = np.linalg.norm(cell[axis])
+        if length <= 0.0:
+            raise ValueError("Periodic embedding requires nonzero cell vectors.")
+        nmax = int(np.ceil(float(cutoff) / length)) + 1
+        ranges.append(range(-nmax, nmax + 1))
+
+    shifts = []
+    for i in ranges[0]:
+        for j in ranges[1]:
+            for k in ranges[2]:
+                shifts.append(np.array([i, j, k], dtype=float) @ cell)
+    return shifts
+
+
+def _sum_image_forces(image_forces, owners, nowners):
+    out = np.zeros((nowners, 3), dtype=float)
+    if len(image_forces):
+        np.add.at(out, np.asarray(owners, dtype=int), np.asarray(image_forces, dtype=float))
+    return out
 
 
 def _pairs_touching(indices, natoms):

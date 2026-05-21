@@ -629,6 +629,7 @@ class RHFAnalysis:
         metric='mulliken',
         min_contribution=0.0,
         sort=True,
+        max_components=None,
     ):
         if self.mf.mo_coeff is None or self.mf.mo_occ is None:
             raise ValueError("Run RHF before analyzing MO AO components.")
@@ -678,6 +679,11 @@ class RHFAnalysis:
 
             if sort:
                 ao_entries.sort(key=lambda item: abs(item['contribution']), reverse=True)
+            if max_components is not None:
+                max_components = int(max_components)
+                if max_components < 0:
+                    raise ValueError("max_components must be non-negative.")
+                ao_entries = ao_entries[:max_components]
 
             result.append(
                 {
@@ -698,15 +704,23 @@ class RHFAnalysis:
         metric='mulliken',
         min_contribution=0.0,
         sort=True,
+        max_components=None,
     ):
         analysis = self.mo_components(
             mo_indices=mo_indices,
             metric=metric,
             min_contribution=min_contribution,
             sort=sort,
+            max_components=max_components,
         )
 
         lines = []
+        max_label = "all" if max_components is None else str(int(max_components))
+        lines.append(
+            "Main AO components of molecular orbitals "
+            f"(metric={str(metric).lower()}, min_contribution={float(min_contribution):.3g}, "
+            f"max_components={max_label})"
+        )
         for rec in analysis:
             energy = rec['mo_energy']
             occupation = rec['occupation']

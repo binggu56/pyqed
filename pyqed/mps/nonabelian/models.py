@@ -898,7 +898,15 @@ def _accumulate_four_distinct_spinfree_we_product(pending_we, p, q, r, s, coeff,
     return count
 
 
-def _emit_shared_spinfree_we_terms(autompo, pending_we, *, phys_leg, dtype, cutoff):
+def _emit_shared_spinfree_we_terms(
+    autompo,
+    pending_we,
+    *,
+    phys_leg,
+    dtype,
+    cutoff,
+    family="P",
+):
     annihilation = reduced_spatial_fermion_annihilation(phys_leg, dtype=dtype)
     creation = annihilation.adjoint()
     dual_annihilation = time_reversed_reduced_operator(annihilation)
@@ -925,7 +933,7 @@ def _emit_shared_spinfree_we_terms(autompo, pending_we, *, phys_leg, dtype, cuto
             intermediate_irreps=(SU2Irrep(1), SU2Irrep(middle_irrep), SU2Irrep(1)),
             coeff=coeff,
             middle_operators=middle,
-            family="P",
+            family=family,
         )
         count += 1
     return count
@@ -1203,12 +1211,12 @@ def _accumulate_spinfree_component_product_terms(pending_scalar, p, q, r, s, coe
     return count
 
 
-def _emit_shared_scalar_product_terms(autompo, pending_scalar, *, cutoff):
+def _emit_shared_scalar_product_terms(autompo, pending_scalar, *, cutoff, family="P"):
     count = 0
     for coeff, site_ops in pending_scalar.values():
         if abs(coeff) <= cutoff:
             continue
-        autompo.add_term(*site_ops, coeff=coeff, family="P")
+        autompo.add_term(*site_ops, coeff=coeff, family=family)
         count += 1
     return count
 
@@ -1682,11 +1690,13 @@ class SpatialSpinFreeERIBuilder:
             phys_leg=phys_leg,
             dtype=dtype,
             cutoff=cutoff,
+            family="P",
         )
         scalar_product_terms = _emit_shared_scalar_product_terms(
             autompo,
             pending_scalar,
             cutoff=cutoff,
+            family="P",
         )
         correction_terms = int(np.count_nonzero(np.abs(one_body_correction) > cutoff))
         if correction_terms:
@@ -1760,6 +1770,92 @@ def add_spatial_spinfree_eri_terms(
         reduced_we=reduced_we,
     )
     return builder.add_to(autompo, return_info=return_info)
+
+
+def add_spatial_two_generator_product_terms(
+    autompo,
+    entries,
+    *,
+    cutoff=1.0e-12,
+    family="P",
+    reduced_we=True,
+    return_info=False,
+):
+    """
+    Add ``sum_pqrs entries[p,q,r,s] E_pq E_rs`` in the canonical spatial basis.
+
+    This intentionally does not emit the ``-delta_qr E_ps`` one-body
+    correction used by the full ERI Hamiltonian builder; callers that use the
+    complementary R/P decomposition should carry that correction in the R
+    family.
+    """
+    if not isinstance(autompo, AutoMPO):
+        raise TypeError("add_spatial_two_generator_product_terms expects an AutoMPO.")
+    if any(phys_leg != autompo.site_legs[0] for phys_leg in autompo.site_legs):
+        raise ValueError(
+            "add_spatial_two_generator_product_terms expects a uniform spatial-orbital PhysicalLeg."
+        )
+    phys_leg = physical_leg_from_spatial_orbital(autompo.site_legs[0])
+    if phys_leg != physical_leg_from_spatial_orbital():
+        raise NotImplementedError(
+            "Native two-generator product terms are currently implemented for the canonical spatial basis."
+        )
+
+    pending_we = {}
+    pending_scalar = {}
+    dtype = np.result_type(
+        *[np.asarray(value).dtype for value in dict(entries or {}).values()],
+        float,
+    )
+    raw_terms = 0
+    for key, coeff in dict(entries or {}).items():
+        p, q, r, s = (int(index) for index in key)
+        coeff = np.asarray(coeff, dtype=dtype).item()
+        if abs(coeff) <= cutoff:
+            continue
+        if reduced_we and len({p, q, r, s}) == 4:
+            raw_terms += _accumulate_four_distinct_spinfree_we_product(
+                pending_we,
+                p,
+                q,
+                r,
+                s,
+                coeff,
+                cutoff=cutoff,
+            )
+        else:
+            raw_terms += _accumulate_spinfree_component_product_terms(
+                pending_scalar,
+                p,
+                q,
+                r,
+                s,
+                coeff,
+                dtype=dtype,
+                cutoff=cutoff,
+            )
+    we_terms = _emit_shared_spinfree_we_terms(
+        autompo,
+        pending_we,
+        phys_leg=phys_leg,
+        dtype=dtype,
+        cutoff=cutoff,
+        family=family,
+    )
+    scalar_terms = _emit_shared_scalar_product_terms(
+        autompo,
+        pending_scalar,
+        cutoff=cutoff,
+        family=family,
+    )
+    info = {
+        "raw_spin_component_terms": int(raw_terms),
+        "we_product_terms": int(we_terms),
+        "symbolic_product_terms": int(scalar_terms),
+        "total_product_terms": int(we_terms + scalar_terms),
+        "input_generator_terms": int(len(dict(entries or {}))),
+    }
+    return info if return_info else info["total_product_terms"]
 
 
 def build_spatial_spinfree_eri_mpo(sites_or_legs, eri_spatial, *, cutoff=1.0e-12, include_half=True):

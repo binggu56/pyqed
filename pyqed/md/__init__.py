@@ -10,7 +10,16 @@ from .analysis import (
     water_oxygen_indices,
 )
 from .backends import backend_status
-from .calculators import Coulomb, EwaldCoulomb, LennardJones, MM, MolecularMechanics, PMECoulomb
+from .calculators import (
+    Coulomb,
+    EwaldCoulomb,
+    LennardJones,
+    MM,
+    MolecularMechanics,
+    PMECoulomb,
+    pme_reciprocal_potential,
+    pme_reciprocal_potential_grid,
+)
 from .constraints import FixBondLengths
 from .forcefield import load_forcefield, mm_from_topology, solute_from_parameters
 from .io import EnergyLogger, XYZTrajectoryWriter, write_xyz
@@ -45,6 +54,8 @@ __all__ = [
     "MolecularMechanics",
     "NeighborList",
     "PMECoulomb",
+    "pme_reciprocal_potential",
+    "pme_reciprocal_potential_grid",
     "QMMM",
     "radial_distribution",
     "read_restart",
