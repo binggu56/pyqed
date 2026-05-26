@@ -113,6 +113,5 @@ try:  # pragma: no cover
     from .dmrg import DMRG  # noqa: F401
     from .tdmps import TDMPS  # noqa: F401
     from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, OSError, TimeoutError):
     pass
-

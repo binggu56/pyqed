@@ -12,6 +12,7 @@ from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
 
 _SPATIAL_LOCAL_OPS = None
+_CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE = {}
 
 
 def spatial_local_ops():
@@ -35,23 +36,35 @@ def spatial_local_ops():
 
 def canonical_spatial_local_symbol(symbols, *, tol=1.0e-14):
     """Collapse an ordered same-site operator product into one local symbol."""
+    key = (tuple(str(symbol) for symbol in symbols), float(tol))
+    cached = _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE.get(key)
+    if cached is not None:
+        return cached
     aliases = spatial_local_ops()
     mat = np.eye(4, dtype=complex)
     for symbol in symbols:
         mat = mat @ aliases[symbol]
 
     if np.linalg.norm(mat) <= tol:
-        return None, 0.0
+        result = (None, 0.0)
+        _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE[key] = result
+        return result
 
     for name, ref in aliases.items():
         if np.allclose(mat, ref, atol=tol, rtol=0.0):
-            return name, 1.0
+            result = (name, 1.0)
+            _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE[key] = result
+            return result
         if np.allclose(mat, -ref, atol=tol, rtol=0.0):
-            return name, -1.0
+            result = (name, -1.0)
+            _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE[key] = result
+            return result
 
     name = f"spop{len(aliases)}"
     aliases[name] = mat
-    return name, 1.0
+    result = (name, 1.0)
+    _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE[key] = result
+    return result
 
 
 class BasisSpatialFermion(BasisSet):

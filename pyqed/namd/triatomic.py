@@ -1,5 +1,6 @@
 import string
 import functools
+import itertools
 import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -418,16 +419,23 @@ class Triatom(Molecule):
                  spin: int = 0,
                  unit: str = 'Angstrom',
                  dvr_type: str = 'default',
+                 driver=None,
                  J: int = 0,
                  Jz: int | None = None):  # 新增 dvr_type 参数
 
         # 调用父类初始化
+        if driver is not None and basis == 'sto-3g':
+            driver_ref = getattr(driver, "template", driver)
+            driver_mol = getattr(driver_ref, "mol", None)
+            basis = getattr(driver_mol, "basis", basis)
         super().__init__(atom=atom, basis=basis, charge=charge, spin=spin, unit=unit)
 
+        self.driver = driver
         self.nstates = nstates
         self.dvr_type = dvr_type  # 修复: 添加 dvr_type 属性
         self.overlap_matrix=None
         self.overlap_links = None
+        self.overlap_path_average = False
         self.ndim=3
         # 初始化其他属性，防止 AttributeError
         self.masses = [1.0, 1.0, 1.0]
@@ -1309,8 +1317,8 @@ class Triatom(Molecule):
 
         def sandwich(Pl, g, Pr):
             if sparse:
-                return Pl @ sp.diags(g, format="csr") @ Pr
-            return Pl @ np.diag(g) @ Pr
+                return Pl.conj().T @ sp.diags(g, format="csr") @ Pr
+            return Pl.conj().T @ np.diag(g) @ Pr
 
         T = 0.5 * (
             sandwich(P1, np.full_like(r1v, val_G11), P1)
@@ -1366,6 +1374,9 @@ class Triatom(Molecule):
                 out = out @ op
             return out
 
+        def adjoint(op):
+            return op.getH() if sp.issparse(op) else op.conj().T
+
         p_r1 = momentum_matrix(dvrs[0])
         p_r2 = momentum_matrix(dvrs[1])
         p_th = momentum_matrix(dvrs[2])
@@ -1390,26 +1401,26 @@ class Triatom(Molecule):
         def add(label, coef, A, B, C):
             terms.append((label, complex(coef), A, B, C))
 
-        add("p1_G11_p1", 0.5 * inv_mu1, matmul(p_r1, p_r1), I_r2, I_th)
-        add("p2_G22_p2", 0.5 * inv_mu2, I_r1, matmul(p_r2, p_r2), I_th)
+        add("p1_G11_p1", 0.5 * inv_mu1, matmul(adjoint(p_r1), p_r1), I_r2, I_th)
+        add("p2_G22_p2", 0.5 * inv_mu2, I_r1, matmul(adjoint(p_r2), p_r2), I_th)
 
-        add("pth_Gthth_r1_pth", 0.5 * inv_mu1, D_r1_inv2, I_r2, matmul(p_th, p_th))
-        add("pth_Gthth_r2_pth", 0.5 * inv_mu2, I_r1, D_r2_inv2, matmul(p_th, p_th))
+        add("pth_Gthth_r1_pth", 0.5 * inv_mu1, D_r1_inv2, I_r2, matmul(adjoint(p_th), p_th))
+        add("pth_Gthth_r2_pth", 0.5 * inv_mu2, I_r1, D_r2_inv2, matmul(adjoint(p_th), p_th))
         add(
             "pth_Gthth_r12_pth",
             -1.0 / M_Y,
             D_r1_inv,
             D_r2_inv,
-            matmul(p_th, D_cos, p_th),
+            matmul(adjoint(p_th), D_cos, p_th),
         )
 
-        add("p1_G12_p2", 0.5 / M_Y, p_r1, p_r2, D_cos)
-        add("p2_G12_p1", 0.5 / M_Y, p_r1, p_r2, D_cos)
+        add("p1_G12_p2", 0.5 / M_Y, adjoint(p_r1), p_r2, D_cos)
+        add("p2_G12_p1", 0.5 / M_Y, p_r1, adjoint(p_r2), D_cos)
 
         add(
             "p1_G1th_pth",
             -0.5 / M_Y,
-            p_r1,
+            adjoint(p_r1),
             D_r2_inv,
             matmul(D_sin, p_th),
         )
@@ -1418,13 +1429,13 @@ class Triatom(Molecule):
             -0.5 / M_Y,
             p_r1,
             D_r2_inv,
-            matmul(p_th, D_sin),
+            matmul(adjoint(p_th), D_sin),
         )
         add(
             "p2_G2th_pth",
             -0.5 / M_Y,
             D_r1_inv,
-            p_r2,
+            adjoint(p_r2),
             matmul(D_sin, p_th),
         )
         add(
@@ -1432,7 +1443,7 @@ class Triatom(Molecule):
             -0.5 / M_Y,
             D_r1_inv,
             p_r2,
-            matmul(p_th, D_sin),
+            matmul(adjoint(p_th), D_sin),
         )
 
         add("V_metric_r1", -0.125 * inv_mu1, D_r1_inv2, I_r2, D_csc_metric)
@@ -1448,9 +1459,6 @@ class Triatom(Molecule):
 
         if symmetrize:
             hermitian_terms = []
-
-            def adjoint(op):
-                return op.getH() if sp.issparse(op) else op.conj().T
 
             for label, coef, A, B, C in terms:
                 hermitian_terms.append((label, 0.5 * coef, A, B, C))
@@ -2667,7 +2675,10 @@ class Triatom(Molecule):
 
 
         times = t0 + dt * nout * np.arange(len(psilist))
-        return {'times': times, 'psilist': psilist}
+        result = {'times': times, 'psilist': psilist}
+        self.ldr_result = result
+        self.ued_result = result
+        return result
 
 
 
@@ -2695,6 +2706,29 @@ class Triatom(Molecule):
         # C at angle theta from BA
         C = np.array([r2 * np.cos(theta), r2 * np.sin(theta), 0.0])
         return np.array([A, B, C])  # order: end1, center, end2
+
+    def cartesian_grid(self, copy=True):
+        """Cartesian atom coordinates on the current internal-coordinate grid.
+
+        Returns
+        -------
+        coords : ndarray, shape (*nx, natom, 3)
+            Body-fixed Cartesian coordinates for each DVR grid point.  The
+            array is cached after the first call and invalidated by set_dvr().
+        """
+        if self.x is None or self.nx is None:
+            raise RuntimeError("DVR grids not set. Call set_dvr() first.")
+        cached = getattr(self, "_cartesian_grid_cache", None)
+        if cached is None:
+            axes = [np.asarray(axis, dtype=float) for axis in self.x]
+            R1, R2, Theta = np.meshgrid(*axes, indexing="ij")
+            coords = np.zeros((*self.nx, self.natom, 3), dtype=float)
+            coords[..., 0, 0] = R1
+            coords[..., 2, 0] = R2 * np.cos(Theta)
+            coords[..., 2, 1] = R2 * np.sin(Theta)
+            self._cartesian_grid_cache = coords
+            cached = coords
+        return cached.copy() if copy else cached
 
     def set_dvr(self, dvrs=None, domains=None, npts=None, dvr_type=None, dvr_params=None):
         """
@@ -2783,6 +2817,7 @@ class Triatom(Molecule):
         self.w = [getattr(d, 'w', np.ones(len(d.x)) * d.dx) for d in self.dvrs]
         self.grid_weights = self._build_grid_weights()
         self.sqrt_grid_weights = np.sqrt(self.grid_weights)
+        self._cartesian_grid_cache = None
         # 兼容旧代码，将属性也暴露为 domain
         if domains is not None:
             self.domain = domains
@@ -3025,11 +3060,11 @@ class Triatom(Molecule):
             for axis, idx, mat in zip(axes, indices, data)
         }
 
-    def _linked_overlap_between(self, bra_idx, ket_idx, links, nstates):
+    def _linked_overlap_between_path(self, bra_idx, ket_idx, links, nstates, axes):
         current = list(bra_idx)
         mat = np.eye(nstates, dtype=complex)
 
-        for axis in range(self.ndim):
+        for axis in axes:
             while current[axis] < ket_idx[axis]:
                 src = tuple(current)
                 mat = mat @ links[(axis, src)]
@@ -3040,6 +3075,32 @@ class Triatom(Molecule):
                 mat = mat @ links[(axis, src)].conj().T
 
         return mat
+
+    def _linked_overlap_between(self, bra_idx, ket_idx, links, nstates):
+        active_axes = [
+            axis for axis in range(self.ndim)
+            if int(bra_idx[axis]) != int(ket_idx[axis])
+        ]
+        if not getattr(self, "overlap_path_average", False) or len(active_axes) <= 1:
+            return self._linked_overlap_between_path(
+                bra_idx,
+                ket_idx,
+                links,
+                nstates,
+                range(self.ndim),
+            )
+
+        paths = list(itertools.permutations(active_axes))
+        out = np.zeros((nstates, nstates), dtype=complex)
+        for axes in paths:
+            out += self._linked_overlap_between_path(
+                bra_idx,
+                ket_idx,
+                links,
+                nstates,
+                axes,
+            )
+        return out / len(paths)
 
     def _build_linked_overlap_from_links(self, links, nstates):
         indices = self._grid_indices()
@@ -3304,6 +3365,75 @@ class Triatom(Molecule):
 
         return apes, grid_mc_objects
 
+    @staticmethod
+    def _driver_point_object(point):
+        if isinstance(point, dict):
+            for key in ("mc", "casci", "result", "object"):
+                if key in point:
+                    return point[key]
+        return point
+
+    @staticmethod
+    def _driver_point_energies(point, nstates):
+        if isinstance(point, dict):
+            for key in ("energies", "e_tot", "energy"):
+                if key in point:
+                    energies = point[key]
+                    break
+            else:
+                raise ValueError("Electronic driver result dictionary has no energies.")
+        elif hasattr(point, "e_tot"):
+            energies = point.e_tot
+        elif isinstance(point, (tuple, list)) and point:
+            energies = point[0]
+        else:
+            energies = point
+
+        energies = np.atleast_1d(np.asarray(energies, dtype=float))
+        if len(energies) < nstates:
+            raise ValueError(
+                f"Electronic driver returned {len(energies)} energies, expected {nstates}."
+            )
+        return energies[:nstates]
+
+    def _run_electronic_driver_scan(
+        self,
+        driver,
+        indices,
+        nstates,
+        worker_threads=1,
+    ):
+        """Run a serial scan using a user-supplied electronic driver/scanner."""
+        _set_worker_thread_limits(worker_threads)
+        if hasattr(driver, "as_scanner"):
+            try:
+                scanner = driver.as_scanner(nstates=nstates)
+            except TypeError:
+                scanner = driver.as_scanner()
+        else:
+            scanner = driver
+        if not callable(scanner):
+            raise TypeError("driver must be callable or provide as_scanner().")
+
+        total = len(indices)
+        grid_objects = np.empty(self.nx, dtype=object)
+        apes = np.zeros((*self.nx, nstates))
+        report_every = max(1, total // 10)
+
+        for count, idx in enumerate(indices, start=1):
+            q = [self.x[axis][idx[axis]] for axis in range(self.ndim)]
+            xyz = np.asarray(self.internal_to_xyz(*q), dtype=float)
+            point = scanner(xyz)
+            obj = self._driver_point_object(point)
+            grid_objects[idx] = obj
+            apes[idx] = self._driver_point_energies(point, nstates)
+            if count % report_every == 0 or count == total:
+                converged = getattr(getattr(scanner, "mf", None), "converged", None)
+                suffix = "" if converged is None else f", scf_converged={bool(converged)}"
+                print(f"  ... {count}/{total} points computed{suffix}")
+
+        return apes, grid_objects, scanner
+
     def scan_pes(
         self,
         basis="631g*",
@@ -3341,6 +3471,7 @@ class Triatom(Molecule):
         scanner_retry_conv_tol_dms=None,
         scanner_retry_diis=(True, False),
         scanner_retry_max_cycle=None,
+        driver=None,
     ):
         """
         Scan the adiabatic PES over the DVR grid and compute the non-adiabatic
@@ -3350,7 +3481,8 @@ class Triatom(Molecule):
                                    overlap_method='link-only'
             overlap_links.npz   -- nearest-neighbor LDR links, for linked
                                    and link-only overlap methods
-            grid_mc_objects.npz -- raw CASCI objects for every grid point
+            electronic_data.npz -- AO density matrices and AO-origin geometry
+                                   when the electronic backend provides them
 
         If externally provided (self.apes and self.overlap_matrix or
         self.overlap_links are already set), the scan is skipped entirely.
@@ -3367,7 +3499,7 @@ class Triatom(Molecule):
             Number of active-space orbitals for CASCI.
         nelecas : int
             Number of active-space electrons for CASCI.
-        overlap_method : {'linked', 'full', 'link-only'}
+        overlap_method : {'linked', 'full', 'link-only', 'none'}
             How to build the LDR electronic overlap matrix.  ``'linked'`` is
             the default linked-product approximation from nearest-neighbor
             overlaps.  ``'full'`` computes every pair directly.
@@ -3428,14 +3560,18 @@ class Triatom(Molecule):
         scanner_retry_max_cycle : int or None, optional
             Maximum ROHF iterations for retry attempts.  Defaults to at least
             200 cycles.
-
         Returns
         -------
         apes : ndarray, shape (*nx, nstates)
             Adiabatic potential energy surfaces on the DVR grid.
         overlap_matrix_or_links : ndarray or dict
             Full pairwise overlap matrix for ``'full'`` and ``'linked'``;
-            nearest-neighbor link dictionary for ``'link-only'``.
+            nearest-neighbor link dictionary for ``'link-only'``; or ``None``
+            for ``'none'``.
+        electronic_data : dict
+            Electronic-structure scan data for downstream observables,
+            including AO density matrices, transition density matrices, and
+            Cartesian geometries when the backend provides them.
         """
         if self.x is None:
             raise RuntimeError("DVR grids not set. Call set_dvr() first.")
@@ -3444,26 +3580,39 @@ class Triatom(Molecule):
                 "Method 'internal_to_xyz(r1, r2, theta)' must be implemented."
             )
 
+        driver = self.driver if driver is None else driver
+        using_driver = driver is not None
+        if using_driver:
+            driver_ref = getattr(driver, "template", driver)
+            driver_mol = getattr(driver_ref, "mol", None)
+            basis = getattr(driver_mol, "basis", basis)
+            ncas = getattr(driver_ref, "ncas", ncas)
+            nelecas = getattr(driver_ref, "nelecas", nelecas)
+
         if nstates is None:
-            nstates = self.nstates
+            driver_nstates = getattr(driver, "nstates", None)
+            nstates = self.nstates if driver_nstates is None else driver_nstates
         nstates = int(nstates)
         if scan_roots is None:
             scan_roots = nstates
         scan_roots = int(scan_roots)
         if scan_roots < nstates:
             raise ValueError("scan_roots must be >= nstates.")
-        electronic_method = _normalize_triatomic_electronic_method(electronic_method)
-        if electronic_method not in ("casci", "rohf-casci", "am1-meci", "uam1-meci"):
-            raise ValueError(
-                "electronic_method must be 'casci', 'rohf/casci', 'am1/meci', or 'uam1/meci'."
-            )
+        if using_driver:
+            electronic_method = "driver"
+        else:
+            electronic_method = _normalize_triatomic_electronic_method(electronic_method)
+            if electronic_method not in ("casci", "rohf-casci", "am1-meci", "uam1-meci"):
+                raise ValueError(
+                    "electronic_method must be 'casci', 'rohf/casci', 'am1/meci', or 'uam1/meci'."
+                )
         nx = self.nx  # [N_r1, N_r2, N_theta]
         overlap_method = overlap_method.lower().replace("_", "-")
         if overlap_method == "links":
             overlap_method = "link-only"
-        if overlap_method not in ("linked", "full", "link-only"):
+        if overlap_method not in ("linked", "full", "link-only", "none"):
             raise ValueError(
-                "overlap_method must be 'linked', 'full', or 'link-only'."
+                "overlap_method must be 'linked', 'full', 'link-only', or 'none'."
             )
         meta = dict(
             nx=nx,
@@ -3501,25 +3650,126 @@ class Triatom(Molecule):
             scanner_retry_conv_tol_dms=scanner_retry_conv_tol_dms,
             scanner_retry_diis=scanner_retry_diis,
             scanner_retry_max_cycle=scanner_retry_max_cycle,
+            driver=None if driver is None else driver.__class__.__name__,
         )
+
+        def make_electronic_data(grid_mc_objects):
+            coords = None
+            if hasattr(self, "cartesian_grid"):
+                try:
+                    coords = self.cartesian_grid(copy=True)
+                except Exception:
+                    coords = None
+            first_mc = None
+            if grid_mc_objects is not None:
+                first_mc = next((mc for mc in grid_mc_objects.flat if mc is not None), None)
+            mol0 = getattr(getattr(first_mc, "mf", None), "mol", None)
+            if mol0 is None:
+                mol0 = first_mc.mol if hasattr(first_mc, "mol") else None
+
+            data = {
+                "coords": coords,
+                "symbols": tuple(self.atom_symbols()),
+                "basis": getattr(mol0, "basis", basis),
+                "charge": getattr(mol0, "charge", self.charge),
+                "spin": getattr(mol0, "spin", self.spin),
+                "unit": getattr(mol0, "unit", self.unit),
+                "nstates": nstates,
+                "ncas": ncas,
+                "nelecas": nelecas,
+                "electronic_method": electronic_method,
+            }
+            if grid_mc_objects is None:
+                return data
+
+            if (
+                first_mc is None
+                or not hasattr(first_mc, "make_rdm1")
+                or not hasattr(first_mc, "make_tdm1")
+                or not hasattr(first_mc, "mf")
+                or not hasattr(first_mc.mf, "mol")
+            ):
+                return data
+
+            mol0 = first_mc.mf.mol
+            nao = int(mol0.nao)
+            dm1_ao = np.empty((*self.nx, nstates, nao, nao), dtype=complex)
+            tdm1_ao = np.empty((*self.nx, nstates, nstates, nao, nao), dtype=complex)
+            for idx in np.ndindex(*self.nx):
+                mc = grid_mc_objects[idx]
+                for state in range(nstates):
+                    dm1_ao[idx + (state,)] = mc.make_rdm1(
+                        state,
+                        with_core=True,
+                        representation="ao",
+                    )
+                for bra in range(nstates):
+                    for ket in range(nstates):
+                        tdm1_ao[idx + (bra, ket)] = mc.make_tdm1(
+                            bra,
+                            ket,
+                            with_core=True,
+                            representation="ao",
+                        )
+
+            data["dm1_ao"] = dm1_ao
+            data["tdm1_ao"] = tdm1_ao
+            data["nao"] = nao
+
+            try:
+                from pyqed.qchem.fourier import AOPairFTPlan
+
+                plan = AOPairFTPlan.from_molecule(mol0)
+                data["ao_ft_plan"] = plan
+                if coords is not None:
+                    ao_origins = np.empty((*self.nx, plan.ncart, 3), dtype=float)
+                    for idx in np.ndindex(*self.nx):
+                        ao_origins[idx] = plan.origins_from_atom_coords(coords[idx])
+                    data["ao_origins"] = ao_origins
+            except Exception:
+                pass
+
+            return data
+
+        def save_electronic_data(electronic_data):
+            arrays = {
+                key: electronic_data[key]
+                for key in ("coords", "dm1_ao", "tdm1_ao", "ao_origins")
+                if key in electronic_data and electronic_data[key] is not None
+            }
+            if "dm1_ao" not in arrays or "tdm1_ao" not in arrays:
+                return
+            arrays["meta"] = np.array(meta)
+            np.savez("electronic_data.npz", **arrays)
+            print("[scan_pes] Saved electronic_data.npz")
+
+        def scan_return(apes, overlap_data, grid_mc_objects, save_electronic=False):
+            electronic_data = make_electronic_data(grid_mc_objects)
+            self.ed = electronic_data
+            self.electronic_data = electronic_data
+            self.ued_data = electronic_data
+            if save_electronic:
+                save_electronic_data(electronic_data)
+            return apes, overlap_data, electronic_data
 
         # --- 0. Skip if external inputs are already provided -------------------
         if self.apes is not None and (
             self.overlap_matrix is not None or self.overlap_links is not None
         ):
             print("[scan_pes] External PES and LDR overlaps already set. Skipping.")
+            grid_mc_objects = getattr(self, "grid_mc_objects", None)
             overlap_data = (
                 self.overlap_matrix
                 if self.overlap_matrix is not None
                 else self.overlap_links
             )
-            return self.apes, overlap_data
+            return scan_return(self.apes, overlap_data, grid_mc_objects)
 
         # --- 1. Scan: compute electronic states at every grid point ------------
         print(
             f"[scan_pes] Scanning PES "
             f"(method={electronic_method}, basis={basis}, ncas={ncas}, "
-            f"nelecas={nelecas}, n_workers={n_workers}, use_scanner={use_scanner}) ..."
+            f"nelecas={nelecas}, n_workers={n_workers}, use_scanner={use_scanner or using_driver}) ..."
         )
         total = np.prod(nx)
         electronic_options = dict(
@@ -3555,21 +3805,36 @@ class Triatom(Molecule):
             raise ValueError("scanner_order must be 'snake' or 'lexicographic'.")
         indices = (
             self._snake_grid_indices()
-            if use_scanner and scanner_order == "snake"
+            if (use_scanner or using_driver) and scanner_order == "snake"
             else self._grid_indices()
         )
-        tasks = self._electronic_structure_tasks(
-            basis,
-            ncas,
-            nelecas,
-            scan_roots,
-            electronic_method=electronic_method,
-            electronic_options=electronic_options,
-            indices=indices,
-        )
-        if len(tasks) != total:
-            raise RuntimeError("Internal error while preparing electronic-structure tasks.")
-        if use_scanner:
+        driver_scanner = None
+        if using_driver:
+            if n_workers is not None and int(n_workers) != 1:
+                warnings.warn(
+                    "scan_pes(driver=...) is serial; ignoring n_workers > 1.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.apes, grid_mc_objects, driver_scanner = self._run_electronic_driver_scan(
+                driver,
+                indices,
+                nstates,
+                worker_threads=worker_threads,
+            )
+        else:
+            tasks = self._electronic_structure_tasks(
+                basis,
+                ncas,
+                nelecas,
+                scan_roots,
+                electronic_method=electronic_method,
+                electronic_options=electronic_options,
+                indices=indices,
+            )
+            if len(tasks) != total:
+                raise RuntimeError("Internal error while preparing electronic-structure tasks.")
+        if (not using_driver) and use_scanner:
             if n_workers is not None and int(n_workers) != 1:
                 warnings.warn(
                     "scan_pes(use_scanner=True) is serial; ignoring n_workers > 1.",
@@ -3581,25 +3846,40 @@ class Triatom(Molecule):
                 nstates,
                 worker_threads=worker_threads,
             )
-        else:
+        elif not using_driver:
             self.apes, grid_mc_objects = self._run_electronic_structure_scan(
                 tasks,
                 nstates,
                 n_workers=n_workers,
                 worker_threads=worker_threads,
             )
+        self.grid_mc_objects = grid_mc_objects
+        overlap_fn = (
+            driver_scanner.overlap
+            if driver_scanner is not None and hasattr(driver_scanner, "overlap")
+            else _electronic_state_overlap
+        )
 
-        np.savez("grid_mc_objects.npz", data=grid_mc_objects, meta=np.array(meta))
         np.savez("apes.npz", data=self.apes, meta=np.array(meta))
-        print("[scan_pes] Saved grid_mc_objects.npz and apes.npz")
+        print("[scan_pes] Saved apes.npz")
 
         # --- 2. Compute LDR overlap matrix -------------------------------------
+        if overlap_method == "none":
+            self.overlap_links = None
+            self.overlap_matrix = None
+            return scan_return(
+                self.apes,
+                None,
+                grid_mc_objects,
+                save_electronic=True,
+            )
+
         if overlap_method == "linked":
             print("[scan_pes] Computing overlap matrix with linked-product approximation ...")
             self.overlap_links = self._compute_overlap_links(
                 grid_mc_objects,
                 nstates,
-                overlap_fn=_electronic_state_overlap,
+                overlap_fn=overlap_fn,
                 unitarize=unitarize_overlap_links,
             )
             axes, link_indices, link_data = self._pack_overlap_links(self.overlap_links)
@@ -3620,7 +3900,7 @@ class Triatom(Molecule):
             self.overlap_links = self._compute_overlap_links(
                 grid_mc_objects,
                 nstates,
-                overlap_fn=_electronic_state_overlap,
+                overlap_fn=overlap_fn,
                 unitarize=unitarize_overlap_links,
             )
             self.overlap_matrix = None
@@ -3633,19 +3913,29 @@ class Triatom(Molecule):
                 meta=np.array(meta),
             )
             print("[scan_pes] Saved overlap_links.npz")
-            return self.apes, self.overlap_links
+            return scan_return(
+                self.apes,
+                self.overlap_links,
+                grid_mc_objects,
+                save_electronic=True,
+            )
         else:
             print("[scan_pes] Computing full pairwise overlap matrix ...")
             self.overlap_matrix = self._build_full_overlap_matrix(
                 grid_mc_objects,
                 nstates,
-                overlap_fn=_electronic_state_overlap,
+                overlap_fn=overlap_fn,
             )
 
         np.savez("overlap_matrix.npz", data=self.overlap_matrix, meta=np.array(meta))
         print("[scan_pes] Saved overlap_matrix.npz")
 
-        return self.apes, self.overlap_matrix
+        return scan_return(
+            self.apes,
+            self.overlap_matrix,
+            grid_mc_objects,
+            save_electronic=True,
+        )
 
     def get_population(self, result, plot=True):
         """
@@ -3691,6 +3981,9 @@ class Triatom(Molecule):
             fig.show()
 
         return pops
+
+
+Triatomic = Triatom
 
 
 # ====================================================================== #

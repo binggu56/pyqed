@@ -12,13 +12,13 @@ Reallocated singl_function (elt_size=4) to 100 items from 50.
 Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
 Reallocated singl_function (elt_size=4) to 100 items from 50.
 Database file #1: rovibronic_ldr_theoryNotes.bib
-Warning--I didn't find a database entry for "bornhuang1954"
-Warning--I didn't find a database entry for "bunkerjensen1998"
+Warning--I didn't find a database entry for "eckart1935"
 Warning--I didn't find a database entry for "watson1968"
+Warning--I didn't find a database entry for "bunkerjensen1998"
+Warning--I didn't find a database entry for "lauvergnat2016"
+Warning--I didn't find a database entry for "bornhuang1954"
 Warning--I didn't find a database entry for "zare1988"
 Warning--I didn't find a database entry for "varshalovich1988"
-Warning--I didn't find a database entry for "eckart1935"
-Warning--I didn't find a database entry for "lauvergnat2016"
 Warning--I didn't find a database entry for "lightcarrington2000"
 control{REVTEX42Control}, control.key{N/A}, control.author{N/A}, control.editor{N/A}, control.title{N/A}, control.pages{N/A}, control.year{N/A}, control.eprint{N/A}, 
 control{apsrev42Control}, control.key{N/A}, control.author{08}, control.editor{1}, control.title{0}, control.pages{0}, control.year{1}, control.eprint{N/A}, 

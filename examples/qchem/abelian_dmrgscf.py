@@ -38,7 +38,11 @@ def parse_args():
     parser.add_argument("--macro-tol", type=float, default=1.0e-6)
     parser.add_argument("--site", choices=("spatial", "spin_orbital"), default="spatial")
     parser.add_argument("--symmetry", choices=("sz", "pg"), default="sz")
-    parser.add_argument("--spatial-abelian-mpo", choices=("grouped", "direct"), default="grouped")
+    parser.add_argument(
+        "--spatial-abelian-mpo",
+        choices=("spatial", "grouped", "direct"),
+        default="spatial",
+    )
     parser.add_argument("--orb-sym", default=None, help="Comma-separated AbelianPG orbital irreps, e.g. 0,1,0,1")
     parser.add_argument("--nstates", type=int, default=1)
     parser.add_argument("--conv-tol", type=float, default=None)

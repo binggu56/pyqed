@@ -38,6 +38,78 @@ except Exception:  # pragma: no cover - optional accelerator
     _rys_cy = None
 
 
+def _basis_from_libcint_arrays(mol):
+    """Build native Cartesian AOs in the molecule's libcint shell order.
+
+    PyQED can receive molecules that already carry libcint-style ``_bas`` and
+    ``_env`` arrays.  Reusing those arrays avoids any PySCF import while still
+    preserving the AO order used by the density matrix, including split SP
+    shells where reparsing the basis file can produce a different order.
+    """
+    bas = getattr(mol, "_bas", None)
+    env = getattr(mol, "_env", None)
+    if bas is None or env is None or not hasattr(bas, "ndim") or bas.ndim != 2:
+        return None
+
+    atom_coords = np.asarray(mol.atom_coords(), dtype=float)
+    basis_cart = []
+    transform_blocks = []
+    cart = bool(getattr(mol, "cart", False))
+
+    for shell in np.asarray(bas, dtype=int):
+        atom_id = int(shell[0])
+        angular = int(shell[1])
+        nprim = int(shell[2])
+        nctr = int(shell[3])
+        ptr_exp = int(shell[5])
+        ptr_coeff = int(shell[6])
+
+        exps = np.asarray(env[ptr_exp:ptr_exp + nprim], dtype=float)
+        coeffs = np.asarray(
+            env[ptr_coeff:ptr_coeff + nprim * nctr],
+            dtype=float,
+        ).reshape(nctr, nprim).T
+        # libcint stores contraction coefficients in a real-solid-harmonic
+        # normalization convention.  The native Rys code contracts normalized
+        # Cartesian primitives, so convert the shell-wide factor here.
+        weights = coeffs / math.sqrt(4.0 * math.pi / (2 * angular + 1))
+        axes = []
+        for lx in range(angular, -1, -1):
+            remaining = angular - lx
+            for ly in range(remaining, -1, -1):
+                axes.append((lx, ly, remaining - ly))
+
+        for ictr in range(nctr):
+            start = len(basis_cart)
+            for axis in axes:
+                basis_cart.append(
+                    ContractedGaussian(
+                        origin=atom_coords[atom_id],
+                        shell=axis,
+                        exps=exps,
+                        coefs=weights[:, ictr],
+                        norm=np.ones(nprim, dtype=float),
+                        prim_weights=weights[:, ictr],
+                        normalize=False,
+                    )
+                )
+            if not cart:
+                transform_blocks.append((start, len(basis_cart), angular))
+
+    if cart:
+        return basis_cart, None
+
+    nsph = sum(2 * angular + 1 for _, _, angular in transform_blocks)
+    transform = np.zeros((len(basis_cart), nsph), dtype=float)
+    col = 0
+    for start, stop, angular in transform_blocks:
+        block = _cart2sph_unit_block(angular)
+        ncols = block.shape[1]
+        transform[start:stop, col:col + ncols] = block
+        col += ncols
+    return basis_cart, transform
+
+
 def _native_basis_and_transform(mol):
     basis = getattr(mol, "_bas_cart", None)
     transform = getattr(mol, "_ao_cart2sph", None)
@@ -47,6 +119,10 @@ def _native_basis_and_transform(mol):
     basis = getattr(mol, "_bas", None)
     if basis is not None and all(isinstance(fn, ContractedGaussian) for fn in basis):
         return list(basis), None
+
+    libcint_basis = _basis_from_libcint_arrays(mol)
+    if libcint_basis is not None:
+        return libcint_basis
 
     basis_dict = parse_gbs(_basis_path(mol.basis))
     basis_cart = make_contractions(

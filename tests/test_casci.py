@@ -62,6 +62,46 @@ def test_casci_is_exported_from_pyqed_qchem():
     assert ExportedCASCI is CASCI
 
 
+def test_casci_make_rdm1_ao_representation_matches_manual_transform():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=1)
+
+    dm_mo = mc.make_rdm1(0, with_core=True, with_vir=True, representation='mo')
+    dm_mo_no_vir = mc.make_rdm1(0, with_core=True, representation='mo')
+    dm_ao = mc.make_rdm1(0, with_core=True, with_vir=True, representation='ao')
+    dm_ao_no_vir = mc.make_rdm1(0, with_core=True, representation='ao')
+    dm_ao_alias = mc.make_rdm1(0, with_core=True, with_vir=True, repr='ao')
+
+    expected = mf.mo_coeff @ dm_mo @ mf.mo_coeff.conj().T
+    expected_no_vir = mf.mo_coeff[:, :dm_mo_no_vir.shape[0]] @ dm_mo_no_vir @ mf.mo_coeff[:, :dm_mo_no_vir.shape[0]].conj().T
+    np.testing.assert_allclose(dm_ao, expected, atol=1e-12)
+    np.testing.assert_allclose(dm_ao_no_vir, expected_no_vir, atol=1e-12)
+    np.testing.assert_allclose(dm_ao_no_vir, expected, atol=1e-12)
+    np.testing.assert_allclose(dm_ao_alias, expected, atol=1e-12)
+
+
+def test_casci_make_tdm1_ao_representation_matches_manual_transform():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    tdm_active = mc.make_tdm1(0, 1)
+    tdm_ao = mc.make_tdm1(0, 1, representation='ao')
+    tdm_ao_with_core = mc.make_tdm1(0, 1, with_core=True, representation='ao')
+    tdm_ao_alias = mc.make_tdm1(0, 1, repr='ao')
+
+    active_coeff = mf.mo_coeff[:, mc.ncore:mc.ncore + mc.ncas]
+    expected = active_coeff @ tdm_active @ active_coeff.conj().T
+    np.testing.assert_allclose(tdm_ao, expected, atol=1e-12)
+    np.testing.assert_allclose(tdm_ao_with_core, expected, atol=1e-12)
+    np.testing.assert_allclose(tdm_ao_alias, expected, atol=1e-12)
+
+
 def test_casci_accepts_open_shell_uhf_reference():
     mol = Molecule(atom='H 0 0 0', unit='bohr', basis='sto-3g', spin=1)
     mol.build(driver='gbasis')

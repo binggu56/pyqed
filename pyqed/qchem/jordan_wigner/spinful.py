@@ -34,7 +34,10 @@ import logging
 # import warnings
 
 from pyqed import discretize, sort, dag, tensor
-from pyqed.mps import DMRG
+try:
+    from pyqed.mps import DMRG
+except ImportError:  # pragma: no cover - optional legacy helper
+    DMRG = None
 from pyqed.phys import eigh
 from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom, obs

@@ -1490,17 +1490,13 @@ class Molecule:
             ints = np.einsum('pi,xpq,qj->xij', transform, ints, transform, optimize=True)
         return ints
 
-    def _native_cartesian_basis_and_transform(self):
-        basis = self._bas_cart
-        transform = getattr(self, "_ao_cart2sph", None)
-        if basis is None:
-            basis = self._bas
-            transform = None
+    def _cart_basis(self):
+        basis = self._bas_cart if self._bas_cart is not None else self._bas
         if basis is None:
             raise ValueError("Build molecular integrals before requesting one-electron integrals.")
         if not all(isinstance(fn, ContractedGaussian) for fn in basis):
             raise RuntimeError("Native one-electron integrals require a ContractedGaussian basis.")
-        return list(basis), transform
+        return list(basis), getattr(self, "_ao_cart2sph", None)
 
     @staticmethod
     def _raise_axis(shell, axis, delta):
@@ -1590,7 +1586,7 @@ class Molecule:
             if ints.shape[-1] == 3:
                 ints = np.moveaxis(ints, -1, 0)
             return ints
-        basis, transform = self._native_cartesian_basis_and_transform()
+        basis, transform = self._cart_basis()
         nao = len(basis)
         op = np.zeros((3, nao, nao), dtype=float)
         for i, bra in enumerate(basis):
@@ -1611,7 +1607,7 @@ class Molecule:
             mol.build()
             mol.set_common_orig(coord=center)
             return mol.intor("int1e_cg_irxp", comp=3)
-        basis, transform = self._native_cartesian_basis_and_transform()
+        basis, transform = self._cart_basis()
         nao = len(basis)
         op = np.zeros((3, nao, nao), dtype=float)
         pairs = ((1, 2), (2, 0), (0, 1))

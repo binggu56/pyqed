@@ -9,7 +9,8 @@ from .ehrenfest import (
     TDDFTEhrenfest,
     TDDFTTrajectory,
 )
-from .ldrfg import LDRFG, LDRFGRHS, grad_overlap_from_derivative_couplings
+from .ldrfg import AbInitioLDRFGAdapter, LDRFG, LDRFGRHS, grad_overlap_from_derivative_couplings
+from .triatomic import Triatom, Triatomic
 
 __all__ = [
     "AbInitioEhrenfest",
@@ -19,10 +20,13 @@ __all__ = [
     "Ehrenfest",
     "EhrenfestTrajectory",
     "GeometricEhrenfest",
+    "AbInitioLDRFGAdapter",
     "LDRFG",
     "LDRFGRHS",
     "grad_overlap_from_derivative_couplings",
     "TDDFTDriver",
     "TDDFTEhrenfest",
     "TDDFTTrajectory",
+    "Triatom",
+    "Triatomic",
 ]

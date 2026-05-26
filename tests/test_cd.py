@@ -33,7 +33,7 @@ def _chiral_methyl_lactate_molecule():
         'H 3.890 1.670 -0.370'
     )
     mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build(driver='builtin', eri='s8')
     return mol
 
 
@@ -118,6 +118,7 @@ def test_cd_from_tda_pcm_backend_h2():
     pytest.importorskip('pyscf.solvent')
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    # This TDDFT/PCM test deliberately uses PySCF-built orbitals.
     mol.build(driver='pyscf')
     mf = RHF(mol).run()
 
@@ -180,6 +181,7 @@ def test_tddft_pcm_cd_matches_pyscf_h2o2():
     ptd.kernel()
 
     mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
+    # Keep PySCF AO ordering because the reference MO/TD data are injected below.
     mol.build(driver='pyscf')
     mf = RHF(mol)
     mf.mo_energy = np.array(pmf.mo_energy)
@@ -213,7 +215,6 @@ def test_tddft_pcm_cd_matches_pyscf_h2o2():
 
 
 def test_chiral_cd_spectra_for_gas_phase_and_pcm_casci_backends(tmp_path):
-    pytest.importorskip('pyscf.solvent')
     pytest.importorskip('matplotlib')
     import matplotlib
 

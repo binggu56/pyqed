@@ -1,10 +1,15 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from pyqed.qchem.dmrg.dmrg import (
+    DMRG,
     _build_spatial_active_hamiltonian_matrix,
     _normalize_spatial_family_environment_backend,
+    _normalize_spatial_native_p_grouping,
 )
+from pyqed.qchem.dmrg.spatial_mpo import build_spatial_block2_carrier_mpo
 from pyqed.qchem.dmrg.backends.reduced import (
     build_spatial_complementary_operator_families,
     build_spatial_reduced_hamiltonian_mpo,
@@ -22,6 +27,7 @@ from pyqed.qchem.dmrg.spatial_terms import (
     spatial_two_body_term_map,
     spatial_two_body_spinfree_term_map,
 )
+from pyqed.qchem.mcscf.cocas import _fresh_casci_like
 from pyqed.mps.nonabelian import (
     AutoMPO,
     FullyReducedSpatialOrbitalSite,
@@ -33,6 +39,12 @@ from pyqed.mps.nonabelian.models import (
     _dense_matrix_from_local_mpo,
     add_spatial_one_body_terms,
     add_spatial_two_generator_product_terms,
+)
+from pyqed.mps.nonabelian.renormalized import (
+    ComplementaryFamilyRenormalizedOperatorTable,
+    ComplementaryNativeExactPatternComponentTable,
+    ComplementaryNativeExactPatternOperatorTable,
+    ComplementaryNativePairBoundaryOperatorTable,
 )
 
 
@@ -56,8 +68,16 @@ def _dense_from_spatial_term_map(term_map, nsites):
 
 
 def test_spatial_family_environment_backend_block2_aliases_use_family_mpos():
-    assert _normalize_spatial_family_environment_backend(None) == "block2"
+    assert _normalize_spatial_family_environment_backend(None) == "block2_table"
     assert _normalize_spatial_family_environment_backend("block2") == "block2"
+    assert (
+        _normalize_spatial_family_environment_backend("operator_table")
+        == "block2_table"
+    )
+    assert (
+        _normalize_spatial_family_environment_backend("generator_table")
+        == "generator_table"
+    )
     assert _normalize_spatial_family_environment_backend("autompo") == "block2"
     assert (
         _normalize_spatial_family_environment_backend("native_generators")
@@ -72,6 +92,300 @@ def test_spatial_family_environment_backend_block2_aliases_use_family_mpos():
         == "block2"
     )
     assert _normalize_spatial_family_environment_backend("none") == "none"
+
+
+def test_spatial_native_p_grouping_aliases():
+    assert _normalize_spatial_native_p_grouping(None) == "first_site_order"
+    assert _normalize_spatial_native_p_grouping("balanced") == "first_site_order"
+    assert _normalize_spatial_native_p_grouping("all") == "none"
+    assert (
+        _normalize_spatial_native_p_grouping("first_two_sites")
+        == "first_two_site_order"
+    )
+    assert _normalize_spatial_native_p_grouping("full_site_order") == "site_order"
+
+
+def test_qchem_spatial_abelian_defaults_to_spatial_block2_table_payload():
+    class Mol:
+        spin = 0
+
+    class MF:
+        nelec = 2
+        mol = Mol()
+
+    dmrg = DMRG(MF(), ncas=2, nelecas=2, D=4, site="spatial", symmetry="sz")
+
+    assert dmrg.spatial_abelian_mpo == "spatial"
+    assert dmrg.spatial_family_environment_backend == "block2_table"
+    assert dmrg.spatial_block2_table_p_split_metric == "auto"
+    assert dmrg.spatial_block2_table_p_split_groups == "auto"
+    assert dmrg.spatial_block2_table_native_p is False
+    assert dmrg.spatial_complementary_payload_tensor_matvec is True
+    assert dmrg.spatial_precontracted_family_environment is True
+    assert dmrg.spatial_boundary_table_max_dim == 32
+    assert dmrg.spatial_exact_component_compression_policy == "auto"
+    assert dmrg.spatial_exact_component_compression_validate is True
+    assert dmrg.spatial_exact_component_compression_validation_vectors == 1
+    assert dmrg.spatial_exact_component_compression_min_reduction == 1
+    assert dmrg.spatial_exact_component_compression_max_group_size == 64
+    assert dmrg.spatial_enable_native_boundary_p is True
+    assert dmrg.spatial_validate_native_boundary_p is True
+    assert dmrg.spatial_native_boundary_p_validation_policy == "first_pass"
+    assert dmrg.spatial_direct_operator_batch_min_entries == 2
+    assert dmrg.spatial_reduced_mpo is False
+    assert dmrg._can_use_spatial_block2_carrier() is True
+
+    dense = DMRG(MF(), ncas=2, nelecas=2, D=4, site="spatial", symmetry=None)
+    assert dense.spatial_abelian_mpo == "spatial"
+    assert dense._can_use_spatial_block2_carrier() is False
+
+
+def test_spatial_block2_carrier_is_d4_scaffold_not_grouped_spin_orbital():
+    carrier = build_spatial_block2_carrier_mpo(3)
+
+    assert carrier.info["representation"] == "spatial_block2_table_carrier_mpo"
+    assert carrier.info["replaces_grouped_spin_orbital_carrier"] is True
+    assert [factor.shape for factor in carrier.factors] == [(1, 1, 4, 4)] * 3
+    for factor in carrier.factors:
+        np.testing.assert_allclose(factor[0, 0], np.eye(4))
+
+
+def test_block2_table_backend_uses_family_mpos_not_direct_term_maps():
+    h1 = np.array([[0.1, 0.02], [0.02, -0.1]])
+    eri = np.zeros((2, 2, 2, 2, 2, 2))
+    eri[:, :, 0, 0, 1, 1] = 0.3
+    families = build_spatial_complementary_operator_families(h1, eri, cutoff=1.0e-12)
+    term_maps = spatial_complementary_family_term_maps(families, cutoff=1.0e-12)
+
+    dmrg = DMRG.__new__(DMRG)
+    dmrg.ncas = 2
+    dmrg.spatial_family_environment_backend = "block2_table"
+    dmrg.spatial_abelian_symbolic_algo = "Hopcroft-Karp"
+    dmrg.spatial_native_p_grouping = "first_site_order"
+
+    family_mpos, family_info = DMRG._build_spatial_family_environment_mpos(
+        dmrg,
+        families,
+        term_maps,
+        cutoff=1.0e-12,
+    )
+    DMRG._expose_spatial_family_environment(
+        dmrg,
+        families,
+        term_maps,
+        family_mpos,
+        expose_direct_terms=True,
+    )
+
+    p_mpos = {name for name in family_mpos if name.split(":", 1)[0] == "P"}
+    assert "R" in family_mpos
+    assert p_mpos
+    assert "P" in family_info
+    if p_mpos != {"P"}:
+        assert family_info["P"]["source"] == "symbolic_spatial_term_map_split_summary"
+        assert set(family_info["P"]["split_family_names"]) == p_mpos
+    assert dmrg.complementary_operator_mpos is family_mpos
+    assert dmrg.complementary_operator_term_maps is None
+
+
+def test_block2_table_native_p_replaces_only_p_family_mpo():
+    h1 = np.array([[0.1, 0.02], [0.02, -0.1]])
+    eri = np.zeros((2, 2, 2, 2, 2, 2))
+    eri[:, :, 0, 0, 1, 1] = 0.3
+    families = build_spatial_complementary_operator_families(h1, eri, cutoff=1.0e-12)
+    term_maps = spatial_complementary_family_term_maps(families, cutoff=1.0e-12)
+
+    dmrg = DMRG.__new__(DMRG)
+    dmrg.ncas = 2
+    dmrg.spatial_family_environment_backend = "block2_table"
+    dmrg.spatial_abelian_symbolic_algo = "Hopcroft-Karp"
+    dmrg.spatial_native_p_grouping = "first_site_order"
+    dmrg.spatial_block2_table_native_p = True
+
+    family_mpos, family_info = DMRG._build_spatial_family_environment_mpos(
+        dmrg,
+        families,
+        term_maps,
+        cutoff=1.0e-12,
+    )
+    DMRG._expose_spatial_family_environment(
+        dmrg,
+        families,
+        term_maps,
+        family_mpos,
+        expose_direct_terms=True,
+    )
+
+    assert "R" in family_mpos
+    assert not any(name.split(":", 1)[0] == "P" for name in family_mpos)
+    assert family_info["P"]["source"] == "native_direct_generator_table"
+    assert family_info["P"]["symbolic_mpo_replaced"] is True
+    assert dmrg.complementary_operator_mpos is family_mpos
+    assert dmrg.complementary_operator_term_maps is None
+    assert set(dmrg.complementary_operator_generator_entries) == {"P"}
+    assert dmrg.complementary_operator_generator_entries["P"] == families["P"].entries
+
+
+def test_generator_table_backend_exposes_generator_entries_not_symbolic_mpos():
+    h1 = np.array([[0.1, 0.02], [0.02, -0.1]])
+    eri = np.zeros((2, 2, 2, 2, 2, 2))
+    eri[:, :, 0, 0, 1, 1] = 0.3
+    families = build_spatial_complementary_operator_families(h1, eri, cutoff=1.0e-12)
+    term_maps = spatial_complementary_family_term_maps(families, cutoff=1.0e-12)
+
+    dmrg = DMRG.__new__(DMRG)
+    dmrg.ncas = 2
+    dmrg.spatial_family_environment_backend = "generator_table"
+    dmrg.spatial_abelian_symbolic_algo = "Hopcroft-Karp"
+    dmrg.spatial_native_p_grouping = "first_site_order"
+
+    family_mpos, family_info = DMRG._build_spatial_family_environment_mpos(
+        dmrg,
+        families,
+        term_maps,
+        cutoff=1.0e-12,
+    )
+    DMRG._expose_spatial_family_environment(
+        dmrg,
+        families,
+        term_maps,
+        family_mpos,
+        expose_direct_terms=False,
+    )
+
+    assert family_mpos == {}
+    assert family_info["R"]["source"] == "native_generator_entries"
+    assert family_info["P"]["source"] == "native_generator_entries"
+    assert dmrg.complementary_operator_mpos is None
+    assert dmrg.complementary_operator_term_maps is None
+    assert set(dmrg.complementary_operator_generator_entries) == {"R", "P"}
+    assert dmrg.complementary_operator_generator_entries["R"]
+    assert dmrg.complementary_operator_generator_entries["P"]
+
+
+def test_native_exact_pattern_table_is_exposed_in_family_stats():
+    table = ComplementaryNativeExactPatternOperatorTable(side="left", bond=1)
+    block_like = SimpleNamespace(data={("q0",): np.ones((2, 3))})
+    table.put((("I",), "C"), (block_like,), family_name="P")
+    component_table = ComplementaryNativeExactPatternComponentTable(bond=1)
+    component_table.put_family_records(
+        "P",
+        (((("I",), "C", "D", ("I",), 0.5 + 0.0j)),),
+    )
+    component_table.put_family("P", ((block_like,),))
+    pair_table = ComplementaryNativePairBoundaryOperatorTable(side="center", bond=1)
+    pair_table.add((0, 0, 1, 1), ((block_like,),))
+
+    family_table = ComplementaryFamilyRenormalizedOperatorTable(
+        side="left",
+        bond=1,
+        family_blocks={},
+    )
+    family_table.put_native_operator_table(("exact", 1), table)
+    family_table.put_native_operator_table(("components", 1), component_table)
+    family_table.put_native_operator_table(("pair", 1), pair_table)
+    stats = family_table.stats
+
+    assert stats["native_operator_tables"] == 3
+    assert stats["native_operator_table_stored_elements"] == 18
+    nested = {
+        value["kind"]: value
+        for value in stats["native_operator_table_stats"].values()
+    }
+    assert (
+        nested["complementary_native_exact_pattern_operator_table"]["family_counts"]
+        == {"P": 1}
+    )
+    assert (
+        nested["complementary_native_exact_pattern_component_table"]["family_counts"]
+        == {"P": 1}
+    )
+    assert (
+        nested["complementary_native_exact_pattern_component_table"]["record_counts"]
+        == {"P": 1}
+    )
+    assert nested["complementary_native_pair_boundary_operator_table"]["n_terms"] == 1
+
+
+def test_fresh_casci_like_preserves_spatial_block2_table_settings():
+    class DummyDMRG:
+        def __init__(self, mf, **kwargs):
+            self.mf = mf
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+            self.spin_purification = False
+            self.ss = None
+            self.shift = None
+
+    source = DummyDMRG(
+        object(),
+        ncas=4,
+        nelecas=4,
+        D=10,
+        init_guess="hf",
+        m_warmup=8,
+        tol=1.0e-7,
+        low_rank_mpo=True,
+        low_rank_mpo_bond=12,
+        low_rank_mpo_batch_size=3,
+        site="spatial",
+        spatial_reduced_mpo=True,
+        symmetry=("u1",),
+        spatial_site_basis="canonical",
+        integral_backend="dense",
+        spatial_abelian_mpo="direct",
+        spatial_abelian_symbolic_algo="optimal_bipartite",
+        spatial_family_environment_backend="block2_table",
+        spatial_native_p_grouping="first_two_site_order",
+        spatial_block2_table_p_split_metric="span",
+        spatial_block2_table_p_split_groups=3,
+        spatial_block2_table_native_p=True,
+        spatial_complementary_payload_tensor_matvec=False,
+        spatial_precontracted_family_environment=True,
+        spatial_boundary_table_max_dim=96,
+        spatial_exact_component_compression_policy="structural",
+        spatial_exact_component_compression_validate=False,
+        spatial_exact_component_compression_validation_vectors=5,
+        spatial_exact_component_compression_min_reduction=3,
+        spatial_exact_component_compression_max_group_size=11,
+        spatial_enable_native_boundary_p=False,
+        spatial_validate_native_boundary_p=False,
+        spatial_native_boundary_p_validation_policy="always",
+        spatial_direct_operator_batch_min_entries=5,
+        debug_complementary_action_check=True,
+        debug_complementary_action_check_tol=1.0e-9,
+        debug_complementary_action_check_limit=7,
+        debug_spatial_family_hamiltonian_check=True,
+        orb_sym=(0, 1, 0, 1),
+        verbose=2,
+    )
+
+    fresh = _fresh_casci_like(source)
+
+    assert fresh.spatial_abelian_mpo == "direct"
+    assert fresh.spatial_family_environment_backend == "block2_table"
+    assert fresh.spatial_native_p_grouping == "first_two_site_order"
+    assert fresh.spatial_block2_table_p_split_metric == "span"
+    assert fresh.spatial_block2_table_p_split_groups == 3
+    assert fresh.spatial_block2_table_native_p is True
+    assert fresh.spatial_complementary_payload_tensor_matvec is False
+    assert fresh.spatial_precontracted_family_environment is True
+    assert fresh.spatial_boundary_table_max_dim == 96
+    assert fresh.spatial_exact_component_compression_policy == "structural"
+    assert fresh.spatial_exact_component_compression_validate is False
+    assert fresh.spatial_exact_component_compression_validation_vectors == 5
+    assert fresh.spatial_exact_component_compression_min_reduction == 3
+    assert fresh.spatial_exact_component_compression_max_group_size == 11
+    assert fresh.spatial_enable_native_boundary_p is False
+    assert fresh.spatial_validate_native_boundary_p is False
+    assert fresh.spatial_native_boundary_p_validation_policy == "always"
+    assert fresh.spatial_direct_operator_batch_min_entries == 5
+    assert fresh.debug_complementary_action_check is True
+    assert fresh.debug_complementary_action_check_tol == pytest.approx(1.0e-9)
+    assert fresh.debug_complementary_action_check_limit == 7
+    assert fresh.debug_spatial_family_hamiltonian_check is True
+    assert fresh.integral_backend == "dense"
+    assert fresh.orb_sym == (0, 1, 0, 1)
 
 
 def test_spatial_complementary_operator_families_group_integrals():
@@ -90,6 +404,13 @@ def test_spatial_complementary_operator_families_group_integrals():
     assert (0, 1) in families["A"].entries
     assert (1, 2) in families["A"].entries
     assert families.as_metadata()["families"]["P"]["n_terms"] == 2
+    assert families.as_metadata()["enable_native_boundary_p"] is True
+    assert families.as_metadata()["validate_native_boundary_p"] is True
+    assert (
+        families.as_metadata()["native_boundary_p_validation_policy"]
+        == "first_pass"
+    )
+    assert families.as_metadata()["direct_operator_batch_min_entries"] == 2
 
 
 def test_spatial_complementary_local_matrix_matches_two_site_hamiltonian():

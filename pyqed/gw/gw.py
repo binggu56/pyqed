@@ -1036,6 +1036,55 @@ class GW(object):
 
         return TDA(self, **kwargs)
 
+    def pes(self, **kwargs):
+        """Construct a photoelectron-spectrum driver from this GW reference."""
+        from pyqed.gw.pes import PES
+
+        return PES(self, **kwargs)
+
+    def arpes(self, **kwargs):
+        """Compute an angle-resolved photoelectron spectrum."""
+        return self.pes().arpes(**kwargs)
+
+    def spectral_function(self, **kwargs):
+        """Compute orbital-resolved diagonal GW spectral functions."""
+        return self.pes().spectral_function(**kwargs)
+
+    def spectral_matrix(self, **kwargs):
+        """Compute the full MO-subspace GW spectral matrix."""
+        return self.pes().spectral_matrix(**kwargs)
+
+    def satellite_spectrum(self, **kwargs):
+        """Compute a grid PES signal from the GW spectral function."""
+        return self.pes().satellite_spectrum(**kwargs)
+
+    def spectral_pes(self, **kwargs):
+        """Compute a full spectral PES signal from the GW spectral function."""
+        return self.pes().spectral_pes(**kwargs)
+
+    def dyson_orbital(self, orbital, **kwargs):
+        """Compute a matrix-GW Dyson orbital for one spatial orbital."""
+        from pyqed.gw.pes import dyson_orbital
+
+        return dyson_orbital(self, orbital, **kwargs)
+
+    def dyson_orbitals(self, orbitals=None, **kwargs):
+        """Compute matrix-GW Dyson orbitals for multiple spatial orbitals."""
+        from pyqed.gw.pes import dyson_orbital
+
+        if self.e_qp is None:
+            raise ValueError("Run GW before requesting Dyson orbitals.")
+        if orbitals is None:
+            orbitals = np.arange(len(self.e_qp), dtype=int)
+        orbitals = np.atleast_1d(np.asarray(orbitals, dtype=int))
+
+        local_kwargs = dict(kwargs)
+        if "e_rpa" not in local_kwargs and "t_rpa" not in local_kwargs:
+            e_rpa, t_rpa = self.rpa(method=self.screening)
+            local_kwargs["e_rpa"] = e_rpa
+            local_kwargs["t_rpa"] = t_rpa
+        return [dyson_orbital(self, int(orbital), **local_kwargs) for orbital in orbitals]
+
     def rpa_correlation_energy(self, mo_energy=None, method='direct', use_qp=False):
         return rpa_correlation_energy(self, mo_energy=mo_energy, method=method, use_qp=use_qp)
 

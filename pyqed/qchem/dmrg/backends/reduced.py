@@ -116,10 +116,20 @@ class SpatialComplementaryOperatorFamilies:
     prefer_direct_component_transform: bool = False
     prefer_recursive_operator_matvec: bool = True
     prefer_complementary_payload_tensor_matvec: bool = False
-    prefer_precontracted_family_environment: bool = False
+    prefer_precontracted_family_environment: bool = True
+    boundary_table_max_dim: int = 32
     debug_complementary_action_check: bool = False
     debug_complementary_action_check_tol: float = 1.0e-10
     debug_complementary_action_check_limit: int = 32
+    exact_component_compression_policy: str = "auto"
+    exact_component_compression_validate: bool = True
+    exact_component_compression_validation_vectors: int = 1
+    exact_component_compression_min_reduction: int = 1
+    exact_component_compression_max_group_size: int = 64
+    enable_native_boundary_p: bool = True
+    validate_native_boundary_p: bool = True
+    native_boundary_p_validation_policy: str = "first_pass"
+    direct_operator_batch_min_entries: int = 2
 
     def __getitem__(self, name):
         """Return a named family such as ``"P"`` or ``"Q"``."""
@@ -178,6 +188,7 @@ class SpatialComplementaryOperatorFamilies:
             "prefer_precontracted_family_environment": bool(
                 self.prefer_precontracted_family_environment
             ),
+            "boundary_table_max_dim": int(self.boundary_table_max_dim),
             "debug_complementary_action_check": bool(
                 self.debug_complementary_action_check
             ),
@@ -186,6 +197,29 @@ class SpatialComplementaryOperatorFamilies:
             ),
             "debug_complementary_action_check_limit": int(
                 self.debug_complementary_action_check_limit
+            ),
+            "exact_component_compression_policy": str(
+                self.exact_component_compression_policy
+            ),
+            "exact_component_compression_validate": bool(
+                self.exact_component_compression_validate
+            ),
+            "exact_component_compression_validation_vectors": int(
+                self.exact_component_compression_validation_vectors
+            ),
+            "exact_component_compression_min_reduction": int(
+                self.exact_component_compression_min_reduction
+            ),
+            "exact_component_compression_max_group_size": int(
+                self.exact_component_compression_max_group_size
+            ),
+            "enable_native_boundary_p": bool(self.enable_native_boundary_p),
+            "validate_native_boundary_p": bool(self.validate_native_boundary_p),
+            "native_boundary_p_validation_policy": str(
+                self.native_boundary_p_validation_policy
+            ),
+            "direct_operator_batch_min_entries": int(
+                self.direct_operator_batch_min_entries
             ),
             "families": {
                 name: family.as_metadata()
@@ -203,10 +237,20 @@ def build_spatial_complementary_operator_families(
     cutoff=1.0e-10,
     include_half=True,
     prefer_complementary_payload_tensor_matvec=False,
-    prefer_precontracted_family_environment=False,
+    prefer_precontracted_family_environment=True,
+    boundary_table_max_dim=32,
     debug_complementary_action_check=False,
     debug_complementary_action_check_tol=1.0e-10,
     debug_complementary_action_check_limit=32,
+    exact_component_compression_policy="auto",
+    exact_component_compression_validate=True,
+    exact_component_compression_validation_vectors=1,
+    exact_component_compression_min_reduction=1,
+    exact_component_compression_max_group_size=64,
+    enable_native_boundary_p=True,
+    validate_native_boundary_p=True,
+    native_boundary_p_validation_policy="first_pass",
+    direct_operator_batch_min_entries=2,
 ):
     """
     Build sparse block2-style ``S/R/A/P/B/Q`` families from active integrals.
@@ -235,6 +279,8 @@ def build_spatial_complementary_operator_families(
         kernels should precontract named family environments before the local
         center action.  This is useful for profiling but not the default on
         small and medium Abelian benchmarks.
+    :param boundary_table_max_dim: Maximum local layout dimension for the
+        long-term family-operator boundary action table.
     :param debug_complementary_action_check: Enable live local-action checks
         against the exact MPO action in sweep kernels.
     :returns: :class:`SpatialComplementaryOperatorFamilies`.
@@ -345,9 +391,25 @@ def build_spatial_complementary_operator_families(
         prefer_precontracted_family_environment=bool(
             prefer_precontracted_family_environment
         ),
+        boundary_table_max_dim=int(boundary_table_max_dim),
         debug_complementary_action_check=bool(debug_complementary_action_check),
         debug_complementary_action_check_tol=float(debug_complementary_action_check_tol),
         debug_complementary_action_check_limit=int(debug_complementary_action_check_limit),
+        exact_component_compression_policy=str(exact_component_compression_policy),
+        exact_component_compression_validate=bool(exact_component_compression_validate),
+        exact_component_compression_validation_vectors=int(
+            exact_component_compression_validation_vectors
+        ),
+        exact_component_compression_min_reduction=int(
+            exact_component_compression_min_reduction
+        ),
+        exact_component_compression_max_group_size=int(
+            exact_component_compression_max_group_size
+        ),
+        enable_native_boundary_p=bool(enable_native_boundary_p),
+        validate_native_boundary_p=bool(validate_native_boundary_p),
+        native_boundary_p_validation_policy=str(native_boundary_p_validation_policy),
+        direct_operator_batch_min_entries=int(direct_operator_batch_min_entries),
     )
 
 

@@ -662,6 +662,33 @@ class CASCI:
         self.h1e = None
         self.h2e = None
 
+    def as_scanner(
+        self,
+        nstates=None,
+        method='direct_ci',
+        build_driver=None,
+        run_kwargs=None,
+        reuse_ci=False,
+        **kwargs,
+    ):
+        """Return a stateful CASCI scanner for nearby geometries.
+
+        The scanner reuses the underlying mean-field scanner, then runs a fresh
+        CASCI calculation at each geometry. It returns the computed CASCI object
+        so downstream LDR code can use energies, overlaps, and density matrices
+        from the same electronic calculation.
+        """
+        options = dict(run_kwargs or {})
+        options.update(kwargs)
+        return CASCIScanner(
+            self,
+            nstates=nstates,
+            method=method,
+            build_driver=build_driver,
+            run_kwargs=options,
+            reuse_ci=reuse_ci,
+        )
+
 
     def PCM(self, solvent_obj=None, dm=None, **kwargs):
         """
@@ -1314,7 +1341,14 @@ class CASCI:
     def contract_with_rdm1(self, state_id, h1e=None, representation='ao'):
         return self.make_rdm1_contract(state_id, h1e=h1e, representation=representation)
 
-    def make_rdm1(self, state_id, with_core=False, with_vir=False, representation='mo'):
+    def make_rdm1(
+        self,
+        state_id,
+        with_core=False,
+        with_vir=False,
+        representation='mo',
+        repr=None,
+    ):
         """
         spin-traced 1e reduced density matrix
         .. math::
@@ -1345,6 +1379,12 @@ class CASCI:
         #     c_core = 2 * np.trace(h1e[:ncore,:ncore])
         # else:
         #     c_core = 0
+        if repr is not None:
+            representation = repr
+        representation = str(representation).lower()
+        if representation not in ("mo", "ao"):
+            raise ValueError("representation must be 'mo' or 'ao'.")
+
         if with_core and not with_vir:
 
             norb = ncas + ncore
@@ -1355,6 +1395,9 @@ class CASCI:
                     D[i, i] = 2
             D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
 
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, :norb]
+                return C @ D @ C.conj().T
             return D
 
         if with_core and with_vir:
@@ -1365,9 +1408,16 @@ class CASCI:
                     D[i, i] = 2
             D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
 
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)
+                return C @ D @ C.conj().T
             return D
         else:
-            return make_rdm1(ci, self.binary, self.SC1)
+            D = make_rdm1(ci, self.binary, self.SC1)
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, ncore:ncore+ncas]
+                return C @ D @ C.conj().T
+            return D
 
 
     def make_rdm1s(self, state_id):
@@ -1519,7 +1569,15 @@ class CASCI:
 
         return c_cas + c_core
 
-    def make_tdm1(self, bra_id, ket_id=0):
+    def make_tdm1(
+        self,
+        bra_id,
+        ket_id=0,
+        representation='mo',
+        repr=None,
+        with_core=False,
+        with_vir=False,
+    ):
         """
         TDM
 
@@ -1535,10 +1593,40 @@ class CASCI:
         None.
 
         """
+        if repr is not None:
+            representation = repr
+        representation = str(representation).lower()
+        if representation not in ("mo", "ao"):
+            raise ValueError("representation must be 'mo' or 'ao'.")
+
+        if bra_id == ket_id:
+            return self.make_rdm1(
+                bra_id,
+                with_core=with_core,
+                with_vir=with_vir,
+                representation=representation,
+            )
+
         cibra = self.ci[bra_id]
         ciket = self.ci[ket_id]
+        D_active = make_tdm1(cibra, ciket, self.binary, self.SC1)
 
-        return make_tdm1(cibra, ciket, self.binary, self.SC1)
+        if not with_core and not with_vir:
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, self.ncore:self.ncore + self.ncas]
+                return C @ D_active @ C.conj().T
+            return D_active
+
+        ncore = self.ncore
+        ncas = self.ncas
+        nmo = self.mf.nmo if with_vir else ncore + ncas
+        D = np.zeros((nmo, nmo), dtype=np.result_type(D_active, complex))
+        D[ncore:ncore + ncas, ncore:ncore + ncas] = D_active
+
+        if representation == "ao":
+            C = np.asarray(self.mf.mo_coeff)[:, :nmo]
+            return C @ D @ C.conj().T
+        return D
 
     def vibronic_couplings(
         self,
@@ -2927,6 +3015,86 @@ def overlap(cibra, ciket, s=None):
         ciket,
         s=s,
     )
+
+
+class CASCIScanner:
+    """Stateful multi-state CASCI scanner.
+
+    Calling the scanner with Cartesian coordinates or a Molecule-like object
+    updates the HF reference through ``mf.as_scanner()``, runs CASCI, stores the
+    result as ``last_result``, and returns the CASCI object.
+    """
+
+    def __init__(
+        self,
+        mc,
+        nstates=None,
+        method='direct_ci',
+        build_driver=None,
+        run_kwargs=None,
+        reuse_ci=False,
+    ):
+        self.template = mc
+        self.mf = mc.mf
+        self.mol = mc.mol
+        self.nstates = int(nstates if nstates is not None else (mc.nstates or 1))
+        self.method = method
+        self.run_kwargs = dict(run_kwargs or {})
+        self.reuse_ci = bool(reuse_ci)
+        self.last_result = None
+        self._mf_scanner = (
+            self.mf.as_scanner(build_driver=build_driver)
+            if hasattr(self.mf, "as_scanner")
+            else None
+        )
+
+    def __call__(self, mol_or_geom):
+        if self._mf_scanner is not None:
+            self._mf_scanner(mol_or_geom)
+            mf = self._mf_scanner.mf
+        else:
+            mf = self.mf
+            if hasattr(mf, "mol") and isinstance(mol_or_geom, np.ndarray):
+                mol = mf.mol
+                mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+                mol.build(driver=getattr(mol, "_build_driver", None) or "gbasis")
+                mf.run()
+            elif mol_or_geom is not None and mol_or_geom is not getattr(mf, "mol", None):
+                mf.mol = mol_or_geom
+                mf.run()
+
+        scanner_mc = self.template.__class__(
+            mf,
+            ncas=self.template.ncas,
+            nelecas=self.template.nelecas,
+            spin=self.template.spin,
+            verbose=self.template.verbose,
+        )
+        scanner_mc.binary = self.template.binary
+        scanner_mc.spin_purification = self.template.spin_purification
+        scanner_mc.ss = self.template.ss
+        scanner_mc.shift = self.template.shift
+        scanner_mc.use_cholesky_integrals = self.template.use_cholesky_integrals
+
+        options = dict(self.run_kwargs)
+        method = options.pop("method", self.method)
+        ci0 = options.pop("ci0", None)
+        if ci0 is None and self.reuse_ci and self.last_result is not None:
+            ci0 = getattr(self.last_result, "ci", None)
+        scanner_mc.run(
+            nstates=self.nstates,
+            method=method,
+            ci0=ci0,
+            **options,
+        )
+
+        self.mf = mf
+        self.mol = mf.mol
+        self.last_result = scanner_mc
+        return scanner_mc
+
+    def overlap(self, left, right):
+        return overlap(left, right)
 
 if __name__ == "__main__":
     from pyqed import Molecule

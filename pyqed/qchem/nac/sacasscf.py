@@ -1,71 +1,136 @@
-"""MCSCF/CASCI nonadiabatic couplings from state overlaps.
+"""State-averaged CASSCF nonadiabatic couplings.
 
 This module provides a small backend for computing adiabatic derivative
 coupling matrices
 
     D[a, i, j] = <Psi_i(R)|d Psi_j(R) / d R_a>
 
-from finite differences of MCSCF/CASCI wavefunction overlaps.  It is intended
-as the first ab initio NAC provider for LDRFG-style dynamics; the public shape
-matches the existing Ehrenfest NAC convention.
+from state overlaps or SA-CASSCF response equations.  The public shape matches
+the existing Ehrenfest NAC convention.
 """
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 
 from pyqed.qchem.mol import Molecule
-from pyqed.qchem.basis_derivatives import eri_derivatives, one_electron_derivatives
+from pyqed.qchem.basis_derivatives import (
+    eri_derivatives,
+    one_electron_derivatives,
+    one_index_one_electron_derivatives,
+)
+from pyqed.qchem.grad import sacasscf as sacasscf_grad
 from pyqed.qchem.mcscf.casci import CASCI, overlap
-from pyqed.qchem.mcscf.orbopt import pack_nonredundant, unpack_nonredundant
-from pyqed.qchem.mcscf.zvector import MCSCFZVector, NACRHS
+from pyqed.qchem.mcscf.orbopt import (
+    generalized_fock,
+    orbital_gradient,
+    pack_nonredundant,
+    unpack_nonredundant,
+)
+from pyqed.qchem.mcscf.reduced_ci import _transition_rdms_with_core
+from pyqed.qchem.mcscf.zvector import MCSCFZVector, NACRHS, PropertyRHS
+
+
+@dataclass
+class FixedOrbitalCASCIDriver:
+    """Minimal driver adapter for fixed-orbital CASCI NACs."""
+
+    mf: object
+    mo_coeff: np.ndarray
+    ncore: int
+    ncas: int
+    weights: np.ndarray | None = None
+    state_id: int = 0
+
+    def __post_init__(self) -> None:
+        self.mo_coeff = np.asarray(self.mo_coeff, dtype=float)
+        self.ncore = int(self.ncore)
+        self.ncas = int(self.ncas)
+        self.nmo = int(self.mo_coeff.shape[1])
+
+    def _get_integrals(self, mo_coeff):
+        if not hasattr(self.mf, "get_hcore_mo") or not hasattr(self.mf, "get_eri_mo"):
+            raise NotImplementedError(
+                "CASCI NAC requires a reference with get_hcore_mo() and get_eri_mo()."
+            )
+        return (
+            self.mf.get_hcore_mo(mo_coeff),
+            self.mf.get_eri_mo(mo_coeff, notation="chem"),
+        )
+
+    def _active_integrals_from_full_mo(self, h1_mo, eri_mo, ncore, ncas):
+        ncore = int(ncore)
+        ncas = int(ncas)
+        nocc = ncore + ncas
+        active = slice(ncore, nocc)
+        core = slice(0, ncore)
+        h1_mo = np.asarray(h1_mo)
+        eri_mo = np.asarray(eri_mo)
+        h1_active = np.array(h1_mo[active, active], copy=True)
+        if ncore > 0:
+            core_j = 2.0 * np.einsum("pqii->pq", eri_mo[active, active, core, core], optimize=True)
+            core_k = np.einsum("piqi->pq", eri_mo[active, core, active, core], optimize=True)
+            h1_active = h1_active + core_j - core_k
+        return h1_active, np.array(eri_mo[active, active, active, active], copy=True)
+
+    def _make_active_sigma_casci(self, mc, h1_active, eri_active):
+        if not hasattr(mc, "ci_sigma"):
+            raise NotImplementedError(
+                "CASCI NAC currently requires the direct-CI CASCI backend with ci_sigma()."
+            )
+        sigma_mc = copy.copy(mc)
+        h1_active = np.asarray(h1_active, dtype=float)
+        eri_active = np.asarray(eri_active, dtype=float)
+        sigma_mc.hcore = np.asarray([h1_active, h1_active])
+        sigma_mc.h2e_cas = eri_active
+        sigma_mc.eri_so = None
+        sigma_mc._direct_spatial_h1 = h1_active
+        sigma_mc._direct_spatial_eri = eri_active
+        sigma_mc._direct_same_spin_eri = eri_active - eri_active.swapaxes(1, 3)
+        sigma_mc._direct_cross_spin_eri = eri_active
+        sigma_mc._direct_factor_H_diag = None
+        sigma_mc._direct_factor_H_A = None
+        sigma_mc._direct_factor_H_B = None
+        sigma_mc._direct_factor_H_AA = None
+        sigma_mc._direct_factor_H_BB = None
+        sigma_mc._direct_factor_H_AB = None
+        return sigma_mc
+
+    def _core_energy_derivative(self, dh1_mo, deri_mo, ncore):
+        ncore = int(ncore)
+        if ncore <= 0:
+            return 0.0
+        out = 0.0
+        for i in range(ncore):
+            out += 2.0 * dh1_mo[i, i]
+        for i in range(ncore):
+            for j in range(ncore):
+                out += 2.0 * deri_mo[i, i, j, j] - deri_mo[i, j, j, i]
+        return float(np.real(out))
 
 
 def _one_sided_overlap_derivatives(mol: Molecule, *, step: float = 1.0e-4) -> np.ndarray:
     """Return d <AO(R)|AO(R + x)> / dx at the reference geometry."""
 
-    try:
-        from pyscf import gto
-    except ImportError as exc:
-        raise ImportError("one-sided overlap transport requires pyscf.gto.") from exc
-
-    coords0 = np.asarray(mol.atom_coords(), dtype=float)
-    symbols = list(mol.atom_symbols())
-    flat0 = coords0.reshape(-1)
-    pmol0 = mol.topyscf()
-    pmol0.build()
-
-    def displaced_pyscf_mol(flat_coords):
-        coords = np.asarray(flat_coords, dtype=float).reshape(coords0.shape)
-        out = gto.Mole()
-        out.atom = [[symbol, tuple(coord)] for symbol, coord in zip(symbols, coords, strict=True)]
-        out.basis = mol.basis
-        out.charge = mol.charge
-        out.spin = mol.spin
-        out.unit = "Bohr"
-        out.build()
-        return out
-
-    derivatives = np.empty((flat0.size, mol.nao, mol.nao), dtype=float)
-    for coord in range(flat0.size):
-        displacement = np.zeros_like(flat0)
-        displacement[coord] = float(step)
-        overlap_plus = gto.intor_cross("int1e_ovlp", pmol0, displaced_pyscf_mol(flat0 + displacement))
-        overlap_minus = gto.intor_cross("int1e_ovlp", pmol0, displaced_pyscf_mol(flat0 - displacement))
-        derivatives[coord] = (overlap_plus - overlap_minus) / (2.0 * float(step))
-    return derivatives
+    _ = step
+    return one_index_one_electron_derivatives(mol, "overlap", index="ket").reshape(
+        -1,
+        mol.nao,
+        mol.nao,
+    )
 
 
 @dataclass
-class MCSCFResponseBackend:
-    """Backend adapter for MCSCF NAC response operations.
+class ResponseBackend:
+    """Backend adapter for SA-CASSCF NAC response operations.
 
-    The default implementation wraps the native MCSCF/CASCI objects.  Other
-    MCSCF solvers can implement the same methods and reuse the NAC/Z-vector
-    builders without subclassing the native CASSCF driver.
+    The default implementation wraps the native state-averaged CASSCF/CASCI
+    objects and exposes the active-space data needed by the NAC/Z-vector
+    builders.
     """
 
     driver: object
@@ -77,10 +142,10 @@ class MCSCFResponseBackend:
             self.nroots = len(getattr(self.mc, "ci", ()))
         self.nroots = int(self.nroots)
         if self.nroots <= 0:
-            raise ValueError("MCSCFResponseBackend requires at least one root.")
+            raise ValueError("ResponseBackend requires at least one root.")
 
     @classmethod
-    def from_driver(cls, driver, mc, *, nroots: int | None = None) -> "MCSCFResponseBackend":
+    def from_driver(cls, driver, mc, *, nroots: int | None = None) -> "ResponseBackend":
         return cls(driver=driver, mc=mc, nroots=nroots)
 
     @property
@@ -324,7 +389,7 @@ def analytic_nac(
     modes=None,
     gap_threshold: float = 1.0e-8,
 ) -> np.ndarray:
-    """Return Hellmann-Feynman NACs from MCSCF/CASCI vibronic couplings.
+    """Return Hellmann-Feynman NACs from CASSCF/CASCI vibronic couplings.
 
     ``state_model`` must provide ``e_tot`` and ``vibronic_couplings``.  The
     result has shape ``(nstates, nstates, ncoord)`` where ``ncoord`` is either
@@ -374,6 +439,29 @@ def _project_against_roots(vector, roots):
         root = np.asarray(root, dtype=float)
         out -= root * float(np.dot(root, out))
     return out
+
+
+def _symmetrized_transition_rdms_with_core(
+    mc,
+    cibra: np.ndarray,
+    ciket: np.ndarray,
+    *,
+    nmo: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the real SA-CASSCF transition RDM convention used for NAC RHSs.
+
+    Native CASCI stores the active 2-RDM as
+    ``E = h[p,q] D[p,q] + 0.5 g[p,q,r,s] Gamma[p,q,r,s]``.  For NAC response
+    the state-pair orbital RHS uses the Hermitian/symmetrized transition
+    density, equivalent to ``0.5 * (Gamma + Gamma.transpose(1,0,3,2))`` for
+    real CI vectors.
+    """
+
+    tdm1_ba, tdm2_ba = _transition_rdms_with_core(mc, cibra, ciket, nmo=nmo)
+    tdm1_ab, tdm2_ab = _transition_rdms_with_core(mc, ciket, cibra, nmo=nmo)
+    dm1 = 0.5 * (tdm1_ba + tdm1_ab)
+    dm2 = 0.5 * (tdm2_ba + tdm2_ab)
+    return dm1, dm2
 
 
 def nac_rhs_from_hamiltonian_derivative(
@@ -440,7 +528,7 @@ def nac_rhs_from_hamiltonian_derivative(
 
 
 def nac_rhs_from_integrals(
-    backend: MCSCFResponseBackend,
+    backend: ResponseBackend,
     zvector: MCSCFZVector,
     h1_derivative_mo: np.ndarray,
     eri_derivative_mo: np.ndarray,
@@ -450,15 +538,15 @@ def nac_rhs_from_integrals(
     gap_threshold: float = 1.0e-8,
     project_ci: bool = True,
 ) -> NACRHS:
-    """Build a first analytic MCSCF NAC RHS from derivative MO integrals.
+    """Build a first analytic SA-CASSCF NAC RHS from derivative MO integrals.
 
     ``h1_derivative_mo`` and ``eri_derivative_mo`` are full-MO derivatives of
     the electronic Hamiltonian for one nuclear Cartesian coordinate or normal
     mode.  The returned RHS can be passed directly to ``MCSCFZVector.solve``.
     """
 
-    if not isinstance(backend, MCSCFResponseBackend):
-        raise TypeError("nac_rhs_from_integrals expects an MCSCFResponseBackend.")
+    if not isinstance(backend, ResponseBackend):
+        raise TypeError("nac_rhs_from_integrals expects an ResponseBackend.")
     energies = backend.energies if energies is None else np.asarray(energies, dtype=float)
     beta, alpha = (int(state_pair[0]), int(state_pair[1]))
     roots = backend.roots
@@ -474,7 +562,7 @@ def nac_rhs_from_integrals(
 
     nvar = backend.orbital_size
     if nvar != zvector.orbital_size:
-        raise ValueError(f"zvector orbital_size {zvector.orbital_size} != MCSCF orbital size {nvar}.")
+        raise ValueError(f"zvector orbital_size {zvector.orbital_size} != SA-CASSCF orbital size {nvar}.")
 
     orbital_gradient = np.zeros(nvar, dtype=float)
     if nvar:
@@ -575,7 +663,7 @@ def mo_derivs(
 
 
 def nac_rhs_cartesian(
-    backend: MCSCFResponseBackend,
+    backend: ResponseBackend,
     zvector: MCSCFZVector,
     *,
     state_pair: tuple[int, int],
@@ -587,9 +675,11 @@ def nac_rhs_cartesian(
 ) -> list[NACRHS]:
     """Build one NAC RHS per Cartesian nuclear coordinate."""
 
-    if not isinstance(backend, MCSCFResponseBackend):
-        raise TypeError("nac_rhs_cartesian expects an MCSCFResponseBackend.")
+    if not isinstance(backend, ResponseBackend):
+        raise TypeError("nac_rhs_cartesian expects an ResponseBackend.")
     if h1_mo is None or eri_mo is None:
+        if mo_coeff is None:
+            mo_coeff = getattr(backend.driver, "mo_coeff", None)
         h1_mo, eri_mo = mo_derivs(backend.mf, mo_coeff=mo_coeff, with_eri=True)
     h1_mo = np.asarray(h1_mo, dtype=float)
     eri_mo = np.asarray(eri_mo, dtype=float)
@@ -614,23 +704,165 @@ def nac_rhs_cartesian(
     return rhs
 
 
+def nac_csf_cartesian(
+    backend: ResponseBackend,
+    *,
+    mo_coeff=None,
+    overlap_derivatives_ao: np.ndarray | None = None,
+    state_pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+    overlap_step: float = 1.0e-4,
+) -> np.ndarray:
+    """Return the explicit CSF/basis-motion NAC contribution.
+
+    The convention matches :func:`nac_from_hamiltonian_derivatives`:
+    ``out[beta, alpha, x] = <Psi_beta|d Psi_alpha/dR_x>``.  This is the
+    non-ETFS contribution in the full SA-CASSCF NAC implementation, expressed
+    with the one-sided AO-overlap derivative used by the overlap NAC path.
+    """
+
+    if not isinstance(backend, ResponseBackend):
+        raise TypeError("nac_csf_cartesian expects an ResponseBackend.")
+    if mo_coeff is None:
+        mo_coeff = getattr(backend.mf, "mo_coeff", None)
+    if mo_coeff is None:
+        raise ValueError("mo_coeff must be supplied or available as backend.mf.mo_coeff.")
+    mo_coeff = np.asarray(mo_coeff, dtype=float)
+
+    mol = getattr(backend.mf, "mol", None)
+    if mol is None:
+        raise ValueError("backend.mf must provide mol for AO-overlap derivatives.")
+    if overlap_derivatives_ao is None:
+        overlap_derivatives_ao = _one_sided_overlap_derivatives(mol, step=overlap_step)
+    overlap_derivatives_ao = np.asarray(overlap_derivatives_ao, dtype=float)
+    if overlap_derivatives_ao.ndim != 3:
+        raise ValueError("overlap_derivatives_ao must have shape (ncoord, nao, nao).")
+
+    ncoord = overlap_derivatives_ao.shape[0]
+    out = np.zeros((backend.nroots, backend.nroots, ncoord), dtype=float)
+    if state_pairs is None:
+        state_pairs = [
+            (beta, alpha)
+            for beta in range(backend.nroots)
+            for alpha in range(beta + 1, backend.nroots)
+        ]
+
+    ncore = backend.ncore
+    ncas = backend.ncas
+    mo_cas = mo_coeff[:, ncore : ncore + ncas]
+    for beta, alpha in state_pairs:
+        beta = int(beta)
+        alpha = int(alpha)
+        gamma = np.asarray(backend.mc.make_tdm1(beta, alpha), dtype=float)
+        anti = gamma.T - gamma
+        tm1_ao = mo_cas @ anti @ mo_cas.T
+        values = 0.5 * np.einsum("xij,ij->x", overlap_derivatives_ao, tm1_ao, optimize=True)
+        out[beta, alpha] = values
+        out[alpha, beta] = -values
+    return out
+
+
+def nac_state_pair_response_rhs(
+    backend: ResponseBackend,
+    zvector: MCSCFZVector,
+    *,
+    state_pair: tuple[int, int],
+    h1_mo: np.ndarray | None = None,
+    eri_mo: np.ndarray | None = None,
+    symmetrize_transition: bool = True,
+) -> PropertyRHS:
+    """Build the coordinate-independent SA-MCSCF NAC wavefunction RHS.
+
+    This mirrors the usual SA-CASSCF NAC wavefunction-response structure: the
+    RHS depends on the pair of electronic states, not on a nuclear derivative.
+    Its solution must be contracted with the nuclear derivative of the
+    state-averaged stationarity equations.  The current native contraction is
+    still approximate, but this RHS is the correct object to expose and test.
+    """
+
+    if not isinstance(backend, ResponseBackend):
+        raise TypeError("nac_state_pair_response_rhs expects an ResponseBackend.")
+    if zvector.orbital_size != backend.orbital_size:
+        raise ValueError(f"zvector orbital_size {zvector.orbital_size} != backend orbital_size {backend.orbital_size}.")
+    if zvector.nroots > backend.nroots:
+        raise ValueError("zvector requests more roots than backend provides.")
+    if h1_mo is None or eri_mo is None:
+        mo_coeff = getattr(backend.driver, "mo_coeff", None)
+        if mo_coeff is None:
+            mo_coeff = getattr(backend.mf, "mo_coeff", None)
+        h1_mo, eri_mo = backend.driver._get_integrals(mo_coeff)
+
+    beta, alpha = (int(state_pair[0]), int(state_pair[1]))
+    roots = backend.roots
+    if beta == alpha:
+        raise ValueError("NAC state_pair must contain two different states.")
+    if beta < 0 or alpha < 0 or beta >= len(roots) or alpha >= len(roots):
+        raise ValueError("state_pair indices must be available in backend roots.")
+
+    if symmetrize_transition:
+        dm1, dm2 = _symmetrized_transition_rdms_with_core(
+            backend.mc,
+            roots[beta],
+            roots[alpha],
+            nmo=backend.nmo,
+        )
+    else:
+        tdm1_ba, tdm2_ba = _transition_rdms_with_core(
+            backend.mc,
+            roots[beta],
+            roots[alpha],
+            nmo=backend.nmo,
+        )
+        dm1 = tdm1_ba
+        dm2 = tdm2_ba
+
+    fock = generalized_fock(h1_mo, eri_mo, dm1, dm2)
+    orbital = pack_nonredundant(
+        orbital_gradient(fock),
+        backend.ncore,
+        backend.ncas,
+        backend.nmo,
+    )
+
+    # For converged SA-CASSCF roots these CI blocks should be tiny, but keeping
+    # them makes the layout match the full state-pair Lagrange equation.
+    ci_blocks = [np.zeros(zvector.ci_size) for _ in range(zvector.nroots)]
+    active_energies = backend.energies[: zvector.nroots] - float(getattr(backend.mc, "e_core", 0.0))
+    if beta < zvector.nroots:
+        ci_blocks[beta] = 0.5 * (
+            backend.mc.ci_sigma(roots[alpha]) - float(active_energies[alpha]) * roots[alpha]
+        )
+    if alpha < zvector.nroots:
+        ci_blocks[alpha] = 0.5 * (
+            backend.mc.ci_sigma(roots[beta]) - float(active_energies[beta]) * roots[beta]
+        )
+    for idx, block in enumerate(ci_blocks):
+        if block.size != zvector.ci_size:
+            raise ValueError(f"CI block {idx} size {block.size} != zvector.ci_size {zvector.ci_size}.")
+        ci_blocks[idx] = _project_against_roots(block, roots[: zvector.nroots])
+
+    return PropertyRHS.from_blocks(orbital, ci_blocks, state_pair=(beta, alpha))
+
+
 @dataclass
-class NACResponseResult:
+class NACResult:
     """Analytic NAC data and optional Z-vector response solves."""
 
     energies: np.ndarray
     gradients: np.ndarray
     nac: np.ndarray
     explicit_nac: np.ndarray
+    csf: np.ndarray
     correction: np.ndarray
+    orbital_correction: np.ndarray
+    ci_correction: np.ndarray
     h_derivatives: np.ndarray
     stationarity_derivatives: np.ndarray | None
-    rhs: dict[tuple[int, int], list[NACRHS]]
+    rhs: dict[tuple[int, int], list[NACRHS] | PropertyRHS]
     z: dict[tuple[int, int], list[object]]
 
 
 def relaxed_nac(
-    backend: MCSCFResponseBackend,
+    backend: ResponseBackend,
     zvector: MCSCFZVector | None = None,
     *,
     h1_mo: np.ndarray | None = None,
@@ -638,20 +870,59 @@ def relaxed_nac(
     state_pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     gap_threshold: float = 1.0e-8,
     solve_response: bool = True,
-) -> NACResponseResult:
+    include_csf: bool = False,
+    response_rhs: str = "state-pair",
+    response_contraction: str = "mo",
+    ao_level_shift: float = 1.0e-8,
+    moving_basis: bool | str = True,
+    nac_gauge: str | None = None,
+) -> NACResult:
     """Assemble analytic Cartesian NACs and optional Z-vector response data.
 
-    The returned ``nac`` is the Hellmann-Feynman derivative-coupling matrix
-    from the derivative Hamiltonian.  When ``zvector`` is supplied, the function
-    also builds and solves the corresponding NAC property-gradient RHS objects;
-    these response solutions are returned for downstream relaxed-property
-    contractions.
+    The returned ``nac`` starts from the Hellmann-Feynman derivative-coupling
+    matrix.  ``nac_gauge`` is the preferred high-level gauge selector:
+    ``"overlap"`` keeps the one-sided overlap gauge, ``"full"`` selects the
+    full NAC path, and ``"etfs"`` selects the ETFS path without the explicit
+    CSF contribution.  The older ``include_csf`` and
+    ``response_contraction`` options remain available for diagnostics.  When
+    ``zvector`` is supplied,
+    ``response_rhs="state-pair"`` builds the
+    coordinate-independent SA-MCSCF NAC wavefunction RHS for each state pair.
+    ``response_rhs="property"`` keeps the older coordinate-dependent property
+    RHS for diagnostics.  With ``response_rhs="state-pair"``,
+    ``response_contraction="ao"`` evaluates the final Lagrange contraction in
+    AO-gradient form.  The default ``"mo"`` keeps the lightweight
+    transported-MO stationarity derivative path.
     """
 
-    if not isinstance(backend, MCSCFResponseBackend):
-        raise TypeError("relaxed_nac expects an MCSCFResponseBackend.")
+    if not isinstance(backend, ResponseBackend):
+        raise TypeError("relaxed_nac expects an ResponseBackend.")
+    if nac_gauge is not None:
+        nac_gauge = str(nac_gauge).lower().replace("_", "-")
+        if nac_gauge not in {"overlap", "full", "etfs"}:
+            raise ValueError("nac_gauge must be 'overlap', 'full', or 'etfs'.")
+        if nac_gauge == "overlap":
+            include_csf = False
+            moving_basis = True
+        elif nac_gauge == "full":
+            include_csf = True
+            moving_basis = "symmetric"
+            response_contraction = "ao"
+        else:
+            include_csf = False
+            moving_basis = "symmetric"
+            response_contraction = "ao"
     if h1_mo is None or eri_mo is None:
-        h1_mo, eri_mo = mo_derivs(backend.mf, with_eri=True)
+        mo_coeff = getattr(backend.driver, "mo_coeff", None)
+        derivative_moving_basis = (
+            "symmetric" if include_csf and moving_basis is True else moving_basis
+        )
+        h1_mo, eri_mo = mo_derivs(
+            backend.mf,
+            mo_coeff=mo_coeff,
+            with_eri=True,
+            moving_basis=derivative_moving_basis,
+        )
     h1_mo = np.asarray(h1_mo, dtype=float)
     eri_mo = np.asarray(eri_mo, dtype=float)
     if h1_mo.ndim != 3:
@@ -670,13 +941,30 @@ def relaxed_nac(
         h_derivatives,
         gap_threshold=gap_threshold,
     )
-    nac = np.array(explicit_nac, copy=True)
+    csf = np.zeros_like(explicit_nac)
+    if include_csf:
+        csf = nac_csf_cartesian(
+            backend,
+            mo_coeff=getattr(backend.driver, "mo_coeff", None),
+            state_pairs=state_pairs,
+        )
+    nac = np.array(explicit_nac - csf, copy=True)
     correction = np.zeros_like(nac, dtype=np.result_type(nac, float))
+    orbital_correction = np.zeros_like(correction)
+    ci_correction = np.zeros_like(correction)
 
-    rhs_by_pair: dict[tuple[int, int], list[NACRHS]] = {}
+    rhs_by_pair: dict[tuple[int, int], list[NACRHS] | PropertyRHS] = {}
     z_by_pair: dict[tuple[int, int], list[object]] = {}
     stationarity_derivatives = None
     if zvector is not None:
+        response_rhs = str(response_rhs).lower().replace("_", "-")
+        if response_rhs not in {"state-pair", "property"}:
+            raise ValueError("response_rhs must be 'state-pair' or 'property'.")
+        response_contraction = str(response_contraction).lower().replace("_", "-")
+        if response_contraction not in {"mo", "ao"}:
+            raise ValueError("response_contraction must be 'mo' or 'ao'.")
+        if response_rhs == "property" and response_contraction == "ao":
+            raise ValueError("response_contraction='ao' is only available with response_rhs='state-pair'.")
         stationarity_derivatives = np.asarray(
             [
                 backend.stationarity_derivative(h1_mo[coord], eri_mo[coord], zvector)
@@ -691,31 +979,104 @@ def relaxed_nac(
                 for alpha in range(beta + 1, backend.nroots)
             ]
         for pair in state_pairs:
-            pair_rhs = nac_rhs_cartesian(
-                backend,
-                zvector,
-                state_pair=pair,
-                h1_mo=h1_mo,
-                eri_mo=eri_mo,
-                gap_threshold=gap_threshold,
-            )
-            rhs_by_pair[tuple(pair)] = pair_rhs
-            if solve_response:
-                pair_z = [zvector.solve(item) for item in pair_rhs]
-                z_by_pair[tuple(pair)] = pair_z
-                beta, alpha = (int(pair[0]), int(pair[1]))
-                for coord, z_result in enumerate(pair_z):
-                    value = float(np.dot(z_result.solution, stationarity_derivatives[coord]))
-                    correction[beta, alpha, coord] += value
-                    correction[alpha, beta, coord] -= value
+            beta, alpha = (int(pair[0]), int(pair[1]))
+            if response_rhs == "property":
+                pair_rhs = nac_rhs_cartesian(
+                    backend,
+                    zvector,
+                    state_pair=pair,
+                    h1_mo=h1_mo,
+                    eri_mo=eri_mo,
+                    gap_threshold=gap_threshold,
+                )
+                rhs_by_pair[tuple(pair)] = pair_rhs
+                if solve_response:
+                    pair_z = [zvector.solve(item) for item in pair_rhs]
+                    z_by_pair[tuple(pair)] = pair_z
+                    for coord, z_result in enumerate(pair_z):
+                        orbital_value = float(
+                            np.dot(
+                                z_result.solution[: zvector.orbital_size],
+                                stationarity_derivatives[coord, : zvector.orbital_size],
+                            )
+                        )
+                        ci_value = float(
+                            np.dot(
+                                z_result.solution[zvector.orbital_size :],
+                                stationarity_derivatives[coord, zvector.orbital_size :],
+                            )
+                        )
+                        orbital_correction[beta, alpha, coord] += orbital_value
+                        orbital_correction[alpha, beta, coord] -= orbital_value
+                        ci_correction[beta, alpha, coord] += ci_value
+                        ci_correction[alpha, beta, coord] -= ci_value
+                        correction[beta, alpha, coord] += orbital_value + ci_value
+                        correction[alpha, beta, coord] -= orbital_value + ci_value
+            else:
+                mo_coeff = getattr(backend.driver, "mo_coeff", None)
+                if mo_coeff is None:
+                    mo_coeff = getattr(backend.mf, "mo_coeff", None)
+                h0_mo, eri0_mo = backend.driver._get_integrals(mo_coeff)
+                pair_rhs = nac_state_pair_response_rhs(
+                    backend,
+                    zvector,
+                    state_pair=pair,
+                    h1_mo=h0_mo,
+                    eri_mo=eri0_mo,
+                )
+                rhs_by_pair[tuple(pair)] = pair_rhs
+                if solve_response:
+                    z_kwargs = {"level_shift": float(ao_level_shift)} if response_contraction == "ao" else {}
+                    z_result = zvector.solve(pair_rhs, **z_kwargs)
+                    z_by_pair[tuple(pair)] = [z_result]
+                    gap = float(energies[alpha] - energies[beta])
+                    if abs(gap) > gap_threshold:
+                        if response_contraction == "ao":
+                            orbital_values = (
+                                sacasscf_grad.lorb_dot_dgorb_cartesian(
+                                    backend,
+                                    z_result.solution[: zvector.orbital_size],
+                                    mo_coeff=mo_coeff,
+                                )
+                                / gap
+                            )
+                            ci_values = (
+                                sacasscf_grad.lci_dot_dgci_cartesian(
+                                    backend,
+                                    z_result.solution[zvector.orbital_size :],
+                                    mo_coeff=mo_coeff,
+                                )
+                                / gap
+                            )
+                        else:
+                            orbital_values = (
+                                stationarity_derivatives[:, : zvector.orbital_size]
+                                @ z_result.solution[: zvector.orbital_size]
+                                / gap
+                            )
+                            ci_values = (
+                                stationarity_derivatives[:, zvector.orbital_size :]
+                                @ z_result.solution[zvector.orbital_size :]
+                                / gap
+                            )
+                        values = orbital_values + ci_values
+                        orbital_correction[beta, alpha] += orbital_values
+                        orbital_correction[alpha, beta] -= orbital_values
+                        ci_correction[beta, alpha] += ci_values
+                        ci_correction[alpha, beta] -= ci_values
+                        correction[beta, alpha] += values
+                        correction[alpha, beta] -= values
         nac = nac + correction
 
-    return NACResponseResult(
+    return NACResult(
         energies=energies,
         gradients=gradients,
         nac=nac,
         explicit_nac=explicit_nac,
+        csf=csf,
         correction=correction,
+        orbital_correction=orbital_correction,
+        ci_correction=ci_correction,
         h_derivatives=h_derivatives,
         stationarity_derivatives=stationarity_derivatives,
         rhs=rhs_by_pair,
@@ -723,27 +1084,81 @@ def relaxed_nac(
     )
 
 
+def casci_nac(
+    mc,
+    *,
+    mf=None,
+    mo_coeff=None,
+    nroots: int | None = None,
+    state_pairs: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+    gap_threshold: float = 1.0e-8,
+    include_csf: bool = False,
+    moving_basis: bool | str = True,
+    nac_gauge: str | None = None,
+) -> NACResult:
+    """Compute fixed-orbital CASCI NACs from native Hamiltonian derivatives.
+
+    This is the CASCI analogue of :func:`relaxed_nac` with no orbital or
+    SA-CASSCF Z-vector relaxation.  The orbitals are treated as fixed input
+    orbitals, while the CI eigenvectors respond through the off-diagonal
+    Hamiltonian derivative relation.
+    """
+
+    if mf is None:
+        mf = getattr(mc, "mf", None)
+    if mf is None:
+        raise ValueError("mf must be supplied or available as mc.mf.")
+    if mo_coeff is None:
+        mo_coeff = getattr(mc, "mo_coeff", None)
+    if mo_coeff is None:
+        mo_coeff = getattr(mf, "mo_coeff", None)
+    if mo_coeff is None:
+        raise ValueError("mo_coeff must be supplied or available on mc/mf.")
+    if not hasattr(mc, "ci_sigma"):
+        raise NotImplementedError(
+            "casci_nac currently requires the direct-CI CASCI backend with ci_sigma()."
+        )
+
+    driver = FixedOrbitalCASCIDriver(
+        mf=mf,
+        mo_coeff=np.asarray(mo_coeff, dtype=float),
+        ncore=int(mc.ncore),
+        ncas=int(mc.ncas),
+    )
+    backend = ResponseBackend.from_driver(driver, mc, nroots=nroots)
+    return relaxed_nac(
+        backend,
+        zvector=None,
+        state_pairs=state_pairs,
+        gap_threshold=gap_threshold,
+        solve_response=False,
+        include_csf=include_csf,
+        moving_basis=moving_basis,
+        nac_gauge=nac_gauge,
+    )
+
+
 @dataclass
-class MCSCFNACScanner:
+class NACScanner:
     """Scanner wrapper returning ``(energies, gradients, nac)``."""
 
     point_builder: Callable[[np.ndarray | None], object]
     solve_response: bool = False
     gap_threshold: float = 1.0e-8
 
-    def _point(self, coords=None) -> tuple[MCSCFResponseBackend, MCSCFZVector | None]:
+    def _point(self, coords=None) -> tuple[ResponseBackend, MCSCFZVector | None]:
         point = self.point_builder(coords)
-        if isinstance(point, MCSCFResponseBackend):
+        if isinstance(point, ResponseBackend):
             return point, None
         if isinstance(point, tuple):
             if len(point) == 2:
                 backend, zvector = point
-                if not isinstance(backend, MCSCFResponseBackend):
-                    raise TypeError("point_builder tuple must start with MCSCFResponseBackend.")
+                if not isinstance(backend, ResponseBackend):
+                    raise TypeError("point_builder tuple must start with ResponseBackend.")
                 return backend, zvector
         raise TypeError(
-            "point_builder must return MCSCFResponseBackend or "
-            "(MCSCFResponseBackend, MCSCFZVector)."
+            "point_builder must return ResponseBackend or "
+            "(ResponseBackend, MCSCFZVector)."
         )
 
     def evaluate(self, coords=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -811,8 +1226,8 @@ def nac_from_displaced_overlaps(
 
 
 @dataclass
-class MCSCFNACDriver:
-    """Finite-difference MCSCF/CASCI NAC driver.
+class OverlapNACDriver:
+    """Finite-difference CASSCF/CASCI NAC driver.
 
     Parameters
     ----------
@@ -823,8 +1238,8 @@ class MCSCFNACDriver:
     step
         Cartesian displacement in bohr.
     point_builder
-        Optional callable ``point_builder(coords) -> mc`` for custom MCSCF or
-        state-averaged MCSCF points.  If omitted, native RHF/CASCI is used.
+        Optional callable ``point_builder(coords) -> mc`` for custom CASSCF or
+        state-averaged CASSCF points.  If omitted, native RHF/CASCI is used.
     """
 
     mol: Molecule
@@ -912,11 +1327,11 @@ class MCSCFNACDriver:
 
 @dataclass
 class AnalyticNACDriver:
-    """NAC driver from MCSCF/CASCI Hamiltonian derivative couplings.
+    """NAC driver from CASSCF/CASCI Hamiltonian derivative couplings.
 
-    This class wraps a completed MCSCF/CASCI-like object that exposes
+    This class wraps a completed CASSCF/CASCI-like object that exposes
     ``vibronic_couplings``.  It returns the nondegenerate Hellmann-Feynman NAC
-    matrix.  Use ``MCSCFNACDriver`` when the response-complete derivative
+    matrix.  Use ``OverlapNACDriver`` when the response-complete derivative
     couplings are not available.
     """
 

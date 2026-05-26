@@ -141,6 +141,7 @@ def _current_memory_mb():
 
 modified_Bondi = _modified_bondi_radii()
 
+
 def switch_h(x):
     '''
     switching function (eq. 3.19)
@@ -382,7 +383,7 @@ class PCM:
 
         self.frozen = False
         self.equilibrium_solvation = False
-        self.integral_backend = 'native'
+        self.integral_backend = 'auto'
 
         self.surface = {}
         self._intermediates = {}
@@ -446,13 +447,15 @@ class PCM:
         D, S = get_D_S(self.surface, with_S=True, with_D=True)
 
         epsilon = self.eps
-        print('eps', self.eps)
+        if self.verbose:
+            print('eps', self.eps)
         if self.method.upper() in ['C-PCM', 'CPCM']:
             f_epsilon = (epsilon-1.)/epsilon if epsilon != float('inf') else 1.0
             K = S
             R = -f_epsilon * numpy.eye(K.shape[0])
-            print('f_epsilon', f_epsilon)
-            print('R[0]', R[0,0])
+            if self.verbose:
+                print('f_epsilon', f_epsilon)
+                print('R[0]', R[0,0])
         elif self.method.upper() == 'COSMO':
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0/2.0) if epsilon != float('inf') else 1.0
             K = S

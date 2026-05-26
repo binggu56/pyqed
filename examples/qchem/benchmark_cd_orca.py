@@ -58,7 +58,7 @@ def atom_string():
 
 def build_molecule():
     mol = Molecule(atom=atom_string(), unit="angstrom", basis="sto-3g")
-    mol.build(driver="pyscf")
+    mol.build(driver="builtin", eri="s8")
     return mol
 
 

@@ -30,7 +30,8 @@
 \providecommand \href [0]{\begingroup \@sanitize@url \@href}%
 \providecommand \@href[1]{\@@startlink{#1}\@@href}%
 \providecommand \@@href[1]{\endgroup#1\@@endlink}%
-\providecommand \@sanitize@url [0]{\catcode `\\12\catcode `\$12\catcode `\&12\catcode `\#12\catcode `\^12\catcode `\_12\catcode `\%12\relax}%
+\providecommand \@sanitize@url [0]{\catcode `\\12\catcode `\$12\catcode
+  `\&12\catcode `\#12\catcode `\^12\catcode `\_12\catcode `\%12\relax}%
 \providecommand \@@startlink[1]{}%
 \providecommand \@@endlink[0]{}%
 \providecommand \url  [0]{\begingroup\@sanitize@url \@url }%

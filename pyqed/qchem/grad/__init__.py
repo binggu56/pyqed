@@ -18,5 +18,8 @@ class Grad:
     
     def run(self):
         pass
+
+
+from . import sacasscf
     
     

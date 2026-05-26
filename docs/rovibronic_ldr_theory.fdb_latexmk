@@ -1,14 +1,13 @@
 # Fdb version 4
-["bibtex rovibronic_ldr_theory"] 1778659055.61561 "rovibronic_ldr_theory.aux" "rovibronic_ldr_theory.bbl" "rovibronic_ldr_theory" 1778659056.41373 0
-  "./rovibronic_ldr_theoryNotes.bib" 1778659056.18514 104 4d8bb863c86f3d7b03a471e9d4707f34 ""
+["bibtex rovibronic_ldr_theory"] 1778838478.37369 "rovibronic_ldr_theory.aux" "rovibronic_ldr_theory.bbl" "rovibronic_ldr_theory" 1778838479.59228 0
+  "./rovibronic_ldr_theoryNotes.bib" 1778838479.26309 104 4d8bb863c86f3d7b03a471e9d4707f34 ""
   "/usr/local/texlive/2025/texmf-dist/bibtex/bst/revtex/apsrev4-2.bst" 1601932770 69609 e9dea59f0e753ccda3ddc8f5806d846d ""
-  "rovibronic_ldr_theory.aux" 1778659056.18415 2740 9bb0441b94939b9157bc441256630b92 "pdflatex"
+  "rovibronic_ldr_theory.aux" 1778838479.26198 2975 dff745b11ce1f57fbe416bba875c304d "pdflatex"
   (generated)
   "rovibronic_ldr_theory.bbl"
   "rovibronic_ldr_theory.blg"
   (rewritten before read)
-["pdflatex"] 1778659055.71276 "/Users/gugroup/Library/CloudStorage/OneDrive-西湖大学/pyqed/docs/rovibronic_ldr_theory.tex" "rovibronic_ldr_theory.pdf" "rovibronic_ldr_theory" 1778659056.41396 0
-  "/Users/gugroup/Library/CloudStorage/OneDrive-西湖大学/pyqed/docs/rovibronic_ldr_theory.tex" 1778659054.73359 12813 dfa50220b641993f4c410564c886798e ""
+["pdflatex"] 1778838478.48956 "rovibronic_ldr_theory.tex" "rovibronic_ldr_theory.pdf" "rovibronic_ldr_theory" 1778838479.59287 0
   "/usr/local/texlive/2025/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/tfm/public/amsfonts/cmextra/cmbsy5.tfm" 1246382020 1120 1e8878807317373affa7f7bba4cf2f6a ""
   "/usr/local/texlive/2025/texmf-dist/fonts/tfm/public/amsfonts/cmextra/cmbsy6.tfm" 1246382020 1124 14ccf5552bc7f77ca02a8a402bea8bfb ""
@@ -50,14 +49,17 @@
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx12.pfb" 1248133631 32080 340ef9bf63678554ee606688e7b5339d ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb" 1248133631 30251 6afa5cb1d0204815a708a080681d4674 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb" 1248133631 36299 5f9df58c2139e7edcf37c8fca4bd384d ""
+  "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb" 1248133631 37166 8ab3487cbe3ab49ebce74c29ea2418db ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb" 1248133631 36281 c355509802a035cadc5f15869451dcee ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb" 1248133631 35469 70d41d2b9ea31d5d813066df7c99281c ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb" 1248133631 35752 024fb6c41858982481f6968b5fc26508 ""
+  "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb" 1248133631 32734 69e00a6b65cedb993666e42eedb3d48f ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb" 1248133631 32762 224316ccc9ad3ca0423a14971cfa7fc1 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb" 1248133631 32726 0a1aea6fcd6468ee2cf64d891f5c43c8 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb" 1248133631 32569 5e5ddc8df908dea60932f3c484a54c0d ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb" 1248133631 32587 1788b0c1c5b39540c96f5e42ccd6dae8 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb" 1248133631 32626 4f5c1b83753b1dd3a97d1b399a005b4b ""
+  "/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmti10.pfb" 1248133631 37944 359e864bd06cde3b1cf57bb20757fb06 ""
   "/usr/local/texlive/2025/texmf-dist/tex/generic/atbegshi/atbegshi.sty" 1575674566 24708 5584a51a7101caf7e6bbf1fc27d8f7b1 ""
   "/usr/local/texlive/2025/texmf-dist/tex/generic/bigintcalc/bigintcalc.sty" 1576625341 40635 c40361e206be584d448876bba8a64a3b ""
   "/usr/local/texlive/2025/texmf-dist/tex/generic/bitset/bitset.sty" 1576016050 33961 6b5c75130e435b2bfdb9f480a09a39f9 ""
@@ -113,10 +115,10 @@
   "/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map" 1767923690 5467155 19efa205003f9ecad95fbbaa6ff24da1 ""
   "/usr/local/texlive/2025/texmf-var/web2c/pdftex/pdflatex.fmt" 1767923670 3345732 98099a59a27e67b57a2f9f6f1df53c67 ""
   "/usr/local/texlive/2025/texmf.cnf" 1741450484 577 418a7058ec8e006d8704f60ecd22c938 ""
-  "rovibronic_ldr_theory.aux" 1778659056.18415 2740 9bb0441b94939b9157bc441256630b92 "pdflatex"
-  "rovibronic_ldr_theory.bbl" 1778659055.71031 1980 28c19e8c34138b62d4af8c2d0ed844b0 "bibtex rovibronic_ldr_theory"
-  "rovibronic_ldr_theory.out" 1778659056.18488 2486 31ebdb8f181da1c56dda86631d80fb43 "pdflatex"
-  "rovibronic_ldr_theory.tex" 1778659054.73359 12813 dfa50220b641993f4c410564c886798e ""
+  "rovibronic_ldr_theory.aux" 1778838479.26198 2975 dff745b11ce1f57fbe416bba875c304d "pdflatex"
+  "rovibronic_ldr_theory.bbl" 1778838478.48643 1982 35453d3875d823f0ec9445e740a573d9 "bibtex rovibronic_ldr_theory"
+  "rovibronic_ldr_theory.out" 1778838479.26269 2497 bd854184f401ccc5dcbd33c0fa83850f "pdflatex"
+  "rovibronic_ldr_theory.tex" 1778838470.05875 23700 9984b791bc1f28a46bb537ca677a4a87 ""
   (generated)
   "rovibronic_ldr_theory.aux"
   "rovibronic_ldr_theory.log"

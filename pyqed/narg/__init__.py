@@ -4,9 +4,11 @@
 Nonadiabatic renormalization-group utilities.
 """
 
-from .variational import LETTA, LETTAResult
+from .variational import LETTA, LETTAResult, LegTiedLETTA, LegTiedLETTAResult
 
 __all__ = [
     "LETTA",
     "LETTAResult",
+    "LegTiedLETTA",
+    "LegTiedLETTAResult",
 ]

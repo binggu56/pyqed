@@ -102,7 +102,7 @@ def main():
         dvr_type=["sine", "sine", "legendre"],
     )
 
-    apes, overlap_data = solver.scan_pes(
+    apes, overlap_data, _ = solver.scan_pes(
         electronic_method="am1/meci",
         nstates=args.nstates,
         ncas=3,

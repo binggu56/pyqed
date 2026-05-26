@@ -426,6 +426,17 @@ def _transform_eri(eri, transform):
     )
 
 
+def _pack_eri_s2kl(eri):
+    """Pack the last two AO indices of an ERI-like tensor."""
+
+    nao = eri.shape[-1]
+    pairs = _ao_pair_indices(nao)
+    out = np.empty(eri.shape[:-2] + (len(pairs),), dtype=eri.dtype)
+    for pair, (r, s) in enumerate(pairs):
+        out[..., pair] = eri[..., r, s]
+    return out
+
+
 def _ao_pair_indices(nao):
     return [(p, q) for p in range(nao) for q in range(p + 1)]
 
@@ -775,6 +786,58 @@ def one_electron_derivatives(mol, kernel="hcore", order=1):
     return _transform_one(out, transform)
 
 
+def one_index_one_electron_derivatives(mol, kernel="overlap", index="ket"):
+    """
+    Return one-index first derivatives of one-electron AO integrals.
+
+    Only one AO center is differentiated.  For ``index='ket'`` this returns
+    ``<chi_p | d chi_q / d R_A>`` for basis functions ``q`` on atom ``A``;
+    ``index='bra'`` differentiates ``chi_p`` instead.
+
+    Parameters
+    ----------
+    mol
+        Built ``Molecule`` object.
+    kernel : {'overlap', 'kinetic'}
+        Integral family.  One-index nuclear-attraction derivatives are not
+        included here because nuclear attraction also depends explicitly on
+        nuclear charge centers.
+    index : {'bra', 'ket'}
+        AO index whose Gaussian center is differentiated.
+
+    Returns
+    -------
+    ndarray
+        Shape ``(natm, 3, nao, nao)``.
+    """
+
+    kernel = str(kernel).lower()
+    if kernel not in {"overlap", "kinetic"}:
+        raise ValueError("kernel must be 'overlap' or 'kinetic'.")
+    index = str(index).lower()
+    if index not in {"bra", "ket"}:
+        raise ValueError("index must be 'bra' or 'ket'.")
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    natm = coords.shape[0]
+    nao_cart = len(basis)
+
+    out = np.zeros((natm, 3, nao_cart, nao_cart), dtype=float)
+    for p, fn_p in enumerate(basis):
+        for q, fn_q in enumerate(basis):
+            atom = atom_ids[p] if index == "bra" else atom_ids[q]
+            for axis in range(3):
+                order = _axis_order(axis)
+                if index == "bra":
+                    value = _contracted_one_deriv(fn_p, fn_q, kernel, order_a=order)
+                else:
+                    value = _contracted_one_deriv(fn_p, fn_q, kernel, order_b=order)
+                out[atom, axis, p, q] = value
+    return _transform_one(out, transform)
+
+
 def position_derivatives(mol, center=None):
     """
     Return first nuclear derivatives of AO position integrals.
@@ -1052,6 +1115,65 @@ def eri_derivative_veff_scalar(mol, dm_left, dm_right, order=2):
                     out[pidx_a, pidx_b] += value
                     if pidx_a != pidx_b:
                         out[pidx_b, pidx_a] += value
+    return out
+
+
+def one_index_eri_derivatives(mol, aosym="s1", convention="center"):
+    """
+    Return one-index AO ERI derivatives in the molecule AO basis.
+
+    Only the first AO center of ``(pq|rs)`` is differentiated.  The returned
+    tensor is useful for AO-gradient contractions that use PySCF's
+    ``int2e_ip1`` primitive.
+
+    Parameters
+    ----------
+    mol
+        Built ``Molecule`` object.
+    aosym : {'s1', 's2kl'}
+        ``'s1'`` returns ``(natm, 3, nao, nao, nao, nao)``. ``'s2kl'`` packs
+        the last two AO indices and returns ``(natm, 3, nao, nao, nao_pair)``.
+    convention : {'center', 'ip1'}
+        ``'center'`` returns derivatives with respect to the Gaussian center
+        of the first AO.  ``'ip1'`` returns the opposite sign, matching the
+        usual libcint/PySCF ``int2e_ip1`` electron-coordinate derivative.
+    """
+
+    aosym = str(aosym).lower()
+    if aosym not in {"s1", "s2kl"}:
+        raise ValueError("aosym must be 's1' or 's2kl'.")
+    convention = str(convention).lower().replace("-", "_")
+    if convention not in {"center", "ip1"}:
+        raise ValueError("convention must be 'center' or 'ip1'.")
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    natm = coords.shape[0]
+    nao_cart = len(basis)
+
+    out = np.zeros((natm, 3, nao_cart, nao_cart, nao_cart, nao_cart), dtype=float)
+    ao_pairs = _ao_pair_indices(nao_cart)
+    for p, fn_p in enumerate(basis):
+        atom = atom_ids[p]
+        for q, fn_q in enumerate(basis):
+            for pair_rs, (r, s) in enumerate(ao_pairs):
+                fns = (fn_p, fn_q, basis[r], basis[s])
+                cache = {}
+                for axis in range(3):
+                    orders = [_axis_order(axis), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
+                    key = tuple(orders)
+                    if key not in cache:
+                        cache[key] = _contracted_eri_deriv(*fns, *orders)
+                    value = cache[key]
+                    out[atom, axis, p, q, r, s] = value
+                    out[atom, axis, p, q, s, r] = value
+
+    if convention == "ip1":
+        out = -out
+    out = _transform_eri(out, transform)
+    if aosym == "s2kl":
+        out = _pack_eri_s2kl(out)
     return out
 
 

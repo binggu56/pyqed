@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.basis_derivatives import (
@@ -7,6 +8,8 @@ from pyqed.qchem.basis_derivatives import (
     eri_derivative_veff_scalar,
     eri_derivatives,
     one_electron_derivatives,
+    one_index_eri_derivatives,
+    one_index_one_electron_derivatives,
     position_derivatives,
 )
 
@@ -131,6 +134,52 @@ def test_compact_eri_derivative_contractions_match_dense_h2():
         ),
         atol=1.0e-10,
     )
+
+
+def test_one_index_eri_derivatives_reconstruct_total_derivative_h2():
+    mol = _h2(1.4)
+    total = eri_derivatives(mol, order=1)
+    one = one_index_eri_derivatives(mol)
+
+    rebuilt = (
+        one
+        + one.transpose(0, 1, 3, 2, 4, 5)
+        + one.transpose(0, 1, 4, 5, 2, 3)
+        + one.transpose(0, 1, 4, 5, 3, 2)
+    )
+    np.testing.assert_allclose(rebuilt, total, atol=1.0e-10)
+
+    packed = one_index_eri_derivatives(mol, aosym="s2kl")
+    pairs = [(p, q) for p in range(mol.nao) for q in range(p + 1)]
+    for pair, (r, s) in enumerate(pairs):
+        np.testing.assert_allclose(packed[..., pair], one[..., r, s], atol=1.0e-12)
+
+
+def test_one_index_one_electron_derivatives_reconstruct_total_overlap_h2():
+    mol = _h2(1.4)
+    total = one_electron_derivatives(mol, "overlap", order=1)
+    ket = one_index_one_electron_derivatives(mol, "overlap", index="ket")
+    bra = one_index_one_electron_derivatives(mol, "overlap", index="bra")
+
+    np.testing.assert_allclose(bra, ket.transpose(0, 1, 3, 2), atol=1.0e-12)
+    np.testing.assert_allclose(bra + ket, total, atol=1.0e-10)
+
+
+def test_one_index_eri_derivatives_match_pyscf_ip1_h2():
+    pyscf = pytest.importorskip("pyscf")
+
+    mol = _h2(1.4)
+    pmol = mol.topyscf()
+    pmol.build()
+    ref = pmol.intor("int2e_ip1", comp=3, aosym="s1").reshape(
+        3,
+        mol.nao,
+        mol.nao,
+        mol.nao,
+        mol.nao,
+    )
+    got = one_index_eri_derivatives(mol, convention="ip1").sum(axis=0)
+    np.testing.assert_allclose(got, ref, atol=1.0e-10)
 
 
 def test_builtin_position_derivatives_match_finite_difference_h2():

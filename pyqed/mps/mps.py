@@ -25,6 +25,7 @@ import scipy
 import scipy.sparse.linalg
 import scipy.sparse as sparse
 import math
+import time
 from copy import deepcopy
 from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian matrices
 from collections import defaultdict
@@ -495,17 +496,34 @@ class HamiltonianMultiplyU1:
                 False,
             )
         )
+        self._direct_operator_batch_min_entries = int(
+            getattr(
+                complementary_operator_families,
+                "direct_operator_batch_min_entries",
+                2,
+            )
+        )
+        if self._direct_operator_batch_min_entries < 2:
+            self._direct_operator_batch_min_entries = 2
         self.dtype = np.float64
         self._dense_cache = {}
         self._action_cache = {}
         self._compiled_action_cap = 4
         self._boundary_factorized_cache = {}
+        self._combined_direct_family_plan_cache = {}
+        self._direct_operator_batched_plan_cache = {}
         self._boundary_factorized_action_cap = 8192
         self._w12_cache = None
         self._local_complementary_cache = {}
         self._local_complementary_channel_cache = {}
         self._boundary_table_cache = {}
-        self._boundary_table_max_dim = 32
+        self._boundary_table_max_dim = int(
+            getattr(
+                complementary_operator_families,
+                "boundary_table_max_dim",
+                32,
+            )
+        )
         self._boundary_einsum_path_cache = {}
         self._boundary_einsum_expr_cache = self._GLOBAL_BOUNDARY_EINSUM_EXPR_CACHE
         self._boundary_batched_einsum_expr_cache = (
@@ -664,6 +682,79 @@ class HamiltonianMultiplyU1:
             "boundary_direct_operator",
         )
 
+    def _direct_operator_batched_plan(self, A, entries):
+        cache_key = (id(entries), self._layout(A), "direct_operator_batches")
+        cached = self._direct_operator_batched_plan_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        batch_sources = {}
+        for index, (channel, a_key, out_key, left_op, right_op, expr) in enumerate(entries):
+            a_blk = A.data.get(a_key)
+            if a_blk is None:
+                continue
+            batch_key = (
+                out_key,
+                left_op.shape,
+                a_blk.shape,
+                right_op.shape,
+            )
+            batch_sources.setdefault(batch_key, []).append(
+                (index, channel, a_key, left_op, right_op, expr)
+            )
+
+        batched_groups = []
+        batched_indices = set()
+        batch_eq = "zbijux,zjkxy,zbvylk->iluv"
+        for batch_key, members in batch_sources.items():
+            if len(members) < int(self._direct_operator_batch_min_entries):
+                continue
+            out_key, left_shape, a_shape, right_shape = batch_key
+            expr_key = (len(members), left_shape, a_shape, right_shape, "direct_batch")
+            expr = self._boundary_batched_einsum_expr_cache.get(expr_key)
+            if expr is None:
+                try:
+                    import opt_einsum as oe
+
+                    expr = oe.contract_expression(
+                        batch_eq,
+                        (len(members),) + tuple(left_shape),
+                        (len(members),) + tuple(a_shape),
+                        (len(members),) + tuple(right_shape),
+                        optimize="greedy",
+                    )
+                except Exception:
+                    expr = None
+                self._boundary_batched_einsum_expr_cache[expr_key] = expr
+            if expr is None:
+                continue
+            try:
+                left_stack = np.stack([entry[3] for entry in members], axis=0)
+                right_stack = np.stack([entry[4] for entry in members], axis=0)
+            except ValueError:
+                continue
+            indices = tuple(int(entry[0]) for entry in members)
+            batched_indices.update(indices)
+            batched_groups.append(
+                (
+                    out_key,
+                    tuple(entry[2] for entry in members),
+                    left_stack,
+                    right_stack,
+                    expr,
+                    indices,
+                )
+            )
+
+        scalar_entries = tuple(
+            entry
+            for index, entry in enumerate(entries)
+            if index not in batched_indices
+        )
+        plan = (scalar_entries, tuple(batched_groups))
+        self._direct_operator_batched_plan_cache[cache_key] = plan
+        return plan
+
     def _apply_direct_operator_plan(self, A, plan):
         if plan is None:
             return None
@@ -673,7 +764,12 @@ class HamiltonianMultiplyU1:
             key: np.zeros(shape, dtype=dtype)
             for key, shape in out_shapes.items()
         }
-        for _channel, a_key, out_key, left_op, right_op, expr in entries:
+        scalar_entries, batched_groups = self._direct_operator_batched_plan(A, entries)
+        self._record_direct_operator_batch_stats(entries, batched_groups)
+        for out_key, a_keys, left_stack, right_stack, expr, _indices in batched_groups:
+            a_stack = np.stack([A.data[a_key] for a_key in a_keys], axis=0)
+            total_data[out_key] += expr(left_stack, a_stack, right_stack)
+        for _channel, a_key, out_key, left_op, right_op, expr in scalar_entries:
             if callable(expr):
                 contribution = expr(left_op, A.data[a_key], right_op)
             else:
@@ -686,6 +782,95 @@ class HamiltonianMultiplyU1:
                 )
             total_data[out_key] += contribution
         return BlockTensor(total_data, out_qns, out_dirs), channels, entries
+
+    def _accumulate_direct_operator_plan(self, A, plan, total_data):
+        if plan is None:
+            return None
+        channels, entries, out_shapes, out_qns, out_dirs, dtype = plan
+        action_eq = "bijux,jkxy,bvylk->iluv"
+        for key, shape in out_shapes.items():
+            if key not in total_data:
+                total_data[key] = np.zeros(shape, dtype=dtype)
+            elif total_data[key].shape != tuple(shape):
+                return None
+        scalar_entries, batched_groups = self._direct_operator_batched_plan(A, entries)
+        self._record_direct_operator_batch_stats(entries, batched_groups)
+        for out_key, a_keys, left_stack, right_stack, expr, _indices in batched_groups:
+            a_stack = np.stack([A.data[a_key] for a_key in a_keys], axis=0)
+            contribution = expr(left_stack, a_stack, right_stack)
+            if out_key in total_data and total_data[out_key].shape != contribution.shape:
+                return None
+            total_data[out_key] += contribution
+        for _channel, a_key, out_key, left_op, right_op, expr in scalar_entries:
+            if callable(expr):
+                contribution = expr(left_op, A.data[a_key], right_op)
+            else:
+                contribution = np.einsum(
+                    action_eq,
+                    left_op,
+                    A.data[a_key],
+                    right_op,
+                    optimize=expr,
+                )
+            if out_key in total_data and total_data[out_key].shape != contribution.shape:
+                return None
+            total_data[out_key] += contribution
+        return channels, entries, out_qns, out_dirs
+
+    def _build_combined_direct_family_plan(self, A, name, component_entries):
+        layout = self._layout(A)
+        cache_key = (
+            layout,
+            str(name),
+            int(len(component_entries)),
+            "combined_direct_family_plan",
+        )
+        cached = self._combined_direct_family_plan_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        channels = set()
+        entries = []
+        out_shapes = {}
+        out_qns = None
+        out_dirs = None
+        dtype_args = []
+        for index, (E, W, F) in enumerate(component_entries):
+            plan = self._build_direct_operator_plan(
+                A,
+                E,
+                W,
+                F,
+                ("direct_symbolic_family", str(name), index),
+            )
+            if plan is None:
+                self._combined_direct_family_plan_cache[cache_key] = None
+                return None
+            plan_channels, plan_entries, plan_shapes, plan_qns, plan_dirs, plan_dtype = plan
+            channels.update(plan_channels)
+            entries.extend(plan_entries)
+            dtype_args.append(plan_dtype)
+            if out_qns is None:
+                out_qns = plan_qns
+                out_dirs = plan_dirs
+            for key, shape in plan_shapes.items():
+                old_shape = out_shapes.get(key)
+                if old_shape is not None and old_shape != shape:
+                    self._combined_direct_family_plan_cache[cache_key] = None
+                    return None
+                out_shapes[key] = shape
+
+        dtype = np.result_type(*(dtype_args or [complex]))
+        combined = (
+            tuple(sorted(channels, key=lambda item: repr(item))),
+            tuple(entries),
+            out_shapes,
+            out_qns if out_qns is not None else A.qns[:],
+            out_dirs if out_dirs is not None else A.dirs[:],
+            dtype,
+        )
+        self._combined_direct_family_plan_cache[cache_key] = combined
+        return combined
 
     def _matvec_boundary_direct_operator(self, A, *, local_channels=None):
         plan = self._build_boundary_direct_operator_plan(A)
@@ -713,6 +898,55 @@ class HamiltonianMultiplyU1:
                 "channels_materialized": False,
             },
         }
+
+    def _build_family_action_table_from_direct_family_environments(self, proto):
+        if not self.complementary_direct_family_environments:
+            return None
+        cap = int(self._boundary_table_max_dim)
+        layout = self._closed_layout(proto, cap)
+        if layout is None:
+            return None
+        dim = self._size(layout)
+        if dim <= 0 or dim > cap:
+            return None
+        H = np.zeros((dim, dim), dtype=complex)
+        offsets = []
+        pos = 0
+        for key, shape in layout:
+            n = int(np.prod(shape, dtype=int))
+            offsets.append((key, shape, pos, n))
+            pos += n
+        qns = self._qns_from_layout(layout)
+        dtype = np.result_type(*[blk.dtype for blk in proto.data.values()], complex)
+        for col in range(dim):
+            data = {}
+            for key, shape, start, n in offsets:
+                if start <= col < start + n:
+                    arr = np.zeros(shape, dtype=dtype)
+                    arr.reshape(-1)[col - start] = 1.0
+                    data[key] = arr
+                    break
+            basis = BlockTensor(data, qns, proto.dirs[:])
+            direct = self._matvec_direct_symbolic_family_channels(basis)
+            if direct is None:
+                return None
+            family_channels, _family_stats = direct
+            total = None
+            for tensor in family_channels.values():
+                total = tensor if total is None else total + tensor
+            local = self._matvec_local_complementary(basis)
+            if total is None or local is None:
+                return None
+            H[:, col] = self._flatten(total - local, layout)
+        return AbelianComplementaryBoundaryActionTable(
+            H,
+            layout,
+            qns,
+            proto.dirs[:],
+            bond=self.bond,
+            source="direct_family_term_environments_minus_local_RP",
+            boundary_family_tables=self._boundary_family_tables(),
+        )
 
     def _record_complementary_split(
         self,
@@ -1095,12 +1329,77 @@ class HamiltonianMultiplyU1:
         T4 = tensordot(T3, F, axes=([3, 1], [0, 2]))
         return T4.transpose(0, 3, 1, 2)
 
+    @staticmethod
+    def _family_base_name(name):
+        return str(name).split(":", 1)[0]
+
+    def _record_family_environment_timing(self, name, phase, elapsed):
+        stats = self.complementary_split_stats
+        if stats is None:
+            return
+        family_stats = stats.setdefault("family_environment_timings", {})
+        phases = family_stats.setdefault(str(name), {})
+        entry = phases.setdefault(
+            str(phase),
+            {"calls": 0, "seconds": 0.0, "last_seconds": 0.0},
+        )
+        entry["calls"] = int(entry.get("calls", 0)) + 1
+        entry["seconds"] = float(entry.get("seconds", 0.0)) + float(elapsed)
+        entry["last_seconds"] = float(elapsed)
+        if self.bond is not None:
+            entry["last_bond"] = int(self.bond)
+
+    def _record_direct_operator_batch_stats(self, entries, batched_groups):
+        stats = self.complementary_split_stats
+        if stats is None:
+            return
+        total_entries = int(len(entries))
+        batched_entries = int(sum(len(group[1]) for group in batched_groups))
+        scalar_entries = int(total_entries - batched_entries)
+        batch_stats = stats.setdefault(
+            "direct_operator_batching",
+            {
+                "calls": 0,
+                "entries": 0,
+                "batched_entries": 0,
+                "scalar_entries": 0,
+                "batched_groups": 0,
+                "max_group_size": 0,
+            },
+        )
+        batch_stats["calls"] = int(batch_stats.get("calls", 0)) + 1
+        batch_stats["entries"] = int(batch_stats.get("entries", 0)) + total_entries
+        batch_stats["batched_entries"] = (
+            int(batch_stats.get("batched_entries", 0)) + batched_entries
+        )
+        batch_stats["scalar_entries"] = (
+            int(batch_stats.get("scalar_entries", 0)) + scalar_entries
+        )
+        batch_stats["batched_groups"] = (
+            int(batch_stats.get("batched_groups", 0)) + int(len(batched_groups))
+        )
+        max_group = max((len(group[1]) for group in batched_groups), default=0)
+        batch_stats["max_group_size"] = max(
+            int(batch_stats.get("max_group_size", 0)),
+            int(max_group),
+        )
+        batch_stats["last"] = {
+            "entries": total_entries,
+            "batched_entries": batched_entries,
+            "scalar_entries": scalar_entries,
+            "batched_groups": int(len(batched_groups)),
+            "max_group_size": int(max_group),
+            "min_entries": int(self._direct_operator_batch_min_entries),
+            "bond": self.bond,
+        }
+
     def _matvec_named_family_channels(self, A):
         if not self.complementary_family_environments:
             return None
         channels = {}
         stats = {}
         for name, env in self.complementary_family_environments.items():
+            t0 = time.perf_counter()
             try:
                 E, W, F = env
             except Exception:
@@ -1129,13 +1428,54 @@ class HamiltonianMultiplyU1:
                 n_channels = int(len(family_channels))
                 source = "precontracted_family_environment"
             if tensor is not None:
-                key = str(name)
-                channels[key] = tensor
-                stats[key] = {
+                raw_name = str(name)
+                base_name = self._family_base_name(raw_name)
+                channels[base_name] = (
+                    tensor
+                    if base_name not in channels
+                    else channels[base_name] + tensor
+                )
+                raw_stats = {
                     "source": source,
                     "n_entries": n_entries,
                     "n_mpo_middle_channels": n_channels,
+                    "seconds": float(time.perf_counter() - t0),
                 }
+                self._record_family_environment_timing(
+                    raw_name,
+                    "apply",
+                    raw_stats["seconds"],
+                )
+                base_stats = stats.setdefault(
+                    base_name,
+                    {
+                        "source": "family_mpo_environments",
+                        "split_family_names": (),
+                        "n_entries": 0,
+                        "n_mpo_middle_channels": 0,
+                        "seconds": 0.0,
+                        "raw_family_channel_stats": {},
+                    },
+                )
+                base_stats["split_family_names"] = (
+                    tuple(base_stats["split_family_names"]) + (raw_name,)
+                )
+                if n_entries is None:
+                    base_stats["n_entries"] = None
+                elif base_stats["n_entries"] is not None:
+                    base_stats["n_entries"] = int(base_stats["n_entries"]) + int(
+                        n_entries
+                    )
+                if n_channels is None:
+                    base_stats["n_mpo_middle_channels"] = None
+                elif base_stats["n_mpo_middle_channels"] is not None:
+                    base_stats["n_mpo_middle_channels"] = int(
+                        base_stats["n_mpo_middle_channels"]
+                    ) + int(n_channels)
+                base_stats["seconds"] = float(base_stats["seconds"]) + raw_stats[
+                    "seconds"
+                ]
+                base_stats["raw_family_channel_stats"][raw_name] = raw_stats
         if not channels:
             return None
         return channels, stats
@@ -1146,19 +1486,184 @@ class HamiltonianMultiplyU1:
         channels = {}
         stats = {}
         for name, entries in self.complementary_direct_family_environments.items():
+            t0 = time.perf_counter()
             total = None
+            total_data = {}
+            total_qns = None
+            total_dirs = None
             n_entries = 0
-            for E, W, F in entries:
-                tensor = self._matvec_generic_components(E, W, F, A)
+            n_precontracted = 0
+            n_generic = 0
+            n_middle_channels = 0
+            entry_groups = tuple(getattr(entries, "entry_groups", ()) or ())
+            if len(entry_groups) >= int(len(entries)):
+                entry_groups = ()
+            group_keys = tuple(getattr(entries, "group_keys", ()) or ())
+            if self._prefer_precontracted_family_environment:
+                if entry_groups:
+                    trial_data = {}
+                    trial_qns = None
+                    trial_dirs = None
+                    trial_middle_channels = 0
+                    grouped_ok = True
+                    for group_index, group_entries in enumerate(entry_groups):
+                        group_name = (
+                            f"{name}:group:{group_index}:"
+                            f"{repr(group_keys[group_index]) if group_index < len(group_keys) else '?'}"
+                        )
+                        combined_plan = self._build_combined_direct_family_plan(
+                            A,
+                            group_name,
+                            group_entries,
+                        )
+                        plan_data = {}
+                        applied = self._accumulate_direct_operator_plan(
+                            A,
+                            combined_plan,
+                            plan_data,
+                        )
+                        if applied is None:
+                            grouped_ok = False
+                            break
+                        middle_channels, plan_entries, out_qns, out_dirs = applied
+                        for key, block in plan_data.items():
+                            if key in trial_data and trial_data[key].shape != block.shape:
+                                grouped_ok = False
+                                break
+                            trial_data[key] = (
+                                trial_data[key] + block
+                                if key in trial_data
+                                else block.copy()
+                            )
+                        if not grouped_ok:
+                            break
+                        if trial_qns is None:
+                            trial_qns = out_qns
+                            trial_dirs = out_dirs
+                        trial_middle_channels += int(len(middle_channels))
+                    if grouped_ok and trial_data:
+                        total_data = trial_data
+                        total_qns = trial_qns
+                        total_dirs = trial_dirs
+                        n_entries = int(len(entries))
+                        n_precontracted = int(len(entries))
+                        n_middle_channels = int(trial_middle_channels)
+                else:
+                    combined_plan = self._build_combined_direct_family_plan(
+                        A,
+                        name,
+                        entries,
+                    )
+                    plan_data = {}
+                    applied = self._accumulate_direct_operator_plan(
+                        A,
+                        combined_plan,
+                        plan_data,
+                    )
+                    if applied is not None:
+                        middle_channels, plan_entries, total_qns, total_dirs = applied
+                        total_data = plan_data
+                        n_entries = int(len(entries))
+                        n_precontracted = int(len(entries))
+                        n_middle_channels = int(len(middle_channels))
+            if not n_precontracted:
+                for E, W, F in entries:
+                    if self._prefer_precontracted_family_environment:
+                        plan = self._build_direct_operator_plan(
+                            A,
+                            E,
+                            W,
+                            F,
+                            ("direct_symbolic_family", str(name), n_entries),
+                        )
+                        plan_data = {}
+                        applied = self._accumulate_direct_operator_plan(
+                            A,
+                            plan,
+                            plan_data,
+                        )
+                    else:
+                        applied = None
+                    if applied is None:
+                        tensor = self._matvec_generic_components(E, W, F, A)
+                        if total_data:
+                            for key, block in tensor.data.items():
+                                if key in total_data:
+                                    total_data[key] = total_data[key] + block
+                                else:
+                                    total_data[key] = block.copy()
+                            if total_qns is None:
+                                total_qns = tensor.qns
+                                total_dirs = tensor.dirs
+                            tensor = None
+                        else:
+                            total = tensor if total is None else total + tensor
+                        n_generic += 1
+                    else:
+                        middle_channels, plan_entries, out_qns, out_dirs = applied
+                        compatible = True
+                        for key, block in plan_data.items():
+                            if key in total_data and total_data[key].shape != block.shape:
+                                compatible = False
+                                break
+                        if compatible:
+                            for key, block in plan_data.items():
+                                if key in total_data:
+                                    total_data[key] = total_data[key] + block
+                                else:
+                                    total_data[key] = block.copy()
+                        else:
+                            applied = None
+                        if applied is None:
+                            tensor = self._matvec_generic_components(E, W, F, A)
+                            for key, block in tensor.data.items():
+                                if key in total_data:
+                                    total_data[key] = total_data[key] + block
+                                else:
+                                    total_data[key] = block.copy()
+                            if total_qns is None:
+                                total_qns = tensor.qns
+                                total_dirs = tensor.dirs
+                            n_generic += 1
+                            n_entries += 1
+                            continue
+                        if total_qns is None:
+                            total_qns = out_qns
+                            total_dirs = out_dirs
+                        n_precontracted += 1
+                        n_middle_channels += int(len(middle_channels))
+                    n_entries += 1
+            if total_data:
+                tensor = BlockTensor(total_data, total_qns, total_dirs)
                 total = tensor if total is None else total + tensor
-                n_entries += 1
             if total is not None:
                 key = str(name)
                 channels[key] = total
+                source = (
+                    "precontracted_direct_symbolic_term_environments"
+                    if n_precontracted and not n_generic
+                    else "mixed_direct_symbolic_term_environments"
+                    if n_precontracted
+                    else "direct_symbolic_term_environments"
+                )
+                elapsed = float(time.perf_counter() - t0)
                 stats[key] = {
-                    "source": "direct_symbolic_term_environments",
+                    "source": source,
                     "n_entries": int(n_entries),
+                    "n_precontracted_entries": int(n_precontracted),
+                    "n_generic_entries": int(n_generic),
+                    "n_mpo_middle_channels": int(n_middle_channels),
+                    "seconds": elapsed,
+                    "n_entry_groups": int(len(entry_groups)),
+                    "entry_group_sizes": tuple(
+                        int(len(group)) for group in entry_groups
+                    ),
                 }
+                self._record_family_environment_timing(
+                    key,
+                    "direct_apply",
+                    elapsed,
+                )
         if not channels:
             return None
         return channels, stats
@@ -1677,10 +2182,10 @@ class HamiltonianMultiplyU1:
         Return the exact complementary split for this local problem.
 
         When complementary payload matvecs are enabled, the boundary term is
-        applied through the factorized middle-channel plan and local R/P
-        channels are subtracted explicitly.  Otherwise, small local spaces may
-        use a dense boundary table before falling back to the exact residual
-        ``full - local``.
+        tried through the renormalized family table/direct family environments
+        before falling back to factorized middle-channel plans.  Otherwise,
+        small local spaces may use a dense boundary table before falling back
+        to the exact residual ``full - local``.
         """
         if self._prefer_boundary_factorized:
             local_channels = self._matvec_local_complementary_channels(A)
@@ -1690,9 +2195,62 @@ class HamiltonianMultiplyU1:
                 local = None
                 for value in local_channels.values():
                     local = value if local is None else local + value
+            boundary_family_table = (
+                None
+                if self.complementary_direct_family_environments
+                and self.complementary_family_environments
+                else self._matvec_boundary_family_operator_table(A)
+            )
+            if boundary_family_table is not None:
+                boundary = boundary_family_table["total"]
+                mode = (
+                    "local_RP_plus_boundary_family_operator_table"
+                    if local is not None
+                    else "boundary_family_operator_table_no_local_complementary"
+                )
+                total = boundary if local is None else boundary + local
+                self._audit_complementary_action(A, total, mode)
+                self._record_complementary_split(
+                    mode,
+                    local=local,
+                    local_channels=local_channels,
+                    boundary=boundary,
+                    boundary_table=boundary_family_table.get("table"),
+                    boundary_operator=boundary_family_table["stats"],
+                )
+                return {
+                    "total": total,
+                    "local": local,
+                    "local_channels": local_channels,
+                    "boundary": boundary,
+                    "boundary_channels": boundary_family_table["channels"],
+                    "boundary_operator": boundary_family_table["stats"],
+                    "boundary_table": boundary_family_table.get("table"),
+                    "mode": mode,
+                }
             direct_symbolic = self._matvec_direct_symbolic_family_channels(A)
             if direct_symbolic is not None:
                 direct_channels, direct_stats = direct_symbolic
+                family_sources = {"direct": tuple(direct_channels)}
+                if self.complementary_family_environments:
+                    named_family = self._matvec_named_family_channels(A)
+                    if named_family is not None:
+                        named_family_channels, named_family_stats = named_family
+                        family_sources["named"] = tuple(named_family_channels)
+                        for name, tensor in named_family_channels.items():
+                            if name in direct_channels:
+                                direct_channels[name] = direct_channels[name] + tensor
+                            else:
+                                direct_channels[name] = tensor
+                            if name in direct_stats:
+                                old_stats = dict(direct_stats[name])
+                                direct_stats[name] = {
+                                    "source": "hybrid_direct_and_named_family_environment",
+                                    "direct_family_stats": old_stats,
+                                    "named_family_stats": named_family_stats.get(name),
+                                }
+                            else:
+                                direct_stats[name] = named_family_stats.get(name, {})
                 total = None
                 boundary_channels = {}
                 for name, tensor in direct_channels.items():
@@ -1702,16 +2260,45 @@ class HamiltonianMultiplyU1:
                         boundary = boundary - local_channels[name]
                     boundary_channels[f"{name}:boundary"] = boundary
                 if total is not None:
-                    mode = (
-                        "direct_RP_symbolic_environment"
-                        if local is not None
-                        else "direct_symbolic_environment"
+                    direct_sources = tuple(
+                        str(item.get("source", ""))
+                        for item in direct_stats.values()
                     )
+                    precontracted = bool(direct_sources) and all(
+                        source == "precontracted_direct_symbolic_term_environments"
+                        for source in direct_sources
+                    )
+                    if precontracted:
+                        mode = (
+                            "direct_RP_precontracted_family_environment"
+                            if local is not None
+                            else "direct_precontracted_family_environment"
+                        )
+                    else:
+                        mode = (
+                            "direct_RP_symbolic_environment"
+                            if local is not None
+                            else "direct_symbolic_environment"
+                        )
+                    if "named" in family_sources:
+                        mode = (
+                            "hybrid_direct_named_RP_family_environment"
+                            if local is not None
+                            else "hybrid_direct_named_family_environment"
+                        )
                     self._audit_complementary_action(A, total, mode)
                     stats = {
                         "kind": "abelian_direct_symbolic_family_environment_action",
-                        "source": "direct_symbolic_term_environments",
+                        "source": (
+                            "hybrid_direct_and_named_family_environments"
+                            if "named" in family_sources
+                            else
+                            "precontracted_direct_family_environments"
+                            if precontracted
+                            else "direct_symbolic_term_environments"
+                        ),
                         "bond": self.bond,
+                        "family_sources": family_sources,
                         "family_names": tuple(direct_channels),
                         "n_channels": int(
                             len(direct_channels)
@@ -2004,6 +2591,82 @@ class HamiltonianMultiplyU1:
             if table is not None:
                 tables.append(table)
         return tuple(tables)
+
+    def _boundary_family_action_key(self, A):
+        layout = self._layout(A)
+        return (
+            "abelian_boundary_action",
+            int(self.bond or 0),
+            layout,
+        ), layout
+
+    def _stored_boundary_family_action_table(self, key):
+        if key is None:
+            return None
+        for table in self._boundary_family_tables():
+            getter = getattr(table, "get_numeric_action_table", None)
+            if getter is None:
+                continue
+            action_table = getter(key)
+            if action_table is not None:
+                return action_table
+        return None
+
+    def _store_boundary_family_action_table(self, key, action_table):
+        if key is None or action_table is None:
+            return action_table
+        stored = False
+        for table in self._boundary_family_tables():
+            putter = getattr(table, "put_numeric_action_table", None)
+            if putter is None:
+                continue
+            putter(key, action_table)
+            stored = True
+        return action_table if stored else None
+
+    def _boundary_family_action_table(self, A):
+        tables = self._boundary_family_tables()
+        if not tables:
+            return None
+        key, _layout = self._boundary_family_action_key(A)
+        cached = self._stored_boundary_family_action_table(key)
+        if cached is not None:
+            return cached
+        built = self._build_family_action_table_from_direct_family_environments(A)
+        if built is None:
+            return None
+        source = str(built.source)
+        if not source.startswith("renormalized_family_operator_tables:"):
+            built.source = "renormalized_family_operator_tables:" + source
+        stored = self._store_boundary_family_action_table(key, built)
+        return built if stored is not None else None
+
+    def _matvec_boundary_family_operator_table(self, A):
+        table = self._boundary_family_action_table(A)
+        if table is None:
+            return None
+        boundary = table.apply(A)
+        channel_tensors = (
+            table.apply_channels(A)
+            if getattr(self, "_debug_boundary_channel_matrices", False)
+            else {}
+        )
+        return {
+            "total": boundary,
+            "channels": channel_tensors,
+            "table": table,
+            "stats": {
+                "kind": "abelian_complementary_boundary_family_operator_table_action",
+                "source": str(table.source),
+                "bond": self.bond,
+                "n_family_operator_tables": int(len(self._boundary_family_tables())),
+                "active_family_names": tuple(table.stats.get("active_family_names", ())),
+                "n_channels": int(len(channel_tensors)),
+                "channel_names": tuple(channel_tensors),
+                "channels_materialized": bool(channel_tensors),
+                "table": table.stats,
+            },
+        }
 
     def _compact_complementary_split_metadata(self):
         def _table_summary(entry):
@@ -5830,14 +6493,39 @@ def two_site_dmrg(
         str(name): dict(entries)
         for name, entries in (complementary_operator_generator_entries or {}).items()
     }
-    comp_family_E = {
-        name: construct_E(MPS, factors, MPS)
-        for name, factors in complementary_operator_mpos.items()
+    comp_stack, comp_payload_map = _make_complementary_boundary_stack(
+        complementary_operator_families,
+        len(MPS),
+    )
+    comp_split_stats = {
+        "enabled": comp_stack is not None,
+        "calls": 0,
+        "modes": {},
+        "bonds": {},
+        "family_environment_timings": {},
     }
-    comp_family_F = {
-        name: construct_F(MPS, factors, MPS, target_qn=target_qn)
-        for name, factors in complementary_operator_mpos.items()
-    }
+
+    def _record_comp_family_timing(name, phase, elapsed):
+        timings = comp_split_stats.setdefault("family_environment_timings", {})
+        phases = timings.setdefault(str(name), {})
+        entry = phases.setdefault(
+            str(phase),
+            {"calls": 0, "seconds": 0.0, "last_seconds": 0.0},
+        )
+        entry["calls"] = int(entry.get("calls", 0)) + 1
+        entry["seconds"] = float(entry.get("seconds", 0.0)) + float(elapsed)
+        entry["last_seconds"] = float(elapsed)
+
+    comp_family_E = {}
+    comp_family_F = {}
+    for name, factors in complementary_operator_mpos.items():
+        t0 = time.perf_counter()
+        comp_family_E[name] = construct_E(MPS, factors, MPS)
+        _record_comp_family_timing(name, "build_left", time.perf_counter() - t0)
+    for name, factors in complementary_operator_mpos.items():
+        t0 = time.perf_counter()
+        comp_family_F[name] = construct_F(MPS, factors, MPS, target_qn=target_qn)
+        _record_comp_family_timing(name, "build_right", time.perf_counter() - t0)
     for stack in comp_family_F.values():
         stack.pop()
 
@@ -5853,26 +6541,17 @@ def two_site_dmrg(
         nz *= float(noise_decay) ** int(half_sweep)
         return 0.0 if nz < float(noise_cutoff) else nz
 
-    comp_stack, comp_payload_map = _make_complementary_boundary_stack(
-        complementary_operator_families,
-        len(MPS),
-    )
-    comp_split_stats = {
-        "enabled": comp_stack is not None,
-        "calls": 0,
-        "modes": {},
-        "bonds": {},
-    }
-
     def _comp_payload(bond):
         if comp_stack is None:
             return None
         bond = int(bond)
-        return {
+        payload = {
             "stack": comp_stack,
             "left": comp_payload_map.get(("left", bond)),
             "right": comp_payload_map.get(("right", bond + 1)),
         }
+        _attach_native_generator_boundary_tables(payload)
+        return payload
 
     def _comp_split_snapshot():
         if comp_stack is None:
@@ -5901,16 +6580,41 @@ def two_site_dmrg(
 
     generator_expansion_cache = {}
     generator_term_map_cache = None
+    native_generator_boundary_table_cache = {}
+    native_pair_operator_boundary_table_cache = {}
+    native_pair_boundary_table_cache = {}
+    native_exact_pattern_boundary_table_cache = {}
+    native_exact_pattern_component_table_cache = {}
+    native_boundary_p_validation_cache = {}
+    native_pair_operator_equivalence_cache = {}
     direct_family_sym_pattern_cache = {}
     direct_family_left_env_cache = {}
     direct_family_right_env_cache = {}
+    direct_family_contextual_site_operator_cache = {}
+    direct_family_contextual_left_env_cache = {}
+    direct_family_contextual_right_env_cache = {}
     direct_family_env_revision = [0]
     direct_family_pattern_terms_cache = None
+    direct_family_builder_stats = comp_split_stats.setdefault(
+        "direct_family_table_builder",
+        {
+            "contextual_recursive_terms": 0,
+            "fallback_full_pattern_terms": 0,
+            "failed_terms": 0,
+        },
+    )
 
     def _invalidate_direct_family_env_cache():
         direct_family_env_revision[0] += 1
+        native_generator_boundary_table_cache.clear()
+        native_pair_operator_boundary_table_cache.clear()
+        native_pair_boundary_table_cache.clear()
+        native_exact_pattern_boundary_table_cache.clear()
+        native_exact_pattern_component_table_cache.clear()
         direct_family_left_env_cache.clear()
         direct_family_right_env_cache.clear()
+        direct_family_contextual_left_env_cache.clear()
+        direct_family_contextual_right_env_cache.clear()
 
     def _generator_expansion(p, q):
         key = ("E", int(p), int(q))
@@ -5930,6 +6634,439 @@ def two_site_dmrg(
                 terms.append((symbol, tuple(dofs), complex(factor)))
         generator_expansion_cache[key] = tuple(terms)
         return generator_expansion_cache[key]
+
+    def _native_generator_keys():
+        keys = set()
+        for key in complementary_operator_generator_entries.get("R", {}):
+            try:
+                keys.add((int(key[0]), int(key[1])))
+            except Exception:
+                continue
+        for key in complementary_operator_generator_entries.get("P", {}):
+            try:
+                keys.add((int(key[0]), int(key[1])))
+                keys.add((int(key[2]), int(key[3])))
+            except Exception:
+                continue
+        return tuple(sorted(keys))
+
+    def _attach_native_generator_boundary_tables(payload):
+        if not complementary_operator_generator_entries:
+            return
+        if site_qn_maps is None or not payload:
+            return
+        if not _native_generator_keys():
+            return
+        for side in ("left", "right"):
+            entry = payload.get(side)
+            family_table = None if entry is None else entry.family_operator_table
+            if family_table is None:
+                continue
+            key = (
+                "native_spinfree_generator_boundary",
+                int(direct_family_env_revision[0]),
+                str(entry.side),
+                int(entry.bond),
+            )
+            if family_table.get_native_operator_table(key) is not None:
+                continue
+            table = _build_native_generator_boundary_table(
+                str(entry.side),
+                int(entry.bond),
+            )
+            if table is not None:
+                family_table.put_native_operator_table(key, table)
+
+    def _build_native_generator_boundary_table(side, boundary_bond):
+        cache_key = (
+            int(direct_family_env_revision[0]),
+            str(side),
+            int(boundary_bond),
+        )
+        cached = native_generator_boundary_table_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if site_qn_maps is None:
+            return None
+        try:
+            from pyqed.mps.nonabelian.renormalized import (
+                ComplementaryNativeGeneratorOperatorTable,
+            )
+        except Exception:
+            return None
+
+        t0 = time.perf_counter()
+        L = len(MPS)
+        sample_qn = list(site_qn_maps[0].values())[0]
+        zero_qn = zero_like_sector(sample_qn)
+        site_operator_cache = {}
+
+        def _site_operator(piece, site, boundary_qns, direction):
+            boundary_qns = tuple(boundary_qns)
+            key = (str(direction), str(piece), int(site), boundary_qns)
+            cached_op = site_operator_cache.get(key)
+            if cached_op is not None:
+                return cached_op
+            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+            mat = np.asarray(spatial_local_ops()[str(piece)], dtype=complex)
+            phys_items = tuple(sorted(site_qn_maps[int(site)].items()))
+            phys_qns = tuple(sorted({qn for _state, qn in phys_items}))
+            data = {}
+            if str(direction) == "left":
+                right_qns = set()
+                for q_l in boundary_qns:
+                    for out_s, q_out in phys_items:
+                        for in_s, q_in in phys_items:
+                            coeff = mat[int(out_s), int(in_s)]
+                            if abs(coeff) <= 1.0e-14:
+                                continue
+                            flux = q_out - q_in
+                            q_r = q_l - flux
+                            right_qns.add(q_r)
+                            data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                                [[[[coeff]]]],
+                                dtype=complex,
+                            )
+                if not data:
+                    return None
+                op = BlockTensor(
+                    data,
+                    [list(boundary_qns), sorted(right_qns), list(phys_qns), list(phys_qns)],
+                    [-1, 1, 1, -1],
+                )
+            else:
+                left_qns = set()
+                for q_r in boundary_qns:
+                    for out_s, q_out in phys_items:
+                        for in_s, q_in in phys_items:
+                            coeff = mat[int(out_s), int(in_s)]
+                            if abs(coeff) <= 1.0e-14:
+                                continue
+                            flux = q_out - q_in
+                            q_l = q_r + flux
+                            left_qns.add(q_l)
+                            data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                                [[[[coeff]]]],
+                                dtype=complex,
+                            )
+                if not data:
+                    return None
+                op = BlockTensor(
+                    data,
+                    [sorted(left_qns), list(boundary_qns), list(phys_qns), list(phys_qns)],
+                    [-1, 1, 1, -1],
+                )
+            site_operator_cache[key] = op
+            return op
+
+        def _component_env(component):
+            symbol, dofs, factor = component
+            pieces = str(symbol).split()
+            pattern = {int(site): str(piece) for piece, site in zip(pieces, dofs)}
+            support = set(pattern)
+            if str(side) == "left":
+                if not support or any(site >= int(boundary_bond) for site in support):
+                    return None
+                env = None
+                for site in range(int(boundary_bond)):
+                    piece = pattern.get(site, "I")
+                    qns = (zero_qn,) if env is None else env.qns[0]
+                    W = _site_operator(piece, site, qns, "left")
+                    if W is None:
+                        return None
+                    try:
+                        if env is None:
+                            env = initial_E(W)
+                        env = contract_from_left(
+                            W,
+                            MPS[site],
+                            env,
+                            MPS[site],
+                        )
+                    except Exception:
+                        return None
+                return None if env is None else env * complex(factor)
+            if str(side) == "right":
+                if not support or any(site <= int(boundary_bond) for site in support):
+                    return None
+                env = None
+                target = target_qn if target_qn is not None else 0
+                for site in range(L - 1, int(boundary_bond), -1):
+                    piece = pattern.get(site, "I")
+                    qns = (zero_qn,) if env is None else env.qns[0]
+                    W = _site_operator(piece, site, qns, "right")
+                    if W is None:
+                        return None
+                    try:
+                        if env is None:
+                            env = initial_F(W, target_qn=target)
+                        env = contract_from_right(
+                            W,
+                            MPS[site],
+                            env,
+                            MPS[site],
+                        )
+                    except Exception:
+                        return None
+                return None if env is None else env * complex(factor)
+            return None
+
+        operators = {}
+        for p, q in _native_generator_keys():
+            total = None
+            for component in _generator_expansion(p, q):
+                env = _component_env(component)
+                if env is None:
+                    total = None
+                    break
+                total = env if total is None else total + env
+            if total is not None:
+                operators[(int(p), int(q))] = total
+        table = ComplementaryNativeGeneratorOperatorTable(
+            side=str(side),
+            bond=int(boundary_bond),
+            operators=operators,
+            build_seconds=float(time.perf_counter() - t0),
+        )
+        native_generator_boundary_table_cache[cache_key] = table
+        stats = comp_split_stats.setdefault("native_generator_boundary_tables", {})
+        side_stats = stats.setdefault(str(side), {"builds": 0, "operators": 0, "seconds": 0.0})
+        side_stats["builds"] = int(side_stats.get("builds", 0)) + 1
+        side_stats["operators"] = int(side_stats.get("operators", 0)) + int(table.n_operators)
+        side_stats["seconds"] = float(side_stats.get("seconds", 0.0)) + float(table.build_seconds)
+        side_stats["last_bond"] = int(boundary_bond)
+        side_stats["last_operators"] = int(table.n_operators)
+        return table
+
+    def _build_native_pair_operator_boundary_table(side, boundary_bond):
+        cache_key = (
+            int(direct_family_env_revision[0]),
+            str(side),
+            int(boundary_bond),
+        )
+        cached = native_pair_operator_boundary_table_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if site_qn_maps is None or not complementary_operator_generator_entries:
+            return None
+        try:
+            from pyqed.mps.nonabelian.renormalized import (
+                ComplementaryNativePairBoundaryOperatorTable,
+            )
+        except Exception:
+            return None
+        entry = comp_payload_map.get((str(side), int(boundary_bond)))
+        family_table = None if entry is None else entry.family_operator_table
+        storage_key = (
+            "native_pair_complement_operator_boundary",
+            int(direct_family_env_revision[0]),
+            str(side),
+            int(boundary_bond),
+        )
+        if family_table is not None:
+            existing = family_table.get_native_operator_table(storage_key)
+            if existing is not None:
+                native_pair_operator_boundary_table_cache[cache_key] = existing
+                return existing
+
+        t0 = time.perf_counter()
+        L = len(MPS)
+        sample_qn = list(site_qn_maps[0].values())[0]
+        zero_qn = zero_like_sector(sample_qn)
+        site_operator_cache = {}
+
+        def _site_operator(piece, site, boundary_qns, direction):
+            boundary_qns = tuple(boundary_qns)
+            key = (str(direction), str(piece), int(site), boundary_qns)
+            cached_op = site_operator_cache.get(key)
+            if cached_op is not None:
+                return cached_op
+            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+            mat = np.asarray(spatial_local_ops()[str(piece)], dtype=complex)
+            phys_items = tuple(sorted(site_qn_maps[int(site)].items()))
+            phys_qns = tuple(sorted({qn for _state, qn in phys_items}))
+            data = {}
+            if str(direction) == "left":
+                right_qns = set()
+                for q_l in boundary_qns:
+                    for out_s, q_out in phys_items:
+                        for in_s, q_in in phys_items:
+                            coeff = mat[int(out_s), int(in_s)]
+                            if abs(coeff) <= 1.0e-14:
+                                continue
+                            flux = q_out - q_in
+                            q_r = q_l - flux
+                            right_qns.add(q_r)
+                            data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                                [[[[coeff]]]],
+                                dtype=complex,
+                            )
+                if not data:
+                    return None
+                op = BlockTensor(
+                    data,
+                    [list(boundary_qns), sorted(right_qns), list(phys_qns), list(phys_qns)],
+                    [-1, 1, 1, -1],
+                )
+            else:
+                left_qns = set()
+                for q_r in boundary_qns:
+                    for out_s, q_out in phys_items:
+                        for in_s, q_in in phys_items:
+                            coeff = mat[int(out_s), int(in_s)]
+                            if abs(coeff) <= 1.0e-14:
+                                continue
+                            flux = q_out - q_in
+                            q_l = q_r + flux
+                            left_qns.add(q_l)
+                            data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                                [[[[coeff]]]],
+                                dtype=complex,
+                            )
+                if not data:
+                    return None
+                op = BlockTensor(
+                    data,
+                    [sorted(left_qns), list(boundary_qns), list(phys_qns), list(phys_qns)],
+                    [-1, 1, 1, -1],
+                )
+            site_operator_cache[key] = op
+            return op
+
+        def _merge_terms(weighted_terms):
+            weighted_terms = tuple(weighted_terms or ())
+            if not weighted_terms:
+                return None
+            first = weighted_terms[0][0]
+            dirs = getattr(first, "dirs", None)
+            if dirs is None:
+                return None
+            rank = int(len(dirs))
+            data = {}
+            qn_sets = [set() for _ in range(rank)]
+            for tensor, factor in weighted_terms:
+                if getattr(tensor, "dirs", None) != dirs:
+                    return None
+                for key, block in getattr(tensor, "data", {}).items():
+                    if len(key) != rank:
+                        return None
+                    for axis, qn in enumerate(key):
+                        qn_sets[axis].add(qn)
+                    scaled = np.asarray(block) * complex(factor)
+                    if key in data:
+                        if data[key].shape != scaled.shape:
+                            return None
+                        data[key] = data[key] + scaled
+                    else:
+                        data[key] = scaled.copy()
+            if not data:
+                return None
+            return BlockTensor(data, [sorted(qns) for qns in qn_sets], list(dirs))
+
+        def _component_env(component):
+            symbol, dofs, factor = component
+            pieces = str(symbol).split()
+            pattern = {int(site): str(piece) for piece, site in zip(pieces, dofs)}
+            support = set(pattern)
+            if str(side) == "left":
+                if not support or any(site >= int(boundary_bond) for site in support):
+                    return None
+                env = None
+                for site in range(int(boundary_bond)):
+                    piece = pattern.get(site, "I")
+                    qns = (zero_qn,) if env is None else env.qns[0]
+                    W = _site_operator(piece, site, qns, "left")
+                    if W is None:
+                        return None
+                    try:
+                        if env is None:
+                            env = initial_E(W)
+                        env = contract_from_left(
+                            W,
+                            MPS[site],
+                            env,
+                            MPS[site],
+                        )
+                    except Exception:
+                        return None
+                return None if env is None else env * complex(factor)
+            if str(side) == "right":
+                if not support or any(site <= int(boundary_bond) for site in support):
+                    return None
+                env = None
+                target = target_qn if target_qn is not None else 0
+                for site in range(L - 1, int(boundary_bond), -1):
+                    piece = pattern.get(site, "I")
+                    qns = (zero_qn,) if env is None else env.qns[0]
+                    W = _site_operator(piece, site, qns, "right")
+                    if W is None:
+                        return None
+                    try:
+                        if env is None:
+                            env = initial_F(W, target_qn=target)
+                        env = contract_from_right(
+                            W,
+                            MPS[site],
+                            env,
+                            MPS[site],
+                        )
+                    except Exception:
+                        return None
+                return None if env is None else env * complex(factor)
+            return None
+
+        table = ComplementaryNativePairBoundaryOperatorTable(
+            side=str(side),
+            bond=int(boundary_bond),
+        )
+        p_entries = complementary_operator_generator_entries.get("P", {})
+
+        def _generator_component_support(p, q):
+            support = set()
+            for _symbol, dofs, _factor in _generator_expansion(p, q):
+                support.update(int(site) for site in dofs)
+            return support
+
+        def _same_side_support(p, q, r, s):
+            support = _generator_component_support(p, q)
+            support.update(_generator_component_support(r, s))
+            if not support:
+                return False
+            if str(side) == "left":
+                return all(site < int(boundary_bond) for site in support)
+            return all(site > int(boundary_bond) for site in support)
+
+        for key, coeff in p_entries.items():
+            p, q, r, s = (int(index) for index in key)
+            if abs(complex(coeff)) <= 1.0e-14:
+                continue
+            if not _same_side_support(p, q, r, s):
+                continue
+            terms = []
+            for component in _two_generator_expansion(p, q, r, s):
+                env = _component_env(component)
+                if env is None:
+                    terms = None
+                    break
+                terms.append((env, 1.0))
+            if terms:
+                operator = _merge_terms(terms)
+                if operator is not None:
+                    table.add_operator((p, q, r, s), operator)
+        table.build_seconds = float(time.perf_counter() - t0)
+        native_pair_operator_boundary_table_cache[cache_key] = table
+        if family_table is not None:
+            family_table.put_native_operator_table(storage_key, table)
+        stats = comp_split_stats.setdefault("native_pair_operator_boundary_tables", {})
+        side_stats = stats.setdefault(str(side), {"builds": 0, "operators": 0, "seconds": 0.0})
+        side_stats["builds"] = int(side_stats.get("builds", 0)) + 1
+        side_stats["operators"] = int(side_stats.get("operators", 0)) + int(table.n_operators)
+        side_stats["seconds"] = float(side_stats.get("seconds", 0.0)) + float(table.build_seconds)
+        side_stats["last_bond"] = int(boundary_bond)
+        side_stats["last_operators"] = int(table.n_operators)
+        return table
 
     def _two_generator_expansion(p, q, r, s):
         key = ("EE", int(p), int(q), int(r), int(s))
@@ -5951,14 +7088,48 @@ def two_site_dmrg(
         generator_expansion_cache[key] = tuple(terms)
         return generator_expansion_cache[key]
 
-    def _iter_direct_family_terms():
+    def _iter_direct_family_terms(skip_p_keys=None, skip_r_keys=None):
+        skip_p_keys = {
+            tuple(int(index) for index in key)
+            for key in (skip_p_keys or ())
+        }
+        skip_r_keys = {
+            tuple(int(index) for index in key)
+            for key in (skip_r_keys or ())
+        }
         if complementary_operator_term_maps:
             for family_name, term_map in complementary_operator_term_maps.items():
                 for (symbol, dofs), coeff in term_map.items():
                     yield str(family_name), str(symbol), tuple(dofs), complex(coeff)
         if complementary_operator_generator_entries:
             nonlocal generator_term_map_cache
-            if generator_term_map_cache is None:
+            if skip_p_keys or skip_r_keys:
+                from pyqed.qchem.dmrg.spatial_terms import accumulate_symbolic_term
+
+                term_map_cache = {"R": {}, "P": {}}
+                for (p, q), coeff in complementary_operator_generator_entries.get("R", {}).items():
+                    key = (int(p), int(q))
+                    if key in skip_r_keys:
+                        continue
+                    for symbol, dofs, factor in _generator_expansion(p, q):
+                        accumulate_symbolic_term(
+                            term_map_cache["R"],
+                            symbol,
+                            dofs,
+                            complex(coeff) * factor,
+                        )
+                for (p, q, r, s), coeff in complementary_operator_generator_entries.get("P", {}).items():
+                    key = (int(p), int(q), int(r), int(s))
+                    if key in skip_p_keys:
+                        continue
+                    for symbol, dofs, factor in _two_generator_expansion(p, q, r, s):
+                        accumulate_symbolic_term(
+                            term_map_cache["P"],
+                            symbol,
+                            dofs,
+                            complex(coeff) * factor,
+                        )
+            elif generator_term_map_cache is None:
                 from pyqed.qchem.dmrg.spatial_terms import accumulate_symbolic_term
 
                 generator_term_map_cache = {"R": {}, "P": {}}
@@ -5978,30 +7149,80 @@ def two_site_dmrg(
                             dofs,
                             complex(coeff) * factor,
                         )
-            for family_name, term_map in generator_term_map_cache.items():
+                term_map_cache = generator_term_map_cache
+            else:
+                term_map_cache = generator_term_map_cache
+            for family_name, term_map in term_map_cache.items():
                 for (symbol, dofs), coeff in term_map.items():
                     yield str(family_name), str(symbol), tuple(dofs), complex(coeff)
 
-    def _direct_family_pattern_terms():
+    def _direct_family_pattern_terms(skip_p_keys=None, skip_r_keys=None):
         nonlocal direct_family_pattern_terms_cache
-        if direct_family_pattern_terms_cache is not None:
+        skip_p_keys = {
+            tuple(int(index) for index in key)
+            for key in (skip_p_keys or ())
+        }
+        skip_r_keys = {
+            tuple(int(index) for index in key)
+            for key in (skip_r_keys or ())
+        }
+        if not skip_p_keys and not skip_r_keys and direct_family_pattern_terms_cache is not None:
             return direct_family_pattern_terms_cache
         L = len(MPS)
         grouped = {}
-        for family_name, symbol, dofs, coeff in _iter_direct_family_terms():
+        raw_counts = {}
+        for family_name, symbol, dofs, coeff in _iter_direct_family_terms(
+            skip_p_keys=skip_p_keys,
+            skip_r_keys=skip_r_keys,
+        ):
             per_site = ["I"] * L
             for piece, site in zip(str(symbol).split(), dofs):
                 per_site[int(site)] = str(piece)
-            grouped.setdefault(str(family_name), []).append(
-                (tuple(per_site), complex(coeff))
+            name = str(family_name)
+            pattern = tuple(per_site)
+            raw_counts[name] = int(raw_counts.get(name, 0)) + 1
+            family_terms = grouped.setdefault(name, {})
+            family_terms[pattern] = family_terms.get(pattern, 0.0) + complex(coeff)
+        pattern_terms = {
+            name: tuple(
+                (pattern, coeff)
+                for pattern, coeff in sorted(
+                    terms.items(),
+                    key=lambda item: item[0],
+                )
+                if abs(coeff) > 1.0e-14
             )
-        direct_family_pattern_terms_cache = {
-            name: tuple(terms)
             for name, terms in grouped.items()
         }
-        return direct_family_pattern_terms_cache
+        if not skip_p_keys and not skip_r_keys:
+            direct_family_pattern_terms_cache = pattern_terms
+        else:
+            direct_family_builder_stats["skipped_native_p_generator_terms"] = (
+                int(direct_family_builder_stats.get("skipped_native_p_generator_terms", 0))
+                + int(len(skip_p_keys))
+            )
+            direct_family_builder_stats["skipped_native_r_generator_terms"] = (
+                int(direct_family_builder_stats.get("skipped_native_r_generator_terms", 0))
+                + int(len(skip_r_keys))
+            )
+        merged_counts = {
+            name: int(len(terms))
+            for name, terms in pattern_terms.items()
+        }
+        stat_prefix = "remaining_" if skip_p_keys or skip_r_keys else ""
+        direct_family_builder_stats[f"{stat_prefix}raw_pattern_terms"] = {
+            name: int(count)
+            for name, count in raw_counts.items()
+        }
+        direct_family_builder_stats[f"{stat_prefix}merged_pattern_terms"] = merged_counts
+        direct_family_builder_stats[f"{stat_prefix}merged_pattern_reduction"] = {
+            name: int(raw_counts.get(name, 0) - merged_counts.get(name, 0))
+            for name in raw_counts
+        }
+        return pattern_terms
 
     def _direct_family_env(bond):
+        t_env0 = time.perf_counter()
         if not complementary_operator_term_maps and not complementary_operator_generator_entries:
             return None
         if site_qn_maps is None:
@@ -6009,6 +7230,299 @@ def two_site_dmrg(
         bond = int(bond)
         out = {}
         L = len(MPS)
+        sample_qn = list(site_qn_maps[0].values())[0]
+        zero_qn = zero_like_sector(sample_qn)
+
+        def _native_exact_pattern_component_table():
+            cache_key = (int(direct_family_env_revision[0]), int(bond))
+            cached = native_exact_pattern_component_table_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                from pyqed.mps.nonabelian.renormalized import (
+                    ComplementaryNativeExactPatternComponentTable,
+                )
+            except Exception:
+                return None
+            table = ComplementaryNativeExactPatternComponentTable(bond=int(bond))
+            native_exact_pattern_component_table_cache[cache_key] = table
+            storage_key = (
+                "native_exact_jw_pattern_components",
+                int(direct_family_env_revision[0]),
+                int(bond),
+            )
+            stored = False
+            for side, boundary_bond in (("left", bond), ("right", bond + 1)):
+                entry = comp_payload_map.get((side, int(boundary_bond)))
+                family_table = None if entry is None else entry.family_operator_table
+                if family_table is None:
+                    continue
+                existing = family_table.get_native_operator_table(storage_key)
+                if existing is not None:
+                    native_exact_pattern_component_table_cache[cache_key] = existing
+                    return existing
+                family_table.put_native_operator_table(storage_key, table)
+                stored = True
+            stats = direct_family_builder_stats.setdefault(
+                "native_exact_pattern_component_tables",
+                {"created": 0},
+            )
+            stats["created"] = int(stats.get("created", 0)) + 1
+            stats["last_bond"] = int(bond)
+            stats["stored_on_boundary_tables"] = bool(stored)
+            return table
+
+        def _native_pair_boundary_table():
+            cache_key = (int(direct_family_env_revision[0]), int(bond))
+            cached = native_pair_boundary_table_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                from pyqed.mps.nonabelian.renormalized import (
+                    ComplementaryNativePairBoundaryOperatorTable,
+                )
+            except Exception:
+                return None
+            table = ComplementaryNativePairBoundaryOperatorTable(
+                side="center",
+                bond=int(bond),
+            )
+            native_pair_boundary_table_cache[cache_key] = table
+            storage_key = (
+                "native_pair_complement_boundary",
+                int(direct_family_env_revision[0]),
+                int(bond),
+            )
+            stored = False
+            for side, boundary_bond in (("left", bond), ("right", bond + 1)):
+                entry = comp_payload_map.get((side, int(boundary_bond)))
+                family_table = None if entry is None else entry.family_operator_table
+                if family_table is None:
+                    continue
+                existing = family_table.get_native_operator_table(storage_key)
+                if existing is not None:
+                    native_pair_boundary_table_cache[cache_key] = existing
+                    return existing
+                family_table.put_native_operator_table(storage_key, table)
+                stored = True
+            stats = direct_family_builder_stats.setdefault(
+                "native_pair_boundary_tables",
+                {"created": 0},
+            )
+            stats["created"] = int(stats.get("created", 0)) + 1
+            stats["last_bond"] = int(bond)
+            stats["stored_on_boundary_tables"] = bool(stored)
+            return table
+
+        def _native_exact_pattern_boundary_table(side):
+            side = str(side)
+            boundary_bond = bond if side == "left" else bond + 1
+            cache_key = (
+                int(direct_family_env_revision[0]),
+                side,
+                int(boundary_bond),
+            )
+            cached = native_exact_pattern_boundary_table_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                from pyqed.mps.nonabelian.renormalized import (
+                    ComplementaryNativeExactPatternOperatorTable,
+                )
+            except Exception:
+                return None
+            entry_key = (side, int(boundary_bond))
+            entry = comp_payload_map.get(entry_key)
+            family_table = None if entry is None else entry.family_operator_table
+            storage_key = (
+                "native_exact_jw_pattern_boundary",
+                int(direct_family_env_revision[0]),
+                side,
+                int(boundary_bond),
+            )
+            if family_table is not None:
+                existing = family_table.get_native_operator_table(storage_key)
+                if existing is not None:
+                    native_exact_pattern_boundary_table_cache[cache_key] = existing
+                    return existing
+            table = ComplementaryNativeExactPatternOperatorTable(
+                side=side,
+                bond=int(boundary_bond),
+            )
+            native_exact_pattern_boundary_table_cache[cache_key] = table
+            if family_table is not None:
+                family_table.put_native_operator_table(storage_key, table)
+            stats = direct_family_builder_stats.setdefault(
+                "native_exact_pattern_boundary_tables",
+                {},
+            )
+            side_stats = stats.setdefault(side, {"created": 0})
+            side_stats["created"] = int(side_stats.get("created", 0)) + 1
+            side_stats["last_bond"] = int(boundary_bond)
+            return table
+
+        def _sym_site_operator_from_left(piece, site, left_qns):
+            left_qns = tuple(left_qns)
+            key = ("left", str(piece), int(site), left_qns)
+            cached = direct_family_contextual_site_operator_cache.get(key)
+            if cached is not None:
+                return cached
+            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+            mat = np.asarray(spatial_local_ops()[str(piece)], dtype=complex)
+            phys_items = tuple(sorted(site_qn_maps[int(site)].items()))
+            phys_qns = tuple(sorted({qn for _state, qn in phys_items}))
+            right_qns = set()
+            data = {}
+            for q_l in left_qns:
+                for out_s, q_out in phys_items:
+                    for in_s, q_in in phys_items:
+                        coeff = mat[int(out_s), int(in_s)]
+                        if abs(coeff) <= 1.0e-14:
+                            continue
+                        flux = q_out - q_in
+                        q_r = q_l - flux
+                        right_qns.add(q_r)
+                        data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                            [[[[coeff]]]],
+                            dtype=complex,
+                        )
+            if not data:
+                return None
+            op = BlockTensor(
+                data,
+                [list(left_qns), sorted(right_qns), list(phys_qns), list(phys_qns)],
+                [-1, 1, 1, -1],
+            )
+            direct_family_contextual_site_operator_cache[key] = op
+            return op
+
+        def _sym_site_operator_from_right(piece, site, right_qns):
+            right_qns = tuple(right_qns)
+            key = ("right", str(piece), int(site), right_qns)
+            cached = direct_family_contextual_site_operator_cache.get(key)
+            if cached is not None:
+                return cached
+            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+            mat = np.asarray(spatial_local_ops()[str(piece)], dtype=complex)
+            phys_items = tuple(sorted(site_qn_maps[int(site)].items()))
+            phys_qns = tuple(sorted({qn for _state, qn in phys_items}))
+            left_qns = set()
+            data = {}
+            for q_r in right_qns:
+                for out_s, q_out in phys_items:
+                    for in_s, q_in in phys_items:
+                        coeff = mat[int(out_s), int(in_s)]
+                        if abs(coeff) <= 1.0e-14:
+                            continue
+                        flux = q_out - q_in
+                        q_l = q_r + flux
+                        left_qns.add(q_l)
+                        data[(q_l, q_r, q_out, q_in)] = np.asarray(
+                            [[[[coeff]]]],
+                            dtype=complex,
+                        )
+            if not data:
+                return None
+            op = BlockTensor(
+                data,
+                [sorted(left_qns), list(right_qns), list(phys_qns), list(phys_qns)],
+                [-1, 1, 1, -1],
+            )
+            direct_family_contextual_site_operator_cache[key] = op
+            return op
+
+        def _left_env_and_local_operator(left_pattern, local_piece, family_name=None):
+            left_pattern = tuple(left_pattern)
+            table = _native_exact_pattern_boundary_table("left")
+            table_key = (left_pattern, str(local_piece))
+            if table is not None:
+                cached = table.get(table_key)
+                if cached is not None:
+                    return cached
+            key = (direct_family_env_revision[0], bond, left_pattern, str(local_piece))
+            cached = direct_family_contextual_left_env_cache.get(key)
+            if cached is not None:
+                if table is not None:
+                    table.put(table_key, cached, family_name=family_name)
+                return cached
+            if bond == 0:
+                W_local = _sym_site_operator_from_left(local_piece, bond, (zero_qn,))
+                if W_local is None:
+                    return None
+                result = (initial_E(W_local), W_local)
+                direct_family_contextual_left_env_cache[key] = result
+                if table is not None:
+                    table.put(table_key, result, family_name=family_name)
+                return result
+            W = _sym_site_operator_from_left(left_pattern[0], 0, (zero_qn,))
+            if W is None:
+                return None
+            env = initial_E(W)
+            env = contract_from_left(W, MPS[0], env, MPS[0])
+            for site, piece in enumerate(left_pattern[1:], start=1):
+                W = _sym_site_operator_from_left(piece, site, env.qns[0])
+                if W is None:
+                    return None
+                env = contract_from_left(W, MPS[site], env, MPS[site])
+            W_local = _sym_site_operator_from_left(local_piece, bond, env.qns[0])
+            if W_local is None:
+                return None
+            result = (env, W_local)
+            direct_family_contextual_left_env_cache[key] = result
+            if table is not None:
+                table.put(table_key, result, family_name=family_name)
+            return result
+
+        def _right_env_and_local_operator(right_pattern, local_piece, family_name=None):
+            right_pattern = tuple(right_pattern)
+            table = _native_exact_pattern_boundary_table("right")
+            table_key = (right_pattern, str(local_piece))
+            if table is not None:
+                cached = table.get(table_key)
+                if cached is not None:
+                    return cached
+            key = (direct_family_env_revision[0], bond, right_pattern, str(local_piece))
+            cached = direct_family_contextual_right_env_cache.get(key)
+            if cached is not None:
+                if table is not None:
+                    table.put(table_key, cached, family_name=family_name)
+                return cached
+            target = target_qn if target_qn is not None else 0
+            local_site = bond + 1
+            if not right_pattern:
+                W_local = _sym_site_operator_from_right(local_piece, local_site, (zero_qn,))
+                if W_local is None:
+                    return None
+                result = (W_local, initial_F(W_local, target_qn=target))
+                direct_family_contextual_right_env_cache[key] = result
+                if table is not None:
+                    table.put(table_key, result, family_name=family_name)
+                return result
+            last_site = L - 1
+            W = _sym_site_operator_from_right(right_pattern[-1], last_site, (zero_qn,))
+            if W is None:
+                return None
+            env = initial_F(W, target_qn=target)
+            env = contract_from_right(W, MPS[last_site], env, MPS[last_site])
+            suffix_start = bond + 2
+            for offset, piece in enumerate(reversed(right_pattern[:-1]), start=0):
+                site = last_site - offset - 1
+                if site < suffix_start:
+                    break
+                W = _sym_site_operator_from_right(piece, site, env.qns[0])
+                if W is None:
+                    return None
+                env = contract_from_right(W, MPS[site], env, MPS[site])
+            W_local = _sym_site_operator_from_right(local_piece, local_site, env.qns[0])
+            if W_local is None:
+                return None
+            result = (W_local, env)
+            direct_family_contextual_right_env_cache[key] = result
+            if table is not None:
+                table.put(table_key, result, family_name=family_name)
+            return result
 
         def _sym_mpo_for_pattern(pattern):
             cached = direct_family_sym_pattern_cache.get(pattern)
@@ -6069,23 +7583,1211 @@ def two_site_dmrg(
             direct_family_right_env_cache[key] = env
             return env
 
-        for family_name, terms in _direct_family_pattern_terms().items():
+        def _native_boundary_table(side):
+            if not complementary_operator_generator_entries:
+                return None
+            boundary_bond = bond if str(side) == "left" else bond + 1
+            table = _build_native_generator_boundary_table(side, boundary_bond)
+            if table is None or not getattr(table, "operators", None):
+                return None
+            return table
+
+        def _generator_support(p, q):
+            support = set()
+            for _symbol, dofs, _factor in _generator_expansion(p, q):
+                support.update(int(site) for site in dofs)
+            return frozenset(support)
+
+        def _is_local_generator(p, q):
+            support = _generator_support(p, q)
+            return bool(support) and support.issubset({bond, bond + 1})
+
+        def _local_generator_entries(p, q, coeff, E_term, F_term):
             entries = []
-            for pattern, coeff in terms:
-                try:
-                    sym_term_mpo = _sym_mpo_for_pattern(pattern)
-                    E_term = _left_env(pattern, sym_term_mpo)
-                    F_term = _right_env(pattern, sym_term_mpo)
-                except Exception:
-                    entries = None
-                    break
+            for symbol, dofs, factor in _generator_expansion(p, q):
+                pattern = {int(site): str(piece) for piece, site in zip(str(symbol).split(), dofs)}
+                if not set(pattern).issubset({bond, bond + 1}):
+                    return None
+                left_piece = pattern.get(bond, "I")
+                right_piece = pattern.get(bond + 1, "I")
+                W_left = _sym_site_operator_from_left(left_piece, bond, E_term.qns[0])
+                W_right = _sym_site_operator_from_right(
+                    right_piece,
+                    bond + 1,
+                    F_term.qns[0],
+                )
+                if W_left is None or W_right is None:
+                    return None
+                common = set(W_left.qns[1]).intersection(W_right.qns[0])
+                if not common:
+                    return None
+                common = tuple(sorted(common))
+                W_left_data = {
+                    key: value
+                    for key, value in W_left.data.items()
+                    if key[1] in common
+                }
+                W_right_data = {
+                    key: value
+                    for key, value in W_right.data.items()
+                    if key[0] in common
+                }
+                if not W_left_data or not W_right_data:
+                    return None
+                W_left = BlockTensor(
+                    W_left_data,
+                    [W_left.qns[0], list(common), W_left.qns[2], W_left.qns[3]],
+                    W_left.dirs[:],
+                )
+                W_right = BlockTensor(
+                    W_right_data,
+                    [list(common), W_right.qns[1], W_right.qns[2], W_right.qns[3]],
+                    W_right.dirs[:],
+                )
                 entries.append((
                     E_term,
-                    [sym_term_mpo[bond] * complex(coeff), sym_term_mpo[bond + 1]],
+                    [W_left * (complex(coeff) * complex(factor)), W_right],
+                    F_term,
+                ))
+            return tuple(entries)
+
+        def _identity_local_entries(coeff, E_term, F_term):
+            W_left = _sym_site_operator_from_left("I", bond, E_term.qns[0])
+            W_right = _sym_site_operator_from_right("I", bond + 1, F_term.qns[0])
+            if W_left is None or W_right is None:
+                return None
+            common = set(W_left.qns[1]).intersection(W_right.qns[0])
+            if not common:
+                return None
+            common = tuple(sorted(common))
+            W_left_data = {
+                key: value
+                for key, value in W_left.data.items()
+                if key[1] in common
+            }
+            W_right_data = {
+                key: value
+                for key, value in W_right.data.items()
+                if key[0] in common
+            }
+            if not W_left_data or not W_right_data:
+                return None
+            W_left = BlockTensor(
+                W_left_data,
+                [W_left.qns[0], list(common), W_left.qns[2], W_left.qns[3]],
+                W_left.dirs[:],
+            )
+            W_right = BlockTensor(
+                W_right_data,
+                [list(common), W_right.qns[1], W_right.qns[2], W_right.qns[3]],
+                W_right.dirs[:],
+            )
+            return ((E_term, [W_left * complex(coeff), W_right], F_term),)
+
+        def _local_proto():
+            try:
+                AA = tensordot(MPS[bond], MPS[bond + 1], axes=([1], [0]))
+                return AA.transpose(0, 2, 1, 3)
+            except Exception:
+                return None
+
+        def _sum_entry_action(candidate_entries, basis):
+            total = None
+            for E_term, W_pair, F_term in candidate_entries:
+                tensor = HamiltonianMultiplyU1._matvec_generic_components(
+                    E_term,
+                    W_pair,
+                    F_term,
+                    basis,
+                )
+                total = tensor if total is None else total + tensor
+            return total
+
+        def _native_entries_apply_clean(candidate_entries):
+            proto = _local_proto()
+            if proto is None or not candidate_entries:
+                return False
+            layout_map = {
+                key: shape
+                for key, shape in HamiltonianMultiplyU1._layout(proto)
+            }
+            for _iter in range(4):
+                changed = False
+                layout = tuple((key, layout_map[key]) for key in sorted(layout_map))
+                for key, shape in layout:
+                    data = {key: np.zeros(shape, dtype=complex)}
+                    if data[key].size:
+                        data[key].reshape(-1)[0] = 1.0
+                    basis = BlockTensor(
+                        data,
+                        HamiltonianMultiplyU1._qns_from_layout(((key, shape),)),
+                        proto.dirs[:],
+                    )
+                    try:
+                        native = _sum_entry_action(candidate_entries, basis)
+                    except Exception:
+                        return False
+                    if native is None:
+                        return False
+                    for out_key, block in native.data.items():
+                        old_shape = layout_map.get(out_key)
+                        if old_shape is None:
+                            layout_map[out_key] = block.shape
+                            changed = True
+                        elif old_shape != block.shape:
+                            return False
+                if not changed:
+                    return True
+            return False
+
+        def _native_entries_probe_reference(
+            candidate_entries,
+            reference_entries,
+            max_vectors=4,
+        ):
+            proto = _local_proto()
+            if proto is None or not candidate_entries or not reference_entries:
+                return False
+            layout = tuple(HamiltonianMultiplyU1._layout(proto))
+            if not layout:
+                return False
+            qns = HamiltonianMultiplyU1._qns_from_layout(layout)
+            checked = 0
+            for key, shape in layout:
+                n = int(np.prod(shape, dtype=int))
+                for offset in range(n):
+                    data = {key: np.zeros(shape, dtype=complex)}
+                    data[key].reshape(-1)[offset] = 1.0
+                    basis = BlockTensor(data, qns, proto.dirs[:])
+                    try:
+                        native = _sum_entry_action(candidate_entries, basis)
+                        reference = _sum_entry_action(reference_entries, basis)
+                    except Exception:
+                        return False
+                    if native is None or reference is None:
+                        return False
+                    native_layout = {
+                        out_key: block.shape
+                        for out_key, block in native.data.items()
+                    }
+                    reference_layout = {
+                        out_key: block.shape
+                        for out_key, block in reference.data.items()
+                    }
+                    if native_layout != reference_layout:
+                        return False
+                    diff = native - reference
+                    ref_norm = max(float(reference.norm()), 1.0e-30)
+                    if float(diff.norm()) > 1.0e-10 * ref_norm + 1.0e-12:
+                        return False
+                    checked += 1
+                    if checked >= int(max_vectors):
+                        return True
+            return checked > 0
+
+        def _native_entries_match_reference(candidate_entries, reference_entries):
+            proto = _local_proto()
+            if proto is None or not candidate_entries or not reference_entries:
+                return False
+            layout_map = {
+                key: shape
+                for key, shape in HamiltonianMultiplyU1._layout(proto)
+            }
+            for _iter in range(4):
+                changed = False
+                layout = tuple((key, layout_map[key]) for key in sorted(layout_map))
+                for key, shape in layout:
+                    data = {key: np.zeros(shape, dtype=complex)}
+                    if data[key].size:
+                        data[key].reshape(-1)[0] = 1.0
+                    basis = BlockTensor(
+                        data,
+                        HamiltonianMultiplyU1._qns_from_layout(((key, shape),)),
+                        proto.dirs[:],
+                    )
+                    try:
+                        native = _sum_entry_action(candidate_entries, basis)
+                        reference = _sum_entry_action(reference_entries, basis)
+                    except Exception:
+                        return False
+                    if native is None or reference is None:
+                        return False
+                    native_layout = {
+                        out_key: block.shape
+                        for out_key, block in native.data.items()
+                    }
+                    reference_layout = {
+                        out_key: block.shape
+                        for out_key, block in reference.data.items()
+                    }
+                    if native_layout != reference_layout:
+                        return False
+                    diff = native - reference
+                    ref_norm = max(float(reference.norm()), 1.0e-30)
+                    if float(diff.norm()) > 1.0e-10 * ref_norm + 1.0e-12:
+                        return False
+                    for out_key, out_shape in reference_layout.items():
+                        old_shape = layout_map.get(out_key)
+                        if old_shape is None:
+                            layout_map[out_key] = out_shape
+                            changed = True
+                        elif old_shape != out_shape:
+                            return False
+                if not changed:
+                    return True
+            return False
+
+        def _expanded_r_entries_for_key(raw_key, coeff):
+            p, q = (int(index) for index in raw_key)
+            expanded = []
+            for symbol, dofs, factor in _generator_expansion(p, q):
+                per_site = ["I"] * L
+                for piece, site in zip(str(symbol).split(), dofs):
+                    per_site[int(site)] = str(piece)
+                pattern = tuple(per_site)
+                left_result = _left_env_and_local_operator(
+                    pattern[:bond],
+                    pattern[bond],
+                    family_name="R",
+                )
+                right_result = _right_env_and_local_operator(
+                    pattern[bond + 2:],
+                    pattern[bond + 1],
+                    family_name="R",
+                )
+                if left_result is None or right_result is None:
+                    return None
+                E_term, W_left = left_result
+                W_right, F_term = right_result
+                expanded.append((
+                    E_term,
+                    [W_left * (complex(coeff) * complex(factor)), W_right],
+                    F_term,
+                ))
+            return tuple(expanded)
+
+        def _native_boundary_r_entries():
+            if not bool(
+                getattr(
+                    complementary_operator_families,
+                    "enable_native_boundary_r",
+                    False,
+                )
+            ):
+                direct_family_builder_stats["native_boundary_r"] = {
+                    "enabled": False,
+                    "reason": "exact validation required before default use",
+                }
+                return (), set()
+            left_table = _native_boundary_table("left")
+            right_table = _native_boundary_table("right")
+            if left_table is None and right_table is None:
+                return (), set()
+            entries = []
+            consumed = set()
+            rejected = 0
+            left_identity_pattern = tuple("I" for _ in range(bond))
+            right_identity_pattern = tuple("I" for _ in range(max(0, L - bond - 2)))
+            r_entries = complementary_operator_generator_entries.get("R", {})
+            active_sites = {bond, bond + 1}
+            validate = bool(
+                getattr(
+                    complementary_operator_families,
+                    "validate_native_boundary_r",
+                    True,
+                )
+            )
+
+            for key, coeff in r_entries.items():
+                p, q = (int(index) for index in key)
+                raw_key = (p, q)
+                coeff = complex(coeff)
+                if abs(coeff) <= 1.0e-14:
+                    continue
+                support = _generator_support(p, q)
+                built = None
+                if support and support.issubset(set(range(bond))):
+                    right_result = _right_env_and_local_operator(
+                        right_identity_pattern,
+                        "I",
+                        family_name="R",
+                    )
+                    if (
+                        left_table is not None
+                        and raw_key in left_table.operators
+                        and right_result is not None
+                    ):
+                        _W_identity, F_identity = right_result
+                        built = _identity_local_entries(
+                            coeff,
+                            left_table.operators[raw_key],
+                            F_identity,
+                        )
+                elif support and support.issubset(set(range(bond + 2, L))):
+                    left_result = _left_env_and_local_operator(
+                        left_identity_pattern,
+                        "I",
+                        family_name="R",
+                    )
+                    if (
+                        right_table is not None
+                        and raw_key in right_table.operators
+                        and left_result is not None
+                    ):
+                        E_identity, _W_identity = left_result
+                        built = _identity_local_entries(
+                            coeff,
+                            E_identity,
+                            right_table.operators[raw_key],
+                        )
+                elif support and support.issubset(active_sites):
+                    left_result = _left_env_and_local_operator(
+                        left_identity_pattern,
+                        "I",
+                        family_name="R",
+                    )
+                    right_result = _right_env_and_local_operator(
+                        right_identity_pattern,
+                        "I",
+                        family_name="R",
+                    )
+                    if left_result is not None and right_result is not None:
+                        E_identity, _W_left_identity = left_result
+                        _W_right_identity, F_identity = right_result
+                        built = _local_generator_entries(
+                            p,
+                            q,
+                            coeff,
+                            E_identity,
+                            F_identity,
+                        )
+                if built and not _native_entries_apply_clean(built):
+                    rejected += 1
+                elif built and not validate:
+                    entries.extend(built)
+                    consumed.add(raw_key)
+                elif built:
+                    reference = _expanded_r_entries_for_key(raw_key, coeff)
+                    if reference and _native_entries_match_reference(built, reference):
+                        entries.extend(built)
+                        consumed.add(raw_key)
+                    else:
+                        rejected += 1
+            stats = direct_family_builder_stats.setdefault(
+                "native_boundary_r",
+                {"enabled": True, "generator_terms": 0, "component_entries": 0},
+            )
+            stats["enabled"] = True
+            stats["validation_enabled"] = bool(validate)
+            stats["last_bond"] = int(bond)
+            stats["generator_terms"] = (
+                int(stats.get("generator_terms", 0)) + int(len(consumed))
+            )
+            stats["component_entries"] = (
+                int(stats.get("component_entries", 0)) + int(len(entries))
+            )
+            stats["rejected_candidates"] = (
+                int(stats.get("rejected_candidates", 0)) + int(rejected)
+            )
+            return tuple(entries), consumed
+
+        def _native_boundary_p_entries():
+            if not bool(
+                getattr(
+                    complementary_operator_families,
+                    "enable_native_boundary_p",
+                    False,
+                )
+            ):
+                direct_family_builder_stats["native_boundary_p"] = {
+                    "enabled": False,
+                    "reason": "native boundary P disabled",
+                }
+                return (), set()
+            left_table = _native_boundary_table("left")
+            right_table = _native_boundary_table("right")
+            pair_table = _native_pair_boundary_table()
+            if pair_table is None or (left_table is None and right_table is None):
+                return (), set()
+            entries = []
+            consumed = set()
+            rejected = 0
+            left_identity_pattern = tuple("I" for _ in range(bond))
+            right_identity_pattern = tuple("I" for _ in range(max(0, L - bond - 2)))
+            p_entries = complementary_operator_generator_entries.get("P", {})
+            left_sites = set(range(bond))
+            right_sites = set(range(bond + 2, L))
+            validate = bool(
+                getattr(
+                    complementary_operator_families,
+                    "validate_native_boundary_p",
+                    True,
+                )
+            )
+            validation_policy = str(
+                getattr(
+                    complementary_operator_families,
+                    "native_boundary_p_validation_policy",
+                    "first_pass",
+                )
+                or "first_pass"
+            ).lower().replace("-", "_")
+            if not validate:
+                validation_policy = "off"
+            if validation_policy in {"false", "no", "none", "disabled"}:
+                validation_policy = "off"
+            if validation_policy in {"true", "yes", "on"}:
+                validation_policy = "first_pass"
+            if validation_policy not in {"off", "first_pass", "always"}:
+                validation_policy = "first_pass"
+
+            def _expanded_p_entries_for_key(raw_key, coeff):
+                p, q, r, s = (int(index) for index in raw_key)
+                expanded = []
+                for symbol, dofs, factor in _two_generator_expansion(p, q, r, s):
+                    per_site = ["I"] * L
+                    for piece, site in zip(str(symbol).split(), dofs):
+                        per_site[int(site)] = str(piece)
+                    pattern = tuple(per_site)
+                    left_result = _left_env_and_local_operator(
+                        pattern[:bond],
+                        pattern[bond],
+                        family_name="P",
+                    )
+                    right_result = _right_env_and_local_operator(
+                        pattern[bond + 2:],
+                        pattern[bond + 1],
+                        family_name="P",
+                    )
+                    if left_result is None or right_result is None:
+                        return None
+                    E_term, W_left = left_result
+                    W_right, F_term = right_result
+                    expanded.append((
+                        E_term,
+                        [W_left * (complex(coeff) * complex(factor)), W_right],
+                        F_term,
+                    ))
+                return tuple(expanded)
+
+            def _native_entries_valid(raw_key, coeff, candidate_entries):
+                if not _native_entries_apply_clean(candidate_entries):
+                    return False
+                validation_key = (
+                    int(bond),
+                    tuple(int(index) for index in raw_key),
+                    int(len(candidate_entries)),
+                )
+                if validation_policy == "off":
+                    return True
+                if (
+                    validation_policy == "first_pass"
+                    and native_boundary_p_validation_cache.get(validation_key) is True
+                ):
+                    stats = direct_family_builder_stats.setdefault(
+                        "native_boundary_p",
+                        {
+                            "enabled": True,
+                            "generator_terms": 0,
+                            "component_entries": 0,
+                        },
+                    )
+                    stats["cached_center_validations"] = (
+                        int(stats.get("cached_center_validations", 0)) + 1
+                    )
+                    return True
+                reference_entries = _expanded_p_entries_for_key(raw_key, coeff)
+                matched = _native_entries_match_reference(
+                    candidate_entries,
+                    reference_entries,
+                )
+                if matched:
+                    native_boundary_p_validation_cache[validation_key] = True
+                return matched
+
+            def _id_left_env():
+                result = _left_env_and_local_operator(left_identity_pattern, "I")
+                if result is None:
+                    return None
+                E_id, _W_id = result
+                return E_id
+
+            def _id_right_env():
+                result = _right_env_and_local_operator(right_identity_pattern, "I")
+                if result is None:
+                    return None
+                _W_id, F_id = result
+                return F_id
+
+            def _own(support):
+                support = set(support)
+                if support and support.issubset(left_sites):
+                    return "left"
+                if support and support.issubset(right_sites):
+                    return "right"
+                if support and support.issubset({bond, bond + 1}):
+                    return "local"
+                return None
+
+            def _boundary_operator(side, pair):
+                table = left_table if str(side) == "left" else right_table
+                if table is None:
+                    return None
+                return getattr(table, "operators", {}).get(tuple(pair))
+
+            def _merge_boundary_terms(weighted_terms):
+                weighted_terms = tuple(weighted_terms or ())
+                if not weighted_terms:
+                    return None
+                first = weighted_terms[0][0]
+                dirs = getattr(first, "dirs", None)
+                if dirs is None:
+                    return None
+                rank = int(len(dirs))
+                data = {}
+                qn_sets = [set() for _ in range(rank)]
+                for tensor, factor in weighted_terms:
+                    if getattr(tensor, "dirs", None) != dirs:
+                        return None
+                    for key, block in getattr(tensor, "data", {}).items():
+                        if len(key) != rank:
+                            return None
+                        for axis, qn in enumerate(key):
+                            qn_sets[axis].add(qn)
+                        scaled = np.asarray(block) * complex(factor)
+                        if key in data:
+                            if data[key].shape != scaled.shape:
+                                return None
+                            data[key] = data[key] + scaled
+                        else:
+                            data[key] = scaled.copy()
+                if not data:
+                    return None
+                qns = [sorted(items) for items in qn_sets]
+                return BlockTensor(data, qns, list(dirs))
+
+            def _boundary_operator_close(left, right):
+                if left is None or right is None:
+                    return False
+                if getattr(left, "dirs", None) != getattr(right, "dirs", None):
+                    return False
+                left_data = getattr(left, "data", {})
+                right_data = getattr(right, "data", {})
+                if set(left_data) != set(right_data):
+                    return False
+                for key in left_data:
+                    lhs = np.asarray(left_data[key])
+                    rhs = np.asarray(right_data[key])
+                    if lhs.shape != rhs.shape:
+                        return False
+                    scale = max(float(np.linalg.norm(rhs.reshape(-1))), 1.0e-30)
+                    if float(np.linalg.norm((lhs - rhs).reshape(-1))) > (
+                        1.0e-10 * scale + 1.0e-12
+                    ):
+                        return False
+                return True
+
+            def _boundary_operator_mismatch_summary(left, right):
+                if left is None or right is None:
+                    return {"reason": "missing"}
+                left_data = getattr(left, "data", {})
+                right_data = getattr(right, "data", {})
+                left_keys = set(left_data)
+                right_keys = set(right_data)
+                common = left_keys.intersection(right_keys)
+                diff_norm = 0.0
+                ref_norm = 0.0
+                for key in common:
+                    lhs = np.asarray(left_data[key])
+                    rhs = np.asarray(right_data[key])
+                    if lhs.shape == rhs.shape:
+                        diff_norm += float(np.linalg.norm((lhs - rhs).reshape(-1))) ** 2
+                        ref_norm += float(np.linalg.norm(rhs.reshape(-1))) ** 2
+                return {
+                    "left_blocks": int(len(left_keys)),
+                    "right_blocks": int(len(right_keys)),
+                    "common_blocks": int(len(common)),
+                    "missing_from_left": int(len(right_keys - left_keys)),
+                    "extra_on_left": int(len(left_keys - right_keys)),
+                    "diff_norm": float(diff_norm ** 0.5),
+                    "ref_norm": float(ref_norm ** 0.5),
+                    "left_dirs": tuple(getattr(left, "dirs", ())),
+                    "right_dirs": tuple(getattr(right, "dirs", ())),
+                }
+
+            def _contextual_same_side_pair_operator(side, p, q, r, s):
+                weighted = []
+                for symbol, dofs, factor in _two_generator_expansion(p, q, r, s):
+                    per_site = ["I"] * L
+                    for piece, site in zip(str(symbol).split(), dofs):
+                        per_site[int(site)] = str(piece)
+                    pattern = tuple(per_site)
+                    if str(side) == "left":
+                        if pattern[bond] != "I" or any(
+                            piece != "I" for piece in pattern[bond + 1:]
+                        ):
+                            return None
+                        result = _left_env_and_local_operator(
+                            pattern[:bond],
+                            "I",
+                            family_name="P",
+                        )
+                        if result is None:
+                            return None
+                        tensor, _W_id = result
+                    else:
+                        if pattern[bond + 1] != "I" or any(
+                            piece != "I" for piece in pattern[: bond + 1]
+                        ):
+                            return None
+                        result = _right_env_and_local_operator(
+                            pattern[bond + 2:],
+                            "I",
+                            family_name="P",
+                        )
+                        if result is None:
+                            return None
+                        _W_id, tensor = result
+                    weighted.append((tensor, factor))
+                return _merge_boundary_terms(weighted)
+
+            def _same_side_pair_operator(side, p, q, r, s, *, use_native=True):
+                contextual = None
+                if use_native:
+                    boundary_bond = bond if str(side) == "left" else bond + 1
+                    equivalence_key = (
+                        str(side),
+                        int(boundary_bond),
+                        (int(p), int(q), int(r), int(s)),
+                    )
+                    table = _build_native_pair_operator_boundary_table(
+                        str(side),
+                        int(boundary_bond),
+                    )
+                    if table is not None:
+                        operator = table.get_operator((int(p), int(q), int(r), int(s)))
+                        if operator is not None:
+                            if validation_policy == "off":
+                                return operator
+                            cached = native_pair_operator_equivalence_cache.get(
+                                equivalence_key
+                            )
+                            if cached is True and validation_policy != "always":
+                                native_stats = direct_family_builder_stats.setdefault(
+                                    "native_boundary_p",
+                                    {
+                                        "enabled": True,
+                                        "generator_terms": 0,
+                                        "component_entries": 0,
+                                    },
+                                )
+                                native_stats["cached_boundary_operator_equivalences"] = (
+                                    int(
+                                        native_stats.get(
+                                            "cached_boundary_operator_equivalences",
+                                            0,
+                                        )
+                                    )
+                                    + 1
+                                )
+                                return operator
+                            if cached is False and validation_policy != "always":
+                                contextual = _contextual_same_side_pair_operator(
+                                    side,
+                                    p,
+                                    q,
+                                    r,
+                                    s,
+                                )
+                                return contextual
+                            contextual = _contextual_same_side_pair_operator(
+                                side,
+                                p,
+                                q,
+                                r,
+                                s,
+                            )
+                            if _boundary_operator_close(operator, contextual):
+                                native_pair_operator_equivalence_cache[
+                                    equivalence_key
+                                ] = True
+                                return operator
+                            native_pair_operator_equivalence_cache[
+                                equivalence_key
+                            ] = False
+                            native_stats = direct_family_builder_stats.setdefault(
+                                "native_boundary_p",
+                                {
+                                    "enabled": True,
+                                    "generator_terms": 0,
+                                    "component_entries": 0,
+                                },
+                            )
+                            native_stats["native_pair_operator_mismatches"] = (
+                                int(native_stats.get("native_pair_operator_mismatches", 0))
+                                + 1
+                            )
+                            samples = list(
+                                native_stats.get(
+                                    "native_pair_operator_mismatch_samples",
+                                    (),
+                                )
+                            )
+                            if len(samples) < 8:
+                                samples.append(
+                                    (
+                                        str(side),
+                                        int(boundary_bond),
+                                        (int(p), int(q), int(r), int(s)),
+                                    )
+                                )
+                                native_stats[
+                                    "native_pair_operator_mismatch_samples"
+                                ] = tuple(samples)
+                            if "native_pair_operator_first_mismatch" not in native_stats:
+                                native_stats[
+                                    "native_pair_operator_first_mismatch"
+                                ] = _boundary_operator_mismatch_summary(
+                                    operator,
+                                    contextual,
+                                )
+                if contextual is not None:
+                    return contextual
+                return _contextual_same_side_pair_operator(side, p, q, r, s)
+
+            def _build_pair(p, q, r, s, coeff, *, use_native_pair=True):
+                pair_l = (int(p), int(q))
+                pair_r = (int(r), int(s))
+                own_l = _own(_generator_support(*pair_l))
+                own_r = _own(_generator_support(*pair_r))
+                if own_l == "left" and own_r == "left":
+                    E_op = _same_side_pair_operator(
+                        "left",
+                        p,
+                        q,
+                        r,
+                        s,
+                        use_native=use_native_pair,
+                    )
+                    F_id = _id_right_env()
+                    if E_op is not None and F_id is not None:
+                        return _identity_local_entries(coeff, E_op, F_id)
+                if own_l == "right" and own_r == "right":
+                    E_id = _id_left_env()
+                    F_op = _same_side_pair_operator(
+                        "right",
+                        p,
+                        q,
+                        r,
+                        s,
+                        use_native=use_native_pair,
+                    )
+                    if E_id is not None and F_op is not None:
+                        return _identity_local_entries(coeff, E_id, F_op)
+                if own_l == "left" and own_r == "right":
+                    E_op = _boundary_operator("left", pair_l)
+                    F_op = _boundary_operator("right", pair_r)
+                    if E_op is not None and F_op is not None:
+                        return _identity_local_entries(coeff, E_op, F_op)
+                if own_l == "right" and own_r == "left":
+                    E_op = _boundary_operator("left", pair_r)
+                    F_op = _boundary_operator("right", pair_l)
+                    if E_op is not None and F_op is not None:
+                        return _identity_local_entries(coeff, E_op, F_op)
+                if own_l == "left" and own_r == "local":
+                    E_op = _boundary_operator("left", pair_l)
+                    F_id = _id_right_env()
+                    if E_op is not None and F_id is not None:
+                        return _local_generator_entries(r, s, coeff, E_op, F_id)
+                if own_r == "left" and own_l == "local":
+                    E_op = _boundary_operator("left", pair_r)
+                    F_id = _id_right_env()
+                    if E_op is not None and F_id is not None:
+                        return _local_generator_entries(p, q, coeff, E_op, F_id)
+                if own_l == "right" and own_r == "local":
+                    E_id = _id_left_env()
+                    F_op = _boundary_operator("right", pair_l)
+                    if E_id is not None and F_op is not None:
+                        return _local_generator_entries(r, s, coeff, E_id, F_op)
+                if own_r == "right" and own_l == "local":
+                    E_id = _id_left_env()
+                    F_op = _boundary_operator("right", pair_r)
+                    if E_id is not None and F_op is not None:
+                        return _local_generator_entries(p, q, coeff, E_id, F_op)
+                return None
+
+            for key, coeff in p_entries.items():
+                p, q, r, s = (int(index) for index in key)
+                raw_key = (p, q, r, s)
+                coeff = complex(coeff)
+                if abs(coeff) <= 1.0e-14:
+                    continue
+                built = _build_pair(p, q, r, s, coeff)
+                if built and _native_entries_valid(raw_key, coeff, built):
+                    pair_table.add(raw_key, built)
+                    entries.extend(built)
+                    consumed.add(raw_key)
+                elif built:
+                    fallback = _build_pair(
+                        p,
+                        q,
+                        r,
+                        s,
+                        coeff,
+                        use_native_pair=False,
+                    )
+                    if fallback and _native_entries_valid(raw_key, coeff, fallback):
+                        pair_table.add(raw_key, fallback)
+                        entries.extend(fallback)
+                        consumed.add(raw_key)
+                        native_stats = direct_family_builder_stats.setdefault(
+                            "native_boundary_p",
+                            {
+                                "enabled": True,
+                                "generator_terms": 0,
+                                "component_entries": 0,
+                            },
+                        )
+                        native_stats["contextual_same_side_fallbacks"] = (
+                            int(native_stats.get("contextual_same_side_fallbacks", 0))
+                            + 1
+                        )
+                    else:
+                        pair_table.reject()
+                        rejected += 1
+            native_stats = direct_family_builder_stats.setdefault(
+                "native_boundary_p",
+                {
+                    "enabled": True,
+                    "generator_terms": 0,
+                    "component_entries": 0,
+                },
+            )
+            native_stats["enabled"] = True
+            native_stats["validation_enabled"] = bool(validate)
+            native_stats["validation_policy"] = str(validation_policy)
+            native_stats["last_bond"] = int(bond)
+            native_stats["generator_terms"] = (
+                int(native_stats.get("generator_terms", 0)) + int(len(consumed))
+            )
+            native_stats["component_entries"] = (
+                int(native_stats.get("component_entries", 0)) + int(len(entries))
+            )
+            native_stats["rejected_candidates"] = (
+                int(native_stats.get("rejected_candidates", 0)) + int(rejected)
+            )
+            native_stats["table_terms"] = int(pair_table.n_terms)
+            native_stats["table_entries"] = int(pair_table.n_entries)
+            return tuple(entries), consumed
+
+        native_r_entries, native_consumed_r_keys = _native_boundary_r_entries()
+        if native_r_entries:
+            out["R"] = tuple(native_r_entries)
+
+        native_p_entries, native_consumed_p_keys = _native_boundary_p_entries()
+        if native_p_entries:
+            out["P"] = tuple(native_p_entries)
+
+        component_table = _native_exact_pattern_component_table()
+        for family_name, terms in _direct_family_pattern_terms(
+            skip_p_keys=native_consumed_p_keys,
+            skip_r_keys=native_consumed_r_keys,
+        ).items():
+            if component_table is not None:
+                stored_entries = component_table.get_family(family_name)
+                if stored_entries is not None:
+                    if stored_entries:
+                        old = out.get(str(family_name))
+                        out[str(family_name)] = (
+                            stored_entries
+                            if old is None
+                            else tuple(old) + tuple(stored_entries)
+                        )
+                    continue
+                records = component_table.get_family_records(family_name)
+                if records is None:
+                    records = component_table.put_family_records(
+                        family_name,
+                        tuple(
+                            (
+                                tuple(pattern[:bond]),
+                                str(pattern[bond]),
+                                str(pattern[bond + 1]),
+                                tuple(pattern[bond + 2:]),
+                                complex(coeff),
+                            )
+                            for pattern, coeff in terms
+                        ),
+                    )
+            else:
+                records = tuple(
+                    (
+                        tuple(pattern[:bond]),
+                        str(pattern[bond]),
+                        str(pattern[bond + 1]),
+                        tuple(pattern[bond + 2:]),
+                        complex(coeff),
+                    )
+                    for pattern, coeff in terms
+                )
+            entries = []
+            for left_pattern, left_piece, right_piece, right_pattern, coeff in records:
+                pattern = (
+                    tuple(left_pattern)
+                    + (str(left_piece), str(right_piece))
+                    + tuple(right_pattern)
+                )
+                try:
+                    left_result = _left_env_and_local_operator(
+                        left_pattern,
+                        left_piece,
+                        family_name=family_name,
+                    )
+                    right_result = _right_env_and_local_operator(
+                        right_pattern,
+                        right_piece,
+                        family_name=family_name,
+                    )
+                    if left_result is None or right_result is None:
+                        raise ValueError("empty contextual operator")
+                    E_term, W_left = left_result
+                    W_right, F_term = right_result
+                    direct_family_builder_stats["contextual_recursive_terms"] = (
+                        int(
+                            direct_family_builder_stats.get(
+                                "contextual_recursive_terms",
+                                0,
+                            )
+                        )
+                        + 1
+                    )
+                except Exception:
+                    try:
+                        sym_term_mpo = _sym_mpo_for_pattern(pattern)
+                        E_term = _left_env(pattern, sym_term_mpo)
+                        F_term = _right_env(pattern, sym_term_mpo)
+                        W_left = sym_term_mpo[bond]
+                        W_right = sym_term_mpo[bond + 1]
+                        direct_family_builder_stats["fallback_full_pattern_terms"] = (
+                            int(
+                                direct_family_builder_stats.get(
+                                    "fallback_full_pattern_terms",
+                                    0,
+                                )
+                            )
+                            + 1
+                        )
+                    except Exception:
+                        direct_family_builder_stats["failed_terms"] = (
+                            int(direct_family_builder_stats.get("failed_terms", 0))
+                            + 1
+                        )
+                        entries = None
+                        break
+                entries.append((
+                    E_term,
+                    [W_left * complex(coeff), W_right],
                     F_term,
                 ))
             if entries:
-                out[str(family_name)] = tuple(entries)
+                if component_table is not None:
+                    original_entries = tuple(entries)
+                    policy = getattr(
+                        complementary_operator_families,
+                        "exact_component_compression_policy",
+                        "auto",
+                    )
+                    validate_compressed = bool(
+                        getattr(
+                            complementary_operator_families,
+                            "exact_component_compression_validate",
+                            True,
+                        )
+                    )
+                    max_group_size = int(
+                        getattr(
+                            complementary_operator_families,
+                            "exact_component_compression_max_group_size",
+                            64,
+                        )
+                    )
+                    entries = component_table.put_family(
+                        family_name,
+                        original_entries,
+                        records=records,
+                        compression_policy=policy,
+                        min_reduction=int(
+                            getattr(
+                                complementary_operator_families,
+                                "exact_component_compression_min_reduction",
+                                1,
+                            )
+                        ),
+                        max_group_size=None if max_group_size <= 0 else max_group_size,
+                    )
+                    if (
+                        validate_compressed
+                        and len(entries) < len(original_entries)
+                        and not _native_entries_probe_reference(
+                            tuple(entries),
+                            original_entries,
+                            max_vectors=int(
+                                getattr(
+                                    complementary_operator_families,
+                                    "exact_component_compression_validation_vectors",
+                                    1,
+                                )
+                            ),
+                        )
+                    ):
+                        entries = component_table.put_family(
+                            family_name,
+                            original_entries,
+                            records=records,
+                            compression_policy="none",
+                        )
+                        validation_stats = direct_family_builder_stats.setdefault(
+                            "native_exact_component_compression_validation",
+                            {"rejected": 0},
+                        )
+                        validation_stats["rejected"] = (
+                            int(validation_stats.get("rejected", 0)) + 1
+                        )
+                        validation_stats["last_family"] = str(family_name)
+                        validation_stats["last_bond"] = int(bond)
+                    elif validate_compressed and len(entries) < len(original_entries):
+                        validation_stats = direct_family_builder_stats.setdefault(
+                            "native_exact_component_compression_validation",
+                            {"accepted": 0},
+                        )
+                        validation_stats["accepted"] = (
+                            int(validation_stats.get("accepted", 0)) + 1
+                        )
+                        validation_stats["last_family"] = str(family_name)
+                        validation_stats["last_bond"] = int(bond)
+                old = out.get(str(family_name))
+                out[str(family_name)] = (
+                    entries
+                    if old is None
+                    else tuple(old) + tuple(entries)
+                )
+            elif entries == [] and component_table is not None:
+                component_table.put_family(family_name, ())
+        elapsed = time.perf_counter() - t_env0
+        direct_family_builder_stats["build_calls"] = (
+            int(direct_family_builder_stats.get("build_calls", 0)) + 1
+        )
+        direct_family_builder_stats["build_seconds"] = (
+            float(direct_family_builder_stats.get("build_seconds", 0.0))
+            + float(elapsed)
+        )
+        direct_family_builder_stats["last_build_seconds"] = float(elapsed)
+        direct_family_builder_stats["site_operator_cache_size"] = int(
+            len(direct_family_contextual_site_operator_cache)
+        )
+        direct_family_builder_stats["left_env_cache_size"] = int(
+            len(direct_family_contextual_left_env_cache)
+        )
+        direct_family_builder_stats["right_env_cache_size"] = int(
+            len(direct_family_contextual_right_env_cache)
+        )
+        exact_tables = tuple(native_exact_pattern_boundary_table_cache.values())
+        direct_family_builder_stats["native_exact_pattern_boundary_table_entries"] = {
+            "tables": int(len(exact_tables)),
+            "entries": int(
+                sum(int(getattr(table, "n_entries", 0)) for table in exact_tables)
+            ),
+            "stored_elements": int(
+                sum(int(getattr(table, "stored_elements", 0)) for table in exact_tables)
+            ),
+        }
+        pair_tables = tuple(native_pair_boundary_table_cache.values())
+        direct_family_builder_stats["native_pair_boundary_table_entries"] = {
+            "tables": int(len(pair_tables)),
+            "terms": int(
+                sum(int(getattr(table, "n_terms", 0)) for table in pair_tables)
+            ),
+            "entries": int(
+                sum(int(getattr(table, "n_entries", 0)) for table in pair_tables)
+            ),
+            "stored_elements": int(
+                sum(
+                    int(getattr(table, "stored_elements", 0))
+                    for table in pair_tables
+                )
+            ),
+            "rejected_terms": int(
+                sum(
+                    int(getattr(table, "rejected_terms", 0))
+                    for table in pair_tables
+                )
+            ),
+        }
+        pair_operator_tables = tuple(
+            native_pair_operator_boundary_table_cache.values()
+        )
+        direct_family_builder_stats["native_pair_operator_boundary_table_entries"] = {
+            "tables": int(len(pair_operator_tables)),
+            "operators": int(
+                sum(
+                    int(getattr(table, "n_operators", 0))
+                    for table in pair_operator_tables
+                )
+            ),
+            "stored_elements": int(
+                sum(
+                    int(getattr(table, "stored_elements", 0))
+                    for table in pair_operator_tables
+                )
+            ),
+        }
+        component_tables = tuple(native_exact_pattern_component_table_cache.values())
+        direct_family_builder_stats["native_exact_pattern_component_table_entries"] = {
+            "tables": int(len(component_tables)),
+            "families": int(
+                sum(int(getattr(table, "n_families", 0)) for table in component_tables)
+            ),
+            "groups": int(
+                sum(
+                    sum(
+                        int(getattr(entries, "n_groups", 0))
+                        for entries in getattr(table, "families", {}).values()
+                    )
+                    for table in component_tables
+                )
+            ),
+            "group_entries": int(
+                sum(
+                    sum(
+                        int(getattr(entries, "n_group_entries", len(entries)))
+                        for entries in getattr(table, "families", {}).values()
+                    )
+                    for table in component_tables
+                )
+            ),
+            "entry_reduction": int(
+                sum(
+                    int(getattr(table, "n_records", 0))
+                    - sum(
+                        int(len(entries))
+                        for entries in getattr(table, "families", {}).values()
+                    )
+                    for table in component_tables
+                )
+            ),
+            "records": int(
+                sum(int(getattr(table, "n_records", 0)) for table in component_tables)
+            ),
+            "entries": int(
+                sum(int(getattr(table, "n_entries", 0)) for table in component_tables)
+            ),
+            "stored_elements": int(
+                sum(
+                    int(getattr(table, "stored_elements", 0))
+                    for table in component_tables
+                )
+            ),
+        }
         return out or None
 
     if len(MPS) == 2:
@@ -6197,8 +8899,14 @@ def two_site_dmrg(
 
             E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
             for name, factors in complementary_operator_mpos.items():
+                t0 = time.perf_counter()
                 comp_family_E[name].append(
                     contract_from_left(factors[i], MPS[i], comp_family_E[name][-1], MPS[i])
+                )
+                _record_comp_family_timing(
+                    name,
+                    "update_left",
+                    time.perf_counter() - t0,
                 )
             F.pop()
             for stack in comp_family_F.values():
@@ -6253,6 +8961,7 @@ def two_site_dmrg(
                      .format(sweep*2+1, i, i+1, E_ground_state, states, trunc))
             F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
             for name, factors in complementary_operator_mpos.items():
+                t0 = time.perf_counter()
                 comp_family_F[name].append(
                     contract_from_right(
                         factors[i + 1],
@@ -6260,6 +8969,11 @@ def two_site_dmrg(
                         comp_family_F[name][-1],
                         MPS[i + 1],
                     )
+                )
+                _record_comp_family_timing(
+                    name,
+                    "update_right",
+                    time.perf_counter() - t0,
                 )
             E.pop()
             for stack in comp_family_E.values():
@@ -6320,6 +9034,7 @@ def two_site_dmrg(
             if i > center_i: # Don't shift environments on the final stop
                 F.append(contract_from_right(MPO[i+1], MPS[i+1], F[-1], MPS[i+1]))
                 for name, factors in complementary_operator_mpos.items():
+                    t0 = time.perf_counter()
                     comp_family_F[name].append(
                         contract_from_right(
                             factors[i + 1],
@@ -6327,6 +9042,11 @@ def two_site_dmrg(
                             comp_family_F[name][-1],
                             MPS[i + 1],
                         )
+                    )
+                    _record_comp_family_timing(
+                        name,
+                        "update_right",
+                        time.perf_counter() - t0,
                     )
                 E.pop()
                 for stack in comp_family_E.values():
@@ -6361,6 +9081,7 @@ def two_site_dmrg(
             if i < center_i: # Don't shift environments on the final stop
                 E.append(contract_from_left(MPO[i], MPS[i], E[-1], MPS[i]))
                 for name, factors in complementary_operator_mpos.items():
+                    t0 = time.perf_counter()
                     comp_family_E[name].append(
                         contract_from_left(
                             factors[i],
@@ -6368,6 +9089,11 @@ def two_site_dmrg(
                             comp_family_E[name][-1],
                             MPS[i],
                         )
+                    )
+                    _record_comp_family_timing(
+                        name,
+                        "update_left",
+                        time.perf_counter() - t0,
                     )
                 F.pop()
                 for stack in comp_family_F.values():

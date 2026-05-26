@@ -6,6 +6,14 @@ import math
 import numpy as np
 
 from pyqed.qchem.basis import E, R
+from pyqed.qchem.fourier import (
+    ao_pair_ft_matrix_s,
+    ao_pair_ft_matrices_compiled,
+    ao_pair_ft_matrices,
+    gaussian_pair_ft,
+    gaussian_pair_ft_batch,
+    gaussian_pair_ft_s,
+)
 
 
 def _require_s_gaussians(basis):
@@ -120,66 +128,6 @@ def inf_vacuum_1d_gv_weights(lattice_vectors, mesh):
     coeffs = np.stack((gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)), axis=1)
     gvecs = coeffs @ b
     return gvecs, weights
-
-
-def gaussian_pair_ft(a, b, gvec):
-    """
-    Fourier transform of a Cartesian Gaussian AO pair density.
-
-    Returns int chi_a(r) chi_b(r) exp(-i G.r) dr for contracted, normalized
-    Cartesian Gaussians from the builtin basis representation.
-    """
-    gvec = _validate_gvec(gvec)
-    a_origin = np.asarray(a.origin, dtype=float)
-    b_origin = np.asarray(b.origin, dtype=float)
-    g2 = float(np.dot(gvec, gvec))
-    l1, m1, n1 = tuple(int(x) for x in a.shell)
-    l2, m2, n2 = tuple(int(x) for x in b.shell)
-
-    value = 0.0j
-    for ia, wa in enumerate(a.prim_weights):
-        alpha = float(a.exps[ia])
-        for ib, wb in enumerate(b.prim_weights):
-            beta = float(b.exps[ib])
-            p = alpha + beta
-            center = (alpha * a_origin + beta * b_origin) / p
-            prefactor = wa * wb * (math.pi / p) ** 1.5
-            damping = math.exp(-g2 / (4.0 * p))
-            phase = np.exp(-1j * np.dot(gvec, center))
-            primitive = 0.0j
-            ab = a_origin - b_origin
-            for t in range(l1 + l2 + 1):
-                ex = E(l1, l2, t, float(ab[0]), alpha, beta)
-                gx = (-1j * gvec[0]) ** t
-                for u in range(m1 + m2 + 1):
-                    exy = ex * E(m1, m2, u, float(ab[1]), alpha, beta)
-                    gxy = gx * ((-1j * gvec[1]) ** u)
-                    for v in range(n1 + n2 + 1):
-                        primitive += (
-                            exy
-                            * E(n1, n2, v, float(ab[2]), alpha, beta)
-                            * gxy
-                            * ((-1j * gvec[2]) ** v)
-                        )
-            value += prefactor * damping * phase * primitive
-    return complex(value)
-
-
-def gaussian_pair_ft_s(a, b, gvec):
-    """Backward-compatible alias for Gaussian AO pair Fourier factors."""
-    return gaussian_pair_ft(a, b, gvec)
-
-
-def ao_pair_ft_matrix_s(basis, gvec):
-    """Return all AO pair Fourier factors for a builtin Cartesian AO basis."""
-    basis = tuple(basis)
-
-    nao = len(basis)
-    out = np.empty((nao, nao), dtype=np.complex128)
-    for p, bp in enumerate(basis):
-        for q, bq in enumerate(basis):
-            out[p, q] = gaussian_pair_ft_s(bp, bq, gvec)
-    return out
 
 
 def short_range_point_charge(a, b, center, eta):

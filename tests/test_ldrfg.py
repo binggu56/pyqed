@@ -144,3 +144,56 @@ def test_grad_overlap_from_derivative_couplings():
     expected = overlap[0, :, 1, :] @ d[0, 1]
     np.testing.assert_allclose(grad[0, 0, :, 1, :], expected)
     np.testing.assert_allclose(grad[0, 0, :, 0, :], 0.0)
+
+
+def test_abinitio_ldrfg_adapter_projects_nac_to_overlap_gradient():
+    _prefer_source_package()
+    from pyqed.namd import AbInitioLDRFGAdapter
+
+    ldr_grid = np.array([[-0.5], [0.5]])
+    fg_vectors = np.array([[0.0, 1.0]])
+    calls = []
+
+    def geometry(x, q):
+        return np.array([x[0], q[0]])
+
+    def scanner(coords):
+        calls.append(tuple(np.asarray(coords, dtype=float)))
+        x, y = coords
+        energies = np.array([x + y, 2.0 + x - y])
+        gradients = np.array([[1.0, 1.0], [1.0, -1.0]])
+        nac = np.zeros((2, 2, 2), dtype=float)
+        nac[0, 1, 1] = 0.25 + x
+        nac[1, 0, 1] = -(0.25 + x)
+        return energies, gradients, nac
+
+    overlap = np.zeros((2, 2, 2, 2), dtype=complex)
+    for m in range(2):
+        for n in range(2):
+            overlap[m, :, n, :] = np.eye(2)
+
+    adapter = AbInitioLDRFGAdapter(
+        ldr_grid,
+        scanner,
+        geometry,
+        fg_vectors,
+        overlap=overlap,
+        kinetic_x=np.eye(2),
+        masses_y=[3.0],
+    )
+
+    q = np.array([0.2])
+    np.testing.assert_allclose(adapter.energies(q), [[-0.3, 1.3], [0.7, 2.3]])
+    np.testing.assert_allclose(adapter.grad_energies(q), [[[1.0, -1.0], [1.0, -1.0]]])
+
+    d = adapter.derivative_couplings(q)
+    np.testing.assert_allclose(d[0, 0], [[0.0, -0.25], [0.25, 0.0]])
+    np.testing.assert_allclose(d[0, 1], [[0.0, 0.75], [-0.75, 0.0]])
+
+    grad = adapter.grad_overlap(q)
+    np.testing.assert_allclose(grad[0, 0, :, 1, :], d[0, 1] - d[0, 0])
+
+    solver = adapter.solver()
+    rhs = solver.rhs(np.array([[1.0, 0.0], [0.0, 0.0]]), q=q, p=[0.0])
+    np.testing.assert_allclose(rhs.q_dot, [0.0])
+    assert len(calls) == 2

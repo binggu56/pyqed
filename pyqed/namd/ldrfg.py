@@ -83,6 +83,174 @@ class LDRFGRHS:
     p_dot: np.ndarray
 
 
+class AbInitioLDRFGAdapter:
+    """Adapter from ab initio NAC scanners to :class:`LDRFG` callables.
+
+    ``scanner(coords)`` must return ``(energies, gradients, nac)`` with
+    ``gradients[state, cart]`` and ``nac[bra, ket, cart]``.  ``geometry`` maps
+    one LDR grid point and the current frozen-Gaussian coordinates to the
+    Cartesian coordinates consumed by the scanner.  ``fg_vectors`` projects
+    Cartesian gradients and NACs onto the frozen-Gaussian coordinates.
+    """
+
+    def __init__(
+        self,
+        ldr_grid: ArrayLike,
+        scanner,
+        geometry: Callable[[np.ndarray, np.ndarray], ArrayLike],
+        fg_vectors: ArrayLike | None,
+        overlap: QDependent | None = None,
+        *,
+        masses_y: ArrayLike | None = None,
+        kinetic_x: ArrayLike | None = None,
+        gamma: ArrayLike | None = None,
+        hbar: float = 1.0,
+        cache: bool = True,
+    ) -> None:
+        self.ldr_grid = np.asarray(ldr_grid, dtype=float)
+        if self.ldr_grid.ndim == 1:
+            self.ldr_grid = self.ldr_grid[:, None]
+        if self.ldr_grid.ndim != 2:
+            raise ValueError("ldr_grid must have shape (ngrid, nldr).")
+
+        if hasattr(scanner, "as_scanner"):
+            scanner = scanner.as_scanner()
+        if not callable(scanner):
+            raise TypeError("scanner must be callable or provide as_scanner().")
+        self.scanner = scanner
+        self.geometry = geometry
+        self.overlap = overlap
+        self.kinetic_x = None if kinetic_x is None else np.asarray(kinetic_x, dtype=complex)
+        self.masses_y = None if masses_y is None else np.asarray(masses_y, dtype=float)
+        self.gamma = gamma
+        self.hbar = float(hbar)
+        self.cache = bool(cache)
+        self._cache_key = None
+        self._cache_data = None
+
+        if fg_vectors is None:
+            self.fg_vectors = None
+            if self.masses_y is None:
+                raise ValueError("masses_y is required when fg_vectors is omitted.")
+            self.ny = int(self.masses_y.size)
+        else:
+            self.fg_vectors = np.asarray(fg_vectors, dtype=float)
+            if self.fg_vectors.ndim > 2:
+                self.fg_vectors = self.fg_vectors.reshape(self.fg_vectors.shape[0], -1)
+            if self.fg_vectors.ndim != 2:
+                raise ValueError("fg_vectors must have shape (ny, ncart) or (ny, natom, 3).")
+            self.ny = int(self.fg_vectors.shape[0])
+            if self.masses_y is not None and self.masses_y.shape != (self.ny,):
+                raise ValueError(f"masses_y shape {self.masses_y.shape} != {(self.ny,)}.")
+
+    @property
+    def ngrid(self) -> int:
+        return int(self.ldr_grid.shape[0])
+
+    def _key(self, q: np.ndarray) -> tuple[float, ...]:
+        return tuple(np.asarray(q, dtype=float).reshape(-1))
+
+    def _project_gradients(self, gradients: np.ndarray) -> np.ndarray:
+        gradients = np.asarray(gradients, dtype=float)
+        if self.fg_vectors is None:
+            if gradients.shape[-1] != self.ny:
+                raise ValueError(
+                    "scanner gradients must already be projected onto q when fg_vectors is omitted."
+                )
+            return gradients
+        flat = gradients.reshape(gradients.shape[0], -1)
+        if flat.shape[1] != self.fg_vectors.shape[1]:
+            raise ValueError(
+                f"scanner gradient coordinate size {flat.shape[1]} != fg vector size {self.fg_vectors.shape[1]}."
+            )
+        return np.einsum("ac,jc->ja", flat, self.fg_vectors, optimize=True)
+
+    def _project_nac(self, nac: np.ndarray) -> np.ndarray:
+        nac = np.asarray(nac, dtype=float)
+        if self.fg_vectors is None:
+            if nac.shape[-1] != self.ny:
+                raise ValueError("scanner NACs must already be projected onto q when fg_vectors is omitted.")
+            return np.moveaxis(nac, -1, 0)
+        flat = nac.reshape(nac.shape[0], nac.shape[1], -1)
+        if flat.shape[2] != self.fg_vectors.shape[1]:
+            raise ValueError(
+                f"scanner NAC coordinate size {flat.shape[2]} != fg vector size {self.fg_vectors.shape[1]}."
+            )
+        return np.einsum("bac,jc->jba", flat, self.fg_vectors, optimize=True)
+
+    def local_data(self, q: ArrayLike) -> dict[str, np.ndarray]:
+        q = np.asarray(q, dtype=float)
+        if q.shape != (self.ny,):
+            raise ValueError(f"q shape {q.shape} != {(self.ny,)}.")
+        key = self._key(q)
+        if self.cache and self._cache_key == key and self._cache_data is not None:
+            return self._cache_data
+
+        energies = []
+        grad_energies = []
+        derivative_couplings = []
+        for grid_point in self.ldr_grid:
+            coords = np.asarray(self.geometry(grid_point, q), dtype=float)
+            e, grad, nac = self.scanner(coords)
+            energies.append(np.asarray(e, dtype=float))
+            grad_energies.append(self._project_gradients(np.asarray(grad, dtype=float)))
+            derivative_couplings.append(self._project_nac(np.asarray(nac, dtype=float)))
+
+        data = {
+            "energies": np.asarray(energies, dtype=float),
+            "grad_energies": np.moveaxis(np.asarray(grad_energies, dtype=float), 0, 1),
+            "derivative_couplings": np.moveaxis(np.asarray(derivative_couplings, dtype=float), 0, 1),
+        }
+        if self.cache:
+            self._cache_key = key
+            self._cache_data = data
+        return data
+
+    def energies(self, q: ArrayLike) -> np.ndarray:
+        return self.local_data(q)["energies"]
+
+    def grad_energies(self, q: ArrayLike) -> np.ndarray:
+        return self.local_data(q)["grad_energies"]
+
+    def derivative_couplings(self, q: ArrayLike) -> np.ndarray:
+        return self.local_data(q)["derivative_couplings"]
+
+    def overlap_at(self, q: ArrayLike) -> np.ndarray:
+        if self.overlap is not None:
+            return _asarray_or_call(self.overlap, np.asarray(q, dtype=float), dtype=complex)
+        nstates = self.energies(q).shape[1]
+        overlap = np.zeros((self.ngrid, nstates, self.ngrid, nstates), dtype=complex)
+        eye = np.eye(nstates, dtype=complex)
+        for m in range(self.ngrid):
+            for n in range(self.ngrid):
+                overlap[m, :, n, :] = eye
+        return overlap
+
+    def grad_overlap(self, q: ArrayLike) -> np.ndarray:
+        return grad_overlap_from_derivative_couplings(
+            self.overlap_at(q),
+            self.derivative_couplings(q),
+        )
+
+    def solver(self, *, kinetic_x: ArrayLike | None = None, masses_y: ArrayLike | None = None) -> "LDRFG":
+        kinetic = self.kinetic_x if kinetic_x is None else np.asarray(kinetic_x, dtype=complex)
+        masses = self.masses_y if masses_y is None else np.asarray(masses_y, dtype=float)
+        if kinetic is None:
+            raise ValueError("kinetic_x must be supplied to build an LDRFG solver.")
+        if masses is None:
+            raise ValueError("masses_y must be supplied to build an LDRFG solver.")
+        return LDRFG(
+            kinetic,
+            masses,
+            energies=self.energies,
+            overlap=self.overlap_at,
+            grad_energies=self.grad_energies,
+            grad_overlap=self.grad_overlap,
+            gamma=self.gamma,
+            hbar=self.hbar,
+        )
+
+
 class LDRFG:
     r"""Dense TDVP engine for the hybrid LDR--frozen Gaussian ansatz.
 

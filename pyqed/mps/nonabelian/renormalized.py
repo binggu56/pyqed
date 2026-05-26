@@ -916,6 +916,8 @@ class ComplementaryFamilyRenormalizedOperatorTable:
     bond: int
     family_blocks: dict
     source: str = "symbolic_renormalized_operator_table"
+    numeric_action_tables: dict = field(default_factory=dict, compare=False, repr=False)
+    native_operator_tables: dict = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
     def from_symbolic_table(cls, symbolic_table, family_names, *, family_payloads=None):
@@ -1042,6 +1044,37 @@ class ComplementaryFamilyRenormalizedOperatorTable:
         active = self.active_family_set()
         return bool(active.intersection(str(name) for name in family_names))
 
+    def get_numeric_action_table(self, key):
+        """
+        Return a cached numeric boundary action table for ``key``.
+
+        The table object is intentionally opaque to this non-Abelian storage
+        layer; Abelian sweep code owns the concrete action-table type.  Keeping
+        the cache here makes the complementary-family table the persistent owner
+        of boundary actions rather than a passive metadata record.
+        """
+
+        return self.numeric_action_tables.get(key)
+
+    def put_numeric_action_table(self, key, table):
+        """
+        Store an opaque numeric boundary action table and return it.
+        """
+
+        self.numeric_action_tables[key] = table
+        return table
+
+    def get_native_operator_table(self, key):
+        """Return a cached native renormalized operator table."""
+
+        return self.native_operator_tables.get(key)
+
+    def put_native_operator_table(self, key, table):
+        """Store a native renormalized operator table and return it."""
+
+        self.native_operator_tables[key] = table
+        return table
+
     @property
     def n_channels(self):
         """Return total family-channel assignments."""
@@ -1082,10 +1115,755 @@ class ComplementaryFamilyRenormalizedOperatorTable:
             "n_payload_blocks": int(self.n_payload_blocks),
             "stored_elements": int(self.stored_elements),
             "symbolic_terms": int(self.symbolic_terms),
+            "numeric_action_tables": int(len(self.numeric_action_tables)),
+            "numeric_action_table_stored_elements": int(
+                sum(
+                    int(getattr(table, "matrix", np.asarray(())).size)
+                    for table in self.numeric_action_tables.values()
+                )
+            ),
+            "native_operator_tables": int(len(self.native_operator_tables)),
+            "native_operator_table_stored_elements": int(
+                sum(
+                    int(getattr(table, "stored_elements", 0))
+                    for table in self.native_operator_tables.values()
+                )
+            ),
+            "native_operator_table_stats": {
+                repr(key): getattr(table, "stats", {})
+                for key, table in self.native_operator_tables.items()
+            },
             "families": {
                 str(name): block.stats
                 for name, block in self.family_blocks.items()
             },
+        }
+
+
+@dataclass(frozen=True)
+class ComplementaryNativeGeneratorOperatorTable:
+    """
+    Abelian-native renormalized spin-free generator operators for one boundary.
+
+    The table stores already-renormalized boundary tensors for spin-summed
+    one-body generators ``E_pq``.  It is intentionally independent from the
+    local Davidson action table so the sweep layer can reuse these blocks when
+    assembling R/P/Q family contractions.
+    """
+
+    side: str
+    bond: int
+    operators: dict
+    source: str = "abelian_native_spinfree_generator_boundary_table"
+    build_seconds: float = 0.0
+
+    @property
+    def n_operators(self):
+        """Return the number of stored generator operators."""
+
+        return int(len(self.operators))
+
+    @property
+    def stored_blocks(self):
+        """Return the number of block-sparse tensor blocks stored."""
+
+        return int(
+            sum(
+                len(getattr(operator, "data", {}) or {})
+                for operator in self.operators.values()
+            )
+        )
+
+    @property
+    def stored_elements(self):
+        """Return the number of scalar tensor elements stored."""
+
+        return int(
+            sum(
+                int(np.asarray(block).size)
+                for operator in self.operators.values()
+                for block in (getattr(operator, "data", {}) or {}).values()
+            )
+        )
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this native operator table."""
+
+        return {
+            "kind": "complementary_native_generator_operator_table",
+            "source": str(self.source),
+            "side": str(self.side),
+            "bond": int(self.bond),
+            "n_operators": int(self.n_operators),
+            "stored_blocks": int(self.stored_blocks),
+            "stored_elements": int(self.stored_elements),
+            "build_seconds": float(self.build_seconds),
+            "operator_keys": tuple(
+                tuple(int(index) for index in key)
+                for key in sorted(self.operators)
+            ),
+        }
+
+
+@dataclass
+class ComplementaryNativePairBoundaryOperatorTable:
+    """
+    Abelian-native renormalized pair-complement boundary table.
+
+    The table records block2-like ``P`` candidates that are consumed through
+    renormalized generator boundary operators instead of expanded exact JW
+    patterns.  Entries are still validated by the sweep code before they are
+    allowed to replace exact-pattern components.
+    """
+
+    side: str
+    bond: int
+    entries: dict = field(default_factory=dict)
+    operators: dict = field(default_factory=dict)
+    source: str = "abelian_native_pair_complement_boundary_table"
+    build_seconds: float = 0.0
+    validated_terms: int = 0
+    rejected_terms: int = 0
+
+    def get_operator(self, key):
+        """Return a stored renormalized pair boundary operator."""
+
+        return self.operators.get(tuple(key))
+
+    def add_operator(self, key, operator):
+        """Store one renormalized pair boundary operator."""
+
+        self.operators[tuple(key)] = operator
+        return operator
+
+    def add(self, key, entries):
+        """Store validated component entries for one ``P`` integral key."""
+
+        entries = tuple(entries or ())
+        self.entries[tuple(key)] = entries
+        self.validated_terms += 1
+        return entries
+
+    def reject(self):
+        """Record one rejected native ``P`` candidate."""
+
+        self.rejected_terms += 1
+
+    @property
+    def n_terms(self):
+        """Return the number of accepted ``P`` generator keys."""
+
+        return int(len(self.entries))
+
+    @property
+    def n_operators(self):
+        """Return the number of stored renormalized pair boundary operators."""
+
+        return int(len(self.operators))
+
+    @property
+    def n_entries(self):
+        """Return the number of executable component entries."""
+
+        return int(sum(len(entries) for entries in self.entries.values()))
+
+    @property
+    def stored_blocks(self):
+        """Return the number of stored block-sparse tensor blocks."""
+
+        return int(
+            sum(
+                ComplementaryNativeExactPatternComponentTable._stored_blocks_for(entries)
+                for entries in self.entries.values()
+            )
+            + sum(
+                ComplementaryNativeExactPatternComponentTable._stored_blocks_for(operator)
+                for operator in self.operators.values()
+            )
+        )
+
+    @property
+    def stored_elements(self):
+        """Return the number of stored scalar tensor elements."""
+
+        return int(
+            sum(
+                ComplementaryNativeExactPatternComponentTable._stored_elements_for(entries)
+                for entries in self.entries.values()
+            )
+            + sum(
+                ComplementaryNativeExactPatternComponentTable._stored_elements_for(operator)
+                for operator in self.operators.values()
+            )
+        )
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this native pair table."""
+
+        return {
+            "kind": "complementary_native_pair_boundary_operator_table",
+            "source": str(self.source),
+            "side": str(self.side),
+            "bond": int(self.bond),
+            "n_terms": int(self.n_terms),
+            "n_operators": int(self.n_operators),
+            "n_entries": int(self.n_entries),
+            "stored_blocks": int(self.stored_blocks),
+            "stored_elements": int(self.stored_elements),
+            "build_seconds": float(self.build_seconds),
+            "validated_terms": int(self.validated_terms),
+            "rejected_terms": int(self.rejected_terms),
+            "operator_keys": tuple(
+                tuple(int(index) for index in key)
+                for key in sorted(set(self.entries) | set(self.operators))
+            ),
+        }
+
+
+@dataclass
+class ComplementaryNativeExactPatternOperatorTable:
+    """
+    Abelian-native exact JW-pattern boundary table for direct family actions.
+
+    The table stores contextual renormalized boundary pieces produced from the
+    exact Jordan-Wigner-expanded patterns.  Unlike the spin-free generator
+    table, these entries do not assume that generator products can be split
+    across a boundary; they preserve the already-validated direct path algebra.
+    """
+
+    side: str
+    bond: int
+    entries: dict = field(default_factory=dict)
+    family_counts: dict = field(default_factory=dict)
+    source: str = "abelian_native_exact_jw_pattern_boundary_table"
+    build_seconds: float = 0.0
+
+    def get(self, key):
+        """Return a stored exact-pattern boundary entry."""
+
+        return self.entries.get(key)
+
+    def put(self, key, value, family_name=None):
+        """Store an exact-pattern boundary entry and record its owner family."""
+
+        is_new = key not in self.entries
+        self.entries[key] = value
+        if is_new and family_name is not None:
+            name = str(family_name)
+            self.family_counts[name] = int(self.family_counts.get(name, 0)) + 1
+        return value
+
+    @staticmethod
+    def _stored_blocks_for(value):
+        if value is None:
+            return 0
+        data = getattr(value, "data", None)
+        if isinstance(data, dict):
+            return int(len(data))
+        entries = getattr(value, "entries", None)
+        if entries is not None:
+            return ComplementaryNativeExactPatternComponentTable._stored_blocks_for(
+                tuple(entries)
+            )
+        if isinstance(value, (tuple, list)):
+            return int(
+                sum(
+                    ComplementaryNativeExactPatternOperatorTable._stored_blocks_for(item)
+                    for item in value
+                )
+            )
+        return 0
+
+    @staticmethod
+    def _stored_elements_for(value):
+        if value is None:
+            return 0
+        data = getattr(value, "data", None)
+        if isinstance(data, dict):
+            return int(sum(int(np.asarray(block).size) for block in data.values()))
+        entries = getattr(value, "entries", None)
+        if entries is not None:
+            return ComplementaryNativeExactPatternComponentTable._stored_elements_for(
+                tuple(entries)
+            )
+        if isinstance(value, (tuple, list)):
+            return int(
+                sum(
+                    ComplementaryNativeExactPatternOperatorTable._stored_elements_for(item)
+                    for item in value
+                )
+            )
+        return 0
+
+    @property
+    def n_entries(self):
+        """Return the number of stored exact-pattern entries."""
+
+        return int(len(self.entries))
+
+    @property
+    def stored_blocks(self):
+        """Return the number of stored block-sparse tensor blocks."""
+
+        return int(
+            sum(self._stored_blocks_for(value) for value in self.entries.values())
+        )
+
+    @property
+    def stored_elements(self):
+        """Return the number of stored scalar tensor elements."""
+
+        return int(
+            sum(self._stored_elements_for(value) for value in self.entries.values())
+        )
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this exact-pattern table."""
+
+        return {
+            "kind": "complementary_native_exact_pattern_operator_table",
+            "source": str(self.source),
+            "side": str(self.side),
+            "bond": int(self.bond),
+            "n_entries": int(self.n_entries),
+            "stored_blocks": int(self.stored_blocks),
+            "stored_elements": int(self.stored_elements),
+            "build_seconds": float(self.build_seconds),
+            "family_counts": {
+                str(name): int(count)
+                for name, count in sorted(self.family_counts.items())
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ComplementaryNativeExactPatternFamilyEntries:
+    """
+    Iterable family component entries plus exact grouping metadata.
+    """
+
+    family_name: str
+    entries: tuple
+    entry_groups: tuple = ()
+    group_keys: tuple = ()
+    source: str = "native_exact_pattern_family_entries"
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self):
+        return int(len(self.entries))
+
+    def __bool__(self):
+        return bool(self.entries)
+
+    def __getitem__(self, index):
+        return self.entries[index]
+
+    @property
+    def n_groups(self):
+        """Return the number of stored entry groups."""
+
+        return int(len(self.entry_groups))
+
+    @property
+    def n_group_entries(self):
+        """Return the total number of entries after exact group aggregation."""
+
+        return int(sum(len(group) for group in self.entry_groups))
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for these grouped entries."""
+
+        return {
+            "kind": "complementary_native_exact_pattern_family_entries",
+            "source": str(self.source),
+            "family_name": str(self.family_name),
+            "n_entries": int(len(self.entries)),
+            "n_groups": int(self.n_groups),
+            "n_group_entries": int(self.n_group_entries),
+            "entry_reduction": int(self.n_group_entries - len(self.entries)),
+            "group_sizes": tuple(int(len(group)) for group in self.entry_groups),
+            "group_keys": tuple(repr(key) for key in self.group_keys),
+        }
+
+
+@dataclass
+class ComplementaryNativeExactPatternComponentTable:
+    """
+    Center-bond exact JW-pattern component table for direct family actions.
+
+    Boundary tables own the contextual left/right operators.  This table owns
+    the assembled two-site family components that consume those boundary
+    pieces.  It keeps the direct path algebra exact while giving the sweep a
+    block2-like table object for P/R component ownership.
+    """
+
+    bond: int
+    families: dict = field(default_factory=dict)
+    family_records: dict = field(default_factory=dict)
+    source: str = "abelian_native_exact_jw_pattern_component_table"
+    build_seconds: float = 0.0
+
+    def get_family_records(self, family_name):
+        """Return exact component records for one family."""
+
+        return self.family_records.get(str(family_name))
+
+    def put_family_records(self, family_name, records):
+        """Store exact component records for one family and return them."""
+
+        records = tuple(records or ())
+        self.family_records[str(family_name)] = records
+        return records
+
+    def get_family(self, family_name):
+        """Return stored component entries for one family."""
+
+        return self.families.get(str(family_name))
+
+    def put_family(
+        self,
+        family_name,
+        entries,
+        records=None,
+        *,
+        compression_policy="auto",
+        min_reduction=1,
+        max_group_size=None,
+    ):
+        """Store component entries for one family and return them."""
+
+        entries = tuple(entries or ())
+        if records is None:
+            records = self.family_records.get(str(family_name), ())
+        records = tuple(records or ())
+        policy = str(compression_policy or "auto").lower().replace("-", "_")
+        if policy in {"off", "false", "disabled", "uncompressed"}:
+            policy = "none"
+        if policy not in {"none", "auto", "structural"}:
+            policy = "auto"
+        grouped = {}
+        for index, entry in enumerate(entries):
+            key = (
+                self._record_boundary_pair(records[index])
+                if index < len(records)
+                else ((), ())
+            )
+            grouped.setdefault(key, []).append(entry)
+
+        def _axis_dim(blocks, entry_index, q_mid, axis):
+            dims = set()
+            for key, block in blocks:
+                if key[axis] == q_mid:
+                    dims.add(int(block.shape[axis]))
+            if len(dims) != 1:
+                raise ValueError(
+                    f"inconsistent middle dimension for entry {entry_index}"
+                )
+            return dims.pop()
+
+        def _direct_sum_w_pair(group):
+            if len(group) <= 1:
+                return tuple(group)
+            parsed = []
+            mid_dims = {}
+            for entry_index, entry in enumerate(group):
+                try:
+                    E_term, W_pair, F_term = entry
+                    W_left, W_right = W_pair
+                except Exception:
+                    return tuple(group)
+                left_mids = {key[1] for key in getattr(W_left, "data", {})}
+                right_mids = {key[0] for key in getattr(W_right, "data", {})}
+                mids = left_mids.intersection(right_mids)
+                if not mids:
+                    return tuple(group)
+                left_blocks = tuple(getattr(W_left, "data", {}).items())
+                right_blocks = tuple(getattr(W_right, "data", {}).items())
+                for q_mid in mids:
+                    left_dim = _axis_dim(left_blocks, entry_index, q_mid, 1)
+                    right_dim = _axis_dim(right_blocks, entry_index, q_mid, 0)
+                    if left_dim != right_dim:
+                        return tuple(group)
+                    mid_dims[(entry_index, q_mid)] = int(left_dim)
+                parsed.append((E_term, W_left, W_right, F_term, tuple(sorted(mids))))
+
+            E_term = parsed[0][0]
+            F_term = parsed[0][3]
+            mid_sectors = tuple(sorted({q for item in parsed for q in item[4]}))
+            offsets = {}
+            totals = {q_mid: 0 for q_mid in mid_sectors}
+            for entry_index, _item in enumerate(parsed):
+                for q_mid in mid_sectors:
+                    dim = int(mid_dims.get((entry_index, q_mid), 0))
+                    offsets[(entry_index, q_mid)] = totals[q_mid]
+                    totals[q_mid] += dim
+            try:
+                W_left_qns = [
+                    sorted({q for _E, W_left, _W_right, _F, _mids in parsed for q in W_left.qns[0]}),
+                    list(mid_sectors),
+                    sorted({q for _E, W_left, _W_right, _F, _mids in parsed for q in W_left.qns[2]}),
+                    sorted({q for _E, W_left, _W_right, _F, _mids in parsed for q in W_left.qns[3]}),
+                ]
+                W_right_qns = [
+                    list(mid_sectors),
+                    sorted({q for _E, _W_left, W_right, _F, _mids in parsed for q in W_right.qns[1]}),
+                    sorted({q for _E, _W_left, W_right, _F, _mids in parsed for q in W_right.qns[2]}),
+                    sorted({q for _E, _W_left, W_right, _F, _mids in parsed for q in W_right.qns[3]}),
+                ]
+            except Exception:
+                return tuple(group)
+
+            left_data = {}
+            right_data = {}
+
+            def _accumulate_block(data, key, block, axis, start, total_dim):
+                shape = list(block.shape)
+                shape[axis] = int(total_dim)
+                if key not in data:
+                    data[key] = np.zeros(shape, dtype=np.asarray(block).dtype)
+                elif tuple(data[key].shape) != tuple(shape):
+                    return False
+                slices = [slice(None)] * len(shape)
+                slices[axis] = slice(int(start), int(start) + int(block.shape[axis]))
+                data[key][tuple(slices)] += block
+                return True
+
+            for entry_index, (_E, W_left, W_right, _F, _mids) in enumerate(parsed):
+                for key, block in W_left.data.items():
+                    q_mid = key[1]
+                    if q_mid not in totals:
+                        continue
+                    if not _accumulate_block(
+                        left_data,
+                        key,
+                        np.asarray(block),
+                        1,
+                        offsets[(entry_index, q_mid)],
+                        totals[q_mid],
+                    ):
+                        return tuple(group)
+                for key, block in W_right.data.items():
+                    q_mid = key[0]
+                    if q_mid not in totals:
+                        continue
+                    if not _accumulate_block(
+                        right_data,
+                        key,
+                        np.asarray(block),
+                        0,
+                        offsets[(entry_index, q_mid)],
+                        totals[q_mid],
+                    ):
+                        return tuple(group)
+            if not left_data or not right_data:
+                return tuple(group)
+            try:
+                W_class = parsed[0][1].__class__
+                W_left = W_class(left_data, W_left_qns, parsed[0][1].dirs[:])
+                W_right = W_class(right_data, W_right_qns, parsed[0][2].dirs[:])
+            except Exception:
+                return tuple(group)
+            return ((E_term, [W_left, W_right], F_term),)
+
+        if policy == "none":
+            group_items = tuple(
+                (key, tuple(grouped[key]))
+                for key in sorted(grouped, key=repr)
+            )
+        else:
+            group_items = tuple(
+                (key, _direct_sum_w_pair(tuple(grouped[key])))
+                for key in sorted(grouped, key=repr)
+            )
+        compressed_entries = tuple(
+            entry
+            for _key, group in group_items
+            for entry in group
+        )
+        reduction = int(len(entries) - len(compressed_entries))
+        largest_group = max((len(group) for _key, group in group_items), default=0)
+        if (
+            policy == "auto"
+            and (
+                reduction < int(min_reduction)
+                or (
+                    max_group_size is not None
+                    and int(largest_group) > int(max_group_size)
+                )
+            )
+        ):
+            group_items = tuple(
+                (key, tuple(grouped[key]))
+                for key in sorted(grouped, key=repr)
+            )
+            compressed_entries = entries
+        family_entries = ComplementaryNativeExactPatternFamilyEntries(
+            family_name=str(family_name),
+            entries=compressed_entries,
+            entry_groups=tuple(group for _key, group in group_items),
+            group_keys=tuple(key for key, _group in group_items),
+        )
+        self.families[str(family_name)] = family_entries
+        return family_entries
+
+    @staticmethod
+    def _stored_blocks_for(value):
+        if value is None:
+            return 0
+        data = getattr(value, "data", None)
+        if isinstance(data, dict):
+            return int(len(data))
+        entries = getattr(value, "entries", None)
+        if entries is not None:
+            return ComplementaryNativeExactPatternComponentTable._stored_blocks_for(
+                tuple(entries)
+            )
+        if isinstance(value, (tuple, list)):
+            return int(
+                sum(
+                    ComplementaryNativeExactPatternComponentTable._stored_blocks_for(item)
+                    for item in value
+                )
+            )
+        return 0
+
+    @staticmethod
+    def _stored_elements_for(value):
+        if value is None:
+            return 0
+        data = getattr(value, "data", None)
+        if isinstance(data, dict):
+            return int(sum(int(np.asarray(block).size) for block in data.values()))
+        entries = getattr(value, "entries", None)
+        if entries is not None:
+            return ComplementaryNativeExactPatternComponentTable._stored_elements_for(
+                tuple(entries)
+            )
+        if isinstance(value, (tuple, list)):
+            return int(
+                sum(
+                    ComplementaryNativeExactPatternComponentTable._stored_elements_for(item)
+                    for item in value
+                )
+            )
+        return 0
+
+    @property
+    def n_families(self):
+        """Return the number of stored families."""
+
+        return int(len(self.families))
+
+    @property
+    def n_entries(self):
+        """Return the total number of stored component entries."""
+
+        return int(sum(len(entries) for entries in self.families.values()))
+
+    @property
+    def n_records(self):
+        """Return the total number of exact symbolic component records."""
+
+        return int(sum(len(records) for records in self.family_records.values()))
+
+    @staticmethod
+    def _record_local_pair(record):
+        try:
+            return (str(record[1]), str(record[2]))
+        except Exception:
+            return ("?", "?")
+
+    @staticmethod
+    def _record_boundary_pair(record):
+        try:
+            return (tuple(record[0]), tuple(record[3]))
+        except Exception:
+            return ((), ())
+
+    def _record_group_counts(self, indexer):
+        out = {}
+        for name, records in self.family_records.items():
+            groups = {}
+            for record in records:
+                key = indexer(record)
+                groups[key] = int(groups.get(key, 0)) + 1
+            out[str(name)] = {
+                repr(key): int(count)
+                for key, count in sorted(groups.items(), key=lambda item: repr(item[0]))
+            }
+        return out
+
+    @property
+    def stored_blocks(self):
+        """Return the number of stored block-sparse tensor blocks."""
+
+        return int(
+            sum(self._stored_blocks_for(entries) for entries in self.families.values())
+        )
+
+    @property
+    def stored_elements(self):
+        """Return the number of stored scalar tensor elements."""
+
+        return int(
+            sum(self._stored_elements_for(entries) for entries in self.families.values())
+        )
+
+    @property
+    def stats(self):
+        """Return compact diagnostics for this component table."""
+
+        return {
+            "kind": "complementary_native_exact_pattern_component_table",
+            "source": str(self.source),
+            "bond": int(self.bond),
+            "n_families": int(self.n_families),
+            "n_records": int(self.n_records),
+            "n_entries": int(self.n_entries),
+            "stored_blocks": int(self.stored_blocks),
+            "stored_elements": int(self.stored_elements),
+            "build_seconds": float(self.build_seconds),
+            "record_counts": {
+                str(name): int(len(records))
+                for name, records in sorted(self.family_records.items())
+            },
+            "family_counts": {
+                str(name): int(len(entries))
+                for name, entries in sorted(self.families.items())
+            },
+            "family_group_counts": {
+                str(name): int(getattr(entries, "n_groups", 0))
+                for name, entries in sorted(self.families.items())
+            },
+            "family_group_entry_counts": {
+                str(name): int(getattr(entries, "n_group_entries", len(entries)))
+                for name, entries in sorted(self.families.items())
+            },
+            "family_entry_reductions": {
+                str(name): int(
+                    len(self.family_records.get(str(name), ())) - len(entries)
+                )
+                for name, entries in sorted(self.families.items())
+            },
+            "family_group_sizes": {
+                str(name): tuple(
+                    int(len(group))
+                    for group in getattr(entries, "entry_groups", ())
+                )
+                for name, entries in sorted(self.families.items())
+            },
+            "local_pair_group_counts": self._record_group_counts(
+                self._record_local_pair
+            ),
+            "boundary_pair_group_counts": self._record_group_counts(
+                self._record_boundary_pair
+            ),
         }
 
 

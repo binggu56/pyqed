@@ -362,6 +362,8 @@ def test_abelian_boundary_action_table_reports_family_ownership():
         },
     )
 
+    assert H._boundary_family_action_table(A) is None
+
     table = H._boundary_table(A)
     stats = table.stats
 

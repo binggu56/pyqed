@@ -870,7 +870,17 @@ def _middle_parity_operators_for_four_sites(sorted_sites, *, phys_leg, dtype):
     return middle
 
 
-def _accumulate_four_distinct_spinfree_we_product(pending_we, p, q, r, s, coeff, *, cutoff):
+def _accumulate_four_distinct_spinfree_we_product(
+    pending_we,
+    p,
+    q,
+    r,
+    s,
+    coeff,
+    *,
+    cutoff,
+    middle_irreps=(0, 2),
+):
     """
     Accumulate shared reduced WE strings for one four-distinct ERI product.
     """
@@ -884,9 +894,12 @@ def _accumulate_four_distinct_spinfree_we_product(pending_we, p, q, r, s, coeff,
     sorted_sites = tuple(site for site, _ in sorted_entries)
     site_order = tuple(original_index for _, original_index in sorted_entries)
     recoupling = _spinfree_we_recoupling_coefficients(site_order, cutoff=cutoff)
+    allowed_middle_irreps = {int(irrep) for irrep in middle_irreps}
 
     count = 0
     for middle_irrep, recoupling_coeff in zip((0, 2), recoupling):
+        if int(middle_irrep) not in allowed_middle_irreps:
+            continue
         term_coeff = coeff * recoupling_coeff
         if abs(term_coeff) <= cutoff:
             continue
@@ -1779,6 +1792,7 @@ def add_spatial_two_generator_product_terms(
     cutoff=1.0e-12,
     family="P",
     reduced_we=True,
+    we_middle_irreps=(0, 2),
     return_info=False,
 ):
     """
@@ -1808,12 +1822,23 @@ def add_spatial_two_generator_product_terms(
         float,
     )
     raw_terms = 0
+    input_terms = 0
+    four_distinct_entries = 0
+    repeated_entries = 0
+    repeat_histogram = {}
     for key, coeff in dict(entries or {}).items():
         p, q, r, s = (int(index) for index in key)
         coeff = np.asarray(coeff, dtype=dtype).item()
         if abs(coeff) <= cutoff:
             continue
-        if reduced_we and len({p, q, r, s}) == 4:
+        input_terms += 1
+        unique = len({p, q, r, s})
+        repeat_histogram[unique] = int(repeat_histogram.get(unique, 0)) + 1
+        if unique == 4:
+            four_distinct_entries += 1
+        else:
+            repeated_entries += 1
+        if reduced_we and unique == 4:
             raw_terms += _accumulate_four_distinct_spinfree_we_product(
                 pending_we,
                 p,
@@ -1822,6 +1847,7 @@ def add_spatial_two_generator_product_terms(
                 s,
                 coeff,
                 cutoff=cutoff,
+                middle_irreps=we_middle_irreps,
             )
         else:
             raw_terms += _accumulate_spinfree_component_product_terms(
@@ -1853,7 +1879,13 @@ def add_spatial_two_generator_product_terms(
         "we_product_terms": int(we_terms),
         "symbolic_product_terms": int(scalar_terms),
         "total_product_terms": int(we_terms + scalar_terms),
-        "input_generator_terms": int(len(dict(entries or {}))),
+        "input_generator_terms": int(input_terms),
+        "four_distinct_generator_terms": int(four_distinct_entries),
+        "repeated_generator_terms": int(repeated_entries),
+        "unique_index_histogram": {
+            str(key): int(value)
+            for key, value in sorted(repeat_histogram.items())
+        },
     }
     return info if return_info else info["total_product_terms"]
 
