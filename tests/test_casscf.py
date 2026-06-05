@@ -7,6 +7,7 @@ from pyqed.qchem import (
     COCASCI,
     FirstOrderCASSCF,
     Molecule,
+    st_soc,
     soc_state_interaction,
 )
 from pyqed.qchem.mcscf import casci as casci_module
@@ -861,6 +862,51 @@ def test_soc_state_interaction_somf_matches_explicit_operator():
         mc_singlet.soc_matrix_element(0, other=mc_triplet, hso=hso),
         atol=1e-10,
     )
+
+
+def test_st_soc_matches_explicit_sectors():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = mol.RHF().run()
+    hso = np.array(
+        [
+            [0.02, 0.17 - 0.03j, -0.11 + 0.07j, 0.05j],
+            [0.13 + 0.04j, -0.08, 0.19 - 0.02j, -0.03 + 0.09j],
+            [0.07 - 0.05j, -0.04j, 0.06, 0.12 + 0.08j],
+            [-0.02 + 0.01j, 0.16, -0.09 + 0.05j, -0.04],
+        ],
+        dtype=complex,
+    )
+
+    result = st_soc(
+        mf,
+        ncas=2,
+        nelecas=2,
+        hso=hso,
+        method='direct_ci',
+    )
+
+    assert set(result.components) == {-1, 0, 1}
+    np.testing.assert_allclose(result.singlet.spin_square(0), 0.0, atol=1e-10)
+    for ms, triplet in result.triplets.items():
+        np.testing.assert_allclose(triplet.spin_square(0), 2.0, atol=1e-10)
+        assert triplet.ms2 == 2 * ms
+
+    expected = {
+        ms: result.singlet.soc_matrix_element(0, other=triplet, hso=hso)
+        for ms, triplet in result.triplets.items()
+    }
+    for ms in (-1, 0, 1):
+        np.testing.assert_allclose(result.components[ms], expected[ms], atol=1e-12)
+    np.testing.assert_allclose(
+        result.norm,
+        np.sqrt(sum(abs(value) ** 2 for value in expected.values())),
+        atol=1e-12,
+    )
+
+    one_e = st_soc(mf, ncas=2, nelecas=2, model='1e', method='direct_ci')
+    assert set(one_e.components) == {-1, 0, 1}
 
 
 def test_first_order_casscf_line_search_failure_raises(monkeypatch):

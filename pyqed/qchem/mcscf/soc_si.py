@@ -22,6 +22,17 @@ class SOCStateInteractionResult:
     eigenvectors: np.ndarray
 
 
+@dataclass
+class SingletTripletSOCResult:
+    singlet: object
+    triplets: dict
+    singlet_root: int
+    triplet_root: int
+    components: dict
+    norm: float
+    hso: np.ndarray
+
+
 def _normalize_states(states):
     if not states:
         raise ValueError("states must contain at least one CASCI state.")
@@ -148,4 +159,128 @@ def soc_state_interaction(states, hso=None, one_center=True,
         h_total=h_total,
         eigenvalues=eigenvalues,
         eigenvectors=eigenvectors,
+    )
+
+
+def st_soc(
+    mf,
+    ncas,
+    nelecas,
+    ncore=None,
+    singlet_root=0,
+    triplet_root=0,
+    mo_coeff=None,
+    method='direct_ci',
+    hso=None,
+    one_center=True,
+    with_prefactor=True,
+    light_speed=None,
+    order='grouped',
+    model='somf',
+    dm=None,
+    spin_root_cushion=None,
+    spin_selection_tol=None,
+    verbose=0,
+    run_kwargs=None,
+):
+    """
+    Compute the three singlet-triplet SOC components.
+
+    The public labels are triplet ``M_S = -1, 0, +1``. Internally these
+    correspond to CASCI determinant sectors ``ms2 = -2, 0, +2``. The
+    ``M_S = 0`` triplet is selected from the ``ms2=0`` determinant block by
+    ``multiplicity=3`` and ``<S^2>`` filtering.
+    """
+    from pyqed.qchem.mcscf.casci import CASCI
+
+    singlet_root = int(singlet_root)
+    triplet_root = int(triplet_root)
+    run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
+
+    def _run_casci(ms2, multiplicity, root):
+        mc = CASCI(
+            mf,
+            ncas=ncas,
+            nelecas=nelecas,
+            ncore=ncore,
+            ms2=ms2,
+            multiplicity=multiplicity,
+            verbose=verbose,
+        )
+        mc.run(
+            nstates=root + 1,
+            mo_coeff=mo_coeff,
+            method=method,
+            spin_root_cushion=spin_root_cushion,
+            spin_selection_tol=spin_selection_tol,
+            **run_kwargs,
+        )
+        return mc
+
+    singlet = _run_casci(ms2=0, multiplicity=1, root=singlet_root)
+    triplets = {
+        ms: _run_casci(ms2=2 * ms, multiplicity=3, root=triplet_root)
+        for ms in (-1, 0, 1)
+    }
+
+    states = [(singlet, singlet_root)] + [
+        (triplets[ms], triplet_root) for ms in (-1, 0, 1)
+    ]
+    _validate_compatible_states(states)
+
+    if hso is None:
+        model_name = model.lower()
+        if model_name == '1e':
+            hso = get_soc_1e_spin_orbital(
+                singlet.mf,
+                representation='mo',
+                mo_coeff=singlet.mo_cas,
+                one_center=one_center,
+                with_prefactor=with_prefactor,
+                light_speed=light_speed,
+                order=order,
+            )
+        elif model_name == 'somf':
+            hso = get_soc_somf_spin_orbital(
+                singlet.mf,
+                representation='mo',
+                mo_coeff=singlet.mo_cas,
+                states=states if dm is None else None,
+                dm=dm,
+                one_center=one_center,
+                with_prefactor=with_prefactor,
+                light_speed=light_speed,
+                order=order,
+            )
+        else:
+            raise ValueError("model must be '1e' or 'somf'.")
+    else:
+        hso = np.asarray(hso)
+
+    expected_shape = (2 * singlet.ncas, 2 * singlet.ncas)
+    if hso.shape != expected_shape:
+        raise ValueError(
+            f"hso has shape {hso.shape}, expected active spin-orbital shape {expected_shape}."
+        )
+
+    components = {
+        ms: singlet.soc_matrix_element(
+            singlet_root,
+            ket_id=triplet_root,
+            other=triplets[ms],
+            hso=hso,
+            order=order,
+        )
+        for ms in (-1, 0, 1)
+    }
+    norm = float(np.sqrt(sum(abs(value) ** 2 for value in components.values())))
+
+    return SingletTripletSOCResult(
+        singlet=singlet,
+        triplets=triplets,
+        singlet_root=singlet_root,
+        triplet_root=triplet_root,
+        components=components,
+        norm=norm,
+        hso=hso,
     )

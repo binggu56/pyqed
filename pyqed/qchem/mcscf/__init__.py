@@ -18,7 +18,14 @@ except (ImportError, OSError, TimeoutError):
     ReducedCISubspace = None
 
 try:
-    from .soc_si import SOCStateInteractionResult, soc_state_interaction
+    from .soc_si import (
+        SOCStateInteractionResult,
+        SingletTripletSOCResult,
+        st_soc,
+        soc_state_interaction,
+    )
 except (ImportError, OSError, TimeoutError):
     SOCStateInteractionResult = None
+    SingletTripletSOCResult = None
+    st_soc = None
     soc_state_interaction = None

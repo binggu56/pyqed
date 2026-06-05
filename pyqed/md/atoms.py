@@ -122,10 +122,12 @@ class Atoms(Molecule):
 
     def get_masses(self):
         """Get atomic masses in atomic units."""
-        return self.atom_mass_list() * amu2au
+        return self.get_masses_amu() * amu2au
 
     def get_masses_amu(self):
         """Get atomic masses in unified atomic mass units."""
+        if "masses_amu" in self.arrays:
+            return self.arrays["masses_amu"].copy()
         return self.atom_mass_list()
 
     def set_cell(self, cell, scale_atoms=False, apply_constraint=True):

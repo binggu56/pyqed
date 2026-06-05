@@ -122,6 +122,28 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
     np.testing.assert_allclose(e_rys, e_default, atol=1e-10, rtol=1e-10)
 
 
+def test_builtin_parallel_option_keeps_compiled_rys_for_sp_basis():
+    atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
+    basis = 'sto-3g'
+
+    mol_serial = Molecule(atom=atom, unit='bohr', basis=basis)
+    mol_serial.build(driver='builtin', options={'eri_representation': 'dense'})
+
+    mol_parallel = Molecule(atom=atom, unit='bohr', basis=basis)
+    mol_parallel.build(
+        driver='builtin',
+        options={
+            'eri_representation': 'dense',
+            'parallel': True,
+            'eri_workers': 2,
+        },
+    )
+
+    if _rys_cy is not None:
+        assert mol_parallel._builtin_build_info['dense_builder'] == 'rys-cython-blocked-auto'
+    np.testing.assert_allclose(mol_parallel.eri, mol_serial.eri, atol=1e-11, rtol=1e-11)
+
+
 def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
     atom = 'H 0 0 0; F 0 0 0.9'
     basis = '6-31g(d,p)'
@@ -135,16 +157,12 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
     np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-9, rtol=1e-9)
-<<<<<<< HEAD
     expected_builder = (
         'cython-shell-os-blocked-mixed-d-fallback'
         if _basis_cy is not None
         else 'python-serial-mixed-d-fallback'
     )
     assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
-=======
-    assert mol_rys._builtin_build_info['dense_builder'] == 'rys-screened-mixed'
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
     e_default = mol_default.RHF().run(max_cycle=80).e_tot
     e_rys = mol_rys.RHF().run(max_cycle=80).e_tot

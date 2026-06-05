@@ -50,6 +50,7 @@ class PointChargeEmbeddedSCF:
         analytic_qm_gradients=True,
         analytic_point_charge_forces=True,
         build_driver=None,
+        build_kwargs=None,
         run_kwargs=None,
         reference_run_kwargs=None,
     ):
@@ -62,6 +63,7 @@ class PointChargeEmbeddedSCF:
         self.analytic_qm_gradients = bool(analytic_qm_gradients)
         self.analytic_point_charge_forces = bool(analytic_point_charge_forces)
         self.build_driver = build_driver or getattr(self.mol, "_build_driver", None) or "builtin"
+        self.build_kwargs = {} if build_kwargs is None else dict(build_kwargs)
         self.run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
         self.reference_run_kwargs = (
             {} if reference_run_kwargs is None else dict(reference_run_kwargs)
@@ -173,7 +175,7 @@ class PointChargeEmbeddedSCF:
             )
 
         self.mol.set_geom(qm_coords)
-        self.mol.build(driver=self.build_driver)
+        self.mol.build(driver=self.build_driver, **self.build_kwargs)
         hcore0 = np.asarray(self.mol.hcore, dtype=float)
         self.mol.hcore = hcore0 + point_charge_hcore(self.mol, pc_coords, self.charges)
 
@@ -202,6 +204,7 @@ class PointChargeEmbeddedPostSCF:
         analytic_qm_gradients=False,
         analytic_point_charge_forces=False,
         build_driver=None,
+        build_kwargs=None,
         run_kwargs=None,
         reference_run_kwargs=None,
     ):
@@ -216,6 +219,7 @@ class PointChargeEmbeddedPostSCF:
         self.analytic_qm_gradients = bool(analytic_qm_gradients)
         self.analytic_point_charge_forces = bool(analytic_point_charge_forces)
         self.build_driver = build_driver or getattr(self.mol, "_build_driver", None) or "builtin"
+        self.build_kwargs = {} if build_kwargs is None else dict(build_kwargs)
         self.run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
         self.reference_run_kwargs = (
             {} if reference_run_kwargs is None else dict(reference_run_kwargs)
@@ -255,7 +259,7 @@ class PointChargeEmbeddedPostSCF:
             )
 
         self.mol.set_geom(qm_coords)
-        self.mol.build(driver=self.build_driver)
+        self.mol.build(driver=self.build_driver, **self.build_kwargs)
         hcore0 = np.asarray(self.mol.hcore, dtype=float)
         self.mol.hcore = hcore0 + point_charge_hcore(self.mol, pc_coords, self.charges)
 

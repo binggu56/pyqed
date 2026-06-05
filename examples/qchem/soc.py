@@ -6,8 +6,7 @@ Created on Wed Apr 15 13:48:10 2026
 @author: gugroup
 """
 
-from pyqed.qchem import Molecule, soc_state_interaction
-from pyqed.qchem.mcscf.direct_ci import CASCI
+from pyqed.qchem import Molecule, st_soc
 from pyqed import au2ev
 
 mol = Molecule(atom='''
@@ -20,13 +19,13 @@ mol.build(driver='gbasis')
 
 mf = mol.RHF().run()
 
-mc_s = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
-mc_t = CASCI(mf, ncas=2, nelecas=2, spin=2).run(nstates=1, method='direct_ci')
-
-res = soc_state_interaction([(mc_s, 0), (mc_t, 0)], soc_model='1e')
-print(res.h_soc[0, 1] * au2ev)
-
-
-res = soc_state_interaction([(mc_s, 0), (mc_t, 0)], soc_model='somf')
-print(res.h_soc[0, 1] * au2ev)
-# print(res.eigenvalues)
+for model in ('1e', 'somf'):
+    res = st_soc(
+        mf,
+        ncas=2,
+        nelecas=2,
+        model=model,
+        method='direct_ci',
+    )
+    print(model, {ms: value * au2ev for ms, value in res.components.items()})
+    print(model, 'norm', res.norm * au2ev)

@@ -12,7 +12,10 @@ import math
 import ctypes
 import multiprocessing as mp
 import time
-from concurrent.futures import ProcessPoolExecutor
+import hashlib
+import json
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
@@ -35,6 +38,12 @@ _NATIVE_PAR_PAIR_BOUNDS = None
 _NATIVE_PAR_SCREEN_TOL = 0.0
 _NATIVE_RI_AO_SIGNATURES = None
 _NATIVE_RI_AUX_SIGNATURES = None
+_NATIVE_RI_PAIR_BOUNDS = None
+_NATIVE_RI_AUX_DIAG = None
+_NATIVE_RI_SCREEN_TOL = 0.0
+_NATIVE_RI_CY_PACKED = None
+_NATIVE_RI_CY_AUX_PACKED = None
+_NATIVE_RI_LAST_KERNEL_INFO = {}
 _NUMBA_AVAILABLE = njit is not None
 _NUMBA_DENSE_ERI_ENABLED = False
 _BASIS_ACCEL = None
@@ -1208,6 +1217,21 @@ def _unique_ao_pairs(nao):
 
 def _compute_pair_bounds(signatures):
     nao = len(signatures)
+    if _basis_cy is not None and hasattr(_basis_cy, "compute_pair_bounds"):
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        try:
+            return np.asarray(
+                _basis_cy.compute_pair_bounds(
+                    np.ascontiguousarray(shells, dtype=np.int64),
+                    np.ascontiguousarray(origins, dtype=np.float64),
+                    np.ascontiguousarray(exps, dtype=np.float64),
+                    np.ascontiguousarray(weights, dtype=np.float64),
+                    np.ascontiguousarray(nprim, dtype=np.int64),
+                ),
+                dtype=np.float64,
+            )
+        except Exception:
+            pass
     bounds = np.zeros((nao, nao), dtype=float)
     for p in range(nao):
         sig_p = signatures[p]
@@ -1896,23 +1920,38 @@ def _basis_path(basis_name):
     return os.path.join(basis_dir, sorted(candidates, key=_basis_sort_key)[0])
 
 
-def _default_auxbasis_name(primary_basis, purpose="jk"):
+def _auxbasis_defines_symbols(auxbasis, symbols):
+    try:
+        basis_dict = parse_gbs(_basis_path(auxbasis))
+    except ValueError:
+        return False
+    return all(symbol in basis_dict for symbol in symbols)
+
+
+def _default_auxbasis_name(primary_basis, purpose="jk", required_symbols=None):
     basis = str(primary_basis)
     lower = basis.lower()
     purpose = str(purpose or "jk").lower().replace("_", "-")
     prefer_jk = purpose in {"auto", "j", "jk", "scf", "hf", "rhf"}
+    required_symbols = tuple(dict.fromkeys(required_symbols or ()))
+
+    def choose(candidate):
+        try:
+            _basis_path(candidate)
+        except ValueError:
+            return None
+        if required_symbols and not _auxbasis_defines_symbols(candidate, required_symbols):
+            return None
+        return candidate
+
     if lower.startswith("6-311"):
-        try:
-            _basis_path("cc-pvtz-jkfit")
-            return "cc-pvtz-jkfit"
-        except ValueError:
-            pass
+        candidate = choose("cc-pvtz-jkfit")
+        if candidate is not None:
+            return candidate
     if lower.startswith("6-31"):
-        try:
-            _basis_path("cc-pvdz-jkfit")
-            return "cc-pvdz-jkfit"
-        except ValueError:
-            pass
+        candidate = choose("cc-pvdz-jkfit")
+        if candidate is not None:
+            return candidate
     if prefer_jk:
         candidates = (
             f"{basis}-jkfit",
@@ -1920,6 +1959,9 @@ def _default_auxbasis_name(primary_basis, purpose="jk"):
             f"{basis}-rifit",
             f"{basis}_st_-j",
             f"{basis}_st_-rifit",
+            "def2-universal-jkfit",
+            "def2-sv(p)-jkfit",
+            "def2-universal-jfit",
         )
     else:
         candidates = (
@@ -1928,13 +1970,14 @@ def _default_auxbasis_name(primary_basis, purpose="jk"):
             f"{basis}-j",
             f"{basis}_st_-rifit",
             f"{basis}_st_-j",
+            "def2-svp-rifit",
+            "def2-universal-jfit",
+            "def2-universal-jkfit",
         )
     for candidate in candidates:
-        try:
-            _basis_path(candidate)
-        except ValueError:
-            continue
-        return candidate
+        candidate = choose(candidate)
+        if candidate is not None:
+            return candidate
     raise ValueError(
         "Native RI requires an auxiliary basis. Pass options={'auxbasis': '...'} "
         f"or use a primary basis with a bundled RI/J-fit partner; no default was found for {basis!r}."
@@ -1978,33 +2021,638 @@ def _compute_native_ri_tensors_cython(signatures, aux_signatures):
 
 
 def _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol):
+    global _NATIVE_RI_LAST_KERNEL_INFO
+    _NATIVE_RI_LAST_KERNEL_INFO = {}
     if _basis_cy is None or not hasattr(_basis_cy, "compute_ri_tensors_packed"):
         return None
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
     aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+    aux_shells = np.ascontiguousarray(aux_shells, dtype=np.int64)
+    aux_origins = np.ascontiguousarray(aux_origins, dtype=np.float64)
+    aux_exps = np.ascontiguousarray(aux_exps, dtype=np.float64)
+    aux_weights = np.ascontiguousarray(aux_weights, dtype=np.float64)
+    aux_nprim = np.ascontiguousarray(aux_nprim, dtype=np.int64)
+    pair_bounds = np.ascontiguousarray(pair_bounds, dtype=np.float64)
+    if hasattr(_basis_cy, "compute_ri_j3_packed_range_shell_blocked_cached"):
+        max_primary_l = max((sum(sig[0]) for sig in signatures), default=0)
+        if max_primary_l <= 2 and len(aux_signatures) * (len(signatures) * (len(signatures) + 1) // 2) <= 2_000_000:
+            try:
+                metric = np.asarray(
+                    _basis_cy.compute_aux_metric(
+                        aux_shells,
+                        aux_origins,
+                        aux_exps,
+                        aux_weights,
+                        aux_nprim,
+                    ),
+                    dtype=np.float64,
+                )
+                aux_diag = np.ascontiguousarray(
+                    np.sqrt(np.maximum(np.abs(np.diag(metric)), 0.0)),
+                    dtype=np.float64,
+                )
+                shell_blocks = _contiguous_shell_blocks_from_signatures(signatures)
+                aux_shell_blocks = _contiguous_shell_blocks_from_signatures(aux_signatures)
+                shell_starts = np.ascontiguousarray([start for start, _ in shell_blocks], dtype=np.int64)
+                shell_stops = np.ascontiguousarray([stop for _, stop in shell_blocks], dtype=np.int64)
+                aux_shell_starts = np.ascontiguousarray([start for start, _ in aux_shell_blocks], dtype=np.int64)
+                aux_shell_stops = np.ascontiguousarray([stop for _, stop in aux_shell_blocks], dtype=np.int64)
+                shell_pair_cache = _precompute_shell_pair_geometry(
+                    shell_starts,
+                    shell_stops,
+                    origins,
+                    exps,
+                    nprim,
+                )
+                j3_pair, computed, skipped = _basis_cy.compute_ri_j3_packed_range_shell_blocked_cached(
+                    shells,
+                    origins,
+                    exps,
+                    weights,
+                    nprim,
+                    aux_shells,
+                    aux_origins,
+                    aux_exps,
+                    aux_weights,
+                    aux_nprim,
+                    0,
+                    int(aux_shells.shape[0]),
+                    pair_bounds,
+                    aux_diag,
+                    shell_starts,
+                    shell_stops,
+                    aux_shell_starts,
+                    aux_shell_stops,
+                    *shell_pair_cache,
+                    float(ri_screen_tol),
+                )
+                _NATIVE_RI_LAST_KERNEL_INFO = {
+                    "tensor_kernel": "shell-block-vrr-hrr",
+                    "parallel_mode": "serial",
+                    "shell_blocked": True,
+                    "shell_pair_cache": True,
+                    "task_count": 1,
+                    "max_primary_l": int(max_primary_l),
+                }
+                return (
+                    metric,
+                    np.asarray(j3_pair, dtype=np.float64),
+                    int(computed),
+                    int(skipped),
+                )
+            except Exception:
+                pass
     try:
         metric, j3_pair, computed, skipped = _basis_cy.compute_ri_tensors_packed(
-            np.ascontiguousarray(shells, dtype=np.int64),
-            np.ascontiguousarray(origins, dtype=np.float64),
-            np.ascontiguousarray(exps, dtype=np.float64),
-            np.ascontiguousarray(weights, dtype=np.float64),
-            np.ascontiguousarray(nprim, dtype=np.int64),
-            np.ascontiguousarray(aux_shells, dtype=np.int64),
-            np.ascontiguousarray(aux_origins, dtype=np.float64),
-            np.ascontiguousarray(aux_exps, dtype=np.float64),
-            np.ascontiguousarray(aux_weights, dtype=np.float64),
-            np.ascontiguousarray(aux_nprim, dtype=np.int64),
-            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            shells,
+            origins,
+            exps,
+            weights,
+            nprim,
+            aux_shells,
+            aux_origins,
+            aux_exps,
+            aux_weights,
+            aux_nprim,
+            pair_bounds,
             float(ri_screen_tol),
         )
     except Exception:
         return None
+    _NATIVE_RI_LAST_KERNEL_INFO = {
+        "tensor_kernel": "ao-loop-packed",
+        "parallel_mode": "serial",
+        "shell_blocked": False,
+        "task_count": 1,
+    }
     return (
         np.asarray(metric, dtype=np.float64),
         np.asarray(j3_pair, dtype=np.float64),
         int(computed),
         int(skipped),
     )
+
+
+def _precompute_shell_pair_geometry(shell_starts, shell_stops, origins, exps, nprim):
+    nshell = int(len(shell_starts))
+    max_prim = int(exps.shape[1])
+    pair_cap = max_prim * max_prim
+    n_pair_shell = nshell * nshell
+    pair_n = np.zeros(n_pair_shell, dtype=np.int64)
+    pair_a = np.zeros((n_pair_shell, pair_cap), dtype=np.float64)
+    pair_b = np.zeros_like(pair_a)
+    pair_p = np.zeros_like(pair_a)
+    pair_px = np.zeros_like(pair_a)
+    pair_py = np.zeros_like(pair_a)
+    pair_pz = np.zeros_like(pair_a)
+
+    for ish, p0 in enumerate(np.asarray(shell_starts, dtype=np.int64)):
+        p0 = int(p0)
+        for jsh, q0 in enumerate(np.asarray(shell_starts, dtype=np.int64)):
+            q0 = int(q0)
+            idx = ish * nshell + jsh
+            out = 0
+            ax, ay, az = origins[p0]
+            bx, by, bz = origins[q0]
+            for ip in range(int(nprim[p0])):
+                aval = float(exps[p0, ip])
+                for iq in range(int(nprim[q0])):
+                    bval = float(exps[q0, iq])
+                    pval = aval + bval
+                    pair_a[idx, out] = aval
+                    pair_b[idx, out] = bval
+                    pair_p[idx, out] = pval
+                    pair_px[idx, out] = (aval * ax + bval * bx) / pval
+                    pair_py[idx, out] = (aval * ay + bval * by) / pval
+                    pair_pz[idx, out] = (aval * az + bval * bz) / pval
+                    out += 1
+            pair_n[idx] = out
+
+    return pair_n, pair_a, pair_b, pair_p, pair_px, pair_py, pair_pz
+
+
+def _init_builtin_ri_cython_worker(
+    shells,
+    origins,
+    exps,
+    weights,
+    nprim,
+    aux_shells,
+    aux_origins,
+    aux_exps,
+    aux_weights,
+    aux_nprim,
+    pair_bounds,
+    aux_diag,
+    shell_starts,
+    shell_stops,
+    aux_shell_starts,
+    aux_shell_stops,
+    shell_pair_cache,
+    use_shell_blocked,
+    ri_screen_tol,
+):
+    global _NATIVE_RI_CY_PACKED
+    _NATIVE_RI_CY_PACKED = (
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+        pair_bounds,
+        aux_diag,
+        shell_starts,
+        shell_stops,
+        aux_shell_starts,
+        aux_shell_stops,
+        shell_pair_cache,
+        bool(use_shell_blocked),
+        float(ri_screen_tol or 0.0),
+    )
+
+
+def _ri_three_center_pair_cython_chunk_worker(task):
+    start, stop = task
+    (
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+        pair_bounds,
+        aux_diag,
+        shell_starts,
+        shell_stops,
+        aux_shell_starts,
+        aux_shell_stops,
+        shell_pair_cache,
+        use_shell_blocked,
+        ri_screen_tol,
+    ) = _NATIVE_RI_CY_PACKED
+    if use_shell_blocked:
+        try:
+            if shell_pair_cache is not None and hasattr(_basis_cy, "compute_ri_j3_packed_range_shell_blocked_cached"):
+                (
+                    shell_pair_n,
+                    shell_pair_a,
+                    shell_pair_b,
+                    shell_pair_p,
+                    shell_pair_px,
+                    shell_pair_py,
+                    shell_pair_pz,
+                ) = shell_pair_cache
+                block, computed, skipped = _basis_cy.compute_ri_j3_packed_range_shell_blocked_cached(
+                    shells,
+                    origins,
+                    exps,
+                    weights,
+                    nprim,
+                    aux_shells,
+                    aux_origins,
+                    aux_exps,
+                    aux_weights,
+                    aux_nprim,
+                    int(start),
+                    int(stop),
+                    pair_bounds,
+                    aux_diag,
+                    shell_starts,
+                    shell_stops,
+                    aux_shell_starts,
+                    aux_shell_stops,
+                    shell_pair_n,
+                    shell_pair_a,
+                    shell_pair_b,
+                    shell_pair_p,
+                    shell_pair_px,
+                    shell_pair_py,
+                    shell_pair_pz,
+                    ri_screen_tol,
+                )
+            else:
+                block, computed, skipped = _basis_cy.compute_ri_j3_packed_range_shell_blocked(
+                    shells,
+                    origins,
+                    exps,
+                    weights,
+                    nprim,
+                    aux_shells,
+                    aux_origins,
+                    aux_exps,
+                    aux_weights,
+                    aux_nprim,
+                    int(start),
+                    int(stop),
+                    pair_bounds,
+                    aux_diag,
+                    shell_starts,
+                    shell_stops,
+                    aux_shell_starts,
+                    aux_shell_stops,
+                    ri_screen_tol,
+                )
+        except Exception:
+            block, computed, skipped = _basis_cy.compute_ri_j3_packed_range(
+                shells,
+                origins,
+                exps,
+                weights,
+                nprim,
+                aux_shells,
+                aux_origins,
+                aux_exps,
+                aux_weights,
+                aux_nprim,
+                int(start),
+                int(stop),
+                pair_bounds,
+                aux_diag,
+                ri_screen_tol,
+            )
+    else:
+        block, computed, skipped = _basis_cy.compute_ri_j3_packed_range(
+            shells,
+            origins,
+            exps,
+            weights,
+            nprim,
+            aux_shells,
+            aux_origins,
+            aux_exps,
+            aux_weights,
+            aux_nprim,
+            int(start),
+            int(stop),
+            pair_bounds,
+            aux_diag,
+            ri_screen_tol,
+        )
+    return start, np.asarray(block, dtype=np.float64), int(computed), int(skipped)
+
+
+def _init_builtin_aux_metric_cython_worker(
+    aux_shells,
+    aux_origins,
+    aux_exps,
+    aux_weights,
+    aux_nprim,
+):
+    global _NATIVE_RI_CY_AUX_PACKED
+    _NATIVE_RI_CY_AUX_PACKED = (
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+    )
+
+
+def _aux_metric_cython_chunk_worker(task):
+    start, stop = task
+    aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _NATIVE_RI_CY_AUX_PACKED
+    block = _basis_cy.compute_aux_metric_range(
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+        int(start),
+        int(stop),
+    )
+    return start, np.asarray(block, dtype=np.float64)
+
+
+def _compute_aux_metric_cython_parallel(
+    aux_shells,
+    aux_origins,
+    aux_exps,
+    aux_weights,
+    aux_nprim,
+    workers,
+):
+    if _basis_cy is None or not hasattr(_basis_cy, "compute_aux_metric_range") or int(workers) <= 1:
+        return None
+    naux = int(aux_shells.shape[0])
+    if naux == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+
+    chunk = max(1, min(64, naux // max(int(workers) * 4, 1) or 1))
+    tasks = [(start, min(start + chunk, naux)) for start in range(0, naux, chunk)]
+    metric = np.zeros((naux, naux), dtype=np.float64)
+
+    start_methods = mp.get_all_start_methods()
+    ctx = mp.get_context("fork") if "fork" in start_methods else None
+    executor_kwargs = {}
+    if ctx is not None:
+        executor_kwargs["mp_context"] = ctx
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=int(workers),
+            initializer=_init_builtin_aux_metric_cython_worker,
+            initargs=(aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim),
+            **executor_kwargs,
+        ) as pool:
+            for start, block in pool.map(_aux_metric_cython_chunk_worker, tasks, chunksize=1):
+                stop = start + block.shape[0]
+                metric[start:stop, :] = block
+                for p in range(start, stop):
+                    local_p = p - start
+                    metric[:p + 1, p] = block[local_p, :p + 1]
+    except Exception:
+        return None
+
+    return metric
+
+
+def _compute_native_ri_pair_tensors_cython_parallel(
+    signatures,
+    aux_signatures,
+    pair_bounds,
+    ri_screen_tol,
+    workers,
+):
+    global _NATIVE_RI_LAST_KERNEL_INFO
+    _NATIVE_RI_LAST_KERNEL_INFO = {}
+    if (
+        _basis_cy is None
+        or not hasattr(_basis_cy, "compute_aux_metric")
+        or not hasattr(_basis_cy, "compute_ri_j3_packed_range")
+        or int(workers) <= 1
+    ):
+        return None
+
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+    aux_shells = np.ascontiguousarray(aux_shells, dtype=np.int64)
+    aux_origins = np.ascontiguousarray(aux_origins, dtype=np.float64)
+    aux_exps = np.ascontiguousarray(aux_exps, dtype=np.float64)
+    aux_weights = np.ascontiguousarray(aux_weights, dtype=np.float64)
+    aux_nprim = np.ascontiguousarray(aux_nprim, dtype=np.int64)
+    pair_bounds = np.ascontiguousarray(pair_bounds, dtype=np.float64)
+
+    metric = _compute_aux_metric_cython_parallel(
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+        workers,
+    )
+    if metric is None:
+        try:
+            metric = np.asarray(
+                _basis_cy.compute_aux_metric(
+                    aux_shells,
+                    aux_origins,
+                    aux_exps,
+                    aux_weights,
+                    aux_nprim,
+                ),
+                dtype=np.float64,
+            )
+        except Exception:
+            return None
+
+    naux = int(aux_shells.shape[0])
+    nao = int(shells.shape[0])
+    if naux == 0:
+        return metric, np.zeros((0, nao * (nao + 1) // 2), dtype=np.float64), 0, 0
+
+    npair = nao * (nao + 1) // 2
+    aux_diag = np.ascontiguousarray(np.sqrt(np.maximum(np.abs(np.diag(metric)), 0.0)), dtype=np.float64)
+    max_primary_l = max((sum(sig[0]) for sig in signatures), default=0)
+    use_shell_blocked_j3 = (
+        hasattr(_basis_cy, "compute_ri_j3_packed_range_shell_blocked_cached")
+        and max_primary_l <= 2
+    )
+    if use_shell_blocked_j3:
+        shell_blocks = _contiguous_shell_blocks_from_signatures(signatures)
+        aux_shell_blocks = _contiguous_shell_blocks_from_signatures(aux_signatures)
+        shell_starts = np.ascontiguousarray([start for start, _ in shell_blocks], dtype=np.int64)
+        shell_stops = np.ascontiguousarray([stop for _, stop in shell_blocks], dtype=np.int64)
+        aux_shell_starts = np.ascontiguousarray([start for start, _ in aux_shell_blocks], dtype=np.int64)
+        aux_shell_stops = np.ascontiguousarray([stop for _, stop in aux_shell_blocks], dtype=np.int64)
+        shell_pair_cache = _precompute_shell_pair_geometry(
+            shell_starts,
+            shell_stops,
+            origins,
+            exps,
+            nprim,
+        )
+    else:
+        shell_starts = np.zeros(0, dtype=np.int64)
+        shell_stops = np.zeros(0, dtype=np.int64)
+        aux_shell_starts = np.zeros(0, dtype=np.int64)
+        aux_shell_stops = np.zeros(0, dtype=np.int64)
+        shell_pair_cache = None
+    bytes_per_aux = max(1, npair * np.dtype(np.float64).itemsize)
+    if use_shell_blocked_j3:
+        target_block_bytes = 16 * 1024 * 1024
+        byte_limited_chunk = max(1, target_block_bytes // bytes_per_aux)
+        work_limited_chunk = max(1, naux // max(int(workers) * 3, 1))
+        chunk = max(1, max(byte_limited_chunk, work_limited_chunk))
+    else:
+        target_block_bytes = 4 * 1024 * 1024
+        byte_limited_chunk = max(1, target_block_bytes // bytes_per_aux)
+        work_limited_chunk = max(1, naux // max(int(workers) * 4, 1))
+        chunk = max(1, min(byte_limited_chunk, max(1, work_limited_chunk)))
+    if use_shell_blocked_j3:
+        tasks = []
+        task_start = None
+        task_stop = None
+        rows_in_task = 0
+        for start, stop in zip(aux_shell_starts.tolist(), aux_shell_stops.tolist()):
+            if task_start is None:
+                task_start = int(start)
+            task_stop = int(stop)
+            rows_in_task += int(stop) - int(start)
+            if rows_in_task >= chunk:
+                tasks.append((task_start, task_stop))
+                task_start = None
+                task_stop = None
+                rows_in_task = 0
+        if task_start is not None:
+            tasks.append((task_start, task_stop))
+    else:
+        tasks = [(start, min(start + chunk, naux)) for start in range(0, naux, chunk)]
+    j3_pair = np.zeros((naux, npair), dtype=np.float64)
+    computed = 0
+    skipped = 0
+
+    if use_shell_blocked_j3:
+        def compute_thread_task(task):
+            start, stop = task
+            block, block_computed, block_skipped = _basis_cy.compute_ri_j3_packed_range_shell_blocked_cached(
+                shells,
+                origins,
+                exps,
+                weights,
+                nprim,
+                aux_shells,
+                aux_origins,
+                aux_exps,
+                aux_weights,
+                aux_nprim,
+                int(start),
+                int(stop),
+                pair_bounds,
+                aux_diag,
+                shell_starts,
+                shell_stops,
+                aux_shell_starts,
+                aux_shell_stops,
+                *shell_pair_cache,
+                ri_screen_tol,
+            )
+            return int(start), np.asarray(block, dtype=np.float64), int(block_computed), int(block_skipped)
+
+        try:
+            with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+                for start, block, block_computed, block_skipped in pool.map(compute_thread_task, tasks):
+                    j3_pair[start:start + block.shape[0]] = block
+                    computed += int(block_computed)
+                    skipped += int(block_skipped)
+            _NATIVE_RI_LAST_KERNEL_INFO = {
+                "tensor_kernel": "shell-block-vrr-hrr",
+                "parallel_mode": "thread",
+                "shell_blocked": True,
+                "shell_pair_cache": True,
+                "task_count": int(len(tasks)),
+                "chunk_rows": int(chunk),
+                "workers": int(workers),
+                "max_primary_l": int(max_primary_l),
+            }
+            return metric, j3_pair, computed, skipped
+        except Exception:
+            return None
+
+    start_methods = mp.get_all_start_methods()
+    ctx = mp.get_context("fork") if "fork" in start_methods else None
+    executor_kwargs = {}
+    if ctx is not None:
+        executor_kwargs["mp_context"] = ctx
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=int(workers),
+            initializer=_init_builtin_ri_cython_worker,
+            initargs=(
+                shells,
+                origins,
+                exps,
+                weights,
+                nprim,
+                aux_shells,
+                aux_origins,
+                aux_exps,
+                aux_weights,
+                aux_nprim,
+                pair_bounds,
+                aux_diag,
+                shell_starts,
+                shell_stops,
+                aux_shell_starts,
+                aux_shell_stops,
+                shell_pair_cache,
+                use_shell_blocked_j3,
+                ri_screen_tol,
+            ),
+            **executor_kwargs,
+        ) as pool:
+            for start, block, block_computed, block_skipped in pool.map(
+                _ri_three_center_pair_cython_chunk_worker, tasks, chunksize=1
+            ):
+                j3_pair[start:start + block.shape[0]] = block
+                computed += int(block_computed)
+                skipped += int(block_skipped)
+    except Exception:
+        return None
+
+    _NATIVE_RI_LAST_KERNEL_INFO = {
+        "tensor_kernel": "ao-loop-packed",
+        "parallel_mode": "process",
+        "shell_blocked": False,
+        "task_count": int(len(tasks)),
+        "chunk_rows": int(chunk),
+        "workers": int(workers),
+    }
+    return metric, j3_pair, computed, skipped
+
+
+def _resolve_ri_tensor_backend(mol):
+    backend = str(
+        getattr(mol, "builtin_ri_tensor_backend", getattr(mol, "native_ri_tensor_backend", "auto"))
+    ).lower().replace("_", "-")
+    aliases = {
+        "compiled": "cython",
+        "c": "cython",
+        "serial": "python",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in {"auto", "native", "cython", "python"}:
+        raise ValueError("builtin_ri_tensor_backend must be 'auto', 'native', 'cython', or 'python'.")
+    return backend
 
 
 def _compute_three_center_tensor_from_signatures(signatures, aux_signatures):
@@ -2056,10 +2704,14 @@ def _compute_three_center_pair_tensor_from_signatures(signatures, aux_signatures
     return j3, computed, skipped
 
 
-def _init_builtin_ri_worker(signatures, aux_signatures):
+def _init_builtin_ri_worker(signatures, aux_signatures, pair_bounds=None, aux_diag=None, ri_screen_tol=0.0):
     global _NATIVE_RI_AO_SIGNATURES, _NATIVE_RI_AUX_SIGNATURES
+    global _NATIVE_RI_PAIR_BOUNDS, _NATIVE_RI_AUX_DIAG, _NATIVE_RI_SCREEN_TOL
     _NATIVE_RI_AO_SIGNATURES = signatures
     _NATIVE_RI_AUX_SIGNATURES = aux_signatures
+    _NATIVE_RI_PAIR_BOUNDS = pair_bounds
+    _NATIVE_RI_AUX_DIAG = aux_diag
+    _NATIVE_RI_SCREEN_TOL = float(ri_screen_tol or 0.0)
 
 
 def _ri_three_center_chunk_worker(task):
@@ -2077,6 +2729,41 @@ def _ri_three_center_chunk_worker(task):
                 block[local_p, i, j] = value
                 block[local_p, j, i] = value
     return start, block
+
+
+def _ri_three_center_pair_chunk_worker(task):
+    start, stop = task
+    signatures = _NATIVE_RI_AO_SIGNATURES
+    aux_signatures = _NATIVE_RI_AUX_SIGNATURES
+    pair_bounds = _NATIVE_RI_PAIR_BOUNDS
+    aux_diag = _NATIVE_RI_AUX_DIAG
+    ri_screen_tol = _NATIVE_RI_SCREEN_TOL
+    nao = len(signatures)
+    npair = nao * (nao + 1) // 2
+    block = np.zeros((stop - start, npair), dtype=float)
+    computed = 0
+    skipped = 0
+    for local_p, p in enumerate(range(start, stop)):
+        aux_sig = aux_signatures[p]
+        pair = 0
+        for i in range(nao):
+            sig_i = signatures[i]
+            for j in range(i + 1):
+                if (
+                    ri_screen_tol > 0.0
+                    and pair_bounds is not None
+                    and aux_diag is not None
+                    and pair_bounds[i, j] * aux_diag[p] < ri_screen_tol
+                ):
+                    skipped += 1
+                    pair += 1
+                    continue
+                block[local_p, pair] = _contracted_three_center_from_signatures(
+                    sig_i, signatures[j], aux_sig
+                )
+                computed += 1
+                pair += 1
+    return start, block, computed, skipped
 
 
 def _compute_three_center_tensor_parallel(signatures, aux_signatures, workers):
@@ -2108,6 +2795,67 @@ def _compute_three_center_tensor_parallel(signatures, aux_signatures, workers):
         return _compute_three_center_tensor_from_signatures(signatures, aux_signatures)
 
     return j3
+
+
+def _compute_three_center_pair_tensor_parallel(
+    signatures,
+    aux_signatures,
+    workers,
+    pair_bounds=None,
+    ri_screen_tol=0.0,
+):
+    naux = len(aux_signatures)
+    nao = len(signatures)
+    if workers <= 1 or naux == 0:
+        return _compute_three_center_pair_tensor_from_signatures(
+            signatures,
+            aux_signatures,
+            pair_bounds=pair_bounds,
+            ri_screen_tol=ri_screen_tol,
+        )
+
+    aux_diag = None
+    if ri_screen_tol > 0.0:
+        aux_diag = np.array([
+            math.sqrt(max(abs(float(np.real(_contracted_two_center_coulomb_from_signatures(sig, sig)))), 0.0))
+            for sig in aux_signatures
+        ])
+
+    npair = nao * (nao + 1) // 2
+    chunk = max(1, naux // max(workers * 4, 1))
+    tasks = [(start, min(start + chunk, naux)) for start in range(0, naux, chunk)]
+    j3 = np.zeros((naux, npair), dtype=float)
+    computed = 0
+    skipped = 0
+
+    start_methods = mp.get_all_start_methods()
+    ctx = mp.get_context("fork") if "fork" in start_methods else None
+    executor_kwargs = {}
+    if ctx is not None:
+        executor_kwargs["mp_context"] = ctx
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_builtin_ri_worker,
+            initargs=(signatures, aux_signatures, pair_bounds, aux_diag, ri_screen_tol),
+            **executor_kwargs,
+        ) as pool:
+            for start, block, block_computed, block_skipped in pool.map(
+                _ri_three_center_pair_chunk_worker, tasks
+            ):
+                j3[start:start + block.shape[0]] = block
+                computed += int(block_computed)
+                skipped += int(block_skipped)
+    except Exception:
+        return _compute_three_center_pair_tensor_from_signatures(
+            signatures,
+            aux_signatures,
+            pair_bounds=pair_bounds,
+            ri_screen_tol=ri_screen_tol,
+        )
+
+    return j3, computed, skipped
 
 
 def _metric_factorize_ri(metric, j3_pair, tol=1e-10, solver="auto", block_size=None):
@@ -2167,68 +2915,365 @@ def _builtin_ri_worker_count(mol, nao, naux):
     return min(4, max(1, os.cpu_count() or 1))
 
 
+def _native_ri_cache_enabled(mol):
+    return bool(getattr(mol, "builtin_ri_cache", getattr(mol, "native_ri_cache", True)))
+
+
+def _native_ri_cache_dir(mol):
+    cache_dir = getattr(mol, "builtin_ri_cache_dir", getattr(mol, "native_ri_cache_dir", None))
+    if cache_dir is None:
+        cache_dir = os.environ.get("PYQED_RI_CACHE_DIR")
+    if cache_dir is None:
+        cache_dir = os.path.join(tempfile.gettempdir(), "pyqed-ri-cache")
+    return os.path.abspath(os.path.expanduser(str(cache_dir)))
+
+
+def _native_ri_cache_key(
+    mol,
+    signatures,
+    aux_signatures,
+    auxbasis,
+    purpose,
+    ri_screen_tol,
+    metric_tol,
+    metric_solver,
+    tensor_backend,
+):
+    payload = (
+        "pyqed-native-ri-v5",
+        getattr(pyqed, "__version__", None),
+        tuple(getattr(mol, "atom_symbols", lambda: [])()),
+        tuple(np.round(np.asarray(getattr(mol, "atom_coords", lambda: np.zeros((0, 3)))()), 12).reshape(-1).tolist()),
+        repr(getattr(mol, "basis", None)),
+        str(auxbasis),
+        str(purpose),
+        int(getattr(mol, "charge", 0)),
+        int(getattr(mol, "spin", 0)),
+        float(ri_screen_tol),
+        float(metric_tol),
+        str(metric_solver),
+        str(tensor_backend),
+        signatures,
+        aux_signatures,
+    )
+    return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _basis_file_fingerprint(basis_name):
+    path = _basis_path(basis_name)
+    stat = os.stat(path)
+    return (os.path.basename(path), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _native_ri_fast_cache_key(
+    mol,
+    signatures,
+    auxbasis,
+    purpose,
+    ri_screen_tol,
+    metric_tol,
+    metric_solver,
+    tensor_backend,
+):
+    payload = (
+        "pyqed-native-ri-fast-v1",
+        getattr(pyqed, "__version__", None),
+        tuple(getattr(mol, "atom_symbols", lambda: [])()),
+        tuple(np.round(np.asarray(getattr(mol, "atom_coords", lambda: np.zeros((0, 3)))()), 12).reshape(-1).tolist()),
+        repr(getattr(mol, "basis", None)),
+        _basis_file_fingerprint(getattr(mol, "basis", None)),
+        str(auxbasis),
+        _basis_file_fingerprint(auxbasis),
+        str(purpose),
+        int(getattr(mol, "charge", 0)),
+        int(getattr(mol, "spin", 0)),
+        float(ri_screen_tol),
+        float(metric_tol),
+        str(metric_solver),
+        str(tensor_backend),
+        signatures,
+    )
+    return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _native_ri_cache_path(mol, cache_key):
+    return os.path.join(_native_ri_cache_dir(mol), f"native-ri-{cache_key}.npz")
+
+
+def _native_ri_cache_array_path(mol, cache_key):
+    return os.path.join(_native_ri_cache_dir(mol), f"native-ri-{cache_key}.factors.npy")
+
+
+def _native_ri_cache_info_path(mol, cache_key):
+    return os.path.join(_native_ri_cache_dir(mol), f"native-ri-{cache_key}.json")
+
+
+def _load_native_ri_factor_cache(mol, cache_key):
+    if not _native_ri_cache_enabled(mol):
+        return None
+    array_path = _native_ri_cache_array_path(mol, cache_key)
+    info_path = _native_ri_cache_info_path(mol, cache_key)
+    if os.path.exists(array_path) and os.path.exists(info_path):
+        try:
+            mmap_mode = getattr(mol, "builtin_ri_cache_mmap", getattr(mol, "native_ri_cache_mmap", "r"))
+            if mmap_mode is True:
+                mmap_mode = "r"
+            elif mmap_mode is False:
+                mmap_mode = None
+            factors_pair = np.load(array_path, mmap_mode=mmap_mode, allow_pickle=False)
+            with open(info_path, "r", encoding="utf-8") as handle:
+                info = json.load(handle)
+        except Exception:
+            return None
+        info["cache_hit"] = True
+        info["cache_file"] = array_path
+        info["cache_info_file"] = info_path
+        info["cache_format"] = "npy-mmap" if isinstance(factors_pair, np.memmap) else "npy"
+        return factors_pair, info
+
+    path = _native_ri_cache_path(mol, cache_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            factors_pair = np.asarray(data["factors_pair"], dtype=np.float64)
+            info_json = str(data["info_json"].item())
+        info = json.loads(info_json)
+    except Exception:
+        return None
+    info["cache_hit"] = True
+    info["cache_file"] = path
+    info["cache_format"] = "npz"
+    return factors_pair, info
+
+
+def _write_native_ri_factor_cache(mol, cache_key, factors_pair, info):
+    if not _native_ri_cache_enabled(mol):
+        return
+    cache_dir = _native_ri_cache_dir(mol)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        array_path = _native_ri_cache_array_path(mol, cache_key)
+        info_path = _native_ri_cache_info_path(mol, cache_key)
+        tmp_array = f"{array_path}.{os.getpid()}.tmp"
+        tmp_info = f"{info_path}.{os.getpid()}.tmp"
+        cache_info = dict(info)
+        cache_info["cache_hit"] = False
+        cache_info["cache_file"] = array_path
+        cache_info["cache_info_file"] = info_path
+        cache_info["cache_format"] = "npy"
+        with open(tmp_array, "wb") as handle:
+            np.save(handle, np.asarray(factors_pair, dtype=np.float64), allow_pickle=False)
+        with open(tmp_info, "w", encoding="utf-8") as handle:
+            json.dump(cache_info, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_array, array_path)
+        os.replace(tmp_info, info_path)
+    except Exception:
+        return
+
+
+def _native_one_electron_cache_enabled(mol):
+    default = _native_ri_cache_enabled(mol)
+    return bool(getattr(mol, "builtin_one_electron_cache", getattr(mol, "native_one_electron_cache", default)))
+
+
+def _native_one_electron_cache_key(mol, signatures, atcoords, atnums):
+    payload = (
+        "pyqed-native-one-electron-v1",
+        getattr(pyqed, "__version__", None),
+        tuple(getattr(mol, "atom_symbols", lambda: [])()),
+        tuple(np.round(np.asarray(atcoords, dtype=float), 12).reshape(-1).tolist()),
+        tuple(np.asarray(atnums, dtype=float).reshape(-1).tolist()),
+        repr(getattr(mol, "basis", None)),
+        signatures,
+    )
+    return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _native_one_electron_cache_path(mol, cache_key):
+    return os.path.join(_native_ri_cache_dir(mol), f"native-onee-{cache_key}.npz")
+
+
+def _load_native_one_electron_cache(mol, cache_key):
+    if not _native_one_electron_cache_enabled(mol):
+        return None
+    path = _native_one_electron_cache_path(mol, cache_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            overlap = np.asarray(data["overlap"], dtype=np.float64)
+            kinetic = np.asarray(data["kinetic"], dtype=np.float64)
+            vnuc = np.asarray(data["vnuc"], dtype=np.float64)
+    except Exception:
+        return None
+    return overlap, kinetic, vnuc, path
+
+
+def _write_native_one_electron_cache(mol, cache_key, overlap, kinetic, vnuc):
+    if not _native_one_electron_cache_enabled(mol):
+        return
+    cache_dir = _native_ri_cache_dir(mol)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        path = _native_one_electron_cache_path(mol, cache_key)
+        tmp = f"{path}.{os.getpid()}.tmp.npz"
+        np.savez(
+            tmp,
+            overlap=np.asarray(overlap, dtype=np.float64),
+            kinetic=np.asarray(kinetic, dtype=np.float64),
+            vnuc=np.asarray(vnuc, dtype=np.float64),
+        )
+        os.replace(tmp, path)
+    except Exception:
+        return
+
+
+def _resolve_native_ri_storage(mol, purpose):
+    storage = str(getattr(mol, "builtin_ri_storage", getattr(mol, "native_ri_storage", "auto"))).lower()
+    if storage == "auto":
+        purpose_key = str(purpose or "jk").lower().replace("_", "-")
+        storage = "full" if purpose_key in {"auto", "j", "jk", "scf", "hf", "rhf"} else "packed"
+    if storage not in {"packed", "full"}:
+        raise ValueError("builtin_ri_storage/native_ri_storage must be 'auto', 'packed', or 'full'.")
+    return storage
+
+
 def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     auxbasis = getattr(mol, "builtin_auxbasis", getattr(mol, "native_auxbasis", None))
     purpose = getattr(mol, "builtin_ri_purpose", getattr(mol, "native_ri_purpose", "jk"))
     if auxbasis is None:
-        auxbasis = _default_auxbasis_name(mol.basis, purpose=purpose)
+        auxbasis = _default_auxbasis_name(mol.basis, purpose=purpose, required_symbols=atoms)
 
+    signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+    ri_screen_tol = getattr(mol, "builtin_ri_screen_tol", getattr(mol, "native_ri_screen_tol", None))
+    if ri_screen_tol is None:
+        ri_screen_tol = getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12))
+    ri_screen_tol = float(ri_screen_tol or 0.0)
+    tol = float(getattr(mol, "builtin_ri_metric_tol", getattr(mol, "native_ri_metric_tol", 1e-10)))
+    metric_solver = getattr(mol, "builtin_ri_metric_solver", getattr(mol, "native_ri_metric_solver", "auto"))
+    tensor_backend = _resolve_ri_tensor_backend(mol)
+    storage = _resolve_native_ri_storage(mol, purpose)
+    cache_key = _native_ri_fast_cache_key(
+        mol,
+        signatures,
+        auxbasis,
+        purpose,
+        ri_screen_tol,
+        tol,
+        metric_solver,
+        tensor_backend,
+    )
+    ri_timings = {}
+    t0 = time.perf_counter()
+    cached = _load_native_ri_factor_cache(mol, cache_key)
+    ri_timings["cache_lookup"] = time.perf_counter() - t0
+    if cached is not None:
+        factors_pair, info = cached
+        info["storage"] = storage
+        info["timings"] = {key: float(value) for key, value in ri_timings.items()}
+        factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
+        return factors, info
+
+    t0 = time.perf_counter()
     aux_dict = parse_gbs(_basis_path(auxbasis))
     try:
-        aux_cart = make_contractions(aux_dict, atoms, atcoords, coord_types='c')
+        aux_signatures = _make_contraction_signatures(aux_dict, atoms, atcoords, coord_types="c")
     except KeyError as exc:
         raise ValueError(
             f"Auxiliary basis {auxbasis!r} does not define element {exc.args[0]!r} "
             "needed by this molecule."
         ) from exc
-
-    signatures = tuple(_basis_signature(fn) for fn in basis_cart)
-    aux_signatures = tuple(_basis_signature(fn) for fn in aux_cart)
     pair_bounds = _compute_pair_bounds(signatures)
-    ri_screen_tol = getattr(mol, "builtin_ri_screen_tol", getattr(mol, "native_ri_screen_tol", None))
-    if ri_screen_tol is None:
-        ri_screen_tol = getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12))
-    ri_screen_tol = float(ri_screen_tol or 0.0)
-    cy_tensors = _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol)
-    if cy_tensors is None:
+    ri_timings["auxbasis_setup"] = time.perf_counter() - t0
+
+    legacy_cache_key = _native_ri_cache_key(
+        mol,
+        signatures,
+        aux_signatures,
+        auxbasis,
+        purpose,
+        ri_screen_tol,
+        tol,
+        metric_solver,
+        tensor_backend,
+    )
+    if legacy_cache_key != cache_key:
+        t0 = time.perf_counter()
+        cached = _load_native_ri_factor_cache(mol, legacy_cache_key)
+        ri_timings["legacy_cache_lookup"] = time.perf_counter() - t0
+        if cached is not None:
+            factors_pair, info = cached
+            info["storage"] = storage
+            info["cache_key"] = cache_key
+            info["legacy_cache_key"] = legacy_cache_key
+            info["timings"] = {**dict(info.get("timings", {}) or {}), **ri_timings}
+            _write_native_ri_factor_cache(mol, cache_key, factors_pair, info)
+            factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
+            return factors, info
+
+    tensors = None
+    tensor_builder = None
+    workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
+    t0 = time.perf_counter()
+    if tensor_backend in {"auto", "native", "cython"}:
+        if workers > 1:
+            tensors = _compute_native_ri_pair_tensors_cython_parallel(
+                signatures,
+                aux_signatures,
+                pair_bounds,
+                ri_screen_tol,
+                workers,
+            )
+            if tensors is not None:
+                tensor_builder = "cython-kernel-packed-parallel"
+        if tensors is None:
+            tensors = _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol)
+        if tensors is not None:
+            if tensor_builder is None:
+                tensor_builder = "cython-kernel-packed"
+                workers = 1
+        elif tensor_backend == "cython":
+            raise RuntimeError("builtin_ri_tensor_backend='cython' was requested, but no compiled RI tensor kernel is available.")
+
+    if tensors is None:
         metric = _compute_aux_coulomb_metric(aux_signatures)
-        workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_cart))
-        j3_pair, ri_computed, ri_skipped = _compute_three_center_pair_tensor_from_signatures(
+        j3_pair, ri_computed, ri_skipped = _compute_three_center_pair_tensor_parallel(
             signatures,
             aux_signatures,
+            workers,
             pair_bounds=pair_bounds,
             ri_screen_tol=ri_screen_tol,
         )
-        tensor_builder = "python"
+        tensor_builder = "python-parallel" if workers > 1 else "python"
     else:
-        metric, j3_pair, ri_computed, ri_skipped = cy_tensors
-        workers = 1
-        tensor_builder = "cython-kernel-packed"
+        metric, j3_pair, ri_computed, ri_skipped = tensors
+        if tensor_builder != "cython-kernel-packed-parallel":
+            workers = 1
+    ri_timings["tensor_build"] = time.perf_counter() - t0
+    kernel_info = dict(_NATIVE_RI_LAST_KERNEL_INFO or {})
     evals, evecs = np.linalg.eigh(metric)
-    tol = float(getattr(mol, "builtin_ri_metric_tol", getattr(mol, "native_ri_metric_tol", 1e-10)))
     keep = evals > tol
     if not np.any(keep):
         raise ValueError(
             f"Auxiliary Coulomb metric for {auxbasis!r} has no eigenvalues above ri_metric_tol={tol:g}."
         )
 
+    t0 = time.perf_counter()
     factors_pair, factor_info = _metric_factorize_ri(
         metric,
         j3_pair,
         tol=tol,
-        solver=getattr(mol, "builtin_ri_metric_solver", getattr(mol, "native_ri_metric_solver", "auto")),
+        solver=metric_solver,
         block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
     )
-    storage = str(getattr(mol, "builtin_ri_storage", getattr(mol, "native_ri_storage", "auto"))).lower()
-    if storage == "auto":
-        storage = "full" if str(purpose or "jk").lower().replace("_", "-") in {"auto", "j", "jk", "scf", "hf", "rhf"} else "packed"
-    if storage not in {"packed", "full"}:
-        raise ValueError("builtin_ri_storage/native_ri_storage must be 'auto', 'packed', or 'full'.")
+    ri_timings["metric_factorize"] = time.perf_counter() - t0
     factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
     info = {
         "auxbasis": auxbasis,
         "purpose": purpose,
-        "naux": len(aux_cart),
+        "naux": len(aux_signatures),
         "metric_rank": int(factor_info["metric_rank"]),
         "metric_min_eig": float(np.min(evals)),
         "metric_max_eig": float(np.max(evals)),
@@ -2236,12 +3281,22 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         "block_size": factor_info["block_size"],
         "workers": int(workers),
         "tensor_builder": tensor_builder,
+        "tensor_kernel": kernel_info.get("tensor_kernel"),
+        "parallel_mode": kernel_info.get("parallel_mode"),
+        "kernel_info": kernel_info,
+        "tensor_backend": tensor_backend,
         "storage": storage,
         "pair_shape": tuple(int(x) for x in factors_pair.shape),
         "screen_tol": float(ri_screen_tol),
         "three_center_computed": int(ri_computed),
         "three_center_screened": int(ri_skipped),
+        "cache_hit": False,
+        "cache_key": cache_key,
+        "timings": {key: float(value) for key, value in ri_timings.items()},
     }
+    t0 = time.perf_counter()
+    _write_native_ri_factor_cache(mol, cache_key, factors_pair, info)
+    info["timings"]["cache_write"] = float(time.perf_counter() - t0)
     return factors, info
 
 
@@ -2388,6 +3443,80 @@ def _pair_factor_blocks_to_vk(pair_factors, dm, nao, block_size=None):
     return vk
 
 
+def _ri_occ_block_size(nao, nocc, naux=None, target_bytes=16 * 1024 * 1024):
+    bytes_per_factor = max(1, int(nao) * int(nao) * 8)
+    bytes_per_bc = max(1, int(nao) * int(nocc) * 8)
+    bytes_per_aux = bytes_per_factor + bytes_per_bc
+    block_size = max(1, int(target_bytes) // bytes_per_aux)
+    if naux is not None:
+        block_size = min(block_size, int(naux))
+    return block_size
+
+
+def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=None):
+    pair_factors = np.asarray(pair_factors, dtype=np.float64)
+    mo_coeff = np.ascontiguousarray(mo_coeff, dtype=np.float64)
+    mo_occ = np.asarray(mo_occ, dtype=np.float64)
+    occ_idx = np.abs(mo_occ) > 1e-14
+    if not np.any(occ_idx):
+        return np.zeros((nao, nao), dtype=np.float64), np.zeros((nao, nao), dtype=np.float64)
+
+    c_occ = np.ascontiguousarray(mo_coeff[:, occ_idx], dtype=np.float64)
+    occ = mo_occ[occ_idx]
+    c_weighted = np.ascontiguousarray(c_occ * occ[None, :], dtype=np.float64)
+    nocc = c_occ.shape[1]
+    if block_size is None:
+        block_size = _ri_occ_block_size(nao, nocc, pair_factors.shape[0])
+    else:
+        block_size = max(1, int(block_size))
+
+    j_pairs = np.zeros(pair_factors.shape[1], dtype=np.float64)
+    vk = np.zeros((nao, nao), dtype=np.float64)
+    for start in range(0, pair_factors.shape[0], block_size):
+        stop = min(start + block_size, pair_factors.shape[0])
+        packed = pair_factors[start:stop]
+        factors = _pair_factors_to_full(packed, nao)
+        bc = np.einsum("pij,ja->pia", factors, c_occ, optimize=True)
+        coeff = np.einsum("ia,pia->p", c_weighted, bc, optimize=True)
+        j_pairs += coeff @ packed
+        bc *= np.sqrt(np.abs(occ))[None, None, :]
+        vk += np.einsum("pia,pja->ij", bc, bc, optimize=True)
+
+    vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
+    return vj, vk
+
+
+def _contract_jk_ri_occ_full(eri_factors, mo_coeff, mo_occ, nao, block_size=None):
+    eri_factors = np.asarray(eri_factors, dtype=np.float64)
+    mo_coeff = np.ascontiguousarray(mo_coeff, dtype=np.float64)
+    mo_occ = np.asarray(mo_occ, dtype=np.float64)
+    occ_idx = np.abs(mo_occ) > 1e-14
+    if not np.any(occ_idx):
+        return np.zeros((nao, nao), dtype=np.float64), np.zeros((nao, nao), dtype=np.float64)
+
+    c_occ = np.ascontiguousarray(mo_coeff[:, occ_idx], dtype=np.float64)
+    occ = mo_occ[occ_idx]
+    c_weighted = np.ascontiguousarray(c_occ * occ[None, :], dtype=np.float64)
+    nocc = c_occ.shape[1]
+    if block_size is None:
+        block_size = _ri_occ_block_size(nao, nocc, eri_factors.shape[0])
+    else:
+        block_size = max(1, int(block_size))
+
+    vj = np.zeros((nao, nao), dtype=np.float64)
+    vk = np.zeros((nao, nao), dtype=np.float64)
+    sqrt_occ = np.sqrt(np.abs(occ))
+    for start in range(0, eri_factors.shape[0], block_size):
+        stop = min(start + block_size, eri_factors.shape[0])
+        factors = np.ascontiguousarray(eri_factors[start:stop], dtype=np.float64)
+        bc = np.einsum("pij,ja->pia", factors, c_occ, optimize=True)
+        coeff = np.einsum("ia,pia->p", c_weighted, bc, optimize=True)
+        vj += np.einsum("p,pij->ij", coeff, factors, optimize=True)
+        bc *= sqrt_occ[None, None, :]
+        vk += np.einsum("pia,pja->ij", bc, bc, optimize=True)
+    return vj, vk
+
+
 class PackedRIFactors:
     """
     Lazy compatibility wrapper for RI/DF factors stored over unique AO pairs.
@@ -2399,8 +3528,12 @@ class PackedRIFactors:
 
     __array_priority__ = 1000
 
-    def __init__(self, pair_factors, nao):
-        pair_factors = np.ascontiguousarray(pair_factors, dtype=np.float64)
+    def __init__(self, pair_factors, nao, copy=False):
+        pair_factors = np.asarray(pair_factors, dtype=np.float64)
+        if copy:
+            pair_factors = np.ascontiguousarray(pair_factors, dtype=np.float64).copy()
+        elif not pair_factors.flags.c_contiguous:
+            pair_factors = np.ascontiguousarray(pair_factors, dtype=np.float64)
         nao = int(nao)
         npair = nao * (nao + 1) // 2
         if pair_factors.ndim != 2 or pair_factors.shape[1] != npair:
@@ -2626,6 +3759,20 @@ def contract_jk_ri(eri_factors, dm, nao):
     return vj, vk
 
 
+def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao):
+    """
+    Contract RI/DF factors for an idempotent MO density.
+
+    This evaluates the same J/K matrices as ``contract_jk_ri`` for
+    ``dm = C occ C.T`` but avoids the full-density exchange contraction.
+    """
+    nao = int(nao)
+    if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
+        pair_factors = _as_ri_pair_factors(eri_factors, nao)
+        return _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao)
+    return _contract_jk_ri_occ_full(eri_factors, mo_coeff, mo_occ, nao)
+
+
 def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
     """
     Transform AO RI factors to an MO pair block without forcing packed factors
@@ -2738,20 +3885,34 @@ def build_builtin(mol):
     timings["basis_setup"] = time.perf_counter() - t0
     nao_cart = len(basis_cart)
     signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+
     t0 = time.perf_counter()
-    one_electron_result = _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums)
-    if one_electron_result is not None:
-        overlap_mat, kinetic_mat, vnuc_mat = one_electron_result
+    one_electron_cache_key = _native_one_electron_cache_key(mol, signatures, atcoords, atnums)
+    one_electron_cached = _load_native_one_electron_cache(mol, one_electron_cache_key)
+    timings["one_electron_cache_lookup"] = time.perf_counter() - t0
+    if one_electron_cached is not None:
+        overlap_mat, kinetic_mat, vnuc_mat, one_electron_cache_file = one_electron_cached
+        timings["one_electron"] = 0.0
+        timings["one_electron_cache_hit"] = 1.0
     else:
-        overlap_mat, kinetic_mat, vnuc_mat = _compute_one_electron_shellblocked(
-            basis_cart,
-            atcoords,
-            atnums,
-        )
-    timings["one_electron"] = time.perf_counter() - t0
+        timings["one_electron_cache_hit"] = 0.0
+        t0 = time.perf_counter()
+        one_electron_result = _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums)
+        if one_electron_result is not None:
+            overlap_mat, kinetic_mat, vnuc_mat = one_electron_result
+        else:
+            overlap_mat, kinetic_mat, vnuc_mat = _compute_one_electron_shellblocked(
+                basis_cart,
+                atcoords,
+                atnums,
+            )
+        timings["one_electron"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        _write_native_one_electron_cache(mol, one_electron_cache_key, overlap_mat, kinetic_mat, vnuc_mat)
+        timings["one_electron_cache_write"] = time.perf_counter() - t0
 
     screen_tol = float(
-        getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12)) or 0.0
+        getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-10)) or 0.0
     )
     eri_backend = str(
         getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
@@ -2848,7 +4009,6 @@ def build_builtin(mol):
                 eri_backend == "auto"
                 and _rys_cy is not None
                 and _signatures_are_sp_only(signatures)
-                and workers == 1
             )
         )
         t0 = time.perf_counter()
@@ -3351,6 +4511,51 @@ def make_contractions(basis_dict, atoms, coords, coord_types):
                         )
                     )
     return tuple(basis)
+
+
+def _make_contraction_signatures(basis_dict, atoms, coords, coord_types="c"):
+    """Build builtin integral signatures directly, without GTO objects."""
+    if not (isinstance(atoms, (list, tuple)) and all(isinstance(i, str) for i in atoms)):
+        raise TypeError("Atoms must be provided as a list or tuple.")
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise TypeError("Coordinates must be a two-dimensional array with three columns.")
+    if len(atoms) != coords.shape[0]:
+        raise ValueError("Number of atoms must be equal to the number of rows in the coordinates.")
+    if coord_types not in {"c", "cartesian"}:
+        raise ValueError("Direct builtin signatures currently support Cartesian coord_types only.")
+
+    signatures = []
+    for atom, coord in zip(atoms, coords):
+        if atom not in basis_dict:
+            raise KeyError(atom)
+        origin = tuple(float(x) for x in coord)
+        for angmom, exps, coeffs in basis_dict[atom]:
+            coeffs = np.asarray(coeffs, dtype=float)
+            if coeffs.ndim == 1:
+                coeffs = coeffs[:, None]
+            exps_tuple = tuple(float(x) for x in np.asarray(exps, dtype=float))
+            for shell in _shell(int(angmom)):
+                shell_tuple = tuple(int(x) for x in shell)
+                for icontr in range(coeffs.shape[1]):
+                    coefs_tuple = tuple(float(x) for x in coeffs[:, icontr])
+                    tpl_exps, _tpl_coefs, _tpl_norm, tpl_prim_weights = (
+                        _normalized_contracted_gaussian_template(
+                            shell_tuple,
+                            exps_tuple,
+                            coefs_tuple,
+                        )
+                    )
+                    signatures.append(
+                        (
+                            shell_tuple,
+                            origin,
+                            tpl_exps,
+                            tuple(float(x) for x in tpl_prim_weights),
+                        )
+                    )
+    return tuple(signatures)
+
 
 def _shell(l):
     """

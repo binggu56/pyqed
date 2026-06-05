@@ -27,12 +27,15 @@ def combine_systems(
     ewald_alpha=0.35,
     ewald_kmax=5,
     pme_mesh=(16, 16, 16),
+    nonbonded_skin=1.0,
 ):
     """Combine multiple :class:`Atoms` objects and their topology metadata."""
     atom_records = []
     topologies = []
     constraint_pairs = []
     constraint_distances = []
+    residue_names = []
+    residue_ids = []
     atom_offset = 0
     molecule_offset = 0
     for system in systems:
@@ -41,6 +44,16 @@ def combine_systems(
         atom_records.extend([[symbol, tuple(xyz)] for symbol, xyz in zip(symbols, positions)])
         topology = _topology_with_defaults(system).shifted(atom_offset, molecule_offset)
         topologies.append(topology)
+        if system.has("residue_names"):
+            residue_names.extend(system.get_array("residue_names"))
+        else:
+            residue_names.extend(["MOL"] * len(system))
+        if system.has("residue_ids"):
+            residue_ids.extend(system.get_array("residue_ids"))
+        elif topology.molecule_ids is not None:
+            residue_ids.extend(topology.molecule_ids)
+        else:
+            residue_ids.extend(np.arange(molecule_offset + 1, molecule_offset + len(system) + 1))
         for constraint in system.constraints:
             if isinstance(constraint, FixBondLengths):
                 targets = constraint._targets(system)
@@ -61,8 +74,12 @@ def combine_systems(
             bonds=topology.bonds,
             angles=topology.angles,
             torsions=topology.torsions,
+            impropers=getattr(topology, "impropers", []),
+            cmaps=getattr(topology, "cmaps", []),
+            cmap_grids=getattr(topology, "cmap_grids", []),
             angle_unit="degree",
             torsion_unit="degree",
+            improper_unit="degree",
             charges=topology.charges,
             coulomb_constant=coulomb_constant,
             coulomb_method=coulomb_method,
@@ -70,8 +87,16 @@ def combine_systems(
             ewald_alpha=ewald_alpha,
             ewald_kmax=ewald_kmax,
             pme_mesh=pme_mesh,
+            nonbonded_skin=nonbonded_skin,
             lj_epsilon=topology.lj_epsilon,
             lj_sigma=topology.lj_sigma,
+            atom_types=getattr(topology, "atom_types", None),
+            lj_pair_overrides=getattr(topology, "lj_pair_overrides", None),
+            nonbonded_exclusions=getattr(topology, "nonbonded_exclusions", None),
+            lj_exclusions=getattr(topology, "lj_exclusions", None),
+            coulomb_exclusions=getattr(topology, "coulomb_exclusions", None),
+            lj_pair_scales=getattr(topology, "lj_pair_scales", None),
+            coulomb_pair_scales=getattr(topology, "coulomb_pair_scales", None),
             lj_cutoff=lj_cutoff,
             exclude_bonded=True,
             exclude_angles=True,
@@ -87,6 +112,14 @@ def combine_systems(
     combined.set_array("lj_epsilon", topology.lj_epsilon, float, ())
     combined.set_array("lj_sigma", topology.lj_sigma, float, ())
     combined.set_array("molecule_ids", topology.molecule_ids, int, ())
+    if topology.masses_amu is not None:
+        combined.set_array("masses_amu", topology.masses_amu, float, ())
+    if topology.atom_types is not None:
+        combined.set_array("atom_types", topology.atom_types, str, ())
+    if topology.atom_names is not None:
+        combined.set_array("atom_names", topology.atom_names, str, ())
+    combined.set_array("residue_names", np.asarray(residue_names), str, ())
+    combined.set_array("residue_ids", np.asarray(residue_ids), int if _all_int_like(residue_ids) else str, ())
     return combined
 
 
@@ -104,6 +137,7 @@ def solvate_box(
     ewald_kmax=5,
     pme_mesh=(16, 16, 16),
     rigid=False,
+    nonbonded_skin=1.0,
     placement="grid",
     seed=None,
     max_attempts=10000,
@@ -164,6 +198,7 @@ def solvate_box(
             ewald_alpha=ewald_alpha,
             ewald_kmax=ewald_kmax,
             pme_mesh=pme_mesh,
+            nonbonded_skin=nonbonded_skin,
         )
     else:
         system = combine_systems(
@@ -176,6 +211,7 @@ def solvate_box(
             ewald_alpha=ewald_alpha,
             ewald_kmax=ewald_kmax,
             pme_mesh=pme_mesh,
+            nonbonded_skin=nonbonded_skin,
         )
     system.solvation = {
         "placement": placement,
@@ -221,10 +257,22 @@ def _topology_with_defaults(atoms):
         bonds=topology.bonds,
         angles=topology.angles,
         torsions=getattr(topology, "torsions", []),
+        impropers=getattr(topology, "impropers", []),
+        cmaps=getattr(topology, "cmaps", []),
+        cmap_grids=getattr(topology, "cmap_grids", []),
         charges=_array_or_zeros(topology.charges, natoms),
         lj_epsilon=_array_or_zeros(topology.lj_epsilon, natoms),
         lj_sigma=_array_or_zeros(topology.lj_sigma, natoms),
         molecule_ids=molecule_ids,
+        masses_amu=atoms.get_masses_amu(),
+        atom_types=getattr(topology, "atom_types", None),
+        atom_names=getattr(topology, "atom_names", None),
+        lj_pair_overrides=getattr(topology, "lj_pair_overrides", None),
+        nonbonded_exclusions=getattr(topology, "nonbonded_exclusions", None),
+        lj_exclusions=getattr(topology, "lj_exclusions", None),
+        coulomb_exclusions=getattr(topology, "coulomb_exclusions", None),
+        lj_pair_scales=getattr(topology, "lj_pair_scales", None),
+        coulomb_pair_scales=getattr(topology, "coulomb_pair_scales", None),
     )
 
 
@@ -235,6 +283,15 @@ def _array_or_zeros(array, natoms):
     if array.shape != (natoms,):
         raise ValueError(f"topology array has shape {array.shape}, expected ({natoms},).")
     return array
+
+
+def _all_int_like(values):
+    try:
+        for value in values:
+            int(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _water_origins(box_size, spacing):

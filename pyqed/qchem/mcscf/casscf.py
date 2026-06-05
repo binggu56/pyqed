@@ -1168,6 +1168,20 @@ class FirstOrderCASSCF:
             raise ValueError("Run CASSCF before requesting RDMs.")
         return self.casci.make_rdm2(state_id, **kwargs)
 
+    def overlap(self, other):
+        """Electronic state overlap with another completed CASSCF object.
+
+        The optimized CASSCF wavefunction is represented by the final CASCI
+        solve in the optimized orbital basis, so the existing CASCI overlap
+        implementation is the correct backend for CASSCF LDR links.
+        """
+        if self.casci is None:
+            raise ValueError("Run CASSCF before requesting overlaps.")
+        other_casci = getattr(other, "casci", other)
+        if other_casci is None:
+            raise ValueError("Run the other CASSCF object before requesting overlaps.")
+        return self.casci.overlap(other_casci)
+
 
 class SecondOrderCASSCF(FirstOrderCASSCF):
     """

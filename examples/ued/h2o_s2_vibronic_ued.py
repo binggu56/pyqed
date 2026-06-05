@@ -40,12 +40,18 @@ DEFAULTS = {
     "nstates": 3,
     "initial_state": 2,
     "fc_surface": 0,
+    "coordinates": "jacobi-h-oh",
     "n_r": 11,
-    "n_theta": 9,
+    "n_R": 11,
+    "n_theta": 15,
     "r_min": 1.25,
     "r_max": 2.85,
+    "R_min": 1.20,
+    "R_max": 5.00,
     "theta_min_deg": 65.0,
     "theta_max_deg": 145.0,
+    "gamma_min_deg": 0.0,
+    "gamma_max_deg": 180.0,
     "n_s": 31,
     "s_max": 8.0,
     "dt_fs": 0.1,
@@ -97,16 +103,23 @@ def make_ldr(cfg, driver) -> Triatomic:
         spin=0,
         unit="bohr",
         driver=driver,
+        coordinates=cfg.coordinates,
     )
-    ldr.set_dvr(
-        domains=[
+    if ldr.coordinates == "jacobi-h-oh":
+        domains = [
+            [cfg.r_min, cfg.r_max],
+            [cfg.R_min, cfg.R_max],
+            [np.deg2rad(cfg.gamma_min_deg), np.deg2rad(cfg.gamma_max_deg)],
+        ]
+        npts = [cfg.n_r, cfg.n_R, cfg.n_theta]
+    else:
+        domains = [
             [cfg.r_min, cfg.r_max],
             [cfg.r_min, cfg.r_max],
             [np.deg2rad(cfg.theta_min_deg), np.deg2rad(cfg.theta_max_deg)],
-        ],
-        npts=[cfg.n_r, cfg.n_r, cfg.n_theta],
-        dvr_type=["sine", "sine", "legendre"],
-    )
+        ]
+        npts = [cfg.n_r, cfg.n_r, cfg.n_theta]
+    ldr.set_dvr(domains=domains, npts=npts, dvr_type=["sine", "sine", "legendre"])
     return ldr
 
 
@@ -160,11 +173,13 @@ def fc_packet_on_state(ldr: Triatomic, pes: np.ndarray, cfg):
 
     psi /= ldr.norm(psi)
     q = [ldr.x[axis][ref_idx[axis]] for axis in range(ldr.ndim)]
+    labels = ldr.coordinate_labels
     print(
         "[initial packet] "
         f"S{cfg.fc_surface} ground packet projected to S{cfg.initial_state}; "
         f"E={energies[0].real:.10f} Eh; "
-        f"peak r1={q[0]:.6f}, r2={q[1]:.6f}, theta={np.rad2deg(q[2]):.3f} deg"
+        f"peak {labels[0]}={q[0]:.6f}, {labels[1]}={q[1]:.6f}, "
+        f"{labels[2]}={np.rad2deg(q[2]):.3f} deg"
     )
     return psi, float(energies[0].real), ref_idx
 
@@ -210,6 +225,7 @@ def normalize_panels(stack):
 def plot_overview(path, ldr, times_fs, pops, r12, sx, sy, intensity):
     frames = frame_indices(times_fs)
     r12 = normalize_panels(r12[frames])
+    labels = ldr.coordinate_labels
     fig = plt.figure(figsize=(4.0 * (len(frames) + 1), 7.0), dpi=200)
     gs = fig.add_gridspec(2, len(frames) + 1)
 
@@ -232,8 +248,8 @@ def plot_overview(path, ldr, times_fs, pops, r12, sx, sy, intensity):
             vmax=1.0,
             aspect="auto",
         )
-        ax.set_xlabel("O-H r1 (bohr)")
-        ax.set_ylabel("O-H r2 (bohr)")
+        ax.set_xlabel(f"{labels[0]} (bohr)")
+        ax.set_ylabel(f"{labels[1]} (bohr)")
         ax.set_title(rf"$|\chi|^2$ {times_fs[frame]:.1f} fs")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -290,6 +306,7 @@ def plot_difference(path, times_fs, sx, sy, intensity):
 def plot_wavepacket(path, ldr, times_fs, r12_state, pops):
     frames = frame_indices(times_fs)
     rows = [state for state in (1, 2) if state < r12_state.shape[-1]]
+    labels = ldr.coordinate_labels
     fig, axes = plt.subplots(
         len(rows),
         len(frames),
@@ -311,8 +328,8 @@ def plot_wavepacket(path, ldr, times_fs, r12_state, pops):
                 interpolation="bicubic",
                 aspect="auto",
             )
-            ax.set_xlabel("O-H r1 (bohr)")
-            ax.set_ylabel("O-H r2 (bohr)")
+            ax.set_xlabel(f"{labels[0]} (bohr)")
+            ax.set_ylabel(f"{labels[1]} (bohr)")
             ax.set_title(f"S{state} {times_fs[frame]:.1f} fs, P={pops[frame, state]:.2e}")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
@@ -321,7 +338,8 @@ def plot_wavepacket(path, ldr, times_fs, r12_state, pops):
 
 
 def plot_theta(path, ldr, times_fs, pops, theta_density):
-    theta_deg = np.rad2deg(np.asarray(ldr.x[2], dtype=float))
+    angle_deg = np.rad2deg(np.asarray(ldr.x[2], dtype=float))
+    angle_label = ldr.coordinate_labels[2]
     fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.2), dpi=200)
     for state in range(pops.shape[1]):
         axes[0].plot(times_fs, pops[:, state], lw=2, label=f"S{state}")
@@ -332,12 +350,12 @@ def plot_theta(path, ldr, times_fs, pops, theta_density):
     im = axes[1].imshow(
         theta_density.T,
         origin="lower",
-        extent=[times_fs[0], times_fs[-1], theta_deg[0], theta_deg[-1]],
+        extent=[times_fs[0], times_fs[-1], angle_deg[0], angle_deg[-1]],
         aspect="auto",
         cmap="viridis",
     )
     axes[1].set_xlabel("time (fs)")
-    axes[1].set_ylabel("theta (deg)")
+    axes[1].set_ylabel(f"{angle_label} (deg)")
     fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
@@ -353,6 +371,8 @@ def parse_args():
             kwargs["choices"] = ("link-only", "linked", "full", "none")
         elif name == "kinetic_propagator":
             kwargs["choices"] = ("dense", "expm_multiply", "chebyshev")
+        elif name == "coordinates":
+            kwargs["choices"] = ("valence", "jacobi-h-oh", "jacobi")
         elif isinstance(default, Path):
             kwargs["type"] = Path
         else:
@@ -400,9 +420,11 @@ def run(cfg):
         npz_path,
         times_fs=times_fs,
         populations=pops,
-        r1_bohr=ldr.x[0],
-        r2_bohr=ldr.x[1],
-        theta_rad=ldr.x[2],
+        coordinate_labels=np.array(ldr.coordinate_labels),
+        coordinates=np.array(ldr.coordinates),
+        q0_bohr=ldr.x[0],
+        q1_bohr=ldr.x[1],
+        q2_rad=ldr.x[2],
         sx_angstrom_inv=sx,
         sy_angstrom_inv=sy,
         s_bohr_inv=s,

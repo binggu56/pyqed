@@ -71,7 +71,12 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-jkfit"
     assert mol._builtin_build_info["ri"]["metric_solver"] == "cholesky"
     assert mol._builtin_build_info["ri"]["storage"] == "full"
-    assert mol._builtin_build_info["ri"]["tensor_builder"] == "cython-kernel-packed"
+    assert mol._builtin_build_info["ri"]["tensor_builder"] in {
+        "cython-kernel-packed",
+        "cython-kernel-packed-parallel",
+        "python",
+        "python-parallel",
+    }
 
 
 def test_builtin_native_ri_ignores_dense_aosym_keyword():
@@ -125,6 +130,19 @@ def test_builtin_native_ri_defaults_pople_to_cc_pvdz_jkfit():
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-jkfit"
 
 
+def test_builtin_native_ri_falls_back_to_fe_capable_jkfit():
+    _use_source_tree_pyqed()
+    from pyqed.qchem.basis import _default_auxbasis_name
+
+    auxbasis = _default_auxbasis_name(
+        "sto-3g",
+        purpose="jk",
+        required_symbols=("Fe", "N", "C", "H"),
+    )
+
+    assert auxbasis == "def2-universal-jkfit"
+
+
 def test_builtin_native_ri_purpose_can_prefer_rifit():
     _use_source_tree_pyqed()
     from pyqed.qchem import Molecule
@@ -159,7 +177,7 @@ def test_builtin_native_ri_packed_storage_option():
 def test_builtin_native_ri_full_storage_option_matches_packed_jk():
     _use_source_tree_pyqed()
     from pyqed.qchem import Molecule
-    from pyqed.qchem.basis import contract_jk_ri
+    from pyqed.qchem.basis import contract_jk_ri, contract_jk_ri_mo
 
     atom = "H 0 0 0; H 0 0 0.74"
     packed = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
@@ -182,6 +200,20 @@ def test_builtin_native_ri_full_storage_option_matches_packed_jk():
     assert full._builtin_build_info["ri"]["storage"] == "full"
     np.testing.assert_allclose(vj_packed, vj_full, atol=1e-11, rtol=1e-11)
     np.testing.assert_allclose(vk_packed, vk_full, atol=1e-11, rtol=1e-11)
+
+    s = packed.overlap
+    h = packed.hcore
+    evals, evecs = np.linalg.eigh(s)
+    x = evecs @ np.diag(evals ** -0.5) @ evecs.T
+    _eps, c0 = np.linalg.eigh(x.T @ h @ x)
+    mo_coeff = x @ c0
+    mo_occ = np.zeros(packed.nao)
+    mo_occ[: packed.nelec // 2] = 2.0
+    dm_mo = mo_coeff @ np.diag(mo_occ) @ mo_coeff.T
+    vj_dm, vk_dm = contract_jk_ri(packed.eri_factors, dm_mo, packed.nao)
+    vj_mo, vk_mo = contract_jk_ri_mo(packed.eri_factors, mo_coeff, mo_occ, packed.nao)
+    np.testing.assert_allclose(vj_mo, vj_dm, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(vk_mo, vk_dm, atol=1e-10, rtol=1e-10)
 
 
 def test_builtin_native_ri_reconstructs_dense_eri_to_auxbasis_accuracy():

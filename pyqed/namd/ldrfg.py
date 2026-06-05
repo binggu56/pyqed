@@ -21,6 +21,8 @@ import numpy as np
 
 ArrayLike = np.ndarray
 QDependent = ArrayLike | Callable[[np.ndarray], ArrayLike]
+HamiltonianAction = Callable[[np.ndarray, np.ndarray, np.ndarray], ArrayLike]
+HamiltonianTrace = Callable[[np.ndarray, np.ndarray], complex]
 
 
 def _asarray_or_call(value: QDependent, q: np.ndarray, *, dtype=None) -> np.ndarray:
@@ -303,6 +305,8 @@ class LDRFG:
         grad_electronic_hamiltonian: QDependent | None = None,
         grad_overlap: QDependent | None = None,
         berry: QDependent | None = None,
+        hamiltonian_action: HamiltonianAction | None = None,
+        hamiltonian_trace: HamiltonianTrace | None = None,
         gamma: ArrayLike | None = None,
         hbar: float = 1.0,
     ) -> None:
@@ -324,6 +328,8 @@ class LDRFG:
         self.grad_energies = grad_energies
         self.grad_overlap = grad_overlap
         self.berry = berry
+        self.hamiltonian_action = hamiltonian_action
+        self.hamiltonian_trace = hamiltonian_trace
         self.hbar = float(hbar)
 
         if gamma is None:
@@ -464,10 +470,13 @@ class LDRFG:
         q = self._validate_q(q)
         electronic_h = self.electronic_hamiltonian_at(q)
         grad_electronic_h = self.grad_electronic_hamiltonian_at(q)
-        grad_a = self.grad_overlap_at(q)
         nstates = electronic_h.shape[1]
 
-        grad_h = np.einsum("mn,jmbna->jmbna", self.kinetic_x, grad_a)
+        if self.grad_overlap is None:
+            grad_h = np.zeros((self.ny, self.ngrid, nstates, self.ngrid, nstates), dtype=complex)
+        else:
+            grad_a = self.grad_overlap_at(q)
+            grad_h = np.einsum("mn,jmbna->jmbna", self.kinetic_x, grad_a)
         for j in range(self.ny):
             for n in range(self.ngrid):
                 grad_h[j, n, :, n, :] += grad_electronic_h[j, n]
@@ -486,9 +495,70 @@ class LDRFG:
             raise ValueError("Cannot normalize an expectation value with zero-norm C.")
         return np.vdot(c_flat, operator @ c_flat) / denom
 
+    def apply_hamiltonian(self, c: ArrayLike, q: ArrayLike, p: ArrayLike) -> np.ndarray:
+        """Return ``H(q,p) @ C`` as a flattened vector."""
+        c0 = np.asarray(c, dtype=complex)
+        c_flat = self._validate_c(c0)
+        q = self._validate_q(q)
+        p = self._validate_p(p)
+        if self.hamiltonian_action is None:
+            return self.hamiltonian(q, p) @ c_flat
+
+        value = self.hamiltonian_action(q, p, c0)
+        return np.asarray(value, dtype=complex).reshape(-1)
+
+    def trace_hamiltonian(self, q: ArrayLike, p: ArrayLike) -> complex | None:
+        """Return ``trace(H(q,p))`` when a cheap trace callback is available."""
+        q = self._validate_q(q)
+        p = self._validate_p(p)
+        if self.hamiltonian_trace is None:
+            return None
+        return complex(self.hamiltonian_trace(q, p))
+
     def energy(self, c: ArrayLike, q: ArrayLike, p: ArrayLike, *, normalize: bool = True) -> complex:
         """Return ``<C|H(q,p)|C>``."""
-        return self.expectation(self.hamiltonian(q, p), c, normalize=normalize)
+        c_flat = self._validate_c(c)
+        denom = np.vdot(c_flat, c_flat) if normalize else 1.0
+        if normalize and np.isclose(denom, 0.0):
+            raise ValueError("Cannot normalize an energy expectation value with zero-norm C.")
+        return np.vdot(c_flat, self.apply_hamiltonian(c, q, p)) / denom
+
+    def force(
+        self,
+        c: ArrayLike,
+        q: ArrayLike,
+        p: ArrayLike | None = None,
+        *,
+        normalize: bool = True,
+    ) -> np.ndarray:
+        """Return the TDVP force ``-<C|dH/dq|C>`` on the FG coordinates."""
+        q = self._validate_q(q)
+        if p is None:
+            p = np.zeros(self.ny, dtype=float)
+        else:
+            p = self._validate_p(p)
+        c_flat = self._validate_c(c)
+        grad_h = self.grad_hamiltonian(q, p)
+        norm = np.vdot(c_flat, c_flat) if normalize else 1.0
+        if normalize and np.isclose(norm, 0.0):
+            raise ValueError("Cannot evaluate LDRFG force with zero-norm C.")
+
+        force = np.empty(self.ny, dtype=float)
+        if self.berry is not None:
+            h = self.hamiltonian(q, p)
+            berry = self.berry_at(q).reshape(self.ny, c_flat.size, c_flat.size)
+        else:
+            h = None
+            berry = None
+
+        for j in range(self.ny):
+            value = -np.vdot(c_flat, grad_h[j] @ c_flat) / norm
+            if berry is not None and h is not None:
+                d_j = berry[j]
+                commutator = h @ d_j - d_j @ h
+                value += np.vdot(c_flat, commutator @ c_flat) / norm
+            force[j] = float(np.real_if_close(value))
+        return force
 
     def rhs(self, c: ArrayLike, q: ArrayLike, p: ArrayLike, *, normalize_force: bool = True) -> LDRFGRHS:
         """Evaluate the TDVP equations of motion."""
@@ -496,31 +566,84 @@ class LDRFG:
         p = self._validate_p(p)
         c_flat = self._validate_c(c)
 
-        h = self.hamiltonian(q, p)
+        h_c = self.apply_hamiltonian(c_flat, q, p)
         q_dot = self.inv_masses_y * p
 
         berry = self.berry_at(q).reshape(self.ny, c_flat.size, c_flat.size)
-        c_dot = -1j / self.hbar * (h @ c_flat)
+        c_dot = -1j / self.hbar * h_c
         c_dot -= np.einsum("j,jab,b->a", q_dot, berry, c_flat)
-
-        grad_h = self.grad_hamiltonian(q, p)
-        norm = np.vdot(c_flat, c_flat) if normalize_force else 1.0
-        if normalize_force and np.isclose(norm, 0.0):
-            raise ValueError("Cannot evaluate LDRFG force with zero-norm C.")
-        p_dot = np.empty(self.ny, dtype=float)
-        for j in range(self.ny):
-            force = -np.vdot(c_flat, grad_h[j] @ c_flat) / norm
-            if self.berry is not None:
-                d_j = berry[j]
-                commutator = h @ d_j - d_j @ h
-                force += np.vdot(c_flat, commutator @ c_flat) / norm
-            p_dot[j] = float(np.real_if_close(force))
 
         return LDRFGRHS(
             c_dot=c_dot.reshape(np.asarray(c).shape),
             q_dot=q_dot,
-            p_dot=p_dot,
+            p_dot=self.force(c_flat, q, p, normalize=normalize_force),
         )
+
+    def propagate_coefficients(self, c: ArrayLike, q: ArrayLike, p: ArrayLike, dt: float) -> np.ndarray:
+        """Propagate ``C`` at fixed ``q, p`` with a matrix exponential."""
+        from scipy.sparse.linalg import expm_multiply
+        from scipy.sparse.linalg import LinearOperator
+
+        c0 = np.asarray(c, dtype=complex)
+        c_flat = self._validate_c(c0)
+        q = self._validate_q(q)
+        p = self._validate_p(p)
+
+        if self.berry is not None:
+            q_dot = self.inv_masses_y * p
+            berry = self.berry_at(q).reshape(self.ny, c_flat.size, c_flat.size)
+        else:
+            q_dot = None
+            berry = None
+
+        if self.hamiltonian_action is None:
+            h = self.hamiltonian(q, p)
+            generator = (-1j / self.hbar) * h
+            if berry is not None and q_dot is not None:
+                generator -= np.einsum("j,jab->ab", q_dot, berry, optimize=True)
+            c_new = expm_multiply(dt * generator, c_flat)
+            return np.asarray(c_new, dtype=complex).reshape(c0.shape)
+
+        dim = c_flat.size
+
+        def matvec(v):
+            value = (-1j / self.hbar) * self.apply_hamiltonian(v.reshape(c0.shape), q, p)
+            if berry is not None and q_dot is not None:
+                value -= np.einsum("j,jab,b->a", q_dot, berry, v, optimize=True)
+            return value
+
+        def rmatvec(v):
+            value = (1j / self.hbar) * self.apply_hamiltonian(v.reshape(c0.shape), q, p)
+            if berry is not None and q_dot is not None:
+                value += np.einsum("j,jab,b->a", q_dot, berry, v, optimize=True)
+            return value
+
+        def matmat(vectors):
+            return np.column_stack([matvec(vectors[:, col]) for col in range(vectors.shape[1])])
+
+        generator = LinearOperator((dim, dim), matvec=matvec, rmatvec=rmatvec, matmat=matmat, dtype=complex)
+        trace_h = self.trace_hamiltonian(q, p)
+        trace_generator = None if trace_h is None else (-1j / self.hbar) * trace_h
+
+        c_new = expm_multiply(
+            dt * generator,
+            c_flat,
+            traceA=None if trace_generator is None else dt * trace_generator,
+        )
+        return np.asarray(c_new, dtype=complex).reshape(c0.shape)
+
+    def step_split(self, c: ArrayLike, q: ArrayLike, p: ArrayLike, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Advance one Strang split unitary-electronic/Verlet-FG step."""
+        c0 = np.asarray(c, dtype=complex)
+        q0 = self._validate_q(q)
+        p0 = self._validate_p(p)
+
+        c_half = self.propagate_coefficients(c0, q0, p0, 0.5 * dt)
+        p_half = p0 + 0.5 * dt * self.force(c_half, q0, p0)
+        q_new = q0 + dt * self.inv_masses_y * p_half
+        p_new = p_half + 0.5 * dt * self.force(c_half, q_new, p_half)
+        c_new = self.propagate_coefficients(c_half, q_new, p_new, 0.5 * dt)
+        return c_new, q_new, p_new
 
     def step_rk4(self, c: ArrayLike, q: ArrayLike, p: ArrayLike, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Advance ``(C, q, p)`` by one fourth-order Runge--Kutta step."""

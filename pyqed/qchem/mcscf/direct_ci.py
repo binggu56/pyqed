@@ -1830,7 +1830,18 @@ def sigma_on_the_fly(Binary, SC1, SC2, H1, H2, H_diag, c):
 
 
 class CASCI(mcscf.casci.CASCI):
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, tol=0, verbose=0):
+    def __init__(
+        self,
+        mf,
+        ncas,
+        nelecas,
+        ncore=None,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
+        tol=0,
+        verbose=0,
+    ):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -1864,7 +1875,16 @@ class CASCI(mcscf.casci.CASCI):
         None.
 
         """
-        super().__init__(mf, ncas, nelecas, ncore=ncore, spin=spin, verbose=verbose)
+        super().__init__(
+            mf,
+            ncas,
+            nelecas,
+            ncore=ncore,
+            spin=spin,
+            ms2=ms2,
+            multiplicity=multiplicity,
+            verbose=verbose,
+        )
         self.direct_connectivity = None
         self.spin_string_connectivity = None
         
@@ -2577,7 +2597,16 @@ class CASCI(mcscf.casci.CASCI):
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
 
-    def run(self, nstates=1, mo_coeff=None, method='direct_ci', ci0=None, use_cholesky=None):
+    def run(
+        self,
+        nstates=1,
+        mo_coeff=None,
+        method='direct_ci',
+        ci0=None,
+        use_cholesky=None,
+        spin_root_cushion=None,
+        spin_selection_tol=None,
+    ):
         """
         solve the full CI in the active space
 
@@ -2632,6 +2661,11 @@ class CASCI(mcscf.casci.CASCI):
             mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
+            solve_nstates = self._spin_selected_nstates(
+                requested_nstates,
+                binary.shape[0],
+                spin_root_cushion=spin_root_cushion,
+            )
 
 
             # print('Number of determinants', binary.shape[0])
@@ -2683,7 +2717,10 @@ class CASCI(mcscf.casci.CASCI):
             H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
 
 
-            E, X = eigsh(H_CI, k=nstates, which='SA')
+            if solve_nstates >= H_CI.shape[0]:
+                E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
+            else:
+                E, X = eigsh(H_CI, k=solve_nstates, which='SA')
             
             # from pyqed.davidson import davidson
             
@@ -2704,6 +2741,15 @@ class CASCI(mcscf.casci.CASCI):
 
             else:
                 binary = self.binary
+            solve_nstates = self._spin_selected_nstates(
+                requested_nstates,
+                binary.shape[0],
+                spin_root_cushion=spin_root_cushion,
+            )
+            if self.multiplicity is None and requested_nstates > 1:
+                extra_roots = max(0, int(getattr(self, 'direct_ci_root_cushion', 0)))
+                extra_roots = min(extra_roots, max(0, binary.shape[0] - requested_nstates))
+                solve_nstates = requested_nstates + extra_roots
 
 
             factor_data = None
@@ -2810,7 +2856,10 @@ class CASCI(mcscf.casci.CASCI):
 
                 SC1, SC2 = self.ensure_slater_condon_cache()
                 H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
-                E, X = eigsh(H_CI, k=nstates, which='SA')
+                if solve_nstates >= H_CI.shape[0]:
+                    E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
+                else:
+                    E, X = eigsh(H_CI, k=solve_nstates, which='SA')
             else:
                 if factor_data is not None:
                     self.solver_backend = 'direct_ci_factor_conn_uhf' if uhf_reference else 'direct_ci_factor_conn'
@@ -2818,11 +2867,6 @@ class CASCI(mcscf.casci.CASCI):
                     self.solver_backend = 'direct_ci_spin_string'
                 else:
                     self.solver_backend = 'direct_ci_compact_conn' if spatial_eri is not None else 'direct_ci'
-                extra_roots = 0
-                if requested_nstates > 1:
-                    extra_roots = max(0, int(getattr(self, 'direct_ci_root_cushion', 0)))
-                    extra_roots = min(extra_roots, max(0, binary.shape[0] - requested_nstates))
-                solve_nstates = requested_nstates + extra_roots
                 # The diagonal is reused in every matvec, so it is worth
                 # computing once up front even in the matrix-free solver.
                 if factor_data is not None:
@@ -2924,7 +2968,7 @@ class CASCI(mcscf.casci.CASCI):
                     # generic sparse eigensolver.
                     guess = _select_direct_ci_guess(
                         self,
-                        nstates,
+                        solve_nstates,
                         ci0=ci0 if ci0 is not None or not self.direct_ci_reuse_guess else None,
                     )
                     E, X = davidson_lowest(
@@ -2949,10 +2993,6 @@ class CASCI(mcscf.casci.CASCI):
                             eigensolver
                         )
                     )
-                if solve_nstates != requested_nstates:
-                    order = np.argsort(E)[:requested_nstates]
-                    E = np.asarray(E)[order]
-                    X = np.asarray(X)[:, order]
             
 
 
@@ -2968,6 +3008,13 @@ class CASCI(mcscf.casci.CASCI):
 
         else:
             raise ValueError("There is no {} solver for CASCI. Use 'ci' or 'jw'".format(method))
+
+        E, X = self._apply_multiplicity_selection(
+            E,
+            X,
+            requested_nstates,
+            spin_selection_tol=spin_selection_tol,
+        )
 
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
@@ -3249,14 +3296,23 @@ class CASCI(mcscf.casci.CASCI):
             ncas = self.ncas
 
             if ncore > 0:
-                c_core = 2 * np.trace(h1e[:ncore,:ncore])
+                c_core = 2 * np.trace(h1e[:ncore,:ncore]) * np.vdot(
+                    self.ci[bra_id],
+                    self.ci[ket_id],
+                )
             else:
                 c_core = 0
 
             h1e = h1e[ncore:ncas+ncore, ncore:ncas+ncore]
 
 
-            c_cas = make_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e)
+            c_cas = contract_with_tdm1(
+                self.ci[bra_id],
+                self.ci[ket_id],
+                self.binary,
+                self.SC1,
+                h1e,
+            )
 
         return c_cas + c_core
 

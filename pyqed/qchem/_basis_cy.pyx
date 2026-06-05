@@ -16,6 +16,8 @@ DEF OS_MAX_STATES = 65536
 DEF OS_HASH_CAP = 16384
 DEF OS_VRR_PAIR_MAX_L = 4
 DEF OS_VRR_MAX_CART = 15
+DEF THREE_CENTER_E_CAP = 128
+DEF THREE_CENTER_R_CAP = 2048
 
 
 cdef inline size_t idx3(int i, int j, int t, int jdim, int tdim) noexcept nogil:
@@ -445,18 +447,54 @@ cdef inline double primitive_three_center_coulomb(
     cdef int vz_max = n1 + n2 + n3
     cdef int nmax = tx_max + uy_max + vz_max + 2
     cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
-    cdef double* memo_abx = <double*>malloc(size_abx * sizeof(double))
-    cdef double* memo_aby = <double*>malloc(size_aby * sizeof(double))
-    cdef double* memo_abz = <double*>malloc(size_abz * sizeof(double))
-    cdef double* memo_cx = <double*>malloc(size_cx * sizeof(double))
-    cdef double* memo_cy = <double*>malloc(size_cy * sizeof(double))
-    cdef double* memo_cz = <double*>malloc(size_cz * sizeof(double))
-    cdef double* memo_r = <double*>malloc(size_r * sizeof(double))
+    cdef double memo_abx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_aby_stack[THREE_CENTER_E_CAP]
+    cdef double memo_abz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cy_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_r_stack[THREE_CENTER_R_CAP]
+    cdef double* memo_abx = NULL
+    cdef double* memo_aby = NULL
+    cdef double* memo_abz = NULL
+    cdef double* memo_cx = NULL
+    cdef double* memo_cy = NULL
+    cdef double* memo_cz = NULL
+    cdef double* memo_r = NULL
+    cdef bint use_heap = False
     cdef size_t i
     cdef int t, u, v, tau, nu, phi
     cdef double ex_ab, exy_ab, xyz_ab, ex_c, exy_c, sign, value = 0.0
+
+    if (
+        size_abx <= THREE_CENTER_E_CAP
+        and size_aby <= THREE_CENTER_E_CAP
+        and size_abz <= THREE_CENTER_E_CAP
+        and size_cx <= THREE_CENTER_E_CAP
+        and size_cy <= THREE_CENTER_E_CAP
+        and size_cz <= THREE_CENTER_E_CAP
+        and size_r <= THREE_CENTER_R_CAP
+    ):
+        memo_abx = &memo_abx_stack[0]
+        memo_aby = &memo_aby_stack[0]
+        memo_abz = &memo_abz_stack[0]
+        memo_cx = &memo_cx_stack[0]
+        memo_cy = &memo_cy_stack[0]
+        memo_cz = &memo_cz_stack[0]
+        memo_r = &memo_r_stack[0]
+    else:
+        use_heap = True
+        memo_abx = <double*>malloc(size_abx * sizeof(double))
+        memo_aby = <double*>malloc(size_aby * sizeof(double))
+        memo_abz = <double*>malloc(size_abz * sizeof(double))
+        memo_cx = <double*>malloc(size_cx * sizeof(double))
+        memo_cy = <double*>malloc(size_cy * sizeof(double))
+        memo_cz = <double*>malloc(size_cz * sizeof(double))
+        memo_r = <double*>malloc(size_r * sizeof(double))
+
     if memo_abx == NULL or memo_aby == NULL or memo_abz == NULL or memo_cx == NULL or memo_cy == NULL or memo_cz == NULL or memo_r == NULL:
-        free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+        if use_heap:
+            free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
         return 0.0
     for i in range(size_abx): memo_abx[i] = NAN
     for i in range(size_aby): memo_aby[i] = NAN
@@ -478,7 +516,116 @@ cdef inline double primitive_three_center_coulomb(
                         for phi in range(n3 + 1):
                             sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
                             value += xyz_ab * exy_c * E_rec(n3, 0, phi, 0.0, c, 0.0, memo_cz, 1, tdim_cz) * sign * R_rec(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax)
-    free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+    if use_heap:
+        free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+    return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
+
+
+cdef inline double primitive_three_center_precomputed(
+    double a, double b, double p, double px, double py, double pz, double abx, double aby, double abz,
+    int l1, int m1, int n1, int l2, int m2, int n2,
+    double c, int l3, int m3, int n3, double Cx, double Cy, double Cz
+) noexcept nogil:
+    cdef double q = c
+    cdef double alpha = p * q / (p + q)
+    cdef double dx = px - Cx
+    cdef double dy = py - Cy
+    cdef double dz = pz - Cz
+    cdef double rpc = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef int tdim_abx = l1 + l2 + 2
+    cdef int tdim_aby = m1 + m2 + 2
+    cdef int tdim_abz = n1 + n2 + 2
+    cdef int tdim_cx = l3 + 2
+    cdef int tdim_cy = m3 + 2
+    cdef int tdim_cz = n3 + 2
+    cdef size_t size_abx = <size_t>(l1 + 1) * <size_t>(l2 + 1) * <size_t>tdim_abx
+    cdef size_t size_aby = <size_t>(m1 + 1) * <size_t>(m2 + 1) * <size_t>tdim_aby
+    cdef size_t size_abz = <size_t>(n1 + 1) * <size_t>(n2 + 1) * <size_t>tdim_abz
+    cdef size_t size_cx = <size_t>(l3 + 1) * <size_t>tdim_cx
+    cdef size_t size_cy = <size_t>(m3 + 1) * <size_t>tdim_cy
+    cdef size_t size_cz = <size_t>(n3 + 1) * <size_t>tdim_cz
+    cdef int tx_max = l1 + l2 + l3
+    cdef int uy_max = m1 + m2 + m3
+    cdef int vz_max = n1 + n2 + n3
+    cdef int nmax = tx_max + uy_max + vz_max + 2
+    cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
+    cdef double memo_abx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_aby_stack[THREE_CENTER_E_CAP]
+    cdef double memo_abz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cy_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_r_stack[THREE_CENTER_R_CAP]
+    cdef double* memo_abx = NULL
+    cdef double* memo_aby = NULL
+    cdef double* memo_abz = NULL
+    cdef double* memo_cx = NULL
+    cdef double* memo_cy = NULL
+    cdef double* memo_cz = NULL
+    cdef double* memo_r = NULL
+    cdef bint use_heap = False
+    cdef size_t i
+    cdef int t, u, v, tau, nu, phi
+    cdef double ex_ab, exy_ab, xyz_ab, ex_c, exy_c, sign, value = 0.0
+
+    if (
+        size_abx <= THREE_CENTER_E_CAP
+        and size_aby <= THREE_CENTER_E_CAP
+        and size_abz <= THREE_CENTER_E_CAP
+        and size_cx <= THREE_CENTER_E_CAP
+        and size_cy <= THREE_CENTER_E_CAP
+        and size_cz <= THREE_CENTER_E_CAP
+        and size_r <= THREE_CENTER_R_CAP
+    ):
+        memo_abx = &memo_abx_stack[0]
+        memo_aby = &memo_aby_stack[0]
+        memo_abz = &memo_abz_stack[0]
+        memo_cx = &memo_cx_stack[0]
+        memo_cy = &memo_cy_stack[0]
+        memo_cz = &memo_cz_stack[0]
+        memo_r = &memo_r_stack[0]
+    else:
+        use_heap = True
+        memo_abx = <double*>malloc(size_abx * sizeof(double))
+        memo_aby = <double*>malloc(size_aby * sizeof(double))
+        memo_abz = <double*>malloc(size_abz * sizeof(double))
+        memo_cx = <double*>malloc(size_cx * sizeof(double))
+        memo_cy = <double*>malloc(size_cy * sizeof(double))
+        memo_cz = <double*>malloc(size_cz * sizeof(double))
+        memo_r = <double*>malloc(size_r * sizeof(double))
+
+    if memo_abx == NULL or memo_aby == NULL or memo_abz == NULL or memo_cx == NULL or memo_cy == NULL or memo_cz == NULL or memo_r == NULL:
+        if use_heap:
+            free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+        return 0.0
+    for i in range(size_abx): memo_abx[i] = NAN
+    for i in range(size_aby): memo_aby[i] = NAN
+    for i in range(size_abz): memo_abz[i] = NAN
+    for i in range(size_cx): memo_cx[i] = NAN
+    for i in range(size_cy): memo_cy[i] = NAN
+    for i in range(size_cz): memo_cz[i] = NAN
+    for i in range(size_r): memo_r[i] = NAN
+    for t in range(l1 + l2 + 1):
+        ex_ab = E_rec(l1, l2, t, abx, a, b, memo_abx, l2 + 1, tdim_abx)
+        for u in range(m1 + m2 + 1):
+            exy_ab = ex_ab * E_rec(m1, m2, u, aby, a, b, memo_aby, m2 + 1, tdim_aby)
+            for v in range(n1 + n2 + 1):
+                xyz_ab = exy_ab * E_rec(n1, n2, v, abz, a, b, memo_abz, n2 + 1, tdim_abz)
+                for tau in range(l3 + 1):
+                    ex_c = E_rec(l3, 0, tau, 0.0, c, 0.0, memo_cx, 1, tdim_cx)
+                    for nu in range(m3 + 1):
+                        exy_c = ex_c * E_rec(m3, 0, nu, 0.0, c, 0.0, memo_cy, 1, tdim_cy)
+                        for phi in range(n3 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            value += (
+                                xyz_ab
+                                * exy_c
+                                * E_rec(n3, 0, phi, 0.0, c, 0.0, memo_cz, 1, tdim_cz)
+                                * sign
+                                * R_rec(t + tau, u + nu, v + phi, 0, alpha, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax)
+                            )
+    if use_heap:
+        free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
     return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
 
 
@@ -1809,13 +1956,14 @@ cpdef compute_ri_tensors(
     cdef double[:, ::1] metric_v = metric
     cdef double[:, :, ::1] j3_v = j3
 
-    for p in range(naux):
-        for q in range(p + 1):
-            value = contracted_two_center_coulomb_indices(
-                p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
-            )
-            metric_v[p, q] = value
-            metric_v[q, p] = value
+    with nogil:
+        for p in range(naux):
+            for q in range(p + 1):
+                value = contracted_two_center_coulomb_indices(
+                    p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
+                )
+                metric_v[p, q] = value
+                metric_v[q, p] = value
 
     for a in range(naux):
         for p in range(nao):
@@ -1895,6 +2043,769 @@ cpdef compute_ri_tensors_packed(
                 pair += 1
 
     return metric, j3, int(computed), int(skipped)
+
+
+cpdef compute_aux_metric(
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+):
+    cdef int naux = aux_shells.shape[0]
+    cdef cnp.ndarray[double, ndim=2] metric = np.zeros((naux, naux), dtype=np.float64)
+    cdef int p, q
+    cdef double value
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] metric_v = metric
+
+    with nogil:
+        for p in range(naux):
+            for q in range(p + 1):
+                value = contracted_two_center_coulomb_indices(
+                    p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
+                )
+                metric_v[p, q] = value
+                metric_v[q, p] = value
+
+    return metric
+
+
+cpdef compute_aux_metric_range(
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    int row_start,
+    int row_stop,
+):
+    cdef int naux = aux_shells.shape[0]
+    cdef int nblock
+    cdef cnp.ndarray[double, ndim=2] block
+    cdef int p, q, local_p
+    cdef double value
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] block_v
+
+    if row_start < 0 or row_stop < row_start or row_stop > naux:
+        raise ValueError("Invalid auxiliary metric row range.")
+
+    nblock = row_stop - row_start
+    block = np.zeros((nblock, naux), dtype=np.float64)
+    block_v = block
+
+    with nogil:
+        for p in range(row_start, row_stop):
+            local_p = p - row_start
+            for q in range(p + 1):
+                value = contracted_two_center_coulomb_indices(
+                    p, q, aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v
+                )
+                block_v[local_p, q] = value
+
+    return block
+
+
+cpdef compute_ri_j3_packed_range(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    int aux_start,
+    int aux_stop,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[double, ndim=1] aux_diag,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    cdef int nblock
+    cdef cnp.ndarray[double, ndim=2] j3
+    cdef int p, q, a, local_a, pair
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double value, aux_bound
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[::1] aux_diag_v = aux_diag
+    cdef double[:, ::1] j3_v
+
+    if aux_start < 0 or aux_stop < aux_start or aux_stop > naux:
+        raise ValueError("Invalid auxiliary range for RI tensor build.")
+
+    nblock = aux_stop - aux_start
+    j3 = np.zeros((nblock, npair), dtype=np.float64)
+    j3_v = j3
+
+    with nogil:
+        for a in range(aux_start, aux_stop):
+            local_a = a - aux_start
+            aux_bound = aux_diag_v[a]
+            pair = 0
+            for p in range(nao):
+                for q in range(p + 1):
+                    if screen_tol > 0.0 and pair_bounds_v[p, q] * aux_bound < screen_tol:
+                        skipped += 1
+                        pair += 1
+                        continue
+                    value = contracted_three_center_indices(
+                        p, q, a,
+                        shells_v, origins_v, exps_v, weights_v, nprim_v,
+                        aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v,
+                    )
+                    j3_v[local_a, pair] = value
+                    computed += 1
+                    pair += 1
+
+    return j3, int(computed), int(skipped)
+
+
+cdef int compute_shell_triplet_vrr_hrr_into_j3(
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] origins_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    int64_t[:, ::1] aux_shells_v,
+    double[:, ::1] aux_origins_v,
+    double[:, ::1] aux_exps_v,
+    double[:, ::1] aux_weights_v,
+    int64_t[::1] aux_nprim_v,
+    double[:, ::1] pair_bounds_v,
+    double[::1] aux_diag_v,
+    double[:, ::1] j3_v,
+    int aux_start,
+    int aux_stop,
+    double screen_tol,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int a0,
+    int a1,
+    double* pq_a,
+    double* pq_b,
+    double* pq_p,
+    double* pq_px,
+    double* pq_py,
+    double* pq_pz,
+    int npq,
+    double* vrr_table,
+    size_t vrr_table_cap,
+) noexcept nogil:
+    cdef int np_ = p1 - p0
+    cdef int nq_ = q1 - q0
+    cdef int na_ = a1 - a0
+    cdef int lA, lB, lC, max_a_l, max_c_l, max_m_l
+    cdef int ia, ib, ic, idx_pq, ip, iq, iap
+    cdef int ao_p, ao_q, aux_i, local_aux, pair
+    cdef int ax[OS_VRR_MAX_CART]
+    cdef int ay[OS_VRR_MAX_CART]
+    cdef int az[OS_VRR_MAX_CART]
+    cdef int bx[OS_VRR_MAX_CART]
+    cdef int by[OS_VRR_MAX_CART]
+    cdef int bz[OS_VRR_MAX_CART]
+    cdef int cx[OS_VRR_MAX_CART]
+    cdef int cy[OS_VRR_MAX_CART]
+    cdef int cz[OS_VRR_MAX_CART]
+    cdef size_t vrr_table_size
+    cdef double abx, aby, abz, ab2
+    cdef double zeta, alpha, dx, dy, dz, pc2, T, base_pref
+    cdef double cexp, prefac, value, pair_bound
+    cdef double PA[3]
+    cdef double QC[3]
+    cdef double PQ[3]
+    cdef double AB[3]
+    cdef double CD[3]
+
+    lA = <int>shells_v[p0, 0] + <int>shells_v[p0, 1] + <int>shells_v[p0, 2]
+    lB = <int>shells_v[q0, 0] + <int>shells_v[q0, 1] + <int>shells_v[q0, 2]
+    lC = <int>aux_shells_v[a0, 0] + <int>aux_shells_v[a0, 1] + <int>aux_shells_v[a0, 2]
+    max_a_l = lA + lB
+    max_c_l = lC
+    max_m_l = max_a_l + max_c_l
+    if max_a_l > OS_VRR_PAIR_MAX_L or max_c_l > OS_VRR_PAIR_MAX_L:
+        return 0
+    if np_ != ncart_for_l(lA) or nq_ != ncart_for_l(lB) or na_ != ncart_for_l(lC):
+        return 0
+
+    vrr_table_size = (
+        <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1)
+        * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1)
+        * <size_t>(max_m_l + 1)
+    )
+    if vrr_table == NULL or vrr_table_size > vrr_table_cap:
+        return 0
+
+    fill_cartesian_components(lA, ax, ay, az)
+    fill_cartesian_components(lB, bx, by, bz)
+    fill_cartesian_components(lC, cx, cy, cz)
+
+    abx = origins_v[p0, 0] - origins_v[q0, 0]
+    aby = origins_v[p0, 1] - origins_v[q0, 1]
+    abz = origins_v[p0, 2] - origins_v[q0, 2]
+    ab2 = abx * abx + aby * aby + abz * abz
+    AB[0] = abx; AB[1] = aby; AB[2] = abz
+    CD[0] = 0.0; CD[1] = 0.0; CD[2] = 0.0
+
+    for idx_pq in range(npq):
+        ip = idx_pq // <int>nprim_v[q0]
+        iq = idx_pq - ip * <int>nprim_v[q0]
+        for iap in range(aux_nprim_v[a0]):
+            cexp = aux_exps_v[a0, iap]
+            zeta = pq_p[idx_pq] + cexp
+            alpha = pq_p[idx_pq] * cexp / zeta
+            dx = pq_px[idx_pq] - aux_origins_v[a0, 0]
+            dy = pq_py[idx_pq] - aux_origins_v[a0, 1]
+            dz = pq_pz[idx_pq] - aux_origins_v[a0, 2]
+            pc2 = dx * dx + dy * dy + dz * dz
+            T = alpha * pc2
+            base_pref = (
+                ERI_PREFAC
+                * exp(-(pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]) * ab2)
+                / (pq_p[idx_pq] * cexp * sqrt(zeta))
+            )
+            PA[0] = pq_px[idx_pq] - origins_v[p0, 0]
+            PA[1] = pq_py[idx_pq] - origins_v[p0, 1]
+            PA[2] = pq_pz[idx_pq] - origins_v[p0, 2]
+            QC[0] = 0.0; QC[1] = 0.0; QC[2] = 0.0
+            PQ[0] = dx; PQ[1] = dy; PQ[2] = dz
+            os_fill_vrr_table(
+                vrr_table,
+                max_a_l,
+                max_c_l,
+                max_m_l,
+                pq_p[idx_pq],
+                cexp,
+                zeta,
+                T,
+                base_pref,
+                PA,
+                QC,
+                PQ,
+            )
+            for ia in range(np_):
+                ao_p = p0 + ia
+                for ib in range(nq_):
+                    ao_q = q0 + ib
+                    if ao_p < ao_q:
+                        continue
+                    pair = pair_index(ao_p, ao_q)
+                    pair_bound = pair_bounds_v[ao_p, ao_q]
+                    for ic in range(na_):
+                        aux_i = a0 + ic
+                        if aux_i < aux_start or aux_i >= aux_stop:
+                            continue
+                        if screen_tol > 0.0 and pair_bound * aux_diag_v[aux_i] < screen_tol:
+                            continue
+                        local_aux = aux_i - aux_start
+                        prefac = weights_v[ao_p, ip] * weights_v[ao_q, iq] * aux_weights_v[aux_i, iap]
+                        value = prefac * os_vrr_hrr_eval_expanded(
+                            vrr_table,
+                            ax[ia], ay[ia], az[ia],
+                            bx[ib], by[ib], bz[ib],
+                            cx[ic], cy[ic], cz[ic],
+                            0, 0, 0,
+                            0,
+                            max_a_l,
+                            max_c_l,
+                            max_m_l,
+                            AB,
+                            CD,
+                        )
+                        j3_v[local_aux, pair] += value
+
+    return 1
+
+
+cpdef compute_ri_j3_packed_range_shell_blocked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    int aux_start,
+    int aux_stop,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[double, ndim=1] aux_diag,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_starts,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_stops,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int nshell = shell_starts.shape[0]
+    cdef int naux_shell = aux_shell_starts.shape[0]
+    cdef int max_prim = exps.shape[1]
+    cdef int pair_cap = max_prim * max_prim
+    cdef int npair = nao * (nao + 1) // 2
+    cdef int nblock
+    cdef cnp.ndarray[double, ndim=2] j3
+    cdef int ish, jsh, ash, p0, p1, q0, q1, a0, a1
+    cdef int p, q, a, local_a, pair, direct_done
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double pair_bound, value
+    cdef int* shell_pair_n
+    cdef double* shell_pair_a
+    cdef double* shell_pair_b
+    cdef double* shell_pair_p
+    cdef double* shell_pair_px
+    cdef double* shell_pair_py
+    cdef double* shell_pair_pz
+    cdef double* direct_vrr_table
+    cdef size_t pair_storage_size
+    cdef size_t pq_offset
+    cdef int pq_pair_idx
+    cdef size_t direct_vrr_table_cap = (
+        <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(2 * OS_VRR_PAIR_MAX_L + 1)
+    )
+    cdef int npq
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[::1] aux_diag_v = aux_diag
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int64_t[::1] aux_shell_starts_v = aux_shell_starts
+    cdef int64_t[::1] aux_shell_stops_v = aux_shell_stops
+    cdef double[:, ::1] j3_v
+
+    if aux_start < 0 or aux_stop < aux_start or aux_stop > naux:
+        raise ValueError("Invalid auxiliary range for RI tensor build.")
+    pair_storage_size = <size_t>nshell * <size_t>nshell * <size_t>pair_cap
+    shell_pair_n = <int*>malloc(nshell * nshell * sizeof(int))
+    shell_pair_a = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_b = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_p = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_px = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_py = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_pz = <double*>malloc(pair_storage_size * sizeof(double))
+    if shell_pair_n == NULL or shell_pair_a == NULL or shell_pair_b == NULL or shell_pair_p == NULL or shell_pair_px == NULL or shell_pair_py == NULL or shell_pair_pz == NULL:
+        free(shell_pair_n)
+        free(shell_pair_a); free(shell_pair_b); free(shell_pair_p); free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+        raise MemoryError("Could not allocate shell-pair scratch arrays.")
+    direct_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    if direct_vrr_table == NULL:
+        free(shell_pair_n)
+        free(shell_pair_a); free(shell_pair_b); free(shell_pair_p); free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+        raise MemoryError("Could not allocate VRR scratch table.")
+
+    nblock = aux_stop - aux_start
+    j3 = np.zeros((nblock, npair), dtype=np.float64)
+    j3_v = j3
+
+    with nogil:
+        for ish in range(nshell):
+            p0 = <int>shell_starts_v[ish]
+            p1 = <int>shell_stops_v[ish]
+            for jsh in range(nshell):
+                q0 = <int>shell_starts_v[jsh]
+                q1 = <int>shell_stops_v[jsh]
+                pq_pair_idx = ish * nshell + jsh
+                pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                shell_pair_n[pq_pair_idx] = precompute_primitive_pair_geom(
+                    p0,
+                    q0,
+                    origins_v,
+                    exps_v,
+                    nprim_v,
+                    shell_pair_a + pq_offset,
+                    shell_pair_b + pq_offset,
+                    shell_pair_p + pq_offset,
+                    shell_pair_px + pq_offset,
+                    shell_pair_py + pq_offset,
+                    shell_pair_pz + pq_offset,
+                )
+
+        for ash in range(naux_shell):
+            a0 = <int>aux_shell_starts_v[ash]
+            a1 = <int>aux_shell_stops_v[ash]
+            if a1 <= aux_start or a0 >= aux_stop:
+                continue
+            for ish in range(nshell):
+                p0 = <int>shell_starts_v[ish]
+                p1 = <int>shell_stops_v[ish]
+                for jsh in range(ish + 1):
+                    q0 = <int>shell_starts_v[jsh]
+                    q1 = <int>shell_stops_v[jsh]
+                    pq_pair_idx = ish * nshell + jsh
+                    pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                    npq = shell_pair_n[pq_pair_idx]
+                    direct_done = compute_shell_triplet_vrr_hrr_into_j3(
+                        shells_v,
+                        origins_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        pair_bounds_v,
+                        aux_diag_v,
+                        j3_v,
+                        aux_start,
+                        aux_stop,
+                        screen_tol,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                        npq,
+                        direct_vrr_table,
+                        direct_vrr_table_cap,
+                    )
+                    if direct_done == 0:
+                        for a in range(a0, a1):
+                            if a < aux_start or a >= aux_stop:
+                                continue
+                            local_a = a - aux_start
+                            for p in range(p0, p1):
+                                for q in range(q0, q1):
+                                    if p < q:
+                                        continue
+                                    if screen_tol > 0.0 and pair_bounds_v[p, q] * aux_diag_v[a] < screen_tol:
+                                        continue
+                                    pair = pair_index(p, q)
+                                    value = contracted_three_center_indices(
+                                        p, q, a,
+                                        shells_v, origins_v, exps_v, weights_v, nprim_v,
+                                        aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v,
+                                    )
+                                    j3_v[local_a, pair] = value
+
+        for a in range(aux_start, aux_stop):
+            for p in range(nao):
+                for q in range(p + 1):
+                    pair_bound = pair_bounds_v[p, q]
+                    if screen_tol > 0.0 and pair_bound * aux_diag_v[a] < screen_tol:
+                        skipped += 1
+                    else:
+                        computed += 1
+
+    free(shell_pair_n)
+    free(shell_pair_a); free(shell_pair_b); free(shell_pair_p); free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+    free(direct_vrr_table)
+    return j3, int(computed), int(skipped)
+
+
+cpdef compute_ri_j3_packed_range_shell_blocked_cached(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    int aux_start,
+    int aux_stop,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[double, ndim=1] aux_diag,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_starts,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_stops,
+    cnp.ndarray[int64_t, ndim=1] shell_pair_n,
+    cnp.ndarray[double, ndim=2] shell_pair_a,
+    cnp.ndarray[double, ndim=2] shell_pair_b,
+    cnp.ndarray[double, ndim=2] shell_pair_p,
+    cnp.ndarray[double, ndim=2] shell_pair_px,
+    cnp.ndarray[double, ndim=2] shell_pair_py,
+    cnp.ndarray[double, ndim=2] shell_pair_pz,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int nshell = shell_starts.shape[0]
+    cdef int naux_shell = aux_shell_starts.shape[0]
+    cdef int npair = nao * (nao + 1) // 2
+    cdef int nblock
+    cdef cnp.ndarray[double, ndim=2] j3
+    cdef int ish, jsh, ash, p0, p1, q0, q1, a0, a1
+    cdef int p, q, a, local_a, pair, direct_done
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double pair_bound, value
+    cdef double* direct_vrr_table
+    cdef int pq_pair_idx
+    cdef int npq
+    cdef size_t direct_vrr_table_cap = (
+        <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(2 * OS_VRR_PAIR_MAX_L + 1)
+    )
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[::1] aux_diag_v = aux_diag
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int64_t[::1] aux_shell_starts_v = aux_shell_starts
+    cdef int64_t[::1] aux_shell_stops_v = aux_shell_stops
+    cdef int64_t[::1] shell_pair_n_v = shell_pair_n
+    cdef double[:, ::1] shell_pair_a_v = shell_pair_a
+    cdef double[:, ::1] shell_pair_b_v = shell_pair_b
+    cdef double[:, ::1] shell_pair_p_v = shell_pair_p
+    cdef double[:, ::1] shell_pair_px_v = shell_pair_px
+    cdef double[:, ::1] shell_pair_py_v = shell_pair_py
+    cdef double[:, ::1] shell_pair_pz_v = shell_pair_pz
+    cdef double[:, ::1] j3_v
+
+    if aux_start < 0 or aux_stop < aux_start or aux_stop > naux:
+        raise ValueError("Invalid auxiliary range for RI tensor build.")
+    if shell_pair_n.shape[0] < nshell * nshell:
+        raise ValueError("Invalid shell-pair cache size.")
+
+    direct_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    if direct_vrr_table == NULL:
+        raise MemoryError("Could not allocate VRR scratch table.")
+
+    nblock = aux_stop - aux_start
+    j3 = np.zeros((nblock, npair), dtype=np.float64)
+    j3_v = j3
+
+    with nogil:
+        for ash in range(naux_shell):
+            a0 = <int>aux_shell_starts_v[ash]
+            a1 = <int>aux_shell_stops_v[ash]
+            if a1 <= aux_start or a0 >= aux_stop:
+                continue
+            for ish in range(nshell):
+                p0 = <int>shell_starts_v[ish]
+                p1 = <int>shell_stops_v[ish]
+                for jsh in range(ish + 1):
+                    q0 = <int>shell_starts_v[jsh]
+                    q1 = <int>shell_stops_v[jsh]
+                    pq_pair_idx = ish * nshell + jsh
+                    npq = <int>shell_pair_n_v[pq_pair_idx]
+                    direct_done = compute_shell_triplet_vrr_hrr_into_j3(
+                        shells_v,
+                        origins_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        pair_bounds_v,
+                        aux_diag_v,
+                        j3_v,
+                        aux_start,
+                        aux_stop,
+                        screen_tol,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                        &shell_pair_a_v[pq_pair_idx, 0],
+                        &shell_pair_b_v[pq_pair_idx, 0],
+                        &shell_pair_p_v[pq_pair_idx, 0],
+                        &shell_pair_px_v[pq_pair_idx, 0],
+                        &shell_pair_py_v[pq_pair_idx, 0],
+                        &shell_pair_pz_v[pq_pair_idx, 0],
+                        npq,
+                        direct_vrr_table,
+                        direct_vrr_table_cap,
+                    )
+                    if direct_done == 0:
+                        for a in range(a0, a1):
+                            if a < aux_start or a >= aux_stop:
+                                continue
+                            local_a = a - aux_start
+                            for p in range(p0, p1):
+                                for q in range(q0, q1):
+                                    if p < q:
+                                        continue
+                                    if screen_tol > 0.0 and pair_bounds_v[p, q] * aux_diag_v[a] < screen_tol:
+                                        continue
+                                    pair = pair_index(p, q)
+                                    value = contracted_three_center_indices(
+                                        p, q, a,
+                                        shells_v, origins_v, exps_v, weights_v, nprim_v,
+                                        aux_shells_v, aux_origins_v, aux_exps_v, aux_weights_v, aux_nprim_v,
+                                    )
+                                    j3_v[local_a, pair] = value
+
+        for a in range(aux_start, aux_stop):
+            for p in range(nao):
+                for q in range(p + 1):
+                    pair_bound = pair_bounds_v[p, q]
+                    if screen_tol > 0.0 and pair_bound * aux_diag_v[a] < screen_tol:
+                        skipped += 1
+                    else:
+                        computed += 1
+
+    free(direct_vrr_table)
+    return j3, int(computed), int(skipped)
+
+
+cpdef compute_ri_j3_packed_range_pair_outer(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    int aux_start,
+    int aux_stop,
+    cnp.ndarray[double, ndim=2] pair_bounds,
+    cnp.ndarray[double, ndim=1] aux_diag,
+    double screen_tol=0.0,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int max_prim = exps.shape[1]
+    cdef int pair_cap = max_prim * max_prim
+    cdef int npair = nao * (nao + 1) // 2
+    cdef int nblock
+    cdef cnp.ndarray[double, ndim=2] j3
+    cdef int p, q, a, local_a, pair, ij, ia, npq
+    cdef int l1, m1, n1, l2, m2, n2, l3, m3, n3
+    cdef int64_t computed = 0
+    cdef int64_t skipped = 0
+    cdef double value, pair_bound
+    cdef double Ax, Ay, Az, Bx, By, Bz, Cx, Cy, Cz
+    cdef double abx, aby, abz
+    cdef double* pq_a = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_b = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_p = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_px = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_py = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_pz = <double*>malloc(pair_cap * sizeof(double))
+    cdef double* pq_w = <double*>malloc(pair_cap * sizeof(double))
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, ::1] pair_bounds_v = pair_bounds
+    cdef double[::1] aux_diag_v = aux_diag
+    cdef double[:, ::1] j3_v
+
+    if aux_start < 0 or aux_stop < aux_start or aux_stop > naux:
+        raise ValueError("Invalid auxiliary range for RI tensor build.")
+    if pq_a == NULL or pq_b == NULL or pq_p == NULL or pq_px == NULL or pq_py == NULL or pq_pz == NULL or pq_w == NULL:
+        free(pq_a); free(pq_b); free(pq_p); free(pq_px); free(pq_py); free(pq_pz); free(pq_w)
+        raise MemoryError("Could not allocate primitive-pair scratch arrays.")
+
+    nblock = aux_stop - aux_start
+    j3 = np.zeros((nblock, npair), dtype=np.float64)
+    j3_v = j3
+
+    with nogil:
+        pair = 0
+        for p in range(nao):
+            Ax = origins_v[p, 0]; Ay = origins_v[p, 1]; Az = origins_v[p, 2]
+            l1 = <int>shells_v[p, 0]; m1 = <int>shells_v[p, 1]; n1 = <int>shells_v[p, 2]
+            for q in range(p + 1):
+                pair_bound = pair_bounds_v[p, q]
+                Bx = origins_v[q, 0]; By = origins_v[q, 1]; Bz = origins_v[q, 2]
+                l2 = <int>shells_v[q, 0]; m2 = <int>shells_v[q, 1]; n2 = <int>shells_v[q, 2]
+                abx = Ax - Bx; aby = Ay - By; abz = Az - Bz
+                npq = precompute_primitive_pair_data(
+                    p, q, shells_v, origins_v, exps_v, weights_v, nprim_v,
+                    pq_a, pq_b, pq_p, pq_px, pq_py, pq_pz, pq_w,
+                )
+                for a in range(aux_start, aux_stop):
+                    if screen_tol > 0.0 and pair_bound * aux_diag_v[a] < screen_tol:
+                        skipped += 1
+                        continue
+                    Cx = aux_origins_v[a, 0]; Cy = aux_origins_v[a, 1]; Cz = aux_origins_v[a, 2]
+                    l3 = <int>aux_shells_v[a, 0]; m3 = <int>aux_shells_v[a, 1]; n3 = <int>aux_shells_v[a, 2]
+                    value = 0.0
+                    for ij in range(npq):
+                        for ia in range(aux_nprim_v[a]):
+                            value += (
+                                pq_w[ij]
+                                * aux_weights_v[a, ia]
+                                * primitive_three_center_precomputed(
+                                    pq_a[ij], pq_b[ij], pq_p[ij], pq_px[ij], pq_py[ij], pq_pz[ij], abx, aby, abz,
+                                    l1, m1, n1, l2, m2, n2,
+                                    aux_exps_v[a, ia], l3, m3, n3, Cx, Cy, Cz,
+                                )
+                            )
+                    local_a = a - aux_start
+                    j3_v[local_a, pair] = value
+                    computed += 1
+                pair += 1
+
+    free(pq_a); free(pq_b); free(pq_p); free(pq_px); free(pq_py); free(pq_pz); free(pq_w)
+    return j3, int(computed), int(skipped)
 
 
 cpdef compute_dense_eri(
@@ -2542,6 +3453,38 @@ cpdef compute_eri_s8(
                     computed += 1
 
     return eri_s8, int(computed), int(skipped)
+
+
+cpdef compute_pair_bounds(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+):
+    cdef int nao = shells.shape[0]
+    cdef cnp.ndarray[double, ndim=2] bounds = np.zeros((nao, nao), dtype=np.float64)
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] origins_v = origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] bounds_v = bounds
+    cdef int p, q
+    cdef double value, bound
+
+    with nogil:
+        for p in range(nao):
+            for q in range(p + 1):
+                value = contracted_eri_indices(
+                    p, q, p, q,
+                    shells_v, origins_v, exps_v, weights_v, nprim_v,
+                )
+                bound = sqrt(fabs(value))
+                bounds_v[p, q] = bound
+                bounds_v[q, p] = bound
+
+    return bounds
 
 
 cpdef compute_eri_s8_blocked(

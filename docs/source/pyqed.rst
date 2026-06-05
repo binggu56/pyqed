@@ -9,6 +9,7 @@ Subpackages
 
    pyqed.models
    pyqed.polariton
+   pyqed.protein
 
 Submodules
 ----------

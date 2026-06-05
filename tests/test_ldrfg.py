@@ -98,6 +98,26 @@ def test_ldrfg_force_from_overlap_gradient():
     np.testing.assert_allclose(rhs.p_dot, [-1.0])
 
 
+def test_ldrfg_split_step_unitary_fixed_geometry():
+    _prefer_source_package()
+    from pyqed.namd import LDRFG
+
+    tx = np.zeros((1, 1))
+    energies = np.array([[0.2, 0.7]])
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    solver = LDRFG(tx, masses_y=[1.0], energies=energies, overlap=overlap)
+
+    c = np.array([[1.0, 1.0j]], dtype=complex) / np.sqrt(2.0)
+    dt = 0.4
+    c_new, q_new, p_new = solver.step_split(c, q=[0.0], p=[0.0], dt=dt)
+
+    expected = c * np.exp(-1j * energies * dt)
+    np.testing.assert_allclose(c_new, expected)
+    np.testing.assert_allclose(q_new, [0.0])
+    np.testing.assert_allclose(p_new, [0.0])
+    np.testing.assert_allclose(np.vdot(c_new.ravel(), c_new.ravel()), 1.0)
+
+
 def test_ldrfg_accepts_full_local_electronic_hamiltonian():
     _prefer_source_package()
     from pyqed.namd import LDRFG

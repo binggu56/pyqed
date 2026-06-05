@@ -135,6 +135,40 @@ def _as_spin_tuple(values):
     return values, values
 
 
+def _validate_multiplicity(multiplicity):
+    if multiplicity is None:
+        return None
+    multiplicity = int(round(multiplicity))
+    if multiplicity < 1:
+        raise ValueError("multiplicity must be a positive integer.")
+    return multiplicity
+
+
+def _s2_from_multiplicity(multiplicity):
+    multiplicity = _validate_multiplicity(multiplicity)
+    if multiplicity is None:
+        return None
+    spin_s = 0.5 * (multiplicity - 1)
+    return spin_s * (spin_s + 1.0)
+
+
+def _resolve_ms2(nelecas, mol_ms2, *, spin=None, ms2=None, multiplicity=None):
+    if ms2 is None:
+        ms2 = mol_ms2 if spin is None else spin
+    elif spin is not None and int(round(spin)) != int(round(ms2)):
+        raise ValueError("spin and ms2 both set but disagree; use ms2 for 2*M_S.")
+
+    ms2 = int(round(ms2))
+    multiplicity = _validate_multiplicity(multiplicity)
+    if multiplicity is not None:
+        spin2 = multiplicity - 1
+        if abs(ms2) > spin2 or (spin2 - ms2) % 2:
+            raise ValueError(
+                f"multiplicity={multiplicity} is incompatible with ms2={ms2}."
+            )
+    return ms2
+
+
 def _normalize_active_electrons(nelecas, spin):
     if isinstance(nelecas, (tuple, list)):
         if len(nelecas) != 2:
@@ -564,7 +598,17 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
 
 
 class CASCI:
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None, verbose=0):
+    def __init__(
+        self,
+        mf,
+        ncas,
+        nelecas,
+        ncore=None,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
+        verbose=0,
+    ):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -600,12 +644,21 @@ class CASCI:
         self.ncas = ncas # number of MOs in active space
         self.verbose = int(verbose)
 
-        if spin is None:
-            spin = mf.mol.spin
-        self.spin = spin
+        self.ms2 = _resolve_ms2(
+            nelecas,
+            mf.mol.spin,
+            spin=spin,
+            ms2=ms2,
+            multiplicity=multiplicity,
+        )
+        self.spin = self.ms2  # backward-compatible alias for 2*M_S
+        self.multiplicity = _validate_multiplicity(multiplicity)
+        self.target_s2 = _s2_from_multiplicity(self.multiplicity)
+        self.spin_selection_tol = 1.0e-5
+        self.spin_root_cushion = 8
 
         self.nelecas = nelecas
-        self.nelecas_spin = _normalize_active_electrons(nelecas, self.spin)
+        self.nelecas_spin = _normalize_active_electrons(nelecas, self.ms2)
         self.nelecas_total = sum(self.nelecas_spin)
 
         ncore_electrons = mf.nelec - self.nelecas_total
@@ -656,6 +709,7 @@ class CASCI:
         self.SC1 = None # SlaterCondon rule 1
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
         self.use_cholesky_integrals = False
+        self._property_operator_cache = {}
 
 
         # effective CAS Hamiltonian
@@ -794,6 +848,58 @@ class CASCI:
         evals, evecs = eigh(np.asarray(matrix))
         nout = min(nstates, evals.size)
         return evals[:nout], evecs[:, :nout]
+
+    def _spin_selected_nstates(self, requested_nstates, ndet, spin_root_cushion=None):
+        requested_nstates = int(requested_nstates)
+        if self.multiplicity is None:
+            return requested_nstates
+        if spin_root_cushion is None:
+            spin_root_cushion = self.spin_root_cushion
+        nsolve = requested_nstates + max(0, int(spin_root_cushion))
+        return min(nsolve, max(1, int(ndet) - 1))
+
+    def _apply_multiplicity_selection(self, energies, vectors, requested_nstates,
+                                      spin_selection_tol=None):
+        energies = np.asarray(energies)
+        vectors = np.asarray(vectors)
+        requested_nstates = int(requested_nstates)
+        if self.multiplicity is None:
+            order = np.argsort(energies)[:requested_nstates]
+            return energies[order], vectors[:, order]
+
+        if spin_selection_tol is None:
+            spin_selection_tol = self.spin_selection_tol
+        spin_selection_tol = float(spin_selection_tol)
+
+        old_e_tot = self.e_tot
+        old_ci = self.ci
+        self.e_tot = energies + self.e_core
+        self.ci = [vectors[:, i] for i in range(vectors.shape[1])]
+        s2 = np.asarray([self.spin_square(i) for i in range(vectors.shape[1])], dtype=float)
+        self.e_tot = old_e_tot
+        self.ci = old_ci
+
+        target_s2 = self.target_s2
+        selected = [
+            i for i in np.argsort(energies)
+            if abs(s2[i] - target_s2) <= spin_selection_tol
+        ]
+        if len(selected) < requested_nstates:
+            ranked = sorted(
+                range(len(energies)),
+                key=lambda i: (abs(s2[i] - target_s2), energies[i]),
+            )
+            detail = ", ".join(
+                f"root {i}: S^2={s2[i]:.6g}" for i in ranked[:min(6, len(ranked))]
+            )
+            raise ValueError(
+                f"Found {len(selected)} roots with multiplicity={self.multiplicity} "
+                f"(target S^2={target_s2:.6g}) among {len(energies)} solved roots; "
+                f"need {requested_nstates}. Increase spin_root_cushion or nstates. "
+                f"Closest roots: {detail}."
+            )
+        selected = selected[:requested_nstates]
+        return energies[selected], vectors[:, selected]
 
 
     def get_SO_matrix(self, spin_flip=False, H1=None, H2=None, use_cholesky=None):
@@ -1108,6 +1214,8 @@ class CASCI:
         use_cholesky=None,
         solvent_response=None,
         solvent_response_eps=1.78,
+        spin_root_cushion=None,
+        spin_selection_tol=None,
     ):
         """
         solve the full CI in the active space, more efficient than the JW solver
@@ -1167,6 +1275,7 @@ class CASCI:
             self.mo_coeff = mo_coeff
 
         self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
+        self._property_operator_cache = {}
 
 
         if self.binary is None:
@@ -1175,6 +1284,11 @@ class CASCI:
             self.binary = binary
         else:
             binary = self.binary
+        solve_nstates = self._spin_selected_nstates(
+            nstates,
+            binary.shape[0],
+            spin_root_cushion=spin_root_cushion,
+        )
 
         if solvent_response_model is None and (method == 'direct_ci' or (
             method == 'ci' and self.use_cholesky_integrals and not self.spin_purification
@@ -1186,10 +1300,13 @@ class CASCI:
                 ncas=self.ncas,
                 nelecas=self.nelecas,
                 ncore=self.ncore,
-                spin=self.spin,
+                ms2=self.ms2,
+                multiplicity=self.multiplicity,
                 tol=getattr(self, 'tol', 0),
                 verbose=self.verbose,
             )
+            direct_solver.spin_root_cushion = self.spin_root_cushion
+            direct_solver.spin_selection_tol = self.spin_selection_tol
             direct_solver.binary = binary
             direct_solver.run(
                 nstates=nstates,
@@ -1197,6 +1314,8 @@ class CASCI:
                 method='direct_ci',
                 ci0=ci0,
                 use_cholesky=use_cholesky,
+                spin_root_cushion=spin_root_cushion,
+                spin_selection_tol=spin_selection_tol,
             )
 
             self.mo_coeff = direct_solver.mo_coeff
@@ -1271,12 +1390,22 @@ class CASCI:
             raw_E, raw_X = self._lowest_dense_eigensystem(H_CI, max(1, nstates))
             lr_kernel = self._lr_pcm_determinant_kernel(raw_X[:, 0], eps=solvent_response_eps)
             H_CI = H_CI + lr_kernel
-            E, X = self._lowest_dense_eigensystem(H_CI, nstates)
+            E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
             self.lr_pcm_response_matrix = lr_kernel
             self.lr_pcm_response_eps = float(solvent_response_eps)
             self.lr_pcm_raw_e_tot = raw_E[:len(E)] + self.e_core
         else:
-            E, X = eigsh(H_CI, k=nstates, which='SA')
+            if solve_nstates >= H_CI.shape[0]:
+                E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
+            else:
+                E, X = eigsh(H_CI, k=solve_nstates, which='SA')
+
+        E, X = self._apply_multiplicity_selection(
+            E,
+            X,
+            nstates,
+            spin_selection_tol=spin_selection_tol,
+        )
 
 
         # nuclear repulsion energy is included in Ecore
@@ -1557,7 +1686,11 @@ class CASCI:
         ncas = self.ncas
 
         if ncore > 0:
-            c_core = np.trace(h1a[:ncore, :ncore]) + np.trace(h1b[:ncore, :ncore])
+            state_overlap = np.vdot(self.ci[bra_id], self.ci[ket_id])
+            c_core = (
+                np.trace(h1a[:ncore, :ncore])
+                + np.trace(h1b[:ncore, :ncore])
+            ) * state_overlap
         else:
             c_core = 0
 
@@ -1568,6 +1701,110 @@ class CASCI:
         c_cas = contract_with_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e_cas)
 
         return c_cas + c_core
+
+    def _electric_dipole_ao(self, center=None):
+        if hasattr(self.mf, "dipole"):
+            op = self.mf.dipole(center=center, basis="ao")
+        else:
+            if center is None:
+                center = self.mol.center_of_mass()
+            op = -np.asarray(
+                self.mol.moment_integral(center=np.asarray(center, dtype=float)),
+                dtype=float,
+            )
+        op = np.asarray(op)
+        if op.ndim != 3:
+            raise ValueError("Dipole operator must be a rank-3 array.")
+        if op.shape[0] != 3:
+            if op.shape[-1] == 3:
+                op = np.moveaxis(op, -1, 0)
+            else:
+                raise ValueError("Dipole operator must have shape (3, nao, nao) or (nao, nao, 3).")
+        return op
+
+    def _electric_dipole_mo(self, center=None):
+        if center is None:
+            center_key = None
+        else:
+            center_key = tuple(np.asarray(center, dtype=float).ravel())
+        cache_key = ("electric_dipole_mo", center_key, id(self.mo_coeff))
+        cache = getattr(self, "_property_operator_cache", None)
+        if cache is None:
+            cache = self._property_operator_cache = {}
+        if cache_key in cache:
+            return cache[cache_key]
+
+        dipole_ao = self._electric_dipole_ao(center=center)
+        transformed = [
+            _transform_1e_operator_ao_to_mo(dipole_ao[xyz], self.mo_coeff)
+            for xyz in range(3)
+        ]
+        if _is_uhf_reference(self.mo_coeff):
+            dipole_mo = (
+                np.asarray([op[0] for op in transformed]),
+                np.asarray([op[1] for op in transformed]),
+            )
+        else:
+            dipole_mo = np.asarray(transformed)
+        cache[cache_key] = dipole_mo
+        return dipole_mo
+
+    def transition_dipole_moment(self, bra_id=None, ket_id=0, center=None, state_ids=None):
+        """
+        Electronic transition dipole moments between CASCI roots.
+
+        The operator is the electronic dipole ``mu = -r``. If ``bra_id`` is
+        omitted, moments from ``ket_id`` to all other computed roots are
+        returned with shape ``(nroots - 1, 3)``. Supplying ``bra_id`` returns a
+        single ``(3,)`` vector.
+        """
+        if self.ci is None:
+            raise ValueError("Run CASCI before requesting transition dipoles.")
+        if bra_id is not None and state_ids is not None:
+            raise ValueError("Specify either bra_id or state_ids, not both.")
+
+        dipole_mo = self._electric_dipole_mo(center=center)
+        if isinstance(dipole_mo, tuple):
+            dipole_a, dipole_b = dipole_mo
+        else:
+            dipole_a = dipole_mo
+            dipole_b = dipole_a
+
+        ncore = int(self.ncore)
+        ncas = int(self.ncas)
+        active = slice(ncore, ncore + ncas)
+
+        def contract_one(bra):
+            bra = int(bra)
+            ket = int(ket_id)
+            tdm1a, tdm1b = make_tdm1s(
+                self.ci[bra],
+                self.ci[ket],
+                self.binary,
+                self.SC1,
+            )
+            value = (
+                np.einsum("xpq,pq->x", dipole_a[:, active, active], tdm1a, optimize=True)
+                + np.einsum("xpq,pq->x", dipole_b[:, active, active], tdm1b, optimize=True)
+            )
+            if ncore > 0:
+                core_trace = (
+                    np.trace(dipole_a[:, :ncore, :ncore], axis1=1, axis2=2)
+                    + np.trace(dipole_b[:, :ncore, :ncore], axis1=1, axis2=2)
+                )
+                value = value + core_trace * np.vdot(self.ci[bra], self.ci[ket])
+            return value
+
+        if bra_id is not None:
+            return contract_one(bra_id)
+
+        if state_ids is None:
+            state_ids = [idx for idx in range(len(self.ci)) if idx != int(ket_id)]
+        return np.asarray([contract_one(idx) for idx in state_ids])
+
+    def transition_dipole(self, *args, **kwargs):
+        """Alias for :meth:`transition_dipole_moment`."""
+        return self.transition_dipole_moment(*args, **kwargs)
 
     def make_tdm1(
         self,

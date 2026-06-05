@@ -62,6 +62,47 @@ def test_casci_is_exported_from_pyqed_qchem():
     assert ExportedCASCI is CASCI
 
 
+def test_casci_ms2_multiplicity_selects_triplet_m0_root():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc_singlet = CASCI(mf, ncas=2, nelecas=2, ms2=0, multiplicity=1).run(
+        nstates=1, method='direct_ci'
+    )
+    mc_triplet_m0 = CASCI(mf, ncas=2, nelecas=2, ms2=0, multiplicity=3).run(
+        nstates=1, method='direct_ci'
+    )
+    mc_triplet_p1 = CASCI(mf, ncas=2, nelecas=2, ms2=2, multiplicity=3).run(
+        nstates=1, method='direct_ci'
+    )
+
+    np.testing.assert_allclose(mc_singlet.spin_square(0), 0.0, atol=1e-10)
+    np.testing.assert_allclose(mc_triplet_m0.spin_square(0), 2.0, atol=1e-10)
+    np.testing.assert_allclose(mc_triplet_p1.spin_square(0), 2.0, atol=1e-10)
+    np.testing.assert_allclose(mc_triplet_m0.e_tot[0], mc_triplet_p1.e_tot[0], atol=1e-10)
+    assert mc_triplet_m0.ms2 == 0
+    assert mc_triplet_m0.spin == 0
+    assert mc_triplet_m0.multiplicity == 3
+
+
+def test_casci_spin_alias_and_multiplicity_validation():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    mc = CASCI(mf, ncas=2, nelecas=2, spin=2)
+    assert mc.ms2 == 2
+    assert mc.spin == 2
+    assert mc.nelecas_spin == (2, 0)
+
+    with pytest.raises(ValueError, match='spin and ms2'):
+        CASCI(mf, ncas=2, nelecas=2, spin=2, ms2=0)
+
+    with pytest.raises(ValueError, match='incompatible'):
+        CASCI(mf, ncas=2, nelecas=2, ms2=2, multiplicity=1)
+
+
 def test_casci_make_rdm1_ao_representation_matches_manual_transform():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(driver='gbasis')
@@ -100,6 +141,43 @@ def test_casci_make_tdm1_ao_representation_matches_manual_transform():
     np.testing.assert_allclose(tdm_ao, expected, atol=1e-12)
     np.testing.assert_allclose(tdm_ao_with_core, expected, atol=1e-12)
     np.testing.assert_allclose(tdm_ao_alias, expected, atol=1e-12)
+
+
+def test_casci_transition_dipole_moment_matches_ao_tdm_contraction():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    center = np.zeros(3)
+    dipole_ao = mf.dipole(center=center, basis='ao')
+
+    dense = CASCI(mf, ncas=4, nelecas=2).run(nstates=4, method='ci')
+    direct = CASCI(mf, ncas=4, nelecas=2).run(nstates=4, method='direct_ci')
+    raw_direct = direct_ci.CASCI(mf, ncas=4, nelecas=2).run(nstates=4, method='direct_ci')
+
+    tdm_ao = dense.make_tdm1(2, 0, representation='ao')
+    expected = np.einsum('xij,ij->x', dipole_ao, tdm_ao, optimize=True)
+
+    np.testing.assert_allclose(
+        dense.transition_dipole_moment(2, 0, center=center),
+        expected,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        np.abs(direct.transition_dipole_moment(2, 0, center=center)),
+        np.abs(expected),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        np.abs(raw_direct.transition_dipole_moment(2, 0, center=center)),
+        np.abs(expected),
+        atol=1e-10,
+    )
+
+    all_dipoles = dense.transition_dipole_moment(center=center)
+    assert all_dipoles.shape == (3, 3)
+    np.testing.assert_allclose(all_dipoles[1], expected, atol=1e-10)
+    np.testing.assert_allclose(dense.transition_dipole(center=center), all_dipoles)
 
 
 def test_casci_accepts_open_shell_uhf_reference():

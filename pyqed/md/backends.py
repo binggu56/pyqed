@@ -13,7 +13,7 @@ def backend_status(name="python"):
             return {"name": "openmm", "available": False, "reason": "OpenMM is not installed"}
         return {
             "name": "openmm",
-            "available": False,
-            "reason": "OpenMM is installed, but the PyQED OpenMM adapter is not wired yet",
+            "available": True,
+            "reason": "OpenMM is installed and the PyQED OpenMM adapter is available",
         }
     raise ValueError("backend must be 'python' or 'openmm'.")

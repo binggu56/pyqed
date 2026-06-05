@@ -33,6 +33,11 @@ except (ImportError, OSError):
     pass
 
 try:
+    from .relativistic import *
+except (ImportError, OSError):
+    pass
+
+try:
     from .geometric import BOHamiltonianDerivatives, GeometricFGTerms, bo_hamiltonian_derivatives
 except (ImportError, OSError):
     BOHamiltonianDerivatives = None
@@ -61,6 +66,13 @@ try:
 except (ImportError, OSError):
     CD = None
     CDResult = None
+
+try:
+    from .membrane_cd import MembraneCD, MembraneCDFrame, MembraneCDResult
+except (ImportError, OSError):
+    MembraneCD = None
+    MembraneCDFrame = None
+    MembraneCDResult = None
 
 try:
     from .xas import XAS, XASResult
@@ -182,9 +194,16 @@ except (ImportError, OSError):
     SecondOrderCASSCF = None
 
 try:
-    from .mcscf.soc_si import SOCStateInteractionResult, soc_state_interaction
+    from .mcscf.soc_si import (
+        SOCStateInteractionResult,
+        SingletTripletSOCResult,
+        st_soc,
+        soc_state_interaction,
+    )
 except (ImportError, OSError):
     SOCStateInteractionResult = None
+    SingletTripletSOCResult = None
+    st_soc = None
     soc_state_interaction = None
 
 try:

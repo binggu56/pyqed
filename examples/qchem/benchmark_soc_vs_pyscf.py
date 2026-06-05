@@ -8,14 +8,15 @@ benchmark reports |<S|H_SO|T>| rather than the raw complex sign.
 """
 
 from dataclasses import dataclass
-from itertools import combinations
 
 import numpy as np
 from pyscf import ao2mo, fci, gto, mcscf, scf
 
-from pyqed.qchem import Molecule
-from pyqed.qchem.mcscf.direct_ci import CASCI as PyqedCASCI
-from pyqed.qchem.soc import get_soc_1e_mo, soc_1e_prefactor, spatial_soc_to_spin_orbital
+from pyqed.qchem import Molecule, st_soc
+from pyqed.qchem.soc import (
+    soc_1e_prefactor,
+    spatial_soc_to_spin_orbital,
+)
 
 
 AU2CM = 219474.6313705
@@ -72,7 +73,7 @@ CASES = [
 ]
 
 
-def one_center_soc_mo_pyscf(mol, mo_cas):
+def one_center_soc_ao_pyscf(mol):
     hso_ao = np.zeros((3, mol.nao_nr(), mol.nao_nr()), dtype=float)
     aoslices = mol.aoslice_by_atom()
     for ia in range(mol.natm):
@@ -81,12 +82,38 @@ def one_center_soc_mo_pyscf(mol, mo_cas):
             w = mol.intor("int1e_prinvxp", comp=3)
         hso_ao[:, p0:p1, p0:p1] += (-mol.atom_charge(ia)) * w[:, p0:p1, p0:p1]
     hso_ao *= soc_1e_prefactor()
+    return hso_ao
+
+
+def one_center_soc_mo_pyscf(mol, mo_cas):
+    hso_ao = one_center_soc_ao_pyscf(mol)
     return np.einsum("xpq,pi,qj->xij", hso_ao, mo_cas.conj(), mo_cas)
 
 
+def somf_soc_mo_pyscf(mf, mo_cas):
+    mol = mf.mol
+    dm = mf.make_rdm1()
+    g = mol.intor("int2e_p1vxp1", comp=3)
+    term1 = np.einsum("xpqrs,rs->xpq", g, dm, optimize=True)
+    term2 = np.einsum("xprsq,rs->xpq", g, dm, optimize=True)
+    term3 = np.einsum("xsqpr,rs->xpq", g, dm, optimize=True)
+    hso_ao = one_center_soc_ao_pyscf(mol)
+    hso_ao += soc_1e_prefactor() * (term1 - 1.5 * term2 - 1.5 * term3)
+    return np.einsum("xpq,pi,qj->xij", hso_ao, mo_cas.conj(), mo_cas)
+
+
+def pyscf_string_occupations(norb, nelec):
+    """Return PySCF FCI string occupations in PySCF's packed-string order."""
+    strings = fci.cistring.gen_strings4orblist(range(norb), nelec)
+    return [
+        tuple(orb for orb in range(norb) if int(string) & (1 << orb))
+        for string in strings
+    ]
+
+
 def ci_to_state(ci, norb, na, nb):
-    alpha = list(combinations(range(norb), na))
-    beta = list(combinations(range(norb), nb))
+    alpha = pyscf_string_occupations(norb, na)
+    beta = pyscf_string_occupations(norb, nb)
     coeffs = {}
     for ia, occ_a in enumerate(alpha):
         for ib, occ_b in enumerate(beta):
@@ -138,7 +165,47 @@ def one_body_me(h1, bra, ket):
     return value
 
 
-def pyscf_reference(case):
+def determinant_count(norb, nelec):
+    from math import comb
+
+    na, nb = nelec
+    return comb(norb, na) * comb(norb, nb)
+
+
+def fci_root_by_s2(solver, h1, eri, norb, nelec, target_s2, root=0, ecore=0.0):
+    ndet = determinant_count(norb, nelec)
+    nroots = min(ndet, max(root + 1, root + 8))
+    while True:
+        e, c = solver.kernel(h1, eri, norb, nelec, nroots=nroots, ecore=ecore)
+        if np.isscalar(e):
+            energies = np.asarray([e], dtype=float)
+            coeffs = [c]
+        else:
+            energies = np.asarray(e, dtype=float)
+            coeffs = list(c)
+
+        s2 = np.asarray(
+            [fci.spin_op.spin_square0(ci, norb, nelec)[0] for ci in coeffs],
+            dtype=float,
+        )
+        selected = [
+            i for i in np.argsort(energies)
+            if abs(s2[i] - target_s2) <= 1.0e-5
+        ]
+        if len(selected) > root:
+            idx = selected[root]
+            return float(energies[idx]), coeffs[idx], float(s2[idx])
+        if nroots >= ndet:
+            detail = ", ".join(
+                f"root {i}: S^2={s2[i]:.6g}" for i in range(min(6, len(s2)))
+            )
+            raise RuntimeError(
+                f"Could not find PySCF root {root} with target S^2={target_s2}; {detail}"
+            )
+        nroots = min(ndet, max(nroots + 4, 2 * nroots))
+
+
+def pyscf_reference(case, soc_model="1e"):
     mol = gto.M(atom=case.atom, basis=case.basis, unit="angstrom", spin=0, verbose=0)
     mf = scf.RHF(mol).run(conv_tol=1e-12)
     mo = mf.mo_coeff
@@ -150,74 +217,106 @@ def pyscf_reference(case):
     na = case.nelecas // 2
     nb = case.nelecas - na
     solver = fci.direct_spin1.FCI(mol)
-    e_s, c_s = solver.kernel(h1, eri, case.ncas, (na, nb), nroots=1, ecore=ecore)
-    e_t, c_t = solver.kernel(h1, eri, case.ncas, (na + 1, nb - 1), nroots=1, ecore=ecore)
-    if not np.isscalar(e_s):
-        e_s, c_s = e_s[0], c_s[0]
-    if not np.isscalar(e_t):
-        e_t, c_t = e_t[0], c_t[0]
-
-    hso = spatial_soc_to_spin_orbital(one_center_soc_mo_pyscf(mol, mo_cas), order="grouped")
-    soc = one_body_me(
-        hso,
-        ci_to_state(c_s, case.ncas, na, nb),
-        ci_to_state(c_t, case.ncas, na + 1, nb - 1),
+    e_s, c_s, _ = fci_root_by_s2(
+        solver, h1, eri, case.ncas, (na, nb), target_s2=0.0, ecore=ecore
     )
-    return float(e_s), float(e_t), soc
+    triplet_nelec = {
+        -1: (na - 1, nb + 1),
+        0: (na, nb),
+        1: (na + 1, nb - 1),
+    }
+    triplets = {
+        ms: fci_root_by_s2(
+            solver, h1, eri, case.ncas, nelec, target_s2=2.0, ecore=ecore
+        )
+        for ms, nelec in triplet_nelec.items()
+    }
+
+    if soc_model == "1e":
+        hso_spatial = one_center_soc_mo_pyscf(mol, mo_cas)
+    elif soc_model == "somf":
+        hso_spatial = somf_soc_mo_pyscf(mf, mo_cas)
+    else:
+        raise ValueError("soc_model must be '1e' or 'somf'.")
+
+    hso = spatial_soc_to_spin_orbital(hso_spatial, order="grouped")
+    singlet_state = ci_to_state(c_s, case.ncas, na, nb)
+    components = {
+        ms: one_body_me(
+            hso,
+            singlet_state,
+            ci_to_state(ci, case.ncas, *triplet_nelec[ms]),
+        )
+        for ms, (_, ci, _) in triplets.items()
+    }
+    norm = float(np.sqrt(sum(abs(value) ** 2 for value in components.values())))
+    return float(e_s), {ms: data[0] for ms, data in triplets.items()}, components, norm
 
 
-def pyqed_workflow(case):
+def pyqed_workflow(case, soc_model="1e"):
     mol = Molecule(atom=case.atom, unit="angstrom", basis=case.basis)
     mol.build(driver="gbasis-pyscf")
 
-    mf = mol.RHF().run()
-    mc_s = PyqedCASCI(
+    # SOC matrix elements are sensitive to small occupied/virtual rotations.
+    mf = mol.RHF().run(tol=1e-12, conv_tol_dm=1e-10)
+    result = st_soc(
         mf,
         ncas=case.ncas,
         nelecas=case.nelecas,
         ncore=case.ncore,
-        spin=0,
-    ).run(nstates=1, method="direct_ci")
-    mc_t = PyqedCASCI(
-        mf,
-        ncas=case.ncas,
-        nelecas=case.nelecas,
-        ncore=case.ncore,
-        spin=2,
-    ).run(nstates=1, method="direct_ci")
-
-    hso = spatial_soc_to_spin_orbital(
-        get_soc_1e_mo(mf, mo_coeff=mc_s.mo_cas, one_center=True),
-        order="grouped",
+        model=soc_model,
+        dm=mf.make_rdm1() if soc_model == "somf" else None,
+        method="direct_ci",
     )
-    soc = mc_s.soc_matrix_element(0, other=mc_t, hso=hso, order="grouped")
-    return float(mc_s.e_tot[0]), float(mc_t.e_tot[0]), soc
+    return (
+        float(result.singlet.e_tot[result.singlet_root]),
+        {ms: float(mc.e_tot[result.triplet_root]) for ms, mc in result.triplets.items()},
+        result.components,
+        result.norm,
+    )
 
 
 def main():
     header = (
-        f"{'Molecule':<8} {'|SOC| PySCF (cm^-1)':>20} {'|SOC| pyqed (cm^-1)':>20} "
+        f"{'Molecule':<8} {'Model':<6} {'Ms':>4} "
+        f"{'|SOC| PySCF (cm^-1)':>20} {'|SOC| pyqed (cm^-1)':>20} "
         f"{'RelErr(|SOC|)':>15} {'dE_S (Ha)':>12} {'dE_T (Ha)':>12}"
     )
     print(header)
     print("-" * len(header))
 
     for case in CASES:
-        e_s_ref, e_t_ref, soc_ref = pyscf_reference(case)
-        e_s_py, e_t_py, soc_py = pyqed_workflow(case)
+        for soc_model in ("1e", "somf"):
+            e_s_ref, e_t_ref, soc_ref, norm_ref = pyscf_reference(case, soc_model=soc_model)
+            e_s_py, e_t_py, soc_py, norm_py = pyqed_workflow(case, soc_model=soc_model)
 
-        soc_ref_abs = abs(soc_ref)
-        soc_py_abs = abs(soc_py)
-        rel = abs(soc_py_abs - soc_ref_abs) / max(soc_ref_abs, 1e-16)
+            for ms in (-1, 0, 1):
+                soc_ref_abs = abs(soc_ref[ms])
+                soc_py_abs = abs(soc_py[ms])
+                rel = abs(soc_py_abs - soc_ref_abs) / max(soc_ref_abs, 1e-16)
 
-        print(
-            f"{case.name:<8} "
-            f"{soc_ref_abs * AU2CM:20.6f} "
-            f"{soc_py_abs * AU2CM:20.6f} "
-            f"{rel:15.6e} "
-            f"{abs(e_s_ref - e_s_py):12.3e} "
-            f"{abs(e_t_ref - e_t_py):12.3e}"
-        )
+                print(
+                    f"{case.name:<8} "
+                    f"{soc_model:<6} "
+                    f"{ms:4d} "
+                    f"{soc_ref_abs * AU2CM:20.6f} "
+                    f"{soc_py_abs * AU2CM:20.6f} "
+                    f"{rel:15.6e} "
+                    f"{abs(e_s_ref - e_s_py):12.3e} "
+                    f"{abs(e_t_ref[ms] - e_t_py[ms]):12.3e}"
+                )
+
+            norm_rel = abs(norm_py - norm_ref) / max(norm_ref, 1e-16)
+            print(
+                f"{case.name:<8} "
+                f"{soc_model:<6} "
+                f"{'norm':>4} "
+                f"{norm_ref * AU2CM:20.6f} "
+                f"{norm_py * AU2CM:20.6f} "
+                f"{norm_rel:15.6e} "
+                f"{abs(e_s_ref - e_s_py):12.3e} "
+                f"{max(abs(e_t_ref[ms] - e_t_py[ms]) for ms in (-1, 0, 1)):12.3e}"
+            )
 
 
 if __name__ == "__main__":

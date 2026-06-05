@@ -116,6 +116,12 @@ def mm_from_topology(topology, **kwargs):
         lj_sigma=topology.lj_sigma,
         exclude_bonded=True,
         exclude_angles=True,
+        nonbonded_exclusions=getattr(topology, "nonbonded_exclusions", None),
+        lj_exclusions=getattr(topology, "lj_exclusions", None),
+        coulomb_exclusions=getattr(topology, "coulomb_exclusions", None),
+        lj_pair_parameters=getattr(topology, "lj_pair_parameters", None),
+        lj_pair_scales=getattr(topology, "lj_pair_scales", None),
+        coulomb_pair_scales=getattr(topology, "coulomb_pair_scales", None),
         **kwargs,
     )
 

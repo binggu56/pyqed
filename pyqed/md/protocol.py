@@ -1,5 +1,10 @@
 """Small MD preparation/equilibration protocol helpers."""
 
+from .barostat import (
+    MonteCarloSemiIsotropicBarostat,
+    SemiIsotropicBoxController,
+    SemiIsotropicPressureController,
+)
 from .io import EnergyLogger, XYZTrajectoryWriter
 from .langevin import Langevin
 from .minimize import soft_relaxation, steepest_descent, write_minimization_log
@@ -58,6 +63,8 @@ def equilibrate(
                 logger = EnergyLogger(atoms, f"{output_prefix}_stage{index}_energy.dat", dynamics=dyn)
                 dyn.attach(writer)
                 dyn.attach(logger)
+            for attachment in stage.get("attachments", ()):
+                dyn.attach(attachment)
             try:
                 dyn.run(stage.get("steps", 1))
             finally:
@@ -148,6 +155,121 @@ def solvent_equilibration_stages(
                 "temperature_K": temperature_K,
                 "friction": friction,
                 "initialize_velocities": not warmup_steps,
+            }
+        )
+    return stages
+
+
+def membrane_equilibration_stages(
+    atoms,
+    timestep,
+    temperature_K=300.0,
+    friction=1e-3,
+    production_steps=1000,
+    nvt_steps=200,
+    npt_steps=200,
+    minimize_steps=200,
+    minimize_max_step=0.01,
+    minimize_fmax=1e-4,
+    box_coupling=0.01,
+    pressure_control=False,
+    target_lateral_pressure_bar=1.0,
+    target_normal_pressure_bar=None,
+    compressibility_bar=4.5e-5,
+    mc_max_area_change=0.02,
+    mc_max_z_change=0.02,
+    mc_scale_molecule_centers=True,
+    seed=None,
+):
+    """Return a compact membrane preparation protocol.
+
+    By default, the semi-isotropic stage keeps the old weak geometry controller
+    for reproducible smoke workflows.  Set ``pressure_control=True`` to use the
+    native virial/pressure controller with pressures specified in bar, or
+    ``pressure_control='mc'`` to attach the Metropolis semi-isotropic barostat.
+    """
+    stages = []
+    if minimize_steps:
+        stages.append(
+            {
+                "type": "minimize",
+                "label": "minimize",
+                "steps": minimize_steps,
+                "max_step": minimize_max_step,
+                "fmax": minimize_fmax,
+            }
+        )
+    if nvt_steps:
+        stages.append(
+            {
+                "type": "langevin",
+                "label": "nvt_warmup",
+                "steps": nvt_steps,
+                "timestep": timestep,
+                "temperature_K": temperature_K,
+                "friction": friction,
+                "initialize_velocities": True,
+            }
+        )
+    if npt_steps:
+        pressure_mode = (
+            "pressure"
+            if pressure_control is True
+            else str(pressure_control).lower().replace("_", "-")
+        )
+        if pressure_mode in {"mc", "monte-carlo", "montecarlo"}:
+            controller = MonteCarloSemiIsotropicBarostat.from_bar(
+                atoms,
+                temperature_K=temperature_K,
+                target_lateral_pressure_bar=target_lateral_pressure_bar,
+                target_normal_pressure_bar=target_normal_pressure_bar,
+                max_area_change=mc_max_area_change,
+                max_z_change=mc_max_z_change,
+                scale_molecule_centers=mc_scale_molecule_centers,
+                seed=seed,
+            )
+            label = "semi_isotropic_mc_barostat"
+        elif pressure_mode in {"pressure", "true"}:
+            controller = SemiIsotropicPressureController.from_bar(
+                atoms,
+                target_lateral_pressure_bar=target_lateral_pressure_bar,
+                target_normal_pressure_bar=target_normal_pressure_bar,
+                compressibility_bar=compressibility_bar,
+                coupling=box_coupling,
+            )
+            label = "semi_isotropic_pressure_relax"
+        elif pressure_mode in {"false", "none", "box"}:
+            lengths = atoms.get_cell().lengths()
+            controller = SemiIsotropicBoxController(
+                atoms,
+                target_area=lengths[0] * lengths[1],
+                target_z=lengths[2],
+                coupling=box_coupling,
+            )
+            label = "semi_isotropic_box_relax"
+        else:
+            raise ValueError("pressure_control must be False, True, or 'mc'.")
+        stages.append(
+            {
+                "type": "langevin",
+                "label": label,
+                "steps": npt_steps,
+                "timestep": timestep,
+                "temperature_K": temperature_K,
+                "friction": friction,
+                "attachments": [controller],
+            }
+        )
+    if production_steps:
+        stages.append(
+            {
+                "type": "langevin",
+                "label": "production",
+                "steps": production_steps,
+                "timestep": timestep,
+                "temperature_K": temperature_K,
+                "friction": friction,
+                "initialize_velocities": not nvt_steps,
             }
         )
     return stages

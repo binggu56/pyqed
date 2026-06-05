@@ -85,11 +85,11 @@ _BUILTIN_OPTION_SPECS = (
     ("parallel", "builtin_parallel", "native_parallel", bool, False),
     ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
-    ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-12),
+    ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-10),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
     ("shellwise_spherical", "builtin_shellwise_spherical", "native_shellwise_spherical", bool, False),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "auto"),
-    ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s1"),
+    ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s8"),
     ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
     ("ri_metric_tol", "builtin_ri_metric_tol", "native_ri_metric_tol", float, 1e-10),
     ("ri_metric_solver", "builtin_ri_metric_solver", "native_ri_metric_solver", str, "auto"),
@@ -97,6 +97,10 @@ _BUILTIN_OPTION_SPECS = (
     ("ri_screen_tol", "builtin_ri_screen_tol", "native_ri_screen_tol", lambda v: None if v is None else float(v), None),
     ("ri_block_size", "builtin_ri_block_size", "native_ri_block_size", lambda v: None if v is None else int(v), None),
     ("ri_storage", "builtin_ri_storage", "native_ri_storage", str, "auto"),
+    ("ri_tensor_backend", "builtin_ri_tensor_backend", "native_ri_tensor_backend", str, "auto"),
+    ("ri_cache", "builtin_ri_cache", "native_ri_cache", bool, True),
+    ("ri_cache_dir", "builtin_ri_cache_dir", "native_ri_cache_dir", lambda v: None if v is None else str(v), None),
+    ("one_electron_cache", "builtin_one_electron_cache", "native_one_electron_cache", bool, True),
     ("auto_ri_min_nao", "builtin_auto_ri_min_nao", "native_auto_ri_min_nao", int, 24),
     ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
@@ -1255,6 +1259,10 @@ class Molecule:
         self.builtin_ri_screen_tol = self.builtin_options["ri_screen_tol"]
         self.builtin_ri_block_size = self.builtin_options["ri_block_size"]
         self.builtin_ri_storage = self.builtin_options["ri_storage"]
+        self.builtin_ri_tensor_backend = self.builtin_options["ri_tensor_backend"]
+        self.builtin_ri_cache = self.builtin_options["ri_cache"]
+        self.builtin_ri_cache_dir = self.builtin_options["ri_cache_dir"]
+        self.builtin_one_electron_cache = self.builtin_options["one_electron_cache"]
         self.builtin_auto_ri_min_nao = self.builtin_options["auto_ri_min_nao"]
         self.builtin_low_rank_tol = self.builtin_options["low_rank_tol"]
         self.builtin_low_rank_max_rank = self.builtin_options["low_rank_max_rank"]
@@ -1278,6 +1286,10 @@ class Molecule:
         self.native_ri_screen_tol = self.builtin_ri_screen_tol
         self.native_ri_block_size = self.builtin_ri_block_size
         self.native_ri_storage = self.builtin_ri_storage
+        self.native_ri_tensor_backend = self.builtin_ri_tensor_backend
+        self.native_ri_cache = self.builtin_ri_cache
+        self.native_ri_cache_dir = self.builtin_ri_cache_dir
+        self.native_one_electron_cache = self.builtin_one_electron_cache
         self.native_auto_ri_min_nao = self.builtin_auto_ri_min_nao
         self.native_low_rank_tol = self.builtin_low_rank_tol
         self.native_low_rank_max_rank = self.builtin_low_rank_max_rank
@@ -1318,7 +1330,8 @@ class Molecule:
         eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'ri'}, optional
             Short alias for the builtin ``eri_representation`` option.
         aosym : {'s1', 's4', 's8'}, optional
-            AO ERI permutation symmetry for dense-like builtin storage.
+            AO ERI permutation symmetry for dense-like builtin storage. Defaults
+            to ``'s8'`` for the builtin driver.
         auxbasis : str, optional
             Short alias for the builtin ``auxbasis`` option used by
             ``eri='ri'`` and ``eri='dense+ri'``.

@@ -61,6 +61,7 @@ def tip3p_waters(
     ewald_alpha=0.35,
     ewald_kmax=5,
     pme_mesh=(16, 16, 16),
+    nonbonded_skin=1.0,
     rigid=False,
     rotations=None,
 ):
@@ -166,6 +167,7 @@ def tip3p_waters(
             ewald_alpha=ewald_alpha,
             ewald_kmax=ewald_kmax,
             pme_mesh=pme_mesh,
+            nonbonded_skin=nonbonded_skin,
             lj_epsilon=topology.lj_epsilon,
             lj_sigma=topology.lj_sigma,
             lj_cutoff=lj_cutoff,
@@ -183,4 +185,7 @@ def tip3p_waters(
     water.set_array("lj_epsilon", topology.lj_epsilon, float, ())
     water.set_array("lj_sigma", topology.lj_sigma, float, ())
     water.set_array("molecule_ids", topology.molecule_ids, int, ())
+    water.set_array("atom_names", np.tile(["O", "H1", "H2"], len(origins)), str, ())
+    water.set_array("residue_names", np.full(len(water), "HOH"), str, ())
+    water.set_array("residue_ids", np.repeat(np.arange(1, len(origins) + 1), 3), int, ())
     return water

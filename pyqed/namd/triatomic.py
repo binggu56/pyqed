@@ -163,6 +163,67 @@ def _set_worker_thread_limits(worker_threads):
         os.environ[name] = value
 
 
+def _driver_point_object(point):
+    if isinstance(point, dict):
+        for key in ("mc", "casci", "result", "object"):
+            if key in point:
+                return point[key]
+    return point
+
+
+def _driver_point_energies(point, nstates):
+    if isinstance(point, dict):
+        for key in ("energies", "e_tot", "energy"):
+            if key in point:
+                energies = point[key]
+                break
+        else:
+            raise ValueError("Electronic driver result dictionary has no energies.")
+    elif hasattr(point, "e_tot"):
+        energies = point.e_tot
+    elif isinstance(point, (tuple, list)) and point:
+        energies = point[0]
+    else:
+        energies = point
+
+    energies = np.atleast_1d(np.asarray(energies, dtype=float))
+    if len(energies) < nstates:
+        raise ValueError(
+            f"Electronic driver returned {len(energies)} energies, expected {nstates}."
+        )
+    return energies[:nstates]
+
+
+_TRIATOMIC_DRIVER_SCANNER = None
+_TRIATOMIC_DRIVER_NSTATES = None
+
+
+def _init_triatomic_driver_worker(driver, nstates, worker_threads):
+    global _TRIATOMIC_DRIVER_SCANNER, _TRIATOMIC_DRIVER_NSTATES
+    _set_worker_thread_limits(worker_threads)
+    if hasattr(driver, "as_scanner"):
+        try:
+            scanner = driver.as_scanner(nstates=nstates)
+        except TypeError:
+            scanner = driver.as_scanner()
+    else:
+        scanner = driver
+    if not callable(scanner):
+        raise TypeError("driver must be callable or provide as_scanner().")
+    _TRIATOMIC_DRIVER_SCANNER = scanner
+    _TRIATOMIC_DRIVER_NSTATES = int(nstates)
+
+
+def _triatomic_driver_scan_point_worker(task):
+    scanner = _TRIATOMIC_DRIVER_SCANNER
+    nstates = _TRIATOMIC_DRIVER_NSTATES
+    if scanner is None or nstates is None:
+        raise RuntimeError("Driver worker was not initialized.")
+    idx, xyz = task
+    point = scanner(np.asarray(xyz, dtype=float))
+    return idx, _driver_point_energies(point, nstates), _driver_point_object(point)
+
+
 def _run_native_rhf_with_retries(pmol, electronic_options):
     init_guess = str(electronic_options.get("init_guess", "hcore"))
     scf_tol = float(electronic_options.get("scf_tol", 1.0e-9))
@@ -420,6 +481,7 @@ class Triatom(Molecule):
                  unit: str = 'Angstrom',
                  dvr_type: str = 'default',
                  driver=None,
+                 coordinates: str = "valence",
                  J: int = 0,
                  Jz: int | None = None):  # 新增 dvr_type 参数
 
@@ -431,6 +493,7 @@ class Triatom(Molecule):
         super().__init__(atom=atom, basis=basis, charge=charge, spin=spin, unit=unit)
 
         self.driver = driver
+        self.coordinates = self._normalize_coordinates(coordinates)
         self.nstates = nstates
         self.dvr_type = dvr_type  # 修复: 添加 dvr_type 属性
         self.overlap_matrix=None
@@ -450,6 +513,32 @@ class Triatom(Molecule):
         self.nrot = self._rotational_dimension()
         # 用于存储动力学结果
         self.psi_t = None
+
+    @staticmethod
+    def _normalize_coordinates(coordinates):
+        coordinates = str(coordinates).lower().replace("_", "-")
+        aliases = {
+            "bond": "valence",
+            "bond-angle": "valence",
+            "eckart": "valence",
+            "internal": "valence",
+            "oh-oh": "valence",
+            "jacobi": "jacobi-h-oh",
+            "h-oh": "jacobi-h-oh",
+            "jacobi-hoh": "jacobi-h-oh",
+        }
+        coordinates = aliases.get(coordinates, coordinates)
+        if coordinates not in ("valence", "jacobi-h-oh"):
+            raise ValueError(
+                "coordinates must be 'valence' or 'jacobi-h-oh'."
+            )
+        return coordinates
+
+    @property
+    def coordinate_labels(self):
+        if self.coordinates == "jacobi-h-oh":
+            return ("r", "R", "gamma")
+        return ("r1", "r2", "theta")
 
     def atom_mass_list(mol):
         '''
@@ -599,13 +688,49 @@ class Triatom(Molecule):
 
         return T
 
-    def _internal_to_xyz_jax(self, q):
+    def _valence_to_xyz_jax(self, q):
         r1, r2, theta = q
         zero = jnp.asarray(0.0, dtype=q.dtype)
         B = jnp.array([zero, zero, zero], dtype=q.dtype)
         A = jnp.array([r1, zero, zero], dtype=q.dtype)
         C = jnp.array([r2 * jnp.cos(theta), r2 * jnp.sin(theta), zero], dtype=q.dtype)
         return jnp.stack([A, B, C], axis=0)
+
+    def _jacobi_h_oh_to_xyz_jax(self, q):
+        r, R, gamma = q
+        zero = jnp.asarray(0.0, dtype=q.dtype)
+        masses = jnp.asarray(self.mass, dtype=q.dtype)
+        m_b = masses[1]
+        m_c = masses[2]
+        m_bc = m_b + m_c
+        x_b = -m_c / m_bc * r
+        x_c = m_b / m_bc * r
+        A = jnp.array([R * jnp.cos(gamma), R * jnp.sin(gamma), zero], dtype=q.dtype)
+        B = jnp.array([x_b, zero, zero], dtype=q.dtype)
+        C = jnp.array([x_c, zero, zero], dtype=q.dtype)
+        return jnp.stack([A, B, C], axis=0)
+
+    def _internal_to_xyz_jax(self, q):
+        if self.coordinates == "jacobi-h-oh":
+            return self._jacobi_h_oh_to_xyz_jax(q)
+        return self._valence_to_xyz_jax(q)
+
+    def valence_to_jacobi(self, r1, r2, theta):
+        """Convert H-O-H valence coordinates to H + OH Jacobi coordinates.
+
+        Atom order is ``[H_dissociating, O, H_bound]``.  The Jacobi
+        coordinates are ``(r, R, gamma)`` where ``r`` is the bound OH length,
+        ``R`` points from the OH center of mass to the dissociating H, and
+        ``gamma`` is the angle from the OH vector to ``R``.
+        """
+        m_b = float(self.mass[1])
+        m_c = float(self.mass[2])
+        oh_axis = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=float)
+        oh_com = m_c / (m_b + m_c) * r2 * oh_axis
+        R_vec = np.array([r1, 0.0, 0.0], dtype=float) - oh_com
+        R = float(np.linalg.norm(R_vec))
+        gamma = float(np.arccos(np.clip(np.dot(oh_axis, R_vec) / R, -1.0, 1.0)))
+        return np.array([r2, R, gamma], dtype=float)
 
     def build_rovibrational_keo(self, J=None, verbose=True):
         """Build the full vibrational + rotational + Coriolis KEO."""
@@ -1235,6 +1360,75 @@ class Triatom(Molecule):
             verbose=verbose,
         )
 
+    def _buildK_jacobi_h_oh(self, J=None, sparse=False):
+        """Build the J=0 H + OH Jacobi kinetic-energy operator.
+
+        Coordinates are ``(r, R, gamma)``:
+
+        * ``r``: OH bond length for atoms [O, H_bound]
+        * ``R``: distance from the OH center of mass to H_dissociating
+        * ``gamma``: angle between the OH vector and ``R``
+
+        The operator uses the radial-scaled J=0 Jacobi form,
+        ``p_r^2/(2 mu_r) + p_R^2/(2 mu_R)
+        + 0.5 * (1/(mu_r r^2) + 1/(mu_R R^2)) p_gamma^2``.
+        """
+        J = self.J if J is None else int(J)
+        if J > 0:
+            raise NotImplementedError(
+                "Analytical Jacobi KEO is currently implemented for J=0 only."
+            )
+
+        dvrs = self.dvrs
+        m_a, m_b, m_c = [float(m) for m in self.mass]
+        mu_r = m_b * m_c / (m_b + m_c)
+        mu_R = m_a * (m_b + m_c) / (m_a + m_b + m_c)
+
+        def momentum_matrix(dvr):
+            if sparse:
+                try:
+                    return dvr.momentum(sparse=True)
+                except TypeError:
+                    return sp.csr_matrix(dvr.momentum())
+            return dvr.momentum()
+
+        p_r = momentum_matrix(dvrs[0])
+        p_R = momentum_matrix(dvrs[1])
+        p_g = momentum_matrix(dvrs[2])
+
+        r_grid, R_grid, g_grid = self.x
+        n_r, n_R, n_g = self.nx
+
+        if sparse:
+            I_r = sp.eye(n_r, format="csr", dtype=complex)
+            I_R = sp.eye(n_R, format="csr", dtype=complex)
+            I_g = sp.eye(n_g, format="csr", dtype=complex)
+            P_r = sp.kron(p_r, sp.kron(I_R, I_g, format="csr"), format="csr")
+            P_R = sp.kron(I_r, sp.kron(p_R, I_g, format="csr"), format="csr")
+            P_g = sp.kron(I_r, sp.kron(I_R, p_g, format="csr"), format="csr")
+        else:
+            I_r, I_R, I_g = np.eye(n_r), np.eye(n_R), np.eye(n_g)
+            P_r = np.kron(p_r, np.kron(I_R, I_g))
+            P_R = np.kron(I_r, np.kron(p_R, I_g))
+            P_g = np.kron(I_r, np.kron(I_R, p_g))
+
+        Rr, RR, _ = np.meshgrid(r_grid, R_grid, g_grid, indexing="ij")
+        rv = Rr.ravel()
+        Rv = RR.ravel()
+        angular_coeff = 1.0 / mu_r / rv**2 + 1.0 / mu_R / Rv**2
+
+        def sandwich(Pl, g, Pr):
+            if sparse:
+                return Pl.conj().T @ sp.diags(g, format="csr") @ Pr
+            return Pl.conj().T @ np.diag(g) @ Pr
+
+        T = (
+            0.5 / mu_r * (P_r.conj().T @ P_r)
+            + 0.5 / mu_R * (P_R.conj().T @ P_R)
+            + 0.5 * sandwich(P_g, angular_coeff, P_g)
+        )
+        return T.tocsr() if sparse else T
+
     def buildK(self, J=None, sparse=False):
         """Build the analytical kinetic energy operator in bond-distance /
         angle coordinates (Eckart frame).
@@ -1251,6 +1445,9 @@ class Triatom(Molecule):
         1.J. Chem. Phys. 97, 3029–3037 (1992)[An error in Eq.2]
         2.J. Chem. Phys. 88, 4171–4185 (1988)
         """
+        if self.coordinates == "jacobi-h-oh":
+            return self._buildK_jacobi_h_oh(J=J, sparse=sparse)
+
         J = self.J if J is None else int(J)
         if J > 0:
             if sparse:
@@ -2682,30 +2879,29 @@ class Triatom(Molecule):
 
 
 
-    def internal_to_xyz(self, r1, r2, theta):
-        """Convert internal coordinates (r1, r2, theta) to Cartesian XYZ.
+    def internal_to_xyz(self, q0, q1, q2):
+        """Convert the active internal coordinates to Cartesian XYZ.
 
-        Convention:  center atom B at origin,
-                     end atom A along +x at distance r1,
-                     end atom C at distance r2, angle theta from BA.
-
-        Parameters
-        ----------
-        r1, r2 : float   Bond lengths (a.u.)
-        theta  : float   Bond angle (rad)
-
-        Returns
-        -------
-        coords : ndarray, shape (3, 3)
-            Cartesian coordinates of [A, B, C].
+        For ``coordinates='valence'``, ``(q0, q1, q2) = (r1, r2, theta)``.
+        For ``coordinates='jacobi-h-oh'``, ``(q0, q1, q2) = (r, R, gamma)``
+        in the H + OH arrangement.  The atom order is always the molecule atom
+        order, typically ``[H, O, H]`` for the H2O examples.
         """
-        # B (center) at origin
+        if self.coordinates == "jacobi-h-oh":
+            r, R, gamma = q0, q1, q2
+            m_b = float(self.mass[1])
+            m_c = float(self.mass[2])
+            m_bc = m_b + m_c
+            B = np.array([-m_c / m_bc * r, 0.0, 0.0])
+            C = np.array([m_b / m_bc * r, 0.0, 0.0])
+            A = np.array([R * np.cos(gamma), R * np.sin(gamma), 0.0])
+            return np.array([A, B, C])
+
+        r1, r2, theta = q0, q1, q2
         B = np.array([0.0, 0.0, 0.0])
-        # A along +x
         A = np.array([r1, 0.0, 0.0])
-        # C at angle theta from BA
         C = np.array([r2 * np.cos(theta), r2 * np.sin(theta), 0.0])
-        return np.array([A, B, C])  # order: end1, center, end2
+        return np.array([A, B, C])
 
     def cartesian_grid(self, copy=True):
         """Cartesian atom coordinates on the current internal-coordinate grid.
@@ -2721,18 +2917,17 @@ class Triatom(Molecule):
         cached = getattr(self, "_cartesian_grid_cache", None)
         if cached is None:
             axes = [np.asarray(axis, dtype=float) for axis in self.x]
-            R1, R2, Theta = np.meshgrid(*axes, indexing="ij")
             coords = np.zeros((*self.nx, self.natom, 3), dtype=float)
-            coords[..., 0, 0] = R1
-            coords[..., 2, 0] = R2 * np.cos(Theta)
-            coords[..., 2, 1] = R2 * np.sin(Theta)
+            for idx in np.ndindex(*self.nx):
+                q = [axes[axis][idx[axis]] for axis in range(self.ndim)]
+                coords[idx] = self.internal_to_xyz(*q)
             self._cartesian_grid_cache = coords
             cached = coords
         return cached.copy() if copy else cached
 
     def set_dvr(self, dvrs=None, domains=None, npts=None, dvr_type=None, dvr_params=None):
         """
-        Set DVRs for internal coordinates (r1, r2, theta).
+        Set DVRs for the active internal coordinates.
         Can be called with either existing DVR setup `dvrs` OR `domains` and `npts`.
 
         Parameters
@@ -3367,34 +3562,11 @@ class Triatom(Molecule):
 
     @staticmethod
     def _driver_point_object(point):
-        if isinstance(point, dict):
-            for key in ("mc", "casci", "result", "object"):
-                if key in point:
-                    return point[key]
-        return point
+        return _driver_point_object(point)
 
     @staticmethod
     def _driver_point_energies(point, nstates):
-        if isinstance(point, dict):
-            for key in ("energies", "e_tot", "energy"):
-                if key in point:
-                    energies = point[key]
-                    break
-            else:
-                raise ValueError("Electronic driver result dictionary has no energies.")
-        elif hasattr(point, "e_tot"):
-            energies = point.e_tot
-        elif isinstance(point, (tuple, list)) and point:
-            energies = point[0]
-        else:
-            energies = point
-
-        energies = np.atleast_1d(np.asarray(energies, dtype=float))
-        if len(energies) < nstates:
-            raise ValueError(
-                f"Electronic driver returned {len(energies)} energies, expected {nstates}."
-            )
-        return energies[:nstates]
+        return _driver_point_energies(point, nstates)
 
     def _run_electronic_driver_scan(
         self,
@@ -3433,6 +3605,64 @@ class Triatom(Molecule):
                 print(f"  ... {count}/{total} points computed{suffix}")
 
         return apes, grid_objects, scanner
+
+    def _run_parallel_electronic_driver_scan(
+        self,
+        driver,
+        indices,
+        nstates,
+        n_workers=1,
+        worker_threads=1,
+    ):
+        """Run a process-parallel scan using a user-supplied electronic driver."""
+        if n_workers is None:
+            n_workers = 1
+        n_workers = int(n_workers)
+        if n_workers < 1:
+            raise ValueError("n_workers must be >= 1.")
+        if n_workers == 1:
+            return self._run_electronic_driver_scan(
+                driver,
+                indices,
+                nstates,
+                worker_threads=worker_threads,
+            )
+
+        if hasattr(driver, "as_scanner"):
+            try:
+                overlap_scanner = driver.as_scanner(nstates=nstates)
+            except TypeError:
+                overlap_scanner = driver.as_scanner()
+        else:
+            overlap_scanner = driver
+        if not callable(overlap_scanner):
+            raise TypeError("driver must be callable or provide as_scanner().")
+
+        tasks = []
+        for idx in indices:
+            q = [self.x[axis][idx[axis]] for axis in range(self.ndim)]
+            xyz = np.asarray(self.internal_to_xyz(*q), dtype=float)
+            tasks.append((idx, xyz))
+
+        total = len(tasks)
+        grid_objects = np.empty(self.nx, dtype=object)
+        apes = np.zeros((*self.nx, nstates))
+        report_every = max(1, total // 10)
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_triatomic_driver_worker,
+            initargs=(driver, nstates, worker_threads),
+        ) as executor:
+            futures = [executor.submit(_triatomic_driver_scan_point_worker, task) for task in tasks]
+            for count, future in enumerate(as_completed(futures), start=1):
+                idx, energies, obj = future.result()
+                grid_objects[idx] = obj
+                apes[idx] = energies
+                if count % report_every == 0 or count == total:
+                    print(f"  ... {count}/{total} points computed")
+
+        return apes, grid_objects, overlap_scanner
 
     def scan_pes(
         self,
@@ -3576,9 +3806,7 @@ class Triatom(Molecule):
         if self.x is None:
             raise RuntimeError("DVR grids not set. Call set_dvr() first.")
         if not hasattr(self, "internal_to_xyz"):
-            raise NotImplementedError(
-                "Method 'internal_to_xyz(r1, r2, theta)' must be implemented."
-            )
+            raise NotImplementedError("Method 'internal_to_xyz' must be implemented.")
 
         driver = self.driver if driver is None else driver
         using_driver = driver is not None
@@ -3617,6 +3845,8 @@ class Triatom(Molecule):
         meta = dict(
             nx=nx,
             nstates=nstates,
+            coordinates=self.coordinates,
+            coordinate_labels=self.coordinate_labels,
             basis=basis,
             ncas=ncas,
             nelecas=nelecas,
@@ -3810,16 +4040,11 @@ class Triatom(Molecule):
         )
         driver_scanner = None
         if using_driver:
-            if n_workers is not None and int(n_workers) != 1:
-                warnings.warn(
-                    "scan_pes(driver=...) is serial; ignoring n_workers > 1.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            self.apes, grid_mc_objects, driver_scanner = self._run_electronic_driver_scan(
+            self.apes, grid_mc_objects, driver_scanner = self._run_parallel_electronic_driver_scan(
                 driver,
                 indices,
                 nstates,
+                n_workers=n_workers,
                 worker_threads=worker_threads,
             )
         else:

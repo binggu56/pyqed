@@ -4,6 +4,22 @@ from pathlib import Path
 import numpy as np
 
 
+class _ToyElectronicDriver:
+    nstates = 2
+
+    def as_scanner(self, nstates=None):
+        if nstates is not None and int(nstates) != self.nstates:
+            raise ValueError("wrong nstates")
+        return self
+
+    def __call__(self, xyz):
+        q = float(np.asarray(xyz)[0, 0])
+        return {
+            "energies": np.array([q, q + 0.5]),
+            "object": f"mc-{q:g}",
+        }
+
+
 def _prefer_source_package():
     root = Path(__file__).resolve().parents[1]
     outer_init = (root / "__init__.py").resolve()
@@ -625,6 +641,59 @@ def test_triatomic_electronic_structure_scan_runner_serial(monkeypatch):
     np.testing.assert_allclose(apes, [[0.0, 0.25], [1.0, 1.25]])
     assert grid_objects[0] == "mc-0"
     assert grid_objects[1] == "mc-1"
+
+
+def test_triatomic_parallel_driver_scan_runner(monkeypatch):
+    _prefer_source_package()
+    import pyqed.namd.triatomic as triatomic_mod
+    from pyqed.namd.triatomic import Triatom
+
+    class FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer, initargs):
+            self.max_workers = max_workers
+            initializer(*initargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, task):
+            return FakeFuture(fn(task))
+
+    monkeypatch.setattr(triatomic_mod, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(triatomic_mod, "as_completed", lambda futures: futures)
+
+    atom = [
+        ["H", (1.0, 0.0, 0.0)],
+        ["H", (0.0, 0.0, 0.0)],
+        ["H", (0.0, 1.0, 0.0)],
+    ]
+    mol = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr")
+    mol.ndim = 1
+    mol.nx = [3]
+    mol.x = [np.array([0.0, 1.0, 2.0])]
+    mol.internal_to_xyz = lambda q: np.array([[q, 0.0, 0.0]])
+
+    apes, grid_objects, scanner = mol._run_parallel_electronic_driver_scan(
+        _ToyElectronicDriver(),
+        [(0,), (1,), (2,)],
+        nstates=2,
+        n_workers=2,
+        worker_threads=None,
+    )
+
+    np.testing.assert_allclose(apes, [[0.0, 0.5], [1.0, 1.5], [2.0, 2.5]])
+    assert list(grid_objects) == ["mc-0", "mc-1", "mc-2"]
+    assert scanner is not None
 
 
 def test_triatomic_fixed_jz_reduces_rotational_dimension():

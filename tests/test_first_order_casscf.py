@@ -81,6 +81,29 @@ def test_public_second_order_casscf_rejects_conflicting_cycle_aliases():
         CASSCF(mf, ncas=2, nelecas=2, max_cycle=20, max_cycles=40)
 
 
+def test_casscf_overlap_delegates_to_final_casci_overlap():
+    drivers = []
+    for bond in (1.35, 1.45):
+        mol = Molecule(atom=f"H 0 0 0; H 0 0 {bond}", unit="bohr", basis="sto-3g")
+        mol.build(driver="gbasis")
+        mf = mol.RHF().run()
+        drivers.append(
+            SecondOrderCASSCF(
+                mf,
+                ncas=2,
+                nelecas=2,
+                max_cycle=8,
+                verbose=0,
+            ).run(nstates=1)
+        )
+
+    got = drivers[0].overlap(drivers[1])
+    expected = drivers[0].casci.overlap(drivers[1].casci)
+
+    np.testing.assert_allclose(got, expected)
+    assert np.asarray(got).shape == (1, 1)
+
+
 def test_casscf_verbose_one_suppresses_internal_casci_root_spam(capsys):
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
     mol.build(driver="gbasis")

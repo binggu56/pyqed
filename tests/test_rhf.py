@@ -6,7 +6,8 @@ matplotlib.use("Agg", force=True)
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf import RHF, RHFAnalysis
-from pyqed.qchem.hf.rhf import get_or_build_low_rank_eri_factors, get_jk
+from pyqed.qchem.hf.rhf import _rhf_initial_density, get_or_build_low_rank_eri_factors, get_jk
+from pyqed.qchem.solvent import PCM
 from pyqed.qchem.tools import cubegen
 
 try:
@@ -31,6 +32,179 @@ def test_rhf_verbose_zero_is_clean_and_verbose_one_reports_energy(capsys):
     verbose = capsys.readouterr()
     assert "E_nclr" in verbose.out
     assert "E(HF)" in verbose.out
+
+
+def test_rhf_level_shift_decay_is_reported():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run(
+        max_cycle=4,
+        tol=0.0,
+        conv_tol_dm=0.0,
+        conv_tol_grad=1e-30,
+        damping=0.4,
+        damping_mode='density',
+        damping_decay=0.5,
+        damping_decay_start=1,
+        damping_min=0.05,
+        level_shift=0.8,
+        level_shift_decay=0.5,
+        level_shift_decay_start=1,
+        level_shift_min=0.1,
+        scf_diis='hybrid',
+        diis_switch_tol=1e-3,
+    )
+
+    info = mf.scf_info
+    assert info["damping"] == pytest.approx(0.4)
+    assert info["damping_mode"] == 'density'
+    assert info["damping_decay"] == pytest.approx(0.5)
+    assert info["damping_decay_start"] == 1
+    assert info["damping_min"] == pytest.approx(0.05)
+    assert info["final_damping"] == pytest.approx(0.1)
+    assert info["level_shift"] == pytest.approx(0.8)
+    assert info["level_shift_decay"] == pytest.approx(0.5)
+    assert info["level_shift_decay_start"] == 1
+    assert info["level_shift_min"] == pytest.approx(0.1)
+    assert info["final_level_shift"] == pytest.approx(0.2)
+    assert info["scf_diis"] == 'hybrid'
+    assert info["diis_switch_tol"] == pytest.approx(1e-3)
+
+
+def test_rhf_energy_diis_modes_run():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    for mode in ('ediis', 'adiis'):
+        mf = RHF(mol).run(max_cycle=5, scf_diis=mode, diis_start_cycle=1)
+        assert mf.scf_info["scf_diis"] == mode
+        assert mf.e_tot is not None
+
+
+def test_native_rhf_pcm_is_self_consistent_in_scf_loop():
+    mol = Molecule(
+        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+        unit='angstrom',
+        basis='sto-3g',
+    )
+    mol.build(driver='builtin', eri='s8')
+
+    mf_gas = RHF(mol).run(max_cycle=40, tol=1e-10, conv_tol_grad=1e-7)
+
+    pcm = PCM(mol)
+    pcm.eps = 35.688
+    pcm.method = 'C-PCM'
+    pcm.lebedev_order = 3
+    pcm.integral_backend = 'native'
+    pcm.verbose = 0
+
+    mf_pcm = PCM(RHF(mol), pcm).run(
+        dm0=mf_gas.dm,
+        init_guess='dm',
+        max_cycle=40,
+        tol=1e-9,
+        conv_tol_grad=1e-6,
+    )
+
+    assert mf_pcm.with_solvent is pcm
+    assert mf_pcm.scf_info["with_solvent"] is True
+    assert mf_pcm.converged
+    assert np.isfinite(mf_pcm.scf_info["solvent_energy"])
+    assert mf_pcm.scf_info["solvent_potential_norm"] > 0.0
+    assert mf_pcm.e_tot == pytest.approx(mf_pcm.scf_info["total_energy"])
+    assert abs(mf_pcm.e_tot - mf_gas.e_tot) > 1e-6
+    np.testing.assert_allclose(mf_pcm._v_solvent, pcm.v)
+
+
+def test_native_rhf_pcm_matches_pyscf_h2o():
+    pyscf_gto = pytest.importorskip('pyscf.gto')
+    pyscf_scf = pytest.importorskip('pyscf.scf')
+    pytest.importorskip('pyscf.solvent')
+
+    atom = 'O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587'
+    pmol = pyscf_gto.M(atom=atom, unit='Angstrom', basis='sto-3g', verbose=0)
+    pmf_gas = pyscf_scf.RHF(pmol)
+    pmf_gas.conv_tol = 1e-10
+    pmf_gas.verbose = 0
+    e_gas_ref = pmf_gas.kernel()
+
+    pmf_pcm = pyscf_scf.RHF(pmol).PCM()
+    pmf_pcm.conv_tol = 1e-10
+    pmf_pcm.verbose = 0
+    pmf_pcm.with_solvent.eps = 35.688
+    pmf_pcm.with_solvent.method = 'C-PCM'
+    pmf_pcm.with_solvent.lebedev_order = 3
+    pmf_pcm.with_solvent.verbose = 0
+    e_pcm_ref = pmf_pcm.kernel(dm0=pmf_gas.make_rdm1())
+
+    mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
+    mol.build(driver='pyscf')
+    mf_gas = RHF(mol).run(max_cycle=80, tol=1e-10, conv_tol_grad=1e-7)
+
+    pcm = PCM(mol)
+    pcm.eps = 35.688
+    pcm.method = 'C-PCM'
+    pcm.lebedev_order = 3
+    pcm.integral_backend = 'native'
+    pcm.verbose = 0
+    mf_pcm = PCM(RHF(mol), pcm).run(
+        dm0=mf_gas.dm,
+        init_guess='dm',
+        max_cycle=80,
+        tol=1e-10,
+        conv_tol_grad=1e-7,
+    )
+
+    assert pmf_gas.converged
+    assert pmf_pcm.converged
+    assert mf_gas.converged
+    assert mf_pcm.converged
+    np.testing.assert_allclose(mf_gas.e_tot, e_gas_ref, atol=5e-8)
+    np.testing.assert_allclose(mf_pcm.e_tot, e_pcm_ref, atol=5e-8)
+    np.testing.assert_allclose(mf_pcm.scf_info["solvent_energy"], pmf_pcm.with_solvent.e, atol=5e-8)
+
+
+def test_native_minao_fe2_keeps_3d_shell_populated():
+    mol = Molecule(atom='Fe 0 0 0', unit='angstrom', basis='sto-3g', charge=2, spin=0)
+    mol.build(driver='builtin', eri='direct')
+
+    dm = _rhf_initial_density(mol, 'minao')
+    labels = mol.ao_labels()
+    fe_d = [
+        idx for idx, label in enumerate(labels)
+        if label.startswith('0 Fe') and 'd' in label.split()[-1]
+    ]
+    ps = dm @ mol.overlap
+
+    assert np.einsum('ij,ji->', dm, mol.overlap) == pytest.approx(24.0)
+    assert np.trace(ps[np.ix_(fe_d, fe_d)]).real > 5.0
+
+
+def test_native_charged_minao_fe2_assigns_charge_before_shell_fill():
+    mol = Molecule(atom='Fe 0 0 0', unit='angstrom', basis='sto-3g', charge=2, spin=0)
+    mol.build(driver='builtin', eri='direct')
+
+    dm = _rhf_initial_density(mol, 'charged_minao')
+    labels = mol.ao_labels()
+    fe_d = [
+        idx for idx, label in enumerate(labels)
+        if label.startswith('0 Fe') and 'd' in label.split()[-1]
+    ]
+    ps = dm @ mol.overlap
+
+    assert np.einsum('ij,ji->', dm, mol.overlap) == pytest.approx(24.0)
+    assert np.trace(ps[np.ix_(fe_d, fe_d)]).real == pytest.approx(6.0)
+
+
+def test_native_huckel_guess_has_correct_electron_count():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='builtin', eri='direct')
+
+    dm = _rhf_initial_density(mol, 'huckel')
+
+    assert dm.shape == (mol.nao, mol.nao)
+    assert np.einsum('ij,ji->', dm, mol.overlap) == pytest.approx(float(mol.nelec))
 
 
 def test_rhf_density_fit_matches_conventional_energy_and_jk():
