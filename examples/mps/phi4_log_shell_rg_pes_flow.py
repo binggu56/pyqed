@@ -34,16 +34,13 @@ def _s_diagnostics(s_kernel):
     }
 
 
-def _full_narg_residual_surface(toy, previous_s=None):
+def _full_narg_residual_surface(toy):
     result = toy.narg_effective_hamiltonian(nbranches=1)
-    step_s = result.kinetic_dressing[:, 0, :, 0]
-    if previous_s is None:
-        previous_s = np.ones_like(step_s)
-    total_s = previous_s * step_s
-    residual_surface = np.diag(result.hamiltonian - result.active_kinetic * step_s)
+    s_kernel = result.kinetic_dressing[:, 0, :, 0]
+    residual_surface = np.diag(result.hamiltonian - result.active_kinetic * s_kernel)
     fit = _fit_radial_surface(result.active_configs, residual_surface)
-    fit.update(_s_diagnostics(total_s))
-    return result.active_configs, residual_surface, total_s, fit
+    fit.update(_s_diagnostics(s_kernel))
+    return result.active_configs, residual_surface, s_kernel, fit
 
 
 def _quartic_calibration(log_factor, amplitude_npoints, field_range, quadrature_order):
@@ -87,7 +84,6 @@ def _integrate_rescale_pes(
     field_range,
     quadrature_order,
     quartic_factor,
-    previous_s,
 ):
     toy = Phi4LogShellNARG(
         cutoff=log_factor**1.5,
@@ -100,7 +96,7 @@ def _integrate_rescale_pes(
         coupling=coupling,
         quadrature_order=quadrature_order,
     )
-    _, surface, s_kernel, fit = _full_narg_residual_surface(toy, previous_s=previous_s)
+    _, surface, s_kernel, fit = _full_narg_residual_surface(toy)
     surface = surface.reshape(amplitude_npoints, amplitude_npoints)
 
     next_mass2 = log_factor**2 * (fit["omega2_eff"] - 1.0)
@@ -133,7 +129,6 @@ def main():
     )
 
     panels = []
-    s_kernel = None
     q, surface = _single_shell_pes(
         mass2,
         coupling,
@@ -164,7 +159,6 @@ def main():
             field_range=field_range,
             quadrature_order=quadrature_order,
             quartic_factor=quartic_factor,
-            previous_s=s_kernel,
         )
         panels.append(
             {

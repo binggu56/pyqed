@@ -36,17 +36,14 @@ def _s_diagnostics(s_kernel):
     }
 
 
-def full_narg_shell_fit(toy, previous_s=None):
-    """Fit the residual PES and update the full NARG overlap kernel."""
+def full_narg_shell_fit(toy):
+    """Fit the residual PES and recompute the full NARG overlap kernel."""
     result = toy.narg_effective_hamiltonian(nbranches=1)
-    step_s = result.kinetic_dressing[:, 0, :, 0]
-    if previous_s is None:
-        previous_s = np.ones_like(step_s)
-    total_s = previous_s * step_s
-    residual_surface = np.diag(result.hamiltonian - result.active_kinetic * step_s)
+    s_kernel = result.kinetic_dressing[:, 0, :, 0]
+    residual_surface = np.diag(result.hamiltonian - result.active_kinetic * s_kernel)
     fit = fit_radial_surface(result.active_configs, residual_surface)
-    fit["s_kernel"] = total_s
-    fit.update(_s_diagnostics(total_s))
+    fit["s_kernel"] = s_kernel
+    fit.update(_s_diagnostics(s_kernel))
     return fit
 
 
@@ -69,7 +66,6 @@ def calibrate_shell_quartic(log_factor, amplitude_npoints, field_range, quadratu
 def rg_step(
     mass2,
     coupling,
-    previous_s,
     *,
     log_factor,
     amplitude_npoints,
@@ -80,8 +76,8 @@ def rg_step(
     """Integrate one UV cos/sin supersite and rescale the IR supersite.
 
     The rescaling is the standard mode-coordinate rescaling ``q' = q/sqrt(b)``
-    and ``H' = b H``.  The full NARG overlap kernel is retained as a generated
-    operator instead of being compressed to a scalar wave-function factor.
+    and ``H' = b H``.  The full NARG overlap kernel is recomputed from the
+    conditional retained state of the enlarged environment at this split.
     """
     toy = Phi4LogShellNARG(
         cutoff=log_factor**1.5,
@@ -94,7 +90,7 @@ def rg_step(
         coupling=coupling,
         quadrature_order=quadrature_order,
     )
-    fit = full_narg_shell_fit(toy, previous_s=previous_s)
+    fit = full_narg_shell_fit(toy)
     k_ir = toy.mode_wave_numbers[toy.active_modes[0]]
 
     if not np.allclose(k_ir, 1.0, atol=1e-12):
@@ -132,7 +128,6 @@ def main():
 
     mass2 = 0.5
     coupling = 0.8
-    s_kernel = None
     rows = [
         {
             "step": 0,
@@ -151,7 +146,6 @@ def main():
         mapped = rg_step(
             mass2,
             coupling,
-            s_kernel,
             log_factor=log_factor,
             amplitude_npoints=amplitude_npoints,
             field_range=field_range,
@@ -160,7 +154,6 @@ def main():
         )
         mass2 = mapped["mass2"]
         coupling = mapped["coupling"]
-        s_kernel = mapped["s_kernel"]
         current = np.array([mass2, coupling], dtype=float)
         delta = float(np.linalg.norm(current - previous))
         rows.append(
