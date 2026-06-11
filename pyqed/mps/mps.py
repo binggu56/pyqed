@@ -2061,7 +2061,7 @@ class MPO:
 
             # 3. Compress (Input is Left, Phys, Right)
             # The output B will also be (Left, Phys, Right)
-            compressed_factors = compress(mps_factors, chi_max)
+            compressed_factors = compress(mps_factors, chi_max, renormalize=False)
 
             # 4. Restore MPO format
             final_factors = []
@@ -2298,7 +2298,7 @@ class MPO:
 
         """
 
-        return expmpo(self.H, constant, method='taylor', order=4, scale=0)
+        return expmpo(self, constant, D=D, method=method, order=order, scale=scale)
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
     """
@@ -4307,4 +4307,4 @@ if __name__ == '__main__':
 
 # print("m=10 variance = {:16.12f}".format(Esq_10 - E_10*E_10))
 # print("m=20 variance = {:16.12f}".format(Esq_20 - E_20*E_20))
-# print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))
+# print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))# print("m=30 variance = {:16.12f}".format(Esq_30 - E_30*E_30))
