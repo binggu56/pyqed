@@ -167,7 +167,7 @@ class DMRGSCF(QCDMRG):
             spatial_reduced_mpo=getattr(self, "spatial_reduced_mpo", None),
             symmetry=getattr(self, "symmetry", None),
             spatial_site_basis=getattr(self, "spatial_site_basis", "canonical"),
-            spatial_abelian_mpo=getattr(self, "spatial_abelian_mpo", "spatial"),
+            spatial_abelian_mpo=getattr(self, "spatial_abelian_mpo", "grouped"),
             spatial_abelian_symbolic_algo=getattr(
                 self,
                 "spatial_abelian_symbolic_algo",
@@ -258,6 +258,8 @@ class DMRGSCF(QCDMRG):
                 "spatial_direct_operator_batch_min_entries",
                 2,
             ),
+            dmrg_performance=getattr(self, "dmrg_performance", "block2-like"),
+            abelian_matvec_options=getattr(self, "abelian_matvec_options", None),
             debug_complementary_action_check=getattr(
                 self,
                 "debug_complementary_action_check",

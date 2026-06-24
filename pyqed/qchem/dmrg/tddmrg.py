@@ -65,10 +65,9 @@ def _mpo_to_dense_matrix(mpo):
         raise ValueError("Unexpected right MPO bond dimension while densifying.")
 
     tens = acc[0]
-    nsites = len(factors)
-    tens = np.transpose(tens, list(range(0, 2 * nsites, 2)) + list(range(1, 2 * nsites, 2)))
-    dim = 2 ** nsites
-    return tens.reshape(dim, dim)
+    out_dim = int(np.prod([np.asarray(w).shape[2] for w in factors], dtype=np.int64))
+    in_dim = int(np.prod([np.asarray(w).shape[3] for w in factors], dtype=np.int64))
+    return tens.reshape(out_dim, in_dim)
 
 
 class TDDMRG(DMRG):
@@ -113,6 +112,14 @@ class TDDMRG(DMRG):
         self.observables = None
         self.final_state = None
         self.fields = None
+        self.pre_normalization_norms = None
+        self.pre_normalization_norm2 = None
+        self.substep_pre_normalization_norms = None
+        self.energy_times = None
+        self.static_energies = None
+        self.energy_drift = None
+        self.time_reversal_diagnostic = None
+        self.tdvp_truncation_errors = None
         self._interaction_mpo_cache = None
         self._interaction_spatial_cache = None
         self._interaction_unitary_cache = None
@@ -121,7 +128,13 @@ class TDDMRG(DMRG):
         return (2 * self.ncas) <= 8
 
     def _state_from_dense_vector(self, vec):
-        tensor = np.asarray(vec, dtype=complex).reshape((2,) * (2 * self.ncas))
+        if self.H is not None:
+            dims = tuple(int(np.asarray(w).shape[2]) for w in self.H)
+        elif getattr(self, "site", None) == "spatial":
+            dims = (4,) * int(self.ncas)
+        else:
+            dims = (2,) * (2 * int(self.ncas))
+        tensor = np.asarray(vec, dtype=complex).reshape(dims)
         factors = decompose(tensor, rank=tensor.size)
         return MPS(factors, labels=["lv", "p", "rv"]).normalize()
 
@@ -137,15 +150,29 @@ class TDDMRG(DMRG):
         self.times = float(t0) + np.asarray(checkpoints, dtype=float) * dt
         self.observables = np.zeros((len(checkpoints), len(observables)), dtype=complex)
         self.fields = np.zeros((len(checkpoints), 3), dtype=float)
+        pre_norms = np.empty(steps, dtype=float)
+        pre_norm2 = np.empty(steps, dtype=float)
+        static_energies = []
+
+        def _static_energy(vec):
+            denom = np.vdot(vec, vec)
+            if abs(denom) <= 1.0e-30:
+                return np.nan
+            return np.vdot(vec, h_dense @ vec) / denom
 
         vec = np.asarray(tt_to_tensor(psi.factors), dtype=complex).reshape(-1)
+        static_energies.append(_static_energy(vec))
         if interaction_dense is None:
             u_static = expm(-1j * dt * h_dense)
             for i, checkpoint in enumerate(checkpoints):
                 vec = u_static @ vec
-                vec = vec / np.linalg.norm(vec)
+                norm = float(np.linalg.norm(vec))
+                pre_norms[i] = norm
+                pre_norm2[i] = norm**2
+                vec = vec / norm
                 self.observables[i] = [np.vdot(vec, op @ vec) for op in obs_dense]
                 self.fields[i] = self._field_vector(float(t0) + checkpoint * dt, field)
+                static_energies.append(_static_energy(vec))
         else:
             u_static_half = expm(-0.5j * dt * h_dense)
             time = float(t0)
@@ -160,15 +187,54 @@ class TDDMRG(DMRG):
                 vec = u_static_half @ vec
                 vec = u_int @ vec
                 vec = u_static_half @ vec
-                vec = vec / np.linalg.norm(vec)
+                norm = float(np.linalg.norm(vec))
+                pre_norms[i] = norm
+                pre_norm2[i] = norm**2
+                vec = vec / norm
 
                 self.observables[i] = [np.vdot(vec, op @ vec) for op in obs_dense]
                 time = float(t0) + checkpoint * dt
                 self.fields[i] = self._field_vector(time, field)
+                static_energies.append(_static_energy(vec))
 
         self.final_state = self._state_from_dense_vector(vec)
         self.tdmps = None
+        self.pre_normalization_norms = pre_norms
+        self.pre_normalization_norm2 = pre_norm2
+        self.substep_pre_normalization_norms = [(float(norm),) for norm in pre_norms]
+        self.energy_times = np.concatenate(([float(t0)], self.times))
+        self.static_energies = np.asarray(static_energies, dtype=complex)
+        self.energy_drift = self.static_energies - self.static_energies[0]
+        self.tdvp_truncation_errors = np.zeros(steps, dtype=float)
         return self
+
+    def _propagate_dense_vector(self, vec, dt, steps, h_dense, interaction_dense=None, field=None, t0=0.0):
+        vec = np.asarray(vec, dtype=complex).reshape(-1).copy()
+        if interaction_dense is None:
+            u_static = expm(-1j * dt * h_dense)
+            for _ in range(steps):
+                vec = u_static @ vec
+                norm = np.linalg.norm(vec)
+                if norm != 0.0:
+                    vec = vec / norm
+            return vec
+
+        u_static_half = expm(-0.5j * dt * h_dense)
+        time = float(t0)
+        for _ in range(steps):
+            field_vec = self._field_vector(time + 0.5 * dt, field)
+            h_int = np.zeros_like(h_dense)
+            for axis in range(3):
+                if field_vec[axis] != 0.0:
+                    h_int = h_int - field_vec[axis] * interaction_dense[axis]
+            vec = u_static_half @ vec
+            vec = expm(-1j * dt * h_int) @ vec
+            vec = u_static_half @ vec
+            norm = np.linalg.norm(vec)
+            if norm != 0.0:
+                vec = vec / norm
+            time += dt
+        return vec
 
     def _clear_interaction_caches(self):
         self._interaction_mpo_cache = None
@@ -199,7 +265,12 @@ class TDDMRG(DMRG):
         if not isinstance(psi, MPS):
             raise TypeError(f"Expected an MPS initial state, got {type(psi)}.")
         if hasattr(psi.factors[0], "qns"):
-            psi = symmetric_to_dense(psi)
+            site_qn_maps = None
+            if hasattr(self, "_dense_site_qn_maps"):
+                site_qn_maps = self._dense_site_qn_maps()
+            elif getattr(self, "dmrg", None) is not None:
+                site_qn_maps = getattr(self.dmrg, "site_qn_maps", None)
+            psi = symmetric_to_dense(psi, site_qn_maps=site_qn_maps)
         return psi.copy() if copy else psi
 
     def _default_initial_state(self):
@@ -216,7 +287,8 @@ class TDDMRG(DMRG):
                     "initial_guess='previous' requires a prior converged DMRG state. "
                     "Run optimize_ground_state(...) first or provide psi0 explicitly."
                 )
-            dense_guess = self.get_initial_guess_dense(noise=1e-3)
+            noise = 0.0 if guess.lower() == "hf" else 1e-3
+            dense_guess = self.get_initial_guess_dense(noise=noise)
             return MPS(dense_guess, labels=["lv", "p", "rv"]).normalize()
 
         raise TypeError(
@@ -330,7 +402,7 @@ class TDDMRG(DMRG):
             raise ValueError("field must evaluate to a scalar or a length-3 vector.")
         return vec
 
-    def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=2, scale=0):
+    def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
         del order, scale
         field_vec = self._field_vector(time, field)
         if not np.any(field_vec):
@@ -426,7 +498,7 @@ class TDDMRG(DMRG):
     def build_propagator(
         self,
         dt,
-        order=2,
+        order=4,
         scale=0,
         mo_coeff=None,
         field=None,
@@ -454,11 +526,24 @@ class TDDMRG(DMRG):
         e_ops=None,
         interval=1,
         mo_coeff=None,
-        order=2,
+        order=4,
         scale=0,
         field=None,
         interaction_mpo=None,
         t0=0.0,
+        integrator="tdvp",
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+        krylov_method="lanczos",
+        diagonal_fast_path=False,
+        tdvp_dynamic_mode="split",
+        sparse_threshold=0.0,
+        sparse_vectorized=True,
+        reuse_tdvp_engine=True,
+        canonicalize_each_step=False,
+        measure_observables=True,
+        track_energy=True,
+        progress=True,
     ):
         if dt is None:
             raise ValueError("dt must be provided.")
@@ -499,9 +584,126 @@ class TDDMRG(DMRG):
             t0=t0,
             order=order,
             scale=scale,
+            integrator=integrator,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            diagonal_fast_path=diagonal_fast_path,
+            tdvp_dynamic_mode=tdvp_dynamic_mode,
+            sparse_threshold=sparse_threshold,
+            sparse_vectorized=sparse_vectorized,
+            reuse_tdvp_engine=reuse_tdvp_engine,
+            canonicalize_each_step=canonicalize_each_step,
+            measure_observables=measure_observables,
+            track_energy=track_energy,
+            progress=progress,
         )
         self.times = self.tdmps.times
         self.observables = self.tdmps.observables
         self.final_state = getattr(self.tdmps, "final_state", None)
         self.fields = getattr(self.tdmps, "fields", None)
+        self.pre_normalization_norms = getattr(self.tdmps, "pre_normalization_norms", None)
+        self.pre_normalization_norm2 = getattr(self.tdmps, "pre_normalization_norm2", None)
+        self.substep_pre_normalization_norms = getattr(self.tdmps, "substep_pre_normalization_norms", None)
+        self.energy_times = getattr(self.tdmps, "energy_times", None)
+        self.static_energies = getattr(self.tdmps, "static_energies", None)
+        self.energy_drift = getattr(self.tdmps, "energy_drift", None)
+        self.tdvp_truncation_errors = getattr(self.tdmps, "tdvp_truncation_errors", None)
         return self
+
+    def time_reversal_error(
+        self,
+        psi0=None,
+        dt=None,
+        steps=None,
+        mo_coeff=None,
+        order=4,
+        scale=0,
+        field=None,
+        interaction_mpo=None,
+        t0=0.0,
+        integrator="tdvp",
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+        krylov_method="lanczos",
+        diagonal_fast_path=False,
+        tdvp_dynamic_mode="split",
+        sparse_threshold=0.0,
+        sparse_vectorized=True,
+        reuse_tdvp_engine=True,
+        canonicalize_each_step=False,
+    ):
+        if dt is None:
+            raise ValueError("dt must be provided.")
+        if steps is None:
+            raise ValueError("steps must be provided.")
+        if steps < 0:
+            raise ValueError("steps must be non-negative.")
+        if mo_coeff is not None:
+            self.build(mo_coeff=mo_coeff)
+
+        psi = self._default_initial_state() if psi0 is None else self._ensure_dense_mps(psi0)
+        if interaction_mpo is None and field is not None:
+            interaction_mpo = self.get_interaction_mpo()
+
+        if self._use_exact_dense_td():
+            h_dense = _mpo_to_dense_matrix(self._get_td_hamiltonian(mo_coeff=mo_coeff))
+            interaction_dense = None
+            if field is not None:
+                interaction_dense = [_mpo_to_dense_matrix(self.get_interaction_mpo(axis=i)) for i in range(3)]
+            vec0 = np.asarray(tt_to_tensor(psi.factors), dtype=complex).reshape(-1)
+            vec_forward = self._propagate_dense_vector(
+                vec0,
+                dt=dt,
+                steps=steps,
+                h_dense=h_dense,
+                interaction_dense=interaction_dense,
+                field=field,
+                t0=t0,
+            )
+            vec_backward = self._propagate_dense_vector(
+                vec_forward,
+                dt=-dt,
+                steps=steps,
+                h_dense=h_dense,
+                interaction_dense=interaction_dense,
+                field=field,
+                t0=float(t0) + steps * dt,
+            )
+            diagnostic = TDMPS.overlap_diagnostic(
+                np.vdot(vec0, vec_backward),
+                np.vdot(vec0, vec0),
+                np.vdot(vec_backward, vec_backward),
+            )
+            diagnostic.update({"steps": int(steps), "dt": float(dt), "t0": float(t0)})
+            self.time_reversal_diagnostic = diagnostic
+            return diagnostic
+
+        solver = TDMPS(
+            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            D=self.td_bond_dim,
+            interaction_mpo=interaction_mpo,
+            field=field,
+            interaction_propagator_builder=self.build_interaction_unitary_mpo,
+        )
+        diagnostic = solver.time_reversal_error(
+            psi,
+            dt=dt,
+            steps=steps,
+            field=field,
+            t0=t0,
+            order=order,
+            scale=scale,
+            integrator=integrator,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            diagonal_fast_path=diagonal_fast_path,
+            tdvp_dynamic_mode=tdvp_dynamic_mode,
+            sparse_threshold=sparse_threshold,
+            sparse_vectorized=sparse_vectorized,
+            reuse_tdvp_engine=reuse_tdvp_engine,
+            canonicalize_each_step=canonicalize_each_step,
+        )
+        self.time_reversal_diagnostic = diagnostic
+        return diagnostic

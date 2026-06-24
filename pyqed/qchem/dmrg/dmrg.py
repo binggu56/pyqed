@@ -19,6 +19,7 @@ from scipy.sparse.linalg import eigsh
 
 import logging
 import warnings
+from copy import deepcopy
 
 from pyqed import discretize, sort, dag, tensor
 from pyqed.davidson import davidson
@@ -31,20 +32,97 @@ from pyqed.qchem.mcscf.casci import h1e_for_cas
 
 _GLOBAL_HAMILTONIAN_MPO_CACHE = {}
 _GLOBAL_HAMILTONIAN_MPO_CACHE_MAXSIZE = 8
+_GLOBAL_SYMMETRIC_MPO_CACHE = {}
+_GLOBAL_SYMMETRIC_MPO_CACHE_MAXSIZE = 16
 
 
-def _store_global_hamiltonian_mpo_cache(cache_key, *, factors, info, hamiltonian=None):
+def _store_global_hamiltonian_mpo_cache(
+    cache_key,
+    *,
+    factors,
+    info,
+    hamiltonian=None,
+    **extra,
+):
     """Store one process-local Hamiltonian MPO cache entry with FIFO eviction."""
 
     if cache_key in _GLOBAL_HAMILTONIAN_MPO_CACHE:
         _GLOBAL_HAMILTONIAN_MPO_CACHE.pop(cache_key)
     elif len(_GLOBAL_HAMILTONIAN_MPO_CACHE) >= _GLOBAL_HAMILTONIAN_MPO_CACHE_MAXSIZE:
         _GLOBAL_HAMILTONIAN_MPO_CACHE.pop(next(iter(_GLOBAL_HAMILTONIAN_MPO_CACHE)))
-    _GLOBAL_HAMILTONIAN_MPO_CACHE[cache_key] = {
+    entry = {
         "factors": factors,
-        "info": dict(info),
+        "info": deepcopy(dict(info)),
         "hamiltonian": hamiltonian,
     }
+    entry.update(extra)
+    _GLOBAL_HAMILTONIAN_MPO_CACHE[cache_key] = entry
+
+
+def _store_global_symmetric_mpo_cache(
+    cache_key,
+    *,
+    hamiltonian,
+    complementary_mpos,
+):
+    """Store converted Abelian MPO tensors for reuse across DMRG instances."""
+
+    if cache_key is None:
+        return
+    if cache_key in _GLOBAL_SYMMETRIC_MPO_CACHE:
+        _GLOBAL_SYMMETRIC_MPO_CACHE.pop(cache_key)
+    elif len(_GLOBAL_SYMMETRIC_MPO_CACHE) >= _GLOBAL_SYMMETRIC_MPO_CACHE_MAXSIZE:
+        _GLOBAL_SYMMETRIC_MPO_CACHE.pop(next(iter(_GLOBAL_SYMMETRIC_MPO_CACHE)))
+    _GLOBAL_SYMMETRIC_MPO_CACHE[cache_key] = {
+        "hamiltonian": hamiltonian,
+        "complementary_mpos": complementary_mpos,
+    }
+
+
+def _qn_cache_signature(qn):
+    if hasattr(qn, "labels") and hasattr(qn, "components"):
+        return (
+            type(qn).__name__,
+            tuple(str(label) for label in qn.labels),
+            tuple(_qn_cache_signature(component) for component in qn.components),
+        )
+    if isinstance(qn, (tuple, list)):
+        return (type(qn).__name__, tuple(_qn_cache_signature(item) for item in qn))
+    if isinstance(qn, (np.integer, int)):
+        return ("int", int(qn))
+    if isinstance(qn, (np.floating, float)):
+        return ("float", float(qn))
+    if isinstance(qn, str):
+        return ("str", qn)
+    return (type(qn).__name__, repr(qn))
+
+
+def _site_qn_maps_cache_signature(site_qn_maps):
+    return tuple(
+        tuple(
+            (int(local_index), _qn_cache_signature(qn))
+            for local_index, qn in sorted(site_map.items())
+        )
+        for site_map in tuple(site_qn_maps or ())
+    )
+
+
+def _global_symmetric_mpo_cache_key(
+    active_hamiltonian_key,
+    *,
+    sym_types,
+    native_site_storage,
+    site_qn_maps,
+):
+    if active_hamiltonian_key is None:
+        return None
+    return (
+        "qchem_global_symmetric_mpo",
+        active_hamiltonian_key,
+        tuple(str(sym) for sym in sym_types),
+        bool(native_site_storage),
+        _site_qn_maps_cache_signature(site_qn_maps),
+    )
 
 from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
@@ -61,8 +139,15 @@ from pyqed.qchem.mcscf.casci import (
     _get_mf_cholesky_factors,
     transform_eri_factors_to_mo_pair,
 )
-from pyqed.mps import DMRG as TensorDMRG, MPS, dense_to_symmetric_mpo
+from pyqed.mps import (
+    DMRG as TensorDMRG,
+    MPS,
+    dense_to_symmetric_mpo,
+    resolve_abelian_matvec_options,
+)
 from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.mps.abelian_storage import make_abelian_site_tensor
+from pyqed.mps.symmetry import SymmetryManager as BaseSymmetryManager
 from pyqed.mps.decompose import compress
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
@@ -72,22 +157,16 @@ from pyqed.qchem.dmrg.spatial_terms import (
     BasisSpatialFermion,
     accumulate_spatial_jw_term as _accumulate_spatial_jw_term,
     merge_term_maps as _merge_spatial_term_maps,
-    spatial_complementary_family_hamiltonian_term_map as _spatial_family_hamiltonian_term_map,
     spatial_complementary_family_term_maps as _spatial_family_term_maps,
     spatial_one_body_term_map as _spatial_one_body_term_map,
     spatial_two_generator_family_term_map as _spatial_two_generator_family_term_map,
     spatial_two_body_spinfree_term_map as _spatial_two_body_spinfree_term_map,
     spatial_two_body_term_map as _spatial_two_body_term_map,
 )
-from pyqed.qchem.dmrg.spatial_mpo import build_spatial_block2_carrier_mpo
-try:
-    import pyqed.mps.symmetry as sym_module
-    from pyqed.mps.symmetry import BlockTensor, tensordot, QN, SymmetryManager as BaseSymmetryManager
-    SYMMETRY_AVAILABLE = True
-except ImportError:
-    SYMMETRY_AVAILABLE = False
-    BlockTensor = None
-    BaseSymmetryManager = object
+from pyqed.qchem.dmrg.spatial_mpo import (
+    SpatialCarrierMPO,
+    build_spatial_block2_carrier_mpo,
+)
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -447,7 +526,7 @@ def _nonabelian_mps_to_dense_vector(state):
     return np.squeeze(psi, axis=-1).reshape(-1)
 
 
-def _spatial_rdm_dense_mps(state):
+def _spatial_rdm_dense_mps(state, site_qn_maps=None):
     """Return a standard dense d=4 MPS for spatial-site RDM contractions."""
 
     if hasattr(state, "sites"):
@@ -455,7 +534,7 @@ def _spatial_rdm_dense_mps(state):
     if hasattr(state.Bs[0], "qns"):
         from pyqed.mps.mps import symmetric_to_dense
 
-        state = symmetric_to_dense(state)
+        state = symmetric_to_dense(state, site_qn_maps=site_qn_maps)
     else:
         state = state.to_order(["lv", "p", "rv"])
     if state.Bs[0].shape[1] != 4:
@@ -927,6 +1006,18 @@ def _compare_spatial_family_term_map(reference, family, *, cutoff=1e-10):
         "tol": float(cutoff),
         "ok": bool(mismatches == 0),
     }
+
+
+def _spatial_family_generator_entry_counts(complementary):
+    """Return raw R/P generator-entry counts without building symbolic JW maps."""
+    if complementary is None:
+        return {}
+    counts = {}
+    for name in ("R", "P"):
+        family = complementary.get(name) if hasattr(complementary, "get") else None
+        entries = getattr(family, "entries", None) if family is not None else None
+        counts[name] = int(len(entries or {}))
+    return counts
 
 
 def _build_spin_orbital_dense_hamiltonian_tensor_mpo(h1e, eri, ncas, *, spin_purification=False, shift=None, cutoff=1e-10):
@@ -1521,7 +1612,14 @@ def gen_random_cisd_configs(nelec, nsites, n_states=10, mixing=0.1):
 
     return configs
 
-def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5):
+def build_mps_from_configs(
+    configs_with_amps,
+    sym_mgr,
+    nsites,
+    noise_scale=1e-5,
+    *,
+    native_site_storage=False,
+):
     """
     Constructs an entangled U(1) symmetric MPS from a list of determinant configurations.
 
@@ -1532,7 +1630,7 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
         noise_scale: Magnitude of random noise to inject for symmetry breaking.
 
     Returns:
-        List[BlockTensor]: The resulting MPS in (Left, Right, Phys) convention.
+        list: The resulting symmetric MPS tensors in (Left, Right, Phys) convention.
     """
     # Pre-calculate QN Trajectories for all configurations
     # traj[k] is a list of bond QNs [BoundL, Q1, Q2, ..., BoundR] for config k
@@ -1588,7 +1686,7 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
             data[key][row, col, 0] += val + noise
 
         # get basis data
-        # Construct flat lists of QNs for the BlockTensor axes
+        # Construct flat lists of QNs for the symmetric site-tensor axes.
         # Left Bond QNs
         if i == 0:
             final_qns_L = [trajectories[0][0]] # [Vacuum]
@@ -1602,8 +1700,12 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
             final_qns_R = [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
         # Physical QNs (Generic from Manager)
         final_qns_P = [sym_mgr.get_phys_qn(i, 'emp'), sym_mgr.get_phys_qn(i, 'occ')]
-        # Create BlockTensor
-        bt = BlockTensor(data, [final_qns_L, final_qns_R, final_qns_P], [-1, 1, 1])
+        bt = make_abelian_site_tensor(
+            data,
+            [final_qns_L, final_qns_R, final_qns_P],
+            [-1, 1, 1],
+            native_site_storage=native_site_storage,
+        )
         # Normalize
         nrm = bt.norm()
         if nrm > 1e-12:
@@ -1633,8 +1735,15 @@ def _spatial_state_label(state):
     return ("empty", "up", "down", "double")[int(state)]
 
 
-def build_spatial_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5):
-    """Construct a spatial-site U(1) BlockTensor MPS from d=4 local configurations."""
+def build_spatial_mps_from_configs(
+    configs_with_amps,
+    sym_mgr,
+    nsites,
+    noise_scale=1e-5,
+    *,
+    native_site_storage=False,
+):
+    """Construct a spatial-site U(1) MPS from d=4 local configurations."""
     trajectories = []
     vac_qn = sym_mgr.get_vac_qn()
     phys_qns = [sym_mgr.get_phys_qn(0, label) for label in ("empty", "up", "down", "double")]
@@ -1683,7 +1792,12 @@ def build_spatial_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_sca
 
         final_qns_L = [trajectories[0][0]] if i == 0 else [q for q in sorted(left_groups.keys()) for _ in left_groups[q]]
         final_qns_R = [trajectories[0][-1]] if i == nsites - 1 else [q for q in sorted(right_groups.keys()) for _ in right_groups[q]]
-        bt = BlockTensor(data, [final_qns_L, final_qns_R, phys_qns], [-1, 1, 1])
+        bt = make_abelian_site_tensor(
+            data,
+            [final_qns_L, final_qns_R, phys_qns],
+            [-1, 1, 1],
+            native_site_storage=native_site_storage,
+        )
         nrm = bt.norm()
         if nrm > 1e-12:
             bt = bt * (1.0 / nrm)
@@ -1759,9 +1873,9 @@ class DMRG(CASCI):
                  low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
                  orbital_layout=None, spatial_reduced_mpo=None,
                  symmetry=None, spatial_site_basis="canonical",
-                 integral_backend="auto", spatial_abelian_mpo="spatial",
+                 integral_backend="auto", spatial_abelian_mpo="auto",
                  spatial_abelian_symbolic_algo="Hopcroft-Karp",
-                 spatial_family_environment_backend="block2_table",
+                 spatial_family_environment_backend="generator_table",
                  spatial_native_p_grouping="first_site_order",
                  spatial_block2_table_p_split_metric="auto",
                  spatial_block2_table_p_split_groups="auto",
@@ -1775,9 +1889,11 @@ class DMRG(CASCI):
                  spatial_exact_component_compression_min_reduction=1,
                  spatial_exact_component_compression_max_group_size=64,
                  spatial_enable_native_boundary_p=True,
-                 spatial_validate_native_boundary_p=True,
-                 spatial_native_boundary_p_validation_policy="first_pass",
+                 spatial_validate_native_boundary_p=False,
+                 spatial_native_boundary_p_validation_policy="off",
                  spatial_direct_operator_batch_min_entries=2,
+                 dmrg_performance="block2-like",
+                 abelian_matvec_options=None,
                  debug_complementary_action_check=False,
                  debug_complementary_action_check_tol=1.0e-10,
                  debug_complementary_action_check_limit=32,
@@ -1974,18 +2090,22 @@ class DMRG(CASCI):
         self.spatial_validate_native_boundary_p = bool(
             spatial_validate_native_boundary_p
         )
-        policy = str(spatial_native_boundary_p_validation_policy or "first_pass")
+        policy = str(spatial_native_boundary_p_validation_policy or "off")
         policy = policy.lower().replace("-", "_")
         if policy in {"true", "yes", "on"}:
             policy = "first_pass"
         if policy in {"false", "no", "off", "none", "disabled"}:
             policy = "off"
         if policy not in {"off", "first_pass", "always"}:
-            policy = "first_pass"
+            policy = "off"
         self.spatial_native_boundary_p_validation_policy = policy
         self.spatial_direct_operator_batch_min_entries = max(
             2,
             int(spatial_direct_operator_batch_min_entries),
+        )
+        self.dmrg_performance = str(dmrg_performance or "auto")
+        self.abelian_matvec_options = (
+            None if abelian_matvec_options is None else dict(abelian_matvec_options)
         )
         self.debug_complementary_action_check = bool(debug_complementary_action_check)
         self.debug_complementary_action_check_tol = float(
@@ -1997,21 +2117,46 @@ class DMRG(CASCI):
         self.debug_spatial_family_hamiltonian_check = bool(
             debug_spatial_family_hamiltonian_check
         )
-        spatial_abelian_mpo = str(spatial_abelian_mpo).lower().replace("-", "_")
-        if spatial_abelian_mpo in {"block2", "block2_spatial", "native_spatial"}:
-            spatial_abelian_mpo = "spatial"
-        if spatial_abelian_mpo not in {"spatial", "direct", "grouped"}:
-            raise ValueError(
-                "spatial_abelian_mpo must be 'spatial', 'direct', or 'grouped'."
-            )
-        self.spatial_abelian_mpo = spatial_abelian_mpo
-        self.spatial_abelian_symbolic_algo = _normalize_spatial_abelian_symbolic_algo(
-            spatial_abelian_symbolic_algo
-        )
         self.spatial_family_environment_backend = (
             _normalize_spatial_family_environment_backend(
                 spatial_family_environment_backend
             )
+        )
+        spatial_abelian_mpo = str(spatial_abelian_mpo).lower().replace("-", "_")
+        if spatial_abelian_mpo in {"block2", "block2_spatial", "native_spatial"}:
+            spatial_abelian_mpo = "spatial"
+        if spatial_abelian_mpo in {"auto", "default"}:
+            performance_key = str(self.dmrg_performance or "auto").lower()
+            performance_key = performance_key.replace("_", "-")
+            block2_like_performance = performance_key in {
+                "auto",
+                "block2",
+                "block2-like",
+                "block2-style",
+                "packed-block2-style",
+                "cpp",
+                "c++",
+                "block2-cpp",
+                "packed-cpp-fast",
+                "packed-compiled-fast",
+            }
+            can_use_block2_carrier = bool(
+                self.site == "spatial"
+                and normalized_symmetry is not None
+                and "charge" in normalized_symmetry
+                and "su2" not in normalized_symmetry
+                and self.spatial_family_environment_backend
+                in {"block2_table", "generator_table"}
+                and block2_like_performance
+            )
+            spatial_abelian_mpo = "spatial" if can_use_block2_carrier else "grouped"
+        if spatial_abelian_mpo not in {"spatial", "direct", "grouped"}:
+            raise ValueError(
+                "spatial_abelian_mpo must be 'auto', 'spatial', 'direct', or 'grouped'."
+            )
+        self.spatial_abelian_mpo = spatial_abelian_mpo
+        self.spatial_abelian_symbolic_algo = _normalize_spatial_abelian_symbolic_algo(
+            spatial_abelian_symbolic_algo
         )
         self.spatial_native_p_grouping = _normalize_spatial_native_p_grouping(
             spatial_native_p_grouping
@@ -2033,8 +2178,17 @@ class DMRG(CASCI):
         guess = self.dmrg.states[state].copy()
         if dense and hasattr(guess.factors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
-            guess = symmetric_to_dense(guess)
+            guess = symmetric_to_dense(guess, site_qn_maps=self._dense_site_qn_maps())
         return guess.copy()
+
+    def _dense_site_qn_maps(self):
+        """Physical-state maps needed to recover dense local basis ordering."""
+        dmrg = getattr(self, "dmrg", None)
+        if dmrg is not None:
+            site_qn_maps = getattr(dmrg, "site_qn_maps", None)
+            if site_qn_maps is not None:
+                return site_qn_maps
+        return getattr(self, "_site_qn_maps", None)
 
     def reuse_guess_from(self, other, state=0, dense=False):
         """Adopt a converged MPS from another DMRG object as the next guess."""
@@ -2042,7 +2196,7 @@ class DMRG(CASCI):
         return self
 
 
-    def get_initial_guess_symmetric(self, method='cid'):
+    def get_initial_guess_symmetric(self, method='cid', *, native_site_storage=False):
         """
         New Robust Initial Guess Dispatcher.
         """
@@ -2067,7 +2221,12 @@ class DMRG(CASCI):
             else:
                 self._log(f"  [Warning] Method {method} not found. Defaulting to HF.")
                 configs = [(_spin_config_to_spatial_config(gen_hf_config(self.nelecas, nspin)), 1.0)]
-            return build_spatial_mps_from_configs(configs, self.sym_mgr, self.ncas)
+            return build_spatial_mps_from_configs(
+                configs,
+                self.sym_mgr,
+                self.ncas,
+                native_site_storage=native_site_storage,
+            )
 
         nsites = 2 * self.ncas
 
@@ -2094,7 +2253,12 @@ class DMRG(CASCI):
             configs = [(hf_cfg, 1.0)]
 
         # 2. Build Tensor (Math)
-        mps = build_mps_from_configs(configs, self.sym_mgr, nsites)
+        mps = build_mps_from_configs(
+            configs,
+            self.sym_mgr,
+            nsites,
+            native_site_storage=native_site_storage,
+        )
         return mps
 
     def get_initial_guess_dense(self, noise=1e-3):
@@ -2102,7 +2266,7 @@ class DMRG(CASCI):
             return _spatial_hf_guess(self.nelecas, self.ncas, spin=self.spin, noise=noise)
         return get_noisy_hf_guess(self.nelecas, 2*self.ncas, noise=noise)
 
-    def _resolve_initial_guess(self, use_symmetry):
+    def _resolve_initial_guess(self, use_symmetry, *, native_site_storage=False):
         guess = self.init_guess
         if isinstance(guess, MPS):
             self._log("  Reusing MPS initial guess.")
@@ -2119,7 +2283,10 @@ class DMRG(CASCI):
             if not isinstance(guess, str):
                 raise TypeError(f"Unsupported symmetric initial guess type: {type(guess)}")
             self._log(f"  Generating Initial Guess ({guess})...")
-            return self.get_initial_guess_symmetric(method=guess.lower())
+            return self.get_initial_guess_symmetric(
+                method=guess.lower(),
+                native_site_storage=native_site_storage,
+            )
 
         if isinstance(guess, str):
             self._log(f"  Generating Initial Guess ({guess})...")
@@ -2425,60 +2592,503 @@ class DMRG(CASCI):
         """Build the shared Abelian spatial complementary R/P family package."""
 
         from pyqed.qchem.dmrg.backends.reduced import (
+            ComplementaryOperatorFamily,
+            SpatialComplementaryOperatorFamilies,
             build_spatial_complementary_operator_families,
         )
 
         h1_spatial = np.asarray(h1e[0])
         eri_spatial = np.asarray(eri[0, 0])
         timings = {}
+        native_fallback_reason = None
         t0 = time.perf_counter()
-        complementary = build_spatial_complementary_operator_families(
-            h1_spatial,
-            eri,
-            cutoff=cutoff,
-            include_half=True,
-            prefer_complementary_payload_tensor_matvec=(
-                self.spatial_complementary_payload_tensor_matvec
-            ),
-            prefer_precontracted_family_environment=(
-                self.spatial_precontracted_family_environment
-            ),
-            boundary_table_max_dim=self.spatial_boundary_table_max_dim,
-            exact_component_compression_policy=(
-                self.spatial_exact_component_compression_policy
-            ),
-            exact_component_compression_validate=(
-                self.spatial_exact_component_compression_validate
-            ),
-            exact_component_compression_validation_vectors=(
-                self.spatial_exact_component_compression_validation_vectors
-            ),
-            exact_component_compression_min_reduction=(
-                self.spatial_exact_component_compression_min_reduction
-            ),
-            exact_component_compression_max_group_size=(
-                self.spatial_exact_component_compression_max_group_size
-            ),
-            enable_native_boundary_p=self.spatial_enable_native_boundary_p,
-            validate_native_boundary_p=self.spatial_validate_native_boundary_p,
-            native_boundary_p_validation_policy=(
-                self.spatial_native_boundary_p_validation_policy
-            ),
-            direct_operator_batch_min_entries=(
-                self.spatial_direct_operator_batch_min_entries
-            ),
-            debug_complementary_action_check=self.debug_complementary_action_check,
-            debug_complementary_action_check_tol=(
-                self.debug_complementary_action_check_tol
-            ),
-            debug_complementary_action_check_limit=(
-                self.debug_complementary_action_check_limit
-            ),
+        complementary = None
+        native_entries = None
+        native_n_sites = None
+        native_terms = None
+        native_carrier = None
+        native_family_mpos = None
+        native_family_mpo_info = None
+        native_family_mpo_owner = None
+        native_family_descriptor_key = None
+        native_family_descriptor_names = ()
+        native_family_descriptor_info = None
+        self._native_spatial_family_descriptor_key = None
+        self._native_spatial_family_descriptor_names = ()
+
+        def _record_native_family_mpo_payload(native_family_mpo_payload):
+            nonlocal native_family_mpos, native_family_mpo_info
+            native_family_mpos = {
+                str(name): list(factors)
+                for name, factors in dict(
+                    native_family_mpo_payload.get("family_mpos", {})
+                ).items()
+            }
+            native_family_mpo_info = {
+                str(name): dict(info)
+                for name, info in dict(
+                    native_family_mpo_payload.get("family_mpo_info", {})
+                ).items()
+            }
+            timings["family_mpo_backend_actual"] = str(
+                native_family_mpo_payload.get(
+                    "backend_actual",
+                    "cpp_spatial_string_sum_family_mpos",
+                )
+            )
+            timings["family_mpo_cpp_seconds"] = float(
+                native_family_mpo_payload.get("seconds", 0.0)
+            )
+            timings["family_mpo_cpp_counts"] = dict(
+                native_family_mpo_payload.get("counts", {})
+            )
+        needs_symbolic_family_terms = bool(
+            self.debug_spatial_family_hamiltonian_check
+            or self.spatial_family_environment_backend
+            in {"block2", "block2_table", "block2_adaptive", "block2_native", "direct_terms"}
         )
+        needs_native_carrier = bool(
+            self.spatial_abelian_mpo == "spatial"
+            and not self.spin_purification
+            and self._can_use_spatial_block2_carrier()
+        )
+        needs_native_family_mpos = bool(
+            needs_native_carrier
+            and self.spatial_family_environment_backend == "block2_table"
+        )
+        try:
+            from pyqed.mps import cpp_davidson as _cpp_davidson
+
+            native_setup_builder = getattr(
+                _cpp_davidson,
+                "build_spatial_qchem_block2_setup",
+                None,
+            )
+            if native_setup_builder is not None:
+                owner_cls = getattr(_cpp_davidson, "MovingEnvironment", None)
+                build_family_mpos_in_setup = bool(needs_native_family_mpos)
+                if needs_native_family_mpos and owner_cls is not None:
+                    build_family_mpos_in_setup = False
+                native_setup = native_setup_builder(
+                    h1_spatial,
+                    eri,
+                    cutoff,
+                    True,
+                    needs_symbolic_family_terms,
+                    needs_native_carrier,
+                    4,
+                    build_family_mpos_in_setup,
+                    self.spatial_block2_table_p_split_groups,
+                    self.spatial_block2_table_p_split_metric,
+                )
+                native_result = native_setup["family_entries"]
+                native_n_sites = int(
+                    native_setup.get(
+                        "n_sites",
+                        native_result.get("n_sites", self.ncas),
+                    )
+                )
+                native_terms = native_setup.get("family_term_maps")
+                native_carrier = native_setup.get("carrier")
+                native_family_mpo_payload = native_setup.get("family_mpos")
+                if (
+                    native_family_mpo_payload is None
+                    and needs_native_family_mpos
+                    and native_terms is not None
+                    and owner_cls is not None
+                ):
+                    try:
+                        native_family_mpo_owner = getattr(
+                            self,
+                            "_native_spatial_family_mpo_owner",
+                            None,
+                        )
+                        owner_builder = getattr(
+                            native_family_mpo_owner,
+                            "build_spatial_qchem_family_mpos",
+                            None,
+                        )
+                        if owner_builder is None:
+                            native_family_mpo_owner = owner_cls()
+                            self._native_spatial_family_mpo_owner = (
+                                native_family_mpo_owner
+                            )
+                            owner_builder = (
+                                native_family_mpo_owner
+                                .build_spatial_qchem_family_mpos
+                            )
+                        t_owner_mpo = time.perf_counter()
+                        descriptor_installer = getattr(
+                            native_family_mpo_owner,
+                            "install_spatial_qchem_family_descriptor",
+                            None,
+                        )
+                        descriptor_builder = getattr(
+                            native_family_mpo_owner,
+                            "build_spatial_qchem_family_mpos_from_descriptor",
+                            None,
+                        )
+                        if (
+                            descriptor_installer is not None
+                            and descriptor_builder is not None
+                        ):
+                            descriptor_layout = (
+                                self.spatial_block2_table_p_split_groups,
+                                self.spatial_block2_table_p_split_metric,
+                            )
+                            descriptor_key = (
+                                "qchem-family-descriptor:"
+                                f"{id(self)}:{native_n_sites}:"
+                                f"{hash(descriptor_layout)}"
+                            )
+                            t_descriptor = time.perf_counter()
+                            native_family_descriptor_info = descriptor_installer(
+                                descriptor_key,
+                                native_terms,
+                                native_n_sites,
+                                cutoff,
+                                self.spatial_block2_table_p_split_groups,
+                                self.spatial_block2_table_p_split_metric,
+                            )
+                            native_family_descriptor_key = descriptor_key
+                            native_family_descriptor_names = tuple(
+                                str(name)
+                                for name in native_family_descriptor_info.get(
+                                    "family_names",
+                                    (),
+                                )
+                            )
+                            self._native_spatial_family_descriptor_key = (
+                                native_family_descriptor_key
+                            )
+                            self._native_spatial_family_descriptor_names = (
+                                native_family_descriptor_names
+                            )
+                            timings["family_descriptor_backend_actual"] = str(
+                                native_family_descriptor_info.get(
+                                    "backend_actual",
+                                    "cpp_spatial_qchem_family_descriptor",
+                                )
+                            )
+                            timings["family_descriptor_install_s"] = float(
+                                time.perf_counter() - t_descriptor
+                            )
+                            timings["family_descriptor_families"] = int(
+                                len(native_family_descriptor_names)
+                            )
+                            native_family_mpo_payload = descriptor_builder(
+                                descriptor_key
+                            )
+                            timings["family_mpo_owner_builder"] = (
+                                "cpp_descriptor"
+                            )
+                        else:
+                            native_family_mpo_payload = owner_builder(
+                                native_terms,
+                                native_n_sites,
+                                cutoff,
+                                self.spatial_block2_table_p_split_groups,
+                                self.spatial_block2_table_p_split_metric,
+                            )
+                            timings["family_mpo_owner_builder"] = (
+                                "cpp_term_maps"
+                            )
+                        owner_key = (
+                            native_family_mpo_owner
+                            .spatial_route_plan_cache_owner_key()
+                        )
+                        owner_stats = dict(
+                            native_family_mpo_owner
+                            .spatial_route_plan_cache_stats()
+                        )
+                        timings["family_mpo_owner_backend_actual"] = (
+                            "cpp_moving_environment"
+                        )
+                        timings["family_mpo_owner_build_s"] = float(
+                            time.perf_counter() - t_owner_mpo
+                        )
+                        timings["family_mpo_route_cache_owner"] = str(owner_key)
+                        timings["family_mpo_route_cache_records"] = int(
+                            owner_stats.get("records", 0)
+                        )
+                    except Exception as exc:
+                        timings["family_mpo_owner_fallback_reason"] = repr(exc)
+                        standalone_family_mpo_builder = getattr(
+                            _cpp_davidson,
+                            "build_spatial_qchem_family_mpos",
+                            None,
+                        )
+                        if standalone_family_mpo_builder is not None:
+                            try:
+                                native_family_mpo_payload = (
+                                    standalone_family_mpo_builder(
+                                        native_terms,
+                                        native_n_sites,
+                                        cutoff,
+                                        self.spatial_block2_table_p_split_groups,
+                                        self.spatial_block2_table_p_split_metric,
+                                    )
+                                )
+                                timings["family_mpo_owner_backend_actual"] = (
+                                    "standalone_fallback"
+                                )
+                            except Exception as fallback_exc:
+                                timings["family_mpo_cpp_fallback_reason"] = repr(
+                                    fallback_exc
+                                )
+                if native_family_mpo_payload is not None:
+                    _record_native_family_mpo_payload(native_family_mpo_payload)
+                elif native_setup.get("family_mpo_error") is not None:
+                    timings["family_mpo_cpp_fallback_reason"] = str(
+                        native_setup.get("family_mpo_error")
+                    )
+                timings["qchem_block2_setup_backend_actual"] = str(
+                    native_setup.get(
+                        "backend_actual",
+                        "cpp_qchem_spatial_block2_setup",
+                    )
+                )
+                timings["qchem_block2_setup_s"] = float(
+                    native_setup.get("seconds", 0.0)
+                )
+            else:
+                native_builder = getattr(
+                    _cpp_davidson,
+                    "build_spatial_qchem_family_entries",
+                    None,
+                )
+                if native_builder is None:
+                    native_fallback_reason = "cpp_qchem_family_builder_unavailable"
+                    native_result = None
+                else:
+                    native_result = native_builder(h1_spatial, eri, cutoff, True)
+            if native_result is not None:
+                native_entries = native_result["entries"]
+                native_n_sites = int(native_result["n_sites"])
+                ranks = {"S": 1, "R": 2, "A": 2, "P": 4, "B": 2, "Q": 3}
+                descriptions = {
+                    "S": "single-orbital spinor source channels",
+                    "R": "effective one-body complementary coefficients",
+                    "A": "pair/scalar-generator structural channels",
+                    "P": "two-generator ERI complementary coefficients",
+                    "B": "particle-hole scalar-generator structural channels",
+                    "Q": "delta-contracted one-body correction complementary coefficients",
+                }
+                families = {
+                    name: ComplementaryOperatorFamily(
+                        name=name,
+                        rank=ranks[name],
+                        entries=dict(native_entries[name]),
+                        description=descriptions[name],
+                    )
+                    for name in ("S", "R", "A", "P", "B", "Q")
+                }
+                complementary = SpatialComplementaryOperatorFamilies(
+                    families=families,
+                    n_sites=int(native_n_sites),
+                    cutoff=float(cutoff),
+                    include_half=True,
+                    prefer_complementary_payload_tensor_matvec=(
+                        self.spatial_complementary_payload_tensor_matvec
+                    ),
+                    prefer_precontracted_family_environment=(
+                        self.spatial_precontracted_family_environment
+                    ),
+                    boundary_table_max_dim=self.spatial_boundary_table_max_dim,
+                    debug_complementary_action_check=(
+                        self.debug_complementary_action_check
+                    ),
+                    debug_complementary_action_check_tol=(
+                        self.debug_complementary_action_check_tol
+                    ),
+                    debug_complementary_action_check_limit=(
+                        self.debug_complementary_action_check_limit
+                    ),
+                    exact_component_compression_policy=(
+                        self.spatial_exact_component_compression_policy
+                    ),
+                    exact_component_compression_validate=(
+                        self.spatial_exact_component_compression_validate
+                    ),
+                    exact_component_compression_validation_vectors=(
+                        self.spatial_exact_component_compression_validation_vectors
+                    ),
+                    exact_component_compression_min_reduction=(
+                        self.spatial_exact_component_compression_min_reduction
+                    ),
+                    exact_component_compression_max_group_size=(
+                        self.spatial_exact_component_compression_max_group_size
+                    ),
+                    enable_native_boundary_p=self.spatial_enable_native_boundary_p,
+                    validate_native_boundary_p=self.spatial_validate_native_boundary_p,
+                    native_boundary_p_validation_policy=(
+                        self.spatial_native_boundary_p_validation_policy
+                    ),
+                    direct_operator_batch_min_entries=(
+                        self.spatial_direct_operator_batch_min_entries
+                    ),
+                )
+                timings["native_qchem_family_compile_s"] = float(
+                    native_result.get("seconds", 0.0)
+                )
+                timings["qchem_family_backend_actual"] = "cpp"
+                timings["qchem_family_counts"] = dict(native_result["counts"])
+        except Exception as exc:
+            native_fallback_reason = repr(exc)
+            complementary = None
+
+        if complementary is None:
+            complementary = build_spatial_complementary_operator_families(
+                h1_spatial,
+                eri,
+                cutoff=cutoff,
+                include_half=True,
+                prefer_complementary_payload_tensor_matvec=(
+                    self.spatial_complementary_payload_tensor_matvec
+                ),
+                prefer_precontracted_family_environment=(
+                    self.spatial_precontracted_family_environment
+                ),
+                boundary_table_max_dim=self.spatial_boundary_table_max_dim,
+                exact_component_compression_policy=(
+                    self.spatial_exact_component_compression_policy
+                ),
+                exact_component_compression_validate=(
+                    self.spatial_exact_component_compression_validate
+                ),
+                exact_component_compression_validation_vectors=(
+                    self.spatial_exact_component_compression_validation_vectors
+                ),
+                exact_component_compression_min_reduction=(
+                    self.spatial_exact_component_compression_min_reduction
+                ),
+                exact_component_compression_max_group_size=(
+                    self.spatial_exact_component_compression_max_group_size
+                ),
+                enable_native_boundary_p=self.spatial_enable_native_boundary_p,
+                validate_native_boundary_p=self.spatial_validate_native_boundary_p,
+                native_boundary_p_validation_policy=(
+                    self.spatial_native_boundary_p_validation_policy
+                ),
+                direct_operator_batch_min_entries=(
+                    self.spatial_direct_operator_batch_min_entries
+                ),
+                debug_complementary_action_check=self.debug_complementary_action_check,
+                debug_complementary_action_check_tol=(
+                    self.debug_complementary_action_check_tol
+                ),
+                debug_complementary_action_check_limit=(
+                    self.debug_complementary_action_check_limit
+                ),
+            )
+            timings["qchem_family_backend_actual"] = "python"
+            if native_fallback_reason is not None:
+                timings["qchem_family_fallback_reason"] = native_fallback_reason
         timings["complementary_family_build_s"] = float(time.perf_counter() - t0)
-        t0 = time.perf_counter()
-        family_term_maps = _spatial_family_term_maps(complementary, cutoff=cutoff)
-        timings["family_term_map_build_s"] = float(time.perf_counter() - t0)
+        generator_entry_counts = _spatial_family_generator_entry_counts(complementary)
+        if needs_symbolic_family_terms:
+            t0 = time.perf_counter()
+            family_term_maps = None
+            if native_terms is not None:
+                dynamic_ops = dict(native_terms.get("local_ops", {}) or {})
+                if dynamic_ops:
+                    from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+                    spatial_local_ops().update(
+                        {
+                            str(name): np.asarray(matrix, dtype=complex)
+                            for name, matrix in dynamic_ops.items()
+                        }
+                    )
+                family_term_maps = {
+                    str(name): dict(term_map)
+                    for name, term_map in dict(
+                        native_terms.get("term_maps", {})
+                    ).items()
+                }
+                timings["family_term_map_build_s"] = float(time.perf_counter() - t0)
+                timings["family_term_map_backend_actual"] = str(
+                    native_terms.get(
+                        "backend_actual",
+                        "cpp_spatial_jw_family_term_maps",
+                    )
+                )
+                timings["family_term_map_cpp_seconds"] = float(
+                    native_terms.get("seconds", 0.0)
+                )
+                timings["family_term_map_cpp_counts"] = dict(
+                    native_terms.get("counts", {})
+                )
+                timings["family_term_map_cpp_dynamic_local_ops"] = int(
+                    len(dynamic_ops)
+                )
+            if family_term_maps is None and native_entries is not None:
+                try:
+                    from pyqed.mps import cpp_davidson as _cpp_davidson
+
+                    native_term_builder = getattr(
+                        _cpp_davidson,
+                        "build_spatial_qchem_family_term_maps",
+                        None,
+                    )
+                    if native_term_builder is not None:
+                        native_terms = native_term_builder(
+                            native_entries,
+                            int(native_n_sites if native_n_sites is not None else self.ncas),
+                            cutoff,
+                        )
+                        dynamic_ops = dict(native_terms.get("local_ops", {}) or {})
+                        if dynamic_ops:
+                            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+                            spatial_local_ops().update(
+                                {
+                                    str(name): np.asarray(matrix, dtype=complex)
+                                    for name, matrix in dynamic_ops.items()
+                                }
+                            )
+                        family_term_maps = {
+                            str(name): dict(term_map)
+                            for name, term_map in dict(
+                                native_terms.get("term_maps", {})
+                            ).items()
+                        }
+                        timings["family_term_map_build_s"] = float(
+                            time.perf_counter() - t0
+                        )
+                        timings["family_term_map_backend_actual"] = str(
+                            native_terms.get(
+                                "backend_actual",
+                                "cpp_spatial_jw_family_term_maps",
+                            )
+                        )
+                        timings["family_term_map_cpp_seconds"] = float(
+                            native_terms.get("seconds", 0.0)
+                        )
+                        timings["family_term_map_cpp_counts"] = dict(
+                            native_terms.get("counts", {})
+                        )
+                        timings["family_term_map_cpp_dynamic_local_ops"] = int(
+                            len(dynamic_ops)
+                        )
+                except Exception as exc:
+                    timings["family_term_map_cpp_fallback_reason"] = repr(exc)
+                    family_term_maps = None
+            if family_term_maps is None:
+                family_term_maps = _spatial_family_term_maps(
+                    complementary,
+                    cutoff=cutoff,
+                )
+                timings["family_term_map_build_s"] = float(time.perf_counter() - t0)
+                timings["family_term_map_backend_actual"] = "symbolic_spatial_jw"
+        else:
+            family_term_maps = {}
+            timings["family_term_map_build_s"] = 0.0
+            timings["family_term_map_backend_actual"] = "skipped"
+            timings["family_term_map_skip_reason"] = (
+                f"{self.spatial_family_environment_backend}_uses_generator_entries"
+            )
+        timings["family_generator_entry_counts"] = dict(generator_entry_counts)
         if self.debug_spatial_family_hamiltonian_check:
             t0 = time.perf_counter()
             reference_terms = _merge_spatial_term_maps(
@@ -2486,8 +3096,8 @@ class DMRG(CASCI):
                 _spatial_two_body_spinfree_term_map(eri_spatial, cutoff=cutoff),
                 cutoff=cutoff,
             )
-            family_hamiltonian_terms = _spatial_family_hamiltonian_term_map(
-                complementary,
+            family_hamiltonian_terms = _merge_spatial_term_maps(
+                *family_term_maps.values(),
                 cutoff=cutoff,
             )
             hamiltonian_check = _compare_spatial_family_term_map(
@@ -2506,6 +3116,13 @@ class DMRG(CASCI):
         return {
             "complementary": complementary,
             "term_maps": family_term_maps,
+            "carrier": native_carrier,
+            "native_family_mpos": native_family_mpos,
+            "native_family_mpo_info": native_family_mpo_info,
+            "native_family_mpo_owner": native_family_mpo_owner,
+            "native_family_descriptor_key": native_family_descriptor_key,
+            "native_family_descriptor_names": native_family_descriptor_names,
+            "native_family_descriptor_info": native_family_descriptor_info,
             "hamiltonian_check": hamiltonian_check,
             "timings": timings,
         }
@@ -2516,12 +3133,25 @@ class DMRG(CASCI):
         family_term_maps,
         *,
         cutoff=1e-10,
+        native_family_mpos=None,
+        native_family_mpo_info=None,
     ):
         """Build optional family MPO environments for block2-like backends."""
 
         backend = self.spatial_family_environment_backend
         family_tensor_mpos = {}
         family_mpo_info = {}
+        if backend == "block2_table" and native_family_mpos:
+            return (
+                {
+                    str(name): list(factors)
+                    for name, factors in dict(native_family_mpos).items()
+                },
+                {
+                    str(name): dict(info)
+                    for name, info in dict(native_family_mpo_info or {}).items()
+                },
+            )
         if backend == "generator_table":
             return {}, {
                 "R": {
@@ -2798,7 +3428,15 @@ class DMRG(CASCI):
 
         complementary = family_data["complementary"]
         family_term_maps = family_data["term_maps"]
+        timings = dict(family_data.get("timings", {}))
         backend = self.spatial_family_environment_backend
+        symbolic_term_counts = {
+            str(name): int(len(term_map))
+            for name, term_map in family_term_maps.items()
+        }
+        generator_entry_counts = timings.get("family_generator_entry_counts")
+        if generator_entry_counts is None:
+            generator_entry_counts = _spatial_family_generator_entry_counts(complementary)
         environment = {
             "backend": backend,
             "uses_family_mpos": bool(family_tensor_mpos),
@@ -2831,17 +3469,20 @@ class DMRG(CASCI):
             "complementary_operator_family_names": complementary.names,
             "complementary_operator_total_terms": int(complementary.n_terms),
             "complementary_operator_builder": "spatial_spinfree_sparse_S/R/A/P/B/Q",
-            "complementary_operator_family_term_counts": {
-                str(name): int(len(term_map))
-                for name, term_map in family_term_maps.items()
+            "complementary_operator_family_term_counts": symbolic_term_counts,
+            "complementary_operator_family_generator_entry_counts": dict(
+                generator_entry_counts
+            ),
+            "complementary_operator_family_symbolic_term_maps": {
+                "built": bool(symbolic_term_counts),
+                "backend": timings.get("family_term_map_backend_actual"),
+                "skip_reason": timings.get("family_term_map_skip_reason"),
             },
             "complementary_operator_family_hamiltonian_check": (
                 family_data["hamiltonian_check"]
             ),
             "complementary_operator_family_environment": environment,
-            "complementary_operator_family_build_timings": dict(
-                family_data.get("timings", {})
-            ),
+            "complementary_operator_family_build_timings": timings,
         }
         if family_mpo_info is not None:
             metadata["complementary_operator_family_mpos"] = family_mpo_info
@@ -2931,6 +3572,26 @@ class DMRG(CASCI):
             self._log("  Reusing Hamiltonian MPO cache.")
             return self
 
+        cached = _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+        if cached is not None:
+            self._log("  Reusing global Hamiltonian MPO cache.")
+            self._spatial_operator_cache = None
+            self._active_hamiltonian = cached.get("hamiltonian")
+            self.complementary_operators = cached.get("complementary_operators")
+            self.complementary_operator_mpos = cached.get("complementary_operator_mpos")
+            self.complementary_operator_term_maps = cached.get(
+                "complementary_operator_term_maps"
+            )
+            self.complementary_operator_generator_entries = cached.get(
+                "complementary_operator_generator_entries"
+            )
+            self.H_raw = cached["factors"]
+            self.H = cached["factors"]
+            self._hamiltonian_mpo_cache_key = cache_key
+            self._symmetric_mpo_cache = {}
+            self._active_integral_build_info.update(deepcopy(dict(cached["info"])))
+            return self
+
 
 
         # h2e[0,0] -= h2e[0,0].swapaxes(1,3)
@@ -2965,7 +3626,9 @@ class DMRG(CASCI):
                     self.H = cached["factors"]
                     self._hamiltonian_mpo_cache_key = cache_key
                     self._symmetric_mpo_cache = {}
-                    self._active_integral_build_info.update(dict(cached["info"]))
+                    self._active_integral_build_info.update(
+                        deepcopy(dict(cached["info"]))
+                    )
                     return self
                 self._log("  Building spatial-orbital Hamiltonian MPO with reduced SU(2) channels...")
                 from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
@@ -3021,6 +3684,10 @@ class DMRG(CASCI):
                         complementary,
                         family_data["term_maps"],
                         cutoff=1e-10,
+                        native_family_mpos=family_data.get("native_family_mpos"),
+                        native_family_mpo_info=family_data.get(
+                            "native_family_mpo_info"
+                        ),
                     )
                 )
                 _record_build_time("family_mpo_build_s", t_family_mpo)
@@ -3080,6 +3747,8 @@ class DMRG(CASCI):
                     complementary,
                     family_data["term_maps"],
                     cutoff=1e-10,
+                    native_family_mpos=family_data.get("native_family_mpos"),
+                    native_family_mpo_info=family_data.get("native_family_mpo_info"),
                 )
             )
             _record_build_time("family_mpo_build_s", t_family_mpo)
@@ -3094,7 +3763,23 @@ class DMRG(CASCI):
             ):
                 self._log("  Building spatial block2-table carrier MPO in d=4 channels...")
                 t_carrier = time.perf_counter()
-                carrier = build_spatial_block2_carrier_mpo(n_spatial, local_dim=4)
+                native_carrier = family_data.get("carrier")
+                if native_carrier is not None:
+                    carrier = SpatialCarrierMPO(
+                        factors=list(native_carrier["factors"]),
+                        info=dict(native_carrier["info"]),
+                    )
+                    build_timings["carrier_build_backend_actual"] = (
+                        "cpp_qchem_spatial_block2_setup"
+                    )
+                else:
+                    carrier = build_spatial_block2_carrier_mpo(
+                        n_spatial,
+                        local_dim=4,
+                    )
+                    build_timings["carrier_build_backend_actual"] = str(
+                        carrier.info.get("source", "python_spatial_identity_scaffold")
+                    )
                 _record_build_time("carrier_build_s", t_carrier)
                 self._expose_spatial_family_environment(
                     complementary,
@@ -3128,6 +3813,20 @@ class DMRG(CASCI):
                             expose_direct_terms=False,
                         ),
                     }
+                )
+                _store_global_hamiltonian_mpo_cache(
+                    cache_key,
+                    factors=carrier.factors,
+                    info=self._active_integral_build_info,
+                    hamiltonian=None,
+                    complementary_operators=self.complementary_operators,
+                    complementary_operator_mpos=self.complementary_operator_mpos,
+                    complementary_operator_term_maps=(
+                        self.complementary_operator_term_maps
+                    ),
+                    complementary_operator_generator_entries=(
+                        self.complementary_operator_generator_entries
+                    ),
                 )
                 return self
 
@@ -3316,7 +4015,10 @@ class DMRG(CASCI):
                     continue
                 if hasattr(state_for_eval.Bs[0], 'qns'):
                     from pyqed.mps.mps import symmetric_to_dense
-                    state_for_eval = symmetric_to_dense(state)
+                    state_for_eval = symmetric_to_dense(
+                        state,
+                        site_qn_maps=self._dense_site_qn_maps(),
+                    )
                 s2 = mps_lib.expect_mps(state_for_eval.Bs, s2_mpo.factors, state_for_eval.Bs)
                 norm = state_for_eval.norm()
                 s2_vals.append(float(np.real(s2 / norm)))
@@ -3346,7 +4048,10 @@ class DMRG(CASCI):
 
         for state in states_to_eval:
             if hasattr(state.Bs[0], 'qns'):
-                dense_state = mps_lib.symmetric_to_dense(state)
+                dense_state = mps_lib.symmetric_to_dense(
+                    state,
+                    site_qn_maps=self._dense_site_qn_maps(),
+                )
                 psi_for_eval = dense_state.Bs
             else:
                 psi_for_eval = state.Bs
@@ -3581,7 +4286,30 @@ class DMRG(CASCI):
         noise = kwargs.pop("noise", 1.0e-4)
         noise_decay = kwargs.pop("noise_decay", 0.1)
         noise_cutoff = kwargs.pop("noise_cutoff", 1.0e-9)
-        local_dense_max_dim = kwargs.pop("local_dense_max_dim", "auto")
+        local_dense_max_dim = kwargs.pop("local_dense_max_dim", 0)
+        final_expectation = kwargs.pop("final_expectation", None)
+        dmrg_performance = kwargs.pop("dmrg_performance", self.dmrg_performance)
+        abelian_matvec_options = kwargs.pop(
+            "abelian_matvec_options",
+            kwargs.pop("dmrg_matvec_options", self.abelian_matvec_options),
+        )
+        resolved_abelian_options = resolve_abelian_matvec_options(
+            dmrg_performance or "auto",
+            abelian_matvec_options,
+        )
+        abelian_matvec_options = dict(resolved_abelian_options)
+
+        def _metadata_abelian_options(options):
+            metadata = dict(options or {})
+            if "moving_environment_cpp_state_owner_instance" in metadata:
+                metadata["moving_environment_cpp_state_owner_instance"] = (
+                    "cpp_moving_environment_build_owner"
+                )
+            return metadata
+
+        native_symmetric_mpo_storage = bool(
+            resolved_abelian_options.get("native_site_storage", False)
+        )
         # Initialize Symmetry
         self.sym_mgr = SymmetryManager(symmetry_list, orb_sym=getattr(self, "orb_sym", None))
         if self.sym_mgr.enabled:
@@ -3657,56 +4385,117 @@ class DMRG(CASCI):
                     }
                     site_qn_maps.append(map_dn)
             # get MPO in symmetric form with QN index
-            sym_cache_key = tuple(self.sym_mgr.sym_types)
-            final_H = self._symmetric_mpo_cache.get(sym_cache_key)
-            if final_H is None:
-                self._log("  Converting MPO to BlockTensors...")
-                t_convert = time.perf_counter()
-                final_H = dense_to_symmetric_mpo(self.H, site_qn_maps)
+            sym_cache_key = (
+                tuple(self.sym_mgr.sym_types),
+                "native" if native_symmetric_mpo_storage else "legacy",
+            )
+            global_sym_cache_key = _global_symmetric_mpo_cache_key(
+                getattr(self, "_hamiltonian_mpo_cache_key", None),
+                sym_types=self.sym_mgr.sym_types,
+                native_site_storage=native_symmetric_mpo_storage,
+                site_qn_maps=site_qn_maps,
+            )
+            global_sym_cache = (
+                None
+                if global_sym_cache_key is None
+                else _GLOBAL_SYMMETRIC_MPO_CACHE.get(global_sym_cache_key)
+            )
+            if global_sym_cache is not None:
+                self._log("  Reusing global symmetric MPO cache.")
+                final_H = global_sym_cache["hamiltonian"]
+                final_complementary_mpos = global_sym_cache["complementary_mpos"]
+                self._symmetric_mpo_cache[sym_cache_key] = final_H
+                if final_complementary_mpos:
+                    for family_name, family_final in final_complementary_mpos.items():
+                        self._symmetric_mpo_cache[
+                            (
+                                sym_cache_key,
+                                "complementary_family",
+                                str(family_name),
+                            )
+                        ] = family_final
                 timings = self._active_integral_build_info.setdefault(
                     "build_timings",
                     {},
                 )
-                timings["symmetric_hamiltonian_convert_s"] = float(
-                    time.perf_counter() - t_convert
-                )
-                self._symmetric_mpo_cache[sym_cache_key] = final_H
-                self._log(f"  MPO Converted. Sites: {len(final_H)}")
+                timings["symmetric_mpo_global_cache_hits"] = int(
+                    timings.get("symmetric_mpo_global_cache_hits", 0)
+                ) + 1
             else:
-                self._log("  Reusing symmetric MPO cache.")
-            final_complementary_mpos = None
-            if getattr(self, "complementary_operator_mpos", None):
-                final_complementary_mpos = {}
-                family_convert_total = 0.0
-                family_convert_by_name = {}
-                for family_name, family_mpo in self.complementary_operator_mpos.items():
-                    family_cache_key = (
-                        sym_cache_key,
-                        "complementary_family",
-                        str(family_name),
+                final_H = self._symmetric_mpo_cache.get(sym_cache_key)
+                if final_H is None:
+                    self._log(
+                        "  Converting MPO to native Abelian tensors..."
+                        if native_symmetric_mpo_storage
+                        else "  Converting MPO to legacy symmetric tensors..."
                     )
-                    family_final = self._symmetric_mpo_cache.get(family_cache_key)
-                    if family_final is None:
-                        t_convert = time.perf_counter()
-                        family_final = dense_to_symmetric_mpo(family_mpo, site_qn_maps)
-                        elapsed = float(time.perf_counter() - t_convert)
-                        family_convert_total += elapsed
-                        family_convert_by_name[str(family_name)] = elapsed
-                        self._symmetric_mpo_cache[family_cache_key] = family_final
-                    final_complementary_mpos[str(family_name)] = family_final
-                if family_convert_by_name:
+                    t_convert = time.perf_counter()
+                    final_H = dense_to_symmetric_mpo(
+                        self.H,
+                        site_qn_maps,
+                        native_site_storage=native_symmetric_mpo_storage,
+                    )
                     timings = self._active_integral_build_info.setdefault(
                         "build_timings",
                         {},
                     )
-                    timings["symmetric_family_convert_s"] = float(
-                        timings.get("symmetric_family_convert_s", 0.0)
-                        + family_convert_total
+                    timings["symmetric_hamiltonian_convert_s"] = float(
+                        time.perf_counter() - t_convert
                     )
-                    timings["symmetric_family_convert_by_name_s"] = {
-                        **dict(timings.get("symmetric_family_convert_by_name_s", {})),
-                        **family_convert_by_name,
-                    }
+                    self._symmetric_mpo_cache[sym_cache_key] = final_H
+                    self._log(f"  MPO Converted. Sites: {len(final_H)}")
+                else:
+                    self._log("  Reusing symmetric MPO cache.")
+                final_complementary_mpos = None
+                if getattr(self, "complementary_operator_mpos", None):
+                    final_complementary_mpos = {}
+                    family_convert_total = 0.0
+                    family_convert_by_name = {}
+                    for family_name, family_mpo in self.complementary_operator_mpos.items():
+                        family_cache_key = (
+                            sym_cache_key,
+                            "complementary_family",
+                            str(family_name),
+                        )
+                        family_final = self._symmetric_mpo_cache.get(family_cache_key)
+                        if family_final is None:
+                            t_convert = time.perf_counter()
+                            family_final = dense_to_symmetric_mpo(
+                                family_mpo,
+                                site_qn_maps,
+                                native_site_storage=native_symmetric_mpo_storage,
+                            )
+                            elapsed = float(time.perf_counter() - t_convert)
+                            family_convert_total += elapsed
+                            family_convert_by_name[str(family_name)] = elapsed
+                            self._symmetric_mpo_cache[family_cache_key] = family_final
+                        final_complementary_mpos[str(family_name)] = family_final
+                    if family_convert_by_name:
+                        timings = self._active_integral_build_info.setdefault(
+                            "build_timings",
+                            {},
+                        )
+                        timings["symmetric_family_convert_s"] = float(
+                            timings.get("symmetric_family_convert_s", 0.0)
+                            + family_convert_total
+                        )
+                        timings["symmetric_family_convert_by_name_s"] = {
+                            **dict(timings.get("symmetric_family_convert_by_name_s", {})),
+                            **family_convert_by_name,
+                        }
+                _store_global_symmetric_mpo_cache(
+                    global_sym_cache_key,
+                    hamiltonian=final_H,
+                    complementary_mpos=final_complementary_mpos,
+                )
+                if global_sym_cache_key is not None:
+                    timings = self._active_integral_build_info.setdefault(
+                        "build_timings",
+                        {},
+                    )
+                    timings["symmetric_mpo_global_cache_stores"] = int(
+                        timings.get("symmetric_mpo_global_cache_stores", 0)
+                    ) + 1
             final_complementary_term_maps = getattr(
                 self,
                 "complementary_operator_term_maps",
@@ -3729,7 +4518,142 @@ class DMRG(CASCI):
             target_qn = None
             use_symmetry = False
             self.sym_mgr = None
-        mps0 = self._resolve_initial_guess(use_symmetry=use_symmetry)
+            site_qn_maps = None
+        self._site_qn_maps = site_qn_maps if use_symmetry else None
+        active_info = self._active_integral_build_info or {}
+        carrier_only_family_hamiltonian = (
+            active_info.get("representation") == "spatial_block2_table_carrier_mpo"
+        )
+        if carrier_only_family_hamiltonian:
+            abelian_matvec_options = dict(abelian_matvec_options or {})
+            abelian_matvec_options.update(
+                {
+                    "packed_local_flat_matvec": False,
+                    "packed_local_flat_projected_matvec": False,
+                    "packed_local_flat_preconditioner": False,
+                    "packed_local_family_flat_matvec": True,
+                    "packed_local_family_flat_matvec_max_dim": 10**18,
+                }
+            )
+            native_family_mpo_owner = getattr(
+                self,
+                "_native_spatial_family_mpo_owner",
+                None,
+            )
+            reuse_native_family_mpo_owner = bool(
+                native_family_mpo_owner is not None
+                and abelian_matvec_options.get(
+                    "moving_environment_cpp_state_owner",
+                    False,
+                )
+            )
+            if reuse_native_family_mpo_owner:
+                abelian_matvec_options[
+                    "moving_environment_cpp_state_owner_instance"
+                ] = native_family_mpo_owner
+                native_family_descriptor_key = getattr(
+                    self,
+                    "_native_spatial_family_descriptor_key",
+                    None,
+                )
+                native_family_descriptor_names = tuple(
+                    getattr(
+                        self,
+                        "_native_spatial_family_descriptor_names",
+                        (),
+                    )
+                    or ()
+                )
+                if native_family_descriptor_key:
+                    abelian_matvec_options[
+                        "moving_environment_cpp_qchem_family_descriptor_key"
+                    ] = native_family_descriptor_key
+                    abelian_matvec_options[
+                        "moving_environment_cpp_qchem_family_descriptor_names"
+                    ] = native_family_descriptor_names
+                if final_complementary_mpos:
+                    try:
+                        family_items = tuple(
+                            sorted(
+                                final_complementary_mpos.items(),
+                                key=lambda item: str(item[0]),
+                            )
+                        )
+                        family_names = tuple(str(name) for name, _ in family_items)
+                        owned_family_mpo_key = (
+                            "qchem-converted-family-mpos:"
+                            f"{id(self)}:{hash(family_names)}"
+                        )
+                        t_owned = time.perf_counter()
+                        native_family_mpo_owner.install_owned_family_mpos(
+                            owned_family_mpo_key,
+                            family_names,
+                            tuple(factors for _, factors in family_items),
+                        )
+                        abelian_matvec_options[
+                            "moving_environment_cpp_owned_family_mpo_key"
+                        ] = owned_family_mpo_key
+                        abelian_matvec_options[
+                            "moving_environment_cpp_owned_family_mpo_names"
+                        ] = family_names
+                        timings = self._active_integral_build_info.setdefault(
+                            "build_timings",
+                            {},
+                        )
+                        timings[
+                            "cpp_owned_converted_family_mpo_register_s"
+                        ] = float(time.perf_counter() - t_owned)
+                        timings[
+                            "cpp_owned_converted_family_mpo_families"
+                        ] = int(len(family_names))
+                    except Exception as exc:
+                        timings = self._active_integral_build_info.setdefault(
+                            "build_timings",
+                            {},
+                        )
+                        timings[
+                            "cpp_owned_converted_family_mpo_register_error"
+                        ] = repr(exc)
+            final_expectation = False
+            if self._active_integral_build_info is not None:
+                self._active_integral_build_info[
+                    "carrier_only_family_hamiltonian"
+                ] = True
+                self._active_integral_build_info[
+                    "carrier_only_sweep_energy_final"
+                ] = True
+                self._active_integral_build_info[
+                    "carrier_only_disabled_flat_local_shortcuts"
+                ] = True
+                self._active_integral_build_info[
+                    "carrier_only_forced_family_flat_csr"
+                ] = True
+                self._active_integral_build_info[
+                    "moving_environment_cpp_owner_reused_from_build"
+                ] = reuse_native_family_mpo_owner
+        native_initial_guess_storage = bool(
+            use_symmetry
+            and resolved_abelian_options.get("native_site_storage", False)
+        )
+        if self._active_integral_build_info is not None:
+            self._active_integral_build_info["dmrg_performance"] = str(
+                dmrg_performance or "auto"
+            )
+            self._active_integral_build_info["abelian_matvec_options"] = (
+                None
+                if abelian_matvec_options is None
+                else _metadata_abelian_options(abelian_matvec_options)
+            )
+            self._active_integral_build_info[
+                "native_initial_guess_storage"
+            ] = bool(native_initial_guess_storage)
+            self._active_integral_build_info[
+                "native_symmetric_mpo_storage"
+            ] = bool(use_symmetry and native_symmetric_mpo_storage)
+        mps0 = self._resolve_initial_guess(
+            use_symmetry=use_symmetry,
+            native_site_storage=native_initial_guess_storage,
+        )
         schedule = self._normalize_dmrg_schedule(self.D, nsweeps, D_schedule=D_schedule, nsweeps_schedule=nsweeps_schedule)
         t0 = time.time()
         current_guess = mps0
@@ -3762,7 +4686,18 @@ class DMRG(CASCI):
                 complementary_operator_term_maps=final_complementary_term_maps,
                 complementary_operator_generator_entries=final_complementary_generator_entries,
                 site_qn_maps=site_qn_maps if use_symmetry else None,
+                performance=dmrg_performance,
+                abelian_matvec_options=abelian_matvec_options,
+                final_expectation=(
+                    True if final_expectation is None else bool(final_expectation)
+                ),
             )
+            if self._active_integral_build_info is not None:
+                self._active_integral_build_info[
+                    "resolved_abelian_matvec_options"
+                ] = _metadata_abelian_options(
+                    getattr(dmrg, "abelian_matvec_options", {}) or {}
+                )
             dmrg.run()
             current_guess = dmrg.ground_state.copy()
         self.dmrg = dmrg
@@ -3889,7 +4824,10 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        mps_state = _spatial_rdm_dense_mps(state)
+        mps_state = _spatial_rdm_dense_mps(
+            state,
+            site_qn_maps=self._dense_site_qn_maps(),
+        )
         if mps_state is not None:
             norm = mps_state._mps_dot(mps_state, mps_state)
             if abs(norm) < 1e-14:
@@ -3948,7 +4886,10 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        mps_state = _spatial_rdm_dense_mps(state)
+        mps_state = _spatial_rdm_dense_mps(
+            state,
+            site_qn_maps=self._dense_site_qn_maps(),
+        )
         if mps_state is not None:
             norm = mps_state._mps_dot(mps_state, mps_state)
             if abs(norm) < 1e-14:
@@ -4175,7 +5116,10 @@ class DMRG(CASCI):
         # Get Spin-Orbital RDM
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
-            dense_state = symmetric_to_dense(state)
+            dense_state = symmetric_to_dense(
+                state,
+                site_qn_maps=self._dense_site_qn_maps(),
+            )
             dense_state.dim = 2
             P_raw = dense_state.make_rdm1()
         else:
@@ -4244,7 +5188,10 @@ class DMRG(CASCI):
         # Get Spin-Orbital RDM
         if hasattr(state.Bs[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
-            dense_state = symmetric_to_dense(state)
+            dense_state = symmetric_to_dense(
+                state,
+                site_qn_maps=self._dense_site_qn_maps(),
+            )
             dense_state.dim = 2
             G_raw = dense_state.make_rdm2()
         else:

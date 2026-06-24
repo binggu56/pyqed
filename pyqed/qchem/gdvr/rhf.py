@@ -3,29 +3,83 @@ import scipy.linalg as la
 from scipy.special import i0e as I0e
 import time
 import warnings
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 import datetime
 import os
 
-from pyqed.qchem.atomic_data import element_name
+from pyqed.qchem.atomic_data import atomic_number, element_name
 from pyqed.qchem.basis import _basis_path, parse_gbs
 from pyqed.qchem.gdvr.newton import CollocatedERIOp, NewtonHelper
 
 from pyqed.qchem.gdvr.integrals import (
+    STO6_EXPS_H,
+    STO6_EXPS_He,
     make_xy_spd_primitive_basis,
     V_en_sp_total_at_z,
     build_h1_nm,
     overlap_2d_cartesian,
     kinetic_2d_cartesian,
     eri_2d_cartesian_with_p,
+    semilocal_ecp_projector_blocks,
 )
 
 
-STO6G_H_S_EXPS = np.array(
-    [35.52322122, 6.513143725, 1.822142904, 0.6259552659, 0.2430767471, 0.1001124280],
-    float,
-)
+STO6G_H_S_EXPS = np.asarray(STO6_EXPS_H, float).copy()
+STO6G_HE_S_EXPS = np.asarray(STO6_EXPS_He, float).copy()
+DEFAULT_P_EXPS = np.array([], float)
+DEFAULT_D_EXPS = np.array([], float)
+
+
+def _canonicalize_element(symbol):
+    text = str(symbol).strip()
+    if not text:
+        raise ValueError("Empty element label is not allowed.")
+    return text[0].upper() + text[1:].lower()
+
+
+def _elements_to_charges(elements):
+    charges = []
+    normalized = []
+    for elem in elements:
+        sym = _canonicalize_element(elem)
+        try:
+            charge = float(atomic_number(sym.lower()))
+        except ValueError as exc:
+            raise ValueError(f"Unsupported element label for GDVR AtomicChain: {elem!r}") from exc
+        z = int(round(charge))
+        if abs(charge - z) > 1e-8 or z <= 0:
+            raise ValueError(f"Unsupported element label for GDVR AtomicChain: {elem!r}")
+        normalized.append(element_name(z).capitalize())
+        charges.append(float(z))
+    return normalized, np.asarray(charges, float)
+
+
+def _default_sto6g_s_exps_for_charges(charges):
+    symbols = {_canonical_element_symbol_from_charge(charge) for charge in np.asarray(charges, float)}
+    exps = []
+    for symbol in sorted(symbols):
+        if symbol == "H":
+            exps.extend(np.asarray(STO6_EXPS_H, float).tolist())
+        elif symbol == "He":
+            exps.extend(np.asarray(STO6_EXPS_He, float).tolist())
+        else:
+            raise ValueError(
+                "No built-in GDVR STO-6G transverse basis is defined for "
+                f"element {symbol!r}. Use a named basis file or explicit s_exps."
+            )
+    return np.sort(np.unique(np.asarray(exps, float)))[::-1].copy()
+
+
+def _default_transverse_basis(elements):
+    symbols = {_canonicalize_element(elem) for elem in elements}
+    if not symbols:
+        raise ValueError("AtomicChain requires at least one element.")
+    if symbols <= {"H", "He"}:
+        charges = [atomic_number(sym.lower()) for sym in symbols]
+        return _default_sto6g_s_exps_for_charges(charges), DEFAULT_P_EXPS.copy(), DEFAULT_D_EXPS.copy()
+    raise ValueError(
+        "No default GDVR transverse basis is defined for this chain. "
+        "Please provide transverse_basis or explicit s_exps."
+    )
 
 
 def _canonical_element_symbol_from_charge(charge):
@@ -35,8 +89,50 @@ def _canonical_element_symbol_from_charge(charge):
     return element_name(z).capitalize()
 
 
+def _unique_desc(values):
+    if not values:
+        return np.array([], float)
+    arr = np.unique(np.asarray(values, float))
+    return np.sort(arr)[::-1].copy()
+
+
+def _extract_transverse_exponents_from_pyscf_basis(basis_name, charges):
+    try:
+        from pyscf import gto
+    except Exception as exc:
+        raise ValueError(
+            f"Basis {basis_name!r} is not available in pyqed and PySCF could not be imported."
+        ) from exc
+
+    symbols = sorted({_canonical_element_symbol_from_charge(charge) for charge in np.asarray(charges, float)})
+
+    s_exps = []
+    p_exps = []
+    d_exps = []
+    for symbol in symbols:
+        try:
+            shells = gto.basis.load(str(basis_name), symbol)
+        except Exception as exc:
+            raise ValueError(f"Basis {basis_name!r} does not define element {symbol!r}.") from exc
+        for shell in shells:
+            angmom = int(shell[0])
+            exps = [float(row[0]) for row in shell[1:]]
+            if angmom == 0:
+                s_exps.extend(exps)
+            elif angmom == 1:
+                p_exps.extend(exps)
+            elif angmom == 2:
+                d_exps.extend(exps)
+
+    return _unique_desc(s_exps), _unique_desc(p_exps), _unique_desc(d_exps)
+
+
 def _extract_transverse_exponents_from_basis(basis_name, charges):
-    basis_dict = parse_gbs(_basis_path(basis_name))
+    try:
+        basis_dict = parse_gbs(_basis_path(basis_name))
+    except Exception:
+        return _extract_transverse_exponents_from_pyscf_basis(basis_name, charges)
+
     symbols = sorted({_canonical_element_symbol_from_charge(charge) for charge in np.asarray(charges, float)})
 
     s_exps = []
@@ -53,13 +149,96 @@ def _extract_transverse_exponents_from_basis(basis_name, charges):
             elif angmom == 2:
                 d_exps.extend(np.asarray(exps, float).tolist())
 
-    def _unique_desc(values):
-        if not values:
-            return np.array([], float)
-        arr = np.unique(np.asarray(values, float))
-        return np.sort(arr)[::-1].copy()
-
     return _unique_desc(s_exps), _unique_desc(p_exps), _unique_desc(d_exps)
+
+
+def local_ecp_terms_from_pyscf(symbol, ecp_name="bfd", scalarize_nonlocal=False):
+    """Return PySCF ECP terms split into local and semilocal radial channels."""
+    try:
+        from pyscf import gto
+    except Exception as exc:
+        raise ValueError("PySCF is required to load named ECP data.") from exc
+
+    core_electrons, channels = gto.basis.load_ecp(str(ecp_name), _canonicalize_element(symbol))
+    local_terms = []
+    semilocal_terms = []
+    omitted_channels = []
+    scalarized_channels = []
+    for angular_momentum, radial_terms in channels:
+        if int(angular_momentum) == -1:
+            for slot, entries in enumerate(radial_terms):
+                power = int(slot) - 2
+                for entry in entries:
+                    exponent = float(entry[0])
+                    coeff = float(entry[1])
+                    local_terms.append((power, exponent, coeff))
+        elif any(len(entries) > 0 for entries in radial_terms):
+            if scalarize_nonlocal:
+                scalarized_channels.append(int(angular_momentum))
+                for slot, entries in enumerate(radial_terms):
+                    power = int(slot) - 2
+                    for entry in entries:
+                        exponent = float(entry[0])
+                        coeff = float(entry[1])
+                        local_terms.append((power, exponent, coeff))
+            else:
+                omitted_channels.append(int(angular_momentum))
+                for slot, entries in enumerate(radial_terms):
+                    power = int(slot) - 2
+                    for entry in entries:
+                        exponent = float(entry[0])
+                        coeff = float(entry[1])
+                        semilocal_terms.append((int(angular_momentum), power, exponent, coeff))
+    return {
+        "symbol": _canonicalize_element(symbol),
+        "ecp_name": str(ecp_name),
+        "core_electrons": int(core_electrons),
+        "local_terms": tuple(local_terms),
+        "semilocal_terms": tuple(semilocal_terms),
+        "omitted_nonlocal_channels": tuple(omitted_channels),
+        "scalarized_nonlocal_channels": tuple(scalarized_channels),
+    }
+
+
+def _normalize_local_ecp_terms(local_ecp_terms, nnuc):
+    if local_ecp_terms is None:
+        return None
+    if len(local_ecp_terms) != nnuc:
+        raise ValueError("local_ecp_terms must match the number of nuclei.")
+    out = []
+    for atom_terms in local_ecp_terms:
+        clean_terms = []
+        for term in atom_terms:
+            if isinstance(term, dict):
+                power = term["power"]
+                exponent = term["exponent"]
+                coeff = term["coeff"]
+            else:
+                power, exponent, coeff = term[:3]
+            clean_terms.append((int(power), float(exponent), float(coeff)))
+        out.append(tuple(clean_terms))
+    return tuple(out)
+
+
+def _normalize_semilocal_ecp_terms(semilocal_ecp_terms, nnuc):
+    if semilocal_ecp_terms is None:
+        return None
+    if len(semilocal_ecp_terms) != nnuc:
+        raise ValueError("semilocal_ecp_terms must match the number of nuclei.")
+    out = []
+    for atom_terms in semilocal_ecp_terms:
+        clean_terms = []
+        for term in atom_terms:
+            if isinstance(term, dict):
+                angular_momentum = term["angular_momentum"]
+                power = term["power"]
+                exponent = term["exponent"]
+                coeff = term["coeff"]
+            else:
+                angular_momentum, power, exponent, coeff = term[:4]
+            clean_terms.append((int(angular_momentum), int(power), float(exponent), float(coeff)))
+        out.append(tuple(clean_terms))
+    return tuple(out)
 
 
 def _resolve_transverse_basis(charges, transverse_basis=None, s_exps=None, p_exps=None, d_exps=None):
@@ -69,7 +248,7 @@ def _resolve_transverse_basis(charges, transverse_basis=None, s_exps=None, p_exp
             raise ValueError("Use either named transverse basis or explicit s_exps/p_exps/d_exps, not both.")
         key = str(basis_name).strip().lower()
         if key == "sto6g":
-            return STO6G_H_S_EXPS.copy(), np.array([], float), np.array([], float), "sto6g"
+            return _default_sto6g_s_exps_for_charges(charges), DEFAULT_P_EXPS.copy(), DEFAULT_D_EXPS.copy(), "sto6g"
         s_exps, p_exps, d_exps = _extract_transverse_exponents_from_basis(basis_name, charges)
         return s_exps, p_exps, d_exps, str(basis_name)
 
@@ -84,10 +263,40 @@ def _resolve_transverse_basis(charges, transverse_basis=None, s_exps=None, p_exp
 
 #  Basic molecule holder
 class Molecule:
-    def __init__(self, charges, coords, nelec=None, spin = None):
+    def __init__(
+        self,
+        charges,
+        coords,
+        nelec=None,
+        spin=None,
+        softcore_radii=None,
+        basis_charges=None,
+        local_ecp_terms=None,
+        semilocal_ecp_terms=None,
+        slice_local_ecp_terms=None,
+        ecp_metadata=None,
+    ):
         self.charges = np.asarray(charges, float).reshape(-1)
         self.coords  = np.asarray(coords,  float).reshape(-1, 3)
         assert self.charges.shape[0] == self.coords.shape[0]
+        if softcore_radii is None:
+            self.softcore_radii = None
+        else:
+            self.softcore_radii = np.asarray(softcore_radii, float).reshape(-1)
+            if self.softcore_radii.shape != self.charges.shape:
+                raise ValueError("softcore_radii must match the number of nuclei.")
+            if np.any(self.softcore_radii < 0.0):
+                raise ValueError("softcore_radii must be non-negative.")
+        if basis_charges is None:
+            self.basis_charges = None
+        else:
+            self.basis_charges = np.asarray(basis_charges, float).reshape(-1)
+            if self.basis_charges.shape != self.charges.shape:
+                raise ValueError("basis_charges must match the number of nuclei.")
+        self.local_ecp_terms = _normalize_local_ecp_terms(local_ecp_terms, len(self.charges))
+        self.semilocal_ecp_terms = _normalize_semilocal_ecp_terms(semilocal_ecp_terms, len(self.charges))
+        self.slice_local_ecp_terms = _normalize_local_ecp_terms(slice_local_ecp_terms, len(self.charges))
+        self.ecp_metadata = {} if ecp_metadata is None else dict(ecp_metadata)
 
         if nelec is None:
             self.nelec = int(round(float(np.sum(self.charges))))
@@ -105,6 +314,7 @@ class Molecule:
         self.shapes = None
         self.gdvr_options = None
         self._newton_context = None
+        self._gdvr_build_context = None
 
     def to_tuples(self):
         return [(float(Z), float(x), float(y), float(z))
@@ -120,6 +330,23 @@ class Molecule:
                 E += Z[i] * Z[j] / float(np.linalg.norm(dR))
         return E
 
+    def position_operator(self, axis="z"):
+        """Return the one-electron GDVR position operator along an axis."""
+        key = str(axis).strip().lower()
+        if key != "z":
+            raise NotImplementedError("GDVR currently has a built-in position operator only along z.")
+        if self.z is None or self.shapes is None:
+            raise ValueError("Build the GDVR molecule before requesting a position operator.")
+        nz = int(self.shapes["Nz"])
+        m = int(self.shapes["M"])
+        z = np.asarray(self.z, dtype=float).reshape(nz)
+        return np.diag(np.repeat(z, m))
+
+    def dipole_operator(self, axis="z", *, electronic=True):
+        """Return the one-electron GDVR dipole operator along an axis."""
+        op = self.position_operator(axis)
+        return -op if electronic else op
+
     def build(
         self,
         Lz=18.0,
@@ -129,9 +356,6 @@ class Molecule:
         s_exps=None,
         p_exps=None,
         d_exps=None,
-        max_offset=None,
-        auto_cut=False,
-        cut_eps=1e-6,
         verbose=True,
         dvr_method='sine',
     ):
@@ -144,9 +368,6 @@ class Molecule:
             s_exps=s_exps,
             p_exps=p_exps,
             d_exps=d_exps,
-            max_offset=max_offset,
-            auto_cut=auto_cut,
-            cut_eps=cut_eps,
             verbose=verbose,
             dvr_method=dvr_method,
         )
@@ -166,9 +387,6 @@ class Molecule:
             "s_exps": None if s_exps is None else np.asarray(s_exps, float).copy(),
             "p_exps": None if p_exps is None else np.asarray(p_exps, float).copy(),
             "d_exps": None if d_exps is None else np.asarray(d_exps, float).copy(),
-            "max_offset": None if max_offset is None else int(max_offset),
-            "auto_cut": bool(auto_cut),
-            "cut_eps": float(cut_eps),
             "verbose": bool(verbose),
             "dvr_method": str(dvr_method),
         }
@@ -177,6 +395,65 @@ class Molecule:
 
     def RHF(self):
         return RHF(self)
+
+
+class AtomicChain(Molecule):
+    def __init__(
+        self,
+        elements,
+        coords,
+        nelec=None,
+        spin=None,
+        softcore_radii=None,
+        basis_charges=None,
+        local_ecp_terms=None,
+        semilocal_ecp_terms=None,
+        slice_local_ecp_terms=None,
+        ecp_metadata=None,
+    ):
+        self.elements, charges = _elements_to_charges(elements)
+        super().__init__(
+            charges,
+            coords,
+            nelec=nelec,
+            spin=spin,
+            softcore_radii=softcore_radii,
+            basis_charges=basis_charges,
+            local_ecp_terms=local_ecp_terms,
+            semilocal_ecp_terms=semilocal_ecp_terms,
+            slice_local_ecp_terms=slice_local_ecp_terms,
+            ecp_metadata=ecp_metadata,
+        )
+
+    def build(
+        self,
+        Lz=18.0,
+        Nz=121,
+        M=1,
+        transverse_basis=None,
+        s_exps=None,
+        p_exps=None,
+        d_exps=None,
+        verbose=True,
+        dvr_method='sine',
+    ):
+        if transverse_basis is None and s_exps is None:
+            s_exps, default_p_exps, default_d_exps = _default_transverse_basis(self.elements)
+            if p_exps is None:
+                p_exps = default_p_exps
+            if d_exps is None:
+                d_exps = default_d_exps
+        return super().build(
+            Lz=Lz,
+            Nz=Nz,
+            M=M,
+            transverse_basis=transverse_basis,
+            s_exps=s_exps,
+            p_exps=p_exps,
+            d_exps=d_exps,
+            verbose=verbose,
+            dvr_method=dvr_method,
+        )
 
 
 
@@ -290,7 +567,8 @@ def _psd_project_small(M):
 
 def precompute_eri_method2_JK_psd(
     alphas, centers, labels, z_grid, C_list, M,
-    max_offset=None, auto_cut=False, cut_eps=1e-8, verbose=True,
+    verbose=True,
+    return_ao_kernels=False,
 ):
     alphas = np.asarray(alphas, float)
     centers = np.asarray(centers, float)
@@ -301,30 +579,23 @@ def precompute_eri_method2_JK_psd(
     if Nz > 1: dz = float(abs(z_grid[1] - z_grid[0]))
     else: dz = 0.0
 
-    if max_offset is None or max_offset > (Nz - 1):
-        max_offset = Nz - 1
-
     ERI_J = [[np.zeros((M * M, M * M), float) for _ in range(Nz)] for _ in range(Nz)]
     ERI_K = [[np.zeros((M * M, M * M), float) for _ in range(Nz)] for _ in range(Nz)]
 
     eri_by_h = {}
-    norm0 = None
-    h_max = max_offset
+    h_max = Nz - 1
     
-    for h in range(0, max_offset + 1):
+    for h in range(Nz):
         delta_z = abs(h * dz)
         eri_ao = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z)
         eri_by_h[h] = eri_ao
 
-        if auto_cut:
-            nh = float(np.linalg.norm(eri_ao.reshape(-1)))
-            if h == 0: norm0 = max(nh, 1e-16)
-            else:
-                if norm0 is None: norm0 = max(nh, 1e-16)
-                ratio = nh / norm0
-                if ratio < cut_eps:
-                    h_max = h
-                    break
+    if int(M) == 1:
+        K_h, Kx_h = _ao_kernel_matrices_from_eri_by_h(eri_by_h, Nz, len(alphas))
+        ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list, K_h, Kx_h)
+        if return_ao_kernels:
+            return ERI_J, ERI_K, eri_by_h, int(h_max)
+        return ERI_J, ERI_K
 
     for m in range(Nz):
         C_m = np.asarray(C_list[m], float)
@@ -346,17 +617,284 @@ def precompute_eri_method2_JK_psd(
             ERI_J[m][n] = EmnJ
             ERI_K[m][n] = EmnK
             
+    if return_ao_kernels:
+        return ERI_J, ERI_K, eri_by_h, int(h_max)
     return ERI_J, ERI_K
 
 
-def fock_2e_slice_collocated(P, ERI_J, ERI_K, Nz, M, k_scale=1.0):
+def _ao_kernel_matrices_from_eri_by_h(eri_by_h, Nz, n_ao):
+    K_h = [None for _ in range(int(Nz))]
+    Kx_h = [None for _ in range(int(Nz))]
+    for h, eri_tensor in eri_by_h.items():
+        h = int(h)
+        if h < 0 or h >= Nz:
+            continue
+        K_h[h] = eri_tensor.reshape(n_ao * n_ao, n_ao * n_ao)
+        eri_perm = eri_tensor.transpose(0, 2, 1, 3)
+        Kx_h[h] = eri_perm.reshape(n_ao * n_ao, n_ao * n_ao)
+    return K_h, Kx_h
+
+
+def _as_block_matrix(block, mm):
+    arr = np.asarray(block, dtype=float)
+    if arr.ndim == 0:
+        if mm != 1:
+            raise ValueError("Scalar GDVR ERI block is valid only for M=1.")
+        return arr.reshape(1, 1)
+    return arr.reshape(mm, mm)
+
+
+class _PackedBlockMatvec:
+    def __init__(self, m_idx, n_idx, blocks, low_rank_tol=1e-11):
+        self.m_idx = np.asarray(m_idx, dtype=np.intp)
+        self.n_idx = np.asarray(n_idx, dtype=np.intp)
+        self.blocks = np.asarray(blocks, dtype=float)
+        if self.blocks.ndim != 3:
+            raise ValueError("Packed GDVR ERI blocks must have shape (npair, mm, mm).")
+        if self.blocks.shape[0] != self.m_idx.size or self.blocks.shape[0] != self.n_idx.size:
+            raise ValueError("Packed GDVR ERI pair indices do not match block count.")
+        self.dim = int(self.blocks.shape[1])
+        self.low_rank_groups = self._build_low_rank_groups(low_rank_tol)
+
+    def _build_low_rank_groups(self, low_rank_tol):
+        if self.blocks.size == 0:
+            return None
+        dim = self.dim
+        tol = float(low_rank_tol)
+        groups = {}
+        total_rank = 0
+        for pos, block in enumerate(self.blocks):
+            sym_block = 0.5 * (block + block.T)
+            evals, evecs = la.eigh(sym_block)
+            scale = float(np.max(np.abs(evals))) if evals.size else 0.0
+            if scale == 0.0:
+                keep = np.zeros_like(evals, dtype=bool)
+            elif tol <= 0.0:
+                keep = np.abs(evals) > 0.0
+            else:
+                keep = np.abs(evals) > tol * scale
+            rank = int(np.count_nonzero(keep))
+            total_rank += rank
+            if rank == 0:
+                left = np.zeros((dim, 0), dtype=float)
+                right = np.zeros((dim, 0), dtype=float)
+            else:
+                vec = evecs[:, keep]
+                left = vec * evals[keep][np.newaxis, :]
+                right = vec
+            groups.setdefault(rank, [[], [], []])
+            groups[rank][0].append(pos)
+            groups[rank][1].append(left)
+            groups[rank][2].append(right)
+
+        dense_work = self.blocks.shape[0] * dim * dim
+        low_rank_work = 2 * dim * total_rank
+        if low_rank_work >= 0.85 * dense_work:
+            return None
+
+        packed = []
+        for rank, (positions, left, right) in groups.items():
+            packed.append(
+                (
+                    np.asarray(positions, dtype=np.intp),
+                    np.stack(left, axis=0),
+                    np.stack(right, axis=0),
+                )
+            )
+        return tuple(packed)
+
+    def dot(self, vectors):
+        vectors = np.asarray(vectors)
+        if self.blocks.shape[0] == 0:
+            return np.zeros((0, self.dim), dtype=np.result_type(vectors, float))
+        if self.low_rank_groups is None:
+            return np.einsum("puv,pv->pu", self.blocks, vectors, optimize=True)
+
+        out = np.zeros((self.blocks.shape[0], self.dim), dtype=np.result_type(vectors, float))
+        for positions, left, right in self.low_rank_groups:
+            if left.shape[2] == 0:
+                continue
+            vals = vectors[positions]
+            tmp = np.einsum("pur,pu->pr", right, vals, optimize=True)
+            out[positions] = np.einsum("pur,pr->pu", left, tmp, optimize=True)
+        return out
+
+    @property
+    def uses_low_rank(self):
+        return self.low_rank_groups is not None
+
+
+class GDVRFockBuilder:
+    """Packed/banded two-electron Fock builder for collocated GDVR ERIs."""
+
+    def __init__(
+        self,
+        ERI_J,
+        ERI_K,
+        Nz,
+        M,
+        active_tol=0.0,
+        low_rank_tol=1e-11,
+    ):
+        self.Nz = int(Nz)
+        self.M = int(M)
+        self.mm = self.M * self.M
+        self.active_tol = float(active_tol)
+        self.low_rank_tol = float(low_rank_tol)
+        if self.Nz <= 0 or self.M <= 0:
+            raise ValueError("Nz and M must be positive for a GDVR Fock builder.")
+
+        if self.M == 1:
+            self.j_scalar, self.k_scalar = self._pack_scalar(ERI_J, ERI_K)
+            self.j_blocks = None
+            self.k_blocks = None
+            self.k_upper_blocks = None
+            self.exchange_mirror_ok = True
+        else:
+            self.j_scalar = None
+            self.k_scalar = None
+            self.j_blocks = self._pack_blocks(ERI_J)
+            self.k_blocks = self._pack_blocks(ERI_K)
+            self.exchange_mirror_ok = self._check_exchange_mirror(ERI_K)
+            self.k_upper_blocks = self._pack_blocks(ERI_K, upper_only=True)
+
+    def _is_active(self, block):
+        if self.active_tol <= 0.0:
+            return np.any(block != 0.0)
+        return float(np.max(np.abs(block))) > self.active_tol
+
+    def _pack_scalar(self, ERI_J, ERI_K):
+        j = np.zeros((self.Nz, self.Nz), dtype=float)
+        k = np.zeros((self.Nz, self.Nz), dtype=float)
+        for m in range(self.Nz):
+            for n in range(self.Nz):
+                j[m, n] = float(np.asarray(ERI_J[m][n]).reshape(-1)[0])
+                k[m, n] = float(np.asarray(ERI_K[m][n]).reshape(-1)[0])
+        return j, k
+
+    def _pack_blocks(self, ERI, upper_only=False):
+        m_idx = []
+        n_idx = []
+        blocks = []
+        for m in range(self.Nz):
+            n_start = m if upper_only else 0
+            for n in range(n_start, self.Nz):
+                block = _as_block_matrix(ERI[m][n], self.mm)
+                if not self._is_active(block):
+                    continue
+                m_idx.append(m)
+                n_idx.append(n)
+                blocks.append(block)
+        if blocks:
+            block_arr = np.stack(blocks, axis=0)
+        else:
+            block_arr = np.zeros((0, self.mm, self.mm), dtype=float)
+        return _PackedBlockMatvec(m_idx, n_idx, block_arr, low_rank_tol=self.low_rank_tol)
+
+    def _check_exchange_mirror(self, ERI_K):
+        swap = np.arange(self.mm).reshape(self.M, self.M).T.reshape(-1)
+        for m in range(self.Nz):
+            for n in range(m + 1, self.Nz):
+                upper = _as_block_matrix(ERI_K[m][n], self.mm)
+                lower = _as_block_matrix(ERI_K[n][m], self.mm)
+                mirrored = upper[np.ix_(swap, swap)]
+                if not np.allclose(lower, mirrored, rtol=1e-9, atol=1e-11):
+                    return False
+        return True
+
+    @property
+    def uses_low_rank(self):
+        if self.M == 1:
+            return False
+        return (
+            self.j_blocks.uses_low_rank
+            or self.k_blocks.uses_low_rank
+            or self.k_upper_blocks.uses_low_rank
+        )
+
+    @property
+    def active_pair_count(self):
+        if self.M == 1:
+            return int(np.count_nonzero(self.j_scalar) + np.count_nonzero(self.k_scalar))
+        return int(self.j_blocks.m_idx.size + self.k_blocks.m_idx.size)
+
+    def fock(self, P, k_scale=1.0, hermitian_exchange=True):
+        P = np.asarray(P)
+        dtype = np.result_type(P, float)
+        if self.M == 1:
+            P2 = P.reshape(self.Nz, self.Nz)
+            rho = np.diag(P2)
+            j_diag = self.j_scalar @ rho
+            f2e = np.diag(j_diag).astype(dtype, copy=False)
+            f2e = np.asarray(f2e, dtype=dtype)
+            f2e -= 0.5 * float(k_scale) * self.k_scalar * P2
+            return f2e
+
+        P4 = P.reshape(self.Nz, self.M, self.Nz, self.M)
+        f4 = np.zeros((self.Nz, self.M, self.Nz, self.M), dtype=dtype)
+
+        diag_blocks = P4[np.arange(self.Nz), :, np.arange(self.Nz), :]
+        diag_vec = diag_blocks.reshape(self.Nz, self.mm)
+        j_vec = np.zeros((self.Nz, self.mm), dtype=dtype)
+        if self.j_blocks.m_idx.size:
+            vals = self.j_blocks.dot(diag_vec[self.j_blocks.n_idx])
+            np.add.at(j_vec, self.j_blocks.m_idx, vals)
+        f4[np.arange(self.Nz), :, np.arange(self.Nz), :] = j_vec.reshape(self.Nz, self.M, self.M)
+
+        use_upper = bool(hermitian_exchange) and self.exchange_mirror_ok and np.allclose(
+            P,
+            P.conj().T,
+            rtol=1e-10,
+            atol=1e-12,
+        )
+        k_builder = self.k_upper_blocks if use_upper else self.k_blocks
+        if k_builder.m_idx.size:
+            block_vec = P4[k_builder.m_idx, :, k_builder.n_idx, :].reshape(
+                k_builder.m_idx.size, self.mm
+            )
+            vals = k_builder.dot(block_vec).reshape(k_builder.m_idx.size, self.M, self.M)
+            k4 = np.zeros_like(f4)
+            np.add.at(
+                k4,
+                (k_builder.m_idx, slice(None), k_builder.n_idx, slice(None)),
+                vals,
+            )
+            if use_upper:
+                off = k_builder.m_idx != k_builder.n_idx
+                if np.any(off):
+                    np.add.at(
+                        k4,
+                        (
+                            k_builder.n_idx[off],
+                            slice(None),
+                            k_builder.m_idx[off],
+                            slice(None),
+                        ),
+                        vals[off].conj().swapaxes(1, 2),
+                    )
+            f4 -= 0.5 * float(k_scale) * k4
+        return f4.reshape(self.Nz * self.M, self.Nz * self.M)
+
+
+def prepare_gdvr_fock_builder(ERI_J, ERI_K=None, Nz=None, M=None):
+    if isinstance(ERI_J, GDVRFockBuilder):
+        return ERI_J
+    if isinstance(ERI_K, GDVRFockBuilder):
+        return ERI_K
+    if Nz is None or M is None:
+        raise ValueError("Nz and M are required when packing GDVR ERIs.")
+    return GDVRFockBuilder(ERI_J, ERI_K, Nz, M)
+
+
+def _fock_2e_slice_collocated_reference(P, ERI_J, ERI_K, Nz, M, k_scale=1.0):
     N = Nz * M
+    dtype = np.result_type(P, float)
     P4 = P.reshape(Nz, M, Nz, M)
     Ddiag = [P4[b, :, b, :].copy() for b in range(Nz)]
-    F2e = np.zeros((N, N), dtype=float)
+    F2e = np.zeros((N, N), dtype=dtype)
 
     for m in range(Nz):
-        J_mm = np.zeros((M, M), float)
+        J_mm = np.zeros((M, M), dtype=dtype)
         for n in range(Nz):
             EmnJ = ERI_J[m][n]
             if np.ndim(EmnJ)==0: EmnJ = np.atleast_2d(EmnJ)
@@ -382,6 +920,11 @@ def fock_2e_slice_collocated(P, ERI_J, ERI_K, Nz, M, k_scale=1.0):
     return F2e
 
 
+def fock_2e_slice_collocated(P, ERI_J, ERI_K, Nz, M, k_scale=1.0):
+    builder = prepare_gdvr_fock_builder(ERI_J, ERI_K, Nz, M)
+    return builder.fock(P, k_scale=k_scale)
+
+
 
 #  Build Method II (core + ERIs) and SCF TODO: remove the naming of Method II, i used to think and tried Method I as globally share one set of optimized AO but that is a lot less efficient, already removed
 def build_method2(
@@ -389,7 +932,7 @@ def build_method2(
     Lz=18.0, Nz=121, M=1,
     transverse_basis=None,
     s_exps=None, p_exps=None, d_exps=None,
-    max_offset=None, auto_cut=False, cut_eps=1e-6, verbose=True, dvr_method='sine'
+    verbose=True, dvr_method='sine'
 ):
     t0 = time.time()
     if dvr_method == 'sine':
@@ -406,8 +949,9 @@ def build_method2(
         print(f"\n[DEBUG] Grid Info for Nz={Nz}, Lz={Lz}:")
         print(f"  > Grid Spacing (dz): {dz:.6f}")
 
+    basis_charges = mol.charges if getattr(mol, "basis_charges", None) is None else mol.basis_charges
     s_exps, p_exps, d_exps, _basis_name = _resolve_transverse_basis(
-        charges=mol.charges,
+        charges=basis_charges,
         transverse_basis=transverse_basis,
         s_exps=s_exps,
         p_exps=p_exps,
@@ -425,36 +969,124 @@ def build_method2(
 
     S_prim = overlap_2d_cartesian(alphas, centers, labels)
     T_prim = kinetic_2d_cartesian(alphas, centers, labels)
+    softcore_radii = getattr(mol, "softcore_radii", None)
+    local_ecp_terms = getattr(mol, "local_ecp_terms", None)
+    semilocal_ecp_terms = getattr(mol, "semilocal_ecp_terms", None)
+    slice_local_ecp_terms = getattr(mol, "slice_local_ecp_terms", None)
+    if slice_local_ecp_terms is None:
+        slice_local_ecp_terms = local_ecp_terms
+    actual_v_cache = {}
+    slice_v_cache = {}
 
-    def V_en_of_z(zk: float) -> np.ndarray:
-        return V_en_sp_total_at_z(alphas, centers, labels, nuclei, zk)
+    def V_actual_of_z(zk: float) -> np.ndarray:
+        return V_en_sp_total_at_z(
+            alphas,
+            centers,
+            labels,
+            nuclei,
+            zk,
+            softcore_radii=softcore_radii,
+            local_ecp_terms=local_ecp_terms,
+            matrix_cache=actual_v_cache,
+        )
+
+    def V_slice_of_z(zk: float) -> np.ndarray:
+        return V_en_sp_total_at_z(
+            alphas,
+            centers,
+            labels,
+            nuclei,
+            zk,
+            softcore_radii=softcore_radii,
+            local_ecp_terms=slice_local_ecp_terms,
+            matrix_cache=slice_v_cache,
+        )
 
     E_slices, C_list = slice_eigens_xy(
-        z_grid=z, S_prim=S_prim, T_prim=T_prim, V_en_of_z=V_en_of_z, M=M,
+        z_grid=z, S_prim=S_prim, T_prim=T_prim, V_en_of_z=V_slice_of_z, M=M,
     )
 
     Nz = len(z)
-    S_slice = np.zeros((Nz, Nz, M, M), float)
-    for k in range(Nz):
-        Ck = C_list[k]
-        for m in range(Nz):
-            Cm = C_list[m]
-            S_slice[k, m] = Ck.T @ (S_prim @ Cm)
+    if int(M) == 1:
+        d_stack = np.vstack([np.asarray(C_list[k][:, 0], float) for k in range(Nz)])
+        S_scalar = d_stack @ S_prim @ d_stack.T
+        S_slice = S_scalar[:, :, None, None]
+    else:
+        S_slice = np.zeros((Nz, Nz, M, M), float)
+        for k in range(Nz):
+            Ck = C_list[k]
+            for m in range(Nz):
+                Cm = C_list[m]
+                S_slice[k, m] = Ck.T @ (S_prim @ Cm)
 
     size = Nz * M
-    Hcore = np.einsum('km,kmab->kamb', Kz, S_slice, optimize=True).reshape(size, size)
-    Hcore += np.diag(E_slices.reshape(-1))
+    h1_nm = None
+    h_local_ops = None
+    if semilocal_ecp_terms is None:
+        if int(M) == 1:
+            Hcore = (Kz * S_scalar).astype(float, copy=False)
+        else:
+            Hcore = np.einsum('km,kmab->kamb', Kz, S_slice, optimize=True).reshape(size, size)
+        Hcore += np.diag(E_slices.reshape(-1))
+    else:
+        h1_nm = build_h1_nm(Kz, S_prim, T_prim, z, V_actual_of_z)
+        semilocal_blocks = semilocal_ecp_projector_blocks(
+            alphas,
+            centers,
+            labels,
+            nuclei,
+            z,
+            dz,
+            semilocal_ecp_terms,
+            dvr_method=dvr_method,
+        )
+        if semilocal_blocks is not None:
+            h1_nm += semilocal_blocks
+        if int(M) == 1:
+            Hcore = np.einsum("ni,nmij,mj->nm", d_stack, h1_nm, d_stack, optimize=True)
+        else:
+            H_blocks = np.zeros((Nz, Nz, M, M), dtype=float)
+            for k in range(Nz):
+                Ck = np.asarray(C_list[k], float)
+                for m in range(Nz):
+                    Cm = np.asarray(C_list[m], float)
+                    H_blocks[k, m] = Ck.T @ (h1_nm[k, m] @ Cm)
+            Hcore = H_blocks.reshape(size, size)
+        Hcore = 0.5 * (Hcore + Hcore.T)
 
     if verbose:
         print(f"[Method2] Built Hcore {Hcore.shape} in {time.time()-t0:.2f}s")
 
-    ERI_J, ERI_K = precompute_eri_method2_JK_psd(
+    eri_result = precompute_eri_method2_JK_psd(
         alphas, centers, labels, z, C_list,
-        M=M, max_offset=max_offset,
-        auto_cut=auto_cut, cut_eps=cut_eps, verbose=verbose
+        M=M, verbose=verbose,
+        return_ao_kernels=(int(M) == 1),
     )
+    if int(M) == 1:
+        ERI_J, ERI_K, eri_by_h, h_max = eri_result
+        K_h, Kx_h = _ao_kernel_matrices_from_eri_by_h(eri_by_h, Nz, len(alphas))
+    else:
+        ERI_J, ERI_K = eri_result
+        K_h = None
+        Kx_h = None
+        h_max = None
 
     shapes = {"Nz": Nz, "M": M, "n_ao2d": len(alphas), "size": size, "dz": dz}
+    mol._gdvr_build_context = {
+        "alphas": np.asarray(alphas, float).copy(),
+        "centers": np.asarray(centers, float).copy(),
+        "labels": tuple(labels),
+        "S_prim": np.asarray(S_prim, float).copy(),
+        "T_prim": np.asarray(T_prim, float).copy(),
+        "z": np.asarray(z, float).copy(),
+        "Kz": np.asarray(Kz, float).copy(),
+        "dz": float(dz),
+        "h1_nm": None if h1_nm is None else np.asarray(h1_nm, float).copy(),
+        "h_local_ops": h_local_ops,
+        "K_h": K_h,
+        "Kx_h": Kx_h,
+        "eri_h_max": None if h_max is None else int(h_max),
+    }
     return Hcore, z, dz, E_slices, C_list, ERI_J, ERI_K, shapes
 
 
@@ -464,6 +1096,7 @@ class RHF:
         self.e_tot = None
         self.mo_energy = None
         self.mo_coeff = None
+        self.mo_occ = None
         self.dm = None
         self.info = None
 
@@ -478,6 +1111,7 @@ class RHF:
         level_shift=0.5,
         shift_decay=0.75,
         k_ramp_iters=8,
+        dm0=None,
     ):
         if self.mol.hcore is None or self.mol.eri_j is None or self.mol.eri_k is None or self.mol.shapes is None:
             raise ValueError(
@@ -501,11 +1135,14 @@ class RHF:
             level_shift=level_shift,
             shift_decay=shift_decay,
             k_ramp_iters=k_ramp_iters,
+            dm0=dm0,
         )
 
         self.e_tot = float(Etot)
         self.mo_energy = np.asarray(eps, float)
         self.mo_coeff = np.asarray(Cmo, float)
+        self.mo_occ = np.zeros_like(self.mo_energy)
+        self.mo_occ[: self.mol.nelec // 2] = 2.0
         self.dm = np.asarray(P, float)
         self.info = dict(info)
         return self
@@ -514,6 +1151,11 @@ class RHF:
         if self.dm is None:
             raise ValueError("Run GDVR RHF before requesting the density matrix.")
         return np.asarray(self.dm, float)
+
+    def RTTDHF(self, *args, **kwargs):
+        from pyqed.qchem.gdvr.rttdhf import RTTDHF
+
+        return RTTDHF(self, *args, **kwargs)
 
     def newton(
         self,
@@ -563,6 +1205,7 @@ class RHF:
         labels = ctx["labels"]
         K_h = ctx["K_h"]
         Kx_h = ctx["Kx_h"]
+        h1_nm = ctx["h1_nm"]
         h_local_ops = ctx["h_local_ops"]
         nh_sweep = ctx["nh_sweep"]
         nuclei = ctx["nuclei"]
@@ -624,6 +1267,7 @@ class RHF:
                 labels,
                 nuclei,
                 h_local_ops=h_local_ops,
+                h1_nm=h1_nm,
             )
             ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list, K_h, Kx_h)
 
@@ -705,47 +1349,122 @@ def _build_newton_context(mol: Molecule):
     Nz = int(mol.shapes["Nz"])
     Lz = float(opts["Lz"])
     dvr_method = str(opts["dvr_method"])
-    s_exps, p_exps, d_exps, _basis_name = _resolve_transverse_basis(
-        charges=mol.charges,
-        transverse_basis=opts.get("transverse_basis"),
-        s_exps=opts["s_exps"],
-        p_exps=opts["p_exps"],
-        d_exps=opts["d_exps"],
-    )
 
     nuclei = mol.to_tuples()
-    alphas, centers, labels = make_xy_spd_primitive_basis(
-        nuclei,
-        exps_s=s_exps,
-        exps_p=p_exps,
-        exps_d=d_exps,
-    )
-    S_prim = overlap_2d_cartesian(alphas, centers, labels)
-    T_prim = kinetic_2d_cartesian(alphas, centers, labels)
-    z_chk, Kz, dz_chk = _gdvr_grid_for_options(Lz, Nz, dvr_method)
+    cache = getattr(mol, "_gdvr_build_context", None)
+    use_cache = False
+    if cache is not None:
+        z_cached = cache.get("z")
+        use_cache = (
+            z_cached is not None
+            and np.asarray(z_cached).shape == np.asarray(mol.z).shape
+            and np.allclose(z_cached, mol.z)
+        )
+
+    if use_cache:
+        alphas = np.asarray(cache["alphas"], float)
+        centers = np.asarray(cache["centers"], float)
+        labels = tuple(cache["labels"])
+        S_prim = np.asarray(cache["S_prim"], float)
+        T_prim = np.asarray(cache["T_prim"], float)
+        z_chk = np.asarray(cache["z"], float)
+        Kz = np.asarray(cache["Kz"], float)
+        dz_chk = float(cache["dz"])
+    else:
+        basis_charges = mol.charges if getattr(mol, "basis_charges", None) is None else mol.basis_charges
+        s_exps, p_exps, d_exps, _basis_name = _resolve_transverse_basis(
+            charges=basis_charges,
+            transverse_basis=opts.get("transverse_basis"),
+            s_exps=opts["s_exps"],
+            p_exps=opts["p_exps"],
+            d_exps=opts["d_exps"],
+        )
+
+        alphas, centers, labels = make_xy_spd_primitive_basis(
+            nuclei,
+            exps_s=s_exps,
+            exps_p=p_exps,
+            exps_d=d_exps,
+        )
+        S_prim = overlap_2d_cartesian(alphas, centers, labels)
+        T_prim = kinetic_2d_cartesian(alphas, centers, labels)
+        z_chk, Kz, dz_chk = _gdvr_grid_for_options(Lz, Nz, dvr_method)
     if not np.allclose(z_chk, mol.z):
         raise ValueError("Stored GDVR grid does not match the requested Newton sweep grid.")
 
     n_ao = len(alphas)
-    K_h = []
-    Kx_h = []
-    for h in range(Nz):
-        eri_tensor = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z=h * dz_chk)
-        K_h.append(eri_tensor.reshape(n_ao * n_ao, n_ao * n_ao))
-        eri_perm = eri_tensor.transpose(0, 2, 1, 3)
-        Kx_h.append(eri_perm.reshape(n_ao * n_ao, n_ao * n_ao))
+    K_h = None if not use_cache else cache.get("K_h")
+    Kx_h = None if not use_cache else cache.get("Kx_h")
+    if K_h is None or Kx_h is None:
+        h_max = Nz - 1
+        K_h = [None for _ in range(Nz)]
+        Kx_h = [None for _ in range(Nz)]
+        for h in range(Nz):
+            eri_tensor = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z=h * dz_chk)
+            K_h[h] = eri_tensor.reshape(n_ao * n_ao, n_ao * n_ao)
+            eri_perm = eri_tensor.transpose(0, 2, 1, 3)
+            Kx_h[h] = eri_perm.reshape(n_ao * n_ao, n_ao * n_ao)
+    else:
+        K_h = list(K_h)
+        Kx_h = list(Kx_h)
+        h_max = cache.get("eri_h_max")
 
-    h1_nm = build_h1_nm(
-        Kz,
-        S_prim,
-        T_prim,
-        mol.z,
-        lambda zz: V_en_sp_total_at_z(alphas, centers, labels, nuclei, zz),
-    )
-    h_local_ops = np.stack(
-        [T_prim + V_en_sp_total_at_z(alphas, centers, labels, nuclei, float(zz)) for zz in mol.z],
-        axis=0,
-    )
+    actual_v_cache = {}
+    h1_nm = None if not use_cache else cache.get("h1_nm")
+    if h1_nm is None:
+        h1_nm = build_h1_nm(
+            Kz,
+            S_prim,
+            T_prim,
+            mol.z,
+            lambda zz: V_en_sp_total_at_z(
+                alphas,
+                centers,
+                labels,
+                nuclei,
+                zz,
+                softcore_radii=getattr(mol, "softcore_radii", None),
+                local_ecp_terms=getattr(mol, "local_ecp_terms", None),
+                matrix_cache=actual_v_cache,
+            ),
+        )
+        semilocal_ecp_terms = getattr(mol, "semilocal_ecp_terms", None)
+        if semilocal_ecp_terms is not None:
+            semilocal_blocks = semilocal_ecp_projector_blocks(
+                alphas,
+                centers,
+                labels,
+                nuclei,
+                mol.z,
+                dz_chk,
+                semilocal_ecp_terms,
+                dvr_method=dvr_method,
+            )
+            if semilocal_blocks is not None:
+                h1_nm += semilocal_blocks
+    else:
+        h1_nm = np.asarray(h1_nm, float)
+
+    h_local_ops = None if not use_cache else cache.get("h_local_ops")
+    if h_local_ops is None and h1_nm is None:
+        local_v_cache = {}
+        h_local_ops = np.stack(
+            [
+                T_prim
+                + V_en_sp_total_at_z(
+                    alphas,
+                    centers,
+                    labels,
+                    nuclei,
+                    float(zz),
+                    softcore_radii=getattr(mol, "softcore_radii", None),
+                    local_ecp_terms=getattr(mol, "local_ecp_terms", None),
+                    matrix_cache=local_v_cache,
+                )
+                for zz in mol.z
+            ],
+            axis=0,
+        )
     eri_op = CollocatedERIOp.from_kernels(
         N=S_prim.shape[0],
         Nz=Nz,
@@ -765,6 +1484,8 @@ def _build_newton_context(mol: Molecule):
         "dz": float(dz_chk),
         "K_h": K_h,
         "Kx_h": Kx_h,
+        "eri_h_max": None if h_max is None else int(h_max),
+        "h1_nm": h1_nm,
         "h_local_ops": h_local_ops,
         "nuclei": nuclei,
         "nh_sweep": SweepNewtonHelper(h1_nm, S_prim, eri_op),
@@ -821,7 +1542,13 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
                     level_shift=0.5, shift_decay=0.75, k_ramp_iters=8,
                     dm0=None):
     N = Nz * M
+    nelec = int(nelec)
+    if nelec <= 0 or nelec % 2:
+        raise ValueError("GDVR RHF requires a positive even number of electrons.")
     nocc = nelec // 2
+    if nocc > N:
+        raise ValueError(f"GDVR RHF has {nocc} occupied orbitals but only {N} basis functions.")
+    jk_builder = prepare_gdvr_fock_builder(ERI_J, ERI_K, Nz, M)
     I = np.eye(N)
 
     if dm0 is None:
@@ -847,7 +1574,7 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
         t0 = time.time()
         k_scale = 1.0 if k_ramp_iters <= 1 else min(1.0, it / float(k_ramp_iters))
 
-        F2e = fock_2e_slice_collocated(P, ERI_J, ERI_K, Nz, M, k_scale=k_scale)
+        F2e = fock_2e_slice_collocated(P, jk_builder, None, Nz, M, k_scale=k_scale)
         F = Hcore + F2e
 
         diis.push(F, P)
@@ -934,6 +1661,8 @@ def eri_JK_from_kernels_M1(C_list, K_h, Kx_h):
         Nh = Nz - h
         if Nh <= 0:
             break
+        if K_h[h] is None or Kx_h[h] is None:
+            continue
 
         V_right = pair_diag[h:].T
         WJ = K_h[h] @ V_right
@@ -956,13 +1685,44 @@ def eri_JK_from_kernels_M1(C_list, K_h, Kx_h):
     return ERI_J, ERI_K
 
 
-def rebuild_Hcore_from_d(d_stack, z, Kz, S_prim, T_prim, alphas, centers, labels, nuclei, h_local_ops=None):
+def rebuild_Hcore_from_d(
+    d_stack,
+    z,
+    Kz,
+    S_prim,
+    T_prim,
+    alphas,
+    centers,
+    labels,
+    nuclei,
+    h_local_ops=None,
+    softcore_radii=None,
+    local_ecp_terms=None,
+    h1_nm=None,
+):
     d_stack = np.asarray(d_stack, float)
+    if h1_nm is not None:
+        h1_nm = np.asarray(h1_nm, float)
+        Hcore = np.einsum("ni,nmij,mj->nm", d_stack, h1_nm, d_stack, optimize=True)
+        return 0.5 * (Hcore + Hcore.T)
+
     S_scalar = d_stack @ S_prim @ d_stack.T
 
     if h_local_ops is None:
         h_local_ops = np.stack(
-            [T_prim + V_en_sp_total_at_z(alphas, centers, labels, nuclei, float(zz)) for zz in z],
+            [
+                T_prim
+                + V_en_sp_total_at_z(
+                    alphas,
+                    centers,
+                    labels,
+                    nuclei,
+                    float(zz),
+                    softcore_radii=softcore_radii,
+                    local_ecp_terms=local_ecp_terms,
+                )
+                for zz in z
+            ],
             axis=0,
         )
     e_local = np.einsum("ni,nij,nj->n", d_stack, h_local_ops, d_stack, optimize=True)
@@ -996,7 +1756,20 @@ class SweepNewtonHelper(NewtonHelper):
         super().__init__(h1_nm, S_prim, eri_op)
         self.eri_op = eri_op # Store explicitly
 
-    def _gradient_and_hessian_slice(self, n, d_stack, P_slice):
+    def _active_k_range(self, n):
+        hmax = getattr(self.eriop, "max_active_h", self.Nz - 1)
+        if hmax < 0:
+            return range(0, 0)
+        n = int(n)
+        hmax = int(hmax)
+        return range(max(0, n - hmax), min(self.Nz, n + hmax + 1))
+
+    def _offset_is_active(self, n, k):
+        if hasattr(self.eriop, "offset_is_active"):
+            return self.eriop.offset_is_active(int(n) - int(k))
+        return True
+
+    def _gradient_and_hessian_slice(self, n, d_stack, P_slice, pair_diag=None):
         """
         Compute g_n and H_nn together so shared contractions are evaluated once.
         """
@@ -1004,19 +1777,41 @@ class SweepNewtonHelper(NewtonHelper):
         N = self.N
         dn = d_stack[n]
         p_nn = P_slice[n, n]
+        n2 = N * N
+        if pair_diag is None:
+            pair_diag = np.einsum("ni,nj->nij", d_stack, d_stack, optimize=True).reshape(Nz, n2)
+        K_nm_kl = self.eriop.K_h
+        K_nl_km = self.eriop.K_nl_km
+        K_nk_ml = self.eriop.K_nk_ml
+        K_nl_mk = self.eriop.K_nl_mk
+
+        def _from_pair(mats, h, pair):
+            mat = mats[h]
+            if mat is None:
+                return np.zeros((N, N), dtype=float)
+            return (mat @ pair).reshape(N, N)
+
+        def _from_vecs(mats, h, left, right):
+            mat = mats[h]
+            if mat is None:
+                return np.zeros((N, N), dtype=float)
+            pair = np.multiply.outer(left, right).reshape(n2)
+            return (mat @ pair).reshape(N, N)
 
         J_nn = np.zeros((N, N), dtype=float)
         acc40 = np.zeros((N, N), dtype=float)
         acc41 = np.zeros((N, N), dtype=float)
-        K_nn = self.eriop.block_nl__km(n, n, n, n, dn, dn)
-        K_alt_nn = self.eriop.block_nl__mk(n, n, n, n, dn, dn)
+        pair_nn = pair_diag[n]
+        K_nn = _from_pair(K_nl_km, 0, pair_nn)
+        K_alt_nn = _from_pair(K_nl_mk, 0, pair_nn)
         if abs(p_nn) > 1e-12:
             acc41 += (p_nn * p_nn) * K_nn
             acc40 -= 0.5 * (p_nn * p_nn) * K_alt_nn
+            acc40 += (p_nn * p_nn) * _from_pair(K_nk_ml, 0, pair_nn)
 
-        for k in range(Nz):
-            dk = d_stack[k]
-            Jkk = self.eriop.block_nm__kl(n, n, k, k, dk, dk)
+        for k in self._active_k_range(n):
+            h = abs(n - k)
+            Jkk = _from_pair(K_nm_kl, h, pair_diag[k])
 
             p_kk = P_slice[k, k]
             if abs(p_kk) > 1e-12:
@@ -1024,7 +1819,6 @@ class SweepNewtonHelper(NewtonHelper):
 
             p_nk = P_slice[n, k]
             if abs(p_nk) > 1e-12:
-                acc40 += (p_nk * p_nk) * self.eriop.block_nk__ml(n, n, k, k, dk, dk)
                 acc41 -= 0.5 * (p_nk * p_nk) * Jkk
 
         g_n = np.zeros(N, dtype=float)
@@ -1039,10 +1833,13 @@ class SweepNewtonHelper(NewtonHelper):
             if abs(p_sym) > 1e-12:
                 if n == m:
                     V_eff = J_nn - 0.5 * p_nn * K_nn
-                else:
-                    K_val = self.eriop.block_nl__km(n, m, m, n, dm, dn)
+                elif self._offset_is_active(n, m):
+                    K_val = _from_vecs(K_nl_km, abs(n - m), dm, dn)
                     V_eff = -0.5 * p_mn * K_val
-                F_nm += 2.0 * p_sym * V_eff
+                else:
+                    V_eff = None
+                if V_eff is not None:
+                    F_nm += 2.0 * p_sym * V_eff
 
             g_n += F_nm @ dm
 
@@ -1066,7 +1863,7 @@ class SweepNewtonHelper(NewtonHelper):
         # 1. Pre-compute Diagonal Coulomb Term for F_nn (Depends on all k)
         # J_nn = Sum_k P_kk * (nn|kk)
         J_nn = np.zeros((N, N), dtype=float)
-        for k in range(Nz):
+        for k in self._active_k_range(n):
             p_kk = P_slice[k, k]
             if abs(p_kk) > 1e-12:
                 dk = d_stack[k]
@@ -1092,12 +1889,15 @@ class SweepNewtonHelper(NewtonHelper):
                     # Diagonal Exchange: (nn|nn)
                     K_nn = self.eriop.block_nl__km(n, n, n, n, dn, dn)
                     V_eff = J_nn - 0.5 * P_slice[n, n] * K_nn
-                else:
+                elif self._offset_is_active(n, m):
                     # Off-diagonal Exchange: (nn|mm)
                     K_val = self.eriop.block_nl__km(n, m, m, n, dm, dn)
                     V_eff = -0.5 * P_slice[m, n] * K_val
+                else:
+                    V_eff = None
                 
-                F_nm += 2.0 * p_sym * V_eff
+                if V_eff is not None:
+                    F_nm += 2.0 * p_sym * V_eff
             
             g_n += F_nm @ dm
             
@@ -1123,7 +1923,7 @@ class SweepNewtonHelper(NewtonHelper):
             acc39 = np.zeros((N, N), dtype=float)
             
             # Coulomb part: Sum_k P_kk (nn|kk)
-            for k in range(Nz):
+            for k in self._active_k_range(n):
                 p_kk = P_slice[k, k]
                 if abs(p_kk) > 1e-12:
                     dk = d_stack[k]
@@ -1139,7 +1939,7 @@ class SweepNewtonHelper(NewtonHelper):
         # Sparsity: (nk|nl) -> k=l. (nl|nk) -> l=n, k=n.
         acc40 = np.zeros((N, N), dtype=float)
         # Sum_k P_nk^2 (nk|nk)
-        for k in range(Nz):
+        for k in self._active_k_range(n):
             p_nk = P_slice[n, k]
             if abs(p_nk) > 1e-12:
                 dk = d_stack[k]
@@ -1159,7 +1959,7 @@ class SweepNewtonHelper(NewtonHelper):
         acc41 += (P_slice[n, n]**2) * nl_kn_nn
         
         # -0.5 * Sum_k P_nk^2 (nn|kk)
-        for k in range(Nz):
+        for k in self._active_k_range(n):
             p_nk = P_slice[n, k]
             if abs(p_nk) > 1e-12:
                 dk = d_stack[k]
@@ -1169,12 +1969,12 @@ class SweepNewtonHelper(NewtonHelper):
         
         return H_nn
 
-    def kkt_step_slice(self, n, d_stack, P_slice, S_prim, ridge_base=1e-4):
+    def kkt_step_slice(self, n, d_stack, P_slice, S_prim, ridge_base=1e-4, pair_diag=None):
         """
         Solves the local KKT problem with automatic ridge selection for stability.
         """
         # 1-2. Compute Exact Gradient and Diagonal Hessian together to reuse contractions.
-        g_n_vec, H_nn = self._gradient_and_hessian_slice(n, d_stack, P_slice)
+        g_n_vec, H_nn = self._gradient_and_hessian_slice(n, d_stack, P_slice, pair_diag=pair_diag)
         g_n = g_n_vec.reshape(-1, 1)
         
         # 3. Automated Ridge Selection
@@ -1227,13 +2027,14 @@ def sweep_optimize_driver(
     ridge=1,          # large default ridge for stability
     trust_step=1.0,     # Full Newton step
     trust_radius=2.0,   # decides how large a step could be, decides convergence speed vs. monotonic decrement stability
-    verbose=True
+    verbose=True,
 ):
     """
     Performs Symmetric Gauss-Seidel optimization (Forward + Backward).
     """
     Nz = d_stack.shape[0]
     d_current = d_stack.copy()
+    pair_diag = np.einsum("ni,nj->nij", d_current, d_current, optimize=True).reshape(Nz, -1)
     
     # Create Symmetric Order: 0->N, then N-2->0
     forward = list(range(Nz))
@@ -1246,7 +2047,7 @@ def sweep_optimize_driver(
         # Run Symmetric Sweep
         for n in symmetric_order:
             # 1. Solve Local KKT
-            delta_d, lam, g_n = nh.kkt_step_slice(n, d_current, P_slice, S_prim, ridge)
+            delta_d, lam, g_n = nh.kkt_step_slice(n, d_current, P_slice, S_prim, ridge, pair_diag=pair_diag)
             
             gnorm = np.linalg.norm(g_n)
             max_grad = max(max_grad, gnorm)
@@ -1273,6 +2074,7 @@ def sweep_optimize_driver(
             max_delta = max(max_delta, change)
             
             d_current[n] = d_cand
+            pair_diag[n] = np.multiply.outer(d_cand, d_cand).reshape(-1)
             
         if verbose:
             print(f"  [Sweep {cyc+1}] Max |g|: {max_grad:.4e}, Max d-change: {max_delta:.6f}")
@@ -1344,7 +2146,7 @@ if __name__ == "__main__":
     Hcore, z, dz, E_slices, C_list, _ERI_J0, _ERI_K0, shapes = build_method2(
         mol, Lz=LZ, Nz=Nz, M=M,
         s_exps=s_exps, p_exps=p_exps, d_exps=d_exps, 
-        max_offset=None, auto_cut=False, verbose=VERBOSE, dvr_method=DVR_METHOD,
+        verbose=VERBOSE, dvr_method=DVR_METHOD,
     )
 
     nuclei = mol.to_tuples()

@@ -35,8 +35,9 @@ ETAS = np.array([8.0637411874e-05, 5.9071651716e-05, 2.1631763955e-11, 2.7007117
 
 XIS = np.array([1.0320393813e-08, 1.2379525379e-08, 1.3007410055e-08, 1.6173844457e-08, 2.1671426219e-08, 3.0819372215e-08, 3.9488488515e-08, 5.239397947e-08, 6.7352191656e-08, 8.199867748e-08, 1.0733871178e-07, 1.3993987549e-07, 1.5045864863e-07, 1.762693193e-07, 2.6022612644e-07, 3.1978827504e-07, 3.7015405181e-07, 4.4180362755e-07, 5.1259964405e-07, 6.4734980457e-07, 7.8859904928e-07, 1.0121060259e-06, 1.2460518649e-06, 1.5071795775e-06, 1.7569593479e-06, 2.1048930748e-06, 2.6798001247e-06, 3.9862598273e-06, 4.0618706894e-06, 4.3309530723e-06, 5.8091056772e-06, 7.2124239367e-06, 8.5351232982e-06, 1.0560606393e-05, 1.3123236965e-05, 1.5671620218e-05, 1.8965053526e-05, 2.3384323733e-05, 2.8679886374e-05, 3.445667567e-05, 4.0771200327e-05, 5.129473618e-05, 6.2422541922e-05, 7.6007428312e-05, 9.2400388351e-05, 0.00011253074895, 0.00013772902868, 0.00016738522086, 0.0002025720688, 0.00024804805106, 0.00030354482599, 0.00036692765669, 0.00044615253763, 0.00054724664794, 0.00066551100377, 0.00080668549248, 0.00098532060387, 0.0012018944792, 0.0014609396098, 0.00177938937, 0.0021671315854, 0.0026403416651, 0.0032190143368, 0.0039117409934, 0.0047632719365, 0.0058213807652, 0.0070739860415, 0.008589902442, 0.010505787482, 0.012808716845, 0.015531570234, 0.018922744994, 0.02311417046, 0.028130027156, 0.034201812286, 0.041679455593, 0.050808170794, 0.061935497033, 0.075274163361, 0.090705572507, 0.11175575826, 0.16571252954, 0.20009998894, 0.24584084036, 0.30181832979, 0.36389247352, 0.4412302909, 0.54292005309, 0.65869324876, 0.79548721709, 0.98645292185, 1.1988636469, 1.3983486011, 1.7784305553, 2.3439756222, 2.4930918729, 3.2727087091, 4.0240975602, 4.7625671235, 6.9486239367, 6.9497504653, 9.7367725097], dtype=np.float64)
 
-# Standard Exp for H
+# Standard Exp for H / He
 STO6_EXPS_H = np.array([35.52322122, 6.513143725, 1.822142904, 0.6259552659, 0.2430767471, 0.1001124280], dtype=float)
+STO6_EXPS_He = np.array([65.98456824, 12.09819836, 3.384639924, 1.162715163, 0.451516322, 0.185959356], dtype=float)
 Exp_631g_ss_H = np.array([18.73113696, 2.825394365, 0.6401216923, 0.1612777588], dtype=float)
 
 
@@ -624,15 +625,479 @@ def _V_en_prony_general(alphas, centers, labels, nuc_xy, dz_abs):
     return out
 
 
-def V_en_sp_total_at_z(alphas, centers, labels, nuclei_tuples, z):
+def _coerce_local_ecp_terms(local_ecp_terms, nnuc):
+    if local_ecp_terms is None:
+        return [[] for _ in range(nnuc)]
+    if len(local_ecp_terms) != nnuc:
+        raise ValueError("local_ecp_terms must match the number of nuclei.")
+
+    out = []
+    for atom_terms in local_ecp_terms:
+        clean_terms = []
+        for term in atom_terms:
+            if isinstance(term, dict):
+                power = term["power"]
+                exponent = term["exponent"]
+                coeff = term["coeff"]
+            else:
+                power, exponent, coeff = term[:3]
+            exponent = float(exponent)
+            if exponent < 0.0:
+                raise ValueError("ECP Gaussian exponents must be non-negative.")
+            clean_terms.append((int(power), exponent, float(coeff)))
+        out.append(tuple(clean_terms))
+    return out
+
+
+def _coerce_semilocal_ecp_terms(semilocal_ecp_terms, nnuc):
+    if semilocal_ecp_terms is None:
+        return [[] for _ in range(nnuc)]
+    if len(semilocal_ecp_terms) != nnuc:
+        raise ValueError("semilocal_ecp_terms must match the number of nuclei.")
+
+    out = []
+    for atom_terms in semilocal_ecp_terms:
+        clean_terms = []
+        for term in atom_terms:
+            if isinstance(term, dict):
+                angular_momentum = term["angular_momentum"]
+                power = term["power"]
+                exponent = term["exponent"]
+                coeff = term["coeff"]
+            else:
+                angular_momentum, power, exponent, coeff = term[:4]
+            exponent = float(exponent)
+            if exponent < 0.0:
+                raise ValueError("ECP Gaussian exponents must be non-negative.")
+            clean_terms.append((int(angular_momentum), int(power), exponent, float(coeff)))
+        out.append(tuple(clean_terms))
+    return out
+
+
+@functools.lru_cache(maxsize=64)
+def _angle_even_integral(nx, ny):
+    nx = int(nx)
+    ny = int(ny)
+    if nx < 0 or ny < 0:
+        raise ValueError("Angular powers must be non-negative.")
+    if (nx % 2) or (ny % 2):
+        return 0.0
+    ax = nx // 2
+    ay = ny // 2
+    log_val = (
+        np.log(2.0)
+        + sp.gammaln(ax + 0.5)
+        + sp.gammaln(ay + 0.5)
+        - sp.gammaln(ax + ay + 1.0)
+    )
+    return float(np.exp(log_val))
+
+
+@functools.lru_cache(maxsize=512)
+def _genlaguerre_nodes_weights(order, alpha):
+    nodes, weights = sp.roots_genlaguerre(int(order), float(alpha))
+    return np.asarray(nodes, float), np.asarray(weights, float)
+
+
+@functools.lru_cache(maxsize=65536)
+def _local_ecp_same_axis_radial(total_power, total_exponent, ecp_exponent, dz_abs, ecp_power, order=96):
+    total_power = int(total_power)
+    total_exponent = float(total_exponent)
+    ecp_exponent = float(ecp_exponent)
+    dz_abs = float(abs(dz_abs))
+    ecp_power = int(ecp_power)
+    if total_exponent <= 0.0:
+        raise ValueError("Total Gaussian exponent must be positive.")
+
+    d2 = dz_abs * dz_abs
+    prefactor = float(np.exp(-ecp_exponent * d2))
+    if d2 < 1e-28:
+        alpha = 0.5 * (total_power + ecp_power)
+        if alpha <= -1.0:
+            raise ValueError("Divergent same-axis local ECP radial integral.")
+        return float(0.5 * np.exp(sp.gammaln(alpha + 1.0)) / (total_exponent ** (alpha + 1.0)))
+
+    if ecp_power == 0:
+        alpha = 0.5 * total_power
+        return float(
+            0.5
+            * prefactor
+            * np.exp(sp.gammaln(alpha + 1.0))
+            / (total_exponent ** (alpha + 1.0))
+        )
+
+    alpha = 0.5 * total_power
+    nodes, weights = _genlaguerre_nodes_weights(int(order), float(alpha))
+    vals = (nodes / total_exponent + d2) ** (0.5 * ecp_power)
+    return float(
+        0.5
+        * prefactor
+        * np.sum(weights * vals)
+        / (total_exponent ** (alpha + 1.0))
+    )
+
+
+def _local_ecp_single_same_axis(alphas, centers, labels, i, j, nuc_xy, dz_abs, power, exponent):
+    if not _pair_is_on_axis_same_center(centers, i, j, nuc_xy):
+        return None
+
+    lxA, lyA = _parse_2d_l(labels[i])
+    lxB, lyB = _parse_2d_l(labels[j])
+    nx = lxA + lxB
+    ny = lyA + lyB
+    angle = _angle_even_integral(nx, ny)
+    if angle == 0.0:
+        return 0.0
+
+    radial = _local_ecp_same_axis_radial(
+        nx + ny,
+        float(alphas[i] + alphas[j] + exponent),
+        float(exponent),
+        float(abs(dz_abs)),
+        int(power),
+    )
+    return angle * radial
+
+
+def _local_ecp_integrand(
+    y, x,
+    xA, yA, lxA, lyA, aA,
+    xB, yB, lxB, lyB, aB,
+    xN, yN, dz_sq, power, exponent
+):
+    dist_sq = (x - xN) ** 2 + (y - yN) ** 2 + dz_sq
+    r = np.sqrt(max(dist_sq, 1e-300))
+    valA = (x - xA) ** lxA * (y - yA) ** lyA * np.exp(-aA * ((x - xA) ** 2 + (y - yA) ** 2))
+    valB = (x - xB) ** lxB * (y - yB) ** lyB * np.exp(-aB * ((x - xB) ** 2 + (y - yB) ** 2))
+    return valA * valB * (r ** power) * np.exp(-exponent * dist_sq)
+
+
+def _local_ecp_single_numerical(alphas, centers, labels, i, j, nuc_xy, dz_abs, power, exponent):
+    aA = alphas[i]
+    xA, yA = centers[i]
+    lxA, lyA = _parse_2d_l(labels[i])
+
+    aB = alphas[j]
+    xB, yB = centers[j]
+    lxB, lyB = _parse_2d_l(labels[j])
+
+    xN, yN = nuc_xy
+    gamma = aA + aB
+    Px = (aA * xA + aB * xB) / gamma
+    Py = (aA * yA + aB * yB) / gamma
+
+    width_exp = min(float(aA), float(aB), max(float(exponent), 1e-12))
+    bound = 8.0 / np.sqrt(width_exp)
+    x_min = min(Px, xN) - bound
+    x_max = max(Px, xN) + bound
+    y_min = min(Py, yN) - bound
+    y_max = max(Py, yN) + bound
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=IntegrationWarning)
+        val, _err = dblquad(
+            _local_ecp_integrand,
+            x_min, x_max,
+            lambda x: y_min, lambda x: y_max,
+            args=(xA, yA, lxA, lyA, aA, xB, yB, lxB, lyB, aB, xN, yN, dz_abs * dz_abs, power, exponent),
+            epsabs=1e-9,
+            epsrel=1e-7,
+        )
+    return float(val)
+
+
+def local_ecp_potential_at_z(alphas, centers, labels, nuc_xy, dz_abs, terms):
     alphas = np.asarray(alphas, float)
     centers = np.asarray(centers, float)
     N = len(alphas)
     V = np.zeros((N, N), dtype=float)
+    nuc_xy = np.asarray(nuc_xy, dtype=float)
 
-    for (Z, xN, yN, zN) in nuclei_tuples:
-        dz = abs(z - zN)
+    for power, exponent, coeff in terms:
+        if coeff == 0.0:
+            continue
+        for i in range(N):
+            for j in range(i, N):
+                val = _local_ecp_single_same_axis(
+                    alphas, centers, labels, i, j, nuc_xy, dz_abs, power, exponent
+                )
+                if val is None:
+                    val = _local_ecp_single_numerical(
+                        alphas, centers, labels, i, j, nuc_xy, dz_abs, power, exponent
+                    )
+                V[i, j] += coeff * val
+                if i != j:
+                    V[j, i] += coeff * val
+    return V
+
+
+def _fourier_dvr_cardinal_values(x, z_grid, dz):
+    z_grid = np.asarray(z_grid, float)
+    x = np.asarray(x, float)
+    N = int(z_grid.size)
+    if N <= 0:
+        raise ValueError("Empty z_grid for Fourier DVR cardinal values.")
+    box = float(N * dz)
+    if box <= 0.0:
+        raise ValueError("Fourier DVR spacing must be positive.")
+    u = (x[..., None] - z_grid[None, :]) / box
+    u = u - np.round(u)
+    small = np.abs(u) < 1e-13
+    if N % 2 == 0:
+        denom = np.tan(np.pi * u)
+    else:
+        denom = np.sin(np.pi * u)
+    numer = np.sin(np.pi * N * u)
+    vals = np.empty_like(u, dtype=float)
+    np.divide(numer, float(N) * denom, out=vals, where=~small)
+    vals[small] = 1.0
+    return vals / np.sqrt(float(dz))
+
+
+def _same_axis_projector_supported(centers, labels, nuc_xy):
+    nuc_xy = np.asarray(nuc_xy, float)
+    for center in np.asarray(centers, float):
+        if not _same_center(center, nuc_xy):
+            return False
+    for lbl in labels:
+        lx, ly = _parse_2d_l(lbl)
+        if lx + ly > 2:
+            return False
+    return True
+
+
+def _l0_phi_integral_factor(label, rho_sq):
+    lx, ly = _parse_2d_l(label)
+    if lx == 0 and ly == 0:
+        return 2.0 * np.pi * np.ones_like(rho_sq)
+    if (lx == 1 and ly == 0) or (lx == 0 and ly == 1) or (lx == 1 and ly == 1):
+        return np.zeros_like(rho_sq)
+    if (lx == 2 and ly == 0) or (lx == 0 and ly == 2):
+        return np.pi * rho_sq
+    return np.zeros_like(rho_sq)
+
+
+def _semilocal_l0_amplitudes_same_axis(
+    r,
+    z_grid,
+    dz,
+    z_nuc,
+    alphas,
+    labels,
+    mu_nodes,
+    mu_weights,
+):
+    r = float(r)
+    mu = np.asarray(mu_nodes, float)
+    z_eval = float(z_nuc) + r * mu
+    cardinal = _fourier_dvr_cardinal_values(z_eval, z_grid, dz)
+    rho_sq = (r * r) * (1.0 - mu * mu)
+    pref_y00 = 1.0 / np.sqrt(4.0 * np.pi)
+    amps = np.zeros((len(z_grid), len(alphas)), dtype=float)
+    for ip, (alpha, lbl) in enumerate(zip(alphas, labels)):
+        phi_factor = _l0_phi_integral_factor(lbl, rho_sq)
+        if not np.any(phi_factor):
+            continue
+        transverse = phi_factor * np.exp(-float(alpha) * rho_sq)
+        weighted = np.asarray(mu_weights, float) * transverse
+        amps[:, ip] = pref_y00 * (cardinal.T @ weighted)
+    return amps
+
+
+def _semilocal_l0_amplitudes_same_axis_batch(
+    r_nodes,
+    z_grid,
+    dz,
+    z_nuc,
+    alphas,
+    labels,
+    mu_nodes,
+    mu_weights,
+):
+    r_nodes = np.asarray(r_nodes, float)
+    mu = np.asarray(mu_nodes, float)
+    z_eval = float(z_nuc) + r_nodes[:, None] * mu[None, :]
+    cardinal = _fourier_dvr_cardinal_values(z_eval.reshape(-1), z_grid, dz)
+    cardinal = cardinal.reshape(r_nodes.size, mu.size, len(z_grid))
+    rho_sq = (r_nodes[:, None] ** 2) * (1.0 - mu[None, :] ** 2)
+    pref_y00 = 1.0 / np.sqrt(4.0 * np.pi)
+
+    factors = np.zeros((len(alphas), r_nodes.size, mu.size), dtype=float)
+    for ip, lbl in enumerate(labels):
+        factors[ip] = _l0_phi_integral_factor(lbl, rho_sq)
+    if not np.any(factors):
+        return np.zeros((r_nodes.size, len(z_grid), len(alphas)), dtype=float)
+
+    transverse = factors * np.exp(-np.asarray(alphas, float)[:, None, None] * rho_sq[None, :, :])
+    transverse *= np.asarray(mu_weights, float)[None, None, :]
+    amps = pref_y00 * np.einsum("ran,pra->rnp", cardinal, transverse, optimize=True)
+    return amps
+
+
+def semilocal_ecp_projector_blocks(
+    alphas,
+    centers,
+    labels,
+    nuclei_tuples,
+    z_grid,
+    dz,
+    semilocal_ecp_terms,
+    dvr_method="exp",
+    radial_order=96,
+    angular_order=64,
+    radial_cutoff_tol=1.0e-14,
+):
+    """Return primitive GDVR blocks for same-axis semilocal ECP projectors.
+
+    The current implementation targets the Li/BFD case used by the GDVR Li2
+    examples: Fourier DVR along z, all transverse centers on the ECP axis, and
+    semilocal l=0 radial channels.  Unsupported geometries fail loudly instead
+    of silently falling back to a scalar approximation.
+    """
+    terms_by_atom = _coerce_semilocal_ecp_terms(semilocal_ecp_terms, len(nuclei_tuples))
+    if not any(terms_by_atom):
+        return None
+    if str(dvr_method) != "exp":
+        raise NotImplementedError("Semilocal ECP projectors currently require Fourier DVR (dvr_method='exp').")
+
+    alphas = np.asarray(alphas, float)
+    centers = np.asarray(centers, float)
+    z_grid = np.asarray(z_grid, float)
+    Nz = int(z_grid.size)
+    nprim = int(alphas.size)
+    blocks = np.zeros((Nz, Nz, nprim, nprim), dtype=float)
+    mu_nodes, mu_weights = np.polynomial.legendre.leggauss(int(angular_order))
+    dz = float(dz)
+
+    def _accumulate_terms(target, terms, zN):
+        for angular_momentum, power, exponent, coeff in terms:
+            if coeff == 0.0:
+                continue
+            if int(angular_momentum) != 0:
+                raise NotImplementedError("Semilocal ECP projectors currently support only l=0 channels.")
+            if exponent <= 0.0:
+                raise ValueError("Semilocal ECP exponents must be positive.")
+            rmax = np.sqrt(-np.log(float(radial_cutoff_tol)) / float(exponent))
+            r_nodes, r_weights = np.polynomial.legendre.leggauss(int(radial_order))
+            r_nodes = 0.5 * rmax * (r_nodes + 1.0)
+            r_weights = 0.5 * rmax * r_weights
+            amps = _semilocal_l0_amplitudes_same_axis_batch(
+                r_nodes,
+                z_grid,
+                dz,
+                zN,
+                alphas,
+                labels,
+                mu_nodes,
+                mu_weights,
+            ).reshape(r_nodes.size, Nz * nprim)
+            radial_weights = (
+                r_weights
+                * coeff
+                * (r_nodes ** (power + 2))
+                * np.exp(-exponent * r_nodes * r_nodes)
+            )
+            gram = amps.T @ (radial_weights[:, None] * amps)
+            target += gram.reshape(Nz, nprim, Nz, nprim).transpose(0, 2, 1, 3)
+
+    active_atoms = [
+        (tuple(terms), float(xN), float(yN), float(zN))
+        for terms, (_Z, xN, yN, zN) in zip(terms_by_atom, nuclei_tuples)
+        if terms
+    ]
+    if active_atoms:
+        ref_terms, ref_x, ref_y, ref_z = active_atoms[0]
+        same_translated_projector = (
+            dz > 0.0
+            and all(terms == ref_terms for terms, _x, _y, _z in active_atoms)
+            and all(abs(x - ref_x) < CENTER_TOL and abs(y - ref_y) < CENTER_TOL for _terms, x, y, _z in active_atoms)
+        )
+        shifts = []
+        if same_translated_projector:
+            for _terms, _x, _y, zN in active_atoms:
+                shift = int(round((zN - ref_z) / dz))
+                if abs((zN - ref_z) - shift * dz) > 1.0e-8:
+                    same_translated_projector = False
+                    break
+                shifts.append(shift)
+        if same_translated_projector:
+            nuc_xy = np.array([ref_x, ref_y], dtype=float)
+            if not _same_axis_projector_supported(centers, labels, nuc_xy):
+                raise NotImplementedError(
+                    "Semilocal ECP projectors currently support only transverse primitives centered on the ECP axis."
+                )
+            ref_blocks = np.zeros_like(blocks)
+            _accumulate_terms(ref_blocks, ref_terms, ref_z)
+            for shift in shifts:
+                blocks += np.roll(np.roll(ref_blocks, shift, axis=0), shift, axis=1)
+            for n in range(Nz):
+                for m in range(n, Nz):
+                    blk = 0.5 * (blocks[n, m] + blocks[m, n].T)
+                    blocks[n, m] = blk
+                    blocks[m, n] = blk.T
+            return blocks
+
+    for terms, (_Z, xN, yN, zN) in zip(terms_by_atom, nuclei_tuples):
+        if not terms:
+            continue
         nuc_xy = np.array([xN, yN], dtype=float)
+        if not _same_axis_projector_supported(centers, labels, nuc_xy):
+            raise NotImplementedError(
+                "Semilocal ECP projectors currently support only transverse primitives centered on the ECP axis."
+            )
+        _accumulate_terms(blocks, terms, zN)
+
+    for n in range(Nz):
+        for m in range(n, Nz):
+            blk = 0.5 * (blocks[n, m] + blocks[m, n].T)
+            blocks[n, m] = blk
+            blocks[m, n] = blk.T
+    return blocks
+
+
+def V_en_sp_total_at_z(
+    alphas,
+    centers,
+    labels,
+    nuclei_tuples,
+    z,
+    softcore_radii=None,
+    local_ecp_terms=None,
+    matrix_cache=None,
+):
+    alphas = np.asarray(alphas, float)
+    centers = np.asarray(centers, float)
+    N = len(alphas)
+    V = np.zeros((N, N), dtype=float)
+    if softcore_radii is None:
+        softcore_radii = np.zeros(len(nuclei_tuples), dtype=float)
+    else:
+        softcore_radii = np.asarray(softcore_radii, dtype=float).reshape(-1)
+        if softcore_radii.size != len(nuclei_tuples):
+            raise ValueError("softcore_radii must match the number of nuclei.")
+        if np.any(softcore_radii < 0.0):
+            raise ValueError("softcore_radii must be non-negative.")
+    local_ecp_terms = _coerce_local_ecp_terms(local_ecp_terms, len(nuclei_tuples))
+
+    for inucl, (Z, xN, yN, zN) in enumerate(nuclei_tuples):
+        dz0 = float(z) - float(zN)
+        rc = float(softcore_radii[inucl])
+        dz = float(np.sqrt(dz0 * dz0 + rc * rc))
+        nuc_xy = np.array([xN, yN], dtype=float)
+        cache_key = None
+        if matrix_cache is not None:
+            cache_key = (
+                round(float(Z), 12),
+                round(float(xN), 12),
+                round(float(yN), 12),
+                round(float(dz), 12),
+                round(float(abs(dz0)), 12),
+                tuple(local_ecp_terms[inucl]),
+            )
+            cached = matrix_cache.get(cache_key)
+            if cached is not None:
+                V += cached
+                continue
         V_nuc = np.zeros((N, N), dtype=float)
 
         for i in range(N):
@@ -656,7 +1121,19 @@ def V_en_sp_total_at_z(alphas, centers, labels, nuclei_tuples, z):
                 V_nuc[i, j] = val
                 V_nuc[j, i] = val
 
-        V -= Z * V_nuc
+        contribution = -Z * V_nuc
+        if local_ecp_terms[inucl]:
+            contribution += local_ecp_potential_at_z(
+                alphas,
+                centers,
+                labels,
+                nuc_xy,
+                abs(dz0),
+                local_ecp_terms[inucl],
+            )
+        V += contribution
+        if cache_key is not None:
+            matrix_cache[cache_key] = contribution
     return V
 # ============================================================
 # ERI helpers
@@ -1316,6 +1793,205 @@ def _eri_prony_tensor(alphas, centers, labels, dz_eff):
 
     return eri_tensor
 
+def _same_center_sp_basis(centers, labels, tol=CENTER_TOL):
+    allowed = {"2d-s", "2d-px", "2d-py"}
+    return _all_same_center(centers, tol=tol) and all(lbl.kind in allowed for lbl in labels)
+
+
+def _small_comb(n, k):
+    n = np.asarray(n, dtype=int)
+    if k == 0:
+        return np.ones_like(n, dtype=float)
+    if k == 1:
+        return n.astype(float)
+    if k == 2:
+        return 0.5 * n * (n - 1)
+    return np.zeros_like(n, dtype=float)
+
+
+def _same_center_u_moments(mu, dz_abs):
+    mu = np.asarray(mu, float)
+    a = float(abs(dz_abs))
+    root_mu = np.sqrt(mu)
+    F = erfcx(a * root_mu)
+    c = np.pi ** 1.5
+
+    U0 = c * F / root_mu
+    U2 = (
+        0.5 * c * F / (mu * root_mu)
+        - c * a * a * F / root_mu
+        + np.pi * a / mu
+    )
+    U4 = (
+        c * (a ** 4) * F / root_mu
+        - np.pi * (a ** 3) / mu
+        - c * a * a * F / (mu * root_mu)
+        + 1.5 * np.pi * a / (mu * mu)
+        + 0.75 * c * F / (mu * mu * root_mu)
+    )
+    return U0, U2, U4
+
+
+def _even_gaussian_moment_2d(px, py, exponent):
+    px = np.asarray(px, dtype=int)
+    py = np.asarray(py, dtype=int)
+    exponent = np.asarray(exponent, float)
+    out = np.zeros(np.broadcast_shapes(px.shape, py.shape, exponent.shape), dtype=float)
+    bx = np.broadcast_to(px, out.shape)
+    by = np.broadcast_to(py, out.shape)
+    be = np.broadcast_to(exponent, out.shape)
+    mask = ((bx % 2) == 0) & ((by % 2) == 0)
+    if not np.any(mask):
+        return out
+    ax = bx[mask] // 2
+    ay = by[mask] // 2
+    out[mask] = np.exp(
+        sp.gammaln(ax + 0.5)
+        + sp.gammaln(ay + 0.5)
+        - (ax + ay + 1.0) * np.log(be[mask])
+    )
+    return out
+
+
+def _same_center_radial_moment_2d(px, py, U0, U2, U4):
+    px = np.asarray(px, dtype=int)
+    py = np.asarray(py, dtype=int)
+    out = np.zeros(np.broadcast_shapes(px.shape, py.shape, U0.shape), dtype=float)
+    bx = np.broadcast_to(px, out.shape)
+    by = np.broadcast_to(py, out.shape)
+    mask = ((bx % 2) == 0) & ((by % 2) == 0)
+    if not np.any(mask):
+        return out
+
+    ax = bx[mask] // 2
+    ay = by[mask] // 2
+    n = ax + ay
+    angular_avg = np.exp(
+        sp.gammaln(ax + 0.5)
+        + sp.gammaln(ay + 0.5)
+        - np.log(np.pi)
+        - sp.gammaln(n + 1.0)
+    )
+    radial = np.zeros_like(angular_avg, dtype=float)
+    u_stack = (
+        np.broadcast_to(U0, out.shape)[mask],
+        np.broadcast_to(U2, out.shape)[mask],
+        np.broadcast_to(U4, out.shape)[mask],
+    )
+    for order in range(3):
+        order_mask = n == order
+        if np.any(order_mask):
+            radial[order_mask] = u_stack[order][order_mask]
+    out[mask] = angular_avg * radial
+    return out
+
+
+def _same_center_pair_axis_terms(power_bra, power_ket, coeff_bra, coeff_ket):
+    terms = []
+    power_bra = np.asarray(power_bra, dtype=int)
+    power_ket = np.asarray(power_ket, dtype=int)
+    for ib in range(3):
+        cb = _small_comb(power_bra, ib)
+        valid_b = ib <= power_bra
+        for ik in range(3):
+            valid = valid_b & (ik <= power_ket)
+            if not np.any(valid):
+                continue
+            ck = _small_comb(power_ket, ik)
+            coeff = cb * ck * (coeff_bra ** (power_bra - ib)) * (coeff_ket ** (power_ket - ik))
+            coeff = np.where(valid, coeff, 0.0)
+            terms.append((ib + ik, power_bra + power_ket - ib - ik, coeff))
+    return terms
+
+
+def _eri_same_center_sp_analytic_tensor(alphas, centers, labels, dz_eff):
+    """Exact same-center ERI tensor for 2D s/px/py primitives."""
+    alphas = np.asarray(alphas, float)
+    n_ao = int(alphas.size)
+    lx = np.array([_parse_2d_l(lbl)[0] for lbl in labels], dtype=int)
+    ly = np.array([_parse_2d_l(lbl)[1] for lbl in labels], dtype=int)
+
+    pair_exp = alphas[:, None] + alphas[None, :]
+    p = pair_exp[:, :, None, None]
+    q = pair_exp[None, None, :, :]
+    total = p + q
+    mu = (p * q) / total
+    coeff_bra = q / total
+    coeff_ket = -p / total
+    U0, U2, U4 = _same_center_u_moments(mu, dz_eff)
+
+    px_bra = (lx[:, None] + lx[None, :])[:, :, None, None]
+    px_ket = (lx[:, None] + lx[None, :])[None, None, :, :]
+    py_bra = (ly[:, None] + ly[None, :])[:, :, None, None]
+    py_ket = (ly[:, None] + ly[None, :])[None, None, :, :]
+
+    x_terms = _same_center_pair_axis_terms(px_bra, px_ket, coeff_bra, coeff_ket)
+    y_terms = _same_center_pair_axis_terms(py_bra, py_ket, coeff_bra, coeff_ket)
+
+    eri_tensor = np.zeros((n_ao, n_ao, n_ao, n_ao), dtype=float)
+    for vx, ux, cx in x_terms:
+        for vy, uy, cy in y_terms:
+            v_moment = _even_gaussian_moment_2d(vx, vy, total)
+            if not np.any(v_moment):
+                continue
+            u_moment = _same_center_radial_moment_2d(ux, uy, U0, U2, U4)
+            if not np.any(u_moment):
+                continue
+            eri_tensor += cx * cy * v_moment * u_moment
+    return eri_tensor
+
+
+def _zero_mean_pair_moment(power_a, power_b, c11, c22, c12):
+    power_a = np.asarray(power_a, dtype=int)
+    power_b = np.asarray(power_b, dtype=int)
+    out = np.zeros(np.broadcast_shapes(power_a.shape, power_b.shape, c11.shape), dtype=float)
+    pa = np.broadcast_to(power_a, out.shape)
+    pb = np.broadcast_to(power_b, out.shape)
+
+    out[(pa == 0) & (pb == 0)] = 1.0
+    out[(pa == 2) & (pb == 0)] = c11[(pa == 2) & (pb == 0)]
+    out[(pa == 0) & (pb == 2)] = c22[(pa == 0) & (pb == 2)]
+    out[(pa == 1) & (pb == 1)] = c12[(pa == 1) & (pb == 1)]
+    mask22 = (pa == 2) & (pb == 2)
+    out[mask22] = (c11 * c22 + 2.0 * c12 * c12)[mask22]
+    return out
+
+
+def _eri_prony_same_center_sp_tensor(alphas, centers, labels, dz_eff):
+    """Fast Prony ERI tensor for same-center 2D s/px/py primitives."""
+    alphas = np.asarray(alphas, float)
+    n_ao = int(alphas.size)
+    lx = np.array([_parse_2d_l(lbl)[0] for lbl in labels], dtype=int)
+    ly = np.array([_parse_2d_l(lbl)[1] for lbl in labels], dtype=int)
+
+    A = alphas[:, None] + alphas[None, :]
+    px_pair = lx[:, None] + lx[None, :]
+    py_pair = ly[:, None] + ly[None, :]
+
+    a_bd = A[:, :, None, None]
+    b_bd = A[None, None, :, :]
+    px_a = px_pair[:, :, None, None]
+    px_b = px_pair[None, None, :, :]
+    py_a = py_pair[:, :, None, None]
+    py_b = py_pair[None, None, :, :]
+
+    invz = 1.0 / float(dz_eff)
+    gammas = XIS * (invz**2)
+    weights = ETAS * invz
+    eri_tensor = np.zeros((n_ao, n_ao, n_ao, n_ao), dtype=float)
+
+    for weight_p, gamma_p in zip(weights, gammas):
+        D = a_bd * b_bd + gamma_p * (a_bd + b_bd)
+        theta = (a_bd * b_bd * gamma_p) / D
+        base = weight_p * (np.pi**2 / D)
+        c11 = (1.0 / (2.0 * a_bd)) - (theta / (2.0 * a_bd * a_bd))
+        c22 = (1.0 / (2.0 * b_bd)) - (theta / (2.0 * b_bd * b_bd))
+        c12 = theta / (2.0 * a_bd * b_bd)
+        mx = _zero_mean_pair_moment(px_a, px_b, c11, c22, c12)
+        my = _zero_mean_pair_moment(py_a, py_b, c11, c22, c12)
+        eri_tensor += base * mx * my
+    return eri_tensor
+
 def _all_s_same_center_basis(centers, labels, tol=CENTER_TOL):
     return _all_same_center(centers, tol=tol) and all(lbl.kind == "2d-s" for lbl in labels)
 
@@ -1361,6 +2037,10 @@ def eri_2d_cartesian_with_p(alphas, centers, labels, delta_z, dz_tol=None):
     # 1. Exact Analytical s-s same center
     if _all_s_same_center_basis(centers, labels):
         return _eri_all_s_same_center_tensor(alphas, centers, labels, dz_eff)
+
+    # 1b. Exact same-center s/p Cartesian moments, used by aligned Li chains.
+    if _same_center_sp_basis(centers, labels):
+        return _eri_same_center_sp_analytic_tensor(alphas, centers, labels, dz_eff)
 
     # 2. Strictly 2D regime (dz = 0)
     if dz_eff < 1e-9:
@@ -1431,6 +2111,65 @@ def pair_params(alphas, centers):
     A = a_i + a_j
     return A, None, None
 
+def two_electron_wedge_basis(npoints, exchange="symmetric"):
+    """Return raw ordered pairs ``(i, j)`` with ``i < j``.
+
+    The returned phase is the exchange continuation used to fold the omitted
+    sector back into the ``x1 < x2`` wedge: ``+1`` for singlet/Neumann and
+    ``-1`` for triplet/Dirichlet.
+    """
+    npoints = int(npoints)
+    if npoints < 2:
+        raise ValueError("npoints must be at least 2 for an ordered two-electron wedge.")
+    key = str(exchange).strip().lower()
+    if key in {"symmetric", "sym", "singlet", "+", "+1", "even", "neumann"}:
+        phase = 1
+    elif key in {"antisymmetric", "antisym", "triplet", "-", "-1", "odd", "dirichlet"}:
+        phase = -1
+    else:
+        raise ValueError("exchange must be symmetric/singlet or antisymmetric/triplet.")
+    pairs = [(i, j) for i in range(npoints) for j in range(i + 1, npoints)]
+    return np.asarray(pairs, dtype=int), phase
+
+
+def two_electron_wedge_kinetic(K, exchange="symmetric", return_extension=False, return_transform=False):
+    """Fold a full product-DVR KEO onto raw wedge values ``psi[i, j]``, ``i < j``.
+
+    The basis is the unsymmetrized ordered grid ``|i j>`` with ``i < j``.  The
+    omitted sector is supplied by exchange continuation,
+
+    ``psi[j, i] = +/- psi[i, j]``.
+
+    Thus the effective matrix is
+
+    ``H_wedge[(ij),(kl)] = H_full[(ij),(kl)] +/- H_full[(ij),(lk)]``.
+
+    This is the ordered-coordinate version of the Neumann/singlet or
+    Dirichlet/triplet boundary at ``x1 = x2``; it is not the normalized
+    exchange-adapted basis ``(|ij> +/- |ji>)/sqrt(2)``.
+    """
+    K = np.asarray(K)
+    if K.ndim != 2 or K.shape[0] != K.shape[1]:
+        raise ValueError("K must be a square one-particle kinetic matrix.")
+    npoints = K.shape[0]
+    pairs, phase = two_electron_wedge_basis(npoints, exchange)
+    eye = np.eye(npoints, dtype=np.result_type(K, float))
+    full = np.kron(K, eye) + np.kron(eye, K)
+    wedge_index = pairs[:, 0] * npoints + pairs[:, 1]
+    mirror_index = pairs[:, 1] * npoints + pairs[:, 0]
+    wedge = full[np.ix_(wedge_index, wedge_index)] + phase * full[np.ix_(wedge_index, mirror_index)]
+    wedge = 0.5 * (wedge + wedge.T.conj())
+    if return_transform:
+        return_extension = True
+    if return_extension:
+        extension = np.zeros((npoints * npoints, pairs.shape[0]), dtype=np.result_type(K, float))
+        cols = np.arange(pairs.shape[0])
+        extension[wedge_index, cols] = 1.0
+        extension[mirror_index, cols] = phase
+        return wedge, pairs, extension
+    return wedge, pairs
+
+
 def _permute_K_ikjl(K, n):
     return K.reshape(n, n, n, n).transpose(0, 2, 1, 3).reshape(n * n, n * n)
 
@@ -1454,9 +2193,14 @@ __all__ = [
     "overlap_2d_cartesian",
     "kinetic_2d_cartesian",
     "V_en_sp_total_at_z",
+    "local_ecp_potential_at_z",
+    "semilocal_ecp_projector_blocks",
     "eri_2d_cartesian_with_p",
     "build_h1_nm",
+    "two_electron_wedge_basis",
+    "two_electron_wedge_kinetic",
     "STO6_EXPS_H",
+    "STO6_EXPS_He",
     "Exp_631g_ss_H",
     "ETAS",
     "XIS",

@@ -27,6 +27,7 @@ from .symmetry import (  # noqa: F401
     is_sector_like,
     zero_like_sector,
 )
+from .umps import UniformCanonicalForm, UniformMPS, UMPS  # noqa: F401
 
 # Non-Abelian prototype exports (kept available even without SciPy).
 from .nonabelian import (  # noqa: F401
@@ -110,8 +111,17 @@ from .nonabelian import (  # noqa: F401
 # Legacy exports: available only when optional deps exist.
 try:  # pragma: no cover
     from .mps import *  # noqa: F401,F403
-    from .dmrg import DMRG  # noqa: F401
+    from .dmrg import (  # noqa: F401
+        DMRG,
+        dmrg_matvec_options,
+        resolve_abelian_matvec_options,
+    )
     from .tdmps import TDMPS  # noqa: F401
+    from .tdvp import one_site_tdvp_step, two_site_tdvp_step  # noqa: F401
     from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401
 except (ModuleNotFoundError, ImportError, OSError, TimeoutError):
     pass
+
+# Keep the public uniform-MPS name pinned to the NumPy-only implementation even
+# when legacy wildcard exports are available.
+from .umps import UniformCanonicalForm, UniformMPS, UMPS  # noqa: F401,E402

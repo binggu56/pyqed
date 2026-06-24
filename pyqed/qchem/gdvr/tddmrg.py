@@ -1,0 +1,2084 @@
+"""Time-dependent DMRG propagation in a GDVR electronic basis."""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.linalg import expm
+
+from pyqed.qchem.dmrg.tddmrg import TDDMRG as BaseTDDMRG
+from pyqed.qchem.dmrg.dmrg import (
+    _accumulate_symbolic_term,
+    _build_spatial_active_hamiltonian_matrix,
+    _build_tensor_mpo_from_symbolic_terms,
+    _group_spin_orbital_mpo_pairs,
+    get_jw_term_spec,
+)
+from pyqed.qchem.dmrg.overlap import _unitary_rotation_mpo
+from pyqed.mps.autompo.basis import BasisSimpleElectron
+from pyqed.mps.decompose import decompose
+from pyqed.mps.mps import MPS
+from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.mps.tdvp import TDVPEngine, one_site_tdvp_step, two_site_tdvp_step
+from pyqed.qchem.dmrg.spatial_terms import (
+    BasisSpatialFermion,
+    accumulate_spatial_jw_term,
+    accumulate_symbolic_term as accumulate_spatial_symbolic_term,
+)
+from pyqed.qchem.gdvr.rhf import fock_2e_slice_collocated, prepare_gdvr_fock_builder
+
+
+def _axis_index(axis):
+    if isinstance(axis, str):
+        key = axis.lower()
+        if key == "x":
+            return 0
+        if key == "y":
+            return 1
+        if key == "z":
+            return 2
+        raise ValueError("axis must be one of 'x', 'y', or 'z'.")
+    return int(axis)
+
+
+def gdvr_z_operator(mol, *, electronic: bool = True):
+    """Return the one-electron z/electronic-dipole operator in the GDVR basis."""
+    if hasattr(mol, "dipole_operator"):
+        return mol.dipole_operator("z", electronic=electronic)
+    if mol.z is None or mol.shapes is None:
+        raise ValueError("Build the GDVR molecule before requesting a z operator.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    z = np.asarray(mol.z, dtype=float).reshape(nz)
+    op = np.diag(np.repeat(z, m))
+    return -op if electronic else op
+
+
+def _add_spin_summed_one_body_terms(term_map, matrix, *, cutoff=1.0e-12):
+    matrix = np.asarray(matrix)
+    for p, q in np.argwhere(np.abs(matrix) > cutoff):
+        val = matrix[p, q]
+        if int(p) == int(q):
+            _accumulate_symbolic_term(term_map, "n", [2 * p], val, tol=cutoff)
+            _accumulate_symbolic_term(term_map, "n", [2 * p + 1], val, tol=cutoff)
+        else:
+            symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2 * p, 2 * q], val)
+            _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+            symbol, dofs, factor = get_jw_term_spec([r"a^\dagger", "a"], [2 * p + 1, 2 * q + 1], val)
+            _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+
+
+def _add_restricted_two_body_term(term_map, p, q, r, s, val, *, cutoff=1.0e-12):
+    if p != r and s != q:
+        symbol, dofs, factor = get_jw_term_spec(
+            [r"a^\dagger", r"a^\dagger", "a", "a"],
+            [2 * p, 2 * r, 2 * s, 2 * q],
+            val,
+        )
+        _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+        symbol, dofs, factor = get_jw_term_spec(
+            [r"a^\dagger", r"a^\dagger", "a", "a"],
+            [2 * p + 1, 2 * r + 1, 2 * s + 1, 2 * q + 1],
+            val,
+        )
+        _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+
+    symbol, dofs, factor = get_jw_term_spec(
+        [r"a^\dagger", r"a^\dagger", "a", "a"],
+        [2 * p, 2 * r + 1, 2 * s + 1, 2 * q],
+        val,
+    )
+    _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+    symbol, dofs, factor = get_jw_term_spec(
+        [r"a^\dagger", r"a^\dagger", "a", "a"],
+        [2 * p + 1, 2 * r, 2 * s, 2 * q + 1],
+        val,
+    )
+    _accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=cutoff)
+
+
+def gdvr_hamiltonian_term_map(hcore, eri_j, nz, m, *, cutoff=1.0e-12):
+    """
+    Build spin-orbital symbolic terms directly from collocated GDVR blocks.
+
+    ``ERI_J[iz][jz]`` is interpreted as the block
+    ``(iz a, iz b | jz c, jz d)``.  The conventional two-electron prefactor
+    ``1/2`` is applied here, matching the qchem DMRG spin-orbital builder.
+    """
+    hcore = np.asarray(hcore)
+    nz = int(nz)
+    m = int(m)
+    nspatial = nz * m
+    if hcore.shape != (nspatial, nspatial):
+        raise ValueError("hcore shape must be (Nz * M, Nz * M).")
+
+    term_map = {}
+    _add_spin_summed_one_body_terms(term_map, hcore, cutoff=cutoff)
+
+    for iz in range(nz):
+        for jz in range(nz):
+            block = np.asarray(eri_j[iz][jz])
+            if block.ndim == 0:
+                block = block.reshape(1, 1)
+            if block.size == 0:
+                continue
+            block = block.reshape(m, m, m, m)
+            for a, b, c, d in np.argwhere(np.abs(block) > cutoff):
+                val = 0.5 * block[a, b, c, d]
+                p = iz * m + int(a)
+                q = iz * m + int(b)
+                r = jz * m + int(c)
+                s = jz * m + int(d)
+                _add_restricted_two_body_term(term_map, p, q, r, s, val, cutoff=cutoff)
+
+    return term_map
+
+
+def build_gdvr_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build the electronic Hamiltonian MPO directly in the GDVR basis."""
+    if mol.hcore is None or mol.eri_j is None or mol.shapes is None:
+        raise ValueError("Build the GDVR molecule before building a GDVR MPO.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    nspatial = nz * m
+    basis_sites = [BasisSimpleElectron(i) for i in range(2 * nspatial)]
+    term_map = gdvr_hamiltonian_term_map(
+        mol.hcore,
+        mol.eri_j,
+        nz,
+        m,
+        cutoff=cutoff,
+    )
+    mpo, term_count = _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )
+    info = {
+        "representation": "gdvr_direct_spin_orbital_mpo",
+        "pipeline": "gdvr_collocated_blocks->spin_orbital_autompo",
+        "symbolic_terms": int(term_count),
+        "mpo_max_bond": int(max(mpo.bond_orders())),
+        "site": "spin_orbital",
+        "n_spatial_orbitals": int(nspatial),
+        "n_spin_orbitals": int(2 * nspatial),
+        "Nz": int(nz),
+        "M": int(m),
+        "cutoff": float(cutoff),
+        "symbolic_algo": str(symbolic_algo),
+    }
+    return mpo, info
+
+
+def build_gdvr_dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build the electronic z-dipole MPO from the diagonal GDVR z grid."""
+    op = gdvr_z_operator(mol, electronic=True)
+    nspatial = op.shape[0]
+    basis_sites = [BasisSimpleElectron(i) for i in range(2 * nspatial)]
+    term_map = {}
+    diag = np.diag(op)
+    for p, val in enumerate(diag):
+        if abs(val) <= cutoff:
+            continue
+        _accumulate_symbolic_term(term_map, "n", [2 * p], val, tol=cutoff)
+        _accumulate_symbolic_term(term_map, "n", [2 * p + 1], val, tol=cutoff)
+    return _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )[0]
+
+
+def gdvr_spatial_hamiltonian_term_map(hcore, eri_j, nz, m, *, cutoff=1.0e-12):
+    """
+    Build d=4 spatial-site symbolic terms directly from collocated GDVR blocks.
+
+    Each GDVR spatial orbital is one MPS site with local states
+    ``|0>``, ``|up>``, ``|down>``, and ``|up down>``.  The two-electron part
+    uses the spin-free identity
+    ``c^dag_p c^dag_r c_s c_q = E_pq E_rs - delta_qr E_ps``.
+    """
+    hcore = np.asarray(hcore)
+    nz = int(nz)
+    m = int(m)
+    nspatial = nz * m
+    if hcore.shape != (nspatial, nspatial):
+        raise ValueError("hcore shape must be (Nz * M, Nz * M).")
+
+    term_map = {}
+    spin_terms = (("cdu", "cu"), ("cdd", "cd"))
+
+    for p, q in np.argwhere(np.abs(hcore) > cutoff):
+        val = hcore[p, q]
+        for create, destroy in spin_terms:
+            accumulate_spatial_jw_term(
+                term_map,
+                [create, destroy],
+                [int(p), int(q)],
+                val,
+                tol=cutoff,
+            )
+
+    for iz in range(nz):
+        for jz in range(nz):
+            block = np.asarray(eri_j[iz][jz])
+            if block.ndim == 0:
+                block = block.reshape(1, 1)
+            if block.size == 0:
+                continue
+            block = block.reshape(m, m, m, m)
+            for a, b, c, d in np.argwhere(np.abs(block) > cutoff):
+                val = 0.5 * block[a, b, c, d]
+                p = iz * m + int(a)
+                q = iz * m + int(b)
+                r = jz * m + int(c)
+                s = jz * m + int(d)
+                for left_create, left_destroy in spin_terms:
+                    for right_create, right_destroy in spin_terms:
+                        accumulate_spatial_jw_term(
+                            term_map,
+                            [left_create, left_destroy, right_create, right_destroy],
+                            [p, q, r, s],
+                            val,
+                            tol=cutoff,
+                        )
+                if q == r:
+                    for create, destroy in spin_terms:
+                        accumulate_spatial_jw_term(
+                            term_map,
+                            [create, destroy],
+                            [p, s],
+                            -val,
+                            tol=cutoff,
+                        )
+
+    return term_map
+
+
+def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build the GDVR electronic Hamiltonian MPO on d=4 spatial sites."""
+    if mol.hcore is None or mol.eri_j is None or mol.shapes is None:
+        raise ValueError("Build the GDVR molecule before building a GDVR MPO.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    nspatial = nz * m
+    basis_sites = [BasisSpatialFermion(i) for i in range(nspatial)]
+    term_map = gdvr_spatial_hamiltonian_term_map(
+        mol.hcore,
+        mol.eri_j,
+        nz,
+        m,
+        cutoff=cutoff,
+    )
+    mpo, term_count = _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )
+    info = {
+        "representation": "gdvr_direct_spatial_mpo",
+        "pipeline": "gdvr_collocated_blocks->spatial_d4_autompo",
+        "symbolic_terms": int(term_count),
+        "mpo_max_bond": int(max(mpo.bond_orders())),
+        "site": "spatial",
+        "physical_dim": 4,
+        "n_spatial_orbitals": int(nspatial),
+        "Nz": int(nz),
+        "M": int(m),
+        "cutoff": float(cutoff),
+        "symbolic_algo": str(symbolic_algo),
+    }
+    return mpo, info
+
+
+def build_gdvr_spatial_dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build electronic z-dipole MPO as ``-sum_i z_i n_i`` on spatial sites."""
+    op = gdvr_z_operator(mol, electronic=True)
+    nspatial = op.shape[0]
+    basis_sites = [BasisSpatialFermion(i) for i in range(nspatial)]
+    term_map = {}
+    for p, val in enumerate(np.diag(op)):
+        if abs(val) <= cutoff:
+            continue
+        accumulate_spatial_symbolic_term(term_map, "n", [p], val, tol=cutoff)
+    return _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )[0]
+
+
+def build_gdvr_spatial_z_phase_mpo(mol, field_z, dt):
+    """Exact local MPO for ``exp[-i dt (-E_z mu_z)]`` on spatial sites."""
+    z = np.asarray(mol.z, dtype=float).reshape(-1)
+    m = int(mol.shapes["M"])
+    z_values = np.repeat(z, m)
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    factors = []
+    for zi in z_values:
+        # mu_z = -z_i n_i, so H_int = -E_z mu_z = E_z z_i n_i.
+        phase = np.exp(-1j * float(dt) * float(field_z) * float(zi) * occupation)
+        factors.append(np.diag(phase).reshape(1, 1, 4, 4))
+    return TensorMPO(factors, homogenous=False)
+
+
+def _dense_matrix_to_mpo(matrix, dims):
+    matrix = np.asarray(matrix, dtype=complex)
+    dims = tuple(int(dim) for dim in dims)
+    nsites = len(dims)
+    tensor = matrix.reshape(dims + dims)
+    interleaved_axes = []
+    for site in range(nsites):
+        interleaved_axes.extend((site, nsites + site))
+    site_tensor = tensor.transpose(interleaved_axes).reshape(tuple(dim * dim for dim in dims))
+    factors = decompose(site_tensor, rank=matrix.shape[0])
+    cores = []
+    for factor, dim in zip(factors, dims):
+        factor = np.asarray(factor, dtype=complex)
+        cores.append(
+            factor.reshape(factor.shape[0], dim, dim, factor.shape[2]).transpose(0, 3, 1, 2)
+        )
+    return TensorMPO(cores, homogenous=False)
+
+
+def _spatial_occupation_phase_values(value):
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    return np.asarray(value, dtype=complex) ** occupation
+
+
+def _scale_mps(psi, scale):
+    out = psi.copy()
+    out.factors[0] = out.factors[0] * scale
+    return out
+
+
+def _spatial_det_sign(alpha_occ, beta_occ):
+    alpha_occ = np.asarray(alpha_occ, dtype=np.int8)
+    beta_occ = np.asarray(beta_occ, dtype=np.int8)
+    n_cross = 0
+    for p in np.flatnonzero(beta_occ):
+        n_cross += np.count_nonzero(np.flatnonzero(alpha_occ) > p)
+    return -1.0 if (n_cross % 2) else 1.0
+
+
+def _two_orbital_spatial_transform_gate(transform):
+    transform = np.asarray(transform, dtype=complex)
+    if transform.shape != (2, 2):
+        raise ValueError("A two-orbital transform must have shape (2, 2).")
+    local_to_bits = {
+        0: (0, 0),
+        1: (1, 0),
+        2: (0, 1),
+        3: (1, 1),
+    }
+    dense = np.zeros((16, 16), dtype=complex)
+    for out_idx in range(16):
+        out_states = np.unravel_index(out_idx, (4, 4))
+        out_alpha_bits = []
+        out_beta_bits = []
+        for state in out_states:
+            alpha, beta = local_to_bits[int(state)]
+            out_alpha_bits.append(alpha)
+            out_beta_bits.append(beta)
+        out_alpha = np.flatnonzero(out_alpha_bits)
+        out_beta = np.flatnonzero(out_beta_bits)
+        out_sign = _spatial_det_sign(out_alpha_bits, out_beta_bits)
+
+        for in_idx in range(16):
+            in_states = np.unravel_index(in_idx, (4, 4))
+            in_alpha_bits = []
+            in_beta_bits = []
+            for state in in_states:
+                alpha, beta = local_to_bits[int(state)]
+                in_alpha_bits.append(alpha)
+                in_beta_bits.append(beta)
+            in_alpha = np.flatnonzero(in_alpha_bits)
+            in_beta = np.flatnonzero(in_beta_bits)
+            if len(out_alpha) != len(in_alpha) or len(out_beta) != len(in_beta):
+                continue
+            in_sign = _spatial_det_sign(in_alpha_bits, in_beta_bits)
+            alpha_val = (
+                np.linalg.det(transform[np.ix_(out_alpha, in_alpha)])
+                if len(out_alpha)
+                else 1.0
+            )
+            beta_val = (
+                np.linalg.det(transform[np.ix_(out_beta, in_beta)])
+                if len(out_beta)
+                else 1.0
+            )
+            dense[out_idx, in_idx] = out_sign * in_sign * alpha_val * beta_val
+    return dense.reshape(4, 4, 4, 4)
+
+
+def _apply_one_site_phase(psi, site, phase):
+    phase = np.asarray(phase, dtype=complex).reshape(-1)
+    factors = [np.asarray(psi._get_std_B(i), dtype=complex).copy() for i in range(psi.L)]
+    factors[int(site)] = factors[int(site)] * phase[None, :, None]
+    return MPS(factors, labels=["lv", "p", "rv"])
+
+
+def _apply_adjacent_two_site_gate(psi, site, gate, *, max_bond=None, cutoff=0.0):
+    factors = [np.asarray(psi._get_std_B(i), dtype=complex).copy() for i in range(psi.L)]
+    site = int(site)
+    left = factors[site]
+    right = factors[site + 1]
+    gate = np.asarray(gate, dtype=complex).reshape(4, 4, 4, 4)
+    theta = np.tensordot(left, right, axes=([2], [0]))
+    theta = np.einsum("pqrs,arsb->apqb", gate, theta, optimize=True)
+    left_dim, d_left, d_right, right_dim = theta.shape
+    mat = theta.reshape(left_dim * d_left, d_right * right_dim)
+    u, s, vh = np.linalg.svd(mat, full_matrices=False)
+    keep = len(s)
+    if cutoff and cutoff > 0.0:
+        keep = max(1, int(np.count_nonzero(s > cutoff)))
+    if max_bond is not None:
+        keep = min(keep, int(max_bond))
+    u = u[:, :keep]
+    s_keep = s[:keep]
+    vh = vh[:keep]
+    factors[site] = u.reshape(left_dim, d_left, keep)
+    factors[site + 1] = (s_keep[:, None] * vh).reshape(keep, d_right, right_dim)
+    return MPS(factors, labels=["lv", "p", "rv"])
+
+
+def _adjacent_givens_decomposition(unitary, *, tol=1.0e-12):
+    matrix = np.asarray(unitary, dtype=complex).copy()
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("unitary must be a square matrix.")
+    n = matrix.shape[0]
+    rotations = []
+    for col in range(n - 1):
+        for row in range(n - 1, col, -1):
+            a = matrix[row - 1, col]
+            b = matrix[row, col]
+            if abs(b) <= tol:
+                continue
+            radius = np.sqrt(abs(a) ** 2 + abs(b) ** 2)
+            if radius <= tol:
+                continue
+            givens = np.array(
+                [
+                    [np.conj(a) / radius, np.conj(b) / radius],
+                    [-b / radius, a / radius],
+                ],
+                dtype=complex,
+            )
+            matrix[row - 1 : row + 1, :] = givens @ matrix[row - 1 : row + 1, :]
+            rotations.append((row - 1, givens))
+    diagonal = np.diag(matrix).copy()
+    if not np.allclose(matrix, np.diag(diagonal), atol=1.0e-9, rtol=1.0e-9):
+        raise np.linalg.LinAlgError("Adjacent Givens decomposition did not diagonalize the unitary.")
+    return diagonal, rotations
+
+
+class GDVRSpatialOneBodyRotation:
+    """Reusable adjacent-Givens form of a GDVR one-body propagator."""
+
+    def __init__(self, hcore, dt):
+        hcore = np.asarray(hcore, dtype=complex)
+        if hcore.ndim != 2 or hcore.shape[0] != hcore.shape[1]:
+            raise ValueError("hcore must be a square one-body matrix.")
+        self.hcore = hcore
+        self.dt = float(dt)
+        orbital_unitary = expm(-1j * self.dt * hcore)
+        diagonal, rotations = _adjacent_givens_decomposition(orbital_unitary)
+        self.diagonal = np.asarray(diagonal, dtype=complex)
+        self.rotations = tuple((int(site), np.asarray(givens, dtype=complex)) for site, givens in rotations)
+
+    def apply(self, psi, *, max_bond=None, cutoff=0.0):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+
+        for site, value in enumerate(self.diagonal):
+            out = _apply_one_site_phase(out, site, _spatial_occupation_phase_values(value))
+
+        for site, givens in reversed(self.rotations):
+            gate = _two_orbital_spatial_transform_gate(givens.conj().T)
+            out = _apply_adjacent_two_site_gate(
+                out,
+                site,
+                gate,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
+        return out
+
+
+def apply_gdvr_spatial_one_body_rotation(
+    psi,
+    hcore,
+    dt,
+    *,
+    max_bond=None,
+    cutoff=0.0,
+):
+    """Apply ``exp(-i dt sum_sigma h_pq c^dag_p_sigma c_q_sigma)`` to an MPS."""
+    return GDVRSpatialOneBodyRotation(hcore, dt).apply(
+        psi,
+        max_bond=max_bond,
+        cutoff=cutoff,
+    )
+
+
+def build_gdvr_spatial_one_body_rotation_mpo(
+    hcore,
+    dt,
+    *,
+    mpo_bond_dim=None,
+    dense_exact_max_sites=5,
+):
+    """MPO for ``exp(-i dt hcore)`` on grouped spatial ``d=4`` sites."""
+    hcore = np.asarray(hcore, dtype=complex)
+    if hcore.ndim != 2 or hcore.shape[0] != hcore.shape[1]:
+        raise ValueError("hcore must be a square one-body matrix.")
+    nsites = hcore.shape[0]
+    if nsites <= int(dense_exact_max_sites):
+        h_dense, _ = _build_spatial_active_hamiltonian_matrix(
+            [hcore, hcore.copy()],
+            np.zeros((2, 2, nsites, nsites, nsites, nsites), dtype=complex),
+        )
+        return _dense_matrix_to_mpo(expm(-1j * float(dt) * h_dense), [4] * nsites)
+
+    spin_mpo = _unitary_rotation_mpo(
+        expm(-1j * float(dt) * hcore),
+        mpo_bond_dim=mpo_bond_dim,
+    )
+    return _group_spin_orbital_mpo_pairs(spin_mpo)
+
+
+def build_gdvr_spatial_pair_density_phase_mpo(nsites, left_site, right_site, phase_matrix, *, cutoff=1.0e-14):
+    """Low-rank diagonal MPO for ``phase_matrix[n_left, n_right]``."""
+    nsites = int(nsites)
+    left_site = int(left_site)
+    right_site = int(right_site)
+    if not (0 <= left_site < right_site < nsites):
+        raise ValueError("Expected 0 <= left_site < right_site < nsites.")
+    phase_matrix = np.asarray(phase_matrix, dtype=complex).reshape(4, 4)
+    u, s, vh = np.linalg.svd(phase_matrix, full_matrices=False)
+    keep = np.flatnonzero(s > cutoff)
+    if keep.size == 0:
+        keep = np.array([0])
+    u = u[:, keep]
+    s = s[keep]
+    vh = vh[keep]
+    left_values = u * np.sqrt(s)[None, :]
+    right_values = np.sqrt(s)[:, None] * vh
+    rank = len(s)
+
+    identity = np.eye(4, dtype=complex)
+    factors = []
+    for site in range(nsites):
+        if site < left_site or site > right_site:
+            factors.append(identity.reshape(1, 1, 4, 4).copy())
+        elif site == left_site:
+            core = np.zeros((1, rank, 4, 4), dtype=complex)
+            for channel in range(rank):
+                core[0, channel] = np.diag(left_values[:, channel])
+            factors.append(core)
+        elif site == right_site:
+            core = np.zeros((rank, 1, 4, 4), dtype=complex)
+            for channel in range(rank):
+                core[channel, 0] = np.diag(right_values[channel])
+            factors.append(core)
+        else:
+            core = np.zeros((rank, rank, 4, 4), dtype=complex)
+            for channel in range(rank):
+                core[channel, channel] = identity
+            factors.append(core)
+    return TensorMPO(factors, homogenous=False)
+
+
+def _gdvr_m1_density_matrix(mol):
+    if mol.shapes is None or mol.eri_j is None:
+        raise ValueError("Build the GDVR molecule before requesting a density kernel.")
+    m = int(mol.shapes["M"])
+    nsites = int(mol.shapes["size"])
+    if m != 1:
+        raise NotImplementedError("The exponential density fit currently supports M=1 only.")
+    kernel = np.zeros((nsites, nsites), dtype=float)
+    for i in range(nsites):
+        for j in range(nsites):
+            kernel[i, j] = float(np.asarray(mol.eri_j[i][j]).reshape(-1)[0])
+    return kernel
+
+
+def gdvr_spatial_toeplitz_density_kernel(mol, *, statistic="mean"):
+    """Average the M=1 GDVR density kernel by separation for exponential fitting."""
+    kernel = _gdvr_m1_density_matrix(mol)
+    nsites = kernel.shape[0]
+    values = np.zeros(nsites - 1, dtype=float)
+    spreads = np.zeros(nsites - 1, dtype=float)
+    counts = np.zeros(nsites - 1, dtype=int)
+    key = str(statistic).lower()
+    for offset in range(1, nsites):
+        diagonal = np.asarray([kernel[i, i + offset] for i in range(nsites - offset)], dtype=float)
+        counts[offset - 1] = diagonal.size
+        spreads[offset - 1] = float(np.max(diagonal) - np.min(diagonal))
+        if key == "mean":
+            values[offset - 1] = float(np.mean(diagonal))
+        elif key == "median":
+            values[offset - 1] = float(np.median(diagonal))
+        elif key == "center":
+            values[offset - 1] = float(diagonal[diagonal.size // 2])
+        else:
+            raise ValueError("statistic must be 'mean', 'median', or 'center'.")
+    return values, {"spread": spreads, "counts": counts, "kernel": kernel}
+
+
+def prony_exponential_fit(values, rank, *, offsets=None, rcond=None):
+    """Fit ``values[offset]`` as ``sum_a coeff_a * lambda_a**offset``."""
+    values = np.asarray(values, dtype=complex).reshape(-1)
+    if values.size < 2:
+        raise ValueError("Need at least two samples for a Prony fit.")
+    rank = int(rank)
+    if not (1 <= rank < values.size):
+        raise ValueError("rank must satisfy 1 <= rank < len(values).")
+    if offsets is None:
+        offsets = np.arange(1, values.size + 1, dtype=float)
+    else:
+        offsets = np.asarray(offsets, dtype=float).reshape(-1)
+        if offsets.shape != values.shape:
+            raise ValueError("offsets must have the same shape as values.")
+
+    rows = values.size - rank
+    predictor = np.zeros((rows, rank), dtype=complex)
+    rhs = np.zeros(rows, dtype=complex)
+    for row in range(rows):
+        predictor[row] = values[row : row + rank]
+        rhs[row] = -values[row + rank]
+    recurrence, *_ = np.linalg.lstsq(predictor, rhs, rcond=rcond)
+    polynomial = np.concatenate(([1.0 + 0.0j], recurrence[::-1]))
+    lambdas = np.roots(polynomial)
+
+    vandermonde = lambdas[None, :] ** offsets[:, None]
+    coeffs, *_ = np.linalg.lstsq(vandermonde, values, rcond=rcond)
+    fitted = vandermonde @ coeffs
+    residual = fitted - values
+    denom = float(np.linalg.norm(values))
+    rel_error = float(np.linalg.norm(residual) / denom) if denom > 0.0 else float(np.linalg.norm(residual))
+    max_abs = float(np.max(np.abs(residual))) if residual.size else 0.0
+    max_rel = float(np.max(np.abs(residual) / np.maximum(np.abs(values), 1.0e-30)))
+    return {
+        "coeffs": coeffs,
+        "lambdas": lambdas,
+        "fitted": fitted,
+        "residual": residual,
+        "rel_error": rel_error,
+        "max_abs_error": max_abs,
+        "max_rel_error": max_rel,
+    }
+
+
+def fit_gdvr_spatial_density_prony(mol, rank, *, statistic="mean", rcond=None):
+    """Prony-fit the translationally averaged M=1 GDVR intersite density kernel."""
+    values, info = gdvr_spatial_toeplitz_density_kernel(mol, statistic=statistic)
+    fit = prony_exponential_fit(values, rank, rcond=rcond)
+    spread = np.asarray(info["spread"], dtype=float)
+    fit["toeplitz_values"] = values
+    fit["toeplitz_spread"] = spread
+    fit["toeplitz_counts"] = np.asarray(info["counts"], dtype=int)
+    fit["toeplitz_max_rel_spread"] = float(
+        np.max(spread / np.maximum(np.abs(values), 1.0e-30))
+    )
+    return fit
+
+
+def _build_gdvr_spatial_density_channel_hamiltonian_mpo(
+    start_values,
+    end_values,
+    propagation_values=None,
+):
+    """MPO for ``sum_{i<j,a} start[a,i] prod prop[a,k] end[a,j] n_i n_j``."""
+    start_values = np.asarray(start_values, dtype=complex)
+    end_values = np.asarray(end_values, dtype=complex)
+    if start_values.ndim != 2:
+        raise ValueError("start_values must have shape (rank, nsites).")
+    if end_values.shape != start_values.shape:
+        raise ValueError("end_values must have the same shape as start_values.")
+    rank, nsites = start_values.shape
+    if rank < 1 or nsites < 2:
+        raise ValueError("Need at least one channel and two sites.")
+    if propagation_values is None:
+        propagation_values = np.ones_like(start_values)
+    else:
+        propagation_values = np.asarray(propagation_values, dtype=complex)
+        if propagation_values.shape != start_values.shape:
+            raise ValueError("propagation_values must have the same shape as start_values.")
+
+    bond_dim = rank + 2
+    dtype = np.result_type(start_values, end_values, propagation_values, complex)
+    identity = np.eye(4, dtype=dtype)
+    occupation = np.diag(np.array([0.0, 1.0, 1.0, 2.0], dtype=dtype))
+
+    factors = []
+    for site in range(nsites):
+        core = np.zeros((bond_dim, bond_dim, 4, 4), dtype=dtype)
+        core[0, 0] = identity
+        core[-1, -1] = identity
+        for channel in range(rank):
+            bond = channel + 1
+            core[0, bond] = start_values[channel, site] * occupation
+            core[bond, bond] = propagation_values[channel, site] * identity
+            core[bond, -1] = end_values[channel, site] * occupation
+        if site == 0:
+            core = core[0:1]
+        elif site == nsites - 1:
+            core = core[:, -1:]
+        factors.append(core)
+    return TensorMPO(factors, homogenous=False)
+
+
+def build_gdvr_spatial_exponential_density_hamiltonian_mpo(nsites, coeffs, lambdas):
+    """MPO for ``sum_{i<j,a} coeff_a * lambda_a**(j-i) n_i n_j``."""
+    nsites = int(nsites)
+    coeffs = np.asarray(coeffs, dtype=complex).reshape(-1)
+    lambdas = np.asarray(lambdas, dtype=complex).reshape(-1)
+    if coeffs.shape != lambdas.shape:
+        raise ValueError("coeffs and lambdas must have the same shape.")
+    if nsites < 2:
+        raise ValueError("Need at least two sites for an intersite density MPO.")
+    rank = coeffs.size
+    start = np.repeat(lambdas[:, None], nsites, axis=1)
+    end = np.repeat(coeffs[:, None], nsites, axis=1)
+    propagation = np.repeat(lambdas[:, None], nsites, axis=1)
+    return _build_gdvr_spatial_density_channel_hamiltonian_mpo(start, end, propagation)
+
+
+def build_gdvr_spatial_prony_density_hamiltonian_mpo(
+    mol,
+    rank,
+    *,
+    statistic="mean",
+    residual_rank=0,
+    rcond=None,
+):
+    """Build a compact Prony-fitted intersite GDVR density Hamiltonian MPO."""
+    fit = fit_gdvr_spatial_density_prony(mol, rank, statistic=statistic, rcond=rcond)
+    nsites = int(mol.shapes["size"])
+    coeffs = np.asarray(fit["coeffs"], dtype=complex).reshape(-1)
+    lambdas = np.asarray(fit["lambdas"], dtype=complex).reshape(-1)
+    start_blocks = [np.repeat(lambdas[:, None], nsites, axis=1)]
+    end_blocks = [np.repeat(coeffs[:, None], nsites, axis=1)]
+    propagation_blocks = [np.repeat(lambdas[:, None], nsites, axis=1)]
+
+    residual_rank = int(residual_rank)
+    fit["residual_rank"] = residual_rank
+    fit["residual_retained_rank"] = 0
+    fit["residual_rel_error"] = None
+    fit["full_kernel_rel_error"] = None
+    if residual_rank > 0:
+        exact = _gdvr_m1_density_matrix(mol)
+        toeplitz = np.zeros_like(exact, dtype=float)
+        fitted_values = np.real_if_close(np.asarray(fit["fitted"], dtype=complex), tol=1000).real
+        for i in range(nsites):
+            for j in range(i + 1, nsites):
+                toeplitz[i, j] = toeplitz[j, i] = fitted_values[j - i - 1]
+        residual = exact - toeplitz
+        np.fill_diagonal(residual, 0.0)
+        residual = 0.5 * (residual + residual.T)
+        eigvals, eigvecs = np.linalg.eigh(residual)
+        order = np.argsort(np.abs(eigvals))[::-1]
+        keep = order[: min(residual_rank, nsites)]
+        keep = keep[np.abs(eigvals[keep]) > 1.0e-14]
+        if keep.size:
+            residual_start = (eigvals[keep, None] * eigvecs[:, keep].T).astype(complex)
+            residual_end = eigvecs[:, keep].T.astype(complex)
+            residual_propagation = np.ones_like(residual_start)
+            start_blocks.append(residual_start)
+            end_blocks.append(residual_end)
+            propagation_blocks.append(residual_propagation)
+
+            retained = eigvecs[:, keep] @ np.diag(eigvals[keep]) @ eigvecs[:, keep].T
+        else:
+            retained = np.zeros_like(residual)
+        offdiag = ~np.eye(nsites, dtype=bool)
+        residual_norm = float(np.linalg.norm(residual[offdiag]))
+        residual_error = float(np.linalg.norm((residual - retained)[offdiag]))
+        exact_norm = float(np.linalg.norm(exact[offdiag]))
+        full_error = float(np.linalg.norm((exact - toeplitz - retained)[offdiag]))
+        fit["residual_retained_rank"] = int(keep.size)
+        fit["residual_rel_error"] = (
+            residual_error / residual_norm if residual_norm > 0.0 else residual_error
+        )
+        fit["full_kernel_rel_error"] = full_error / exact_norm if exact_norm > 0.0 else full_error
+
+    mpo = _build_gdvr_spatial_density_channel_hamiltonian_mpo(
+        np.concatenate(start_blocks, axis=0),
+        np.concatenate(end_blocks, axis=0),
+        np.concatenate(propagation_blocks, axis=0),
+    )
+    return mpo, fit
+
+
+def build_gdvr_spatial_svd_density_hamiltonian_mpo(mol, rank, *, cutoff=1.0e-14):
+    """Build a low-rank separable MPO from the signed SVD/eigendecomposition of ``V_ij``."""
+    kernel = _gdvr_m1_density_matrix(mol)
+    nsites = kernel.shape[0]
+    offdiag_kernel = 0.5 * (kernel + kernel.T)
+    np.fill_diagonal(offdiag_kernel, 0.0)
+
+    eigvals, eigvecs = np.linalg.eigh(offdiag_kernel)
+    order = np.argsort(np.abs(eigvals))[::-1]
+    keep = order[: min(int(rank), nsites)]
+    keep = keep[np.abs(eigvals[keep]) > float(cutoff)]
+    if keep.size == 0:
+        raise ValueError("SVD density fit retained no nonzero channels.")
+
+    start = (eigvals[keep, None] * eigvecs[:, keep].T).astype(complex)
+    end = eigvecs[:, keep].T.astype(complex)
+    propagation = np.ones_like(start)
+    retained = eigvecs[:, keep] @ np.diag(eigvals[keep]) @ eigvecs[:, keep].T
+    offdiag = ~np.eye(nsites, dtype=bool)
+    kernel_norm = float(np.linalg.norm(offdiag_kernel[offdiag]))
+    residual_norm = float(np.linalg.norm((offdiag_kernel - retained)[offdiag]))
+    info = {
+        "rank": int(rank),
+        "retained_rank": int(keep.size),
+        "singular_values": np.abs(eigvals[keep]),
+        "signed_values": eigvals[keep],
+        "full_kernel_rel_error": residual_norm / kernel_norm if kernel_norm > 0.0 else residual_norm,
+    }
+    return _build_gdvr_spatial_density_channel_hamiltonian_mpo(start, end, propagation), info
+
+
+def build_gdvr_spatial_factorized_density_phase_mpo(
+    mol,
+    dt,
+    *,
+    field_z=0.0,
+    rank=None,
+    tt_rank=None,
+    cutoff=1.0e-14,
+    max_sites=12,
+):
+    """Build a diagonal phase MPO from factorized ``V_ee`` plus local ``zE(t)``.
+
+    The intersite GDVR density kernel is eigendecomposed as
+    ``V_ij ~= sum_a lambda_a u_ai u_aj`` and the resulting diagonal phase tensor
+    is TT-decomposed directly. This is intended as an exact/compressed reference
+    for small GDVR grids; it deliberately refuses to materialize very large
+    ``4**N`` phase tensors.
+    """
+    if mol.shapes is None or mol.eri_j is None:
+        raise ValueError("Build the GDVR molecule before applying density phases.")
+    m = int(mol.shapes["M"])
+    nsites = int(mol.shapes["size"])
+    if m != 1:
+        raise NotImplementedError("The factorized density phase currently supports M=1 only.")
+    if nsites > int(max_sites):
+        raise ValueError(
+            "The factorized phase tensor is only for small/reference grids; "
+            f"got {nsites} sites with max_sites={max_sites}."
+        )
+
+    kernel = _gdvr_m1_density_matrix(mol)
+    offdiag_kernel = 0.5 * (kernel + kernel.T)
+    np.fill_diagonal(offdiag_kernel, 0.0)
+    eigvals, eigvecs = np.linalg.eigh(offdiag_kernel)
+    order = np.argsort(np.abs(eigvals))[::-1]
+    if rank is None:
+        keep = order
+    else:
+        keep = order[: min(int(rank), nsites)]
+    keep = keep[np.abs(eigvals[keep]) > float(cutoff)]
+    if keep.size:
+        retained = eigvecs[:, keep] @ np.diag(eigvals[keep]) @ eigvecs[:, keep].T
+    else:
+        retained = np.zeros_like(offdiag_kernel)
+    upper_kernel = np.triu(retained, k=1)
+
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+    z_values = np.asarray(mol.z, dtype=float).reshape(-1)
+    if z_values.size != nsites:
+        z_values = np.repeat(z_values, m)
+    onsite = np.array(
+        [float(np.asarray(mol.eri_j[i][i]).reshape(-1)[0]) for i in range(nsites)],
+        dtype=float,
+    )
+
+    phase_tensor = np.empty((4,) * nsites, dtype=complex)
+    for state in np.ndindex(phase_tensor.shape):
+        local_state = np.asarray(state, dtype=int)
+        occ = occupation[local_state]
+        docc = double_occupation[local_state]
+        energy = float(np.dot(onsite, docc))
+        energy += float(field_z) * float(np.dot(z_values, occ))
+        energy += float(occ @ upper_kernel @ occ)
+        phase_tensor[state] = np.exp(-1j * float(dt) * energy)
+
+    if tt_rank is None:
+        tt_rank = phase_tensor.size
+    tt_factors = decompose(phase_tensor, rank=tt_rank)
+    mpo_factors = []
+    for factor in tt_factors:
+        factor = np.asarray(factor, dtype=complex)
+        left_dim, physical_dim, right_dim = factor.shape
+        core = np.zeros((left_dim, right_dim, physical_dim, physical_dim), dtype=complex)
+        for local_state in range(physical_dim):
+            core[:, :, local_state, local_state] = factor[:, local_state, :]
+        mpo_factors.append(core)
+
+    offdiag = ~np.eye(nsites, dtype=bool)
+    kernel_norm = float(np.linalg.norm(offdiag_kernel[offdiag]))
+    residual_norm = float(np.linalg.norm((offdiag_kernel - retained)[offdiag]))
+    info = {
+        "rank": None if rank is None else int(rank),
+        "retained_rank": int(keep.size),
+        "tt_rank": tt_rank,
+        "max_mpo_bond": int(max(core.shape[1] for core in mpo_factors[:-1]) if len(mpo_factors) > 1 else 1),
+        "full_kernel_rel_error": residual_norm / kernel_norm if kernel_norm > 0.0 else residual_norm,
+    }
+    return TensorMPO(mpo_factors, homogenous=False), info
+
+
+class GDVRSpatialDensityPhase:
+    """Reusable diagonal GDVR Coulomb phase with an optional z-field phase."""
+
+    def __init__(self, mol, dt, *, cutoff=1.0e-14):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        nz = int(mol.shapes["Nz"])
+        m = int(mol.shapes["M"])
+        nsites = int(mol.shapes["size"])
+        if m != 1:
+            raise NotImplementedError("The scalable density phase currently supports M=1 only.")
+
+        self.dt = float(dt)
+        self.cutoff = float(cutoff)
+        self.nsites = nsites
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+
+        self.local_phases = []
+        for site in range(nsites):
+            g_ii = float(np.asarray(mol.eri_j[site][site]).reshape(-1)[0])
+            self.local_phases.append(np.exp(-1j * self.dt * g_ii * double_occupation))
+
+        self.pair_phases = []
+        for i in range(nsites):
+            for j in range(i + 1, nsites):
+                g_ij = float(np.asarray(mol.eri_j[i][j]).reshape(-1)[0])
+                if abs(g_ij) <= self.cutoff:
+                    continue
+                phase = np.exp(-1j * self.dt * g_ij * np.outer(self.occupation, self.occupation))
+                self.pair_phases.append((i, j, phase))
+
+    def apply(self, psi, *, field_z=0.0, max_bond=None):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        for site, local_phase in enumerate(self.local_phases):
+            phase = local_phase
+            if field_z != 0.0:
+                phase = phase * np.exp(
+                    -1j * self.dt * field_z * float(self.z_values[site]) * self.occupation
+                )
+            out = _apply_one_site_phase(out, site, phase)
+
+        for i, j, phase in self.pair_phases:
+            gate = build_gdvr_spatial_pair_density_phase_mpo(
+                self.nsites,
+                i,
+                j,
+                phase,
+                cutoff=self.cutoff,
+            )
+            out = gate @ out
+            if max_bond is not None:
+                out = out.compress(max_bond)
+            out.normalize()
+        return out
+
+
+def _color_disjoint_pairs(pairs):
+    colors = []
+    for pair in pairs:
+        i, j, phase = pair
+        placed = False
+        for color in colors:
+            used = color[0]
+            if i in used or j in used:
+                continue
+            used.update((i, j))
+            color[1].append(pair)
+            placed = True
+            break
+        if not placed:
+            colors.append(({i, j}, [pair]))
+    return [color_pairs for _, color_pairs in colors]
+
+
+class GDVRSpatialGroupedPairDensityPhase:
+    """Exact pair-gate GDVR density phase grouped by distance and disjoint colors."""
+
+    def __init__(
+        self,
+        mol,
+        dt,
+        *,
+        cutoff=1.0e-14,
+        compress_mode="color",
+        direct_adjacent=False,
+        distance_order="ascending",
+    ):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        nz = int(mol.shapes["Nz"])
+        m = int(mol.shapes["M"])
+        nsites = int(mol.shapes["size"])
+        if m != 1:
+            raise NotImplementedError("The grouped pair density phase currently supports M=1 only.")
+
+        self.dt = float(dt)
+        self.cutoff = float(cutoff)
+        self.nsites = nsites
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+        mode = str(compress_mode).lower().replace("_", "-")
+        if mode not in {"pair", "color", "distance", "end"}:
+            raise ValueError("compress_mode must be 'pair', 'color', 'distance', or 'end'.")
+        self.compress_mode = mode
+        self.direct_adjacent = bool(direct_adjacent)
+        order_key = str(distance_order).lower().replace("_", "-")
+        if order_key not in {"ascending", "descending"}:
+            raise ValueError("distance_order must be 'ascending' or 'descending'.")
+        self.distance_order = order_key
+
+        self.local_phases = []
+        for site in range(nsites):
+            g_ii = float(np.asarray(mol.eri_j[site][site]).reshape(-1)[0])
+            self.local_phases.append(np.exp(-1j * self.dt * g_ii * double_occupation))
+
+        self.distance_groups = []
+        self.n_pair_gates = 0
+        self.n_color_groups = 0
+        for distance in range(1, nsites):
+            pairs = []
+            for i in range(nsites - distance):
+                j = i + distance
+                g_ij = float(np.asarray(mol.eri_j[i][j]).reshape(-1)[0])
+                if abs(g_ij) <= self.cutoff:
+                    continue
+                phase = np.exp(-1j * self.dt * g_ij * np.outer(self.occupation, self.occupation))
+                pairs.append((i, j, phase))
+            if not pairs:
+                continue
+            colors = _color_disjoint_pairs(pairs)
+            self.distance_groups.append((distance, colors))
+            self.n_pair_gates += len(pairs)
+            self.n_color_groups += len(colors)
+        if self.distance_order == "descending":
+            self.distance_groups.reverse()
+        self.fit_info = {
+            "pair_gates": int(self.n_pair_gates),
+            "color_groups": int(self.n_color_groups),
+            "distance_groups": int(len(self.distance_groups)),
+            "compress_mode": self.compress_mode,
+            "direct_adjacent": bool(self.direct_adjacent),
+            "distance_order": self.distance_order,
+        }
+        self.last_apply_info = self.fit_info
+
+    def _apply_pair(self, psi, i, j, phase, *, max_bond=None):
+        if self.direct_adjacent and j == i + 1:
+            gate = np.zeros((4, 4, 4, 4), dtype=complex)
+            for left_state in range(4):
+                for right_state in range(4):
+                    gate[left_state, right_state, left_state, right_state] = phase[
+                        left_state, right_state
+                    ]
+            return _apply_adjacent_two_site_gate(psi, i, gate, max_bond=max_bond)
+        gate = build_gdvr_spatial_pair_density_phase_mpo(
+            self.nsites,
+            i,
+            j,
+            phase,
+            cutoff=self.cutoff,
+        )
+        out = gate @ psi
+        if max_bond is not None:
+            out = out.compress(max_bond)
+        return out
+
+    def apply(self, psi, *, field_z=0.0, max_bond=None):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        for site, local_phase in enumerate(self.local_phases):
+            phase = local_phase
+            if field_z != 0.0:
+                phase = phase * np.exp(
+                    -1j * self.dt * field_z * float(self.z_values[site]) * self.occupation
+                )
+            out = _apply_one_site_phase(out, site, phase)
+
+        for _, colors in self.distance_groups:
+            for color_pairs in colors:
+                pair_bond = max_bond if self.compress_mode == "pair" else None
+                for i, j, phase in color_pairs:
+                    out = self._apply_pair(out, i, j, phase, max_bond=pair_bond)
+                    if self.compress_mode == "pair":
+                        out.normalize()
+                if self.compress_mode == "color" and max_bond is not None:
+                    out = out.compress(max_bond)
+                    out.normalize()
+            if self.compress_mode == "distance" and max_bond is not None:
+                out = out.compress(max_bond)
+                out.normalize()
+        if self.compress_mode == "end" and max_bond is not None:
+            out = out.compress(max_bond)
+        out.normalize()
+        self.fit_info = {
+            "pair_gates": int(self.n_pair_gates),
+            "color_groups": int(self.n_color_groups),
+            "distance_groups": int(len(self.distance_groups)),
+            "compress_mode": self.compress_mode,
+            "direct_adjacent": bool(self.direct_adjacent),
+            "distance_order": self.distance_order,
+        }
+        self.last_apply_info = self.fit_info
+        return out
+
+
+class GDVRSpatialPronyDensityPhase:
+    """Approximate density phase using a Prony-fitted intersite Hamiltonian MPO."""
+
+    def __init__(
+        self,
+        mol,
+        dt,
+        *,
+        rank=8,
+        statistic="mean",
+        residual_rank=0,
+        cutoff=1.0e-14,
+        rcond=None,
+    ):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        nz = int(mol.shapes["Nz"])
+        m = int(mol.shapes["M"])
+        nsites = int(mol.shapes["size"])
+        if m != 1:
+            raise NotImplementedError("The Prony density phase currently supports M=1 only.")
+
+        self.dt = float(dt)
+        self.cutoff = float(cutoff)
+        self.nsites = nsites
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+        self.rank = int(rank)
+        self.statistic = str(statistic)
+        self.residual_rank = int(residual_rank)
+
+        self.local_phases = []
+        for site in range(nsites):
+            g_ii = float(np.asarray(mol.eri_j[site][site]).reshape(-1)[0])
+            self.local_phases.append(np.exp(-1j * self.dt * g_ii * double_occupation))
+
+        self.intersite_mpo, self.fit_info = build_gdvr_spatial_prony_density_hamiltonian_mpo(
+            mol,
+            self.rank,
+            statistic=self.statistic,
+            residual_rank=self.residual_rank,
+            rcond=rcond,
+        )
+        self.last_apply_info = None
+        self._tdvp_engine_cache = {}
+
+    def _apply_local_phase(self, psi, field_z):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        for site, local_phase in enumerate(self.local_phases):
+            phase = local_phase
+            if field_z != 0.0:
+                phase = phase * np.exp(
+                    -1j * self.dt * field_z * float(self.z_values[site]) * self.occupation
+                )
+            out = _apply_one_site_phase(out, site, phase)
+        return out
+
+    def apply(
+        self,
+        psi,
+        *,
+        field_z=0.0,
+        max_bond=None,
+        integrator="tdvp2",
+        cutoff=0.0,
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+        krylov_method="lanczos",
+        diagonal_fast_path=False,
+        sparse_threshold=0.0,
+        sparse_vectorized=True,
+        reuse_tdvp_engine=True,
+        canonicalize_each_step=False,
+        normalize=True,
+    ):
+        out = self._apply_local_phase(psi, field_z)
+        key = str(integrator).lower().replace("_", "-")
+        if key in {"tdvp2", "2tdvp", "two-site-tdvp", "2site-tdvp"}:
+            if reuse_tdvp_engine:
+                cache_key = (
+                    "tdvp2",
+                    int(max_bond) if max_bond is not None else None,
+                    float(cutoff),
+                    int(krylov_dim),
+                    float(krylov_tol),
+                    str(krylov_method).lower().replace("_", "-"),
+                    bool(diagonal_fast_path),
+                    float(sparse_threshold),
+                    bool(sparse_vectorized),
+                    bool(canonicalize_each_step),
+                )
+                engine = self._tdvp_engine_cache.get(cache_key)
+                if engine is None:
+                    engine = TDVPEngine(
+                        self.intersite_mpo,
+                        integrator="tdvp2",
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        sparse_threshold=sparse_threshold,
+                        sparse_vectorized=sparse_vectorized,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                    self._tdvp_engine_cache[cache_key] = engine
+                out, info = engine.step(out, self.dt, normalize=normalize, return_info=True)
+            else:
+                out, info = two_site_tdvp_step(
+                    out,
+                    self.intersite_mpo,
+                    self.dt,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    diagonal_fast_path=diagonal_fast_path,
+                    sparse_threshold=sparse_threshold,
+                    sparse_vectorized=sparse_vectorized,
+                    normalize=normalize,
+                    return_info=True,
+                )
+        elif key in {"tdvp", "tdvp1", "1tdvp", "one-site-tdvp", "1site-tdvp"}:
+            if reuse_tdvp_engine:
+                cache_key = (
+                    "tdvp",
+                    int(krylov_dim),
+                    float(krylov_tol),
+                    str(krylov_method).lower().replace("_", "-"),
+                    bool(diagonal_fast_path),
+                    bool(canonicalize_each_step),
+                )
+                engine = self._tdvp_engine_cache.get(cache_key)
+                if engine is None:
+                    engine = TDVPEngine(
+                        self.intersite_mpo,
+                        integrator="tdvp",
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                    self._tdvp_engine_cache[cache_key] = engine
+                out, info = engine.step(out, self.dt, normalize=normalize, return_info=True)
+            else:
+                out, info = one_site_tdvp_step(
+                    out,
+                    self.intersite_mpo,
+                    self.dt,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    diagonal_fast_path=diagonal_fast_path,
+                    normalize=normalize,
+                    return_info=True,
+                )
+        else:
+            raise ValueError("integrator must be 'tdvp' or 'tdvp2'.")
+        self.last_apply_info = info
+        return out
+
+
+class GDVRSpatialHybridDensityPhase(GDVRSpatialPronyDensityPhase):
+    """Prony Toeplitz density phase plus a low-rank residual SVD correction."""
+
+    def __init__(
+        self,
+        mol,
+        dt,
+        *,
+        prony_rank=8,
+        residual_rank=8,
+        statistic="mean",
+        cutoff=1.0e-14,
+        rcond=None,
+    ):
+        super().__init__(
+            mol,
+            dt,
+            rank=prony_rank,
+            statistic=statistic,
+            residual_rank=residual_rank,
+            cutoff=cutoff,
+            rcond=rcond,
+        )
+        self.prony_rank = int(prony_rank)
+
+
+class GDVRSpatialSVDDensityPhase:
+    """Approximate density phase using a low-rank SVD/eigen fit of the full ``V_ij``."""
+
+    def __init__(self, mol, dt, *, rank=8, cutoff=1.0e-14):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        nz = int(mol.shapes["Nz"])
+        m = int(mol.shapes["M"])
+        nsites = int(mol.shapes["size"])
+        if m != 1:
+            raise NotImplementedError("The SVD density phase currently supports M=1 only.")
+
+        self.dt = float(dt)
+        self.cutoff = float(cutoff)
+        self.nsites = nsites
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+        self.rank = int(rank)
+
+        self.local_phases = []
+        for site in range(nsites):
+            g_ii = float(np.asarray(mol.eri_j[site][site]).reshape(-1)[0])
+            self.local_phases.append(np.exp(-1j * self.dt * g_ii * double_occupation))
+
+        self.intersite_mpo, self.fit_info = build_gdvr_spatial_svd_density_hamiltonian_mpo(
+            mol,
+            self.rank,
+            cutoff=self.cutoff,
+        )
+        self.last_apply_info = None
+        self._tdvp_engine_cache = {}
+
+    def _apply_local_phase(self, psi, field_z):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        for site, local_phase in enumerate(self.local_phases):
+            phase = local_phase
+            if field_z != 0.0:
+                phase = phase * np.exp(
+                    -1j * self.dt * field_z * float(self.z_values[site]) * self.occupation
+                )
+            out = _apply_one_site_phase(out, site, phase)
+        return out
+
+    def apply(
+        self,
+        psi,
+        *,
+        field_z=0.0,
+        max_bond=None,
+        integrator="tdvp2",
+        cutoff=0.0,
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+        krylov_method="lanczos",
+        diagonal_fast_path=False,
+        sparse_threshold=0.0,
+        sparse_vectorized=True,
+        reuse_tdvp_engine=True,
+        canonicalize_each_step=False,
+        normalize=True,
+    ):
+        out = self._apply_local_phase(psi, field_z)
+        key = str(integrator).lower().replace("_", "-")
+        if key in {"tdvp2", "2tdvp", "two-site-tdvp", "2site-tdvp"}:
+            if reuse_tdvp_engine:
+                cache_key = (
+                    "tdvp2",
+                    int(max_bond) if max_bond is not None else None,
+                    float(cutoff),
+                    int(krylov_dim),
+                    float(krylov_tol),
+                    str(krylov_method).lower().replace("_", "-"),
+                    bool(diagonal_fast_path),
+                    float(sparse_threshold),
+                    bool(sparse_vectorized),
+                    bool(canonicalize_each_step),
+                )
+                engine = self._tdvp_engine_cache.get(cache_key)
+                if engine is None:
+                    engine = TDVPEngine(
+                        self.intersite_mpo,
+                        integrator="tdvp2",
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        sparse_threshold=sparse_threshold,
+                        sparse_vectorized=sparse_vectorized,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                    self._tdvp_engine_cache[cache_key] = engine
+                out, info = engine.step(out, self.dt, normalize=normalize, return_info=True)
+            else:
+                out, info = two_site_tdvp_step(
+                    out,
+                    self.intersite_mpo,
+                    self.dt,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    diagonal_fast_path=diagonal_fast_path,
+                    sparse_threshold=sparse_threshold,
+                    sparse_vectorized=sparse_vectorized,
+                    normalize=normalize,
+                    return_info=True,
+                )
+        elif key in {"tdvp", "tdvp1", "1tdvp", "one-site-tdvp", "1site-tdvp"}:
+            if reuse_tdvp_engine:
+                cache_key = (
+                    "tdvp",
+                    int(krylov_dim),
+                    float(krylov_tol),
+                    str(krylov_method).lower().replace("_", "-"),
+                    bool(diagonal_fast_path),
+                    bool(canonicalize_each_step),
+                )
+                engine = self._tdvp_engine_cache.get(cache_key)
+                if engine is None:
+                    engine = TDVPEngine(
+                        self.intersite_mpo,
+                        integrator="tdvp",
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                    self._tdvp_engine_cache[cache_key] = engine
+                out, info = engine.step(out, self.dt, normalize=normalize, return_info=True)
+            else:
+                out, info = one_site_tdvp_step(
+                    out,
+                    self.intersite_mpo,
+                    self.dt,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    diagonal_fast_path=diagonal_fast_path,
+                    normalize=normalize,
+                    return_info=True,
+                )
+        else:
+            raise ValueError("integrator must be 'tdvp' or 'tdvp2'.")
+        self.last_apply_info = info
+        return out
+
+
+class GDVRSpatialFactorizedDensityPhase:
+    """Small-grid diagonal phase from factorized ``V_ee`` plus local ``zE(t)``."""
+
+    def __init__(
+        self,
+        mol,
+        dt,
+        *,
+        rank=None,
+        tt_rank=None,
+        cutoff=1.0e-14,
+        max_sites=12,
+    ):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        self.mol = mol
+        self.dt = float(dt)
+        self.rank = None if rank is None else int(rank)
+        self.tt_rank = tt_rank
+        self.cutoff = float(cutoff)
+        self.max_sites = int(max_sites)
+        self.phase_mpo, self.fit_info = build_gdvr_spatial_factorized_density_phase_mpo(
+            mol,
+            self.dt,
+            field_z=0.0,
+            rank=self.rank,
+            tt_rank=self.tt_rank,
+            cutoff=self.cutoff,
+            max_sites=self.max_sites,
+        )
+        nsites = int(mol.shapes["size"])
+        m = int(mol.shapes["M"])
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(-1)
+        if self.z_values.size != nsites:
+            self.z_values = np.repeat(self.z_values, m)
+        self.last_apply_info = None
+
+    def apply(self, psi, *, field_z=0.0, max_bond=None):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        if field_z != 0.0:
+            for site, zi in enumerate(self.z_values):
+                phase = np.exp(-1j * self.dt * field_z * float(zi) * self.occupation)
+                out = _apply_one_site_phase(out, site, phase)
+        out = self.phase_mpo @ out
+        if max_bond is not None:
+            out = out.compress(max_bond)
+        out.normalize()
+        self.last_apply_info = self.fit_info
+        return out
+
+
+class GDVRSpatialTaylorDensityPhase:
+    """Taylor-applied offsite GDVR density phase with exact local/field phases."""
+
+    def __init__(
+        self,
+        mol,
+        dt,
+        *,
+        order=3,
+        rank=None,
+        method="svd",
+        prony_statistic="mean",
+        prony_residual_rank=0,
+        cutoff=1.0e-14,
+        rcond=None,
+    ):
+        if mol.shapes is None or mol.eri_j is None:
+            raise ValueError("Build the GDVR molecule before applying density phases.")
+        nz = int(mol.shapes["Nz"])
+        m = int(mol.shapes["M"])
+        nsites = int(mol.shapes["size"])
+        if m != 1:
+            raise NotImplementedError("The Taylor density phase currently supports M=1 only.")
+        if int(order) < 0:
+            raise ValueError("order must be non-negative.")
+
+        self.dt = float(dt)
+        self.order = int(order)
+        self.cutoff = float(cutoff)
+        self.nsites = nsites
+        self.occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+
+        self.local_phases = []
+        for site in range(nsites):
+            g_ii = float(np.asarray(mol.eri_j[site][site]).reshape(-1)[0])
+            self.local_phases.append(np.exp(-1j * self.dt * g_ii * double_occupation))
+
+        key = str(method).lower().replace("_", "-")
+        if key == "svd":
+            density_rank = nsites if rank is None else int(rank)
+            self.intersite_mpo, self.fit_info = build_gdvr_spatial_svd_density_hamiltonian_mpo(
+                mol,
+                density_rank,
+                cutoff=self.cutoff,
+            )
+        elif key == "prony":
+            if rank is None:
+                raise ValueError("rank is required for the Prony Taylor density phase.")
+            self.intersite_mpo, self.fit_info = build_gdvr_spatial_prony_density_hamiltonian_mpo(
+                mol,
+                int(rank),
+                statistic=prony_statistic,
+                residual_rank=prony_residual_rank,
+                rcond=rcond,
+            )
+        else:
+            raise ValueError("method must be 'svd' or 'prony'.")
+        self.method = key
+        self.rank = None if rank is None else int(rank)
+        self.last_apply_info = None
+
+    def _apply_local_phase(self, psi, field_z):
+        out = psi.copy().to_order(["lv", "p", "rv"])
+        field_z = float(field_z)
+        for site, local_phase in enumerate(self.local_phases):
+            phase = local_phase
+            if field_z != 0.0:
+                phase = phase * np.exp(
+                    -1j * self.dt * field_z * float(self.z_values[site]) * self.occupation
+                )
+            out = _apply_one_site_phase(out, site, phase)
+        return out
+
+    def apply(self, psi, *, field_z=0.0, max_bond=None, normalize=True):
+        out = self._apply_local_phase(psi, field_z)
+        if self.order == 0:
+            if normalize:
+                out.normalize()
+            self.last_apply_info = {"order": self.order, **self.fit_info}
+            return out
+
+        bond_dim = None if max_bond is None else int(max_bond)
+        accum = out.copy()
+        power = out.copy()
+        coeff = 1.0 + 0.0j
+        for k in range(1, self.order + 1):
+            power = self.intersite_mpo @ power
+            if bond_dim is not None:
+                power = power.compress(bond_dim)
+            coeff *= (-1j * self.dt) / k
+            accum = accum + _scale_mps(power, coeff)
+            if bond_dim is not None:
+                accum = accum.compress(bond_dim)
+        if normalize:
+            accum.normalize()
+        self.last_apply_info = {"order": self.order, **self.fit_info}
+        return accum
+
+
+def apply_gdvr_spatial_density_phase(
+    psi,
+    mol,
+    dt,
+    *,
+    field_z=0.0,
+    max_bond=None,
+    cutoff=1.0e-14,
+):
+    """Apply the diagonal GDVR Coulomb and z-field phase without dense tensors."""
+    return GDVRSpatialDensityPhase(mol, dt, cutoff=cutoff).apply(
+        psi,
+        field_z=field_z,
+        max_bond=max_bond,
+    )
+
+
+def build_gdvr_spatial_density_phase_mpo(
+    mol,
+    dt,
+    *,
+    field_z=0.0,
+    max_exact_sites=10,
+    max_rank=None,
+):
+    """
+    Exact TT/MPO for the diagonal GDVR density phase on small ``M=1`` grids.
+
+    The phase is
+    ``exp[-i dt (V_ee + E_z sum_i z_i n_i)]`` on spatial sites.  This builder
+    materializes a ``4**Nz`` phase tensor before TT factorization, so it is meant
+    for calibration and is deliberately guarded by ``max_exact_sites``.
+    """
+    if mol.shapes is None or mol.eri_j is None:
+        raise ValueError("Build the GDVR molecule before requesting density phases.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    nsites = int(mol.shapes["size"])
+    if m != 1:
+        raise NotImplementedError("The diagonal density phase prototype currently supports M=1 only.")
+    if nsites > int(max_exact_sites):
+        raise ValueError(
+            f"Exact density phase tensor would have 4**{nsites} entries; "
+            f"increase max_exact_sites only for calibration runs."
+        )
+
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    double_occupation = np.array([0.0, 0.0, 0.0, 1.0])
+    energy = np.zeros((4,) * nsites, dtype=float)
+
+    z_values = np.asarray(mol.z, dtype=float).reshape(nz)
+    for i in range(nsites):
+        shape = [1] * nsites
+        shape[i] = 4
+        occ_i = occupation.reshape(shape)
+        double_i = double_occupation.reshape(shape)
+        g_ii = float(np.asarray(mol.eri_j[i][i]).reshape(-1)[0])
+        energy += g_ii * double_i
+        if field_z != 0.0:
+            energy += float(field_z) * float(z_values[i]) * occ_i
+
+    for i in range(nsites):
+        shape_i = [1] * nsites
+        shape_i[i] = 4
+        occ_i = occupation.reshape(shape_i)
+        for j in range(i + 1, nsites):
+            g_ij = float(np.asarray(mol.eri_j[i][j]).reshape(-1)[0])
+            if g_ij == 0.0:
+                continue
+            shape_j = [1] * nsites
+            shape_j[j] = 4
+            occ_j = occupation.reshape(shape_j)
+            energy += g_ij * occ_i * occ_j
+
+    phase = np.exp(-1j * float(dt) * energy)
+    rank = phase.size if max_rank is None else int(max_rank)
+    factors = decompose(phase, rank=rank)
+    mpo_factors = []
+    for factor in factors:
+        factor = np.asarray(factor, dtype=complex)
+        core = np.zeros((factor.shape[0], factor.shape[2], 4, 4), dtype=complex)
+        for local_state in range(4):
+            core[:, :, local_state, local_state] = factor[:, local_state, :]
+        mpo_factors.append(core)
+    return TensorMPO(mpo_factors, homogenous=False)
+
+
+def _symmetrize_chemist_eri(eri):
+    eri = np.asarray(eri)
+    eri = 0.25 * (
+        eri
+        + eri.transpose(1, 0, 2, 3)
+        + eri.transpose(0, 1, 3, 2)
+        + eri.transpose(1, 0, 3, 2)
+    )
+    return 0.5 * (eri + eri.transpose(2, 3, 0, 1).conj())
+
+
+def active_eri_from_gdvr_collocation(eri_j, mo_cas, nz, m, *, symmetrize=True, cutoff=0.0):
+    """
+    Transform collocated GDVR Coulomb blocks to active spatial-orbital ERIs.
+
+    The returned tensor uses chemists' notation ``(pq|rs)`` in the active MO
+    basis expected by the qchem DMRG Hamiltonian builders.
+    """
+    mo_cas = np.asarray(mo_cas)
+    nz = int(nz)
+    m = int(m)
+    if mo_cas.ndim != 2 or mo_cas.shape[0] != nz * m:
+        raise ValueError("mo_cas must have shape (Nz * M, ncas).")
+    ncas = int(mo_cas.shape[1])
+    coeff = mo_cas.reshape(nz, m, ncas)
+    dtype = np.result_type(mo_cas, float)
+    eri = np.zeros((ncas, ncas, ncas, ncas), dtype=dtype)
+
+    for iz in range(nz):
+        c_i = coeff[iz]
+        for jz in range(nz):
+            block = np.asarray(eri_j[iz][jz], dtype=dtype)
+            if block.ndim == 0:
+                block = block.reshape(1, 1)
+            if block.size == 0:
+                continue
+            if cutoff > 0.0 and np.max(np.abs(block)) <= cutoff:
+                continue
+            block4 = block.reshape(m, m, m, m)
+            c_j = coeff[jz]
+            eri += np.einsum(
+                "ap,bq,abcd,cr,ds->pqrs",
+                c_i.conj(),
+                c_i,
+                block4,
+                c_j.conj(),
+                c_j,
+                optimize=True,
+            )
+
+    return _symmetrize_chemist_eri(eri) if symmetrize else eri
+
+
+class GDVRMeanFieldAdapter:
+    """Small RHF-like view of a converged GDVR RHF object for qchem DMRG."""
+
+    def __init__(self, mf, mo_coeff=None):
+        if mf.mo_coeff is None or mf.dm is None:
+            raise ValueError("Run GDVR RHF before constructing GDVR-TDDMRG.")
+        mol = mf.mol
+        if mol.hcore is None or mol.eri_j is None or mol.eri_k is None or mol.shapes is None:
+            raise ValueError("Build the GDVR molecule before constructing GDVR-TDDMRG.")
+
+        self._scf = mf
+        self.mol = mol
+        self.nelec = int(mol.nelec)
+        self.mo_coeff = np.asarray(mf.mo_coeff if mo_coeff is None else mo_coeff)
+        self.mo_energy = np.asarray(mf.mo_energy) if mf.mo_energy is not None else None
+        self.mo_occ = np.asarray(mf.mo_occ) if mf.mo_occ is not None else None
+        self.dm = np.asarray(mf.dm)
+        self.e_tot = None if mf.e_tot is None else float(mf.e_tot)
+        self.eri = None
+        self.cholesky_jk = False
+        self._jk_builder = prepare_gdvr_fock_builder(
+            mol.eri_j,
+            mol.eri_k,
+            int(mol.shapes["Nz"]),
+            int(mol.shapes["M"]),
+        )
+
+    def get_hcore(self):
+        return np.asarray(self.mol.hcore)
+
+    def get_ovlp(self):
+        return np.eye(int(self.mol.shapes["size"]))
+
+    def energy_nuc(self):
+        return float(self.mol.nuclear_repulsion_energy())
+
+    def get_veff(self, dm):
+        return fock_2e_slice_collocated(
+            np.asarray(dm),
+            self._jk_builder,
+            None,
+            int(self.mol.shapes["Nz"]),
+            int(self.mol.shapes["M"]),
+        )
+
+    def dipole(self, center=None, basis="ao"):
+        z_op = gdvr_z_operator(self.mol, electronic=True)
+        if center is not None:
+            center_arr = np.asarray(center, dtype=float).reshape(-1)
+            if center_arr.size >= 3:
+                z_op = z_op + float(center_arr[2]) * np.eye(z_op.shape[0])
+
+        op = np.zeros((3, z_op.shape[0], z_op.shape[1]), dtype=z_op.dtype)
+        op[2] = z_op
+        key = str(basis).lower()
+        if key == "ao":
+            return op
+        if key == "mo":
+            c = np.asarray(self.mo_coeff)
+            return np.einsum("pi,xpq,qj->xij", c.conj(), op, c, optimize=True)
+        raise ValueError("basis must be 'ao' or 'mo'.")
+
+
+class GDVRActiveSpaceTDDMRG(BaseTDDMRG):
+    """
+    Active-space time-dependent DMRG on top of a converged GDVR RHF reference.
+
+    This class reuses the qchem :class:`TDDMRG` propagator while replacing the
+    GTO integral path by a direct transformation of the collocated GDVR ERI
+    blocks into the selected active MO space.
+    """
+
+    def __init__(
+        self,
+        mf,
+        ncas,
+        nelecas,
+        D,
+        init_guess="hf",
+        m_warmup=None,
+        spin=None,
+        tol=1e-6,
+        low_rank_mpo=False,
+        low_rank_mpo_bond=None,
+        low_rank_mpo_batch_size=4,
+        td_bond_dim=None,
+        active_orbitals=None,
+    ):
+        ncas = int(ncas)
+        nelecas_int = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
+        ncore = int(mf.mol.nelec) // 2 - nelecas_int // 2
+        if ncore < 0:
+            raise ValueError("nelecas cannot exceed the number of GDVR RHF electrons.")
+
+        mo_coeff = None
+        if active_orbitals is not None:
+            active_orbitals = tuple(int(i) for i in active_orbitals)
+            needed = ncore + ncas
+            if len(active_orbitals) < needed:
+                raise ValueError("active_orbitals must contain at least ncore + ncas indices.")
+            mo_coeff = np.asarray(mf.mo_coeff)[:, active_orbitals[:needed]]
+
+        adapter = GDVRMeanFieldAdapter(mf, mo_coeff=mo_coeff)
+        if spin is None:
+            spin = 0 if getattr(mf.mol, "spin", None) is None else mf.mol.spin
+
+        super().__init__(
+            adapter,
+            ncas=ncas,
+            nelecas=nelecas,
+            D=D,
+            init_guess=init_guess,
+            m_warmup=m_warmup,
+            spin=spin,
+            tol=tol,
+            low_rank_mpo=low_rank_mpo,
+            low_rank_mpo_bond=low_rank_mpo_bond,
+            low_rank_mpo_batch_size=low_rank_mpo_batch_size,
+            td_bond_dim=td_bond_dim,
+        )
+        self.gdvr_mf = mf
+        self.active_orbitals = active_orbitals
+
+    def _get_active_hamiltonian_inputs(self):
+        hcore = self.mf.get_hcore()
+        ncore = int(self.ncore)
+        mo_core = np.asarray(self.mo_core)
+        mo_cas = np.asarray(self.mo_cas)
+
+        if ncore == 0:
+            core_vhf = 0.0
+            energy_core = self.mf.energy_nuc()
+        else:
+            core_dm = 2.0 * (mo_core @ mo_core.conj().T)
+            core_vhf = self.mf.get_veff(core_dm)
+            energy_core = self.mf.energy_nuc()
+            energy_core += np.einsum("ij,ji->", core_dm, hcore, optimize=True).real
+            energy_core += 0.5 * np.einsum("ij,ji->", core_dm, core_vhf, optimize=True).real
+
+        h1 = mo_cas.conj().T @ (hcore + core_vhf) @ mo_cas
+        mol = self.gdvr_mf.mol
+        eri = active_eri_from_gdvr_collocation(
+            mol.eri_j,
+            mo_cas,
+            int(mol.shapes["Nz"]),
+            int(mol.shapes["M"]),
+        )
+        h2 = np.stack(((eri, eri.copy()), (eri.copy(), eri.copy())))
+
+        self.e_core = float(energy_core)
+        self._active_integral_build_info = {
+            "mode": "gdvr_collocated_dense_active",
+            "factorized_integrals": False,
+            "aux_rank": None,
+            "ncas": self.ncas,
+            "source_basis_size": int(mol.shapes["size"]),
+        }
+        return [h1, h1.copy()], h2, None
+
+
+class TDDMRG(BaseTDDMRG):
+    """
+    Direct GDVR-basis time-dependent DMRG.
+
+    Unlike the active-space adapter above, this builder does not transform the
+    collocated GDVR ERIs into a dense four-index tensor.  It emits the
+    Hamiltonian MPO directly from the nonzero z-slice Coulomb blocks, while
+    ``mu_z`` is built as a diagonal number-operator MPO from the GDVR grid.
+    """
+
+    def __init__(
+        self,
+        mf,
+        D,
+        nelecas=None,
+        init_guess="hf",
+        m_warmup=None,
+        spin=None,
+        tol=1e-6,
+        td_bond_dim=None,
+        cutoff=1.0e-12,
+        symbolic_algo="qr",
+    ):
+        mol = mf.mol
+        if mol.shapes is None:
+            raise ValueError("Build the GDVR molecule before constructing GDVR-TDDMRG.")
+        nspatial = int(mol.shapes["size"])
+        if nelecas is None:
+            nelecas = int(mol.nelec)
+        nelecas_int = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
+        if nelecas_int != int(mol.nelec):
+            raise ValueError("Direct GDVR-TDDMRG currently propagates all GDVR electrons; use GDVRActiveSpaceTDDMRG for CAS runs.")
+        if spin is None:
+            spin = 0 if getattr(mol, "spin", None) is None else mol.spin
+
+        adapter = GDVRMeanFieldAdapter(mf, mo_coeff=np.eye(nspatial))
+        super().__init__(
+            adapter,
+            ncas=nspatial,
+            nelecas=nelecas,
+            D=D,
+            init_guess=init_guess,
+            m_warmup=m_warmup,
+            spin=spin,
+            tol=tol,
+            td_bond_dim=td_bond_dim,
+        )
+        self.site = "spatial"
+        self.site_basis = "spatial"
+        self.orbital_layout = "spatial"
+        self.d = 4
+        self.nsites = self.L = nspatial
+        self.gdvr_mf = mf
+        self.gdvr_mpo_cutoff = float(cutoff)
+        self.gdvr_symbolic_algo = str(symbolic_algo)
+
+    def build(self, mo_coeff=None):
+        if mo_coeff is not None:
+            mo_coeff = np.asarray(mo_coeff)
+            if not np.allclose(mo_coeff, np.eye(self.ncas), atol=1.0e-12):
+                raise ValueError("Direct GDVR-TDDMRG uses the GDVR basis; do not pass mo_coeff.")
+
+        self._clear_interaction_caches()
+        self.mo_coeff = np.eye(self.ncas)
+        self.mo_core = self.mo_coeff[:, :0]
+        self.mo_cas = self.mo_coeff
+        self.e_core = self.mf.energy_nuc()
+        self.h1e = [np.asarray(self.mf.get_hcore()), np.asarray(self.mf.get_hcore())]
+        self.h2e = None
+        self.h2e_factors = None
+        self.complementary_operators = None
+        self.complementary_operator_mpos = None
+        self.complementary_operator_term_maps = None
+        self.complementary_operator_generator_entries = None
+        self._active_hamiltonian = None
+
+        tensor_mpo, info = build_gdvr_spatial_hamiltonian_mpo(
+            self.gdvr_mf.mol,
+            cutoff=self.gdvr_mpo_cutoff,
+            symbolic_algo=self.gdvr_symbolic_algo,
+        )
+        self.H_raw = tensor_mpo.factors
+        self.H = tensor_mpo.factors
+        self._hamiltonian_mpo_cache_key = (
+            "gdvr_direct",
+            id(self.gdvr_mf.mol),
+            self.gdvr_mpo_cutoff,
+            self.gdvr_symbolic_algo,
+        )
+        self._symmetric_mpo_cache = {}
+        self._active_integral_build_info = {
+            **info,
+            "factorized_integrals": False,
+            "aux_rank": None,
+            "ncas": int(self.ncas),
+            "e_core": float(self.e_core),
+        }
+        return self
+
+    def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
+        del order, scale
+        field_vec = self._field_vector(time, field)
+        if not np.any(field_vec):
+            return None
+        if abs(field_vec[0]) > 1.0e-14 or abs(field_vec[1]) > 1.0e-14:
+            raise NotImplementedError("Direct spatial GDVR-TDDMRG currently supports z-polarized fields.")
+        if abs(field_vec[2]) <= 1.0e-14:
+            return None
+        return build_gdvr_spatial_z_phase_mpo(self.gdvr_mf.mol, field_vec[2], dt)
+
+    def get_interaction_mpo(self, axis=None):
+        axis_idx = None if axis is None else _axis_index(axis)
+        if axis_idx is not None and axis_idx != 2:
+            return super().get_interaction_mpo(axis=axis)
+        if self._interaction_mpo_cache is None:
+            zero = self._zero_mpo(self.ncas, phys_dim=4)
+            mu_z = build_gdvr_spatial_dipole_mpo(
+                self.gdvr_mf.mol,
+                cutoff=self.gdvr_mpo_cutoff,
+                symbolic_algo=self.gdvr_symbolic_algo,
+            )
+            self._interaction_mpo_cache = (zero, zero, mu_z)
+        if axis is None:
+            return [type(mpo)([w.copy() for w in mpo.factors], homogenous=False) for mpo in self._interaction_mpo_cache]
+        mpo = self._interaction_mpo_cache[axis_idx]
+        return type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+
+    def get_interaction_spatial(self, axis=None):
+        if axis is None:
+            zero = np.zeros((self.ncas, self.ncas))
+            return [zero.copy(), zero.copy(), gdvr_z_operator(self.gdvr_mf.mol, electronic=True)]
+        if _axis_index(axis) != 2:
+            return np.zeros((self.ncas, self.ncas))
+        return gdvr_z_operator(self.gdvr_mf.mol, electronic=True)
+
+
+RealTimeDMRG = TDDMRG
+RTTDDMRG = TDDMRG

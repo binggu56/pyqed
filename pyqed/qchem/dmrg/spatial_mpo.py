@@ -36,6 +36,18 @@ def build_spatial_block2_carrier_mpo(n_sites, *, local_dim=4):
         raise ValueError("n_sites must be positive.")
     if local_dim <= 0:
         raise ValueError("local_dim must be positive.")
+    try:
+        from pyqed.mps import cpp_davidson as _cpp_davidson
+
+        build = getattr(_cpp_davidson, "build_spatial_block2_carrier_mpo", None)
+        if build is not None:
+            native = build(n_sites, local_dim)
+            return SpatialCarrierMPO(
+                factors=list(native["factors"]),
+                info=dict(native["info"]),
+            )
+    except Exception:
+        pass
     ident = np.eye(local_dim, dtype=complex).reshape(1, 1, local_dim, local_dim)
     factors = [ident.copy() for _ in range(n_sites)]
     info = {

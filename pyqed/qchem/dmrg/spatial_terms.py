@@ -13,6 +13,7 @@ from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
 _SPATIAL_LOCAL_OPS = None
 _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE = {}
+_SPATIAL_JW_TERM_SPEC_CACHE = {}
 
 
 def spatial_local_ops():
@@ -99,26 +100,36 @@ def spatial_jw_term_spec(local_symbols, sites, factor):
     earlier spatial orbitals and a local d=4 creation/annihilation operator on
     its own orbital.
     """
+    key = (
+        tuple(str(symbol) for symbol in local_symbols),
+        tuple(int(site) for site in sites),
+    )
+    cached = _SPATIAL_JW_TERM_SPEC_CACHE.get(key)
+    if cached is not None:
+        symbol, final_sites, local_factor = cached
+        return symbol, list(final_sites), factor * local_factor
     grouped = defaultdict(list)
-    for symbol, site in zip(local_symbols, sites):
-        site = int(site)
+    for symbol, site in zip(key[0], key[1]):
         for k in range(site):
             grouped[k].append("JW")
         grouped[site].append(symbol)
 
     final_symbols = []
     final_sites = []
-    final_factor = factor
+    local_factor = 1.0
     for site in sorted(grouped):
-        symbol, local_factor = canonical_spatial_local_symbol(grouped[site])
+        symbol, site_factor = canonical_spatial_local_symbol(grouped[site])
         if symbol is None:
+            _SPATIAL_JW_TERM_SPEC_CACHE[key] = ("", (), 0.0)
             return "", [], 0.0
         if symbol == "I":
             continue
         final_symbols.append(symbol)
         final_sites.append(site)
-        final_factor *= local_factor
-    return " ".join(final_symbols), final_sites, final_factor
+        local_factor *= site_factor
+    result = (" ".join(final_symbols), tuple(final_sites), local_factor)
+    _SPATIAL_JW_TERM_SPEC_CACHE[key] = result
+    return result[0], list(result[1]), factor * result[2]
 
 
 def accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=1.0e-14):
