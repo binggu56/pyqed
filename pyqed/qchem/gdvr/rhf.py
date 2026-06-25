@@ -330,23 +330,6 @@ class Molecule:
                 E += Z[i] * Z[j] / float(np.linalg.norm(dR))
         return E
 
-    def position_operator(self, axis="z"):
-        """Return the one-electron GDVR position operator along an axis."""
-        key = str(axis).strip().lower()
-        if key != "z":
-            raise NotImplementedError("GDVR currently has a built-in position operator only along z.")
-        if self.z is None or self.shapes is None:
-            raise ValueError("Build the GDVR molecule before requesting a position operator.")
-        nz = int(self.shapes["Nz"])
-        m = int(self.shapes["M"])
-        z = np.asarray(self.z, dtype=float).reshape(nz)
-        return np.diag(np.repeat(z, m))
-
-    def dipole_operator(self, axis="z", *, electronic=True):
-        """Return the one-electron GDVR dipole operator along an axis."""
-        op = self.position_operator(axis)
-        return -op if electronic else op
-
     def build(
         self,
         Lz=18.0,

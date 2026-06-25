@@ -133,9 +133,6 @@ class AtomicChain:
         s_exps=None,
         p_exps=None,
         d_exps=None,
-        max_offset=None,
-        auto_cut=False,
-        cut_eps=1e-6,
         verbose=True,
         dvr_method='sine',
     ):
@@ -153,9 +150,6 @@ class AtomicChain:
             s_exps=s_exps,
             p_exps=p_exps,
             d_exps=d_exps,
-            max_offset=max_offset,
-            auto_cut=auto_cut,
-            cut_eps=cut_eps,
             verbose=verbose,
             dvr_method=dvr_method,
         )
@@ -174,9 +168,6 @@ class AtomicChain:
             's_exps': None if s_exps is None else np.asarray(s_exps, float).copy(),
             'p_exps': None if p_exps is None else np.asarray(p_exps, float).copy(),
             'd_exps': None if d_exps is None else np.asarray(d_exps, float).copy(),
-            'max_offset': None if max_offset is None else int(max_offset),
-            'auto_cut': bool(auto_cut),
-            'cut_eps': float(cut_eps),
             'verbose': bool(verbose),
             'dvr_method': str(dvr_method),
         }
@@ -298,7 +289,7 @@ def _psd_project_small(M):
 
 def precompute_eri_method2_JK_psd(
     alphas, centers, labels, z_grid, C_list, M,
-    max_offset=None, auto_cut=False, cut_eps=1e-8, verbose=True,
+    verbose=True,
 ):
     alphas = np.asarray(alphas, float)
     centers = np.asarray(centers, float)
@@ -309,36 +300,20 @@ def precompute_eri_method2_JK_psd(
     if Nz > 1: dz = float(abs(z_grid[1] - z_grid[0]))
     else: dz = 0.0
 
-    if max_offset is None or max_offset > (Nz - 1):
-        max_offset = Nz - 1
-
     ERI_J = [[np.zeros((M * M, M * M), float) for _ in range(Nz)] for _ in range(Nz)]
     ERI_K = [[np.zeros((M * M, M * M), float) for _ in range(Nz)] for _ in range(Nz)]
 
     eri_by_h = {}
-    norm0 = None
-    h_max = max_offset
     
-    for h in range(0, max_offset + 1):
+    for h in range(Nz):
         delta_z = abs(h * dz)
         eri_ao = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z)
         eri_by_h[h] = eri_ao
-
-        if auto_cut:
-            nh = float(np.linalg.norm(eri_ao.reshape(-1)))
-            if h == 0: norm0 = max(nh, 1e-16)
-            else:
-                if norm0 is None: norm0 = max(nh, 1e-16)
-                ratio = nh / norm0
-                if ratio < cut_eps:
-                    h_max = h
-                    break
 
     for m in range(Nz):
         C_m = np.asarray(C_list[m], float)
         for n in range(Nz):
             h = abs(n - m)
-            if h > h_max: continue
 
             C_n = np.asarray(C_list[n], float)
             eri_ao = eri_by_h[h]
@@ -396,7 +371,7 @@ def build_method2(
     mol: AtomicChain,
     Lz=18.0, Nz=121, M=1,
     s_exps=None, p_exps=None, d_exps=None,
-    max_offset=None, auto_cut=False, cut_eps=1e-6, verbose=True, dvr_method='sine'
+    verbose=True, dvr_method='sine'
 ):
     t0 = time.time()
     z, Kz, dz = _gdvr_dvr_grid(Lz, Nz, dvr_method)
@@ -446,8 +421,7 @@ def build_method2(
 
     ERI_J, ERI_K = precompute_eri_method2_JK_psd(
         alphas, centers, labels, z, C_list,
-        M=M, max_offset=max_offset,
-        auto_cut=auto_cut, cut_eps=cut_eps, verbose=verbose
+        M=M, verbose=verbose
     )
 
     shapes = {"Nz": Nz, "M": M, "n_ao2d": len(alphas), "size": size, "dz": dz}
@@ -691,7 +665,7 @@ def _gdvr_dvr_grid(Lz, Nz, dvr_method):
     raise NotImplementedError("dvr_method must be 'sine', 'exp', or 'sinc'.")
 
 
-def _build_eri_kernels(alphas, centers, labels, z_grid, max_offset=None, auto_cut=False, cut_eps=1e-8):
+def _build_eri_kernels(alphas, centers, labels, z_grid):
     z_grid = np.asarray(z_grid, float)
     Nz = int(z_grid.size)
     if Nz < 1:
@@ -699,29 +673,13 @@ def _build_eri_kernels(alphas, centers, labels, z_grid, max_offset=None, auto_cu
     dz = float(abs(z_grid[1] - z_grid[0])) if Nz > 1 else 0.0
     n_ao = len(alphas)
 
-    if max_offset is None or max_offset > (Nz - 1):
-        max_offset = Nz - 1
-    max_offset = int(max_offset)
-
     K_h = [np.zeros((n_ao * n_ao, n_ao * n_ao), float) for _ in range(Nz)]
     Kx_h = [np.zeros((n_ao * n_ao, n_ao * n_ao), float) for _ in range(Nz)]
 
-    norm0 = None
-    h_max = max_offset
-    for h in range(0, max_offset + 1):
+    h_max = Nz - 1
+    for h in range(Nz):
         delta_z = abs(h * dz)
         eri_tensor = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z=delta_z)
-        if auto_cut:
-            nh = float(np.linalg.norm(eri_tensor.reshape(-1)))
-            if h == 0:
-                norm0 = max(nh, 1e-16)
-            else:
-                if norm0 is None:
-                    norm0 = max(nh, 1e-16)
-                ratio = nh / norm0
-                if ratio < float(cut_eps):
-                    h_max = h
-                    break
 
         K_h[h] = eri_tensor.reshape(n_ao * n_ao, n_ao * n_ao)
         Kx_h[h] = eri_tensor.transpose(0, 2, 1, 3).reshape(n_ao * n_ao, n_ao * n_ao)
@@ -740,9 +698,6 @@ def _build_newton_context(mol):
     s_exps = np.asarray(opts["s_exps"], float)
     p_exps = np.asarray(opts["p_exps"], float)
     d_exps = np.asarray(opts["d_exps"], float)
-    max_offset = opts["max_offset"]
-    auto_cut = bool(opts["auto_cut"])
-    cut_eps = float(opts["cut_eps"])
     nuclei = mol.to_tuples()
 
     alphas, centers, labels = make_xy_spd_primitive_basis(
@@ -767,9 +722,6 @@ def _build_newton_context(mol):
         centers,
         labels,
         z,
-        max_offset=max_offset,
-        auto_cut=auto_cut,
-        cut_eps=cut_eps,
     )
 
     eri_op = CollocatedERIOp.from_kernels(N=S_prim.shape[0], Nz=Nz, dz=dz, K_h=K_h, Kx_h=Kx_h)
@@ -1637,7 +1589,7 @@ if __name__ == "__main__":
     Hcore, z, dz, E_slices, C_list, _ERI_J0, _ERI_K0, shapes = build_method2(
         mol, Lz=LZ, Nz=Nz, M=M,
         s_exps=s_exps, p_exps=p_exps, d_exps=d_exps, 
-        max_offset=None, auto_cut=False, verbose=VERBOSE, dvr_method=DVR_METHOD,
+        verbose=VERBOSE, dvr_method=DVR_METHOD,
     )
 
     nuclei = mol.to_tuples()

@@ -563,243 +563,456 @@ def save_checkpoint(stage_name, d_stack, mps_tensors, energy_dict, mol, params, 
 
 def run_gdvr_dmrg_loop(
     mol, Lz, Nz, basis_cfg,
-    pre_opt_cycles=10,      
-    dmrg_cycles=3,          
+    pre_opt_cycles=10,
+    dmrg_cycles=3,
     dmrg_bond_dim=20,
     dmrg_sweeps=10,
     post_dmrg_opt_cycles=5,
-    abelian_symmetry = True,
-    checkpoint_dir = "."
+    abelian_symmetry=True,
+    checkpoint_dir="."
 ):
     """
-    This function differs from the muted one in the symmetry implementation, this version exploit the abelian symmetry, the old version is just stored in case reference is needed.
+    GDVR-DMRG macro loop.
 
-    Parameters
-    ----------
-    mol : _type_
-        _description_
-    Lz : _type_
-        _description_
-    Nz : _type_
-        _description_
-    basis_cfg : _type_
-        _description_
-    pre_opt_cycles : int, optional
-        _description_, by default 10
-    dmrg_cycles : int, optional
-        _description_, by default 3
-    dmrg_bond_dim : int, optional
-        _description_, by default 20
-    dmrg_sweeps : int, optional
-        _description_, by default 10
-    post_dmrg_opt_cycles : int, optional
-        _description_, by default 5
-    abelian_symmetry : bool, optional
-        _description_, by default True
-    checkpoint_dir : str, optional
-        _description_, by default "."
+    This version keeps the GDVR Hamiltonian in the spin-orbital d=2 chain:
+        site 2*i     = alpha spin orbital on DVR slice i
+        site 2*i + 1 = beta  spin orbital on DVR slice i
 
-    Returns
-    -------
-    _type_
-        _description_
+    The only symmetry update is to use the new SymmetryManager API:
+        SymmetryManager(phys_qns=..., target_qn=..., sym_types=...)
+    while keeping a small get_phys_qn adapter so the old HF guess helpers still work.
     """
-    logger.info("="*60)
+
+    logger.info("=" * 60)
     logger.info(f"GDVR-DMRG | Exact HF Guess Mode | abelian_symmetry={abelian_symmetry}")
     logger.info(f"System: {mol.nelec} e-, Nz={Nz}, Lz={Lz}")
-    logger.info("="*60)
-    
-    energy_log = {"hf_initial": None, "hf_pre_opt": [], "dmrg_cycles": [], "final_overlap": None}
+    logger.info("=" * 60)
+
+    energy_log = {
+        "hf_initial": None,
+        "hf_pre_opt": [],
+        "dmrg_cycles": [],
+        "final_overlap": None,
+    }
     run_params = {"Lz": Lz, "Nz": Nz, "basis": basis_cfg}
 
-    s_exps = basis_cfg.get('s'); p_exps = basis_cfg.get('p', []); d_exps = basis_cfg.get('d', [])
+    s_exps = basis_cfg.get("s")
+    p_exps = basis_cfg.get("p", [])
+    d_exps = basis_cfg.get("d", [])
+
     Hcore, z, dz, E_slices, C_list, _, _, _ = build_method2(
-        mol, Lz=Lz, Nz=Nz, M=1, s_exps=s_exps, p_exps=p_exps, d_exps=d_exps, verbose=False, dvr_method='sine'
+        mol,
+        Lz=Lz,
+        Nz=Nz,
+        M=1,
+        s_exps=s_exps,
+        p_exps=p_exps,
+        d_exps=d_exps,
+        verbose=False,
+        dvr_method="sine",
     )
-    
+
     nuclei = mol.to_tuples()
-    alphas, centers, labels = make_xy_spd_primitive_basis(nuclei, s_exps, p_exps, d_exps)
+    alphas, centers, labels = make_xy_spd_primitive_basis(
+        nuclei, s_exps, p_exps, d_exps
+    )
     S_prim = overlap_2d_cartesian(alphas, centers, labels)
     T_prim = kinetic_2d_cartesian(alphas, centers, labels)
     n_ao_2d = len(alphas)
-    
-    K_h = []; Kx_h = []
+
+    K_h = []
+    Kx_h = []
     for h in range(Nz):
         dz_val = h * dz
-        eri_tensor = eri_2d_cartesian_with_p(alphas, centers, labels, delta_z=dz_val)
+        eri_tensor = eri_2d_cartesian_with_p(
+            alphas, centers, labels, delta_z=dz_val
+        )
         n2 = n_ao_2d * n_ao_2d
         K_h.append(eri_tensor.reshape(n2, n2))
         Kx_h.append(eri_tensor.transpose(0, 2, 1, 3).reshape(n2, n2))
 
     ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list, K_h, Kx_h)
     Enuc = mol.nuclear_repulsion_energy()
-    Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
-    
+
+    Etot, _, Cmo, P, _ = scf_rhf_method2(
+        Hcore, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False
+    )
+
     logger.info(f"  -> Initial HF Energy: {Etot:.8f} Ha")
     energy_log["hf_initial"] = Etot
+
     d_stack = np.vstack([C_list[n][:, 0] for n in range(Nz)])
-    save_checkpoint("01_HF_Initial", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
-    
+    save_checkpoint(
+        "01_HF_Initial",
+        d_stack,
+        None,
+        energy_log,
+        mol,
+        run_params,
+        checkpoint_dir,
+    )
+
     _, Kz_grid, _ = sine_dvr_1d(-Lz, Lz, Nz)
-    ERIop = CollocatedERIOp.from_kernels(N=n_ao_2d, Nz=Nz, dz=dz, K_h=K_h, Kx_h=Kx_h)
-    h1_nm_func = build_h1_nm(Kz_grid, S_prim, T_prim, z, lambda zz: V_en_sp_total_at_z(alphas, centers, labels, nuclei, zz))
+    ERIop = CollocatedERIOp.from_kernels(
+        N=n_ao_2d,
+        Nz=Nz,
+        dz=dz,
+        K_h=K_h,
+        Kx_h=Kx_h,
+    )
+    h1_nm_func = build_h1_nm(
+        Kz_grid,
+        S_prim,
+        T_prim,
+        z,
+        lambda zz: V_en_sp_total_at_z(
+            alphas, centers, labels, nuclei, zz
+        ),
+    )
 
     if pre_opt_cycles > 0:
-        logger.info(f"\n[Phase A.5] Pre-optimization...")
+        logger.info("\n[Phase A.5] Pre-optimization...")
         nh_sweep = SweepNewtonHelper(h1_nm_func, S_prim, ERIop)
+
         for pcyc in range(pre_opt_cycles):
             P_slice = P.reshape(Nz, 1, Nz, 1)[:, 0, :, 0].copy()
-            d_stack = sweep_optimize_driver(
-                nh_sweep, d_stack, P_slice, S_prim, 
-                n_cycles=5, ridge=0.5, trust_step=1.0, trust_radius=2.0, verbose=False
-            )
-            Hcore_curr = rebuild_Hcore_from_d(d_stack, z, Kz_grid, S_prim, T_prim, alphas, centers, labels, nuclei)
-            C_list_curr = [d_stack[n].reshape(-1, 1) for n in range(Nz)]
-            ERI_J, ERI_K = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
-            Etot, _, Cmo, P, _ = scf_rhf_method2(Hcore_curr, ERI_J, ERI_K, Nz, 1, mol.nelec, Enuc, verbose=False)
-            energy_log["hf_pre_opt"].append(Etot)
-            if (pcyc + 1) % 2 == 0: logger.info(f"   Cycle {pcyc+1}: HF Energy = {Etot:.8f} Ha")
 
-    save_checkpoint("02_HF_NewtonOpt", d_stack, None, energy_log, mol, run_params, checkpoint_dir)
+            d_stack = sweep_optimize_driver(
+                nh_sweep,
+                d_stack,
+                P_slice,
+                S_prim,
+                n_cycles=5,
+                ridge=0.5,
+                trust_step=1.0,
+                trust_radius=2.0,
+                verbose=False,
+            )
+
+            Hcore_curr = rebuild_Hcore_from_d(
+                d_stack,
+                z,
+                Kz_grid,
+                S_prim,
+                T_prim,
+                alphas,
+                centers,
+                labels,
+                nuclei,
+            )
+            C_list_curr = [d_stack[n].reshape(-1, 1) for n in range(Nz)]
+            ERI_J, ERI_K = eri_JK_from_kernels_M1(
+                C_list_curr, K_h, Kx_h
+            )
+
+            Etot, _, Cmo, P, _ = scf_rhf_method2(
+                Hcore_curr,
+                ERI_J,
+                ERI_K,
+                Nz,
+                1,
+                mol.nelec,
+                Enuc,
+                verbose=False,
+            )
+
+            energy_log["hf_pre_opt"].append(Etot)
+
+            if (pcyc + 1) % 2 == 0:
+                logger.info(
+                    f"   Cycle {pcyc + 1}: HF Energy = {Etot:.8f} Ha"
+                )
+
+    save_checkpoint(
+        "02_HF_NewtonOpt",
+        d_stack,
+        None,
+        energy_log,
+        mol,
+        run_params,
+        checkpoint_dir,
+    )
 
     if abelian_symmetry:
-        from pyqed.mps.mps import dense_to_symmetric_mpo, SymmetryManager
-        sym_mgr = SymmetryManager(['charge', 'sz'])
-        logger.info(f"  [Symmetry] Manager initialized: {sym_mgr.sym_types}")
-        
-        # Pre-calculate Site QN Maps for MPO Conversion
-        # Spin-orbital mapping: Even=Up, Odd=Down
+        from pyqed.mps.mps import dense_to_symmetric_mpo
+        from pyqed.mps.symmetry import QN, SymmetryManager
+
+        sym_types = ["charge", "sz"]
+
+        q_emp = QN(0, 0)
+        q_up  = QN(1, 1)
+        q_dn  = QN(1, -1)
+
+        target_qn = QN(int(mol.nelec), int(mol.spin))
+
         site_qn_maps = []
-        for i in range(2 * Nz):
-            # i is the spin-orbital index. 
-            # If i%2==0 (Up), Occ=(1, 1). If i%2==1 (Down), Occ=(1, -1)
-            # 'emp' is always (0, 0)
-            q_emp = sym_mgr.get_phys_qn(i, 'emp')
-            q_occ = sym_mgr.get_phys_qn(i, 'occ')
-            site_qn_maps.append({0: q_emp, 1: q_occ})
+        for p in range(2 * Nz):
+            if p % 2 == 0:
+                # alpha spin-orbital site
+                site_qn_maps.append({0: q_emp, 1: q_up})
+            else:
+                # beta spin-orbital site
+                site_qn_maps.append({0: q_emp, 1: q_dn})
+
+        # IMPORTANT:
+        # Do NOT use [q_emp, q_up, q_dn].
+        # That makes len(sym_mgr.phys_qns) = 3 and breaks make_rdm1.
+        #
+        # For spin-orbital d=2 sites, the local physical dimension is always 2:
+        #     |0>, |1>
+        # The true QN of |1> is site-dependent and is stored in site_qn_maps.
+        phys_qns = [q_emp, q_up]
+
+        sym_mgr = SymmetryManager(
+            phys_qns=phys_qns,
+            target_qn=target_qn,
+            sym_types=sym_types,
+        )
+
+        # Store the real site-dependent maps on sym_mgr for RDM/MPO builders.
+        sym_mgr.site_qn_maps = site_qn_maps
+
+        # Backward-compatible adapter for old GDVR helper functions.
+        def _get_phys_qn(site, state):
+            if state in ("emp", "empty", 0):
+                return site_qn_maps[site][0]
+            if state in ("occ", "occupied", 1):
+                return site_qn_maps[site][1]
+            raise ValueError(f"Unknown local state {state}")
+
+        sym_mgr.get_phys_qn = _get_phys_qn
+
+        logger.info("  [Symmetry] New SymmetryManager initialized.")
+        logger.info(f"             sym_types = {sym_types}")
+        logger.info(f"             target_qn = {target_qn}")
+        logger.info("             GDVR chain = spin-orbital d=2")
+        logger.info("             local d = 2; occupied QN is site-dependent")
+
     else:
         sym_mgr = None
         site_qn_maps = None
+        target_qn = None
 
-    last_mps_tensors = None 
+    last_mps_tensors = None
     d_stack_old = d_stack.copy()
     final_dmrg_energy = 0.0
     final_Cmo = None
-    
+
     for cycle in range(dmrg_cycles):
-        logger.info(f"\n[Macro Cycle {cycle+1}/{dmrg_cycles}]")
+        logger.info(f"\n[Macro Cycle {cycle + 1}/{dmrg_cycles}]")
+
         d_stack, _ = align_orbital_phases(d_stack_old, d_stack, S_prim)
         d_stack_old = d_stack.copy()
-        
-        Hcore_curr = rebuild_Hcore_from_d(d_stack, z, Kz_grid, S_prim, T_prim, alphas, centers, labels, nuclei)
+
+        Hcore_curr = rebuild_Hcore_from_d(
+            d_stack,
+            z,
+            Kz_grid,
+            S_prim,
+            T_prim,
+            alphas,
+            centers,
+            labels,
+            nuclei,
+        )
         C_list_curr = [d_stack[n].reshape(-1, 1) for n in range(Nz)]
         V_coul, V_exch = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
-        V_coul = np.array(V_coul) 
-        
-        # Build MPO
+        V_coul = np.array(V_coul)
+
         ham_terms = []
+
         rows, cols = np.nonzero(np.abs(Hcore_curr) > 1e-10)
         for i, j in zip(rows, cols):
             val = Hcore_curr[i, j]
-            ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*i, 2*j], val))
-            ham_terms.append(get_jw_term_robust([r"a^\dagger", "a"], [2*i+1, 2*j+1], val))
-        
+            ham_terms.append(
+                get_jw_term_robust(
+                    [r"a^\dagger", "a"],
+                    [2 * i, 2 * j],
+                    val,
+                )
+            )
+            ham_terms.append(
+                get_jw_term_robust(
+                    [r"a^\dagger", "a"],
+                    [2 * i + 1, 2 * j + 1],
+                    val,
+                )
+            )
+
         rows, cols = np.nonzero(np.abs(V_coul) > 1e-10)
         for i, k in zip(rows, cols):
-            if i == k: 
+            if i == k:
                 val = V_coul[i, k]
-                ham_terms.append(Op("n", 2*i) * Op("n", 2*i+1) * val)
-            else: 
+                ham_terms.append(Op("n", 2 * i) * Op("n", 2 * i + 1) * val)
+            else:
                 val = 0.5 * V_coul[i, k]
-                ham_terms.append(Op("n", 2*i) * Op("n", 2*k) * val)     
-                ham_terms.append(Op("n", 2*i+1) * Op("n", 2*k+1) * val) 
-                ham_terms.append(Op("n", 2*i) * Op("n", 2*k+1) * val)   
-                ham_terms.append(Op("n", 2*i+1) * Op("n", 2*k) * val)   
-        
-        basis = [BasisSimpleElectron(i) for i in range(2*Nz)]
+                ham_terms.append(Op("n", 2 * i) * Op("n", 2 * k) * val)
+                ham_terms.append(
+                    Op("n", 2 * i + 1) * Op("n", 2 * k + 1) * val
+                )
+                ham_terms.append(
+                    Op("n", 2 * i) * Op("n", 2 * k + 1) * val
+                )
+                ham_terms.append(
+                    Op("n", 2 * i + 1) * Op("n", 2 * k) * val
+                )
+
+        basis = [BasisSimpleElectron(i) for i in range(2 * Nz)]
         model = Model(basis=basis, ham_terms=ham_terms)
+
         mpo = Mpo(model, algo="qr")
-        # Transpose to (L, R, Out, In) for standard converter
+
+        # Convert AutoMPO tensor layout to DMRG layout:
+        # expected dense layout = (left, right, physical_out, physical_in)
         mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
+
         for w in mpo_dmrg:
             w[np.abs(w) < 1e-10] = 0.0
+
         if abelian_symmetry:
-            from pyqed.mps.mps import dense_to_symmetric_mpo
             final_H = dense_to_symmetric_mpo(mpo_dmrg, site_qn_maps)
         else:
             final_H = mpo_dmrg
-        
+
         if last_mps_tensors is None:
             if abelian_symmetry:
-                # Use Symmetric Exact HF Guess
+                # This still uses your old helper functions.
+                # The adapter sym_mgr.get_phys_qn(...) makes them compatible.
                 mps_guess = generate_exact_hf_guess(mol, Cmo, Nz, sym_mgr)
             else:
-                # Use Dense Noisy Guess
-                mps_guess = mps_lib.get_noisy_hf_guess(mol.nelec, 2*Nz)
+                mps_guess = mps_lib.get_noisy_hf_guess(mol.nelec, 2 * Nz)
         else:
             mps_guess = [t.copy() for t in last_mps_tensors]
-        
-        logger.info(f"  3. Running DMRG (D={dmrg_bond_dim})...")
-        
-        target_qn = None
-        if abelian_symmetry:
-            target_qn = sym_mgr.get_target_qn(mol.nelec, 2*mol.spin)
 
-        solver = dmrg_lib.DMRG(
-            final_H, 
-            D=dmrg_bond_dim, 
-            nsweeps=dmrg_sweeps, 
-            init_guess=mps_guess, 
-            symmetry=abelian_symmetry, 
-            charge = mol.nelec,
-            spin=2*mol.spin,
-            # sym_mgr = sym_mgr,
-            # target_qn=target_qn,
-            not_conv_err=False,
-        )
+        logger.info(f"  3. Running DMRG (D={dmrg_bond_dim})...")
+
+        if abelian_symmetry:
+            solver = dmrg_lib.DMRG(
+                final_H,
+                D=dmrg_bond_dim,
+                nsweeps=dmrg_sweeps,
+                init_guess=mps_guess,
+                symmetry=True,
+                sym_mgr=sym_mgr,
+                target_qn=target_qn,
+                not_conv_err=False,
+            )
+        else:
+            solver = dmrg_lib.DMRG(
+                final_H,
+                D=dmrg_bond_dim,
+                nsweeps=dmrg_sweeps,
+                init_guess=mps_guess,
+                symmetry=False,
+                not_conv_err=False,
+            )
+
         solver.run()
-        
+
         try:
             psi_tensors = solver.ground_state.Bs
             e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
             e_dmrg = np.real(e_elec) + Enuc
-        except:
+        except Exception:
             e_dmrg = solver.e_tot + Enuc
-            
+
         last_mps_tensors = solver.ground_state.Bs
         final_dmrg_energy = e_dmrg
-        logger.info(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")
-        
-        if cycle == 0:
-            save_checkpoint("03_DMRG_FirstIter", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
 
-        if cycle < dmrg_cycles - 1: 
-            logger.info("  4. Re-optimizing AOs using DMRG 1-RDM...")
-            d_stack = gdvr_dmrg_scf.dmrg_ao_optimization_step(
-                mol, d_stack, sym_mgr, S_prim, ERIop, h1_nm_func,
-                z, Kz_grid, T_prim, alphas, centers, labels, K_h, Kx_h, 
-                solver=solver, Enuc=Enuc, n_cycles=post_dmrg_opt_cycles, verbose=True
+        logger.info(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")
+
+        if cycle == 0:
+            save_checkpoint(
+                "03_DMRG_FirstIter",
+                d_stack,
+                last_mps_tensors,
+                energy_log,
+                mol,
+                run_params,
+                checkpoint_dir,
             )
-            energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": True})
+
+        if cycle < dmrg_cycles - 1:
+            logger.info("  4. Re-optimizing AOs using DMRG 1-RDM...")
+
+            d_stack = gdvr_dmrg_scf.dmrg_ao_optimization_step(
+                mol,
+                d_stack,
+                sym_mgr,
+                S_prim,
+                ERIop,
+                h1_nm_func,
+                z,
+                Kz_grid,
+                T_prim,
+                alphas,
+                centers,
+                labels,
+                K_h,
+                Kx_h,
+                solver=solver,
+                Enuc=Enuc,
+                n_cycles=post_dmrg_opt_cycles,
+                verbose=True,
+            )
+
+            energy_log["dmrg_cycles"].append(
+                {"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": True}
+            )
+
         else:
-            energy_log["dmrg_cycles"].append({"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": False})
+            energy_log["dmrg_cycles"].append(
+                {"cycle": cycle, "e_dmrg": e_dmrg, "ao_opt": False}
+            )
+
             logger.info("  4. Calculating final RHF solution for Overlap analysis...")
-            ERI_J_fin, ERI_K_fin = eri_JK_from_kernels_M1(C_list_curr, K_h, Kx_h)
-            _, _, final_Cmo, _, _ = scf_rhf_method2(Hcore_curr, ERI_J_fin, ERI_K_fin, Nz, 1, mol.nelec, Enuc, verbose=False)
+
+            ERI_J_fin, ERI_K_fin = eri_JK_from_kernels_M1(
+                C_list_curr, K_h, Kx_h
+            )
+            _, _, final_Cmo, _, _ = scf_rhf_method2(
+                Hcore_curr,
+                ERI_J_fin,
+                ERI_K_fin,
+                Nz,
+                1,
+                mol.nelec,
+                Enuc,
+                verbose=False,
+            )
 
     final_overlap = 0.0
+
     try:
         if final_Cmo is not None and last_mps_tensors is not None:
-            logger.info("\n" + "-"*30)
+            logger.info("\n" + "-" * 30)
             logger.info("Calculating Final Overlap...")
-            final_overlap = calculate_overlap_with_hf_robust(last_mps_tensors, final_Cmo, range(mol.nelec // 2), Nz)
-            logger.info(f"Overlap |S|^2 : {abs(final_overlap)**2:.6f}")
+
+            final_overlap = calculate_overlap_with_hf_robust(
+                last_mps_tensors,
+                final_Cmo,
+                range(mol.nelec // 2),
+                Nz,
+            )
+
+            logger.info(f"Overlap |S|^2 : {abs(final_overlap) ** 2:.6f}")
+
     except Exception as e:
-        logger.info(f"Overlap calculation failed (returning 0.0): {e}")
+        logger.info(f"Overlap calculation failed, returning 0.0: {e}")
         final_overlap = 0.0
-    
+
     energy_log["final_overlap"] = final_overlap
-    save_checkpoint("04_DMRG_Final", d_stack, last_mps_tensors, energy_log, mol, run_params, checkpoint_dir)
+
+    save_checkpoint(
+        "04_DMRG_Final",
+        d_stack,
+        last_mps_tensors,
+        energy_log,
+        mol,
+        run_params,
+        checkpoint_dir,
+    )
+
     return final_dmrg_energy, final_overlap
 
 if __name__ == "__main__":
@@ -821,7 +1034,7 @@ if __name__ == "__main__":
     checkpoint_path = os.path.join(master_dir)
     
     E, S = run_gdvr_dmrg_loop(
-        mol, Lz=6.0, Nz=128, basis_cfg=basis_cfg,
+        mol, Lz=6, Nz=7, basis_cfg=basis_cfg,
         pre_opt_cycles=10, dmrg_cycles=4, dmrg_bond_dim=40, dmrg_sweeps=10, post_dmrg_opt_cycles=10,
         abelian_symmetry=True, checkpoint_dir=checkpoint_path
     )

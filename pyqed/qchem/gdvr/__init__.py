@@ -2,7 +2,7 @@ from .rhf import *  # noqa: F401,F403
 from .integrals import two_electron_wedge_basis, two_electron_wedge_kinetic  # noqa: F401
 from .rttdhf import RTTDHF, cap_operator_from_z  # noqa: F401
 from .tddmrg import (  # noqa: F401
-    GDVRActiveSpaceTDDMRG,
+    ActiveSpaceTDDMRG,
     GDVRSpatialDensityPhase,
     GDVRSpatialFactorizedDensityPhase,
     GDVRSpatialGroupedPairDensityPhase,
@@ -35,4 +35,5 @@ from .tddmrg import (  # noqa: F401
     gdvr_spatial_hamiltonian_term_map,
     gdvr_z_operator,
     prony_exponential_fit,
+    rhf_determinant_mps,
 )

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from types import SimpleNamespace
 from scipy.linalg import expm
 
@@ -29,6 +30,7 @@ from pyqed.qchem.gdvr import (
     GDVRSpatialFactorizedDensityPhase,
     GDVRSpatialTaylorDensityPhase,
     prony_exponential_fit,
+    rhf_determinant_mps,
 )
 
 
@@ -462,6 +464,32 @@ def test_gdvr_tddmrg_runs_against_direct_mpo():
 
     reversal = td.time_reversal_error(dt=0.01, steps=2)
     assert reversal["state_error"] < 1.0e-10
+
+
+def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_public():
+    mf = _ToyGDVRRHF()
+    angle = 0.37
+    c = np.cos(angle)
+    s = np.sin(angle)
+    mf.mo_coeff = np.array([[c, -s], [s, c]])
+    mf.dm = 2.0 * mf.mo_coeff[:, :1] @ mf.mo_coeff[:, :1].T
+
+    with pytest.raises(TypeError):
+        TDDMRG(mf, D=8, init_guess="random")
+
+    td = TDDMRG(mf, D=8).build()
+    actual = td._default_initial_state()
+    expected = rhf_determinant_mps(mf, max_bond=8)
+    product = MPS(td.get_initial_guess_dense(noise=0.0), labels=["lv", "p", "rv"]).normalize()
+
+    actual_vec = np.asarray(tt_to_tensor(actual.factors), dtype=complex).reshape(-1)
+    expected_vec = np.asarray(tt_to_tensor(expected.factors), dtype=complex).reshape(-1)
+    product_vec = np.asarray(tt_to_tensor(product.factors), dtype=complex).reshape(-1)
+
+    overlap = abs(np.vdot(expected_vec, actual_vec))
+    product_overlap = abs(np.vdot(product_vec, actual_vec))
+    np.testing.assert_allclose(overlap, 1.0, atol=1.0e-12)
+    assert product_overlap < 0.99
 
 
 def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():

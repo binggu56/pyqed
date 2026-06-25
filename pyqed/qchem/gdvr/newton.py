@@ -17,8 +17,8 @@ class CollocatedERIOp:
         self.N  = int(N)
         self.Nz = int(Nz)
         self.dz = float(dz)
-        self.K_h  = [None if K is None else np.asarray(K, float) for K in K_h]
-        self.Kx_h = [None if K is None else np.asarray(K, float) for K in Kx_h]
+        self.K_h  = list(K_h)
+        self.Kx_h = list(Kx_h)
         assert len(self.K_h)  >= self.Nz
         assert len(self.Kx_h) >= self.Nz
         self.active_h = tuple(
@@ -31,17 +31,6 @@ class CollocatedERIOp:
             self.max_active_h = int(max(self.active_h))
         else:
             self.max_active_h = -1
-        self.K_nl_km = [None for _ in range(self.Nz)]
-        self.K_nk_ml = [None for _ in range(self.Nz)]
-        self.K_nl_mk = [None for _ in range(self.Nz)]
-        n2 = self.N * self.N
-        for h in self.active_h:
-            K4 = self.K_h[h].reshape(self.N, self.N, self.N, self.N)
-            self.K_h[h] = np.ascontiguousarray(self.K_h[h].reshape(n2, n2))
-            self.Kx_h[h] = np.ascontiguousarray(self.Kx_h[h].reshape(n2, n2))
-            self.K_nl_km[h] = np.ascontiguousarray(K4.transpose(0, 3, 2, 1).reshape(n2, n2))
-            self.K_nk_ml[h] = self.Kx_h[h]
-            self.K_nl_mk[h] = np.ascontiguousarray(K4.transpose(0, 3, 1, 2).reshape(n2, n2))
 
     def offset_is_active(self, h):
         h = int(abs(h))
@@ -64,14 +53,6 @@ class CollocatedERIOp:
         return CollocatedERIOp(N, Nz, dz, K_h, Kx_h)
 
     # ---- 4D reshaping + contractions ----
-    def _pair_vec(self, left, right):
-        return np.multiply.outer(left, right).reshape(-1)
-
-    def _mat_contract(self, matrix, d_k, d_l):
-        if matrix is None:
-            return np.zeros((self.N, self.N), float)
-        return (matrix @ self._pair_vec(d_k, d_l)).reshape(self.N, self.N)
-
     def _K4(self, n, k):
         """Return (ij|kl) 4-tensor [μ,ν,λ,σ] for offset h=|n-k|."""
         h = abs(n - k)
@@ -91,25 +72,35 @@ class CollocatedERIOp:
         # (nm|kl) ≠ 0 only if m=n and l=k
         if (m != n) or (l != k):
             return np.zeros((self.N, self.N), float)
-        return self._mat_contract(self.K_h[abs(n - k)], d_k, d_k)  # note: d_k twice
+        return self._contract(self._K4(n, k), d_k, d_k)  # note: d_k twice
 
     def block_nl__km(self, n, m, k, l, d_k, d_l):
         # (nl|km) ≠ 0 only if l=n and k=m
         if (l != n) or (k != m):
             return np.zeros((self.N, self.N), float)
-        return self._mat_contract(self.K_nl_km[abs(n - k)], d_k, d_l)
+        # here d_k = d_m, d_l = d_n by the call site if you want
+        K4 = self._K4(n, k)
+        if K4 is None:
+            return np.zeros((self.N, self.N), float)
+        return self._contract(K4.transpose(0,3,2,1), d_k, d_l)
 
     def block_nk__ml(self, n, m, k, l, d_k, d_l):
         # (nk|ml) ≠ 0 only if k=n and l=m
         if (k != n) or (l != m):
             return np.zeros((self.N, self.N), float)
-        return self._mat_contract(self.K_nk_ml[abs(n - k)], d_k, d_l)
+        K4 = self._K4(n, k)
+        if K4 is None:
+            return np.zeros((self.N, self.N), float)
+        return self._contract(K4.transpose(0,2,1,3), d_k, d_l)
 
     def block_nl__mk(self, n, m, k, l, d_k, d_l):
         # (nl|mk) ≠ 0 only if l=n and m=k
         if (l != n) or (m != k):
             return np.zeros((self.N, self.N), float)
-        return self._mat_contract(self.K_nl_mk[abs(n - k)], d_k, d_l)
+        K4 = self._K4(n, k)
+        if K4 is None:
+            return np.zeros((self.N, self.N), float)
+        return self._contract(K4.transpose(0,3,1,2), d_k, d_l)
 
 
     # Optional: fixed-P surrogate two-electron energy (slow; debug only)

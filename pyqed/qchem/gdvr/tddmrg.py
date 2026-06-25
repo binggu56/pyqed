@@ -364,6 +364,16 @@ def _spatial_det_sign(alpha_occ, beta_occ):
     return -1.0 if (n_cross % 2) else 1.0
 
 
+def _two_orbital_minor(transform, rows, cols):
+    rows = np.asarray(rows, dtype=int)
+    cols = np.asarray(cols, dtype=int)
+    if rows.size == 0:
+        return 1.0
+    if rows.size == 1:
+        return transform[rows[0], cols[0]]
+    return transform[rows[0], cols[0]] * transform[rows[1], cols[1]] - transform[rows[0], cols[1]] * transform[rows[1], cols[0]]
+
+
 def _two_orbital_spatial_transform_gate(transform):
     transform = np.asarray(transform, dtype=complex)
     if transform.shape != (2, 2):
@@ -400,16 +410,8 @@ def _two_orbital_spatial_transform_gate(transform):
             if len(out_alpha) != len(in_alpha) or len(out_beta) != len(in_beta):
                 continue
             in_sign = _spatial_det_sign(in_alpha_bits, in_beta_bits)
-            alpha_val = (
-                np.linalg.det(transform[np.ix_(out_alpha, in_alpha)])
-                if len(out_alpha)
-                else 1.0
-            )
-            beta_val = (
-                np.linalg.det(transform[np.ix_(out_beta, in_beta)])
-                if len(out_beta)
-                else 1.0
-            )
+            alpha_val = _two_orbital_minor(transform, out_alpha, in_alpha)
+            beta_val = _two_orbital_minor(transform, out_beta, in_beta)
             dense[out_idx, in_idx] = out_sign * in_sign * alpha_val * beta_val
     return dense.reshape(4, 4, 4, 4)
 
@@ -518,6 +520,77 @@ def apply_gdvr_spatial_one_body_rotation(
     """Apply ``exp(-i dt sum_sigma h_pq c^dag_p_sigma c_q_sigma)`` to an MPS."""
     return GDVRSpatialOneBodyRotation(hcore, dt).apply(
         psi,
+        max_bond=max_bond,
+        cutoff=cutoff,
+    )
+
+
+def _spatial_product_mps(nsites, nelec, *, spin=0):
+    nelec = int(nelec)
+    spin = 0 if spin is None else int(spin)
+    n_double = nelec // 2
+    has_single = nelec % 2
+    single_state = 1 if spin >= 0 else 2
+    factors = []
+    for site in range(int(nsites)):
+        core = np.zeros((1, 4, 1), dtype=complex)
+        if site < n_double:
+            local = 3
+        elif site == n_double and has_single:
+            local = single_state
+        else:
+            local = 0
+        core[0, local, 0] = 1.0
+        factors.append(core)
+    return MPS(factors, labels=["lv", "p", "rv"])
+
+
+def _apply_spatial_orbital_transform(psi, transform, *, max_bond=None, cutoff=1.0e-12):
+    transform = np.asarray(transform, dtype=complex)
+    if transform.ndim != 2 or transform.shape[0] != transform.shape[1]:
+        raise ValueError("orbital transform must be a square matrix.")
+    if not np.allclose(transform.conj().T @ transform, np.eye(transform.shape[1]), atol=1.0e-8):
+        u, _, vh = np.linalg.svd(transform, full_matrices=False)
+        transform = u @ vh
+
+    diagonal, rotations = _adjacent_givens_decomposition(transform)
+    out = psi.copy().to_order(["lv", "p", "rv"])
+    for site, value in enumerate(diagonal):
+        out = _apply_one_site_phase(out, site, _spatial_occupation_phase_values(value))
+    for site, givens in reversed(rotations):
+        gate = _two_orbital_spatial_transform_gate(givens.conj().T)
+        out = _apply_adjacent_two_site_gate(
+            out,
+            site,
+            gate,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+    return out.normalize()
+
+
+def rhf_determinant_mps(mf, *, max_bond=None, cutoff=1.0e-12):
+    """Return the closed-shell RHF determinant as a spatial-site GDVR MPS."""
+    coeff = np.asarray(mf.mo_coeff, dtype=complex)
+    occ = np.asarray(mf.mo_occ, dtype=float).reshape(-1)
+    if coeff.ndim != 2 or coeff.shape[0] != coeff.shape[1] or occ.shape != (coeff.shape[1],):
+        raise ValueError("RHF mo_coeff/mo_occ have inconsistent shapes.")
+
+    occ_idx = np.flatnonzero(occ > 1.0e-8)
+    if not np.allclose(occ[occ_idx], 2.0, atol=1.0e-8):
+        raise ValueError("RHF determinant initializer currently expects closed-shell occupations.")
+
+    order = np.concatenate(
+        (occ_idx, np.setdiff1d(np.arange(coeff.shape[1]), occ_idx, assume_unique=True))
+    )
+    base = _spatial_product_mps(
+        coeff.shape[1],
+        int(round(np.sum(occ))),
+        spin=getattr(mf.mol, "spin", 0),
+    )
+    return _apply_spatial_orbital_transform(
+        base,
+        coeff[:, order],
         max_bond=max_bond,
         cutoff=cutoff,
     )
@@ -1847,7 +1920,7 @@ class GDVRMeanFieldAdapter:
         raise ValueError("basis must be 'ao' or 'mo'.")
 
 
-class GDVRActiveSpaceTDDMRG(BaseTDDMRG):
+class ActiveSpaceTDDMRG(BaseTDDMRG):
     """
     Active-space time-dependent DMRG on top of a converged GDVR RHF reference.
 
@@ -1862,7 +1935,6 @@ class GDVRActiveSpaceTDDMRG(BaseTDDMRG):
         ncas,
         nelecas,
         D,
-        init_guess="hf",
         m_warmup=None,
         spin=None,
         tol=1e-6,
@@ -1895,7 +1967,7 @@ class GDVRActiveSpaceTDDMRG(BaseTDDMRG):
             ncas=ncas,
             nelecas=nelecas,
             D=D,
-            init_guess=init_guess,
+            init_guess="hf",
             m_warmup=m_warmup,
             spin=spin,
             tol=tol,
@@ -1959,7 +2031,6 @@ class TDDMRG(BaseTDDMRG):
         mf,
         D,
         nelecas=None,
-        init_guess="hf",
         m_warmup=None,
         spin=None,
         tol=1e-6,
@@ -1975,7 +2046,7 @@ class TDDMRG(BaseTDDMRG):
             nelecas = int(mol.nelec)
         nelecas_int = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
         if nelecas_int != int(mol.nelec):
-            raise ValueError("Direct GDVR-TDDMRG currently propagates all GDVR electrons; use GDVRActiveSpaceTDDMRG for CAS runs.")
+            raise ValueError("Direct GDVR-TDDMRG currently propagates all GDVR electrons; use ActiveSpaceTDDMRG for CAS runs.")
         if spin is None:
             spin = 0 if getattr(mol, "spin", None) is None else mol.spin
 
@@ -1985,7 +2056,7 @@ class TDDMRG(BaseTDDMRG):
             ncas=nspatial,
             nelecas=nelecas,
             D=D,
-            init_guess=init_guess,
+            init_guess=rhf_determinant_mps(mf, max_bond=D),
             m_warmup=m_warmup,
             spin=spin,
             tol=tol,
@@ -1999,6 +2070,16 @@ class TDDMRG(BaseTDDMRG):
         self.gdvr_mf = mf
         self.gdvr_mpo_cutoff = float(cutoff)
         self.gdvr_symbolic_algo = str(symbolic_algo)
+
+    def _default_initial_state(self):
+        if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
+            return self.export_initial_guess(dense=True)
+
+        return rhf_determinant_mps(self.gdvr_mf, max_bond=self.D)
+
+    def default_initial_condition(self):
+        """Return the default real-time initial condition for ``run(psi0=...)``."""
+        return self._default_initial_state()
 
     def build(self, mo_coeff=None):
         if mo_coeff is not None:
