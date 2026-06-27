@@ -292,7 +292,8 @@ def run_case(args):
 
     print(
         f"[build] {system_label} GDVR R={spacing:g} bohr "
-        f"extent={chain_extent:g} margin={edge_margin:g} Lz={args.lz:g} Nz={args.nz} M={args.m}"
+        f"extent={chain_extent:g} margin={edge_margin:g} Lz={args.lz:g} Nz={args.nz} M={args.m} "
+        f"transverse_basis={args.transverse_basis or 'default'} TOO={bool(args.transverse_opt)}"
     )
     start = walltime.perf_counter()
     mol = build_hchain(args)
@@ -646,17 +647,25 @@ def main(argv=None):
     parser.add_argument("--lz", type=float, default=10.0)
     parser.add_argument("--nz", type=int, default=32)
     parser.add_argument("--m", type=int, default=1)
-    parser.add_argument("--transverse-basis", default=None)
+    parser.add_argument(
+        "--transverse-basis",
+        default=None,
+        help="Named transverse primitive basis; default uses the element-specific built-in GDVR basis.",
+    )
     parser.add_argument("--dvr-method", choices=("sine", "exp", "sinc"), default="sine")
     parser.add_argument("--scf-conv", type=float, default=1.0e-8)
     parser.add_argument("--scf-max-iter", type=int, default=100)
-    parser.add_argument("--transverse-opt", action="store_true")
-    parser.add_argument("--transverse-opt-cycles", type=int, default=10)
-    parser.add_argument("--transverse-opt-sweeps", type=int, default=1)
-    parser.add_argument("--transverse-opt-tol", type=float, default=1.0e-7)
-    parser.add_argument("--transverse-opt-ridge", type=float, default=0.5)
-    parser.add_argument("--transverse-opt-step", type=float, default=0.5)
-    parser.add_argument("--transverse-opt-radius", type=float, default=1.0)
+    parser.add_argument(
+        "--transverse-opt",
+        action="store_true",
+        help="Run M=1 transverse orbital optimization after RHF and before TDDMRG.",
+    )
+    parser.add_argument("--transverse-opt-cycles", type=int, default=10, help="Maximum TOO/RHF alternation cycles.")
+    parser.add_argument("--transverse-opt-sweeps", type=int, default=1, help="Newton sweep passes per TOO cycle.")
+    parser.add_argument("--transverse-opt-tol", type=float, default=1.0e-7, help="TOO energy convergence tolerance.")
+    parser.add_argument("--transverse-opt-ridge", type=float, default=0.5, help="Ridge shift for the TOO Newton solve.")
+    parser.add_argument("--transverse-opt-step", type=float, default=0.5, help="Trust step for each TOO Newton update.")
+    parser.add_argument("--transverse-opt-radius", type=float, default=1.0, help="Trust radius for the TOO sweep update.")
     parser.add_argument("--bond", type=int, default=64)
     parser.add_argument("--td-bond", type=int, default=None)
     parser.add_argument("--skip-dmrg", action="store_true")
