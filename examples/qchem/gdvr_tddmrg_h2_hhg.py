@@ -80,6 +80,7 @@ def build_hchain(args):
         Lz=args.lz,
         Nz=args.nz,
         M=args.m,
+        transverse_basis=args.transverse_basis,
         dvr_method=args.dvr_method,
         verbose=args.verbose,
     )
@@ -273,6 +274,9 @@ def plot_case(path, trace, analysis, summary, tdhf=None, tdhf_analysis=None):
 
 
 def run_case(args):
+    if bool(args.transverse_opt) and int(args.m) != 1:
+        raise ValueError("--transverse-opt currently requires --m 1.")
+
     elements, _coords, spacing, chain_extent, edge_margin = chain_geometry(args)
     system_label = f"H{len(elements)}"
     tag = (
@@ -281,6 +285,8 @@ def run_case(args):
         f"d{int(args.bond)}_dt{_clean_float(args.dt)}_e{_clean_float(args.field)}_"
         f"{args.pulse_shape}"
     )
+    if bool(args.transverse_opt):
+        tag += "_too"
     prefix = Path(args.outdir) / tag
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
@@ -296,6 +302,24 @@ def run_case(args):
     start = walltime.perf_counter()
     mf = mol.RHF().run(conv=args.scf_conv, max_iter=args.scf_max_iter, verbose=args.verbose)
     scf_seconds = walltime.perf_counter() - start
+    e_before_transverse_opt = None
+    transverse_opt_seconds = 0.0
+    if bool(args.transverse_opt):
+        print("[too] transverse orbital optimization")
+        e_before_transverse_opt = float(mf.e_tot)
+        start = walltime.perf_counter()
+        mf.newton(
+            tol=float(args.transverse_opt_tol),
+            max_cycles=int(args.transverse_opt_cycles),
+            sweep_iterations=int(args.transverse_opt_sweeps),
+            ridge=float(args.transverse_opt_ridge),
+            trust_step=float(args.transverse_opt_step),
+            trust_radius=float(args.transverse_opt_radius),
+            scf_conv=float(args.scf_conv),
+            scf_max_iter=int(args.scf_max_iter),
+            verbose=bool(args.verbose),
+        )
+        transverse_opt_seconds = walltime.perf_counter() - start
 
     pulse = build_pulse(args)
     if args.steps is None:
@@ -478,6 +502,7 @@ def run_case(args):
             "Nz": int(args.nz),
             "M": int(args.m),
             "dz_bohr": float(mol.dz),
+            "transverse_basis": None if args.transverse_basis is None else str(args.transverse_basis),
             "spacing_bohr": float(spacing),
             "bond_bohr": float(spacing),
             "chain_extent_bohr": float(chain_extent),
@@ -501,6 +526,16 @@ def run_case(args):
             "tdvp_projection_backend": None if projection_backend is None else str(projection_backend),
             "skip_dmrg": bool(args.skip_dmrg),
             "RHF_energy_ha": float(mf.e_tot),
+            "RHF_energy_before_transverse_opt_ha": e_before_transverse_opt,
+            "transverse_opt": {
+                "enabled": bool(args.transverse_opt),
+                "seconds": float(transverse_opt_seconds),
+                "cycles": int(mf.info.get("newton_cycles", 0)) if bool(args.transverse_opt) else 0,
+                "converged": bool(mf.info.get("newton_converged", False)) if bool(args.transverse_opt) else False,
+                "history_Ha": [
+                    float(x) for x in mf.info.get("newton_energy_history", [])
+                ] if bool(args.transverse_opt) else [],
+            },
             "DMRG_energy_ha": None if args.skip_dmrg else float(td.e_tot),
             "max_abs_induced_dipole_z_au": float(np.max(np.abs(mu - float(mu[0])))),
             "acceleration_observable": str(args.acceleration_observable),
@@ -531,6 +566,7 @@ def run_case(args):
         "timing_seconds": {
             "build": float(build_seconds),
             "scf": float(scf_seconds),
+            "transverse_opt": float(transverse_opt_seconds),
             "acceleration_mpo": accel_mpo_build_seconds,
             "tddmrg": float(tddmrg_seconds),
             "tdhf": None if tdhf_seconds is None else float(tdhf_seconds),
@@ -610,9 +646,17 @@ def main(argv=None):
     parser.add_argument("--lz", type=float, default=10.0)
     parser.add_argument("--nz", type=int, default=32)
     parser.add_argument("--m", type=int, default=1)
+    parser.add_argument("--transverse-basis", default=None)
     parser.add_argument("--dvr-method", choices=("sine", "exp", "sinc"), default="sine")
     parser.add_argument("--scf-conv", type=float, default=1.0e-8)
     parser.add_argument("--scf-max-iter", type=int, default=100)
+    parser.add_argument("--transverse-opt", action="store_true")
+    parser.add_argument("--transverse-opt-cycles", type=int, default=10)
+    parser.add_argument("--transverse-opt-sweeps", type=int, default=1)
+    parser.add_argument("--transverse-opt-tol", type=float, default=1.0e-7)
+    parser.add_argument("--transverse-opt-ridge", type=float, default=0.5)
+    parser.add_argument("--transverse-opt-step", type=float, default=0.5)
+    parser.add_argument("--transverse-opt-radius", type=float, default=1.0)
     parser.add_argument("--bond", type=int, default=64)
     parser.add_argument("--td-bond", type=int, default=None)
     parser.add_argument("--skip-dmrg", action="store_true")
