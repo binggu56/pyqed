@@ -305,10 +305,10 @@ def _run_casci_like(mc, *args, method="direct_ci", **kwargs):
 def _wguess(src, dst, state=0):
     """Reuse the accepted DMRG MPS as the next macroiteration guess."""
 
-    if not hasattr(src, "export_initial_guess"):
+    if not hasattr(src, "export_ground_state"):
         return
     try:
-        dst.init_guess = src.export_initial_guess(state=state)
+        dst.init_guess = src.export_ground_state(state=state)
     except Exception:
         return
 

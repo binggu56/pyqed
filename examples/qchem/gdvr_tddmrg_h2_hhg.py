@@ -355,7 +355,7 @@ def run_case(args):
         )
     else:
         block_sparse = projection_backend in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
-        psi0 = td.export_initial_guess(dense=not block_sparse)
+        psi0 = td.export_ground_state(dense=not block_sparse)
     acc_mpo = None
     acceleration_source = "finite-difference"
     accel_mpo_build_seconds = None

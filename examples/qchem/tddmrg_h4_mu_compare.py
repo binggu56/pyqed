@@ -49,7 +49,7 @@ def main():
         compute_s2=False,
     )
 
-    psi0 = td.export_initial_guess(dense=True)
+    psi0 = td.export_ground_state(dense=True)
     H = td._get_td_hamiltonian()
     mu_z = td.get_interaction_mpo(axis=2)
     interaction = td.get_interaction_mpo()

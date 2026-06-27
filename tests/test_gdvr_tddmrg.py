@@ -602,7 +602,7 @@ def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():
     state, site_qn_maps = _one_site_spatial_symmetric_state()
     td.dmrg = SimpleNamespace(states=[state], site_qn_maps=site_qn_maps)
 
-    dense = td.export_initial_guess(dense=True)
+    dense = td.export_ground_state(dense=True)
 
     np.testing.assert_allclose(dense.factors[0][0, :, 0], [0.0, 3.0, 7.0, 0.0])
 

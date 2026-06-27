@@ -41,7 +41,7 @@ def main():
         symmetry_list=["charge", "sz"],
         compute_s2=False,
     )
-    psi0 = td.export_initial_guess(dense=True)
+    psi0 = td.export_ground_state(dense=True)
     mu_z_mpo = td.get_interaction_mpo(axis=2)
     center = mol.center_of_mass()
     nuclear_mu_z = np.sum(mol.atom_charges() * (mol.atom_coords()[:, 2] - center[2]))

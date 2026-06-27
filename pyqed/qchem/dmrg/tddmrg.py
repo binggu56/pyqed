@@ -304,7 +304,7 @@ class TDDMRG(DMRG):
 
     def _default_initial_state(self):
         if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
-            return self.export_initial_guess(dense=True)
+            return self.export_ground_state(dense=True)
 
         guess = self.init_guess
         if isinstance(guess, MPS):

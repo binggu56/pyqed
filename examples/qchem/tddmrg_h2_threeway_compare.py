@@ -59,7 +59,7 @@ def main():
             compute_s2=False,
         )
 
-    psi0 = td.export_initial_guess(dense=True)
+    psi0 = td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
     mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
 

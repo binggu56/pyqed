@@ -12,8 +12,8 @@ import numpy as np
 
 from pyqed.mps.mps import expect_mps
 from pyqed.mps.tdmps import TDMPS
-from pyqed.qchem.gdvr import (
-    AtomicChain,
+from pyqed.qchem.gdvr import AtomicChain
+from pyqed.qchem.gdvr.tddmrg import (
     GDVRSpatialDensityPhase,
     GDVRSpatialFactorizedDensityPhase,
     GDVRSpatialGroupedPairDensityPhase,
@@ -22,7 +22,6 @@ from pyqed.qchem.gdvr import (
     GDVRSpatialPronyDensityPhase,
     GDVRSpatialSVDDensityPhase,
     GDVRSpatialTaylorDensityPhase,
-    TDDMRG,
 )
 from pyqed.qchem.rttdhf import gaussian_pulse
 
@@ -204,11 +203,9 @@ def main(argv=None):
         polarization=(0.0, 0.0, 1.0),
     )
 
-    td = TDDMRG(
-        mf,
+    td = mf.TDDMRG(
         D=args.bond,
         td_bond_dim=args.bond if args.td_bond is None else args.td_bond,
-        init_guess="random",
     ).build()
     td.optimize_ground_state(
         nstates=1,
@@ -218,7 +215,7 @@ def main(argv=None):
         davidson_tol=1.0e-8,
     )
 
-    psi0 = td.export_initial_guess(dense=True)
+    psi0 = td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
     mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
 

@@ -1417,7 +1417,7 @@ class DMRG(CASCI):
         if self.verbose >= level:
             print(message)
 
-    def export_initial_guess(self, state=0, dense=False):
+    def export_ground_state(self, state=0, dense=False):
         """Return a reusable copy of a converged DMRG state."""
         if not hasattr(self, 'dmrg') or self.dmrg is None or self.dmrg.states is None:
             raise ValueError("No converged DMRG state available. Run DMRG first.")
@@ -1429,7 +1429,7 @@ class DMRG(CASCI):
 
     def reuse_guess_from(self, other, state=0, dense=False):
         """Adopt a converged MPS from another DMRG object as the next guess."""
-        self.init_guess = other.export_initial_guess(state=state, dense=dense)
+        self.init_guess = other.export_ground_state(state=state, dense=dense)
         return self
 
 

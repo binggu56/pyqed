@@ -9,15 +9,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.mps.mps import MPS, expect_mps
-from pyqed.qchem.gdvr import AtomicChain, RTTDHF as GDVRRTTDHF, TDDMRG
-from pyqed.qchem.gdvr.tddmrg import (
-    _adjacent_givens_decomposition,
-    _apply_adjacent_two_site_gate,
-    _apply_one_site_phase,
-    _spatial_occupation_phase_values,
-    _two_orbital_spatial_transform_gate,
-)
+from pyqed.mps.mps import expect_mps
+from pyqed.qchem.gdvr import AtomicChain, RTTDHF as GDVRRTTDHF
 from pyqed.qchem.rttdhf import gaussian_pulse
 
 
@@ -114,68 +107,6 @@ def build_pulse(args):
     )
 
 
-def spatial_product_mps(nsites, nelec, *, spin=0):
-    nelec = int(nelec)
-    spin = 0 if spin is None else int(spin)
-    n_double = nelec // 2
-    has_single = nelec % 2
-    single_state = 1 if spin >= 0 else 2
-    factors = []
-    for site in range(int(nsites)):
-        core = np.zeros((1, 4, 1), dtype=complex)
-        if site < n_double:
-            local = 3
-        elif site == n_double and has_single:
-            local = single_state
-        else:
-            local = 0
-        core[0, local, 0] = 1.0
-        factors.append(core)
-    return MPS(factors, labels=["lv", "p", "rv"])
-
-
-def apply_spatial_orbital_transform(psi, transform, *, max_bond=None, cutoff=1.0e-12):
-    transform = np.asarray(transform, dtype=complex)
-    if transform.ndim != 2 or transform.shape[0] != transform.shape[1]:
-        raise ValueError("orbital transform must be a square matrix.")
-    if not np.allclose(transform.conj().T @ transform, np.eye(transform.shape[1]), atol=1.0e-8):
-        u, _, vh = np.linalg.svd(transform, full_matrices=False)
-        transform = u @ vh
-
-    diagonal, rotations = _adjacent_givens_decomposition(transform)
-    out = psi.copy().to_order(["lv", "p", "rv"])
-    for site, value in enumerate(diagonal):
-        out = _apply_one_site_phase(out, site, _spatial_occupation_phase_values(value))
-    for site, givens in reversed(rotations):
-        gate = _two_orbital_spatial_transform_gate(givens.conj().T)
-        out = _apply_adjacent_two_site_gate(
-            out,
-            site,
-            gate,
-            max_bond=max_bond,
-            cutoff=cutoff,
-        )
-    return out.normalize()
-
-
-def rhf_determinant_mps(mf, *, max_bond=None, cutoff=1.0e-12):
-    coeff = np.asarray(mf.mo_coeff, dtype=complex)
-    occ = np.asarray(mf.mo_occ, dtype=float).reshape(-1)
-    if coeff.ndim != 2 or coeff.shape[0] != coeff.shape[1] or occ.shape != (coeff.shape[1],):
-        raise ValueError("RHF mo_coeff/mo_occ have inconsistent shapes.")
-    occ_idx = np.flatnonzero(occ > 1.0e-8)
-    if not np.allclose(occ[occ_idx], 2.0, atol=1.0e-8):
-        raise ValueError("RHF determinant initializer currently expects closed-shell occupations.")
-    order = np.concatenate((occ_idx, np.setdiff1d(np.arange(coeff.shape[1]), occ_idx, assume_unique=True)))
-    base = spatial_product_mps(coeff.shape[1], int(round(np.sum(occ))), spin=getattr(mf.mol, "spin", 0))
-    return apply_spatial_orbital_transform(
-        base,
-        coeff[:, order],
-        max_bond=max_bond,
-        cutoff=cutoff,
-    )
-
-
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lz", type=float, default=4.0)
@@ -184,7 +115,6 @@ def build_parser():
     parser.add_argument("--h2-bond", type=float, default=1.4)
     parser.add_argument("--bond", type=int, default=32)
     parser.add_argument("--td-bond", type=int, default=None)
-    parser.add_argument("--init-guess", choices=("hf", "rhf", "random"), default="random")
     parser.add_argument("--skip-dmrg", action="store_true")
     parser.add_argument("--no-dmrg-symmetry", action="store_true")
     parser.add_argument("--symbolic-algo", choices=("qr", "Hopcroft-Karp", "Hungarian"), default="qr")
@@ -224,17 +154,9 @@ def main(argv=None):
     if args.steps is None:
         args.steps = 160 if args.pulse_shape == "gaussian" else int(np.ceil(pulse.duration / float(args.dt)))
 
-    initial_mps = None
-    dmrg_init_guess = args.init_guess
-    if args.init_guess == "rhf":
-        initial_mps = rhf_determinant_mps(mf, max_bond=args.bond)
-        dmrg_init_guess = initial_mps
-
-    td = TDDMRG(
-        mf,
+    td = mf.TDDMRG(
         D=args.bond,
         td_bond_dim=args.bond if args.td_bond is None else args.td_bond,
-        init_guess=dmrg_init_guess,
         symbolic_algo=args.symbolic_algo,
     ).build()
     if args.skip_dmrg:
@@ -248,10 +170,7 @@ def main(argv=None):
             davidson_tol=1.0e-8,
         )
 
-    if args.skip_dmrg:
-        psi0 = initial_mps.copy() if initial_mps is not None else td._default_initial_state()
-    else:
-        psi0 = td.export_initial_guess(dense=True)
+    psi0 = td.default_initial_condition() if args.skip_dmrg else td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
     mu0_dmrg = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
     td.run(
