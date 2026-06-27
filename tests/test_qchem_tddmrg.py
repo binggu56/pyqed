@@ -15,18 +15,25 @@ def test_tddmrg_runs_from_converged_ground_state():
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
     td.optimize_ground_state(
+        D=8,
         nstates=1,
         nsweeps=4,
         symmetry_list=["charge", "sz"],
         compute_s2=False,
     )
-    td.run(dt=0.01, steps=2, e_ops=["H"], interval=1)
+    td.run(dt=0.01, steps=2, e_ops=["H"], interval=1, D=8)
 
     np.testing.assert_allclose(td.times, np.array([0.01, 0.02]))
     assert td.observables.shape == (2, 1)
     assert td.final_state is not None
+    np.testing.assert_allclose(td.pre_normalization_norms, np.ones(2), atol=1.0e-12)
+    assert td.static_energies.shape == (3,)
+    np.testing.assert_allclose(td.energy_drift, np.zeros(3), atol=1.0e-10)
+
+    reversal = td.time_reversal_error(dt=0.01, steps=2, D=8)
+    assert reversal["state_error"] < 1.0e-10
 
 
 def test_tddmrg_supports_gaussian_pulse_and_dipole_observable():
@@ -42,14 +49,15 @@ def test_tddmrg_supports_gaussian_pulse_and_dipole_observable():
         polarization=(1.0, 0.0, 0.0),
     )
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
     td.optimize_ground_state(
+        D=8,
         nstates=1,
         nsweeps=4,
         symmetry_list=["charge", "sz"],
         compute_s2=False,
     )
-    td.run(dt=0.01, steps=3, e_ops=["H", "mu_x"], interval=1, field=pulse)
+    td.run(dt=0.01, steps=3, e_ops=["H", "mu_x"], interval=1, field=pulse, D=8)
 
     assert td.observables.shape == (3, 2)
     assert td.fields.shape == (3, 3)
@@ -69,7 +77,7 @@ def test_tddmrg_builds_exact_one_body_field_propagator():
         polarization=(0.0, 0.0, 1.0),
     )
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
     mpo = td.build_interaction_unitary_mpo(dt=0.01, time=0.02, field=pulse)
 
     assert mpo is not None
@@ -89,14 +97,14 @@ def test_dense_state_transform_operator_respects_td_bond_cap():
         polarization=(0.0, 0.0, 1.0),
     )
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, td_bond_dim=2, init_guess="cid").build()
-    mpo = td.build_interaction_unitary_mpo(dt=0.01, time=0.02, field=pulse)
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
+    mpo = td.build_interaction_unitary_mpo(dt=0.01, time=0.02, field=pulse, D=2)
     psi0 = MPS(td.get_initial_guess_dense(noise=0.0), labels=["lv", "p", "rv"]).normalize()
     psi1 = mpo @ psi0
 
     max_bond = max(max(f.shape[0], f.shape[-1]) for f in psi1.factors)
     assert isinstance(mpo, _DenseStateTransformOperator)
-    assert max_bond <= td.td_bond_dim
+    assert max_bond <= td.bond_dim
 
 
 def test_rhf_dipole_operator_defaults_to_center_of_mass():
@@ -122,7 +130,7 @@ def test_tddmrg_uses_center_of_mass_dipole_origin():
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
     np.testing.assert_allclose(td.get_interaction_ao(), mf.dipole(basis="ao"))
 
 
@@ -131,7 +139,7 @@ def test_tddmrg_run_with_mo_coeff_rebuilds_interaction_caches():
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
 
-    td = TDDMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
     old_spatial = td.get_interaction_spatial(axis=2)
 
     theta = 0.37
@@ -157,6 +165,7 @@ def test_tddmrg_run_with_mo_coeff_rebuilds_interaction_caches():
         e_ops=["mu_z"],
         field=pulse,
         mo_coeff=mo_new,
+        D=8,
     )
 
     expected = td.mo_cas.conj().T @ td.get_interaction_ao()[2] @ td.mo_cas
@@ -174,7 +183,7 @@ def test_tddmrg_h4_uses_exact_dense_td_path_and_matches_dense_oracle():
     mol.build(driver="gbasis")
     mf = RHF(mol).run()
 
-    td = TDDMRG(mf, ncas=4, nelecas=4, D=8, init_guess="hf").build()
+    td = TDDMRG(mf, ncas=4, nelecas=4, init_guess="hf").build()
     psi0 = MPS(td.get_initial_guess_dense(noise=0.0), labels=["lv", "p", "rv"]).normalize()
     pulse = gaussian_pulse(
         amplitude=2e-3,
@@ -208,7 +217,7 @@ def test_tddmrg_h4_uses_exact_dense_td_path_and_matches_dense_oracle():
     builder = td.build_interaction_unitary_mpo(dt, time=0.025, field=pulse)
     assert isinstance(builder, _DenseStateTransformOperator)
 
-    td.run(dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"])
+    td.run(dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"], D=8)
     mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
     mu_td = np.concatenate(([mu0], np.real(td.observables[:, 0])))
 

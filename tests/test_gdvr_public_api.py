@@ -87,8 +87,8 @@ def test_gdvr_rhf_tddmrg_dispatches_direct_and_active_space_paths():
     mol.build(Lz=3.0, Nz=5, M=1, verbose=False)
     mf = mol.RHF().run(conv=1e-6, max_iter=40, verbose=False)
 
-    direct = mf.TDDMRG(D=8)
-    active = mf.TDDMRG(D=8, ncas=2, nelecas=(1, 1))
+    direct = mf.TDDMRG()
+    active = mf.TDDMRG(ncas=2, nelecas=(1, 1))
 
     assert type(direct) is GDVRTDDMRG
     assert type(active) is QChemTDDMRG

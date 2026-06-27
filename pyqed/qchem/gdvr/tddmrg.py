@@ -28,6 +28,7 @@ from pyqed.qchem.dmrg.spatial_terms import (
     accumulate_symbolic_term as accumulate_spatial_symbolic_term,
 )
 from pyqed.qchem.gdvr.rhf import fock_2e_slice_collocated, prepare_gdvr_fock_builder
+from pyqed.qchem.gdvr.rttdhf import cap_operator_from_z
 
 
 def _axis_index(axis):
@@ -303,6 +304,44 @@ def dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
     basis_sites = [BasisSpatialFermion(i) for i in range(nspatial)]
     term_map = {}
     for p, val in enumerate(np.diag(op)):
+        if abs(val) <= cutoff:
+            continue
+        accumulate_spatial_symbolic_term(term_map, "n", [p], val, tol=cutoff)
+    return _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )[0]
+
+
+def cap_operator(mol, *, width=2.0, strength=0.005, order=2):
+    """Return the one-electron Hamiltonian CAP ``-i W(z)`` in the GDVR basis."""
+    if mol.z is None or mol.shapes is None:
+        raise ValueError("Build the GDVR molecule before requesting a CAP operator.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    z = np.asarray(mol.z, dtype=float).reshape(nz)
+    return -1j * cap_operator_from_z(
+        z,
+        M=m,
+        width=width,
+        strength=strength,
+        order=order,
+    )
+
+
+def cap_mpo(mol, *, width=2.0, strength=0.005, order=2, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build the spatial-site CAP MPO ``-i sum_p W_p n_p``."""
+    op = cap_operator(mol, width=width, strength=strength, order=order)
+    nspatial = op.shape[0]
+    diag = np.diag(op)
+    if not np.any(np.abs(diag) > float(cutoff)):
+        return BaseTDDMRG._zero_mpo(nspatial, phys_dim=4, dtype=complex)
+
+    basis_sites = [BasisSpatialFermion(i) for i in range(nspatial)]
+    term_map = {}
+    for p, val in enumerate(diag):
         if abs(val) <= cutoff:
             continue
         accumulate_spatial_symbolic_term(term_map, "n", [p], val, tol=cutoff)
@@ -2176,12 +2215,10 @@ class TDDMRG(BaseTDDMRG):
     def __init__(
         self,
         mf,
-        D,
         nelecas=None,
         m_warmup=None,
         spin=None,
         tol=1e-6,
-        td_bond_dim=None,
         cutoff=1.0e-12,
         symbolic_algo="qr",
     ):
@@ -2195,7 +2232,7 @@ class TDDMRG(BaseTDDMRG):
         if nelecas_int != int(mol.nelec):
             raise ValueError(
                 "Direct GDVR-TDDMRG propagates all GDVR electrons. "
-                "For CAS runs, use mf.TDDMRG(D=..., ncas=..., nelecas=...)."
+                "For CAS runs, use mf.TDDMRG(ncas=..., nelecas=...)."
             )
         if spin is None:
             spin = 0 if getattr(mol, "spin", None) is None else mol.spin
@@ -2211,16 +2248,14 @@ class TDDMRG(BaseTDDMRG):
                 adapter,
                 ncas=nspatial,
                 nelecas=nelecas,
-                D=D,
                 init_guess=rhf_determinant_mps(
                     mf,
-                    max_bond=D,
+                    max_bond=None,
                     preserve_quantum_numbers=True,
                 ),
                 m_warmup=m_warmup,
                 spin=spin,
                 tol=tol,
-                td_bond_dim=td_bond_dim,
             )
         self.site = "spatial"
         self.site_basis = "spatial"
@@ -2230,6 +2265,46 @@ class TDDMRG(BaseTDDMRG):
         self.gdvr_mf = mf
         self.gdvr_mpo_cutoff = float(cutoff)
         self.gdvr_symbolic_algo = str(symbolic_algo)
+        self._cap_mpo = None
+        self.cap_settings = None
+
+    def set_cap(self, cap=True, **kwargs):
+        """Attach a complex absorbing potential to subsequent real-time runs."""
+        if cap is None or cap is False:
+            return self.clear_cap()
+
+        if hasattr(cap, "factors"):
+            if kwargs:
+                raise ValueError("Do not pass CAP keyword settings with a CAP MPO.")
+            self._cap_mpo = TensorMPO([np.asarray(w).copy() for w in cap.factors], homogenous=False)
+            self.cap_settings = {"source": "mpo"}
+            return self
+
+        settings = {}
+        if isinstance(cap, dict):
+            settings.update(cap)
+        elif cap is not True:
+            raise TypeError("cap must be None, True, a settings dict, or an MPO-like object.")
+        settings.update(kwargs)
+        self._cap_mpo = cap_mpo(
+            self.gdvr_mf.mol,
+            cutoff=self.gdvr_mpo_cutoff,
+            symbolic_algo=self.gdvr_symbolic_algo,
+            **settings,
+        )
+        self.cap_settings = {
+            "source": "gdvr",
+            "width": float(settings.get("width", 2.0)),
+            "strength": float(settings.get("strength", 0.005)),
+            "order": int(settings.get("order", 2)),
+        }
+        return self
+
+    def clear_cap(self):
+        """Remove any propagation-time complex absorbing potential."""
+        self._cap_mpo = None
+        self.cap_settings = None
+        return self
 
     def optimize_ground_state(self, *args, **kwargs):
         """Optimize the GDVR ground state with a symmetry-native default guess.
@@ -2246,20 +2321,25 @@ class TDDMRG(BaseTDDMRG):
         if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
             return self.export_ground_state(dense=True)
 
-        return rhf_determinant_mps(self.gdvr_mf, max_bond=self.D)
+        max_bond = self.bond_dim if self.bond_dim is not None else self.D
+        return rhf_determinant_mps(self.gdvr_mf, max_bond=max_bond)
 
     def _default_block_sparse_initial_state(self):
         if isinstance(self.init_guess, MPS) and hasattr(self.init_guess.factors[0], "qns"):
             return self.init_guess.copy()
+        max_bond = self.bond_dim if self.bond_dim is not None else self.D
         return rhf_determinant_mps(
             self.gdvr_mf,
-            max_bond=self.D,
+            max_bond=max_bond,
             preserve_quantum_numbers=True,
         )
 
-    def default_initial_condition(self):
+    def default_initial_condition(self, D=None, *, tdvp_projection_backend=None):
         """Return the default real-time initial condition for ``run(psi0=...)``."""
-        return self._default_initial_state()
+        return super().default_initial_condition(
+            D=D,
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
 
     def _tdvp_sector_settings(self):
         labels = ("charge", "sz")
@@ -2319,6 +2399,13 @@ class TDDMRG(BaseTDDMRG):
         }
         return self
 
+    def _get_td_hamiltonian(self, mo_coeff=None):
+        hamiltonian = super()._get_td_hamiltonian(mo_coeff=mo_coeff)
+        if self._cap_mpo is None:
+            return hamiltonian
+        absorber = TensorMPO([np.asarray(w).copy() for w in self._cap_mpo.factors], homogenous=False)
+        return hamiltonian + absorber
+
     def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
         del order, scale
         field_vec = self._field_vector(time, field)
@@ -2354,3 +2441,17 @@ class TDDMRG(BaseTDDMRG):
         if _axis_index(axis) != 2:
             return np.zeros((self.ncas, self.ncas))
         return gdvr_z_operator(self.gdvr_mf.mol, electronic=True)
+
+    def run(self, *args, cap=None, **kwargs):
+        old_cap = self._cap_mpo
+        old_settings = self.cap_settings
+        if cap is not None:
+            self.set_cap(cap)
+        if self._cap_mpo is not None and "krylov_method" not in kwargs:
+            kwargs["krylov_method"] = "arnoldi"
+        try:
+            return super().run(*args, **kwargs)
+        finally:
+            if cap is not None:
+                self._cap_mpo = old_cap
+                self.cap_settings = old_settings

@@ -99,6 +99,16 @@ def _tdvp_projection_backend(args):
     return None if backend == "none" else backend
 
 
+def _cap_settings(args):
+    if not bool(getattr(args, "cap", False)):
+        return None
+    return {
+        "width": float(args.cap_width),
+        "strength": float(args.cap_strength),
+        "order": int(args.cap_order),
+    }
+
+
 def _expect_initial(td, psi, mpo, args):
     if psi.factors and hasattr(psi.factors[0], "qns"):
         sector_kwargs = td._tdvp_sector_settings()
@@ -116,9 +126,10 @@ def _expect_initial(td, psi, mpo, args):
 
 def _tddmrg_trace(td, psi0, pulse, args, acc_mpo=None):
     projection_backend = _tdvp_projection_backend(args)
+    td_bond = args.td_bond or args.bond
     if psi0 is None:
-        psi0 = td._initial_state_for_run(
-            None,
+        psi0 = td.default_initial_condition(
+            D=td_bond,
             tdvp_projection_backend=projection_backend,
         )
     mu_mpo = td.get_interaction_mpo(axis=2)
@@ -128,22 +139,27 @@ def _tddmrg_trace(td, psi0, pulse, args, acc_mpo=None):
     if acc_mpo is not None:
         e_ops.append(acc_mpo)
         acc0 = float(np.real(_expect_initial(td, psi0, acc_mpo, args)))
-    td.run(
-        psi0=psi0,
-        dt=args.dt,
-        steps=args.steps,
-        e_ops=e_ops,
-        field=pulse,
-        order=args.order,
-        integrator=args.integrator,
-        tdvp_projection_backend=projection_backend,
-        krylov_dim=args.krylov_dim,
-        krylov_tol=args.krylov_tol,
-        diagonal_fast_path=args.diagonal_fast_path,
-        tdvp_dynamic_mode=args.tdvp_dynamic_mode,
-        track_energy=not args.no_track_energy,
-        progress=not args.quiet,
-    )
+    run_kwargs = {
+        "psi0": psi0,
+        "dt": args.dt,
+        "steps": args.steps,
+        "e_ops": e_ops,
+        "field": pulse,
+        "order": args.order,
+        "integrator": args.integrator,
+        "tdvp_projection_backend": projection_backend,
+        "krylov_dim": args.krylov_dim,
+        "krylov_tol": args.krylov_tol,
+        "diagonal_fast_path": args.diagonal_fast_path,
+        "tdvp_dynamic_mode": args.tdvp_dynamic_mode,
+        "track_energy": not args.no_track_energy,
+        "progress": not args.quiet,
+        "D": td_bond,
+        "cap": _cap_settings(args),
+    }
+    if args.krylov_method is not None:
+        run_kwargs["krylov_method"] = args.krylov_method
+    td.run(**run_kwargs)
     times = np.concatenate(([0.0], np.asarray(td.times, dtype=float)))
     mu = np.concatenate(([mu0], np.real(np.asarray(td.observables[:, 0]))))
     acc = None
@@ -287,6 +303,8 @@ def run_case(args):
     )
     if bool(args.transverse_opt):
         tag += "_too"
+    if bool(args.cap):
+        tag += "_cap"
     prefix = Path(args.outdir) / tag
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
@@ -328,18 +346,20 @@ def run_case(args):
     analysis_start, analysis_stop, analysis_window_name = analysis_bounds(pulse, args.analysis_window)
 
     print(
-        f"[tddmrg] D={args.bond} tdD={args.td_bond or args.bond} "
+        f"[tddmrg] D={args.bond} runD={args.td_bond or args.bond} "
         f"integrator={args.integrator} steps={args.steps} dt={args.dt:g}"
     )
-    td = mf.TDDMRG(
-        D=args.bond,
-        td_bond_dim=args.td_bond or args.bond,
-        symbolic_algo=args.symbolic_algo,
-    ).build()
+    if bool(args.cap):
+        print(
+            f"[cap] width={args.cap_width:g} strength={args.cap_strength:g} "
+            f"order={args.cap_order}"
+        )
+    td = mf.TDDMRG(symbolic_algo=args.symbolic_algo).build()
     if args.skip_dmrg:
         td.e_tot = np.nan
     else:
         td.optimize_ground_state(
+            D=args.bond,
             nstates=1,
             nsweeps=args.sweeps,
             symmetry_list=None if args.no_dmrg_symmetry else ["charge", "sz"],
@@ -423,6 +443,8 @@ def run_case(args):
 
     field_z = _field_z(pulse, times)
     norm_error = np.abs(np.asarray(td.pre_normalization_norms, dtype=float) - 1.0)
+    pre_norm2 = np.array([]) if td.pre_normalization_norm2 is None else np.asarray(td.pre_normalization_norm2, dtype=float)
+    norm_loss = np.maximum(0.0, 1.0 - pre_norm2) if pre_norm2.size else np.array([])
     trunc_error = None if td.tdvp_truncation_errors is None else np.asarray(td.tdvp_truncation_errors, dtype=float)
     energy_drift = None
     if td.energy_drift is not None:
@@ -521,10 +543,12 @@ def run_case(args):
         },
         "tddmrg": {
             "D": int(args.bond),
-            "td_bond_dim": int(args.td_bond or args.bond),
+            "run_D": int(args.td_bond or args.bond),
             "integrator": str(args.integrator),
             "tdvp_dynamic_mode": str(args.tdvp_dynamic_mode),
             "tdvp_projection_backend": None if projection_backend is None else str(projection_backend),
+            "krylov_method": str(args.krylov_method or ("arnoldi" if bool(args.cap) else "lanczos")),
+            "cap": None if not bool(args.cap) else _cap_settings(args),
             "skip_dmrg": bool(args.skip_dmrg),
             "RHF_energy_ha": float(mf.e_tot),
             "RHF_energy_before_transverse_opt_ha": e_before_transverse_opt,
@@ -543,6 +567,7 @@ def run_case(args):
             "acceleration_mpo_bond": None if acc_mpo is None else int(max(acc_mpo.bond_orders())),
             "acceleration_source": str(acceleration_source),
             "max_norm_error": float(np.nanmax(norm_error)) if norm_error.size else 0.0,
+            "max_pre_normalization_norm_loss": float(np.nanmax(norm_loss)) if norm_loss.size else 0.0,
             "max_tdvp_truncation": None if trunc_error is None else float(np.nanmax(trunc_error)),
             "max_abs_energy_drift_ha": None if energy_drift is None else float(np.nanmax(np.abs(energy_drift))),
             "symbolic_terms": int(td._active_integral_build_info["symbolic_terms"]),
@@ -607,6 +632,8 @@ def run_case(args):
         hhg_omega4_dipole_norm=analysis["dipole_norm"],
         harmonic_table=analysis["harmonics"],
         pre_normalization_norms=td.pre_normalization_norms,
+        pre_normalization_norm2=td.pre_normalization_norm2,
+        pre_normalization_norm_loss=norm_loss,
         tdvp_truncation_errors=td.tdvp_truncation_errors,
         energy_drift=np.array([]) if energy_drift is None else energy_drift,
         tdhf_time_au=np.array([]) if tdhf is None else tdhf.times,
@@ -687,6 +714,7 @@ def main(argv=None):
     parser.add_argument("--integrator", choices=("tdvp", "tdvp2", "taylor"), default="tdvp")
     parser.add_argument("--krylov-dim", type=int, default=12)
     parser.add_argument("--krylov-tol", type=float, default=1.0e-13)
+    parser.add_argument("--krylov-method", choices=("lanczos", "arnoldi"), default=None)
     parser.add_argument("--diagonal-fast-path", action="store_true")
     parser.add_argument("--tdvp-dynamic-mode", choices=("split", "midpoint"), default="split")
     parser.add_argument(
@@ -694,6 +722,10 @@ def main(argv=None):
         choices=("none", "dense", "dense-sector", "block-sparse"),
         default="block-sparse",
     )
+    parser.add_argument("--cap", action="store_true", help="Add a propagation-time complex absorbing potential.")
+    parser.add_argument("--cap-width", type=float, default=2.0, help="CAP width measured inward from each z edge.")
+    parser.add_argument("--cap-strength", type=float, default=0.005, help="CAP prefactor in Hartree.")
+    parser.add_argument("--cap-order", type=int, default=2, help="Polynomial CAP order.")
     parser.add_argument("--no-track-energy", action="store_true")
     parser.add_argument("--acceleration-observable", choices=("finite-difference", "force", "commutator"), default="force")
     parser.add_argument("--accel-mpo-bond", type=int, default=96)

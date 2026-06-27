@@ -112,7 +112,6 @@ class TDDMRG(DMRG):
         mf,
         ncas,
         nelecas,
-        D,
         init_guess="hf",
         m_warmup=None,
         spin=None,
@@ -120,13 +119,12 @@ class TDDMRG(DMRG):
         low_rank_mpo=False,
         low_rank_mpo_bond=None,
         low_rank_mpo_batch_size=4,
-        td_bond_dim=None,
     ):
         super().__init__(
             mf,
             ncas,
             nelecas,
-            D,
+            None,
             init_guess=init_guess,
             m_warmup=m_warmup,
             spin=spin,
@@ -135,7 +133,7 @@ class TDDMRG(DMRG):
             low_rank_mpo_bond=low_rank_mpo_bond,
             low_rank_mpo_batch_size=low_rank_mpo_batch_size,
         )
-        self.td_bond_dim = self.D if td_bond_dim is None else int(td_bond_dim)
+        self.bond_dim = None
         self.tdmps = None
         self.times = None
         self.observables = None
@@ -152,6 +150,32 @@ class TDDMRG(DMRG):
         self._interaction_mpo_cache = None
         self._interaction_spatial_cache = None
         self._interaction_unitary_cache = None
+
+    @staticmethod
+    def _mps_bond_dim(psi):
+        if not isinstance(psi, MPS) or not psi.factors:
+            return None
+        dims = []
+        for factor in psi.factors:
+            shape = getattr(factor, "shape", None)
+            if shape is None or len(shape) < 3:
+                continue
+            dims.extend((int(shape[0]), int(shape[-1])))
+        return max(dims) if dims else None
+
+    def _set_bond_dim(self, D=None, *, psi=None):
+        if D is not None:
+            self.bond_dim = int(D)
+        elif self.bond_dim is None:
+            psi_bond = self._mps_bond_dim(psi)
+            if psi_bond is not None:
+                self.bond_dim = int(psi_bond)
+            elif self.D is not None:
+                self.bond_dim = int(self.D)
+            else:
+                return 1
+        self.bond_dim = int(self.bond_dim)
+        return self.bond_dim
 
     def _use_exact_dense_td(self):
         return (2 * self.ncas) <= 8
@@ -331,6 +355,15 @@ class TDDMRG(DMRG):
             return guess.copy()
         return self._default_initial_state()
 
+    def default_initial_condition(self, D=None, *, tdvp_projection_backend=None):
+        """Return the default real-time initial condition for ``run(psi0=...)``."""
+        if D is not None:
+            self._set_bond_dim(D)
+        return self._initial_state_for_run(
+            None,
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
+
     def _initial_state_for_run(self, psi0, *, tdvp_projection_backend=None):
         block_sparse = (
             _is_block_sparse_tdvp_backend(tdvp_projection_backend)
@@ -461,8 +494,9 @@ class TDDMRG(DMRG):
             raise ValueError("field must evaluate to a scalar or a length-3 vector.")
         return vec
 
-    def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
+    def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0, D=None):
         del order, scale
+        bond_dim = self._set_bond_dim(D)
         field_vec = self._field_vector(time, field)
         if not np.any(field_vec):
             return None
@@ -485,7 +519,7 @@ class TDDMRG(DMRG):
                     amplitude = float(np.dot(field_vec, polarization))
                     residual = np.linalg.norm(field_vec - amplitude * polarization)
                     if residual <= 1e-12:
-                        cache_key = tuple(np.round(polarization, 12).tolist())
+                        cache_key = (tuple(np.round(polarization, 12).tolist()), int(bond_dim))
                         if (
                             self._interaction_unitary_cache is None
                             or self._interaction_unitary_cache["key"] != cache_key
@@ -509,11 +543,11 @@ class TDDMRG(DMRG):
                             else:
                                 cache["left"] = _unitary_rotation_mpo(
                                     eigvecs,
-                                    mpo_bond_dim=self.td_bond_dim,
+                                    mpo_bond_dim=bond_dim,
                                 )
                                 cache["right"] = _unitary_rotation_mpo(
                                     eigvecs.conj().T,
-                                    mpo_bond_dim=self.td_bond_dim,
+                                    mpo_bond_dim=bond_dim,
                                 )
                             self._interaction_unitary_cache = cache
 
@@ -528,13 +562,13 @@ class TDDMRG(DMRG):
                             return _DenseStateTransformOperator(
                                 dense_transform,
                                 nspin=2 * self.ncas,
-                                chi_max=self.td_bond_dim,
+                                chi_max=bond_dim,
                             )
 
                         dynamic_phases = np.exp(-1j * dt * amplitude * self._interaction_unitary_cache["eigvals"])
                         diag_mpo = _unitary_rotation_mpo(
                             np.diag(dynamic_phases),
-                            mpo_bond_dim=self.td_bond_dim,
+                            mpo_bond_dim=bond_dim,
                         )
                         return _SequentialMPOProduct(
                             (
@@ -542,7 +576,7 @@ class TDDMRG(DMRG):
                                 diag_mpo,
                                 self._interaction_unitary_cache["left"],
                             ),
-                            chi_max=self.td_bond_dim,
+                            chi_max=bond_dim,
                         )
 
         spatial_ops = self.get_interaction_spatial()
@@ -552,7 +586,7 @@ class TDDMRG(DMRG):
                 h_int = h_int - field_vec[i] * np.asarray(spatial_ops[i], dtype=complex)
 
         orbital_transform = expm(-1j * dt * h_int)
-        return _unitary_rotation_mpo(orbital_transform, mpo_bond_dim=self.td_bond_dim)
+        return _unitary_rotation_mpo(orbital_transform, mpo_bond_dim=bond_dim)
 
     def build_propagator(
         self,
@@ -563,14 +597,16 @@ class TDDMRG(DMRG):
         field=None,
         interaction_mpo=None,
         time=0.0,
+        D=None,
     ):
+        bond_dim = self._set_bond_dim(D)
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
         self.tdmps = TDMPS(
             self._get_td_hamiltonian(mo_coeff=mo_coeff),
-            D=self.td_bond_dim,
+            D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
@@ -604,6 +640,7 @@ class TDDMRG(DMRG):
         measure_observables=True,
         track_energy=True,
         progress=True,
+        D=None,
     ):
         if dt is None:
             raise ValueError("dt must be provided.")
@@ -611,11 +648,14 @@ class TDDMRG(DMRG):
             raise ValueError("steps must be provided.")
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
+        if D is not None:
+            self._set_bond_dim(D)
 
         psi = self._initial_state_for_run(
             psi0,
             tdvp_projection_backend=tdvp_projection_backend,
         )
+        bond_dim = self._set_bond_dim(D, psi=psi)
         observables = self._normalize_observables(e_ops)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
@@ -636,7 +676,7 @@ class TDDMRG(DMRG):
 
         self.tdmps = TDMPS(
             self._get_td_hamiltonian(mo_coeff=mo_coeff),
-            D=self.td_bond_dim,
+            D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
@@ -702,6 +742,7 @@ class TDDMRG(DMRG):
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
         tdvp_projection_backend=None,
+        D=None,
     ):
         if dt is None:
             raise ValueError("dt must be provided.")
@@ -711,11 +752,14 @@ class TDDMRG(DMRG):
             raise ValueError("steps must be non-negative.")
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
+        if D is not None:
+            self._set_bond_dim(D)
 
         psi = self._initial_state_for_run(
             psi0,
             tdvp_projection_backend=tdvp_projection_backend,
         )
+        bond_dim = self._set_bond_dim(D, psi=psi)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
 
@@ -758,7 +802,7 @@ class TDDMRG(DMRG):
 
         solver = TDMPS(
             self._get_td_hamiltonian(mo_coeff=mo_coeff),
-            D=self.td_bond_dim,
+            D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,

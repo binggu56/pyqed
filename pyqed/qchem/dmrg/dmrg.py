@@ -1868,7 +1868,7 @@ class DMRG(CASCI):
     """
     ab initio DRMG quantum chemistry calculation
     """
-    def __init__(self, mf, ncas, nelecas, D, init_guess='hf', m_warmup=None,\
+    def __init__(self, mf, ncas, nelecas, D=None, init_guess='hf', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
                  low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
                  orbital_layout=None, spatial_reduced_mpo=None,
@@ -1950,13 +1950,13 @@ class DMRG(CASCI):
         self.spin_purification = False
 
 
-        self.D = self.m = D
+        self.D = self.m = None if D is None else int(D)
 
         self.tol = tol # tolerance for energy convergence
         self.rigid_shift = 0
 
         if m_warmup is None:
-            m_warmup = D
+            m_warmup = self.D
         self.m_warmup = m_warmup
 
 
@@ -4263,6 +4263,7 @@ class DMRG(CASCI):
         symmetry_list=None,
         symmetry=None,
         nsweeps=50,
+        D=None,
         D_schedule=None,
         nsweeps_schedule=None,
         initial_guess=None,
@@ -4281,6 +4282,16 @@ class DMRG(CASCI):
         symmetry_list : list of strings or bool
             Backward-compatible explicit labels such as ``['charge', 'sz']``.
         """
+        if D is not None:
+            self.D = self.m = int(D)
+            if self.m_warmup is None:
+                self.m_warmup = self.D
+        elif self.D is None:
+            if D_schedule is None:
+                raise ValueError("DMRG.run requires D=... or D_schedule=... when no constructor D was set.")
+            self.D = self.m = max(int(x) for x in D_schedule)
+            if self.m_warmup is None:
+                self.m_warmup = self.D
         self.nstates = nstates
         if weights is None:
             self.weights = np.ones(nstates) / nstates

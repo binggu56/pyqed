@@ -1169,14 +1169,14 @@ class RHF:
             mo_coeff = np.asarray(self.mo_coeff)[:, orbitals]
         return GDVRMeanFieldAdapter(self, mo_coeff=mo_coeff)
 
-    def TDDMRG(self, D, *, ncas=None, nelecas=None, orbitals=None, **kwargs):
+    def TDDMRG(self, *, ncas=None, nelecas=None, orbitals=None, **kwargs):
         """Construct direct GDVR TDDMRG or active-space qchem TDDMRG."""
         if ncas is None:
             if orbitals is not None:
                 raise ValueError("orbitals is only meaningful when ncas is set.")
             from pyqed.qchem.gdvr.tddmrg import TDDMRG
 
-            return TDDMRG(self, D=D, nelecas=nelecas, **kwargs)
+            return TDDMRG(self, nelecas=nelecas, **kwargs)
 
         if nelecas is None:
             nelecas = int(self.mol.nelec)
@@ -1186,7 +1186,6 @@ class RHF:
             self.to_gto(orbitals=orbitals),
             ncas=int(ncas),
             nelecas=nelecas,
-            D=D,
             **kwargs,
         )
 

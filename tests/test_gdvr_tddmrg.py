@@ -28,6 +28,8 @@ from pyqed.qchem.gdvr.tddmrg import (
     build_gdvr_spatial_one_body_rotation_mpo,
     build_gdvr_spatial_prony_density_hamiltonian_mpo,
     build_gdvr_spatial_svd_density_hamiltonian_mpo,
+    cap_mpo,
+    cap_operator,
     dipole_mpo,
     force_mpo,
     GDVRSpatialHybridDensityPhase,
@@ -189,7 +191,7 @@ def test_direct_spatial_gdvr_hamiltonian_mpo_matches_spin_orbital_oracle():
 
 def test_to_gto_feeds_generic_active_space_tddmrg():
     mf = _ToyGDVRRHF()
-    td = QChemTDDMRG(mf.to_gto(), ncas=2, nelecas=(1, 1), D=8).build()
+    td = QChemTDDMRG(mf.to_gto(), ncas=2, nelecas=(1, 1)).build()
 
     expected_eri = active_eri_from_gdvr_collocation(mf.mol.eri_j, np.eye(2), nz=2, m=1)
     np.testing.assert_allclose(td.h1e[0], mf.mol.hcore, atol=1.0e-12)
@@ -248,6 +250,22 @@ def test_direct_spatial_gdvr_dipole_mpo_is_site_number_operator():
         expected[state, state] = float(np.dot(z, occupation[local_states]))
 
     np.testing.assert_allclose(mu, expected, atol=1.0e-12)
+
+
+def test_gdvr_cap_mpo_is_negative_imaginary_number_operator():
+    mol = _ThreeSiteToyGDVRMolecule()
+    cap = _mpo_to_dense_matrix(cap_mpo(mol, width=0.4, strength=0.2, order=2))
+
+    expected = np.zeros_like(cap)
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    one_body_diag = np.diag(cap_operator(mol, width=0.4, strength=0.2, order=2))
+    for state in np.ndindex(4, 4, 4):
+        idx = np.ravel_multi_index(state, (4, 4, 4))
+        expected[idx, idx] = np.dot(one_body_diag, occupation[np.asarray(state)])
+
+    np.testing.assert_allclose(cap, expected, atol=1.0e-12)
+    assert np.all(np.real(np.diag(cap)) == pytest.approx(0.0))
+    assert np.min(np.imag(np.diag(cap))) < 0.0
 
 
 def test_field_free_dipole_acceleration_mpo_matches_dense_commutator():
@@ -539,8 +557,8 @@ def test_hybrid_density_phase_exposes_residual_fit():
 
 
 def test_gdvr_tddmrg_runs_against_direct_mpo():
-    td = TDDMRG(_ToyGDVRRHF(), D=8).build()
-    td.run(dt=0.01, steps=2, e_ops=["mu_z"])
+    td = TDDMRG(_ToyGDVRRHF()).build()
+    td.run(dt=0.01, steps=2, e_ops=["mu_z"], D=8)
 
     np.testing.assert_allclose(td.times, [0.01, 0.02])
     assert td.observables.shape == (2, 1)
@@ -549,13 +567,13 @@ def test_gdvr_tddmrg_runs_against_direct_mpo():
     np.testing.assert_allclose(td.pre_normalization_norms, np.ones(2), atol=1.0e-12)
     assert td.static_energies.shape == (3,)
 
-    reversal = td.time_reversal_error(dt=0.01, steps=2)
+    reversal = td.time_reversal_error(dt=0.01, steps=2, D=8)
     assert reversal["state_error"] < 1.0e-10
 
 
 def test_gdvr_tddmrg_accepts_direct_force_mpo_observable():
     mf = _ToyGDVRRHF()
-    td = TDDMRG(mf, D=8).build()
+    td = TDDMRG(mf).build()
     force = force_mpo(mf.mol)
     foreign_mpo = SimpleNamespace(factors=force.factors)
 
@@ -565,10 +583,38 @@ def test_gdvr_tddmrg_accepts_direct_force_mpo_observable():
         e_ops=[force, foreign_mpo],
         track_energy=False,
         progress=False,
+        D=8,
     )
 
     assert td.observables.shape == (1, 2)
     np.testing.assert_allclose(td.observables[0, 0], td.observables[0, 1], atol=1.0e-12)
+
+
+def test_gdvr_tddmrg_cap_is_real_time_only_and_temporary():
+    mf = _ToyGDVRRHF()
+    td = TDDMRG(mf).build()
+    h0 = _mpo_to_dense_matrix(td._get_td_hamiltonian())
+
+    td.set_cap(width=0.5, strength=0.4, order=2)
+    h_cap = _mpo_to_dense_matrix(td._get_td_hamiltonian())
+    assert np.min(np.imag(np.diag(h_cap - h0))) < 0.0
+
+    td.clear_cap()
+    np.testing.assert_allclose(_mpo_to_dense_matrix(td._get_td_hamiltonian()), h0, atol=1.0e-12)
+
+    td.run(
+        dt=0.1,
+        steps=1,
+        e_ops=[],
+        cap={"width": 0.5, "strength": 0.4, "order": 2},
+        track_energy=False,
+        progress=False,
+        D=8,
+    )
+    assert td.cap_settings is None
+    assert td._cap_mpo is None
+    assert not np.allclose(td.pre_normalization_norms, np.ones_like(td.pre_normalization_norms))
+    np.testing.assert_allclose(_mpo_to_dense_matrix(td._get_td_hamiltonian()), h0, atol=1.0e-12)
 
 
 def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_public():
@@ -580,10 +626,10 @@ def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_publi
     mf.dm = 2.0 * mf.mo_coeff[:, :1] @ mf.mo_coeff[:, :1].T
 
     with pytest.raises(TypeError):
-        TDDMRG(mf, D=8, init_guess="random")
+        TDDMRG(mf, init_guess="random")
 
-    td = TDDMRG(mf, D=8).build()
-    actual = td._default_initial_state()
+    td = TDDMRG(mf).build()
+    actual = td.default_initial_condition(D=8)
     expected = rhf_determinant_mps(mf, max_bond=8)
     product = MPS(td.get_initial_guess_dense(noise=0.0), labels=["lv", "p", "rv"]).normalize()
 
@@ -598,7 +644,7 @@ def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_publi
 
 
 def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():
-    td = TDDMRG(_ToyGDVRRHF(), D=8).build()
+    td = TDDMRG(_ToyGDVRRHF()).build()
     state, site_qn_maps = _one_site_spatial_symmetric_state()
     td.dmrg = SimpleNamespace(states=[state], site_qn_maps=site_qn_maps)
 
@@ -608,7 +654,7 @@ def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():
 
 
 def test_gdvr_tddmrg_ensure_dense_preserves_spatial_local_order():
-    td = TDDMRG(_ToyGDVRRHF(), D=8).build()
+    td = TDDMRG(_ToyGDVRRHF()).build()
     state, site_qn_maps = _one_site_spatial_symmetric_state()
     td.dmrg = SimpleNamespace(site_qn_maps=site_qn_maps)
 
@@ -624,7 +670,7 @@ def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
         raise AssertionError("block-sparse GDVR-TDDMRG should keep the QN MPS initial state")
 
     monkeypatch.setattr(qchem_tddmrg_module, "symmetric_to_dense", _fail_densify)
-    td = TDDMRG(_ToyGDVRRHF(), D=4, td_bond_dim=4).build()
+    td = TDDMRG(_ToyGDVRRHF()).build()
     td._use_exact_dense_td = lambda: False
 
     td.run(
@@ -636,6 +682,7 @@ def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
         measure_observables=False,
         track_energy=False,
         progress=False,
+        D=4,
     )
 
     assert hasattr(td.final_state.factors[0], "qns")
