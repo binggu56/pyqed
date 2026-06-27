@@ -553,6 +553,24 @@ def test_gdvr_tddmrg_runs_against_direct_mpo():
     assert reversal["state_error"] < 1.0e-10
 
 
+def test_gdvr_tddmrg_accepts_direct_force_mpo_observable():
+    mf = _ToyGDVRRHF()
+    td = TDDMRG(mf, D=8).build()
+    force = force_mpo(mf.mol)
+    foreign_mpo = SimpleNamespace(factors=force.factors)
+
+    td.run(
+        dt=0.01,
+        steps=1,
+        e_ops=[force, foreign_mpo],
+        track_energy=False,
+        progress=False,
+    )
+
+    assert td.observables.shape == (1, 2)
+    np.testing.assert_allclose(td.observables[0, 0], td.observables[0, 1], atol=1.0e-12)
+
+
 def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_public():
     mf = _ToyGDVRRHF()
     angle = 0.37

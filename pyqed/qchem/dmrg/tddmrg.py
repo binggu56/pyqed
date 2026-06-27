@@ -77,6 +77,28 @@ def _is_block_sparse_tdvp_backend(backend):
     return key in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
 
 
+def _is_mpo_factor_list(obj):
+    return (
+        isinstance(obj, (list, tuple))
+        and bool(obj)
+        and all(hasattr(factor, "shape") for factor in obj)
+    )
+
+
+def _copy_mpo_factors(factors):
+    copied = []
+    for factor in factors:
+        if hasattr(factor, "copy"):
+            copied.append(factor.copy())
+        else:
+            copied.append(np.asarray(factor).copy())
+    return copied
+
+
+def _is_mpo_like(obj):
+    return hasattr(obj, "factors") and _is_mpo_factor_list(getattr(obj, "factors"))
+
+
 class TDDMRG(DMRG):
     """
     Quantum-chemistry time-dependent DMRG wrapper built on top of `TDMPS`.
@@ -330,6 +352,8 @@ class TDDMRG(DMRG):
     def _normalize_observables(self, e_ops):
         if e_ops is None:
             return []
+        if isinstance(e_ops, str) or _is_mpo_like(e_ops) or _is_mpo_factor_list(e_ops):
+            e_ops = [e_ops]
 
         normalized = []
         for op in e_ops:
@@ -355,8 +379,12 @@ class TDDMRG(DMRG):
                 normalized.append(op)
                 continue
 
-            if isinstance(op, (list, tuple)) and op and hasattr(op[0], "shape"):
-                normalized.append(TensorMPO([np.asarray(w).copy() for w in op], homogenous=False))
+            if _is_mpo_like(op):
+                normalized.append(TensorMPO(_copy_mpo_factors(op.factors), homogenous=False))
+                continue
+
+            if _is_mpo_factor_list(op):
+                normalized.append(TensorMPO(_copy_mpo_factors(op), homogenous=False))
                 continue
 
             raise TypeError(f"Unsupported observable type: {type(op)}")
