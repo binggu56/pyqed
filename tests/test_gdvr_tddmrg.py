@@ -5,14 +5,17 @@ from scipy.linalg import expm
 
 from pyqed.mps import MPS
 from pyqed.mps.decompose import decompose, tt_to_tensor
+from pyqed.mps.mps import dense_to_symmetric
 from pyqed.mps.symmetry import AbelianSector, BlockTensor
 from pyqed.qchem.dmrg.dmrg import (
     _build_spatial_active_hamiltonian_matrix,
     _build_spin_orbital_dense_hamiltonian_tensor_mpo,
 )
+from pyqed.qchem.dmrg import TDDMRG as QChemTDDMRG
 from pyqed.qchem.dmrg.tddmrg import _mpo_to_dense_matrix
-from pyqed.qchem.gdvr import (
-    TDDMRG,
+from pyqed.qchem.gdvr import TDDMRG
+from pyqed.qchem.gdvr.tddmrg import (
+    acceleration_mpo,
     active_eri_from_gdvr_collocation,
     apply_gdvr_spatial_density_phase,
     apply_gdvr_spatial_one_body_rotation,
@@ -21,11 +24,12 @@ from pyqed.qchem.gdvr import (
     build_gdvr_dipole_mpo,
     build_gdvr_hamiltonian_mpo,
     build_gdvr_spatial_density_phase_mpo,
-    build_gdvr_spatial_dipole_mpo,
     build_gdvr_spatial_hamiltonian_mpo,
     build_gdvr_spatial_one_body_rotation_mpo,
     build_gdvr_spatial_prony_density_hamiltonian_mpo,
     build_gdvr_spatial_svd_density_hamiltonian_mpo,
+    dipole_mpo,
+    force_mpo,
     GDVRSpatialHybridDensityPhase,
     GDVRSpatialFactorizedDensityPhase,
     GDVRSpatialTaylorDensityPhase,
@@ -39,6 +43,7 @@ class _ToyGDVRMolecule:
         self.z = np.array([-0.5, 0.75])
         self.shapes = {"Nz": 2, "M": 1, "size": 2}
         self.hcore = np.array([[-0.8, 0.13], [0.13, -0.25]])
+        self.e_slices = np.array([[-0.8], [-0.25]])
         self.eri_j = [
             [np.array([[0.70]]), np.array([[0.31]])],
             [np.array([[0.31]]), np.array([[0.55]])],
@@ -62,6 +67,25 @@ class _ToyGDVRRHF:
         self.mo_occ = np.array([2.0, 0.0])
         self.dm = np.diag(self.mo_occ)
         self.e_tot = -1.0
+
+    def to_gto(self, orbitals=None):
+        from pyqed.qchem.gdvr.tddmrg import GDVRMeanFieldAdapter
+
+        mo_coeff = None
+        if orbitals is not None:
+            orbitals = tuple(int(i) for i in orbitals)
+            mo_coeff = self.mo_coeff[:, orbitals]
+        return GDVRMeanFieldAdapter(self, mo_coeff=mo_coeff)
+
+    def energy_nuc(self):
+        return self.mol.nuclear_repulsion_energy()
+
+    def get_hcore(self):
+        return self.mol.hcore
+
+    def dipole(self, basis="ao"):
+        z = np.diag(self.mol.z)
+        return np.array([np.zeros_like(z), np.zeros_like(z), -z])
 
 
 class _ThreeSiteToyGDVRMolecule:
@@ -163,6 +187,26 @@ def test_direct_spatial_gdvr_hamiltonian_mpo_matches_spin_orbital_oracle():
     assert info["representation"] == "gdvr_direct_spatial_mpo"
 
 
+def test_to_gto_feeds_generic_active_space_tddmrg():
+    mf = _ToyGDVRRHF()
+    td = QChemTDDMRG(mf.to_gto(), ncas=2, nelecas=(1, 1), D=8).build()
+
+    expected_eri = active_eri_from_gdvr_collocation(mf.mol.eri_j, np.eye(2), nz=2, m=1)
+    np.testing.assert_allclose(td.h1e[0], mf.mol.hcore, atol=1.0e-12)
+    np.testing.assert_allclose(td.h2e[0, 0], expected_eri, atol=1.0e-12)
+    assert td._active_integral_build_info["mode"] == "gdvr_collocated_dense_active"
+
+
+def test_gdvr_tddmrg_root_api_has_no_active_space_aliases():
+    import pyqed.qchem.gdvr as gdvr
+
+    assert gdvr.TDDMRG is TDDMRG
+    assert not hasattr(gdvr, "qchem_mf")
+    assert not hasattr(gdvr, "ActiveSpaceTDDMRG")
+    assert not hasattr(gdvr, "RealTimeDMRG")
+    assert not hasattr(gdvr, "RTTDDMRG")
+
+
 def test_direct_gdvr_dipole_mpo_is_diagonal_number_operator():
     mol = _ToyGDVRMolecule()
     mu = _mpo_to_dense_matrix(build_gdvr_dipole_mpo(mol))
@@ -176,9 +220,25 @@ def test_direct_gdvr_dipole_mpo_is_diagonal_number_operator():
     np.testing.assert_allclose(mu, expected, atol=1.0e-12)
 
 
+def test_rhf_determinant_mps_can_preserve_abelian_sectors():
+    mf = _ToyGDVRRHF()
+    psi = rhf_determinant_mps(mf, preserve_quantum_numbers=True)
+    q_empty = AbelianSector(("charge", "sz"), (0, 0))
+    q_up = AbelianSector(("charge", "sz"), (1, 1))
+    q_down = AbelianSector(("charge", "sz"), (1, -1))
+    q_double = AbelianSector(("charge", "sz"), (2, 0))
+
+    sym_factors = dense_to_symmetric(
+        psi.to_order(["lv", "p", "rv"]).factors,
+        phys_qns=[q_empty, q_up, q_down, q_double],
+    )
+
+    assert all(hasattr(factor, "qns") for factor in sym_factors)
+
+
 def test_direct_spatial_gdvr_dipole_mpo_is_site_number_operator():
     mol = _ToyGDVRMolecule()
-    mu = _mpo_to_dense_matrix(build_gdvr_spatial_dipole_mpo(mol))
+    mu = _mpo_to_dense_matrix(dipole_mpo(mol))
 
     expected = np.zeros_like(mu)
     occupation = np.array([0.0, 1.0, 1.0, 2.0])
@@ -188,6 +248,33 @@ def test_direct_spatial_gdvr_dipole_mpo_is_site_number_operator():
         expected[state, state] = float(np.dot(z, occupation[local_states]))
 
     np.testing.assert_allclose(mu, expected, atol=1.0e-12)
+
+
+def test_field_free_dipole_acceleration_mpo_matches_dense_commutator():
+    mol = _ToyGDVRMolecule()
+    h_mpo, _ = build_gdvr_spatial_hamiltonian_mpo(mol)
+    mu_mpo = dipole_mpo(mol)
+    acc_mpo = acceleration_mpo(h_mpo, mu_mpo)
+
+    h = _mpo_to_dense_matrix(h_mpo)
+    mu = _mpo_to_dense_matrix(mu_mpo)
+    expected = -(mu @ h @ h - 2.0 * h @ mu @ h + h @ h @ mu)
+
+    np.testing.assert_allclose(_mpo_to_dense_matrix(acc_mpo), expected, atol=1.0e-10)
+
+
+def test_gdvr_spatial_force_acceleration_mpo_is_diagonal_number_operator():
+    mol = _ToyGDVRMolecule()
+    acc = _mpo_to_dense_matrix(force_mpo(mol))
+
+    force = np.gradient(mol.e_slices[:, 0], mol.z, edge_order=1)
+    expected = np.zeros_like(acc)
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    for state in range(acc.shape[0]):
+        local_states = np.asarray(np.unravel_index(state, (4, 4)))
+        expected[state, state] = float(np.dot(force, occupation[local_states]))
+
+    np.testing.assert_allclose(acc, expected, atol=1.0e-12)
 
 
 def test_gdvr_spatial_one_body_rotation_mpo_matches_dense_oracle():
@@ -510,3 +597,28 @@ def test_gdvr_tddmrg_ensure_dense_preserves_spatial_local_order():
     dense = td._ensure_dense_mps(state)
 
     np.testing.assert_allclose(dense.factors[0][0, :, 0], [0.0, 3.0, 7.0, 0.0])
+
+
+def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
+    import pyqed.qchem.dmrg.tddmrg as qchem_tddmrg_module
+
+    def _fail_densify(*args, **kwargs):
+        raise AssertionError("block-sparse GDVR-TDDMRG should keep the QN MPS initial state")
+
+    monkeypatch.setattr(qchem_tddmrg_module, "symmetric_to_dense", _fail_densify)
+    td = TDDMRG(_ToyGDVRRHF(), D=4, td_bond_dim=4).build()
+    td._use_exact_dense_td = lambda: False
+
+    td.run(
+        dt=0.01,
+        steps=1,
+        e_ops=[],
+        integrator="tdvp",
+        tdvp_projection_backend="block-sparse",
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    assert hasattr(td.final_state.factors[0], "qns")
+    np.testing.assert_allclose(td.pre_normalization_norms, np.ones(1), atol=1.0e-12)

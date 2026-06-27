@@ -1888,6 +1888,8 @@ class DMRG(CASCI):
                  spatial_exact_component_compression_validation_vectors=1,
                  spatial_exact_component_compression_min_reduction=1,
                  spatial_exact_component_compression_max_group_size=64,
+                 spatial_enable_native_boundary_r=False,
+                 spatial_validate_native_boundary_r=True,
                  spatial_enable_native_boundary_p=True,
                  spatial_validate_native_boundary_p=False,
                  spatial_native_boundary_p_validation_policy="off",
@@ -1959,11 +1961,12 @@ class DMRG(CASCI):
 
 
         self.ncas = ncas # number of MOs in active space
-        self.nelecas = nelecas
+        self.nelecas = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
 
         self.nelec = mf.nelec
+        nelec_total = int(sum(mf.nelec)) if isinstance(mf.nelec, (tuple, list)) else int(mf.nelec)
 
-        ncore = mf.nelec//2 - self.nelecas//2 # core orbs
+        ncore = nelec_total//2 - self.nelecas//2 # core orbs
         assert(ncore >= 0)
 
 
@@ -2083,6 +2086,12 @@ class DMRG(CASCI):
         )
         self.spatial_exact_component_compression_max_group_size = int(
             spatial_exact_component_compression_max_group_size
+        )
+        self.spatial_enable_native_boundary_r = bool(
+            spatial_enable_native_boundary_r
+        )
+        self.spatial_validate_native_boundary_r = bool(
+            spatial_validate_native_boundary_r
         )
         self.spatial_enable_native_boundary_p = bool(
             spatial_enable_native_boundary_p
@@ -2530,6 +2539,20 @@ class DMRG(CASCI):
         dense active ERI tensor or RI/Cholesky pair factors.
         """
         mf = self.mf
+        active_integrals = getattr(mf, "active_space_integrals", None)
+        if active_integrals is not None:
+            h1e, eri, pair_factors, energy_core, info = active_integrals(
+                mo_coeff=self.mo_coeff,
+                mo_core=self.mo_core,
+                mo_cas=self.mo_cas,
+                ncore=self.ncore,
+                ncas=self.ncas,
+                nelecas=self.nelecas,
+            )
+            self.e_core = float(energy_core)
+            self._active_integral_build_info = dict(info)
+            return h1e, eri, pair_factors
+
         backend = self.integral_backend
         use_factors = backend in {"ri", "cholesky"} or (
             backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
@@ -2919,6 +2942,10 @@ class DMRG(CASCI):
                     exact_component_compression_max_group_size=(
                         self.spatial_exact_component_compression_max_group_size
                     ),
+                    enable_native_boundary_r=self.spatial_enable_native_boundary_r,
+                    validate_native_boundary_r=(
+                        self.spatial_validate_native_boundary_r
+                    ),
                     enable_native_boundary_p=self.spatial_enable_native_boundary_p,
                     validate_native_boundary_p=self.spatial_validate_native_boundary_p,
                     native_boundary_p_validation_policy=(
@@ -2965,6 +2992,8 @@ class DMRG(CASCI):
                 exact_component_compression_max_group_size=(
                     self.spatial_exact_component_compression_max_group_size
                 ),
+                enable_native_boundary_r=self.spatial_enable_native_boundary_r,
+                validate_native_boundary_r=self.spatial_validate_native_boundary_r,
                 enable_native_boundary_p=self.spatial_enable_native_boundary_p,
                 validate_native_boundary_p=self.spatial_validate_native_boundary_p,
                 native_boundary_p_validation_policy=(
@@ -3559,6 +3588,8 @@ class DMRG(CASCI):
             self.spatial_exact_component_compression_validation_vectors,
             self.spatial_exact_component_compression_min_reduction,
             self.spatial_exact_component_compression_max_group_size,
+            self.spatial_enable_native_boundary_r,
+            self.spatial_validate_native_boundary_r,
             self.spatial_enable_native_boundary_p,
             self.spatial_validate_native_boundary_p,
             self.spatial_native_boundary_p_validation_policy,

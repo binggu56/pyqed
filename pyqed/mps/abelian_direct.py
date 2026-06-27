@@ -6945,9 +6945,9 @@ class AbelianPlannedPackedDirectFamilyEntries:
             and bool(np.all(right_table_ids >= 0))
         )
         return cls(
-            route_plan.pair_coeffs,
-            route_plan.pair_left_ids,
-            route_plan.pair_right_ids,
+            route_plan.coeffs,
+            route_plan.left_ids,
+            route_plan.right_ids,
             ()
             if table_backed
             else tuple(getattr(boundary_batch, "left_values", ()) or ()),
@@ -7952,15 +7952,28 @@ class AbelianPackedContextualBoundaryTable:
 
     @staticmethod
     def normalize_key(key):
+        key = tuple(key)
+        if len(key) == 3:
+            return (str(key[0]), tuple(key[1]), str(key[2]))
         return (tuple(key[0]), str(key[1]))
 
     @staticmethod
     def is_normalized_key(key):
         return (
             isinstance(key, tuple)
-            and len(key) == 2
-            and isinstance(key[0], tuple)
-            and isinstance(key[1], str)
+            and (
+                (
+                    len(key) == 2
+                    and isinstance(key[0], tuple)
+                    and isinstance(key[1], str)
+                )
+                or (
+                    len(key) == 3
+                    and isinstance(key[0], str)
+                    and isinstance(key[1], tuple)
+                    and isinstance(key[2], str)
+                )
+            )
         )
 
     @staticmethod
@@ -9953,16 +9966,26 @@ class AbelianContextualDirectFamilyBuilder:
             )
 
     @staticmethod
-    def _normalized_boundary_keys(keys):
+    def _normalized_boundary_keys(keys, family_name=None):
         raw_keys = tuple(keys or ())
         if all(
             AbelianPackedContextualBoundaryTable.is_normalized_key(key)
             for key in raw_keys
         ):
-            return raw_keys
+            normalized = raw_keys
+        else:
+            normalized = tuple(
+                AbelianPackedContextualBoundaryTable.normalize_key(key)
+                for key in raw_keys
+            )
+        if family_name is None:
+            return normalized
+        family = str(family_name)
         return tuple(
-            AbelianPackedContextualBoundaryTable.normalize_key(key)
-            for key in raw_keys
+            key
+            if len(tuple(key)) == 3
+            else (family, tuple(key[0]), str(key[1]))
+            for key in normalized
         )
 
     @staticmethod
@@ -9979,7 +10002,11 @@ class AbelianContextualDirectFamilyBuilder:
     ):
         """Resolve boundary keys through cache, then an optional batch callback."""
 
-        keys = AbelianContextualDirectFamilyBuilder._normalized_boundary_keys(keys)
+        raw_keys = AbelianContextualDirectFamilyBuilder._normalized_boundary_keys(keys)
+        storage_keys = AbelianContextualDirectFamilyBuilder._normalized_boundary_keys(
+            keys,
+            family_name=family_name,
+        )
         debug_prefix = f"{debug_side}_" if debug_side else ""
         owner = getattr(
             AbelianContextualDirectFamilyBuilder,
@@ -9989,7 +10016,7 @@ class AbelianContextualDirectFamilyBuilder:
         if owner is not None and hasattr(owner, "resolve_contextual_boundary_batch"):
             try:
                 result = owner.resolve_contextual_boundary_batch(
-                    tuple(keys),
+                    tuple(raw_keys),
                     cache,
                     builder,
                     batch_builder if callable(batch_builder) else None,
@@ -10029,9 +10056,10 @@ class AbelianContextualDirectFamilyBuilder:
             if debug_stats is not None:
                 debug_stats[debug_prefix + str(name)] = value
 
-        values = [None] * len(keys)
-        table_ids = [-1] * len(keys)
+        values = [None] * len(raw_keys)
+        table_ids = [-1] * len(raw_keys)
         missing = []
+        missing_storage_keys = []
         missing_positions = []
         hits = 0
         misses = 0
@@ -10049,7 +10077,7 @@ class AbelianContextualDirectFamilyBuilder:
                     table_hits,
                     _table_misses,
                 ) = packed_table.resolve_current_ids_many(
-                    keys,
+                    storage_keys,
                     normalized=True,
                 )
             else:
@@ -10061,7 +10089,7 @@ class AbelianContextualDirectFamilyBuilder:
                     table_hits,
                     _table_misses,
                 ) = packed_table.resolve_many(
-                    keys,
+                    storage_keys,
                     normalized=True,
                     return_ids=True,
                 )
@@ -10069,18 +10097,27 @@ class AbelianContextualDirectFamilyBuilder:
                     values[:] = table_values
             table_ids[:] = list(resolved_table_ids)
             hits += int(table_hits)
-            unresolved = tuple(zip(table_missing_positions, table_missing))
+            unresolved = tuple(
+                (
+                    int(pos),
+                    raw_keys[int(pos)],
+                    storage_keys[int(pos)],
+                )
+                for pos in table_missing_positions
+            )
         else:
             unresolved = tuple(
-                (idx, key)
-                for idx, key in enumerate(keys)
+                (idx, raw_key, storage_key)
+                for idx, (raw_key, storage_key) in enumerate(
+                    zip(raw_keys, storage_keys)
+                )
             )
         cache_missing = object()
         cache_table_keys = []
         cache_table_values = []
         cache_table_positions = []
-        for idx, key in unresolved:
-            cached_value = cache.get(key, cache_missing)
+        for idx, raw_key, storage_key in unresolved:
+            cached_value = cache.get(storage_key, cache_missing)
             if cached_value is not cache_missing:
                 values[idx] = cached_value
                 hits += 1
@@ -10089,11 +10126,12 @@ class AbelianContextualDirectFamilyBuilder:
                     and int(table_ids[idx]) < 0
                     and _contextual_boundary_payload_kind(cached_value) == "packed"
                 ):
-                    cache_table_keys.append(key)
+                    cache_table_keys.append(storage_key)
                     cache_table_values.append(cached_value)
                     cache_table_positions.append(idx)
             else:
-                missing.append(key)
+                missing.append(raw_key)
+                missing_storage_keys.append(storage_key)
                 missing_positions.append(idx)
         if cache_table_keys:
             packed_table.put_many(
@@ -10103,8 +10141,8 @@ class AbelianContextualDirectFamilyBuilder:
                 normalized=True,
             )
             table_ids_by_key = packed_table.ids
-            for pos, key in zip(cache_table_positions, cache_table_keys):
-                table_ids[int(pos)] = int(table_ids_by_key.get(key, -1))
+            for pos, storage_key in zip(cache_table_positions, cache_table_keys):
+                table_ids[int(pos)] = int(table_ids_by_key.get(storage_key, -1))
         if missing and callable(batch_builder):
             _debug_increment("batch_attempts")
             _debug_increment("batch_requested_keys", len(missing))
@@ -10154,55 +10192,63 @@ class AbelianContextualDirectFamilyBuilder:
                         "put_many_packed",
                     ):
                         packed_table.put_many_packed(
-                            missing,
+                            missing_storage_keys,
                             built,
                             family_name=family_name,
                             normalized=True,
                         )
                     else:
                         packed_table.put_many(
-                            missing,
+                            missing_storage_keys,
                             built,
                             family_name=family_name,
                             normalized=True,
                         )
-                for pos, key, result in zip(missing_positions, missing, built):
+                for pos, storage_key, result in zip(
+                    missing_positions,
+                    missing_storage_keys,
+                    built,
+                ):
                     if packed_table is not None:
-                        table_ids[pos] = int(packed_table.ids.get(key, -1))
+                        table_ids[pos] = int(packed_table.ids.get(storage_key, -1))
                     if not bool(table_ids_only):
                         values[pos] = result
                     if bool(table_ids_only):
                         if int(table_ids[pos]) < 0:
-                            cache[key] = result
+                            cache[storage_key] = result
                     elif (
                         packed_table is None
                         or _contextual_boundary_payload_kind(result) != "packed"
                     ):
-                        cache[key] = result
+                        cache[storage_key] = result
                     misses += 1
                 missing = []
                 missing_positions = []
-        for pos, (pattern, piece) in zip(missing_positions, missing):
+        for pos, raw_key, storage_key in zip(
+            missing_positions,
+            missing,
+            missing_storage_keys,
+        ):
+            pattern, piece = raw_key
             t_build = time.perf_counter()
             try:
                 result = builder(pattern, piece, family_name=family_name)
             except Exception:
                 result = None
             build_seconds += time.perf_counter() - t_build
-            key = (tuple(pattern), str(piece))
             if (
                 packed_table is None
                 or _contextual_boundary_payload_kind(result) != "packed"
             ):
-                cache[key] = result
+                cache[storage_key] = result
             if packed_table is not None:
                 packed_table.put_many(
-                    (key,),
+                    (storage_key,),
                     (result,),
                     family_name=family_name,
                     normalized=True,
                 )
-                table_ids[pos] = int(packed_table.ids.get(key, -1))
+                table_ids[pos] = int(packed_table.ids.get(storage_key, -1))
             if not bool(table_ids_only):
                 values[pos] = result
             misses += 1
@@ -10240,6 +10286,7 @@ class AbelianContextualDirectFamilyBuilder:
             "contextual_boundary_batch",
             str(side),
             token,
+            str(family_name),
             id(packed_table) if packed_table is not None else None,
             bool(table_ids_only),
             layout_marker,
@@ -11278,7 +11325,8 @@ class AbelianContextualDirectFamilyBuilder:
                     )
                     use_planned_arrays = True
                     _increment_counter(lazy_stats, "planned_calls")
-                    _increment_counter(lazy_stats, "planned_entries", int(pair_coeffs.shape[0]))
+                    _increment_counter(lazy_stats, "planned_entries", int(record_count))
+                    _increment_counter(lazy_stats, "planned_compact_pairs", int(pair_coeffs.shape[0]))
                 else:
                     _increment_counter(lazy_stats, "fallbacks")
                     lazy_stats["last_fallback_reason"] = "nonpacked_or_missing_boundary"
@@ -11288,15 +11336,16 @@ class AbelianContextualDirectFamilyBuilder:
                 and use_packed_buffer
                 and entry_cls is AbelianPackedLocalGeneratorEntry
             ):
-                pair_count = int(pair_coeffs.shape[0])
+                planned_count = int(record_count)
+                compact_pair_count = int(pair_coeffs.shape[0])
                 route_fast_packed = bool(
                     getattr(boundary_batch, "packed_boundary_pairs", False)
                 )
                 if not route_fast_packed:
                     route_fast_packed = True
-                    for route_idx in range(pair_count):
-                        left_id = int(pair_left_ids[route_idx])
-                        right_id = int(pair_right_ids[route_idx])
+                    for route_idx in range(planned_count):
+                        left_id = int(left_ids[route_idx])
+                        right_id = int(right_ids[route_idx])
                         left_result = left_values[left_id]
                         right_result = right_values[right_id]
                         if left_result is None or right_result is None:
@@ -11427,7 +11476,10 @@ class AbelianContextualDirectFamilyBuilder:
                         planned_cache_stats["builds"] = (
                             int(planned_cache_stats.get("builds", 0)) + 1
                         )
-                    planned_cache_stats["last_entries"] = int(pair_count)
+                    planned_cache_stats["last_entries"] = int(len(entries))
+                    planned_cache_stats["last_compact_pairs"] = int(
+                        compact_pair_count
+                    )
                     planned_cache_stats["last_stable_table_key"] = bool(
                         table_backed_possible
                     )
@@ -11440,16 +11492,17 @@ class AbelianContextualDirectFamilyBuilder:
                         {"calls": 0},
                     )
                     _increment_counter(fast_stats, "calls")
-                    _increment_counter(fast_stats, "entries", pair_count)
+                    _increment_counter(fast_stats, "entries", planned_count)
                     _increment_counter(
                         fast_stats,
-                        "coalesced_records",
-                        int(record_count - pair_count),
+                        "compact_pairs",
+                        compact_pair_count,
                     )
-                    fast_stats["last_entries"] = int(pair_count)
+                    fast_stats["last_entries"] = int(planned_count)
                     fast_stats["last_records"] = int(record_count)
-                    fast_stats["last_coalesced_records"] = int(record_count - pair_count)
-                    _increment_counter(fast_stats, "planned_entries", pair_count)
+                    fast_stats["last_compact_pairs"] = int(compact_pair_count)
+                    fast_stats["last_coalesced_records"] = 0
+                    _increment_counter(fast_stats, "planned_entries", planned_count)
                     _increment_counter(fast_stats, "planned_calls")
                     left_table_id_hits = int(
                         np.count_nonzero(left_table_id_array >= 0)
@@ -11474,7 +11527,7 @@ class AbelianContextualDirectFamilyBuilder:
                         _increment_counter(
                             fast_stats,
                             "table_backed_entries",
-                            pair_count,
+                            planned_count,
                         )
                         fast_stats["last_table_backed"] = True
                     else:
@@ -11484,7 +11537,7 @@ class AbelianContextualDirectFamilyBuilder:
                         _increment_counter(
                             fast_stats,
                             "packed_boundary_entries",
-                            pair_count,
+                            planned_count,
                         )
                         fast_stats["last_boundary_payload"] = "packed"
                     else:
@@ -11492,7 +11545,7 @@ class AbelianContextualDirectFamilyBuilder:
                         _increment_counter(
                             fast_stats,
                             "nonpacked_boundary_entries",
-                            pair_count,
+                            planned_count,
                         )
                         fast_stats["last_boundary_payload"] = "mixed_or_legacy"
             if not route_fast_packed:

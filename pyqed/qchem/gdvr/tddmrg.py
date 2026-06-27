@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.linalg import expm
 
@@ -18,6 +20,7 @@ from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.decompose import decompose
 from pyqed.mps.mps import MPS
 from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.mps.symmetry import AbelianSector
 from pyqed.mps.tdvp import TDVPEngine, one_site_tdvp_step, two_site_tdvp_step
 from pyqed.qchem.dmrg.spatial_terms import (
     BasisSpatialFermion,
@@ -293,7 +296,7 @@ def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr
     return mpo, info
 
 
-def build_gdvr_spatial_dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+def dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
     """Build electronic z-dipole MPO as ``-sum_i z_i n_i`` on spatial sites."""
     op = gdvr_z_operator(mol, electronic=True)
     nspatial = op.shape[0]
@@ -309,6 +312,60 @@ def build_gdvr_spatial_dipole_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
         cutoff=cutoff,
         algo=symbolic_algo,
     )[0]
+
+
+def force_operator(mol):
+    """Approximate field-free ``mu_z`` acceleration from the GDVR slice force.
+
+    For the current direct GDVR HHG path this supports ``M=1``. The returned
+    one-body operator is diagonal with entries ``d V_ext(z_i) / dz``; the
+    external field contribution ``N E_z(t)`` should be added at sampling time.
+    """
+    if mol.shapes is None or mol.z is None or mol.e_slices is None:
+        raise ValueError("Build the GDVR molecule before requesting a force operator.")
+    nz = int(mol.shapes["Nz"])
+    m = int(mol.shapes["M"])
+    if m != 1:
+        raise NotImplementedError("The GDVR slice-force acceleration observable currently supports M=1 only.")
+    z = np.asarray(mol.z, dtype=float).reshape(nz)
+    values = np.asarray(mol.e_slices, dtype=float).reshape(nz, m)[:, 0]
+    edge_order = 2 if nz > 2 else 1
+    force = np.gradient(values, z, edge_order=edge_order)
+    return np.diag(force)
+
+
+def force_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
+    """Build the field-free force contribution to ``d^2 mu_z / dt^2``."""
+    op = force_operator(mol)
+    nspatial = op.shape[0]
+    basis_sites = [BasisSpatialFermion(i) for i in range(nspatial)]
+    term_map = {}
+    for p, val in enumerate(np.diag(op)):
+        if abs(val) <= cutoff:
+            continue
+        accumulate_spatial_symbolic_term(term_map, "n", [p], val, tol=cutoff)
+    return _build_tensor_mpo_from_symbolic_terms(
+        basis_sites,
+        term_map,
+        cutoff=cutoff,
+        algo=symbolic_algo,
+    )[0]
+
+
+def _mpo_product(left, right, chi_max=None):
+    if chi_max is None:
+        return left @ right
+    return left.matmul(right, chi_max=int(chi_max))
+
+
+def acceleration_mpo(hamiltonian_mpo, dipole_mpo, *, chi_max=None):
+    """Build the field-free dipole acceleration operator ``-[[mu, H0], H0]``."""
+    h = hamiltonian_mpo
+    mu = dipole_mpo
+    mu_h_h = _mpo_product(_mpo_product(mu, h, chi_max), h, chi_max)
+    h_mu_h = _mpo_product(_mpo_product(h, mu, chi_max), h, chi_max)
+    h_h_mu = _mpo_product(_mpo_product(h, h, chi_max), mu, chi_max)
+    return (-1.0) * (mu_h_h + ((-2.0) * h_mu_h) + h_h_mu)
 
 
 def build_gdvr_spatial_z_phase_mpo(mol, field_z, dt):
@@ -447,6 +504,113 @@ def _apply_adjacent_two_site_gate(psi, site, gate, *, max_bond=None, cutoff=0.0)
     return MPS(factors, labels=["lv", "p", "rv"])
 
 
+_SPATIAL_LOCAL_QNS = ((0, 0), (1, 1), (1, -1), (2, 0))
+
+
+def _qadd(left, right):
+    return (int(left[0]) + int(right[0]), int(left[1]) + int(right[1]))
+
+
+def _qsub(left, right):
+    return (int(left[0]) - int(right[0]), int(left[1]) - int(right[1]))
+
+
+def _spatial_product_bond_qns(nsites, nelec, *, spin=0):
+    nelec = int(nelec)
+    spin = 0 if spin is None else int(spin)
+    n_double = nelec // 2
+    has_single = nelec % 2
+    single_state = 1 if spin >= 0 else 2
+    q = (0, 0)
+    bond_qns = [[q]]
+    for site in range(int(nsites)):
+        if site < n_double:
+            local = 3
+        elif site == n_double and has_single:
+            local = single_state
+        else:
+            local = 0
+        q = _qadd(q, _SPATIAL_LOCAL_QNS[local])
+        bond_qns.append([q])
+    return bond_qns
+
+
+def _apply_adjacent_two_site_gate_sector_preserving(
+    psi,
+    bond_qns,
+    site,
+    gate,
+    *,
+    max_bond=None,
+    cutoff=0.0,
+):
+    factors = [np.asarray(psi._get_std_B(i), dtype=complex).copy() for i in range(psi.L)]
+    site = int(site)
+    left = factors[site]
+    right = factors[site + 1]
+    gate = np.asarray(gate, dtype=complex).reshape(4, 4, 4, 4)
+    theta = np.tensordot(left, right, axes=([2], [0]))
+    theta = np.einsum("pqrs,arsb->apqb", gate, theta, optimize=True)
+    left_dim, d_left, d_right, right_dim = theta.shape
+    mat = theta.reshape(left_dim * d_left, d_right * right_dim)
+
+    row_by_sector = {}
+    for left_idx, q_left in enumerate(bond_qns[site]):
+        for phys_idx, q_phys in enumerate(_SPATIAL_LOCAL_QNS):
+            sector = _qadd(q_left, q_phys)
+            row_by_sector.setdefault(sector, []).append(left_idx * d_left + phys_idx)
+
+    col_by_sector = {}
+    for phys_idx, q_phys in enumerate(_SPATIAL_LOCAL_QNS):
+        for right_idx, q_right in enumerate(bond_qns[site + 2]):
+            sector = _qsub(q_right, q_phys)
+            col_by_sector.setdefault(sector, []).append(phys_idx * right_dim + right_idx)
+
+    blocks = {}
+    candidates = []
+    for sector in row_by_sector.keys() & col_by_sector.keys():
+        rows = row_by_sector[sector]
+        cols = col_by_sector[sector]
+        block = mat[np.ix_(rows, cols)]
+        if not np.any(np.abs(block) > cutoff):
+            continue
+        u, s, vh = np.linalg.svd(block, full_matrices=False)
+        blocks[sector] = (rows, cols, u, s, vh)
+        for idx, sval in enumerate(s):
+            if cutoff and cutoff > 0.0 and sval <= cutoff:
+                continue
+            candidates.append((float(sval), sector, int(idx)))
+
+    if not candidates:
+        sector, (rows, cols, u, s, vh) = max(
+            blocks.items(),
+            key=lambda item: float(item[1][3][0]) if item[1][3].size else -np.inf,
+        )
+        candidates = [(float(s[0]), sector, 0)]
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if max_bond is not None:
+        candidates = candidates[: max(1, int(max_bond))]
+
+    keep = len(candidates)
+    u_full = np.zeros((left_dim * d_left, keep), dtype=complex)
+    vh_full = np.zeros((keep, d_right * right_dim), dtype=complex)
+    s_full = np.zeros(keep, dtype=float)
+    new_qns = []
+    for col_idx, (sval, sector, local_idx) in enumerate(candidates):
+        rows, cols, u, s, vh = blocks[sector]
+        u_full[rows, col_idx] = u[:, local_idx]
+        vh_full[col_idx, cols] = vh[local_idx, :]
+        s_full[col_idx] = s[local_idx]
+        new_qns.append(sector)
+
+    factors[site] = u_full.reshape(left_dim, d_left, keep)
+    factors[site + 1] = (s_full[:, None] * vh_full).reshape(keep, d_right, right_dim)
+    updated_bond_qns = [list(qns) for qns in bond_qns]
+    updated_bond_qns[site + 1] = new_qns
+    return MPS(factors, labels=["lv", "p", "rv"]), updated_bond_qns
+
+
 def _adjacent_givens_decomposition(unitary, *, tol=1.0e-12):
     matrix = np.asarray(unitary, dtype=complex).copy()
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
@@ -545,7 +709,16 @@ def _spatial_product_mps(nsites, nelec, *, spin=0):
     return MPS(factors, labels=["lv", "p", "rv"])
 
 
-def _apply_spatial_orbital_transform(psi, transform, *, max_bond=None, cutoff=1.0e-12):
+def _apply_spatial_orbital_transform(
+    psi,
+    transform,
+    *,
+    max_bond=None,
+    cutoff=1.0e-12,
+    preserve_quantum_numbers=False,
+    nelec=None,
+    spin=0,
+):
     transform = np.asarray(transform, dtype=complex)
     if transform.ndim != 2 or transform.shape[0] != transform.shape[1]:
         raise ValueError("orbital transform must be a square matrix.")
@@ -555,21 +728,42 @@ def _apply_spatial_orbital_transform(psi, transform, *, max_bond=None, cutoff=1.
 
     diagonal, rotations = _adjacent_givens_decomposition(transform)
     out = psi.copy().to_order(["lv", "p", "rv"])
+    bond_qns = None
+    if preserve_quantum_numbers:
+        if nelec is None:
+            raise ValueError("nelec is required for quantum-number-preserving orbital transforms.")
+        bond_qns = _spatial_product_bond_qns(out.L, nelec, spin=spin)
     for site, value in enumerate(diagonal):
         out = _apply_one_site_phase(out, site, _spatial_occupation_phase_values(value))
     for site, givens in reversed(rotations):
         gate = _two_orbital_spatial_transform_gate(givens.conj().T)
-        out = _apply_adjacent_two_site_gate(
-            out,
-            site,
-            gate,
-            max_bond=max_bond,
-            cutoff=cutoff,
-        )
+        if preserve_quantum_numbers:
+            out, bond_qns = _apply_adjacent_two_site_gate_sector_preserving(
+                out,
+                bond_qns,
+                site,
+                gate,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
+        else:
+            out = _apply_adjacent_two_site_gate(
+                out,
+                site,
+                gate,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
     return out.normalize()
 
 
-def rhf_determinant_mps(mf, *, max_bond=None, cutoff=1.0e-12):
+def rhf_determinant_mps(
+    mf,
+    *,
+    max_bond=None,
+    cutoff=1.0e-12,
+    preserve_quantum_numbers=False,
+):
     """Return the closed-shell RHF determinant as a spatial-site GDVR MPS."""
     coeff = np.asarray(mf.mo_coeff, dtype=complex)
     occ = np.asarray(mf.mo_occ, dtype=float).reshape(-1)
@@ -593,6 +787,9 @@ def rhf_determinant_mps(mf, *, max_bond=None, cutoff=1.0e-12):
         coeff[:, order],
         max_bond=max_bond,
         cutoff=cutoff,
+        preserve_quantum_numbers=preserve_quantum_numbers,
+        nelec=int(round(np.sum(occ))),
+        spin=getattr(mf.mol, "spin", 0),
     )
 
 
@@ -1919,84 +2116,36 @@ class GDVRMeanFieldAdapter:
             return np.einsum("pi,xpq,qj->xij", c.conj(), op, c, optimize=True)
         raise ValueError("basis must be 'ao' or 'mo'.")
 
-
-class ActiveSpaceTDDMRG(BaseTDDMRG):
-    """
-    Active-space time-dependent DMRG on top of a converged GDVR RHF reference.
-
-    This class reuses the qchem :class:`TDDMRG` propagator while replacing the
-    GTO integral path by a direct transformation of the collocated GDVR ERI
-    blocks into the selected active MO space.
-    """
-
-    def __init__(
+    def active_space_integrals(
         self,
-        mf,
-        ncas,
-        nelecas,
-        D,
-        m_warmup=None,
-        spin=None,
-        tol=1e-6,
-        low_rank_mpo=False,
-        low_rank_mpo_bond=None,
-        low_rank_mpo_batch_size=4,
-        td_bond_dim=None,
-        active_orbitals=None,
+        *,
+        mo_core,
+        mo_cas,
+        ncore,
+        ncas=None,
+        mo_coeff=None,
+        nelecas=None,
     ):
-        ncas = int(ncas)
-        nelecas_int = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
-        ncore = int(mf.mol.nelec) // 2 - nelecas_int // 2
-        if ncore < 0:
-            raise ValueError("nelecas cannot exceed the number of GDVR RHF electrons.")
-
-        mo_coeff = None
-        if active_orbitals is not None:
-            active_orbitals = tuple(int(i) for i in active_orbitals)
-            needed = ncore + ncas
-            if len(active_orbitals) < needed:
-                raise ValueError("active_orbitals must contain at least ncore + ncas indices.")
-            mo_coeff = np.asarray(mf.mo_coeff)[:, active_orbitals[:needed]]
-
-        adapter = GDVRMeanFieldAdapter(mf, mo_coeff=mo_coeff)
-        if spin is None:
-            spin = 0 if getattr(mf.mol, "spin", None) is None else mf.mol.spin
-
-        super().__init__(
-            adapter,
-            ncas=ncas,
-            nelecas=nelecas,
-            D=D,
-            init_guess="hf",
-            m_warmup=m_warmup,
-            spin=spin,
-            tol=tol,
-            low_rank_mpo=low_rank_mpo,
-            low_rank_mpo_bond=low_rank_mpo_bond,
-            low_rank_mpo_batch_size=low_rank_mpo_batch_size,
-            td_bond_dim=td_bond_dim,
-        )
-        self.gdvr_mf = mf
-        self.active_orbitals = active_orbitals
-
-    def _get_active_hamiltonian_inputs(self):
-        hcore = self.mf.get_hcore()
-        ncore = int(self.ncore)
-        mo_core = np.asarray(self.mo_core)
-        mo_cas = np.asarray(self.mo_cas)
+        del mo_coeff, nelecas
+        hcore = self.get_hcore()
+        ncore = int(ncore)
+        mo_core = np.asarray(mo_core)
+        mo_cas = np.asarray(mo_cas)
+        if ncas is None:
+            ncas = mo_cas.shape[1]
 
         if ncore == 0:
             core_vhf = 0.0
-            energy_core = self.mf.energy_nuc()
+            energy_core = self.energy_nuc()
         else:
             core_dm = 2.0 * (mo_core @ mo_core.conj().T)
-            core_vhf = self.mf.get_veff(core_dm)
-            energy_core = self.mf.energy_nuc()
+            core_vhf = self.get_veff(core_dm)
+            energy_core = self.energy_nuc()
             energy_core += np.einsum("ij,ji->", core_dm, hcore, optimize=True).real
             energy_core += 0.5 * np.einsum("ij,ji->", core_dm, core_vhf, optimize=True).real
 
         h1 = mo_cas.conj().T @ (hcore + core_vhf) @ mo_cas
-        mol = self.gdvr_mf.mol
+        mol = self.mol
         eri = active_eri_from_gdvr_collocation(
             mol.eri_j,
             mo_cas,
@@ -2004,24 +2153,22 @@ class ActiveSpaceTDDMRG(BaseTDDMRG):
             int(mol.shapes["M"]),
         )
         h2 = np.stack(((eri, eri.copy()), (eri.copy(), eri.copy())))
-
-        self.e_core = float(energy_core)
-        self._active_integral_build_info = {
+        info = {
             "mode": "gdvr_collocated_dense_active",
             "factorized_integrals": False,
             "aux_rank": None,
-            "ncas": self.ncas,
+            "ncas": int(ncas),
             "source_basis_size": int(mol.shapes["size"]),
         }
-        return [h1, h1.copy()], h2, None
+        return [h1, h1.copy()], h2, None, float(energy_core), info
 
 
 class TDDMRG(BaseTDDMRG):
     """
     Direct GDVR-basis time-dependent DMRG.
 
-    Unlike the active-space adapter above, this builder does not transform the
-    collocated GDVR ERIs into a dense four-index tensor.  It emits the
+    Unlike the generic qchem active-space path, this builder does not transform
+    the collocated GDVR ERIs into a dense four-index tensor. It emits the
     Hamiltonian MPO directly from the nonzero z-slice Coulomb blocks, while
     ``mu_z`` is built as a diagonal number-operator MPO from the GDVR grid.
     """
@@ -2046,22 +2193,35 @@ class TDDMRG(BaseTDDMRG):
             nelecas = int(mol.nelec)
         nelecas_int = int(sum(nelecas)) if isinstance(nelecas, (tuple, list)) else int(nelecas)
         if nelecas_int != int(mol.nelec):
-            raise ValueError("Direct GDVR-TDDMRG currently propagates all GDVR electrons; use ActiveSpaceTDDMRG for CAS runs.")
+            raise ValueError(
+                "Direct GDVR-TDDMRG propagates all GDVR electrons. "
+                "For CAS runs, use mf.TDDMRG(D=..., ncas=..., nelecas=...)."
+            )
         if spin is None:
             spin = 0 if getattr(mol, "spin", None) is None else mol.spin
 
         adapter = GDVRMeanFieldAdapter(mf, mo_coeff=np.eye(nspatial))
-        super().__init__(
-            adapter,
-            ncas=nspatial,
-            nelecas=nelecas,
-            D=D,
-            init_guess=rhf_determinant_mps(mf, max_bond=D),
-            m_warmup=m_warmup,
-            spin=spin,
-            tol=tol,
-            td_bond_dim=td_bond_dim,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Active space with .* orbitals is probably too big\.",
+                category=UserWarning,
+            )
+            super().__init__(
+                adapter,
+                ncas=nspatial,
+                nelecas=nelecas,
+                D=D,
+                init_guess=rhf_determinant_mps(
+                    mf,
+                    max_bond=D,
+                    preserve_quantum_numbers=True,
+                ),
+                m_warmup=m_warmup,
+                spin=spin,
+                tol=tol,
+                td_bond_dim=td_bond_dim,
+            )
         self.site = "spatial"
         self.site_basis = "spatial"
         self.orbital_layout = "spatial"
@@ -2071,15 +2231,50 @@ class TDDMRG(BaseTDDMRG):
         self.gdvr_mpo_cutoff = float(cutoff)
         self.gdvr_symbolic_algo = str(symbolic_algo)
 
+    def optimize_ground_state(self, *args, **kwargs):
+        """Optimize the GDVR ground state with a symmetry-native default guess.
+
+        The constructor normally provides a sector-preserving RHF determinant
+        MPS.  If a caller replaced it with a non-MPS sentinel, fall back to the
+        built-in symmetry-native HF guess instead of trying to coerce it here.
+        """
+        if "initial_guess" not in kwargs and not isinstance(self.init_guess, MPS):
+            kwargs["initial_guess"] = "hf"
+        return super().optimize_ground_state(*args, **kwargs)
+
     def _default_initial_state(self):
         if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
             return self.export_initial_guess(dense=True)
 
         return rhf_determinant_mps(self.gdvr_mf, max_bond=self.D)
 
+    def _default_block_sparse_initial_state(self):
+        if isinstance(self.init_guess, MPS) and hasattr(self.init_guess.factors[0], "qns"):
+            return self.init_guess.copy()
+        return rhf_determinant_mps(
+            self.gdvr_mf,
+            max_bond=self.D,
+            preserve_quantum_numbers=True,
+        )
+
     def default_initial_condition(self):
         """Return the default real-time initial condition for ``run(psi0=...)``."""
         return self._default_initial_state()
+
+    def _tdvp_sector_settings(self):
+        labels = ("charge", "sz")
+        local_sectors = [
+            AbelianSector(labels, (0, 0)),
+            AbelianSector(labels, (1, 1)),
+            AbelianSector(labels, (1, -1)),
+            AbelianSector(labels, (2, 0)),
+        ]
+        nelec = int(sum(self.nelecas)) if isinstance(self.nelecas, (tuple, list)) else int(self.nelecas)
+        spin = 0 if self.spin is None else int(self.spin)
+        return {
+            "local_sectors": local_sectors,
+            "target_sector": AbelianSector(labels, (nelec, spin)),
+        }
 
     def build(self, mo_coeff=None):
         if mo_coeff is not None:
@@ -2141,7 +2336,7 @@ class TDDMRG(BaseTDDMRG):
             return super().get_interaction_mpo(axis=axis)
         if self._interaction_mpo_cache is None:
             zero = self._zero_mpo(self.ncas, phys_dim=4)
-            mu_z = build_gdvr_spatial_dipole_mpo(
+            mu_z = dipole_mpo(
                 self.gdvr_mf.mol,
                 cutoff=self.gdvr_mpo_cutoff,
                 symbolic_algo=self.gdvr_symbolic_algo,
@@ -2159,7 +2354,3 @@ class TDDMRG(BaseTDDMRG):
         if _axis_index(axis) != 2:
             return np.zeros((self.ncas, self.ncas))
         return gdvr_z_operator(self.gdvr_mf.mol, electronic=True)
-
-
-RealTimeDMRG = TDDMRG
-RTTDDMRG = TDDMRG

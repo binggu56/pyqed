@@ -186,8 +186,10 @@ from pyqed.mps.abelian_direct import (
     unpack_abelian_packed_boundary_tensor,
 )
 from pyqed.mps.abelian_storage import (
+    abelian_environment_scalar,
     make_initial_left_environment,
     make_initial_right_environment,
+    make_identity_mpo_site_from_mps_site,
     make_abelian_site_tensor,
     to_native_abelian_site_tensor,
 )
@@ -13002,7 +13004,9 @@ class MovingEnvironmentCompiledBackend:
                     ),
                     source="packed_boundary_legacy_identity",
                 )
-                cloned.identity_sources = list(packed.identity_sources)
+                identity_sources = list(getattr(packed, "identity_sources", ()))
+                if len(identity_sources) == len(cloned.identity_coeffs):
+                    cloned.identity_sources = identity_sources
                 cloned.extend_local_generators(
                     tuple(packed.local_coeffs),
                     tuple(
@@ -13023,7 +13027,9 @@ class MovingEnvironmentCompiledBackend:
                     ),
                     source="packed_boundary_legacy_local",
                 )
-                cloned.local_sources = list(packed.local_sources)
+                local_sources = list(getattr(packed, "local_sources", ()))
+                if len(local_sources) == len(cloned.local_coeffs):
+                    cloned.local_sources = local_sources
                 changed = any(
                     bool(getattr(tensor, "_pyqed_packed_boundary_tensor", False))
                     for tensors in (
@@ -13092,6 +13098,31 @@ class MovingEnvironmentCompiledBackend:
                 cloned[family_name] = cloned_entries
                 changed = changed or entry_changed
             return cloned, changed
+
+        def _packed_boundary_legacy_compare_supported(entries_obj):
+            packed = (
+                entries_obj
+                if bool(getattr(entries_obj, "_pyqed_packed_direct_family_entries", False))
+                else getattr(entries_obj, "entries", None)
+            )
+            if not bool(getattr(packed, "_pyqed_packed_direct_family_entries", False)):
+                return True
+            if bool(getattr(packed, "_pyqed_planned_direct_family_entries", False)):
+                return False
+            if bool(getattr(packed, "_pyqed_same_side_route_identity_entries", False)):
+                return False
+            if bool(getattr(packed, "_pyqed_composite_direct_family_entries", False)):
+                return all(
+                    _packed_boundary_legacy_compare_supported(part)
+                    for part in tuple(getattr(packed, "parts", ()) or ())
+                )
+            return True
+
+        def _legacy_boundary_compare_supported(environments):
+            return all(
+                _packed_boundary_legacy_compare_supported(entries)
+                for entries in (environments or {}).values()
+            )
 
         mode = str(
             MovingEnvironment._option_value(
@@ -13162,10 +13193,21 @@ class MovingEnvironmentCompiledBackend:
                 "RawRoutePlan",
                 None,
             )
-            planned_plan_cls = None if _cpp_davidson is None else getattr(
-                _cpp_davidson,
-                "PlannedDirectPayloadPlan",
-                None,
+            use_planned_direct_payload = bool(
+                MovingEnvironment._option_value(
+                    self.environment.matvec_options,
+                    "generator_table_use_planned_direct_payload",
+                    True,
+                )
+            )
+            planned_plan_cls = (
+                None
+                if _cpp_davidson is None or not use_planned_direct_payload
+                else getattr(
+                    _cpp_davidson,
+                    "PlannedDirectPayloadPlan",
+                    None,
+                )
             )
             if direct_builder_fn is None or (
                 mode in {"auto", "cython", "cpp", "native", "packed"}
@@ -13248,6 +13290,8 @@ class MovingEnvironmentCompiledBackend:
                 stats["packed_planned_route_cpp_used"] = bool(planned_plan_used)
                 if planned_plan_used:
                     stats["packed_planned_route_cpp_fallback_reason"] = ""
+                elif not use_planned_direct_payload:
+                    stats["packed_planned_route_cpp_fallback_reason"] = "disabled"
                 elif planned_plan_error:
                     stats["packed_planned_route_cpp_fallback_reason"] = (
                         planned_plan_error
@@ -13304,7 +13348,9 @@ class MovingEnvironmentCompiledBackend:
                     legacy_envs, legacy_changed = _legacy_direct_family_environments(
                         direct_environments
                     )
-                    if legacy_changed:
+                    if legacy_changed and _legacy_boundary_compare_supported(
+                        direct_environments
+                    ):
                         legacy_builder = direct_builder_fn(
                             legacy_envs,
                             getattr(proto, "data", {}) or {},
@@ -13392,6 +13438,16 @@ class MovingEnvironmentCompiledBackend:
                                 f"legacy_entries={legacy_entries} "
                                 f"abs={diff:.3e} rel={rel:.3e}"
                             )
+                    elif legacy_changed:
+                        stats["packed_boundary_route_validate_skipped_special"] = int(
+                            stats.get(
+                                "packed_boundary_route_validate_skipped_special",
+                                0,
+                            )
+                        ) + 1
+                        stats["packed_boundary_route_validate_skip_reason"] = (
+                            "compact_planned_or_same_side_entries"
+                        )
                     ref = operator._flat_generator_family_csr_kernels(
                         proto,
                         layout,
@@ -14693,6 +14749,7 @@ class MovingEnvironment:
         self._direct_family_cache_maps = ()
         self._owner_direct_family_environment_cache = {}
         self._owner_direct_family_prepared_payloads = {}
+        self._owner_typed_direct_family_after_environment_consume = None
         self.direct_family_revision = 0
         self.use_cpp_block_matvec = bool(
             self._option_value(
@@ -14808,6 +14865,10 @@ class MovingEnvironment:
             "owner_bond_step_backend_actual": None,
             "owner_bond_step_orchestrator_actual": None,
             "owner_bond_step_last_error": None,
+            "owner_typed_direct_plan_static_refresh_attempts": 0,
+            "owner_typed_direct_plan_static_refresh_accepts": 0,
+            "owner_typed_direct_plan_static_refresh_fallbacks": 0,
+            "owner_typed_direct_plan_static_refresh_failures": 0,
             "owner_local_optimize_calls": 0,
             "owner_local_optimize_accepts": 0,
             "owner_local_optimize_rejections": 0,
@@ -14824,6 +14885,13 @@ class MovingEnvironment:
             "owner_local_optimize_commit_actual": None,
             "owner_local_optimize_solve_actual": None,
             "owner_local_optimize_update_payload_actual": None,
+            "owner_site_chain_backend_actual": None,
+            "owner_site_chain_gets": 0,
+            "owner_site_chain_sets": 0,
+            "owner_site_chain_syncs": 0,
+            "owner_site_chain_sync_sites": 0,
+            "owner_site_chain_deferred_half_syncs": 0,
+            "owner_site_chain_deferred_schedule_syncs": 0,
             "owner_local_grouped_solve_update_calls": 0,
             "owner_local_grouped_solve_update_accepts": 0,
             "owner_local_grouped_solve_update_rejections": 0,
@@ -15026,6 +15094,9 @@ class MovingEnvironment:
             "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_pieces": 0,
             "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_entries": 0,
             "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_empty_pieces": 0,
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_factory_calls": 0,
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_installs": 0,
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_uses": 0,
             "cpp_moving_environment_direct_family_two_phase_dispatch_plan_last_error": None,
             "cpp_moving_environment_owner_bond_step_runner_calls": 0,
             "cpp_moving_environment_owner_bond_step_runner_accepted": 0,
@@ -15033,6 +15104,8 @@ class MovingEnvironment:
             "cpp_moving_environment_owner_bond_step_runner_payload_prepares": 0,
             "cpp_moving_environment_owner_bond_step_runner_environment_moves": 0,
             "cpp_moving_environment_owner_bond_step_runner_environment_fallbacks": 0,
+            "cpp_moving_environment_owner_bond_step_runner_assign_calls": 0,
+            "cpp_moving_environment_owner_bond_step_runner_assign_skips": 0,
             "cpp_moving_environment_owner_bond_step_runner_seconds": 0.0,
             "cpp_moving_environment_owner_bond_step_runner_last_seconds": 0.0,
             "cpp_moving_environment_owner_bond_step_runner_payload_seconds": 0.0,
@@ -15056,6 +15129,33 @@ class MovingEnvironment:
             "cpp_moving_environment_owner_typed_bond_step_environment_record_consumes": 0,
             "cpp_moving_environment_owner_typed_bond_step_python_prepare_calls": 0,
             "cpp_moving_environment_owner_typed_bond_step_python_move_calls": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_record_installs": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_calls": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_accepts": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_empty": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_failures": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_updates": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_misses": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_failures": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_accepts": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_empty": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_failures": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_accepts": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_empty": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_failures": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_accepts": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_links": 0,
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_failures": 0,
+            "cpp_moving_environment_direct_family_revision_state_updates": 0,
+            "cpp_moving_environment_direct_family_revision_state_failures": 0,
+            "cpp_moving_environment_direct_family_revision_cache_key_builds": 0,
+            "cpp_moving_environment_direct_family_revision_cache_key_failures": 0,
+            "cpp_moving_environment_direct_family_cpp_key_bundle_builds": 0,
+            "cpp_moving_environment_direct_family_cpp_key_bundle_failures": 0,
+            "cpp_moving_environment_direct_family_revision_state_last_error": None,
             "cpp_moving_environment_owner_typed_bond_step_record_last_error": None,
             "cpp_moving_environment_owner_typed_half_sweep_plan_records": 0,
             "cpp_moving_environment_owner_typed_half_sweep_plan_installs": 0,
@@ -16669,23 +16769,46 @@ class MovingEnvironment:
             return None
         return (int(bond), cache_key)
 
-    @staticmethod
-    def _owner_direct_family_cpp_payload_key(bond, cache_key):
+    def _owner_direct_family_cpp_key_bundle(self, bond, cache_key):
         if cache_key is None:
             return None
-        return f"direct-family-payload:{int(bond)}:{cache_key!r}"
+        owner = self._cpp_moving_environment
+        if owner is not None and hasattr(owner, "direct_family_cpp_key_bundle"):
+            try:
+                bundle = owner.direct_family_cpp_key_bundle(int(bond), cache_key)
+                self._sync_cpp_moving_environment_stats()
+                self.moving_profile_stats[
+                    "owner_direct_family_cpp_key_bundle_backend_actual"
+                ] = "cpp_moving_environment"
+                return bundle
+            except Exception as exc:
+                self.moving_profile_stats[
+                    "cpp_moving_environment_direct_family_cpp_key_bundle_last_error"
+                ] = str(exc)
+        return {
+            "payload_key": f"direct-family-payload:{int(bond)}:{cache_key!r}",
+            "builder_key": f"direct-family-builder:{int(bond)}:{cache_key!r}",
+            "plan_key": f"direct-family-plan:{int(bond)}:{cache_key!r}",
+            "cache_key": cache_key,
+        }
 
-    @staticmethod
-    def _owner_direct_family_cpp_builder_key(bond, cache_key):
-        if cache_key is None:
+    def _owner_direct_family_cpp_payload_key(self, bond, cache_key):
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
             return None
-        return f"direct-family-builder:{int(bond)}:{cache_key!r}"
+        return str(bundle.get("payload_key", "") or "")
 
-    @staticmethod
-    def _owner_direct_family_cpp_plan_key(bond, cache_key):
-        if cache_key is None:
+    def _owner_direct_family_cpp_builder_key(self, bond, cache_key):
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
             return None
-        return f"direct-family-plan:{int(bond)}:{cache_key!r}"
+        return str(bundle.get("builder_key", "") or "")
+
+    def _owner_direct_family_cpp_plan_key(self, bond, cache_key):
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
+            return None
+        return str(bundle.get("plan_key", "") or "")
 
     def _install_cpp_direct_family_payload(self, bond, cache_key, env):
         owner = self._cpp_moving_environment
@@ -16960,6 +17083,84 @@ class MovingEnvironment:
             ] = str(exc)
             return None
 
+    def _install_cpp_direct_family_two_phase_dispatch_static_plan(
+        self,
+        bond,
+        cache_key,
+        first_plan,
+        second_plan,
+    ):
+        owner = self._cpp_moving_environment
+        if (
+            owner is None
+            or not hasattr(owner, "install_direct_family_two_phase_dispatch_static_plan")
+        ):
+            return None
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
+            return None
+        payload_key = str(bundle.get("payload_key", "") or "")
+        plan_key = str(bundle.get("plan_key", "") or "")
+        if not payload_key or not plan_key:
+            return None
+
+        try:
+            owner.install_direct_family_two_phase_dispatch_static_plan(
+                plan_key,
+                first_plan,
+                second_plan,
+                AbelianCompositePackedDirectFamilyEntries,
+                AbelianPackedDirectFamilyEntries,
+            )
+            self._sync_cpp_moving_environment_stats()
+            self.moving_profile_stats[
+                "owner_direct_family_environment_payload_owner"
+            ] = "cpp_moving_environment_static_two_phase_dispatch_plan"
+        except Exception as exc:
+            self.moving_profile_stats[
+                "cpp_moving_environment_direct_family_two_phase_dispatch_plan_last_error"
+            ] = str(exc)
+            return None
+        return payload_key, plan_key
+
+    def _install_cpp_direct_family_static_payload(
+        self,
+        bond,
+        cache_key,
+        family_names,
+        pieces,
+    ):
+        owner = self._cpp_moving_environment
+        if owner is None or not hasattr(owner, "assemble_direct_family_payload"):
+            return None
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
+            return None
+        payload_key = str(bundle.get("payload_key", "") or "")
+        if not payload_key:
+            return None
+        try:
+            payload = owner.assemble_direct_family_payload(
+                payload_key,
+                tuple(family_names),
+                tuple(pieces),
+                AbelianCompositePackedDirectFamilyEntries,
+                AbelianPackedDirectFamilyEntries,
+                True,
+            )
+            self._sync_cpp_moving_environment_stats()
+            if payload is None:
+                return None
+            self.moving_profile_stats[
+                "owner_direct_family_environment_payload_owner"
+            ] = "cpp_moving_environment_static_direct_family_payload"
+            return payload_key
+        except Exception as exc:
+            self.moving_profile_stats[
+                "cpp_moving_environment_direct_family_static_payload_last_error"
+            ] = str(exc)
+            return None
+
     def _install_cpp_direct_family_two_phase_dispatch_plan(
         self,
         bond,
@@ -16970,9 +17171,12 @@ class MovingEnvironment:
         owner = self._cpp_moving_environment
         if owner is None or not hasattr(owner, "install_direct_family_two_phase_dispatch_plan"):
             return None
-        payload_key = self._owner_direct_family_cpp_payload_key(bond, cache_key)
-        plan_key = self._owner_direct_family_cpp_plan_key(bond, cache_key)
-        if payload_key is None or plan_key is None:
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
+            return None
+        payload_key = str(bundle.get("payload_key", "") or "")
+        plan_key = str(bundle.get("plan_key", "") or "")
+        if not payload_key or not plan_key:
             return None
 
         try:
@@ -16998,9 +17202,12 @@ class MovingEnvironment:
         owner = self._cpp_moving_environment
         if owner is None or not hasattr(owner, "install_direct_family_payload_builder"):
             return None
-        payload_key = self._owner_direct_family_cpp_payload_key(bond, cache_key)
-        builder_key = self._owner_direct_family_cpp_builder_key(bond, cache_key)
-        if payload_key is None or builder_key is None:
+        bundle = self._owner_direct_family_cpp_key_bundle(bond, cache_key)
+        if bundle is None:
+            return None
+        payload_key = str(bundle.get("payload_key", "") or "")
+        builder_key = str(bundle.get("builder_key", "") or "")
+        if not payload_key or not builder_key:
             return None
 
         try:
@@ -19990,6 +20197,9 @@ class MovingEnvironment:
             "direct_family_two_phase_dispatch_plan_dispatch_pieces": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_pieces",
             "direct_family_two_phase_dispatch_plan_dispatch_entries": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_entries",
             "direct_family_two_phase_dispatch_plan_dispatch_empty_pieces": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_empty_pieces",
+            "direct_family_two_phase_dispatch_plan_factory_calls": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_factory_calls",
+            "direct_family_two_phase_dispatch_plan_static_plan_installs": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_installs",
+            "direct_family_two_phase_dispatch_plan_static_plan_uses": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_uses",
             "direct_family_two_phase_dispatch_plan_literal_families": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_literal_families",
             "direct_family_two_phase_dispatch_plan_literal_pieces": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_literal_pieces",
             "direct_family_two_phase_dispatch_plan_literal_entries": "cpp_moving_environment_direct_family_two_phase_dispatch_plan_literal_entries",
@@ -20097,6 +20307,8 @@ class MovingEnvironment:
             "owner_bond_step_runner_payload_prepares": "cpp_moving_environment_owner_bond_step_runner_payload_prepares",
             "owner_bond_step_runner_environment_moves": "cpp_moving_environment_owner_bond_step_runner_environment_moves",
             "owner_bond_step_runner_environment_fallbacks": "cpp_moving_environment_owner_bond_step_runner_environment_fallbacks",
+            "owner_bond_step_runner_assign_calls": "cpp_moving_environment_owner_bond_step_runner_assign_calls",
+            "owner_bond_step_runner_assign_skips": "cpp_moving_environment_owner_bond_step_runner_assign_skips",
             "owner_bond_step_runner_seconds": "cpp_moving_environment_owner_bond_step_runner_seconds",
             "owner_bond_step_runner_last_seconds": "cpp_moving_environment_owner_bond_step_runner_last_seconds",
             "owner_bond_step_runner_payload_seconds": "cpp_moving_environment_owner_bond_step_runner_payload_seconds",
@@ -20119,6 +20331,32 @@ class MovingEnvironment:
             "owner_typed_bond_step_environment_record_consumes": "cpp_moving_environment_owner_typed_bond_step_environment_record_consumes",
             "owner_typed_bond_step_python_prepare_calls": "cpp_moving_environment_owner_typed_bond_step_python_prepare_calls",
             "owner_typed_bond_step_python_move_calls": "cpp_moving_environment_owner_typed_bond_step_python_move_calls",
+            "owner_typed_bond_step_direct_plan_provider_record_installs": "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_record_installs",
+            "owner_typed_bond_step_direct_plan_provider_calls": "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_calls",
+            "owner_typed_bond_step_direct_plan_provider_accepts": "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_accepts",
+            "owner_typed_bond_step_direct_plan_provider_empty": "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_empty",
+            "owner_typed_bond_step_direct_plan_provider_failures": "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_failures",
+            "owner_typed_bond_step_direct_key_updates": "cpp_moving_environment_owner_typed_bond_step_direct_key_updates",
+            "owner_typed_bond_step_direct_key_update_misses": "cpp_moving_environment_owner_typed_bond_step_direct_key_update_misses",
+            "owner_typed_bond_step_direct_key_update_failures": "cpp_moving_environment_owner_typed_bond_step_direct_key_update_failures",
+            "owner_typed_bond_step_direct_key_provider_refresh_calls": "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls",
+            "owner_typed_bond_step_direct_key_provider_refresh_accepts": "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_accepts",
+            "owner_typed_bond_step_direct_key_provider_refresh_empty": "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_empty",
+            "owner_typed_bond_step_direct_key_provider_refresh_failures": "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_failures",
+            "owner_typed_bond_step_direct_key_successor_refresh_calls": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls",
+            "owner_typed_bond_step_direct_key_successor_refresh_accepts": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_accepts",
+            "owner_typed_bond_step_direct_key_successor_refresh_empty": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_empty",
+            "owner_typed_bond_step_direct_key_successor_refresh_failures": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_failures",
+            "owner_typed_bond_step_direct_key_successor_chain_calls": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls",
+            "owner_typed_bond_step_direct_key_successor_chain_accepts": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_accepts",
+            "owner_typed_bond_step_direct_key_successor_chain_links": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_links",
+            "owner_typed_bond_step_direct_key_successor_chain_failures": "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_failures",
+            "direct_family_revision_state_updates": "cpp_moving_environment_direct_family_revision_state_updates",
+            "direct_family_revision_state_failures": "cpp_moving_environment_direct_family_revision_state_failures",
+            "direct_family_revision_cache_key_builds": "cpp_moving_environment_direct_family_revision_cache_key_builds",
+            "direct_family_revision_cache_key_failures": "cpp_moving_environment_direct_family_revision_cache_key_failures",
+            "direct_family_cpp_key_bundle_builds": "cpp_moving_environment_direct_family_cpp_key_bundle_builds",
+            "direct_family_cpp_key_bundle_failures": "cpp_moving_environment_direct_family_cpp_key_bundle_failures",
             "owner_typed_half_sweep_plan_records": "cpp_moving_environment_owner_typed_half_sweep_plan_records",
             "owner_typed_half_sweep_plan_installs": "cpp_moving_environment_owner_typed_half_sweep_plan_installs",
             "owner_typed_half_sweep_plan_replacements": "cpp_moving_environment_owner_typed_half_sweep_plan_replacements",
@@ -20172,6 +20410,14 @@ class MovingEnvironment:
             "owner_local_optimize_boundary_bridge_calls": "cpp_moving_environment_owner_local_optimize_boundary_bridge_calls",
             "owner_local_problem_bind_owner_calls": "cpp_moving_environment_owner_local_problem_bind_owner_calls",
             "owner_local_problem_bind_set_bond_fallbacks": "cpp_moving_environment_owner_local_problem_bind_set_bond_fallbacks",
+            "owner_site_chain_records": "cpp_moving_environment_owner_site_chain_records",
+            "owner_site_chain_installs": "cpp_moving_environment_owner_site_chain_installs",
+            "owner_site_chain_replacements": "cpp_moving_environment_owner_site_chain_replacements",
+            "owner_site_chain_gets": "cpp_moving_environment_owner_site_chain_gets",
+            "owner_site_chain_sets": "cpp_moving_environment_owner_site_chain_sets",
+            "owner_site_chain_syncs": "cpp_moving_environment_owner_site_chain_syncs",
+            "owner_site_chain_sync_sites": "cpp_moving_environment_owner_site_chain_sync_sites",
+            "owner_site_chain_failures": "cpp_moving_environment_owner_site_chain_failures",
             "owner_local_grouped_solve_update_calls": "cpp_moving_environment_owner_local_grouped_solve_update_calls",
             "owner_local_grouped_solve_update_accepted": "cpp_moving_environment_owner_local_grouped_solve_update_accepted",
             "owner_local_grouped_solve_update_rejections": "cpp_moving_environment_owner_local_grouped_solve_update_rejections",
@@ -22854,6 +23100,24 @@ class MovingEnvironment:
                     0,
                 )
             ),
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_factory_calls": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_two_phase_dispatch_plan_factory_calls",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_installs": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_installs",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_uses": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_uses",
+                    0,
+                )
+            ),
             "cpp_moving_environment_direct_family_two_phase_dispatch_plan_literal_families": int(
                 self.moving_profile_stats.get(
                     "cpp_moving_environment_direct_family_two_phase_dispatch_plan_literal_families",
@@ -23706,6 +23970,167 @@ class MovingEnvironment:
                 self.moving_profile_stats.get(
                     "cpp_moving_environment_owner_typed_bond_step_python_move_calls",
                     0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_record_installs": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_record_installs",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_calls": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_calls",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_accepts": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_accepts",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_empty": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_empty",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_updates": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_updates",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_misses": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_update_misses",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_update_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_accepts": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_accepts",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_empty": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_empty",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_accepts": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_accepts",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_empty": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_empty",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_accepts": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_accepts",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_links": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_links",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_revision_state_updates": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_revision_state_updates",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_revision_state_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_revision_state_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_revision_cache_key_builds": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_revision_cache_key_builds",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_revision_cache_key_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_revision_cache_key_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_cpp_key_bundle_builds": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_cpp_key_bundle_builds",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_cpp_key_bundle_failures": int(
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_cpp_key_bundle_failures",
+                    0,
+                )
+            ),
+            "cpp_moving_environment_direct_family_revision_state_last_error": (
+                self.moving_profile_stats.get(
+                    "cpp_moving_environment_direct_family_revision_state_last_error"
                 )
             ),
             "cpp_moving_environment_owner_typed_bond_step_record_last_error": (
@@ -25671,21 +26096,31 @@ class MPS:
 
     def bond_orders(self):
         """Return right bond dimensions for each site."""
-        return [t.shape[2] for t in self.factors]
+        orders = []
+        for tensor in self.factors:
+            if hasattr(tensor, "qns"):
+                orders.append(int(tensor.shape[1]))
+            else:
+                orders.append(int(tensor.shape[2]))
+        return orders
 
     def norm(self):
         """
         Calculate the MPS norm :math:`N = \sqrt{<\psi|\psi>}` robustly using standard layouts.
         """
+        if self.Bs and hasattr(self.Bs[0], "qns"):
+            identity = [make_identity_mpo_site_from_mps_site(site) for site in self.Bs]
+            env = initial_E(identity[0])
+            for W, site in zip(identity, self.Bs):
+                env = contract_from_left(W, site, env, site)
+            return np.abs(abelian_environment_scalar(env))
+
         if self.gauge is None:
 
             val = np.ones((1, 1), dtype=complex)
             for i in range(self.L):
                 B = self._get_std_B(i) # (lv, p, rv)
-                # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
-                T = np.tensordot(val, B, axes=(1, 0))
-                # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
-                val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
+                val = np.einsum("ab,api,bpj->ij", val, B.conj(), B, optimize=True)
             return np.abs(val[0, 0])
 
         elif self.gauge == 'right_canonical':
@@ -25704,15 +26139,21 @@ class MPS:
         """
         normalize a MPS norm :math:`N = \sqrt{<\psi|\psi>}`
         """
+        if self.Bs and hasattr(self.Bs[0], "qns"):
+            norm2 = self.norm()
+            if norm2 < 1e-12:
+                import warnings
+                warnings.warn(f'Norm {norm2} is too small.')
+            self.Bs[0] = self.Bs[0] * (1.0 / np.sqrt(np.abs(norm2)))
+            self.data = self.factors = self.Bs
+            return self
+
         if self.gauge is None:
 
             val = np.ones((1, 1), dtype=complex)
             for i in range(self.L):
                 B = self._get_std_B(i) # (lv, p, rv)
-                # Contract Left legs: val(a, b) * B(b, p, r) -> T(a, p, r)
-                T = np.tensordot(val, B, axes=(1, 0))
-                # Contract with conjugate: T(a, p, r) * B*(a, p, r') -> val(r, r')
-                val = np.tensordot(T, B.conj(), axes=([0, 1], [0, 1]))
+                val = np.einsum("ab,api,bpj->ij", val, B.conj(), B, optimize=True)
 
             # if val < 1e-12: raise warnings.warn('Norm {val} is too small.')
             val_scalar = np.abs(np.atleast_1d(val)[0])
@@ -29577,6 +30018,20 @@ def two_site_dmrg(
             snapshot["moving_environment"] = moving_stats
         return snapshot
 
+    def _current_site_tensor(site):
+        site = int(site)
+        if moving_environment is not None and bool(native_site_storage):
+            owner = getattr(moving_environment, "_cpp_moving_environment", None)
+            key = str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+            if owner is not None and key and hasattr(owner, "owner_site_chain_get"):
+                try:
+                    return owner.owner_site_chain_get(key, site)
+                except Exception as exc:
+                    moving_environment.moving_profile_stats[
+                        "owner_site_chain_get_last_error"
+                    ] = str(exc)
+        return MPS[int(site)]
+
     def _construct_right_environment_stack(Wlist, *, stack_name="hamiltonian"):
         stack = [
             initial_F(
@@ -29587,13 +30042,13 @@ def two_site_dmrg(
         for site in range(len(Wlist) - 1, 0, -1):
             if moving_environment is None:
                 stack.append(
-                    contract_from_right(Wlist[site], MPS[site], stack[-1], MPS[site])
+                    contract_from_right(Wlist[site], _current_site_tensor(site), stack[-1], _current_site_tensor(site))
                 )
             else:
                 moving_environment.update_right_stack(
                     Wlist[site],
-                    MPS[site],
-                    MPS[site],
+                    _current_site_tensor(site),
+                    _current_site_tensor(site),
                     stack=stack,
                     stack_name=stack_name,
                 )
@@ -30272,9 +30727,9 @@ def two_site_dmrg(
                             env = initial_E(W)
                         env = contract_from_left(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             env,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                     except Exception as exc:
                         native_stats = direct_family_builder_stats.setdefault(
@@ -30313,9 +30768,9 @@ def two_site_dmrg(
                             env = initial_F(W, target_qn=target)
                         env = contract_from_right(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             env,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                     except Exception:
                         return None
@@ -30519,9 +30974,9 @@ def two_site_dmrg(
                             env = initial_E(W)
                         env = contract_from_left(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             env,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                     except Exception:
                         return None
@@ -30542,9 +30997,9 @@ def two_site_dmrg(
                             env = initial_F(W, target_qn=target)
                         env = contract_from_right(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             env,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                     except Exception:
                         return None
@@ -31061,6 +31516,15 @@ def two_site_dmrg(
     direct_family_environments_enabled = _direct_family_environments_enabled()
     direct_family_builder_stats["direct_family_environment_enabled"] = bool(
         direct_family_environments_enabled
+    )
+    use_cpp_direct_family_owner_payload = bool(
+        abelian_matvec_options.get(
+            "generator_table_cpp_direct_family_owner_payload",
+            True,
+        )
+    )
+    direct_family_builder_stats["cpp_direct_family_owner_payload_enabled"] = bool(
+        use_cpp_direct_family_owner_payload
     )
 
     def _direct_family_env(
@@ -31726,7 +32190,7 @@ def two_site_dmrg(
             site = int(site)
             if site < 0 or site >= len(MPS):
                 return None
-            A_ref = MPS[site]
+            A_ref = _current_site_tensor(site)
             A = _packed_tensor_view(A_ref, f"{source}_A")
             B = _packed_tensor_view(A_ref, f"{source}_B")
             A_conj = _packed_tensor_conj(A, f"{source}_A_conj")
@@ -31926,9 +32390,9 @@ def two_site_dmrg(
                     else:
                         E_term = _packed_contract_from_left(
                             W_parent,
-                            MPS[site],
+                            _current_site_tensor(site),
                             E_parent,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                         if parent_env_cache is not None:
                             parent_env_cache[cache_key] = E_term
@@ -31971,9 +32435,9 @@ def two_site_dmrg(
                 else:
                     F_term = _packed_contract_from_right(
                         W_parent,
-                        MPS[site],
+                        _current_site_tensor(site),
                         F_parent,
-                        MPS[site],
+                        _current_site_tensor(site),
                     )
                     if parent_env_cache is not None:
                         parent_env_cache[cache_key] = F_term
@@ -32129,9 +32593,9 @@ def two_site_dmrg(
                 if env is None:
                     env = _packed_initial_E(W) if pack_boundary_tensors else initial_E(W)
                 env = (
-                    _packed_contract_from_left(W, MPS[site], env, MPS[site])
+                    _packed_contract_from_left(W, _current_site_tensor(site), env, _current_site_tensor(site))
                     if pack_boundary_tensors
-                    else contract_from_left(W, MPS[site], env, MPS[site])
+                    else contract_from_left(W, _current_site_tensor(site), env, _current_site_tensor(site))
                 )
                 qns = env.qns[0]
                 direct_family_contextual_left_prefix_cache[
@@ -32310,9 +32774,9 @@ def two_site_dmrg(
                         else initial_F(W, target_qn=target)
                     )
                 env = (
-                    _packed_contract_from_right(W, MPS[site], env, MPS[site])
+                    _packed_contract_from_right(W, _current_site_tensor(site), env, _current_site_tensor(site))
                     if pack_boundary_tensors
-                    else contract_from_right(W, MPS[site], env, MPS[site])
+                    else contract_from_right(W, _current_site_tensor(site), env, _current_site_tensor(site))
                 )
                 qns = env.qns[0]
                 direct_family_contextual_right_suffix_cache[
@@ -33829,9 +34293,9 @@ def two_site_dmrg(
                         site = int(site)
                         return _packed_contract_from_left(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             env_in,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
 
                     executed = _execute_contextual_boundary_build_wave_packed(
@@ -33909,16 +34373,16 @@ def two_site_dmrg(
                                 env_next = (
                                     _packed_contract_from_left(
                                         W,
-                                        MPS[site],
+                                        _current_site_tensor(site),
                                         env_in,
-                                        MPS[site],
+                                        _current_site_tensor(site),
                                     )
                                     if pack_boundary_tensors
                                     else contract_from_left(
                                         W,
-                                        MPS[site],
+                                        _current_site_tensor(site),
                                         env_in,
-                                        MPS[site],
+                                        _current_site_tensor(site),
                                     )
                                 )
                             except Exception:
@@ -33994,16 +34458,16 @@ def two_site_dmrg(
                             env_next = (
                                 _packed_contract_from_left(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     env_in,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                                 if pack_boundary_tensors
                                 else contract_from_left(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     env_in,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                             )
                         except Exception:
@@ -34750,16 +35214,16 @@ def two_site_dmrg(
                         env_next = (
                             _packed_contract_from_left(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 env_in,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                             if pack_boundary_tensors
                             else contract_from_left(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 env_in,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                         )
                     except Exception:
@@ -35051,9 +35515,9 @@ def two_site_dmrg(
                     site = int(site)
                     return _packed_contract_from_right(
                         W,
-                        MPS[site],
+                        _current_site_tensor(site),
                         env_in,
-                        MPS[site],
+                        _current_site_tensor(site),
                     )
 
                 executed = _execute_contextual_boundary_build_wave_packed(
@@ -35140,16 +35604,16 @@ def two_site_dmrg(
                             env_next = (
                                 _packed_contract_from_right(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     env_in,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                                 if pack_boundary_tensors
                                 else contract_from_right(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     env_in,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                             )
                         except Exception:
@@ -35234,16 +35698,16 @@ def two_site_dmrg(
                         env_next = (
                             _packed_contract_from_right(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 env_in,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                             if pack_boundary_tensors
                             else contract_from_right(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 env_in,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                         )
                     except Exception:
@@ -36021,9 +36485,9 @@ def two_site_dmrg(
                         else env
                     )
                     env_next = (
-                        _packed_contract_from_right(W, MPS[site], env_in, MPS[site])
+                        _packed_contract_from_right(W, _current_site_tensor(site), env_in, _current_site_tensor(site))
                         if pack_boundary_tensors
-                        else contract_from_right(W, MPS[site], env_in, MPS[site])
+                        else contract_from_right(W, _current_site_tensor(site), env_in, _current_site_tensor(site))
                     )
                 except Exception:
                     failed_suffixes.add(suffix)
@@ -36092,9 +36556,9 @@ def two_site_dmrg(
                 for site in range(bond):
                     env = contract_from_left(
                         sym_pattern_mpo[site],
-                        MPS[site],
+                        _current_site_tensor(site),
                         env,
-                        MPS[site],
+                        _current_site_tensor(site),
                     )
             direct_family_left_env_cache[key] = env
             return env
@@ -36121,9 +36585,9 @@ def two_site_dmrg(
                 for site in range(L - 1, bond + 1, -1):
                     env = contract_from_right(
                         sym_pattern_mpo[site],
-                        MPS[site],
+                        _current_site_tensor(site),
                         env,
-                        MPS[site],
+                        _current_site_tensor(site),
                 )
             direct_family_right_env_cache[key] = env
             return env
@@ -36918,6 +37382,36 @@ def two_site_dmrg(
                     "reason": "exact validation required before default use",
                 }
                 return (), set()
+            native_p_may_replace = (
+                bool(
+                    getattr(
+                        complementary_operator_families,
+                        "enable_native_boundary_p",
+                        False,
+                    )
+                )
+                and not bool(
+                    abelian_matvec_options.get(
+                        "generator_table_disable_native_boundary_p",
+                        False,
+                    )
+                )
+            )
+            if native_p_may_replace and not bool(
+                abelian_matvec_options.get(
+                    "generator_table_allow_native_boundary_r_with_native_p",
+                    False,
+                )
+            ):
+                direct_family_builder_stats["native_boundary_r"] = {
+                    "enabled": False,
+                    "reason": (
+                        "blocked until native R/P cross-family route validation "
+                        "is exact"
+                    ),
+                    "native_p_enabled": True,
+                }
+                return (), set()
             left_table = _native_boundary_table("left")
             right_table = _native_boundary_table("right")
             if left_table is None and right_table is None:
@@ -36943,6 +37437,23 @@ def two_site_dmrg(
                         validate,
                     )
                 )
+            use_packed_native_boundary_r_entries = (
+                pack_boundary_tensors
+                and bool(
+                    abelian_matvec_options.get(
+                        "generator_table_packed_direct_family_entries",
+                        False,
+                    )
+                )
+                and bool(
+                    abelian_matvec_options.get(
+                        "generator_table_packed_native_boundary_r_entries",
+                        True,
+                    )
+                )
+            )
+            if use_packed_native_boundary_r_entries:
+                entries = AbelianPackedDirectFamilyEntries()
 
             for key, coeff in r_entries.items():
                 p, q = (int(index) for index in key)
@@ -36968,6 +37479,8 @@ def two_site_dmrg(
                             coeff,
                             left_table.operators[raw_key],
                             F_identity,
+                            prefer_packed=use_packed_native_boundary_r_entries,
+                            packed_source="native_boundary_r_left_identity",
                         )
                 elif support and support.issubset(set(range(bond + 2, L))):
                     left_result = _left_env_and_local_operator(
@@ -36985,6 +37498,8 @@ def two_site_dmrg(
                             coeff,
                             E_identity,
                             right_table.operators[raw_key],
+                            prefer_packed=use_packed_native_boundary_r_entries,
+                            packed_source="native_boundary_r_right_identity",
                         )
                 elif support and support.issubset(active_sites):
                     left_result = _left_env_and_local_operator(
@@ -37006,6 +37521,8 @@ def two_site_dmrg(
                             coeff,
                             E_identity,
                             F_identity,
+                            prefer_packed=use_packed_native_boundary_r_entries,
+                            packed_source="native_boundary_r_local_generator",
                         )
                 if built and not _native_entries_apply_clean(built):
                     rejected += 1
@@ -37025,6 +37542,7 @@ def two_site_dmrg(
             )
             stats["enabled"] = True
             stats["validation_enabled"] = bool(validate)
+            stats["packed_entry_buffer"] = bool(use_packed_native_boundary_r_entries)
             stats["last_bond"] = int(bond)
             stats["generator_terms"] = (
                 int(stats.get("generator_terms", 0)) + int(len(consumed))
@@ -37035,7 +37553,18 @@ def two_site_dmrg(
             stats["rejected_candidates"] = (
                 int(stats.get("rejected_candidates", 0)) + int(rejected)
             )
-            return tuple(entries), consumed
+            stats["last_consumed_keys"] = tuple(
+                tuple(int(index) for index in key)
+                for key in sorted(consumed)
+            )
+            stats["last_rejected_candidates"] = int(rejected)
+            return (
+                entries
+                if bool(
+                    getattr(entries, "_pyqed_packed_direct_family_entries", False)
+                )
+                else tuple(entries)
+            ), consumed
 
         def _native_boundary_p_entries():
             if bool(
@@ -37103,6 +37632,19 @@ def two_site_dmrg(
                 validation_policy = "first_pass"
             if validation_policy not in {"off", "first_pass", "always"}:
                 validation_policy = "first_pass"
+            validate_native_p_raw_table = bool(
+                abelian_matvec_options.get(
+                    "generator_table_validate_native_boundary_p_raw_table",
+                    True,
+                )
+            )
+            native_p_raw_table_validation_vectors = int(
+                abelian_matvec_options.get(
+                    "generator_table_validate_native_boundary_p_raw_table_vectors",
+                    2,
+                )
+                or 2
+            )
             skip_same_side_native_p = bool(
                 abelian_matvec_options.get(
                     "generator_table_skip_same_side_native_p",
@@ -37267,8 +37809,163 @@ def two_site_dmrg(
                 return tuple(expanded)
 
             def _native_entries_valid(raw_key, coeff, candidate_entries):
-                if validation_policy == "off":
-                    return bool(candidate_entries)
+                def _raw_table_matches(reference_entries):
+                    if not validate_native_p_raw_table:
+                        return True
+                    stats = direct_family_builder_stats.setdefault(
+                        "native_boundary_p_raw_table_validation",
+                        {"calls": 0, "accepted": 0, "rejected": 0},
+                    )
+                    stats["calls"] = int(stats.get("calls", 0)) + 1
+                    if not candidate_entries or not reference_entries:
+                        stats["last_reason"] = "empty"
+                        stats["rejected"] = int(stats.get("rejected", 0)) + 1
+                        return False
+                    builder_fn = (
+                        None
+                        if _cpp_davidson is None
+                        else (
+                            getattr(
+                                _cpp_davidson,
+                                "build_direct_family_payload_fastkeys",
+                                None,
+                            )
+                            or getattr(
+                                _cpp_davidson,
+                                "build_direct_family_payload",
+                                None,
+                            )
+                        )
+                    )
+                    table_cls = (
+                        None
+                        if _cpp_davidson is None
+                        else getattr(_cpp_davidson, "GroupedRenormalizedTable", None)
+                    )
+                    proto = _local_proto()
+                    if builder_fn is None or table_cls is None or proto is None:
+                        stats["last_reason"] = "raw_table_backend_unavailable"
+                        return True
+                    try:
+                        layout = tuple(HamiltonianMultiplyU1._layout(proto))
+                        dim = int(
+                            sum(
+                                int(np.prod(shape, dtype=int))
+                                for _key, shape in layout
+                            )
+                        )
+                        if dim <= 0:
+                            stats["last_reason"] = "empty_layout"
+                            stats["rejected"] = int(stats.get("rejected", 0)) + 1
+                            return False
+                        proto_data = getattr(proto, "data", {}) or {}
+                        candidate_builder = builder_fn(
+                            {"P": candidate_entries},
+                            proto_data,
+                            layout,
+                            True,
+                        )
+                        reference_builder = builder_fn(
+                            {"P": reference_entries},
+                            proto_data,
+                            layout,
+                            True,
+                        )
+                        candidate_table = table_cls.from_raw_builder(
+                            candidate_builder,
+                            dim,
+                            0.0,
+                        )
+                        reference_table = table_cls.from_raw_builder(
+                            reference_builder,
+                            dim,
+                            0.0,
+                        )
+                        seed = (
+                            104729
+                            + 101 * int(bond)
+                            + 17 * int(stats.get("calls", 0))
+                            + sum(
+                                (idx + 1) * int(value)
+                                for idx, value in enumerate(
+                                    tuple(int(index) for index in raw_key)
+                                )
+                            )
+                        )
+                        rng = np.random.default_rng(seed)
+                        max_abs = 0.0
+                        max_rel = 0.0
+                        for _vec_idx in range(
+                            max(1, int(native_p_raw_table_validation_vectors))
+                        ):
+                            vec = (
+                                rng.standard_normal(dim)
+                                + 1j * rng.standard_normal(dim)
+                            ).astype(np.complex128)
+                            out_candidate = np.asarray(
+                                candidate_table.matvec(vec),
+                                dtype=np.complex128,
+                            )
+                            out_reference = np.asarray(
+                                reference_table.matvec(vec),
+                                dtype=np.complex128,
+                            )
+                            if (
+                                not np.all(np.isfinite(out_candidate))
+                                or not np.all(np.isfinite(out_reference))
+                            ):
+                                stats["last_reason"] = "nonfinite_matvec"
+                                stats["rejected"] = int(stats.get("rejected", 0)) + 1
+                                return False
+                            diff = float(
+                                np.linalg.norm(out_candidate - out_reference)
+                            )
+                            denom = max(1.0, float(np.linalg.norm(out_reference)))
+                            rel = diff / denom
+                            max_abs = max(max_abs, diff)
+                            max_rel = max(max_rel, rel)
+                            if rel > 1.0e-10 and diff > 1.0e-10:
+                                stats["last_reason"] = "matvec_mismatch"
+                                stats["last_key"] = tuple(
+                                    int(index) for index in raw_key
+                                )
+                                stats["last_abs"] = float(diff)
+                                stats["last_rel"] = float(rel)
+                                stats["max_abs"] = max(
+                                    float(stats.get("max_abs", 0.0)),
+                                    float(diff),
+                                )
+                                stats["max_rel"] = max(
+                                    float(stats.get("max_rel", 0.0)),
+                                    float(rel),
+                                )
+                                stats["rejected"] = int(stats.get("rejected", 0)) + 1
+                                return False
+                        stats["accepted"] = int(stats.get("accepted", 0)) + 1
+                        stats["last_reason"] = ""
+                        stats["last_key"] = tuple(int(index) for index in raw_key)
+                        stats["last_abs"] = float(max_abs)
+                        stats["last_rel"] = float(max_rel)
+                        stats["max_abs"] = max(
+                            float(stats.get("max_abs", 0.0)),
+                            float(max_abs),
+                        )
+                        stats["max_rel"] = max(
+                            float(stats.get("max_rel", 0.0)),
+                            float(max_rel),
+                        )
+                        return True
+                    except Exception as exc:
+                        stats["last_reason"] = "error"
+                        stats["last_error"] = repr(exc)
+                        stats["rejected"] = int(stats.get("rejected", 0)) + 1
+                        return False
+
+                reference_entries = None
+                if validation_policy == "off" or validate_native_p_raw_table:
+                    reference_entries = _expanded_p_entries_for_key(raw_key, coeff)
+                    if validation_policy == "off":
+                        return _raw_table_matches(reference_entries)
                 if not _native_entries_apply_clean(candidate_entries):
                     return False
                 validation_key = (
@@ -37294,11 +37991,14 @@ def two_site_dmrg(
                         int(stats.get("cached_center_validations", 0)) + 1
                     )
                     return True
-                reference_entries = _expanded_p_entries_for_key(raw_key, coeff)
+                if reference_entries is None:
+                    reference_entries = _expanded_p_entries_for_key(raw_key, coeff)
                 matched = _native_entries_match_reference(
                     candidate_entries,
                     reference_entries,
                 )
+                if matched and not _raw_table_matches(reference_entries):
+                    matched = False
                 if matched:
                     native_boundary_p_validation_cache[validation_key] = True
                 return matched
@@ -38341,11 +39041,11 @@ def two_site_dmrg(
                                 and is_abelian_packed_boundary_tensor(previous_value)
                             ):
                                 A = _packed_tensor_view(
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     f"{side}_same_side_value_identity_advance_A",
                                 )
                                 B = _packed_tensor_view(
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     f"{side}_same_side_value_identity_advance_B",
                                 )
                                 A_conj = _packed_tensor_conj(
@@ -38421,15 +39121,15 @@ def two_site_dmrg(
                             if side == "left":
                                 return _packed_contract_from_left(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     previous_value,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                             return _packed_contract_from_right(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 previous_value,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                         qns = previous_value.qns[0]
                         W = (
@@ -38442,15 +39142,15 @@ def two_site_dmrg(
                         if side == "left":
                             return contract_from_left(
                                 W,
-                                MPS[site],
+                                _current_site_tensor(site),
                                 previous_value,
-                                MPS[site],
+                                _current_site_tensor(site),
                             )
                         return contract_from_right(
                             W,
-                            MPS[site],
+                            _current_site_tensor(site),
                             previous_value,
-                            MPS[site],
+                            _current_site_tensor(site),
                         )
                     except Exception:
                         return None
@@ -38519,11 +39219,11 @@ def two_site_dmrg(
                                 )
                             ) + 1
                             A = _packed_tensor_view(
-                                MPS[site],
+                                _current_site_tensor(site),
                                 f"{side}_same_side_identity_advance_mps_A",
                             )
                             B = _packed_tensor_view(
-                                MPS[site],
+                                _current_site_tensor(site),
                                 f"{side}_same_side_identity_advance_mps_B",
                             )
                             qns = abelian_packed_tensor_axis_qns(operator, 0)
@@ -38592,16 +39292,16 @@ def two_site_dmrg(
                             reference = (
                                 _packed_contract_from_left(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     operator,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                                 if side == "left"
                                 else _packed_contract_from_right(
                                     W,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                     operator,
-                                    MPS[site],
+                                    _current_site_tensor(site),
                                 )
                             )
                             if result is None:
@@ -38629,9 +39329,9 @@ def two_site_dmrg(
                         if W is None:
                             return None
                         return (
-                            contract_from_left(W, MPS[site], operator, MPS[site])
+                            contract_from_left(W, _current_site_tensor(site), operator, _current_site_tensor(site))
                             if side == "left"
-                            else contract_from_right(W, MPS[site], operator, MPS[site])
+                            else contract_from_right(W, _current_site_tensor(site), operator, _current_site_tensor(site))
                         )
                     except Exception:
                         return None
@@ -41774,6 +42474,7 @@ def two_site_dmrg(
             fast_identity_append = (
                 validation_policy == "off"
                 and use_packed_contextual_p_identity_csr
+                and not validate_native_p_raw_table
                 and bool(
                     getattr(
                         entries,
@@ -44089,26 +44790,38 @@ def two_site_dmrg(
             )
             if not native_r_entries:
                 return None
-            r_identity, r_local, r_direct = abelian_typed_direct_entry_buckets(
-                native_r_entries
-            )
+            if bool(getattr(native_r_entries, "_pyqed_packed_direct_family_entries", False)):
+                r_identity_count = int(getattr(native_r_entries, "identity_count", 0))
+                r_local_count = int(
+                    getattr(native_r_entries, "local_generator_count", 0)
+                )
+                r_direct_count = int(
+                    getattr(native_r_entries, "direct_component_count", 0)
+                )
+            else:
+                r_identity, r_local, r_direct = abelian_typed_direct_entry_buckets(
+                    native_r_entries
+                )
+                r_identity_count = int(len(r_identity))
+                r_local_count = int(len(r_local))
+                r_direct_count = int(len(r_direct))
             native_r_stats = direct_family_builder_stats.setdefault(
                 "native_boundary_r",
                 {},
             )
             native_r_stats["packed_identity_entries"] = (
                 int(native_r_stats.get("packed_identity_entries", 0))
-                + int(len(r_identity))
+                + int(r_identity_count)
             )
             native_r_stats["packed_local_generator_entries"] = (
                 int(native_r_stats.get("packed_local_generator_entries", 0))
-                + int(len(r_local))
+                + int(r_local_count)
             )
             native_r_stats["direct_component_entries"] = (
                 int(native_r_stats.get("direct_component_entries", 0))
-                + int(len(r_direct))
+                + int(r_direct_count)
             )
-            return tuple(native_r_entries)
+            return native_r_entries
 
         def _build_native_p_payload_piece():
             nonlocal native_consumed_p_keys
@@ -44172,6 +44885,19 @@ def two_site_dmrg(
 
         def _install_contextual_boundary_batch_plan(side):
             if not pack_boundary_tensors:
+                return None
+            if not bool(
+                abelian_matvec_options.get(
+                    "generator_table_cpp_contextual_boundary_batch_plan",
+                    True,
+                )
+            ):
+                stats = direct_family_builder_stats.setdefault(
+                    "contextual_boundary_batch_plan",
+                    {},
+                )
+                stats[f"{side}_disabled"] = True
+                stats[f"{side}_disabled_reason"] = "option_disabled"
                 return None
             owner = _contextual_wave_cpp_owner()
             if owner is None or not hasattr(owner, "install_contextual_boundary_batch_plan"):
@@ -44276,7 +45002,32 @@ def two_site_dmrg(
             "right"
         )
 
+        reference_contextual_boundary_batch = bool(
+            abelian_matvec_options.get(
+                "generator_table_reference_contextual_boundary_batch",
+                bool(
+                    abelian_matvec_options.get(
+                        "generator_table_packed_direct_family_entries",
+                        False,
+                    )
+                    and abelian_matvec_options.get(
+                        "generator_table_allow_planned_packed_contextual_entries",
+                        False,
+                    )
+                ),
+            )
+        )
+
         def _left_contextual_batch(keys, family_name=None):
+            if reference_contextual_boundary_batch:
+                return tuple(
+                    _left_env_and_local_operator(
+                        tuple(pattern),
+                        str(piece),
+                        family_name=family_name,
+                    )
+                    for pattern, piece in tuple(keys or ())
+                )
             return _left_env_and_local_operator_batch(
                 keys,
                 family_name=family_name,
@@ -44284,17 +45035,26 @@ def two_site_dmrg(
             )
 
         def _right_contextual_batch(keys, family_name=None):
+            if reference_contextual_boundary_batch:
+                return tuple(
+                    _right_env_and_local_operator(
+                        tuple(pattern),
+                        str(piece),
+                        family_name=family_name,
+                    )
+                    for pattern, piece in tuple(keys or ())
+                )
             return _right_env_and_local_operator_batch(
                 keys,
                 family_name=family_name,
                 assume_table_misses=True,
             )
 
-        if left_contextual_batch_plan_key:
+        if left_contextual_batch_plan_key and not reference_contextual_boundary_batch:
             _left_contextual_batch._pyqed_cpp_contextual_batch_plan_key = (
                 left_contextual_batch_plan_key
             )
-        if right_contextual_batch_plan_key:
+        if right_contextual_batch_plan_key and not reference_contextual_boundary_batch:
             _right_contextual_batch._pyqed_cpp_contextual_batch_plan_key = (
                 right_contextual_batch_plan_key
             )
@@ -44342,9 +45102,71 @@ def two_site_dmrg(
         build_options = AbelianContextualFamilyBuildOptions.from_matvec_options(
             abelian_matvec_options
         )
+        allow_planned_packed_contextual_entries = bool(
+            abelian_matvec_options.get(
+                "generator_table_allow_planned_packed_contextual_entries",
+                False,
+            )
+        )
+        allow_table_backed_planned_contextual_entries = bool(
+            abelian_matvec_options.get(
+                "generator_table_allow_table_backed_planned_contextual_entries",
+                False,
+            )
+        )
+        guarded_planned_packed_contextual_entries = False
+        exact_planned_packed_contextual_entries = False
+        if build_options.packed_buffer and not bool(
+            allow_planned_packed_contextual_entries
+        ):
+            guarded_planned_packed_contextual_entries = bool(
+                build_options.precompute_boundaries
+                or build_options.planned_without_precompute
+            )
+            if guarded_planned_packed_contextual_entries:
+                build_options = AbelianContextualFamilyBuildOptions(
+                    precompute_boundaries=False,
+                    precompute_min_records=build_options.precompute_min_records,
+                    pack_entries=build_options.pack_entries,
+                    packed_buffer=build_options.packed_buffer,
+                    planned_without_precompute=False,
+                    planned_without_precompute_batch=(
+                        build_options.planned_without_precompute_batch
+                    ),
+                    planned_without_precompute_table_lookup=(
+                        build_options.planned_without_precompute_table_lookup
+                    ),
+                    planned_without_precompute_table_ids_only=(
+                        build_options.planned_without_precompute_table_ids_only
+                    ),
+                )
+        elif (
+            build_options.packed_buffer
+            and allow_planned_packed_contextual_entries
+            and not allow_table_backed_planned_contextual_entries
+            and (
+                build_options.precompute_boundaries
+                or build_options.planned_without_precompute_batch
+                or build_options.planned_without_precompute_table_lookup
+            )
+        ):
+            exact_planned_packed_contextual_entries = True
+            build_options = AbelianContextualFamilyBuildOptions(
+                precompute_boundaries=False,
+                precompute_min_records=build_options.precompute_min_records,
+                pack_entries=build_options.pack_entries,
+                packed_buffer=build_options.packed_buffer,
+                planned_without_precompute=True,
+                planned_without_precompute_batch=False,
+                planned_without_precompute_table_lookup=False,
+                planned_without_precompute_table_ids_only=False,
+            )
         direct_family_builder_stats["contextual_build_options"] = {
             "precompute_boundaries": build_options.precompute_boundaries,
             "precompute_min_records": int(build_options.precompute_min_records),
+            "planned_without_precompute": bool(
+                build_options.planned_without_precompute
+            ),
             "packed_route_table": str(
                 abelian_matvec_options.get(
                     "generator_table_packed_route_table",
@@ -44358,7 +45180,20 @@ def two_site_dmrg(
                     False,
                 )
             ),
+            "planned_packed_contextual_guard": bool(
+                guarded_planned_packed_contextual_entries
+            ),
+            "exact_planned_packed_contextual_entries": bool(
+                exact_planned_packed_contextual_entries
+            ),
+            "table_backed_planned_contextual_entries": bool(
+                allow_table_backed_planned_contextual_entries
+            ),
         }
+        if guarded_planned_packed_contextual_entries:
+            direct_family_builder_stats["contextual_build_options"][
+                "planned_packed_contextual_guard_reason"
+            ] = "table-backed planned packed contextual entries are not exact"
         build_contextual_local_action_plan = bool(
             abelian_matvec_options.get(
                 "generator_table_build_contextual_local_action_plan",
@@ -44897,6 +45732,63 @@ def two_site_dmrg(
                 {"calls": 0, "cpp_calls": 0, "python_calls": 0},
             )
 
+        def _literal_direct_family_payload_parts():
+            family_names = ["R", "P"]
+            family_pieces = [
+                _build_native_r_payload_piece(),
+                _build_native_p_payload_piece(),
+            ]
+            first_nonempty = 0
+            first_entries = 0
+            for piece in family_pieces:
+                if not _direct_family_payload_piece_empty(piece):
+                    first_nonempty += 1
+                    try:
+                        first_entries += int(len(piece))
+                    except TypeError:
+                        pass
+
+            direct_pattern_terms = _remaining_direct_pattern_terms()
+            literal_entries = 0
+            literal_nonempty = 0
+            for family_name, terms in direct_pattern_terms.items():
+                piece = _build_contextual_family_payload_piece(
+                    family_name,
+                    terms,
+                )
+                family_names.append(str(family_name))
+                family_pieces.append(piece)
+                if not _direct_family_payload_piece_empty(piece):
+                    literal_nonempty += 1
+                    try:
+                        literal_entries += int(len(piece))
+                    except TypeError:
+                        pass
+
+            plan_stats = _direct_family_payload_plan_stats()
+            plan_stats["last_families"] = int(len(family_names))
+            plan_stats["literal_direct_payload_parts"] = True
+            plan_stats["literal_first_phase_direct_calls"] = int(
+                plan_stats.get("literal_first_phase_direct_calls", 0)
+            ) + 1
+            plan_stats["literal_first_phase_nonempty"] = int(
+                plan_stats.get("literal_first_phase_nonempty", 0)
+            ) + int(first_nonempty)
+            plan_stats["literal_first_phase_entries"] = int(
+                plan_stats.get("literal_first_phase_entries", 0)
+            ) + int(first_entries)
+            plan_stats["literal_second_phase"] = True
+            plan_stats["literal_second_phase_calls"] = int(
+                plan_stats.get("literal_second_phase_calls", 0)
+            ) + 1
+            plan_stats["literal_second_phase_nonempty"] = int(
+                plan_stats.get("literal_second_phase_nonempty", 0)
+            ) + int(literal_nonempty)
+            plan_stats["literal_second_phase_entries"] = int(
+                plan_stats.get("literal_second_phase_entries", 0)
+            ) + int(literal_entries)
+            return tuple(family_names), tuple(family_pieces)
+
         def _second_builder_factory():
             family_names, builders = _contextual_family_piece_builders(
                 _remaining_direct_pattern_terms()
@@ -44954,11 +45846,123 @@ def two_site_dmrg(
             return family_plan
 
         def _install_contextual_payload_owner_plan():
+            if not use_cpp_direct_family_owner_payload:
+                plan_stats = _direct_family_payload_plan_stats()
+                plan_stats["owner_payload_disabled"] = (
+                    int(plan_stats.get("owner_payload_disabled", 0)) + 1
+                )
+                plan_stats["backend_actual"] = "python"
+                plan_stats["fallback_reason"] = "owner_payload_disabled"
+                return None
             if moving_environment is None or not hasattr(
                 moving_environment,
                 "_install_cpp_direct_family_two_phase_dispatch_plan",
             ):
                 return None
+            use_static_dispatch_plan = bool(
+                abelian_matvec_options.get(
+                    "generator_table_cpp_direct_family_static_dispatch_plan",
+                    True,
+                )
+            )
+            use_static_payload = bool(
+                abelian_matvec_options.get(
+                    "generator_table_cpp_direct_family_static_payload",
+                    True,
+                )
+            )
+            use_literal_first_phase = bool(
+                abelian_matvec_options.get(
+                    "generator_table_cpp_direct_family_literal_first_phase",
+                    True,
+                )
+            )
+            use_literal_second_phase = bool(
+                abelian_matvec_options.get(
+                    "generator_table_cpp_direct_family_literal_second_phase",
+                    True,
+                )
+            )
+            if (
+                use_static_payload
+                and use_literal_first_phase
+                and use_literal_second_phase
+                and hasattr(
+                    moving_environment,
+                    "_install_cpp_direct_family_static_payload",
+                )
+            ):
+                try:
+                    family_names, family_pieces = _literal_direct_family_payload_parts()
+                    if len(family_names) == len(family_pieces):
+                        payload_key = moving_environment._install_cpp_direct_family_static_payload(
+                            int(bond),
+                            owner_plan_cache_key,
+                            family_names,
+                            family_pieces,
+                        )
+                        if payload_key is not None:
+                            plan_stats = _direct_family_payload_plan_stats()
+                            plan_stats["static_payload_installs"] = int(
+                                plan_stats.get("static_payload_installs", 0)
+                            ) + 1
+                            plan_stats["backend_actual"] = (
+                                "cpp_moving_environment_static_direct_family_payload"
+                            )
+                            return payload_key, ""
+                    plan_stats = _direct_family_payload_plan_stats()
+                    plan_stats["static_payload_fallbacks"] = int(
+                        plan_stats.get("static_payload_fallbacks", 0)
+                    ) + 1
+                    plan_stats["static_payload_fallback_reason"] = (
+                        "literal_plan_shape_mismatch_or_install_returned_none"
+                    )
+                except Exception as exc:
+                    plan_stats = _direct_family_payload_plan_stats()
+                    plan_stats["static_payload_failures"] = int(
+                        plan_stats.get("static_payload_failures", 0)
+                    ) + 1
+                    plan_stats["static_payload_last_error"] = str(exc)
+            if (
+                use_static_dispatch_plan
+                and use_literal_first_phase
+                and use_literal_second_phase
+                and hasattr(
+                    moving_environment,
+                    "_install_cpp_direct_family_two_phase_dispatch_static_plan",
+                )
+            ):
+                try:
+                    static_keys = (
+                        moving_environment._install_cpp_direct_family_two_phase_dispatch_static_plan(
+                            int(bond),
+                            owner_plan_cache_key,
+                            _native_rp_dispatch_plan(),
+                            _second_family_plan_factory(),
+                        )
+                    )
+                    if static_keys is not None:
+                        plan_stats = _direct_family_payload_plan_stats()
+                        plan_stats["static_dispatch_plan_installs"] = int(
+                            plan_stats.get("static_dispatch_plan_installs", 0)
+                        ) + 1
+                        plan_stats["backend_actual"] = (
+                            "cpp_moving_environment_static_two_phase_dispatch_plan"
+                        )
+                        return static_keys
+                    plan_stats = _direct_family_payload_plan_stats()
+                    plan_stats["static_dispatch_plan_fallbacks"] = int(
+                        plan_stats.get("static_dispatch_plan_fallbacks", 0)
+                    ) + 1
+                    plan_stats["static_dispatch_plan_fallback_reason"] = (
+                        "cpp_static_dispatch_plan_install_returned_none"
+                    )
+                except Exception as exc:
+                    plan_stats = _direct_family_payload_plan_stats()
+                    plan_stats["static_dispatch_plan_failures"] = int(
+                        plan_stats.get("static_dispatch_plan_failures", 0)
+                    ) + 1
+                    plan_stats["static_dispatch_plan_last_error"] = str(exc)
             return moving_environment._install_cpp_direct_family_two_phase_dispatch_plan(
                 int(bond),
                 owner_plan_cache_key,
@@ -45324,6 +46328,128 @@ def two_site_dmrg(
             ),
         )
 
+    def _cpp_owner_site_chain_owner():
+        if moving_environment is None or not bool(native_site_storage):
+            return None
+        owner = getattr(moving_environment, "_cpp_moving_environment", None)
+        if (
+            owner is None
+            or not hasattr(owner, "install_owner_site_chain")
+            or not hasattr(owner, "sync_owner_site_chain_to_sequence")
+        ):
+            return None
+        return owner
+
+    def _ensure_cpp_owner_site_chain():
+        owner = _cpp_owner_site_chain_owner()
+        if owner is None:
+            if moving_environment is not None:
+                moving_environment._cpp_owner_site_chain_key = ""
+            return ""
+        key = str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+        if key:
+            return key
+        key = f"owner-site-chain:{id(moving_environment)}"
+        try:
+            owner.install_owner_site_chain(key, MPS)
+            moving_environment._cpp_owner_site_chain_key = key
+            moving_environment._cpp_owner_site_chain_dirty = False
+            moving_environment.moving_profile_stats[
+                "owner_site_chain_backend_actual"
+            ] = "cpp_owner_site_chain"
+        except Exception as exc:
+            moving_environment._cpp_owner_site_chain_key = ""
+            moving_environment._cpp_owner_site_chain_dirty = False
+            moving_environment.moving_profile_stats[
+                "owner_site_chain_install_last_error"
+            ] = str(exc)
+            return ""
+        return key
+
+    def _mark_cpp_owner_site_chain_dirty():
+        if (
+            moving_environment is not None
+            and str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+        ):
+            moving_environment._cpp_owner_site_chain_dirty = True
+
+    def _sync_cpp_owner_site_chain(force=False):
+        owner = _cpp_owner_site_chain_owner()
+        if owner is None:
+            return False
+        key = str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+        if not key:
+            return False
+        if (
+            not bool(force)
+            and not bool(getattr(moving_environment, "_cpp_owner_site_chain_dirty", False))
+        ):
+            return False
+        stats = moving_environment.moving_profile_stats
+        try:
+            owner.sync_owner_site_chain_to_sequence(key, MPS)
+            stats["owner_site_chain_syncs"] = int(
+                stats.get("owner_site_chain_syncs", 0)
+            ) + 1
+            stats["owner_site_chain_sync_sites"] = int(
+                stats.get("owner_site_chain_sync_sites", 0)
+            ) + len(MPS)
+            moving_environment._cpp_owner_site_chain_dirty = False
+            moving_environment._sync_cpp_moving_environment_stats()
+            return True
+        except Exception as exc:
+            stats["owner_site_chain_sync_last_error"] = str(exc)
+            return False
+
+    def _active_site_tensor(site):
+        site = int(site)
+        owner = _cpp_owner_site_chain_owner()
+        key = (
+            ""
+            if moving_environment is None
+            else str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+        )
+        if owner is not None and key:
+            try:
+                site_tensor = owner.owner_site_chain_get(key, site)
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_backend_actual"
+                ] = "cpp_owner_site_chain"
+                return site_tensor
+            except Exception as exc:
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_get_last_error"
+                ] = str(exc)
+        return _current_site_tensor(site)
+
+    def _set_active_site_pair(bond, left_site, right_site):
+        bond = int(bond)
+        old_left = _active_site_tensor(bond)
+        old_right = _active_site_tensor(bond + 1)
+        owner = _cpp_owner_site_chain_owner()
+        key = (
+            ""
+            if moving_environment is None
+            else str(getattr(moving_environment, "_cpp_owner_site_chain_key", "") or "")
+        )
+        if owner is not None and key:
+            try:
+                owner.owner_site_chain_set(key, bond, left_site)
+                owner.owner_site_chain_set(key, bond + 1, right_site)
+                MPS[bond], MPS[bond + 1] = left_site, right_site
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_backend_actual"
+                ] = "cpp_owner_site_chain"
+                _mark_cpp_owner_site_chain_dirty()
+            except Exception as exc:
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_set_last_error"
+                ] = str(exc)
+                MPS[bond], MPS[bond + 1] = left_site, right_site
+        else:
+            MPS[bond], MPS[bond + 1] = left_site, right_site
+        _discard_direct_family_tensor_views(old_left, old_right)
+
     def _invalidate_after_local_solve(changed_bond=None, clear_side=None):
         def _record_moving_direct_family_revisions():
             if moving_environment is None:
@@ -45347,13 +46473,15 @@ def two_site_dmrg(
             ] = int(max(direct_family_site_revision, default=0))
 
         if changed_bond is None:
-            _discard_direct_family_tensor_views(*tuple(MPS))
+            _discard_direct_family_tensor_views(
+                *(tuple(_active_site_tensor(site) for site in range(len(MPS))))
+            )
         else:
             bond_index = int(changed_bond)
             changed_tensors = []
             for site in (bond_index, bond_index + 1):
                 if 0 <= int(site) < len(MPS):
-                    changed_tensors.append(MPS[int(site)])
+                    changed_tensors.append(_active_site_tensor(site))
             if changed_tensors:
                 _discard_direct_family_tensor_views(*changed_tensors)
 
@@ -45433,12 +46561,19 @@ def two_site_dmrg(
         if sweep_direction == "lr":
             update_direction = "left"
             update_phase = "update_left"
+            site_tensor = _active_site_tensor(i)
             update_specs = [
-                ("hamiltonian", E, MPO[i], MPS[i], MPS[i]),
+                ("hamiltonian", E, MPO[i], site_tensor, site_tensor),
             ]
             for name, factors in complementary_operator_mpos.items():
                 update_specs.append(
-                    (f"family:{name}", comp_family_E[name], factors[i], MPS[i], MPS[i])
+                    (
+                        f"family:{name}",
+                        comp_family_E[name],
+                        factors[i],
+                        site_tensor,
+                        site_tensor,
+                    )
                 )
             pop_specs = [("right", "hamiltonian", F)]
             for name, stack in comp_family_F.items():
@@ -45446,8 +46581,9 @@ def two_site_dmrg(
         elif sweep_direction == "rl":
             update_direction = "right"
             update_phase = "update_right"
+            site_tensor = _active_site_tensor(i + 1)
             update_specs = [
-                ("hamiltonian", F, MPO[i + 1], MPS[i + 1], MPS[i + 1]),
+                ("hamiltonian", F, MPO[i + 1], site_tensor, site_tensor),
             ]
             for name, factors in complementary_operator_mpos.items():
                 update_specs.append(
@@ -45455,8 +46591,8 @@ def two_site_dmrg(
                         f"family:{name}",
                         comp_family_F[name],
                         factors[i + 1],
-                        MPS[i + 1],
-                        MPS[i + 1],
+                        site_tensor,
+                        site_tensor,
                     )
                 )
             pop_specs = [("left", "hamiltonian", E)]
@@ -45483,15 +46619,22 @@ def two_site_dmrg(
         i = int(i)
         if sweep_direction == "lr":
             t0 = time.perf_counter()
-            _push_left_env(E, MPO[i], MPS[i], MPS[i], stack_name="hamiltonian")
+            site_tensor = _active_site_tensor(i)
+            _push_left_env(
+                E,
+                MPO[i],
+                site_tensor,
+                site_tensor,
+                stack_name="hamiltonian",
+            )
             _record_environment_timing("update_left", time.perf_counter() - t0)
             for name, factors in complementary_operator_mpos.items():
                 t0 = time.perf_counter()
                 _push_left_env(
                     comp_family_E[name],
                     factors[i],
-                    MPS[i],
-                    MPS[i],
+                    site_tensor,
+                    site_tensor,
                     stack_name=f"family:{name}",
                 )
                 _record_comp_family_timing(
@@ -45505,11 +46648,12 @@ def two_site_dmrg(
             return True
         if sweep_direction == "rl":
             t0 = time.perf_counter()
+            site_tensor = _active_site_tensor(i + 1)
             _push_right_env(
                 F,
                 MPO[i + 1],
-                MPS[i + 1],
-                MPS[i + 1],
+                site_tensor,
+                site_tensor,
                 stack_name="hamiltonian",
             )
             _record_environment_timing("update_right", time.perf_counter() - t0)
@@ -45518,8 +46662,8 @@ def two_site_dmrg(
                 _push_right_env(
                     comp_family_F[name],
                     factors[i + 1],
-                    MPS[i + 1],
-                    MPS[i + 1],
+                    site_tensor,
+                    site_tensor,
                     stack_name=f"family:{name}",
                 )
                 _record_comp_family_timing(
@@ -45646,13 +46790,17 @@ def two_site_dmrg(
                 h2_payload_key = ""
                 h2_plan_key = ""
                 try:
+                    h2_site_chain_key = _ensure_cpp_owner_site_chain()
                     h2_plan_keys = (
                         _direct_family_env(
                             0,
                             install_owner_plan_only=True,
                             owner_plan_cache_key=h2_direct_family_cache_key,
                         )
-                        if direct_family_environments_enabled
+                        if (
+                            direct_family_environments_enabled
+                            and use_cpp_direct_family_owner_payload
+                        )
                         else None
                     )
                     if h2_plan_keys is not None:
@@ -45712,6 +46860,9 @@ def two_site_dmrg(
                         True,
                         True,
                         h2_payload_key,
+                        False,
+                        False,
+                        h2_site_chain_key,
                     )
                     if (
                         hasattr(h2_owner, "install_owner_bond_step")
@@ -45758,7 +46909,9 @@ def two_site_dmrg(
                         ] = str(exc)
                     h2_owner_result = None
             if h2_owner_result is not None:
-                Energy, MPS[0], MPS[1], trunc, states = h2_owner_result
+                Energy, left_site, right_site, trunc, states = h2_owner_result
+                _set_active_site_pair(0, left_site, right_site)
+                _sync_cpp_owner_site_chain(force=True)
             else:
                 Energy, MPS[0], MPS[1], trunc, states = optimize_two_sites(
                     MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
@@ -45909,8 +47062,74 @@ def two_site_dmrg(
             return None
         bonds = _sweep_bonds(direction, center_i=center_i)
 
+        cpp_direct_family_revision_token = [None]
+
+        def _sync_cpp_direct_family_revision_state():
+            if moving_environment is None:
+                return False
+            owner = getattr(moving_environment, "_cpp_moving_environment", None)
+            if owner is None or not hasattr(owner, "set_direct_family_revision_state"):
+                return False
+            token = (
+                int(direct_family_env_revision[0]),
+                tuple(int(rev) for rev in direct_family_site_revision),
+                tuple(
+                    (int(bond), int(rev))
+                    for bond, rev in sorted(
+                        direct_family_boundary_revision.get("left", {}).items()
+                    )
+                ),
+                tuple(
+                    (int(bond), int(rev))
+                    for bond, rev in sorted(
+                        direct_family_boundary_revision.get("right", {}).items()
+                    )
+                ),
+            )
+            if cpp_direct_family_revision_token[0] == token:
+                return True
+            try:
+                owner.set_direct_family_revision_state(
+                    token[0],
+                    token[1],
+                    dict(token[2]),
+                    dict(token[3]),
+                )
+                cpp_direct_family_revision_token[0] = token
+                moving_environment._sync_cpp_moving_environment_stats()
+                moving_environment.moving_profile_stats[
+                    "owner_direct_family_revision_state_backend_actual"
+                ] = "cpp_moving_environment"
+                return True
+            except Exception as exc:
+                moving_environment.moving_profile_stats[
+                    "cpp_moving_environment_direct_family_revision_state_last_error"
+                ] = str(exc)
+                return False
+
         def _owner_direct_family_cache_key(i):
             i = int(i)
+            owner = (
+                None
+                if moving_environment is None
+                else getattr(moving_environment, "_cpp_moving_environment", None)
+            )
+            if (
+                owner is not None
+                and hasattr(owner, "direct_family_revision_cache_key")
+                and _sync_cpp_direct_family_revision_state()
+            ):
+                try:
+                    key = owner.direct_family_revision_cache_key(i)
+                    moving_environment._sync_cpp_moving_environment_stats()
+                    moving_environment.moving_profile_stats[
+                        "owner_direct_family_cache_key_backend_actual"
+                    ] = "cpp_moving_environment"
+                    return key
+                except Exception as exc:
+                    moving_environment.moving_profile_stats[
+                        "cpp_moving_environment_direct_family_revision_cache_key_last_error"
+                    ] = str(exc)
             left_revisions = direct_family_boundary_revision.get("left", {})
             right_revisions = direct_family_boundary_revision.get("right", {})
             return (
@@ -46016,8 +47235,8 @@ def two_site_dmrg(
                     "right" if str(step_direction_value) == "lr" else "left"
                 )
                 return optimize_two_sites(
-                    MPS[bond_index],
-                    MPS[bond_index + 1],
+                    _active_site_tensor(bond_index),
+                    _active_site_tensor(bond_index + 1),
                     MPO[bond_index],
                     MPO[bond_index + 1],
                     E[-1],
@@ -46043,9 +47262,7 @@ def two_site_dmrg(
 
             def assign_bond(self, bond_index, result):
                 bond_index = int(bond_index)
-                old_left, old_right = MPS[bond_index], MPS[bond_index + 1]
-                MPS[bond_index], MPS[bond_index + 1] = result[1], result[2]
-                _discard_direct_family_tensor_views(old_left, old_right)
+                _set_active_site_pair(bond_index, result[1], result[2])
 
             def invalidate_bond(self, bond_index, clear_side_value):
                 clear_value = str(clear_side_value)
@@ -46071,10 +47288,15 @@ def two_site_dmrg(
         def _make_step(i):
             i = int(i)
             should_move = True if move_bond is None else bool(move_bond(i))
+            site_chain_key = _ensure_cpp_owner_site_chain()
             direct_family_cache_key = _owner_direct_family_cache_key(i)
             direct_family_cpp_keys = None
             direct_family_cpp_plan_keys = None
-            if moving_environment is not None and direct_family_environments_enabled:
+            if (
+                moving_environment is not None
+                and direct_family_environments_enabled
+                and use_cpp_direct_family_owner_payload
+            ):
                 direct_family_cpp_plan_keys = _direct_family_env(
                     i,
                     install_owner_plan_only=True,
@@ -46211,12 +47433,15 @@ def two_site_dmrg(
                         True,
                         MPS,
                         i,
-                        False,
+                        bool(site_chain_key),
                         bond_guess_cache,
                         i,
                         False,
                         True,
                         direct_payload_key,
+                        False,
+                        False,
+                        site_chain_key,
                     )
                 except Exception as exc:
                     owner_local_optimize_key = None
@@ -46226,8 +47451,8 @@ def two_site_dmrg(
 
             def _optimize_single():
                 return optimize_two_sites(
-                    MPS[i],
-                    MPS[i + 1],
+                    _active_site_tensor(i),
+                    _active_site_tensor(i + 1),
                     MPO[i],
                     MPO[i + 1],
                     E[-1],
@@ -46254,9 +47479,7 @@ def two_site_dmrg(
                 )
 
             def _assign_single(result):
-                old_left, old_right = MPS[i], MPS[i + 1]
-                MPS[i], MPS[i + 1] = result[1], result[2]
-                _discard_direct_family_tensor_views(old_left, old_right)
+                _set_active_site_pair(i, result[1], result[2])
 
             step_spec = {
                 "prepare": (
@@ -46348,7 +47571,6 @@ def two_site_dmrg(
             owner = getattr(moving_environment, "_cpp_moving_environment", None)
             if (
                 owner is None
-                or direct_family_environments_enabled
                 or not bool(native_site_storage)
                 or not bool(
                     moving_environment._option_value(
@@ -46367,7 +47589,16 @@ def two_site_dmrg(
                 or not hasattr(owner, "run_owner_half_sweep_from_typed_step_keys")
             ):
                 return None
+            if (
+                direct_family_environments_enabled
+                and not use_cpp_direct_family_owner_payload
+            ):
+                moving_environment.moving_profile_stats[
+                    "owner_typed_half_sweep_disabled_reason"
+                ] = "direct_family_owner_payload_disabled"
+                return None
 
+            site_chain_key = _ensure_cpp_owner_site_chain()
             bridge = getattr(
                 moving_environment,
                 "_owner_typed_bond_step_bridge",
@@ -46413,6 +47644,7 @@ def two_site_dmrg(
                 f"{id(moving_environment)}:"
                 f"{direction}:"
                 f"{step_direction}:"
+                f"{int(bool(direct_family_environments_enabled))}:"
                 f"{move_signature}"
             )
             has_typed_plan = (
@@ -46424,8 +47656,177 @@ def two_site_dmrg(
             install_start = time.perf_counter()
             installs = 0
             used_template_installer = False
+            direct_family_plan_provider = None
+            if (
+                direct_family_environments_enabled
+                and use_cpp_direct_family_owner_payload
+            ):
+                def direct_family_plan_provider(bond_index):
+                    bond_index = int(bond_index)
+                    cache_key = _owner_direct_family_cache_key(bond_index)
+                    plan_keys = _direct_family_env(
+                        bond_index,
+                        install_owner_plan_only=True,
+                        owner_plan_cache_key=cache_key,
+                    )
+                    if plan_keys is not None:
+                        return {
+                            "payload_key": str(plan_keys[0]),
+                            "plan_key": str(plan_keys[1]),
+                        }
+                    key_pair = (
+                        moving_environment._install_cpp_direct_family_payload_builder(
+                            bond_index,
+                            cache_key,
+                            lambda b=bond_index: _direct_family_env(b),
+                        )
+                    )
+                    if key_pair is not None:
+                        return {
+                            "payload_key": str(key_pair[0]),
+                            "builder_key": str(key_pair[1]),
+                        }
+                    env = moving_environment.prepare_direct_family_environment_for_bond(
+                        bond_index,
+                        lambda b=bond_index: _direct_family_env(b),
+                        cache_key=cache_key,
+                    )
+                    payload_key = moving_environment._owner_direct_family_cpp_payload_key(
+                        bond_index,
+                        cache_key,
+                    )
+                    if env is not None and payload_key is not None:
+                        moving_environment._install_cpp_direct_family_payload(
+                            bond_index,
+                            cache_key,
+                            env,
+                        )
+                        return {"payload_key": str(payload_key)}
+                    return None
+
+            def _owner_local_key_for_typed_bond(bond_index):
+                return (
+                    "owner-local-typed:"
+                    f"{id(moving_environment)}:"
+                    f"{step_direction}:"
+                    f"{int(bool(direct_family_environments_enabled))}:"
+                    f"{int(bond_index)}"
+                )
+
+            def _typed_bond_step_key(bond_index, should_move_value):
+                return (
+                    "owner-typed-bond-step:"
+                    f"{id(moving_environment)}:"
+                    f"{direction}:"
+                    f"{step_direction}:"
+                    f"{int(bool(direct_family_environments_enabled))}:"
+                    f"{int(bond_index)}:"
+                    f"{int(bool(should_move_value))}"
+                )
+
+            typed_direct_static_refresh = bool(
+                direct_family_environments_enabled
+                and use_cpp_direct_family_owner_payload
+                and moving_environment is not None
+                and hasattr(
+                    owner,
+                    "update_owner_typed_bond_step_direct_family_keys",
+                )
+                and moving_environment._option_value(
+                    abelian_matvec_options,
+                    "moving_environment_cpp_owner_typed_direct_plan_static_refresh",
+                    True,
+                )
+            )
+
+            def _typed_direct_family_key_info_provider(bond_index, step_key=None):
+                if not typed_direct_static_refresh:
+                    return None
+                bond_index = int(bond_index)
+                stats = moving_environment.moving_profile_stats
+                stats["owner_typed_direct_plan_static_refresh_attempts"] = int(
+                    stats.get(
+                        "owner_typed_direct_plan_static_refresh_attempts",
+                        0,
+                    )
+                ) + 1
+                payload_key = ""
+                builder_key = ""
+                plan_key_value = ""
+                try:
+                    cache_key = _owner_direct_family_cache_key(bond_index)
+                    plan_keys = _direct_family_env(
+                        bond_index,
+                        install_owner_plan_only=True,
+                        owner_plan_cache_key=cache_key,
+                    )
+                    if plan_keys is not None:
+                        payload_key = str(plan_keys[0])
+                        plan_key_value = str(plan_keys[1])
+                    else:
+                        key_pair = (
+                            moving_environment._install_cpp_direct_family_payload_builder(
+                                bond_index,
+                                cache_key,
+                                lambda b=bond_index: _direct_family_env(b),
+                            )
+                        )
+                        if key_pair is not None:
+                            payload_key = str(key_pair[0])
+                            builder_key = str(key_pair[1])
+                    if not payload_key:
+                        stats["owner_typed_direct_plan_static_refresh_fallbacks"] = int(
+                            stats.get(
+                                "owner_typed_direct_plan_static_refresh_fallbacks",
+                                0,
+                            )
+                        ) + 1
+                        return None
+                    stats["owner_typed_direct_plan_static_refresh_accepts"] = int(
+                        stats.get(
+                            "owner_typed_direct_plan_static_refresh_accepts",
+                            0,
+                        )
+                    ) + 1
+                    stats["owner_typed_direct_plan_static_refresh_backend_actual"] = (
+                        "cpp_owner_typed_bond_step_static_direct_keys"
+                    )
+                    return {
+                        "payload_key": payload_key,
+                        "builder_key": builder_key,
+                        "plan_key": plan_key_value,
+                    }
+                except Exception as exc:
+                    stats["owner_typed_direct_plan_static_refresh_failures"] = int(
+                        stats.get(
+                            "owner_typed_direct_plan_static_refresh_failures",
+                            0,
+                        )
+                    ) + 1
+                    stats["owner_typed_direct_plan_static_refresh_last_error"] = str(exc)
+                    return None
+
+            def _refresh_typed_direct_family_keys(bond_index, step_key):
+                if not typed_direct_static_refresh:
+                    return False
+                if not hasattr(
+                    owner,
+                    "refresh_owner_typed_bond_step_direct_family_keys_from_provider",
+                ):
+                    return False
+                result = owner.refresh_owner_typed_bond_step_direct_family_keys_from_provider(
+                    str(step_key),
+                    int(bond_index),
+                    _typed_direct_family_key_info_provider,
+                )
+                moving_environment._sync_cpp_moving_environment_stats()
+                return bool(result.get("updated", False))
+
             if not use_typed_plan:
-                if hasattr(owner, "install_owner_typed_half_sweep_template_plan"):
+                if (
+                    not direct_family_environments_enabled
+                    and hasattr(owner, "install_owner_typed_half_sweep_template_plan")
+                ):
                     def _typed_comp_payload_provider(bond_index):
                         return _comp_payload(int(bond_index))
 
@@ -46487,6 +47888,7 @@ def two_site_dmrg(
                                 _typed_env_record_provider,
                                 True,
                                 True,
+                                site_chain_key,
                             )
                         )
                         installs = int(install_summary.get("installs", 0))
@@ -46512,12 +47914,7 @@ def two_site_dmrg(
                             if not direct_family_environments_enabled
                             else str(clear_side)
                         )
-                        owner_local_key = (
-                            "owner-local-typed:"
-                            f"{id(moving_environment)}:"
-                            f"{step_direction}:"
-                            f"{int(bond)}"
-                        )
+                        owner_local_key = _owner_local_key_for_typed_bond(bond)
                         if owner_local_key not in installed:
                             owner.install_owner_local_optimize(
                                 owner_local_key,
@@ -46526,8 +47923,8 @@ def two_site_dmrg(
                                 is_abelian_flat_two_site_guess,
                                 AbelianFlatTwoSiteGuess,
                                 BlockTensor,
-                                MPS[bond],
-                                MPS[bond + 1],
+                                _active_site_tensor(bond),
+                                _active_site_tensor(bond + 1),
                                 MPO[bond],
                                 MPO[bond + 1],
                                 E,
@@ -46558,17 +47955,11 @@ def two_site_dmrg(
                                 "",
                                 True,
                                 True,
+                                site_chain_key,
                             )
                             installed.add(owner_local_key)
                             installs += 1
-                        step_key = (
-                            "owner-typed-bond-step:"
-                            f"{id(moving_environment)}:"
-                            f"{direction}:"
-                            f"{step_direction}:"
-                            f"{int(bond)}:"
-                            f"{int(should_move)}"
-                        )
+                        step_key = _typed_bond_step_key(bond, should_move)
                         if step_key not in installed:
                             env_record = (
                                 _prepare_cpp_bond_environment_step(
@@ -46590,6 +47981,11 @@ def two_site_dmrg(
                                 "",
                                 "",
                                 "",
+                                (
+                                    None
+                                    if typed_direct_static_refresh
+                                    else direct_family_plan_provider
+                                ),
                                 owner_local_key,
                                 moving_environment if env_record is not None else None,
                                 (
@@ -46631,6 +48027,7 @@ def two_site_dmrg(
                             str(step_direction),
                         )
                         plan_installed.add(plan_key)
+                        use_typed_plan = True
 
             stats = moving_environment.moving_profile_stats
             install_elapsed = time.perf_counter() - install_start
@@ -46655,6 +48052,58 @@ def two_site_dmrg(
                     "last_result": None,
                     "seconds": 0.0,
                 }
+
+            typed_static_step_keys = tuple(
+                (
+                    int(bond),
+                    _typed_bond_step_key(int(bond), bool(should_move)),
+                )
+                for bond, should_move in bond_moves
+            )
+            if typed_direct_static_refresh and typed_static_step_keys:
+                if hasattr(
+                    owner,
+                    "install_owner_typed_bond_step_direct_family_successor_chain",
+                ):
+                    owner.install_owner_typed_bond_step_direct_family_successor_chain(
+                        typed_static_step_keys,
+                        _typed_direct_family_key_info_provider,
+                    )
+                    moving_environment._sync_cpp_moving_environment_stats()
+                    stats[
+                        "owner_typed_direct_plan_static_refresh_orchestrator_actual"
+                    ] = "cpp_owner_typed_bond_step_successor_chain"
+                else:
+                    _refresh_typed_direct_family_keys(*typed_static_step_keys[0])
+                    if hasattr(
+                        owner,
+                        "update_owner_typed_bond_step_direct_family_successor",
+                    ):
+                        for (
+                            (_prev_bond, prev_step_key),
+                            (next_bond, next_step_key),
+                        ) in zip(typed_static_step_keys, typed_static_step_keys[1:]):
+                            owner.update_owner_typed_bond_step_direct_family_successor(
+                                str(prev_step_key),
+                                int(next_bond),
+                                str(next_step_key),
+                                _typed_direct_family_key_info_provider,
+                            )
+                        if typed_static_step_keys:
+                            owner.update_owner_typed_bond_step_direct_family_successor(
+                                str(typed_static_step_keys[-1][1]),
+                                -1,
+                                "",
+                                None,
+                            )
+                        moving_environment._sync_cpp_moving_environment_stats()
+                        stats[
+                            "owner_typed_direct_plan_static_refresh_orchestrator_actual"
+                        ] = "cpp_owner_typed_bond_step_successor_refresh"
+                    else:
+                        stats[
+                            "owner_typed_direct_plan_static_refresh_orchestrator_actual"
+                        ] = "python_first_bond_only"
 
             half_start_typed = time.perf_counter()
             stats["owner_half_sweep_calls"] = int(
@@ -46781,6 +48230,27 @@ def two_site_dmrg(
             )
         if prepare_only:
             return summary
+        if (
+            moving_environment is not None
+            and moving_environment.moving_profile_stats.get(
+                "owner_local_optimize_commit_actual"
+            )
+            == "cpp_owner_site_chain"
+        ):
+            _mark_cpp_owner_site_chain_dirty()
+            if bool(
+                moving_environment._option_value(
+                    abelian_matvec_options,
+                    "moving_environment_cpp_owner_site_chain_sync_each_half",
+                    True,
+                )
+            ):
+                _sync_cpp_owner_site_chain(force=True)
+            else:
+                stats = moving_environment.moving_profile_stats
+                stats["owner_site_chain_deferred_half_syncs"] = int(
+                    stats.get("owner_site_chain_deferred_half_syncs", 0)
+                ) + 1
         result = summary.get("last_result")
         if result is None:
             return None
@@ -46813,6 +48283,26 @@ def two_site_dmrg(
         nsweep_half_local = int(sweeps)
         if nsweep_half_local <= 0:
             return None
+        owner_site_chain_key = ""
+        if (
+            hasattr(owner, "install_owner_site_chain")
+            and hasattr(owner, "sync_owner_site_chain_to_sequence")
+        ):
+            owner_site_chain_key = f"owner-site-chain:{id(moving_environment)}"
+            try:
+                owner.install_owner_site_chain(owner_site_chain_key, MPS)
+                moving_environment._cpp_owner_site_chain_key = owner_site_chain_key
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_backend_actual"
+                ] = "cpp_owner_site_chain"
+            except Exception as exc:
+                owner_site_chain_key = ""
+                moving_environment._cpp_owner_site_chain_key = ""
+                moving_environment.moving_profile_stats[
+                    "owner_site_chain_install_last_error"
+                ] = str(exc)
+        else:
+            moving_environment._cpp_owner_site_chain_key = ""
         noise_values = tuple(float(_noise(half) or 0.0) for half in range(nsweep_half_local))
         use_alternating_schedule = (
             hasattr(owner, "install_owner_alternating_sweep_schedule_plan")
@@ -46943,6 +48433,20 @@ def two_site_dmrg(
                 float(np.real(np.asarray(Eold).reshape(-1)[0])),
                 float(conv),
             )
+            if owner_site_chain_key:
+                _mark_cpp_owner_site_chain_dirty()
+                if bool(
+                    moving_environment._option_value(
+                        abelian_matvec_options,
+                        "moving_environment_cpp_owner_site_chain_sync_each_schedule",
+                        True,
+                    )
+                ):
+                    _sync_cpp_owner_site_chain(force=True)
+                else:
+                    stats["owner_site_chain_deferred_schedule_syncs"] = int(
+                        stats.get("owner_site_chain_deferred_schedule_syncs", 0)
+                    ) + 1
             moving_environment._sync_cpp_moving_environment_stats()
         except Exception as exc:
             stats["owner_sweep_schedule_failures"] = int(
@@ -47096,6 +48600,8 @@ def two_site_dmrg(
                 states = owner_half["states"]
                 E_ground_state = owner_half["E_ground_state"]
                 half_updates = owner_half["updates"]
+        if owner_half is None:
+            _sync_cpp_owner_site_chain(force=True)
         for i in (() if owner_half is not None else _sweep_bonds("lr")):
             local_start = time.perf_counter()
             environment_moved = False
@@ -47119,7 +48625,14 @@ def two_site_dmrg(
                 if moving_environment is not None:
                     def _optimize_single_lr():
                         return optimize_two_sites(
-                            MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right',
+                            _active_site_tensor(i),
+                            _active_site_tensor(i + 1),
+                            MPO[i],
+                            MPO[i + 1],
+                            E[-1],
+                            F[-1],
+                            m,
+                            'right',
                             U1=U1, sym_mgr=sym_mgr,
                             init_vecs=bond_guess_cache.get(i),
                             davidson_tol=davidson_tol,
@@ -47134,12 +48647,10 @@ def two_site_dmrg(
                             complementary_direct_family_environments=_direct_family_env(i),
                             matvec_options=abelian_matvec_options,
                             moving_environment=moving_environment,
-                        )
+                    )
 
                     def _assign_single_lr(result):
-                        old_left, old_right = MPS[i], MPS[i+1]
-                        MPS[i], MPS[i+1] = result[1], result[2]
-                        _discard_direct_family_tensor_views(old_left, old_right)
+                        _set_active_site_pair(i, result[1], result[2])
 
                     result = moving_environment.run_single_state_bond_step(
                         sweep_direction="lr",
@@ -47249,6 +48760,8 @@ def two_site_dmrg(
                 states = owner_half["states"]
                 E_ground_state = owner_half["E_ground_state"]
                 half_updates = owner_half["updates"]
+        if owner_half is None:
+            _sync_cpp_owner_site_chain(force=True)
         for i in (() if owner_half is not None else _sweep_bonds("rl")):
             local_start = time.perf_counter()
             environment_moved = False
@@ -47270,7 +48783,14 @@ def two_site_dmrg(
                 if moving_environment is not None:
                     def _optimize_single_rl():
                         return optimize_two_sites(
-                            MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left',
+                            _active_site_tensor(i),
+                            _active_site_tensor(i + 1),
+                            MPO[i],
+                            MPO[i + 1],
+                            E[-1],
+                            F[-1],
+                            m,
+                            'left',
                             U1=U1, sym_mgr=sym_mgr,
                             init_vecs=bond_guess_cache.get(i),
                             davidson_tol=davidson_tol,
@@ -47285,12 +48805,10 @@ def two_site_dmrg(
                             complementary_direct_family_environments=_direct_family_env(i),
                             matvec_options=abelian_matvec_options,
                             moving_environment=moving_environment,
-                        )
+                    )
 
                     def _assign_single_rl(result):
-                        old_left, old_right = MPS[i], MPS[i+1]
-                        MPS[i], MPS[i+1] = result[1], result[2]
-                        _discard_direct_family_tensor_views(old_left, old_right)
+                        _set_active_site_pair(i, result[1], result[2])
 
                     result = moving_environment.run_single_state_bond_step(
                         sweep_direction="rl",
@@ -47415,6 +48933,8 @@ def two_site_dmrg(
                 states = owner_recenter["states"]
                 E_ground_state = owner_recenter["E_ground_state"]
                 recenter_updates = owner_recenter["updates"]
+        if owner_recenter is None:
+            _sync_cpp_owner_site_chain(force=True)
         for i in (
             ()
             if owner_recenter is not None
@@ -47438,8 +48958,17 @@ def two_site_dmrg(
             else:
                 if i > center_i:
                     _prepare_cpp_bond_environment_step("rl", i)
-                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'left', U1, sym_mgr,
+                Energy, left_site, right_site, trunc, states = optimize_two_sites(
+                    _active_site_tensor(i),
+                    _active_site_tensor(i + 1),
+                    MPO[i],
+                    MPO[i + 1],
+                    E[-1],
+                    F[-1],
+                    m,
+                    'left',
+                    U1,
+                    sym_mgr,
                     init_vecs=bond_guess_cache.get(i),
                     davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
                     noise=0.0, local_dense_max_dim=local_dense_max_dim,
@@ -47450,6 +48979,7 @@ def two_site_dmrg(
                     complementary_direct_family_environments=_direct_family_env(i),
                     matvec_options=abelian_matvec_options,
                     moving_environment=moving_environment)
+                _set_active_site_pair(i, left_site, right_site)
                 _invalidate_after_local_solve(i, clear_side="right")
                 _cache_single_guess(i)
                 E_ground_state = Energy
@@ -47467,11 +48997,12 @@ def two_site_dmrg(
             if i > center_i: # Don't shift environments on the final stop
                 if not _move_environment_after_step("rl", i):
                     t0 = time.perf_counter()
+                    site_tensor = _active_site_tensor(i + 1)
                     _push_right_env(
                         F,
                         MPO[i + 1],
-                        MPS[i + 1],
-                        MPS[i + 1],
+                        site_tensor,
+                        site_tensor,
                         stack_name="hamiltonian",
                     )
                     _record_environment_timing("update_right", time.perf_counter() - t0)
@@ -47480,8 +49011,8 @@ def two_site_dmrg(
                         _push_right_env(
                             comp_family_F[name],
                             factors[i + 1],
-                            MPS[i + 1],
-                            MPS[i + 1],
+                            site_tensor,
+                            site_tensor,
                             stack_name=f"family:{name}",
                         )
                         _record_comp_family_timing(
@@ -47522,6 +49053,8 @@ def two_site_dmrg(
                 states = owner_recenter["states"]
                 E_ground_state = owner_recenter["E_ground_state"]
                 recenter_updates = owner_recenter["updates"]
+        if owner_recenter is None:
+            _sync_cpp_owner_site_chain(force=True)
         for i in (
             ()
             if owner_recenter is not None
@@ -47545,8 +49078,17 @@ def two_site_dmrg(
             else:
                 if i < center_i:
                     _prepare_cpp_bond_environment_step("lr", i)
-                Energy, MPS[i], MPS[i+1], trunc, states = optimize_two_sites(
-                    MPS[i], MPS[i+1], MPO[i], MPO[i+1], E[-1], F[-1], m, 'right', U1, sym_mgr,
+                Energy, left_site, right_site, trunc, states = optimize_two_sites(
+                    _active_site_tensor(i),
+                    _active_site_tensor(i + 1),
+                    MPO[i],
+                    MPO[i + 1],
+                    E[-1],
+                    F[-1],
+                    m,
+                    'right',
+                    U1,
+                    sym_mgr,
                     init_vecs=bond_guess_cache.get(i),
                     davidson_tol=davidson_tol, davidson_max_iter=davidson_max_iter,
                     noise=0.0, local_dense_max_dim=local_dense_max_dim,
@@ -47557,6 +49099,7 @@ def two_site_dmrg(
                     complementary_direct_family_environments=_direct_family_env(i),
                     matvec_options=abelian_matvec_options,
                     moving_environment=moving_environment)
+                _set_active_site_pair(i, left_site, right_site)
                 _invalidate_after_local_solve(i, clear_side="left")
                 _cache_single_guess(i)
                 E_ground_state = Energy
@@ -47574,15 +49117,22 @@ def two_site_dmrg(
             if i < center_i: # Don't shift environments on the final stop
                 if not _move_environment_after_step("lr", i):
                     t0 = time.perf_counter()
-                    _push_left_env(E, MPO[i], MPS[i], MPS[i], stack_name="hamiltonian")
+                    site_tensor = _active_site_tensor(i)
+                    _push_left_env(
+                        E,
+                        MPO[i],
+                        site_tensor,
+                        site_tensor,
+                        stack_name="hamiltonian",
+                    )
                     _record_environment_timing("update_left", time.perf_counter() - t0)
                     for name, factors in complementary_operator_mpos.items():
                         t0 = time.perf_counter()
                         _push_left_env(
                             comp_family_E[name],
                             factors[i],
-                            MPS[i],
-                            MPS[i],
+                            site_tensor,
+                            site_tensor,
                             stack_name=f"family:{name}",
                         )
                         _record_comp_family_timing(
@@ -47603,6 +49153,8 @@ def two_site_dmrg(
             sweep_seconds=time.perf_counter() - recenter_start,
             updates=recenter_updates,
         )
+
+    _sync_cpp_owner_site_chain(force=True)
 
     if nstates == 1:
             return Energy, MPS, gauge, converged
@@ -47657,7 +49209,11 @@ def expect_mps(bra, MPO, ket=None):
     AList = bra
     BList = ket
 
-
+    if AList and hasattr(AList[0], "qns"):
+        E = initial_E(MPO[0])
+        for i in range(0, len(MPO)):
+            E = contract_from_left(MPO[i], AList[i], E, BList[i])
+        return abelian_environment_scalar(E)
 
     E = [[[1]]]
     for i in range(0,len(MPO)):

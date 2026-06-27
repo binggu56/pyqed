@@ -10,7 +10,7 @@ import pyqed.mps.tdvp as tdvp_module
 from pyqed.mps.decompose import decompose, tt_to_tensor
 from pyqed.mps.mps import MPS, MPO, _mpo_to_dense_operator
 from pyqed.mps.tdmps import TDMPS
-from pyqed.mps.tdvp import two_site_tdvp_step
+from pyqed.mps.tdvp import SymmetricTDVP, spatial_fermion_number_sz_sectors, two_site_tdvp_step
 
 
 def _cpp_tdvp_or_skip():
@@ -21,6 +21,29 @@ def _cpp_tdvp_or_skip():
     if not tdvp_cpp.CPP_TDVP_HAS_BLAS:
         pytest.skip("C++ TDVP backend built without BLAS contractions")
     return tdvp_cpp
+
+
+def _cpp_davidson_or_skip():
+    try:
+        from pyqed.mps import cpp_davidson
+    except ImportError as exc:
+        pytest.skip(f"C++ Davidson backend module unavailable: {exc}")
+
+    if not cpp_davidson.CPP_DAVIDSON_AVAILABLE:
+        pytest.skip(f"C++ Davidson backend unavailable: {cpp_davidson.CPP_DAVIDSON_BUILD_ERROR}")
+    if cpp_davidson.abelian_tdvp_site_heff_data is None:
+        pytest.skip("C++ Abelian TDVP Heff kernels unavailable")
+    if cpp_davidson.AbelianTDVPSiteHeffPlan is None:
+        pytest.skip("C++ Abelian TDVP Heff plan kernels unavailable")
+    return cpp_davidson
+
+
+def _assert_abelian_data_allclose(actual, expected, *, atol=1.0e-12):
+    assert actual.qns == expected.qns
+    assert actual.dirs == expected.dirs
+    assert set(actual.data) == set(expected.data)
+    for key, block in actual.data.items():
+        np.testing.assert_allclose(block, expected.data[key], atol=atol)
 
 
 class _IdentityOp:
@@ -111,6 +134,55 @@ def test_tdmps_affine_hamiltonian_cache_matches_mpo_addition():
     )
     assert len(td._affine_hamiltonian_cache) == 1
     assert eff.factors[-1] is eff2.factors[-1]
+
+
+def test_affine_block_sparse_mpo_reuses_shared_tail(monkeypatch):
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+    td = TDMPS(h_mpo, D=8, interaction_mpo=h_mpo)
+    site_qn_maps, _target_qn = tdvp_module._block_sparse_site_qn_maps(
+        [0, 1],
+        2,
+        (2, 2),
+        1,
+    )
+
+    tdvp_module._AFFINE_BLOCK_SPARSE_MPO_CACHE.clear()
+    calls = []
+    original = tdvp_module.dense_to_symmetric_mpo
+
+    def _counting_dense_to_symmetric_mpo(dense_mpo_list, *args, **kwargs):
+        calls.append(len(dense_mpo_list))
+        return original(dense_mpo_list, *args, **kwargs)
+
+    monkeypatch.setattr(
+        tdvp_module,
+        "dense_to_symmetric_mpo",
+        _counting_dense_to_symmetric_mpo,
+    )
+    eff1 = td.hamiltonian(time=0.0, field=lambda t: 0.25)
+    eff2 = td.hamiltonian(time=0.0, field=lambda t: 0.5)
+
+    tdvp_module._as_block_sparse_mpo(eff1, site_qn_maps)
+    cached = tdvp_module._as_block_sparse_mpo(eff2, site_qn_maps)
+
+    assert calls == [2, 1]
+    full = original(
+        [np.asarray(w) for w in eff2.factors],
+        site_qn_maps,
+        native_site_storage=True,
+    )
+    for actual, expected in zip(cached, full):
+        _assert_abelian_data_allclose(actual, expected)
 
 
 def test_tdmps_tdvp_matches_exact_dense_for_full_two_site_manifold():
@@ -401,6 +473,399 @@ def test_tdmps_stateful_tdvp_matches_canonicalize_each_step():
         safe.final_state.norm(),
     )
     assert diagnostic["state_error"] < 1.0e-8
+
+
+def test_symmetric_tdvp_projects_dense_mps_to_target_sector():
+    rng = np.random.default_rng(41)
+    nsites = 3
+    phys_dim = 2
+    vec = rng.normal(size=phys_dim**nsites) + 1j * rng.normal(size=phys_dim**nsites)
+    psi = MPS(
+        decompose(vec.reshape((phys_dim,) * nsites), rank=phys_dim**nsites),
+        labels=["lv", "p", "rv"],
+    )
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=[0, 1],
+        target_sector=1,
+        max_bond=phys_dim**nsites,
+    )
+
+    projected, info = engine.project(psi, return_info=True)
+    tensor = np.asarray(tt_to_tensor(projected.factors), dtype=complex).reshape((phys_dim,) * nsites)
+
+    for index in np.ndindex(tensor.shape):
+        if sum(index) != 1:
+            assert abs(tensor[index]) < 1.0e-12
+    np.testing.assert_allclose(projected.norm(), 1.0, atol=1.0e-12)
+    assert 0.0 < info["sector_weight"] < 1.0
+    assert info["backend"] == "sector-mpo"
+    assert info["max_projector_bond"] == 2
+
+
+def test_symmetric_tdvp_one_site_step_preserves_target_sector():
+    nsites = 3
+    phys_dim = 2
+    vec = np.zeros((phys_dim,) * nsites, dtype=complex)
+    vec[1, 0, 0] = 1.0 / np.sqrt(2.0)
+    vec[0, 1, 0] = 1.0j / np.sqrt(2.0)
+    psi = MPS(
+        decompose(vec, rank=phys_dim**nsites),
+        labels=["lv", "p", "rv"],
+    ).normalize()
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=[0, 1],
+        target_sector=1,
+        max_bond=phys_dim**nsites,
+        krylov_dim=4,
+    )
+
+    out, info = engine.step(psi, 0.05, return_info=True)
+    actual = np.asarray(tt_to_tensor(out.factors), dtype=complex).reshape((phys_dim,) * nsites)
+
+    np.testing.assert_allclose(actual, vec, atol=1.0e-12)
+    np.testing.assert_allclose(out.norm(), 1.0, atol=1.0e-12)
+    assert info["input_sector_weight"] == pytest.approx(1.0)
+    assert info["output_sector_weight"] == pytest.approx(1.0)
+    assert info["integrator"] == "tdvp"
+    assert info["projection_backend"] == "sector-mpo"
+
+
+def test_symmetric_tdvp_block_sparse_step_matches_exact_fixed_sector():
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 0.8
+    vec[0, 1] = 0.6j
+    vec = vec / np.linalg.norm(vec.reshape(-1))
+    psi = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+    engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=1,
+        projection_backend="block-sparse",
+        krylov_dim=8,
+    )
+
+    out, info = engine.step(psi, 0.1, return_info=True)
+    dense_out = tdvp_module.symmetric_to_dense(out)
+    actual = np.asarray(tt_to_tensor(dense_out.factors), dtype=complex).reshape(-1)
+    exact = expm(-1j * 0.1 * _mpo_to_dense_operator(h_mpo)) @ vec.reshape(-1)
+
+    assert hasattr(out.factors[0], "qns")
+    assert info["projection_backend"] == "block-sparse"
+    np.testing.assert_allclose(out.norm(), 1.0, atol=1.0e-12)
+    np.testing.assert_allclose(abs(np.vdot(exact, actual)), 1.0, atol=1.0e-12)
+
+
+def test_symmetric_tdvp_block_sparse_accepts_spatial_sector_tuples():
+    nsites = 2
+    phys_dim = 4
+    vec = np.zeros((phys_dim, phys_dim), dtype=complex)
+    vec[1, 2] = 1.0
+    psi = MPS(decompose(vec, rank=4), labels=["lv", "p", "rv"]).normalize()
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=spatial_fermion_number_sz_sectors(),
+        target_sector=(2, 0),
+        projection_backend="block-sparse",
+        krylov_dim=4,
+    )
+
+    out, info = engine.step(psi, 0.02, return_info=True)
+    dense_out = tdvp_module.symmetric_to_dense(out)
+    actual = np.asarray(tt_to_tensor(dense_out.factors), dtype=complex).reshape(vec.shape)
+
+    assert hasattr(out.factors[0], "qns")
+    assert info["target_qn"].components == (2, 0)
+    np.testing.assert_allclose(actual, vec, atol=1.0e-12)
+    np.testing.assert_allclose(out.norm(), 1.0, atol=1.0e-12)
+
+
+def test_symmetric_tdvp_block_sparse_reuses_native_mpo(monkeypatch):
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 1.0
+    psi = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+
+    calls = {"count": 0}
+    original = tdvp_module._as_block_sparse_mpo
+
+    def _counting_as_block_sparse_mpo(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tdvp_module, "_as_block_sparse_mpo", _counting_as_block_sparse_mpo)
+    engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=1,
+        projection_backend="block-sparse",
+        krylov_dim=4,
+    )
+
+    out, info1 = engine.step(psi, 0.01, return_info=True)
+    out, info2 = engine.step(out, 0.01, return_info=True)
+
+    assert calls["count"] == 1
+    assert info1["mpo_cached"] is True
+    assert info2["mpo_cached"] is True
+    assert engine.canonicalize_first is False
+    assert hasattr(out.factors[0], "qns")
+
+
+def test_block_sparse_tdvp_cpp_heff_kernels_match_python():
+    cpp_davidson = _cpp_davidson_or_skip()
+
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 0.8
+    vec[0, 1] = 0.6j
+    psi = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+
+    site_qn_maps, target_qn = tdvp_module._block_sparse_site_qn_maps(
+        [0, 1],
+        2,
+        (2, 2),
+        1,
+    )
+    factors = tdvp_module._as_block_sparse_factors(psi, site_qn_maps)
+    mpo = tdvp_module._as_block_sparse_mpo(h_mpo, site_qn_maps)
+    right_envs = tdvp_module._build_block_right_envs(factors, mpo, target_qn)
+    left = tdvp_module.initial_E(mpo[0])
+
+    site_cpp = tdvp_module._cpp_payload_to_abelian_tensor(
+        cpp_davidson.abelian_tdvp_site_heff_data(
+            factors[0],
+            left,
+            mpo[0],
+            right_envs[1],
+        )
+    )
+    tmp = tdvp_module.abelian_tensor_data_tensordot(left, factors[0], ([2], [0]))
+    tmp = tdvp_module.abelian_tensor_data_tensordot(tmp, mpo[0], ([0, 3], [0, 3]))
+    tmp = tdvp_module.abelian_tensor_data_tensordot(tmp, right_envs[1], ([2, 1], [0, 2]))
+    site_ref = tdvp_module.abelian_transpose_tensor_data(
+        tmp,
+        (0, 2, 1),
+        carrier=tdvp_module.AbelianSiteTensorData,
+    )
+    _assert_abelian_data_allclose(site_cpp, site_ref)
+    site_plan = cpp_davidson.AbelianTDVPSiteHeffPlan.from_tensors(
+        factors[0],
+        left,
+        mpo[0],
+        right_envs[1],
+    )
+    assert site_plan.route_count() > 0
+    site_planned = tdvp_module._cpp_payload_to_abelian_tensor(
+        site_plan.apply(factors[0], left, mpo[0], right_envs[1])
+    )
+    _assert_abelian_data_allclose(site_planned, site_ref)
+
+    q, center = tdvp_module._block_left_qr(factors[0])
+    left_next = tdvp_module.contract_from_left(mpo[0], q, left, q)
+    bond_cpp = tdvp_module._cpp_payload_to_abelian_tensor(
+        cpp_davidson.abelian_tdvp_bond_heff_data(center, left_next, right_envs[1])
+    )
+    tmp = tdvp_module.abelian_tensor_data_tensordot(left_next, center, ([2], [0]))
+    bond_ref = tdvp_module.abelian_tensor_data_tensordot(
+        tmp,
+        right_envs[1],
+        ([0, 2], [0, 2]),
+    )
+    _assert_abelian_data_allclose(bond_cpp, bond_ref)
+    bond_plan = cpp_davidson.AbelianTDVPBondHeffPlan.from_tensors(
+        center,
+        left_next,
+        right_envs[1],
+    )
+    assert bond_plan.route_count() > 0
+    bond_planned = tdvp_module._cpp_payload_to_abelian_tensor(
+        bond_plan.apply(center, left_next, right_envs[1])
+    )
+    _assert_abelian_data_allclose(bond_planned, bond_ref)
+
+
+def test_tdmps_block_sparse_observables_do_not_densify(monkeypatch):
+    import pyqed.mps.tdmps as tdmps_module
+
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 0.8
+    vec[0, 1] = 0.6j
+    vec = vec / np.linalg.norm(vec.reshape(-1))
+    psi = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+
+    def _fail_densify(*args, **kwargs):
+        raise AssertionError("block-sparse observables should not densify the MPS")
+
+    monkeypatch.setattr(tdmps_module, "symmetric_to_dense", _fail_densify)
+    td = TDMPS(
+        h_mpo,
+        D=2,
+        local_sectors=[0, 1],
+        target_sector=1,
+        tdvp_projection_backend="block-sparse",
+    )
+    td.run(
+        psi,
+        dt=0.05,
+        steps=1,
+        e_ops=[h_mpo],
+        integrator="tdvp",
+        krylov_dim=8,
+        measure_observables=True,
+        track_energy=True,
+        progress=False,
+    )
+
+    assert hasattr(td.final_state.factors[0], "qns")
+    np.testing.assert_allclose(td.observables[0, 0], td.static_energies[-1], atol=1.0e-12)
+    np.testing.assert_allclose(
+        TDMPS.state_overlap(td.final_state, td.final_state),
+        td.final_state.norm(),
+        atol=1.0e-12,
+    )
+
+
+def test_symmetric_tdvp_mpo_projector_matches_dense_reference():
+    rng = np.random.default_rng(43)
+    nsites = 4
+    phys_dim = 2
+    vec = rng.normal(size=phys_dim**nsites) + 1j * rng.normal(size=phys_dim**nsites)
+    psi = MPS(
+        decompose(vec.reshape((phys_dim,) * nsites), rank=phys_dim**nsites),
+        labels=["lv", "p", "rv"],
+    )
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=[0, 1],
+        target_sector=2,
+        max_bond=phys_dim**nsites,
+    )
+
+    projected_mpo, mpo_info = engine.project(psi, return_info=True)
+    projected_dense, dense_info = engine.project_dense(psi, return_info=True)
+
+    np.testing.assert_allclose(
+        tt_to_tensor(projected_mpo.factors),
+        tt_to_tensor(projected_dense.factors),
+        atol=1.0e-12,
+    )
+    assert mpo_info["backend"] == "sector-mpo"
+    assert dense_info["backend"] == "dense-sector"
+
+
+def test_symmetric_tdvp_mpo_projector_does_not_need_dense_guard():
+    nsites = 5
+    phys_dim = 2
+    factors = []
+    for site in range(nsites):
+        core = np.zeros((1, phys_dim, 1), dtype=complex)
+        core[0, 1 if site in {1, 3} else 0, 0] = 1.0
+        factors.append(core)
+    psi = MPS(factors, labels=["lv", "p", "rv"])
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=[0, 1],
+        target_sector=2,
+        max_dense_sites=2,
+    )
+
+    projected, info = engine.project(psi, return_info=True)
+
+    np.testing.assert_allclose(projected.norm(), 1.0, atol=1.0e-12)
+    assert info["sector_weight"] == pytest.approx(1.0)
+    assert info["backend"] == "sector-mpo"
+
+
+def test_symmetric_tdvp_accepts_per_site_scalar_sector_tables():
+    nsites = 2
+    phys_dim = 2
+    zero_h = MPO(
+        [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
+        homogenous=False,
+    )
+    engine = SymmetricTDVP(
+        zero_h,
+        local_sectors=[[0, 1], [0, 2]],
+        target_sector=2,
+        max_bond=phys_dim**nsites,
+    )
+
+    mask = engine.sector_mask((phys_dim, phys_dim))
+
+    expected = np.array([[False, True], [False, False]])
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_spatial_fermion_number_sz_sector_helper():
+    assert spatial_fermion_number_sz_sectors() == [(0, 0), (1, 1), (1, -1), (2, 0)]
 
 
 def test_two_site_tdvp_diagonal_mpo_fast_path_matches_dense_path():

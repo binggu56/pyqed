@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from pyqed.qchem.dmrg import TDDMRG as QChemTDDMRG
 from pyqed.qchem.gdvr.newton import CollocatedERIOp
 from pyqed.qchem.gdvr.integrals import (
     PrimitiveLabel,
@@ -23,6 +24,7 @@ from pyqed.qchem.gdvr.rhf import (
     scf_rhf_method2,
     eri_JK_from_kernels_M1,
 )
+from pyqed.qchem.gdvr import TDDMRG as GDVRTDDMRG
 from pyqed.qchem.gdvr.tddmrg import gdvr_z_operator
 
 
@@ -54,6 +56,42 @@ def test_gdvr_molecule_dipole_operator_uses_electronic_sign_and_multiplicity():
     np.testing.assert_allclose(mol.dipole_operator("z"), -np.diag(z_diag))
     np.testing.assert_allclose(mol.dipole_operator("z", electronic=False), np.diag(z_diag))
     np.testing.assert_allclose(gdvr_z_operator(mol, electronic=True), mol.dipole_operator("z"))
+
+
+def test_gdvr_rhf_to_gto_returns_qchem_adapter():
+    mol = AtomicChain(
+        ["H", "H"],
+        coords=[
+            [0.0, 0.0, -0.7],
+            [0.0, 0.0, 0.7],
+        ],
+    )
+    mol.build(Lz=3.0, Nz=5, M=1, verbose=False)
+    mf = mol.RHF().run(conv=1e-6, max_iter=40, verbose=False)
+
+    adapter = mf.to_gto()
+
+    assert adapter.mol is mol
+    assert callable(adapter.active_space_integrals)
+    np.testing.assert_allclose(adapter.get_ovlp(), np.eye(mol.shapes["size"]))
+
+
+def test_gdvr_rhf_tddmrg_dispatches_direct_and_active_space_paths():
+    mol = AtomicChain(
+        ["H", "H"],
+        coords=[
+            [0.0, 0.0, -0.7],
+            [0.0, 0.0, 0.7],
+        ],
+    )
+    mol.build(Lz=3.0, Nz=5, M=1, verbose=False)
+    mf = mol.RHF().run(conv=1e-6, max_iter=40, verbose=False)
+
+    direct = mf.TDDMRG(D=8)
+    active = mf.TDDMRG(D=8, ncas=2, nelecas=(1, 1))
+
+    assert type(direct) is GDVRTDDMRG
+    assert type(active) is QChemTDDMRG
 
 
 def test_sto6g_named_basis_is_element_aware_for_helium():

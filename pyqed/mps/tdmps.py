@@ -1,6 +1,21 @@
 import numpy as np
-from pyqed.mps.mps import MPS, MPO, expmpo, apply_mpo, expect_mps
-from pyqed.mps.tdvp import TDVPEngine, one_site_tdvp_step, two_site_tdvp_step
+from pyqed.mps.mps import (
+    MPS,
+    MPO,
+    dense_to_symmetric_mpo,
+    expmpo,
+    apply_mpo,
+    expect_mps,
+    make_identity_mpo_site_from_mps_site,
+    symmetric_to_dense,
+)
+from pyqed.mps.tdvp import (
+    SymmetricTDVP,
+    TDVPEngine,
+    _block_sparse_site_qn_maps,
+    one_site_tdvp_step,
+    two_site_tdvp_step,
+)
 import logging
 
 
@@ -25,7 +40,17 @@ def _normalize_integrator(integrator):
 
 
 class TDMPS:
-    def __init__(self, H_mpo, D=40, interaction_mpo=None, field=None, interaction_propagator_builder=None):
+    def __init__(
+        self,
+        H_mpo,
+        D=40,
+        interaction_mpo=None,
+        field=None,
+        interaction_propagator_builder=None,
+        local_sectors=None,
+        target_sector=None,
+        tdvp_projection_backend=None,
+    ):
         """
         Time-Dependent MPS Solver (Layout Agnostic).
 
@@ -41,6 +66,9 @@ class TDMPS:
         self.interaction_mpo = interaction_mpo
         self.field = field
         self.interaction_propagator_builder = interaction_propagator_builder
+        self.local_sectors = local_sectors
+        self.target_sector = target_sector
+        self.tdvp_projection_backend = tdvp_projection_backend
         # self.dt = dt
         self.bond_dim = self.D = D
         # self.order = order
@@ -69,6 +97,7 @@ class TDMPS:
         self._last_step_tdvp_truncation_error = 0.0
         self._affine_hamiltonian_cache = {}
         self._tdvp_engine_cache = {}
+        self._symmetric_observable_cache = {}
 
     @staticmethod
     def state_overlap(bra, ket):
@@ -77,6 +106,18 @@ class TDMPS:
             raise TypeError("state_overlap expects MPS objects.")
         if bra.L != ket.L:
             raise ValueError("MPS lengths must match.")
+        if (
+            bra.factors
+            and ket.factors
+            and hasattr(bra.factors[0], "qns")
+            and hasattr(ket.factors[0], "qns")
+        ):
+            identity = [make_identity_mpo_site_from_mps_site(site) for site in ket.factors]
+            return expect_mps(bra.factors, identity, ket.factors)
+        if bra.factors and hasattr(bra.factors[0], "qns"):
+            bra = symmetric_to_dense(bra)
+        if ket.factors and hasattr(ket.factors[0], "qns"):
+            ket = symmetric_to_dense(ket)
 
         val = np.ones((1, 1), dtype=complex)
         for i in range(bra.L):
@@ -141,6 +182,15 @@ class TDMPS:
         canonicalize_each_step=False,
     ):
         H_eff = self.H if H_mpo is None else H_mpo
+        sector_backend = None
+        if self.tdvp_projection_backend is not None:
+            sector_backend = str(self.tdvp_projection_backend).lower().replace("_", "-")
+        use_symmetric_tdvp = (
+            sector_backend is not None
+            and integrator == "tdvp"
+            and self.local_sectors is not None
+            and self.target_sector is not None
+        )
         if reuse_tdvp_engine:
             cache_key = (
                 id(H_eff),
@@ -153,21 +203,36 @@ class TDMPS:
                 float(sparse_threshold),
                 bool(sparse_vectorized),
                 bool(canonicalize_each_step),
+                sector_backend,
             )
             engine = self._tdvp_engine_cache.get(cache_key)
             if engine is None:
-                engine = TDVPEngine(
-                    H_eff,
-                    integrator=integrator,
-                    max_bond=self.D,
-                    krylov_dim=krylov_dim,
-                    krylov_tol=krylov_tol,
-                    krylov_method=krylov_method,
-                    diagonal_fast_path=diagonal_fast_path,
-                    sparse_threshold=sparse_threshold,
-                    sparse_vectorized=sparse_vectorized,
-                    canonicalize_each_step=canonicalize_each_step,
-                )
+                if use_symmetric_tdvp:
+                    engine = SymmetricTDVP(
+                        H_eff,
+                        local_sectors=self.local_sectors,
+                        target_sector=self.target_sector,
+                        max_bond=self.D,
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        projection_backend=sector_backend,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                else:
+                    engine = TDVPEngine(
+                        H_eff,
+                        integrator=integrator,
+                        max_bond=self.D,
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        sparse_threshold=sparse_threshold,
+                        sparse_vectorized=sparse_vectorized,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
                 self._tdvp_engine_cache[cache_key] = engine
             psi, info = engine.step(psi, dt, normalize=True, return_info=True)
         elif integrator == "tdvp2":
@@ -185,6 +250,20 @@ class TDMPS:
                 normalize=True,
                 return_info=True,
             )
+        elif use_symmetric_tdvp:
+            engine = SymmetricTDVP(
+                H_eff,
+                local_sectors=self.local_sectors,
+                target_sector=self.target_sector,
+                max_bond=self.D,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                diagonal_fast_path=diagonal_fast_path,
+                projection_backend=sector_backend,
+                canonicalize_each_step=canonicalize_each_step,
+            )
+            psi, info = engine.step(psi, dt, normalize=True, return_info=True)
         else:
             psi, info = one_site_tdvp_step(
                 psi,
@@ -205,12 +284,50 @@ class TDMPS:
         for engine in self._tdvp_engine_cache.values():
             engine.reset()
 
+    def _block_sparse_site_qn_maps_for_state(self, psi):
+        if self.local_sectors is None or self.target_sector is None:
+            raise ValueError("Block-sparse observables require local_sectors and target_sector.")
+        phys_dims = []
+        for site in range(psi.L):
+            if psi.factors and hasattr(psi.factors[site], "qns"):
+                phys_dims.append(int(psi.factors[site].shape[2]))
+            else:
+                phys_dims.append(int(psi._get_std_B(site).shape[1]))
+        site_qn_maps, _target_qn = _block_sparse_site_qn_maps(
+            self.local_sectors,
+            psi.L,
+            tuple(phys_dims),
+            self.target_sector,
+        )
+        return site_qn_maps
+
+    def _block_sparse_mpo_factors(self, mpo, psi):
+        factors = self._factor_list(mpo)
+        if factors and hasattr(factors[0], "qns"):
+            return factors
+        site_qn_maps = self._block_sparse_site_qn_maps_for_state(psi)
+        cache_key = (tuple(id(factor) for factor in factors), tuple(tuple(sorted(q.items())) for q in site_qn_maps))
+        cached = self._symmetric_observable_cache.get(cache_key)
+        if cached is None:
+            cached = dense_to_symmetric_mpo(
+                [np.asarray(factor) for factor in factors],
+                site_qn_maps,
+                native_site_storage=True,
+            )
+            self._symmetric_observable_cache[cache_key] = cached
+        return cached
+
+    def _expectation(self, psi, mpo):
+        if psi.factors and hasattr(psi.factors[0], "qns"):
+            return expect_mps(psi.factors, self._block_sparse_mpo_factors(mpo, psi))
+        factors = mpo.factors if hasattr(mpo, "factors") else mpo
+        return expect_mps(psi.factors, factors)
+
     def static_energy(self, psi):
-        h_factors = self.H.factors if hasattr(self.H, "factors") else self.H
         norm2 = psi.norm()
         if abs(norm2) <= 1.0e-30:
             return np.nan
-        return expect_mps(psi.factors, h_factors) / norm2
+        return self._expectation(psi, self.H) / norm2
 
     @staticmethod
     def _factor_list(mpo):
@@ -271,7 +388,15 @@ class TDMPS:
             coeff * block for coeff, block in zip((coeff for coeff, _ in active), template["term_first"])
         ]
         factors = [np.concatenate(first_blocks, axis=1)] + template["shared"][1:]
-        return MPO(factors, homogenous=False)
+        out = MPO(factors, homogenous=False)
+        out._pyqed_affine_mpo = {
+            "template_id": id(template),
+            "base_first": template["base_first"],
+            "term_first": tuple(template["term_first"]),
+            "shared": tuple(template["shared"]),
+            "coeffs": tuple(complex(coeff) for coeff, _term in active),
+        }
+        return out
 
     def field_vector(self, time, field=None):
         source = self.field if field is None else field
@@ -447,6 +572,13 @@ class TDMPS:
                 raise ValueError("dt must be provided for TDVP time evolution.")
             if split_dynamic:
                 dynamic_mode = str(tdvp_dynamic_mode).lower().replace("_", "-")
+                if (
+                    self.tdvp_projection_backend is not None
+                    and str(self.tdvp_projection_backend).lower().replace("_", "-")
+                    in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
+                    and dynamic_mode in {"split", "strang", "split-operator"}
+                ):
+                    dynamic_mode = "midpoint"
                 if dynamic_mode in {"midpoint", "mid-point", "full", "combined"}:
                     return self._tdvp_evolve(
                         psi,
@@ -850,7 +982,7 @@ class TDMPS:
             completed_steps = checkpoint
 
             if measure_observables:
-                observables[i] = [expect_mps(psi.factors, e.factors) for e in e_ops]
+                observables[i] = [self._expectation(psi, e) for e in e_ops]
             elif len(e_ops):
                 observables[i] = np.nan
             fields[i] = self.field_vector(time, field=field)

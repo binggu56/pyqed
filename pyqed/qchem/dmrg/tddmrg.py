@@ -70,6 +70,13 @@ def _mpo_to_dense_matrix(mpo):
     return tens.reshape(out_dim, in_dim)
 
 
+def _is_block_sparse_tdvp_backend(backend):
+    if backend is None:
+        return False
+    key = str(backend).lower().replace("_", "-")
+    return key in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
+
+
 class TDDMRG(DMRG):
     """
     Quantum-chemistry time-dependent DMRG wrapper built on top of `TDMPS`.
@@ -295,6 +302,30 @@ class TDDMRG(DMRG):
             "Unable to construct a default initial state. Provide psi0 explicitly "
             "or use a string/MPS init_guess."
         )
+
+    def _default_block_sparse_initial_state(self):
+        guess = self.init_guess
+        if isinstance(guess, MPS) and hasattr(guess.factors[0], "qns"):
+            return guess.copy()
+        return self._default_initial_state()
+
+    def _initial_state_for_run(self, psi0, *, tdvp_projection_backend=None):
+        block_sparse = (
+            _is_block_sparse_tdvp_backend(tdvp_projection_backend)
+            and hasattr(self, "_tdvp_sector_settings")
+        )
+        if psi0 is None:
+            if block_sparse:
+                return self._default_block_sparse_initial_state()
+            return self._default_initial_state()
+        if (
+            block_sparse
+            and isinstance(psi0, MPS)
+            and psi0.factors
+            and hasattr(psi0.factors[0], "qns")
+        ):
+            return psi0.copy()
+        return self._ensure_dense_mps(psi0)
 
     def _normalize_observables(self, e_ops):
         if e_ops is None:
@@ -541,6 +572,7 @@ class TDDMRG(DMRG):
         sparse_vectorized=True,
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
+        tdvp_projection_backend=None,
         measure_observables=True,
         track_energy=True,
         progress=True,
@@ -552,7 +584,10 @@ class TDDMRG(DMRG):
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
 
-        psi = self._default_initial_state() if psi0 is None else self._ensure_dense_mps(psi0)
+        psi = self._initial_state_for_run(
+            psi0,
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
         observables = self._normalize_observables(e_ops)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
@@ -567,12 +602,18 @@ class TDDMRG(DMRG):
                 t0=t0,
             )
 
+        sector_kwargs = {}
+        if tdvp_projection_backend is not None and hasattr(self, "_tdvp_sector_settings"):
+            sector_kwargs = dict(self._tdvp_sector_settings())
+
         self.tdmps = TDMPS(
             self._get_td_hamiltonian(mo_coeff=mo_coeff),
             D=self.td_bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
+            tdvp_projection_backend=tdvp_projection_backend,
+            **sector_kwargs,
         )
         self.tdmps.run(
             psi,
@@ -632,6 +673,7 @@ class TDDMRG(DMRG):
         sparse_vectorized=True,
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
+        tdvp_projection_backend=None,
     ):
         if dt is None:
             raise ValueError("dt must be provided.")
@@ -642,7 +684,10 @@ class TDDMRG(DMRG):
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
 
-        psi = self._default_initial_state() if psi0 is None else self._ensure_dense_mps(psi0)
+        psi = self._initial_state_for_run(
+            psi0,
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
 
@@ -679,12 +724,18 @@ class TDDMRG(DMRG):
             self.time_reversal_diagnostic = diagnostic
             return diagnostic
 
+        sector_kwargs = {}
+        if tdvp_projection_backend is not None and hasattr(self, "_tdvp_sector_settings"):
+            sector_kwargs = dict(self._tdvp_sector_settings())
+
         solver = TDMPS(
             self._get_td_hamiltonian(mo_coeff=mo_coeff),
             D=self.td_bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
+            tdvp_projection_backend=tdvp_projection_backend,
+            **sector_kwargs,
         )
         diagnostic = solver.time_reversal_error(
             psi,

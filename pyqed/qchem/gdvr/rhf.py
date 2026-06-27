@@ -330,6 +330,23 @@ class Molecule:
                 E += Z[i] * Z[j] / float(np.linalg.norm(dR))
         return E
 
+    def position_operator(self, axis="z"):
+        """Return the one-electron GDVR position operator along an axis."""
+        key = str(axis).strip().lower()
+        if key != "z":
+            raise NotImplementedError("GDVR currently has a built-in position operator only along z.")
+        if self.z is None or self.shapes is None:
+            raise ValueError("Build the GDVR molecule before requesting a position operator.")
+        nz = int(self.shapes["Nz"])
+        m = int(self.shapes["M"])
+        z = np.asarray(self.z, dtype=float).reshape(nz)
+        return np.diag(np.repeat(z, m))
+
+    def dipole_operator(self, axis="z", *, electronic=True):
+        """Return the one-electron GDVR dipole operator along an axis."""
+        op = self.position_operator(axis)
+        return -op if electronic else op
+
     def build(
         self,
         Lz=18.0,
@@ -1139,6 +1156,39 @@ class RHF:
         from pyqed.qchem.gdvr.rttdhf import RTTDHF
 
         return RTTDHF(self, *args, **kwargs)
+
+    def to_gto(self, orbitals=None):
+        """Return a GTO-like qchem mean-field view backed by GDVR integrals."""
+        from pyqed.qchem.gdvr.tddmrg import GDVRMeanFieldAdapter
+
+        if self.mo_coeff is None or self.dm is None:
+            raise ValueError("Run GDVR RHF before requesting a GTO-like qchem view.")
+        mo_coeff = None
+        if orbitals is not None:
+            orbitals = tuple(int(i) for i in orbitals)
+            mo_coeff = np.asarray(self.mo_coeff)[:, orbitals]
+        return GDVRMeanFieldAdapter(self, mo_coeff=mo_coeff)
+
+    def TDDMRG(self, D, *, ncas=None, nelecas=None, orbitals=None, **kwargs):
+        """Construct direct GDVR TDDMRG or active-space qchem TDDMRG."""
+        if ncas is None:
+            if orbitals is not None:
+                raise ValueError("orbitals is only meaningful when ncas is set.")
+            from pyqed.qchem.gdvr.tddmrg import TDDMRG
+
+            return TDDMRG(self, D=D, nelecas=nelecas, **kwargs)
+
+        if nelecas is None:
+            nelecas = int(self.mol.nelec)
+        from pyqed.qchem.dmrg import TDDMRG
+
+        return TDDMRG(
+            self.to_gto(orbitals=orbitals),
+            ncas=int(ncas),
+            nelecas=nelecas,
+            D=D,
+            **kwargs,
+        )
 
     def newton(
         self,

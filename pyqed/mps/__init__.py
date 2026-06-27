@@ -117,7 +117,13 @@ try:  # pragma: no cover
         resolve_abelian_matvec_options,
     )
     from .tdmps import TDMPS  # noqa: F401
-    from .tdvp import one_site_tdvp_step, two_site_tdvp_step  # noqa: F401
+    from .tdvp import (  # noqa: F401
+        SymmetricTDVP,
+        block_sparse_one_site_tdvp_step,
+        one_site_tdvp_step,
+        spatial_fermion_number_sz_sectors,
+        two_site_tdvp_step,
+    )
     from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401
 except (ModuleNotFoundError, ImportError, OSError, TimeoutError):
     pass

@@ -32,6 +32,9 @@ class QN(tuple):
     def __lt__(self, other):
         return super().__lt__(other)
 
+    def __reduce__(self):
+        return (QN, tuple(self))
+
 
 class AbelianSector(tuple):
     """Labelled Abelian sector with qn-like arithmetic."""
@@ -75,6 +78,9 @@ class AbelianSector(tuple):
     def __repr__(self):
         return f"AbelianSector({self.labels!r}, {self.components!r})"
 
+    def __reduce__(self):
+        return (AbelianSector, (self.labels, self.components))
+
 
 class Sector(tuple):
     """Generic labelled product sector, including ``charge x SU(2)``."""
@@ -109,6 +115,9 @@ class Sector(tuple):
     def __repr__(self):
         return f"Sector({self.labels!r}, {self.components!r})"
 
+    def __reduce__(self):
+        return (Sector, (self.labels, self.components))
+
 
 def zero_like_sector(sector):
     if isinstance(sector, AbelianSector):
@@ -127,6 +136,8 @@ def zero_like_sector(sector):
         return Sector(sector.labels, tuple(comps))
     if isinstance(sector, QN):
         return QN(*([0] * len(sector)))
+    if np.isscalar(sector):
+        return type(sector)(0)
     return type(sector)(*[0] * len(sector))
 
 
@@ -151,7 +162,7 @@ class BlockTensor:
 
     def copy(self):
         new_data = {k: v.copy() for k, v in self.data.items()}
-        return BlockTensor(new_data, self.qns[:], self.dirs[:])
+        return BlockTensor(new_data, [list(q) for q in self.qns], self.dirs[:])
 
     def __add__(self, other):
         """Tensor addition (A + B)."""
@@ -191,13 +202,15 @@ class BlockTensor:
         total = 0.0
         for k, block_A in self.data.items():
             if k in other.data:
-                # Sum of element-wise products (Frobenius inner product)
-                total += np.sum(block_A.conj() * other.data[k])
+                total += np.vdot(block_A, other.data[k])
         return total
 
     def norm(self):
         """Frobenius norm."""
-        return np.sqrt(np.abs(self.dot(self)))
+        total = 0.0
+        for block in self.data.values():
+            total += float(np.real(np.vdot(block, block)))
+        return np.sqrt(max(total, 0.0))
 
     def transpose(self, *axes):
         """Permute legs."""
@@ -487,7 +500,7 @@ class SymmetryManager:
                 vals.append(0)
         return self._sector(vals)
 
-def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
+def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20, preconditioner=None):
     norm_val = v0.norm()
     if norm_val < 1e-12: 
         # Create a random starting vector in the same sector
@@ -543,7 +556,11 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
         for k in range(1, k_roots):
             resid_sum = resid_sum + (ritz_Hs[k] - ritz_vecs[k] * w[k])
             
-        q = resid_sum * -10.0 
+        q = None
+        if preconditioner is not None:
+            q = preconditioner(resid_sum, w[0])
+        if q is None:
+            q = resid_sum * -10.0
         for vec in V:
             ov = vec.dot(q)
             q = q - vec*ov
@@ -602,6 +619,7 @@ def solve_davidson_block(
     lindep_tol=1e-12,
     resid_add_tol=1e-10,
     verbose=False,
+    preconditioner=None,
 ):
     """
     Block Davidson for BlockTensor-based linear operators.
@@ -724,8 +742,12 @@ def solve_davidson_block(
             if resid_norms[k] < tol:
                 continue
 
-            # Identity preconditioner for now: q = r
-            q = residuals[k]
+            q = None
+            if preconditioner is not None:
+                q = preconditioner(residuals[k], evals[k])
+            if q is None:
+                # Identity preconditioner fallback.
+                q = residuals[k]
 
             # Orthogonalize against current basis and accepted new vectors
             q = _bt_orthonormalize(q, trial_basis, tol=resid_add_tol)
