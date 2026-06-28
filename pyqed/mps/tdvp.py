@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
+import os
 import time
 
 import numpy as np
@@ -21,6 +22,7 @@ from pyqed.mps.mps import (
     symmetric_to_dense,
 )
 from pyqed.mps.abelian_direct import (
+    AbelianEnvironmentTensorData,
     AbelianSiteTensorData,
     _cpp_table_kernel,
     abelian_right_canonicalize_site_tensors,
@@ -31,7 +33,7 @@ from pyqed.mps.abelian_storage import (
     make_identity_mpo_site_from_mps_site,
     to_native_abelian_site_tensor,
 )
-from pyqed.mps.symmetry import AbelianSector
+from pyqed.mps.symmetry import AbelianSector, zero_like_sector
 
 _tdvp_cpp = None
 _tdvp_cpp_tried = False
@@ -40,8 +42,38 @@ _BLOCK_HEFF_PLAN_CACHE_MAX = 512
 _BLOCK_HEFF_BACKEND_DECISION_CACHE = OrderedDict()
 _BLOCK_HEFF_BACKEND_DECISION_CACHE_MAX = 1024
 _BLOCK_HEFF_PLAN_MIN_ROUTE_ESTIMATE = 128
-_BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE = 250_000
-_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE = 2_000_000
+_BLOCK_MOVING_ENV_COUNTERS = (
+    "environment_plan_builds",
+    "environment_plan_replacements",
+    "environment_plan_cache_hits",
+    "environment_plan_advance_calls",
+    "environment_plan_failures",
+    "sweep_environment_step_calls",
+    "sweep_environment_step_updates",
+    "sweep_environment_step_auto_calls",
+    "sweep_environment_step_failures",
+)
+_BLOCK_MOVING_ENV_TIMERS = (
+    "environment_plan_build_seconds",
+    "environment_plan_advance_seconds",
+)
+_BLOCK_MOVING_ENV_ABSOLUTE = (
+    "environment_plan_records",
+    "environment_plan_last_routes",
+    "environment_plan_last_blocks",
+)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+_BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_CPP_MAX_ROUTE", 20_000_000)
+_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE", 20_000_000)
+_BLOCK_QR_CPP_MIN_ELEMENTS = _env_int("PYQED_TDVP_BLOCK_QR_CPP_MIN_ELEMENTS", 1_000_000_000)
 _AFFINE_BLOCK_SPARSE_MPO_CACHE = OrderedDict()
 _AFFINE_BLOCK_SPARSE_MPO_CACHE_MAX = 64
 
@@ -485,11 +517,11 @@ def _block_sparse_phys_dims(psi):
     return tuple(int(dim) for dim in dims)
 
 
-def _as_block_sparse_factors(psi, site_qn_maps):
+def _as_block_sparse_factors(psi, site_qn_maps, *, copy=True):
     if not isinstance(psi, MPS):
         raise TypeError("block-sparse TDVP expects an MPS initial state.")
     if psi.factors and hasattr(psi.factors[0], "qns"):
-        return [to_native_abelian_site_tensor(site, copy=True) for site in psi.factors]
+        return [to_native_abelian_site_tensor(site, copy=copy) for site in psi.factors]
     phys_qns = _block_sparse_uniform_phys_qns(site_qn_maps)
     dense_factors = _standard_mps_factors(psi)
     return dense_to_symmetric(
@@ -517,6 +549,121 @@ def _affine_first_factor(meta):
     return np.concatenate(first_blocks, axis=1)
 
 
+def _affine_first_site_template(meta, site_qn_map):
+    first_blocks = [np.asarray(meta["base_first"])] + [
+        np.asarray(block) for block in meta["term_first"]
+    ]
+    if not first_blocks:
+        return None
+    if any(block.ndim != 4 or block.shape[0] != 1 for block in first_blocks):
+        return None
+    phys_shape = first_blocks[0].shape[2:]
+    if any(block.shape[2:] != phys_shape for block in first_blocks[1:]):
+        return None
+
+    first_val = list(site_qn_map.values())[0]
+    q_left = zero_like_sector(first_val)
+    phys_by_q = defaultdict(list)
+    for state, qn in site_qn_map.items():
+        phys_by_q[qn].append(int(state))
+    phys_by_q = {qn: sorted(states) for qn, states in phys_by_q.items()}
+
+    entries_by_component = []
+    next_nodes = set()
+    block_keys = set()
+    right_offset = 0
+    for component, block in enumerate(first_blocks):
+        idxs = np.nonzero(np.abs(block) > 1.0e-12)
+        entries = []
+        for pos in range(len(idxs[0])):
+            left_idx = int(idxs[0][pos])
+            if left_idx != 0:
+                return None
+            right_idx = int(idxs[1][pos]) + right_offset
+            out_s = int(idxs[2][pos])
+            in_s = int(idxs[3][pos])
+            q_out = site_qn_map[out_s]
+            q_in = site_qn_map[in_s]
+            try:
+                q_right = q_left - (q_out - q_in)
+            except TypeError:
+                return None
+            key = (q_left, q_right, q_out, q_in)
+            value = block[0, int(idxs[1][pos]), out_s, in_s]
+            entries.append((right_idx, out_s, in_s, key, value))
+            next_nodes.add((right_idx, q_right))
+            block_keys.add(key)
+        entries_by_component.append(entries)
+        right_offset += int(block.shape[1])
+
+    if not next_nodes:
+        return None
+    r_map = {qn: sorted([node for node in next_nodes if node[1] == qn]) for qn in set(qn for _, qn in next_nodes)}
+    col_lookup = {
+        node: idx
+        for nodes in r_map.values()
+        for idx, node in enumerate(nodes)
+    }
+    out_lookup = {
+        qn: {state: idx for idx, state in enumerate(states)}
+        for qn, states in phys_by_q.items()
+    }
+
+    block_shapes = {}
+    for q_l, q_r, q_o, q_i in block_keys:
+        block_shapes[(q_l, q_r, q_o, q_i)] = (
+            1,
+            len(r_map[q_r]),
+            len(phys_by_q[q_o]),
+            len(phys_by_q[q_i]),
+        )
+
+    component_data = []
+    dtype = np.result_type(*first_blocks)
+    ordered_keys = sorted(block_keys)
+    for entries in entries_by_component:
+        data = OrderedDict(
+            (key, np.zeros(block_shapes[key], dtype=dtype))
+            for key in ordered_keys
+        )
+        for right_idx, out_s, in_s, key, value in entries:
+            _q_l, q_r, q_o, q_i = key
+            data[key][
+                0,
+                col_lookup[(right_idx, q_r)],
+                out_lookup[q_o][out_s],
+                out_lookup[q_i][in_s],
+            ] = value
+        component_data.append(data)
+
+    qns = (
+        (q_left,),
+        tuple(sorted(r_map)),
+        tuple(sorted(phys_by_q)),
+        tuple(sorted(phys_by_q)),
+    )
+    return {
+        "component_data": component_data,
+        "qns": qns,
+        "dirs": (-1, 1, 1, -1),
+    }
+
+
+def _affine_first_site_from_template(template, coeffs):
+    all_coeffs = (1.0 + 0.0j, *tuple(coeffs))
+    component_data = template["component_data"]
+    if len(all_coeffs) != len(component_data):
+        return None
+    data = OrderedDict()
+    for key in component_data[0]:
+        block = np.zeros_like(component_data[0][key], dtype=np.result_type(*all_coeffs, component_data[0][key]))
+        for coeff, basis_data in zip(all_coeffs, component_data):
+            if coeff != 0:
+                block = block + coeff * basis_data[key]
+        data[key] = block
+    return AbelianSiteTensorData(data, template["qns"], template["dirs"], copy=False)
+
+
 def _as_affine_block_sparse_mpo(H, site_qn_maps):
     meta = _affine_mpo_metadata(H)
     if meta is None:
@@ -525,7 +672,7 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
     if shared is None:
         return None
 
-    key = (int(meta["template_id"]), _site_qn_maps_signature(site_qn_maps))
+    key = (meta.get("cache_id", int(meta["template_id"])), _site_qn_maps_signature(site_qn_maps))
     first = _affine_first_factor(meta)
     cached = _AFFINE_BLOCK_SPARSE_MPO_CACHE.get(key)
     if cached is None:
@@ -538,17 +685,21 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
         _AFFINE_BLOCK_SPARSE_MPO_CACHE[key] = {
             "shared_tail": converted[1:],
             "site1_left_qns": tuple(converted[1].qns[0]) if len(converted) > 1 else (),
+            "site0_template": _affine_first_site_template(meta, site_qn_maps[0]),
         }
         _AFFINE_BLOCK_SPARSE_MPO_CACHE.move_to_end(key)
         if len(_AFFINE_BLOCK_SPARSE_MPO_CACHE) > _AFFINE_BLOCK_SPARSE_MPO_CACHE_MAX:
             _AFFINE_BLOCK_SPARSE_MPO_CACHE.popitem(last=False)
         return converted
 
-    site0 = dense_to_symmetric_mpo(
-        [first],
-        site_qn_maps[:1],
-        native_site_storage=True,
-    )[0]
+    template = cached.get("site0_template")
+    site0 = _affine_first_site_from_template(template, meta["coeffs"]) if template is not None else None
+    if site0 is None:
+        site0 = dense_to_symmetric_mpo(
+            [first],
+            site_qn_maps[:1],
+            native_site_storage=True,
+        )[0]
     if tuple(site0.qns[1]) != cached["site1_left_qns"]:
         dense_factors = [first] + [np.asarray(w) for w in shared[1:]]
         converted = dense_to_symmetric_mpo(
@@ -558,6 +709,7 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
         )
         cached["shared_tail"] = converted[1:]
         cached["site1_left_qns"] = tuple(converted[1].qns[0]) if len(converted) > 1 else ()
+        cached["site0_template"] = _affine_first_site_template(meta, site_qn_maps[0])
         return converted
     _AFFINE_BLOCK_SPARSE_MPO_CACHE.move_to_end(key)
     return [site0] + list(cached["shared_tail"])
@@ -601,17 +753,189 @@ def _normalize_block_factors_inplace(factors):
     return factors, norm2
 
 
-def _build_block_right_envs(factors, mpo, target_qn):
+def _build_block_right_envs(
+    factors,
+    mpo,
+    target_qn,
+    *,
+    moving_environment=None,
+    env_plan_prefix="",
+):
     nsites = len(factors)
     right_envs = [None] * (nsites + 1)
     right_envs[nsites] = initial_F(mpo[-1], target_qn=target_qn)
+    if (
+        moving_environment is not None
+        and hasattr(moving_environment, "sweep_environment_step_auto")
+        and env_plan_prefix
+    ):
+        stack = [right_envs[nsites]]
+        update_rows = [
+            (
+                f"{env_plan_prefix}:right-build:{i}",
+                mpo[i],
+                factors[i],
+                factors[i],
+                stack,
+            )
+            for i in range(nsites - 1, -1, -1)
+        ]
+        try:
+            moving_environment.sweep_environment_step_auto(
+                "right",
+                AbelianEnvironmentTensorData,
+                update_rows,
+                [],
+            )
+            if len(stack) == nsites + 1:
+                for offset, env in enumerate(stack):
+                    right_envs[nsites - offset] = env
+                return right_envs
+        except Exception:
+            pass
+
     for i in range(nsites - 1, -1, -1):
-        right_envs[i] = contract_from_right(mpo[i], factors[i], right_envs[i + 1], factors[i])
+        plan_key = f"{env_plan_prefix}:right-build:{i}" if env_plan_prefix else None
+        right_envs[i] = _advance_block_environment(
+            "right",
+            mpo[i],
+            factors[i],
+            right_envs[i + 1],
+            factors[i],
+            moving_environment=moving_environment,
+            plan_key=plan_key,
+        )
     return right_envs
+
+
+def _new_cpp_moving_environment():
+    owner_cls = _cpp_table_kernel("MovingEnvironment")
+    if owner_cls is None:
+        return None
+    try:
+        return owner_cls()
+    except Exception:
+        return None
+
+
+def _moving_environment_stats(moving_environment):
+    if moving_environment is None or not hasattr(moving_environment, "stats"):
+        return {}
+    try:
+        return dict(moving_environment.stats())
+    except Exception:
+        return {}
+
+
+def _moving_environment_delta_info(moving_environment, before):
+    info = {"cpp_moving_environment": moving_environment is not None}
+    after = _moving_environment_stats(moving_environment)
+    if not after:
+        return info
+    before = before or {}
+    for key in _BLOCK_MOVING_ENV_COUNTERS:
+        value = after.get(key)
+        if value is not None:
+            info[f"cpp_{key}"] = int(value) - int(before.get(key, 0))
+    for key in _BLOCK_MOVING_ENV_TIMERS:
+        value = after.get(key)
+        if value is not None:
+            info[f"cpp_{key}"] = float(value) - float(before.get(key, 0.0))
+    for key in _BLOCK_MOVING_ENV_ABSOLUTE:
+        value = after.get(key)
+        if value is not None:
+            info[f"cpp_{key}"] = int(value)
+    return info
+
+
+def _block_environment_advance_signature(direction, W, A, env, B):
+    def route_signature(tensor):
+        data = getattr(tensor, "data", None)
+        if data is None:
+            return None
+        return (
+            tuple(getattr(tensor, "dirs", ())),
+            tuple(tuple(key) for key in data.keys()),
+        )
+
+    signatures = tuple(
+        route_signature(tensor)
+        for tensor in (W, A, env, B)
+    )
+    if any(signature is None for signature in signatures):
+        return None
+    return repr((str(direction), signatures))
+
+
+def _advance_block_environment(
+    direction,
+    W,
+    A,
+    env,
+    B,
+    *,
+    moving_environment=None,
+    plan_key=None,
+):
+    direction = str(direction).lower()
+    if direction not in {"left", "right"}:
+        raise ValueError("Block environment advance direction must be 'left' or 'right'.")
+
+    if moving_environment is not None:
+        if plan_key is None:
+            plan_key = f"tdvp-block-environment:{direction}"
+        if hasattr(moving_environment, "environment_advance_auto"):
+            try:
+                payload = moving_environment.environment_advance_auto(
+                    str(plan_key),
+                    direction,
+                    W,
+                    A,
+                    env,
+                    B,
+                )
+                return _cpp_payload_to_abelian_tensor(
+                    payload,
+                    carrier=AbelianEnvironmentTensorData,
+                )
+            except Exception:
+                pass
+        signature = _block_environment_advance_signature(direction, W, A, env, B)
+        if signature is not None:
+            try:
+                payload = moving_environment.environment_advance(
+                    str(plan_key),
+                    direction,
+                    W,
+                    A,
+                    env,
+                    B,
+                    signature,
+                )
+                return _cpp_payload_to_abelian_tensor(
+                    payload,
+                    carrier=AbelianEnvironmentTensorData,
+                )
+            except Exception:
+                pass
+
+    if direction == "left":
+        return contract_from_left(W, A, env, B)
+    return contract_from_right(W, A, env, B)
 
 
 def _cpp_payload_to_abelian_tensor(payload, carrier=AbelianSiteTensorData):
     keys, blocks, qns, dirs = payload
+    if carrier is AbelianSiteTensorData:
+        out = AbelianSiteTensorData.__new__(AbelianSiteTensorData)
+        out.data = OrderedDict(
+            (tuple(key), np.asarray(block))
+            for key, block in zip(tuple(keys), tuple(blocks))
+        )
+        out.qns = tuple(tuple(axis_qns) for axis_qns in (qns or ()))
+        out.dirs = tuple(int(d) for d in (dirs or ()))
+        out._layout_signature = None
+        return out
     data = {
         tuple(key): np.asarray(block)
         for key, block in zip(tuple(keys), tuple(blocks))
@@ -619,20 +943,47 @@ def _cpp_payload_to_abelian_tensor(payload, carrier=AbelianSiteTensorData):
     return carrier(data, qns, dirs, copy=False)
 
 
+def _cpp_lapack_qr(matrix):
+    matrix = np.asarray(matrix, dtype=complex)
+    if matrix.size < _BLOCK_QR_CPP_MIN_ELEMENTS:
+        return None
+    kernel = _cpp_table_kernel("lapack_qr")
+    if kernel is None:
+        return None
+    try:
+        q, r = kernel(matrix)
+    except Exception:
+        return None
+    return np.asarray(q, dtype=complex), np.asarray(r, dtype=complex)
+
+
 def _abelian_block_layout_signature(tensor):
     data = getattr(tensor, "data", None)
     if data is None:
         return None
-    return (
+    cached = getattr(tensor, "_layout_signature", None)
+    if cached is not None:
+        return cached
+    signature = (
         tuple(getattr(tensor, "dirs", ())),
         tuple(
             (tuple(key), tuple(int(dim) for dim in np.asarray(block).shape))
             for key, block in data.items()
         ),
     )
+    try:
+        tensor._layout_signature = signature
+    except Exception:
+        pass
+    return signature
 
 
 def _cached_block_heff_plan(kind, *tensors):
+    signatures = tuple(_abelian_block_layout_signature(tensor) for tensor in tensors)
+    return _cached_block_heff_plan_for_signatures(kind, signatures, *tensors)
+
+
+def _cached_block_heff_plan_for_signatures(kind, signatures, *tensors):
     class_name = {
         "site": "AbelianTDVPSiteHeffPlan",
         "bond": "AbelianTDVPBondHeffPlan",
@@ -640,7 +991,6 @@ def _cached_block_heff_plan(kind, *tensors):
     plan_cls = _cpp_table_kernel(class_name)
     if plan_cls is None:
         return None
-    signatures = tuple(_abelian_block_layout_signature(tensor) for tensor in tensors)
     if any(signature is None for signature in signatures):
         return None
     key = (kind, signatures)
@@ -755,16 +1105,30 @@ def _make_planned_block_site_heff(theta, left, W, right):
     route_estimate = _block_heff_route_estimate(theta, left, W, right)
     if route_estimate > _BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE:
         return lambda local: _apply_block_site_heff(local, left, W, right)
-    plan = _cached_block_heff_plan("site", theta, left, W, right)
+    expected_signature = _abelian_block_layout_signature(theta)
+    fixed_signatures = (
+        _abelian_block_layout_signature(left),
+        _abelian_block_layout_signature(W),
+        _abelian_block_layout_signature(right),
+    )
+    plan = _cached_block_heff_plan_for_signatures(
+        "site",
+        (expected_signature, *fixed_signatures),
+        theta,
+        left,
+        W,
+        right,
+    )
     if plan is None:
         return lambda local: _apply_block_site_heff(local, left, W, right)
-    expected_signature = _abelian_block_layout_signature(theta)
-    backend_key = ("site", expected_signature, _abelian_block_layout_signature(left), _abelian_block_layout_signature(W), _abelian_block_layout_signature(right))
+    backend_key = ("site", expected_signature, *fixed_signatures)
+    local_plan_cache = {expected_signature: plan}
 
     preferred = "cpp" if route_estimate <= _BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE else None
 
     def apply(local):
-        if _abelian_block_layout_signature(local) == expected_signature:
+        local_signature = _abelian_block_layout_signature(local)
+        if local_signature == expected_signature:
             decision = preferred
             if decision is None:
                 decision = _BLOCK_HEFF_BACKEND_DECISION_CACHE.get(backend_key)
@@ -791,6 +1155,30 @@ def _make_planned_block_site_heff(theta, left, W, right):
                 except Exception:
                     _cache_block_heff_backend_decision(backend_key, "python")
             return _apply_block_site_heff_python(local, left, W, right)
+
+        if _should_try_block_heff_cpp(local, left, W, right):
+            local_plan = local_plan_cache.get(local_signature)
+            if local_plan is None:
+                local_plan = _cached_block_heff_plan_for_signatures(
+                    "site",
+                    (local_signature, *fixed_signatures),
+                    local,
+                    left,
+                    W,
+                    right,
+                )
+                local_plan_cache[local_signature] = local_plan
+            if local_plan is not None:
+                try:
+                    return _cpp_payload_to_abelian_tensor(local_plan.apply(local, left, W, right))
+                except Exception:
+                    pass
+            kernel = _cpp_table_kernel("abelian_tdvp_site_heff_data")
+            if kernel is not None:
+                try:
+                    return _cpp_payload_to_abelian_tensor(kernel(local, left, W, right))
+                except Exception:
+                    pass
         return _apply_block_site_heff_python(local, left, W, right)
 
     return apply
@@ -802,10 +1190,20 @@ def _make_planned_block_bond_heff(center, left, right):
         or not _should_try_block_heff_plan(center, left, right)
     ):
         return lambda local: _apply_block_bond_heff(local, left, right)
-    plan = _cached_block_heff_plan("bond", center, left, right)
+    expected_signature = _abelian_block_layout_signature(center)
+    fixed_signatures = (
+        _abelian_block_layout_signature(left),
+        _abelian_block_layout_signature(right),
+    )
+    plan = _cached_block_heff_plan_for_signatures(
+        "bond",
+        (expected_signature, *fixed_signatures),
+        center,
+        left,
+        right,
+    )
     if plan is None:
         return lambda local: _apply_block_bond_heff(local, left, right)
-    expected_signature = _abelian_block_layout_signature(center)
 
     def apply(local):
         if _abelian_block_layout_signature(local) == expected_signature:
@@ -819,6 +1217,31 @@ def _make_planned_block_bond_heff(center, left, right):
 
 
 def _block_linear_combination(coeffs, basis):
+    if basis and all(isinstance(vec, AbelianSiteTensorData) for vec in basis):
+        out = None
+        qns = basis[0].qns
+        dirs = basis[0].dirs
+        for coeff, vec in zip(coeffs, basis):
+            if abs(coeff) <= 0.0:
+                continue
+            if vec.qns != qns or vec.dirs != dirs:
+                out = None
+                break
+            if out is None:
+                out = OrderedDict(
+                    (key, np.asarray(block) * coeff)
+                    for key, block in vec.data.items()
+                )
+                continue
+            for key, block in vec.data.items():
+                contrib = np.asarray(block) * coeff
+                old = out.get(key)
+                out[key] = contrib if old is None else old + contrib
+        if out is not None:
+            if not out:
+                return basis[0] * 0.0
+            return AbelianSiteTensorData(out, qns, dirs, copy=False)
+
     out = None
     for coeff, vec in zip(coeffs, basis):
         if abs(coeff) <= 0.0:
@@ -982,7 +1405,11 @@ def _block_left_qr(theta):
             size = left_dim * phys_dim
             mat[offset : offset + size] = np.asarray(block).transpose(0, 2, 1).reshape(size, cols)
             offset += size
-        q_mat, r_mat = np.linalg.qr(mat, mode="reduced")
+        qr = _cpp_lapack_qr(mat)
+        if qr is None:
+            q_mat, r_mat = np.linalg.qr(mat, mode="reduced")
+        else:
+            q_mat, r_mat = qr
         chi = int(q_mat.shape[1])
         if chi == 0:
             continue
@@ -1041,7 +1468,11 @@ def _block_right_rq(theta):
             size = right_dim * phys_dim
             mat[:, offset : offset + size] = np.asarray(block).transpose(0, 2, 1).reshape(left_dim, size)
             offset += size
-        q_t, r_t = np.linalg.qr(mat.T, mode="reduced")
+        qr = _cpp_lapack_qr(mat.T)
+        if qr is None:
+            q_t, r_t = np.linalg.qr(mat.T, mode="reduced")
+        else:
+            q_t, r_t = qr
         chi = int(q_t.shape[1])
         if chi == 0:
             continue
@@ -1646,6 +2077,9 @@ def block_sparse_one_site_tdvp_step(
     krylov_method="lanczos",
     canonicalize=True,
     normalize=True,
+    copy_state=True,
+    moving_environment=None,
+    env_plan_prefix="tdvp-block",
     return_info=False,
 ):
     """
@@ -1660,6 +2094,7 @@ def block_sparse_one_site_tdvp_step(
         raise TypeError("block_sparse_one_site_tdvp_step expects an MPS initial state.")
 
     nsites = psi.L
+    env_plan_prefix = str(env_plan_prefix or "tdvp-block")
     dense_mpo = None if block_mpo is not None else _mpo_factors(H)
     mpo_length = len(block_mpo) if block_mpo is not None else len(dense_mpo)
     if mpo_length != nsites:
@@ -1672,9 +2107,10 @@ def block_sparse_one_site_tdvp_step(
             phys_dims,
             target_sector,
         )
-    factors = _as_block_sparse_factors(psi, site_qn_maps)
+    factors = _as_block_sparse_factors(psi, site_qn_maps, copy=copy_state)
     mpo_cached = block_mpo is not None
     mpo = block_mpo if mpo_cached else _as_block_sparse_mpo(dense_mpo, site_qn_maps)
+    moving_stats_before = _moving_environment_stats(moving_environment)
     if canonicalize:
         factors = abelian_right_canonicalize_site_tensors(factors)
         factors, _ = _normalize_block_factors_inplace(factors)
@@ -1714,11 +2150,19 @@ def block_sparse_one_site_tdvp_step(
             "mps_blocks": int(sum(len(site.data) for site in factors)),
             "mpo_blocks": int(sum(len(site.data) for site in mpo)),
             "mpo_cached": bool(mpo_cached),
+            "state_copied": bool(copy_state),
         }
+        info.update(_moving_environment_delta_info(moving_environment, moving_stats_before))
         return (out, info) if return_info else out
 
     half_dt = 0.5 * dt
-    right_envs = _build_block_right_envs(factors, mpo, target_qn)
+    right_envs = _build_block_right_envs(
+        factors,
+        mpo,
+        target_qn,
+        moving_environment=moving_environment,
+        env_plan_prefix=env_plan_prefix,
+    )
     left_envs = [None] * nsites
     left_envs[0] = initial_E(mpo[0])
 
@@ -1736,7 +2180,15 @@ def block_sparse_one_site_tdvp_step(
         )
         q, center = _block_left_qr(factors[i])
         factors[i] = q
-        left = contract_from_left(mpo[i], q, left, q)
+        left = _advance_block_environment(
+            "left",
+            mpo[i],
+            q,
+            left,
+            q,
+            moving_environment=moving_environment,
+            plan_key=f"{env_plan_prefix}:left-sweep:{i}",
+        )
         left_envs[i + 1] = left
         center = _evolve_block_bond(
             center,
@@ -1774,7 +2226,15 @@ def block_sparse_one_site_tdvp_step(
         )
         center, q = _block_right_rq(factors[i])
         factors[i] = q
-        right = contract_from_right(mpo[i], q, right, q)
+        right = _advance_block_environment(
+            "right",
+            mpo[i],
+            q,
+            right,
+            q,
+            moving_environment=moving_environment,
+            plan_key=f"{env_plan_prefix}:right-sweep:{i}",
+        )
         center = _evolve_block_bond(
             center,
             left_envs[i],
@@ -1816,7 +2276,9 @@ def block_sparse_one_site_tdvp_step(
         "mps_blocks": int(sum(len(site.data) for site in factors)),
         "mpo_blocks": int(sum(len(site.data) for site in mpo)),
         "mpo_cached": bool(mpo_cached),
+        "state_copied": bool(copy_state),
     }
+    info.update(_moving_environment_delta_info(moving_environment, moving_stats_before))
     return (out, info) if return_info else out
 
 
@@ -2119,9 +2581,23 @@ class SymmetricTDVP:
         self._projector_cache = {}
         self._block_sparse_sector_cache = {}
         self._block_sparse_mpo_cache = {}
+        self._block_sparse_cpp_moving_environment = None
+        self._block_sparse_cpp_moving_environment_disabled = False
+        self._block_sparse_env_plan_prefix = "symtdvp-block"
 
     def reset(self):
         self._prepared = False
+
+    def _block_sparse_moving_environment(self):
+        if self._block_sparse_cpp_moving_environment_disabled:
+            return None
+        if self._block_sparse_cpp_moving_environment is None:
+            owner = _new_cpp_moving_environment()
+            if owner is None:
+                self._block_sparse_cpp_moving_environment_disabled = True
+                return None
+            self._block_sparse_cpp_moving_environment = owner
+        return self._block_sparse_cpp_moving_environment
 
     def _block_sparse_sector_data(self, psi):
         nsites = psi.L
@@ -2142,13 +2618,19 @@ class SymmetricTDVP:
         return phys_dims, site_qn_maps, target_qn
 
     def _block_sparse_cached_mpo(self, phys_dims, site_qn_maps):
+        if _affine_mpo_metadata(self._mpo_source) is not None:
+            return _as_block_sparse_mpo(self._mpo_source, site_qn_maps)
         key = tuple(phys_dims)
         mpo = self._block_sparse_mpo_cache.get(key)
         if mpo is None:
-            source = self._mpo_source if _affine_mpo_metadata(self._mpo_source) is not None else self.mpo
-            mpo = _as_block_sparse_mpo(source, site_qn_maps)
+            mpo = _as_block_sparse_mpo(self.mpo, site_qn_maps)
             self._block_sparse_mpo_cache[key] = mpo
         return mpo
+
+    def update_mpo_source(self, H):
+        """Refresh the source MPO for affine Hamiltonians without rebuilding the engine."""
+        self._mpo_source = H
+        self.mpo = [np.asarray(w) for w in _mpo_factors(H)]
 
     def sector_mask(self, shape):
         shape = tuple(int(dim) for dim in shape)
@@ -2280,6 +2762,7 @@ class SymmetricTDVP:
         if self.projection_backend == "block-sparse":
             phys_dims, site_qn_maps, target_qn = self._block_sparse_sector_data(psi)
             block_mpo = self._block_sparse_cached_mpo(phys_dims, site_qn_maps)
+            moving_environment = self._block_sparse_moving_environment()
             out, info = block_sparse_one_site_tdvp_step(
                 psi,
                 self.mpo,
@@ -2294,6 +2777,9 @@ class SymmetricTDVP:
                 krylov_method=self.krylov_method,
                 canonicalize=canonicalize,
                 normalize=normalize,
+                copy_state=not self._prepared,
+                moving_environment=moving_environment,
+                env_plan_prefix=self._block_sparse_env_plan_prefix,
                 return_info=True,
             )
             self._prepared = True

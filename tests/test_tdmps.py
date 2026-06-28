@@ -112,6 +112,46 @@ def test_tdmps_dynamic_run_uses_split_propagation_without_full_rebuild():
     assert td.energy_drift.shape == (4,)
 
 
+def test_tdmps_callable_field_is_precomputed_before_step_loop():
+    model = Heisenberg(L=2)
+    H = model.build_H_mpo()
+    psi0 = model.build_neel_state()
+    field_times = []
+    step_fields = []
+
+    def field(t):
+        field_times.append(float(t))
+        return np.array([0.0, 0.0, t])
+
+    td = TDMPS(H, D=8, interaction_mpo=H, field=field)
+
+    def _fake_step(self, psi, **kwargs):
+        value = kwargs.get("field")
+        assert not callable(value)
+        step_fields.append(np.asarray(value, dtype=float))
+        self._last_step_pre_normalization_norms = (1.0,)
+        self._last_step_pre_normalization_norm2 = (1.0,)
+        self._last_step_tdvp_truncation_error = 0.0
+        return psi
+
+    td.step = types.MethodType(_fake_step, td)
+    td.run(
+        psi0,
+        dt=0.1,
+        steps=3,
+        e_ops=[],
+        interval=2,
+        integrator="tdvp",
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    np.testing.assert_allclose(field_times, [0.05, 0.15, 0.25, 0.2, 0.3])
+    np.testing.assert_allclose([vec[2] for vec in step_fields], [0.05, 0.15, 0.25])
+    np.testing.assert_allclose(td.fields[:, 2], [0.2, 0.3])
+
+
 def test_tdmps_affine_hamiltonian_cache_matches_mpo_addition():
     model = Heisenberg(L=2)
     H = model.build_H_mpo()
@@ -175,7 +215,7 @@ def test_affine_block_sparse_mpo_reuses_shared_tail(monkeypatch):
     tdvp_module._as_block_sparse_mpo(eff1, site_qn_maps)
     cached = tdvp_module._as_block_sparse_mpo(eff2, site_qn_maps)
 
-    assert calls == [2, 1]
+    assert calls == [2]
     full = original(
         [np.asarray(w) for w in eff2.factors],
         site_qn_maps,
@@ -710,6 +750,32 @@ def test_block_sparse_tdvp_cpp_heff_kernels_match_python():
 
     q, center = tdvp_module._block_left_qr(factors[0])
     left_next = tdvp_module.contract_from_left(mpo[0], q, left, q)
+    if cpp_davidson.MovingEnvironment is not None:
+        owner = cpp_davidson.MovingEnvironment()
+        planned_left_next = tdvp_module._advance_block_environment(
+            "left",
+            mpo[0],
+            q,
+            left,
+            q,
+            moving_environment=owner,
+            plan_key="test-left-env",
+        )
+        _assert_abelian_data_allclose(planned_left_next, left_next)
+        planned_left_next_again = tdvp_module._advance_block_environment(
+            "left",
+            mpo[0],
+            q,
+            left,
+            q,
+            moving_environment=owner,
+            plan_key="test-left-env",
+        )
+        _assert_abelian_data_allclose(planned_left_next_again, left_next)
+        stats = dict(owner.stats())
+        assert stats["environment_plan_builds"] == 1
+        assert stats["environment_plan_cache_hits"] >= 1
+
     bond_cpp = tdvp_module._cpp_payload_to_abelian_tensor(
         cpp_davidson.abelian_tdvp_bond_heff_data(center, left_next, right_envs[1])
     )
@@ -730,6 +796,50 @@ def test_block_sparse_tdvp_cpp_heff_kernels_match_python():
         bond_plan.apply(center, left_next, right_envs[1])
     )
     _assert_abelian_data_allclose(bond_planned, bond_ref)
+
+
+def test_cpp_lapack_qr_matches_numpy_reduced_qr():
+    cpp_davidson = _cpp_davidson_or_skip()
+    if getattr(cpp_davidson, "lapack_qr", None) is None:
+        pytest.skip("C++ LAPACK QR wrapper unavailable")
+
+    rng = np.random.default_rng(123)
+    matrix = rng.normal(size=(7, 4)) + 1j * rng.normal(size=(7, 4))
+    q_cpp, r_cpp = cpp_davidson.lapack_qr(matrix)
+    q_np, r_np = np.linalg.qr(matrix, mode="reduced")
+
+    np.testing.assert_allclose(q_cpp @ r_cpp, matrix, atol=1.0e-12)
+    np.testing.assert_allclose(q_cpp.conj().T @ q_cpp, np.eye(4), atol=1.0e-12)
+    np.testing.assert_allclose(np.abs(np.diag(r_cpp)), np.abs(np.diag(r_np)), atol=1.0e-12)
+
+
+def test_block_sparse_symmetric_tdvp_reuses_native_state_after_first_step():
+    identity = np.eye(2, dtype=complex)
+    w0 = np.zeros((1, 1, 2, 2), dtype=complex)
+    w1 = np.zeros((1, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w1[0, 0] = identity
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 1.0
+    psi = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+    engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=1,
+        projection_backend="block-sparse",
+        krylov_dim=4,
+    )
+
+    out, info1 = engine.step(psi, 0.01, return_info=True)
+    _out2, info2 = engine.step(out, 0.01, return_info=True)
+
+    assert info1["state_copied"] is True
+    assert info2["state_copied"] is False
+    if info2.get("cpp_moving_environment"):
+        assert info1["cpp_environment_plan_advance_calls"] > 0
+        assert info2["cpp_environment_plan_cache_hits"] > 0
 
 
 def test_tdmps_block_sparse_observables_do_not_densify(monkeypatch):

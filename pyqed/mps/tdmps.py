@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import numpy as np
 from pyqed.mps.mps import (
     MPS,
@@ -17,6 +18,9 @@ from pyqed.mps.tdvp import (
     two_site_tdvp_step,
 )
 import logging
+
+_SYMMETRIC_OBSERVABLE_MPO_CACHE = OrderedDict()
+_SYMMETRIC_OBSERVABLE_MPO_CACHE_MAX = 64
 
 
 def _normalize_integrator(integrator):
@@ -50,6 +54,7 @@ class TDMPS:
         local_sectors=None,
         target_sector=None,
         tdvp_projection_backend=None,
+        tdvp_split_dynamic_block_sparse=False,
     ):
         """
         Time-Dependent MPS Solver (Layout Agnostic).
@@ -69,6 +74,7 @@ class TDMPS:
         self.local_sectors = local_sectors
         self.target_sector = target_sector
         self.tdvp_projection_backend = tdvp_projection_backend
+        self.tdvp_split_dynamic_block_sparse = bool(tdvp_split_dynamic_block_sparse)
         # self.dt = dt
         self.bond_dim = self.D = D
         # self.order = order
@@ -98,6 +104,7 @@ class TDMPS:
         self._affine_hamiltonian_cache = {}
         self._tdvp_engine_cache = {}
         self._symmetric_observable_cache = {}
+        self._block_sparse_site_qn_maps_cache = {}
 
     @staticmethod
     def state_overlap(bra, ket):
@@ -151,6 +158,10 @@ class TDMPS:
         }
 
     def _compress_normalize(self, psi):
+        if psi.factors and hasattr(psi.factors[0], "qns"):
+            norm2_value = psi.norm()
+            self._record_pre_normalization_norm2(norm2_value)
+            return psi.normalize()
         psi = psi.compress(self.D)
         norm2_value = psi.norm()
         self._record_pre_normalization_norm2(norm2_value)
@@ -192,8 +203,14 @@ class TDMPS:
             and self.target_sector is not None
         )
         if reuse_tdvp_engine:
+            affine_meta = getattr(H_eff, "_pyqed_affine_mpo", None)
+            hamiltonian_cache_key = (
+                ("affine", int(affine_meta["template_id"]))
+                if use_symmetric_tdvp and affine_meta is not None
+                else id(H_eff)
+            )
             cache_key = (
-                id(H_eff),
+                hamiltonian_cache_key,
                 integrator,
                 int(self.D),
                 int(krylov_dim),
@@ -234,6 +251,8 @@ class TDMPS:
                         canonicalize_each_step=canonicalize_each_step,
                     )
                 self._tdvp_engine_cache[cache_key] = engine
+            elif use_symmetric_tdvp and affine_meta is not None:
+                engine.update_mpo_source(H_eff)
             psi, info = engine.step(psi, dt, normalize=True, return_info=True)
         elif integrator == "tdvp2":
             psi, info = two_site_tdvp_step(
@@ -284,6 +303,25 @@ class TDMPS:
         for engine in self._tdvp_engine_cache.values():
             engine.reset()
 
+    def _ensure_block_sparse_state(self, psi):
+        if psi.factors and hasattr(psi.factors[0], "qns"):
+            return psi
+        if self.local_sectors is None or self.target_sector is None:
+            return psi
+        sector_backend = None
+        if self.tdvp_projection_backend is not None:
+            sector_backend = str(self.tdvp_projection_backend).lower().replace("_", "-")
+        if sector_backend not in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}:
+            return psi
+        projector = SymmetricTDVP(
+            self.H,
+            local_sectors=self.local_sectors,
+            target_sector=self.target_sector,
+            max_bond=self.D,
+            projection_backend=sector_backend,
+        )
+        return projector.project(psi, normalize=True)
+
     def _block_sparse_site_qn_maps_for_state(self, psi):
         if self.local_sectors is None or self.target_sector is None:
             raise ValueError("Block-sparse observables require local_sectors and target_sector.")
@@ -293,12 +331,17 @@ class TDMPS:
                 phys_dims.append(int(psi.factors[site].shape[2]))
             else:
                 phys_dims.append(int(psi._get_std_B(site).shape[1]))
+        cache_key = tuple(phys_dims)
+        cached = self._block_sparse_site_qn_maps_cache.get(cache_key)
+        if cached is not None:
+            return cached
         site_qn_maps, _target_qn = _block_sparse_site_qn_maps(
             self.local_sectors,
             psi.L,
             tuple(phys_dims),
             self.target_sector,
         )
+        self._block_sparse_site_qn_maps_cache[cache_key] = site_qn_maps
         return site_qn_maps
 
     def _block_sparse_mpo_factors(self, mpo, psi):
@@ -306,8 +349,18 @@ class TDMPS:
         if factors and hasattr(factors[0], "qns"):
             return factors
         site_qn_maps = self._block_sparse_site_qn_maps_for_state(psi)
-        cache_key = (tuple(id(factor) for factor in factors), tuple(tuple(sorted(q.items())) for q in site_qn_maps))
+        mpo_key = self._mpo_cache_key(mpo) if hasattr(mpo, "factors") else tuple(id(factor) for factor in factors)
+        qn_key = tuple(
+            tuple((int(idx), repr(qn)) for idx, qn in sorted(q.items()))
+            for q in site_qn_maps
+        )
+        cache_key = (mpo_key, qn_key)
         cached = self._symmetric_observable_cache.get(cache_key)
+        if cached is None:
+            cached = _SYMMETRIC_OBSERVABLE_MPO_CACHE.get(cache_key)
+            if cached is not None:
+                _SYMMETRIC_OBSERVABLE_MPO_CACHE.move_to_end(cache_key)
+                self._symmetric_observable_cache[cache_key] = cached
         if cached is None:
             cached = dense_to_symmetric_mpo(
                 [np.asarray(factor) for factor in factors],
@@ -315,6 +368,9 @@ class TDMPS:
                 native_site_storage=True,
             )
             self._symmetric_observable_cache[cache_key] = cached
+            _SYMMETRIC_OBSERVABLE_MPO_CACHE[cache_key] = cached
+            if len(_SYMMETRIC_OBSERVABLE_MPO_CACHE) > _SYMMETRIC_OBSERVABLE_MPO_CACHE_MAX:
+                _SYMMETRIC_OBSERVABLE_MPO_CACHE.popitem(last=False)
         return cached
 
     def _expectation(self, psi, mpo):
@@ -333,6 +389,10 @@ class TDMPS:
     def _factor_list(mpo):
         return mpo.factors if hasattr(mpo, "factors") else list(mpo)
 
+    @staticmethod
+    def _mpo_cache_key(mpo):
+        return getattr(mpo, "_pyqed_cache_key", None) or id(mpo)
+
     def _affine_hamiltonian(self, terms, coeffs, *, cutoff=1.0e-14):
         active = [
             (complex(coeff), term)
@@ -348,7 +408,10 @@ class TDMPS:
         if any(len(factors) != nsites for factors in term_factors):
             raise ValueError("Hamiltonian and interaction MPO lengths must match.")
 
-        cache_key = (id(self.H), tuple(id(term) for _, term in active))
+        cache_key = (
+            self._mpo_cache_key(self.H),
+            tuple(self._mpo_cache_key(term) for _, term in active),
+        )
         template = self._affine_hamiltonian_cache.get(cache_key)
         if template is None:
             shared = [None] * nsites
@@ -391,6 +454,7 @@ class TDMPS:
         out = MPO(factors, homogenous=False)
         out._pyqed_affine_mpo = {
             "template_id": id(template),
+            "cache_id": cache_key,
             "base_first": template["base_first"],
             "term_first": tuple(template["term_first"]),
             "shared": tuple(template["shared"]),
@@ -415,6 +479,56 @@ class TDMPS:
         if vec.size != 3:
             raise ValueError("field must evaluate to a scalar or a length-3 vector.")
         return vec
+
+    def _field_source(self, field=None):
+        return self.field if field is None else field
+
+    def _field_vector_from_sample(self, sample):
+        vec = np.asarray(sample, dtype=float)
+        if vec.ndim == 0:
+            out = np.zeros(3)
+            out[0] = float(vec)
+            return out
+        vec = vec.reshape(-1)
+        if vec.size != 3:
+            raise ValueError("field samples must be scalar or length-3 vectors.")
+        return vec
+
+    def _precompute_field_tables(self, field, *, t0, dt, steps, checkpoints):
+        source = self._field_source(field)
+        if source is None:
+            return None, None
+        if callable(source):
+            step_values = np.asarray(
+                [
+                    self.field_vector(float(t0) + (i + 0.5) * dt, field=source)
+                    for i in range(int(steps))
+                ],
+                dtype=float,
+            )
+            checkpoint_values = np.asarray(
+                [
+                    self.field_vector(float(t0) + checkpoint * dt, field=source)
+                    for checkpoint in checkpoints
+                ],
+                dtype=float,
+            )
+            return step_values, checkpoint_values
+
+        values = np.asarray(source, dtype=float)
+        if values.ndim == 0 or (values.ndim == 1 and values.size in {1, 3}):
+            return None, None
+        if values.shape[0] < int(steps):
+            raise ValueError("field sample table must have at least `steps` rows.")
+        step_values = np.asarray(
+            [self._field_vector_from_sample(values[i]) for i in range(int(steps))],
+            dtype=float,
+        )
+        checkpoint_rows = []
+        for checkpoint in checkpoints:
+            idx = min(max(int(checkpoint) - 1, 0), step_values.shape[0] - 1)
+            checkpoint_rows.append(step_values[idx])
+        return step_values, np.asarray(checkpoint_rows, dtype=float)
 
     def hamiltonian(self, time=0.0, field=None):
         field_vec = self.field_vector(time, field=field)
@@ -577,8 +691,58 @@ class TDMPS:
                     and str(self.tdvp_projection_backend).lower().replace("_", "-")
                     in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
                     and dynamic_mode in {"split", "strang", "split-operator"}
+                    and not self.tdvp_split_dynamic_block_sparse
                 ):
                     dynamic_mode = "midpoint"
+                if dynamic_mode in {
+                    "interaction-split",
+                    "interaction-strang",
+                    "kick",
+                    "kick-static-kick",
+                    "v-split",
+                    "vsplit",
+                }:
+                    U_half = self.build_interaction_propagator(
+                        0.5 * dt,
+                        time=time,
+                        field=field,
+                        order=order,
+                        scale=scale,
+                    )
+                    if U_half is None:
+                        return self._tdvp_evolve(
+                            psi,
+                            dt,
+                            integrator=integrator,
+                            krylov_dim=krylov_dim,
+                            krylov_tol=krylov_tol,
+                            krylov_method=krylov_method,
+                            diagonal_fast_path=diagonal_fast_path,
+                            sparse_threshold=sparse_threshold,
+                            sparse_vectorized=sparse_vectorized,
+                            reuse_tdvp_engine=reuse_tdvp_engine,
+                            canonicalize_each_step=canonicalize_each_step,
+                        )
+                    psi = self._ensure_block_sparse_state(psi)
+                    psi = U_half @ psi
+                    psi = self._compress_normalize(psi)
+                    self._reset_tdvp_engines()
+                    psi = self._tdvp_evolve(
+                        psi,
+                        dt,
+                        integrator=integrator,
+                        krylov_dim=krylov_dim,
+                        krylov_tol=krylov_tol,
+                        krylov_method=krylov_method,
+                        diagonal_fast_path=diagonal_fast_path,
+                        sparse_threshold=sparse_threshold,
+                        sparse_vectorized=sparse_vectorized,
+                        reuse_tdvp_engine=reuse_tdvp_engine,
+                        canonicalize_each_step=canonicalize_each_step,
+                    )
+                    psi = U_half @ psi
+                    return self._compress_normalize(psi)
+
                 if dynamic_mode in {"midpoint", "mid-point", "full", "combined"}:
                     return self._tdvp_evolve(
                         psi,
@@ -596,7 +760,7 @@ class TDMPS:
                         canonicalize_each_step=canonicalize_each_step,
                     )
                 if dynamic_mode not in {"split", "strang", "split-operator"}:
-                    raise ValueError("tdvp_dynamic_mode must be 'split' or 'midpoint'.")
+                    raise ValueError("tdvp_dynamic_mode must be 'split', 'interaction-split', or 'midpoint'.")
                 U_int = self.build_interaction_propagator(
                     dt,
                     time=time,
@@ -732,13 +896,21 @@ class TDMPS:
 
         psi = psi0.copy()
         time = float(t0)
-        for _ in range(steps):
+        step_fields, _checkpoint_fields = self._precompute_field_tables(
+            field,
+            t0=t0,
+            dt=dt,
+            steps=steps,
+            checkpoints=(),
+        )
+        for step_index in range(steps):
             if dynamic_hamiltonian:
+                field_step = step_fields[step_index] if step_fields is not None else field
                 psi = self.step(
                     psi,
                     time=time + 0.5 * dt,
                     dt=dt,
-                    field=field,
+                    field=field_step,
                     order=order,
                     scale=scale,
                     split_dynamic=True,
@@ -918,6 +1090,13 @@ class TDMPS:
         self.times = float(t0) + np.asarray(checkpoints, dtype=float) * dt
         observables = np.zeros((len(self.times), len(e_ops)), dtype=complex)
         fields = np.zeros((len(self.times), 3), dtype=float)
+        step_fields, checkpoint_fields = self._precompute_field_tables(
+            field,
+            t0=t0,
+            dt=dt,
+            steps=steps,
+            checkpoints=checkpoints,
+        )
         pre_norms = np.empty(steps, dtype=float)
         pre_norm2 = np.empty(steps, dtype=float)
         tdvp_truncation_errors = np.zeros(steps, dtype=float)
@@ -934,11 +1113,12 @@ class TDMPS:
         for i, checkpoint in enumerate(checkpoints):
             for _ in range(checkpoint - completed_steps):
                 if dynamic_hamiltonian:
+                    field_step = step_fields[total_step] if step_fields is not None else field
                     psi = self.step(
                         psi,
                         time=time + 0.5 * dt,
                         dt=dt,
-                        field=field,
+                        field=field_step,
                         order=order,
                         scale=scale,
                         split_dynamic=True,
@@ -974,8 +1154,13 @@ class TDMPS:
                 step_norms = tuple(getattr(self, "_last_step_pre_normalization_norms", ()))
                 step_norm2 = tuple(getattr(self, "_last_step_pre_normalization_norm2", ()))
                 substep_norms.append(step_norms)
-                pre_norms[total_step] = step_norms[-1] if step_norms else np.nan
-                pre_norm2[total_step] = step_norm2[-1] if step_norm2 else np.nan
+                if step_norm2:
+                    full_step_norm2 = float(np.prod(step_norm2))
+                    pre_norm2[total_step] = full_step_norm2
+                    pre_norms[total_step] = float(np.sqrt(max(full_step_norm2, 0.0)))
+                else:
+                    pre_norms[total_step] = np.nan
+                    pre_norm2[total_step] = np.nan
                 tdvp_truncation_errors[total_step] = getattr(self, "_last_step_tdvp_truncation_error", 0.0)
                 time += dt
                 total_step += 1
@@ -985,7 +1170,11 @@ class TDMPS:
                 observables[i] = [self._expectation(psi, e) for e in e_ops]
             elif len(e_ops):
                 observables[i] = np.nan
-            fields[i] = self.field_vector(time, field=field)
+            fields[i] = (
+                checkpoint_fields[i]
+                if checkpoint_fields is not None
+                else self.field_vector(time, field=field)
+            )
             energy_times.append(time)
             static_energies.append(self.static_energy(psi) if track_energy else np.nan)
 
