@@ -52,15 +52,24 @@ _BLOCK_MOVING_ENV_COUNTERS = (
     "sweep_environment_step_updates",
     "sweep_environment_step_auto_calls",
     "sweep_environment_step_failures",
+    "one_site_tdvp_sweep_calls",
+    "one_site_tdvp_sweep_failures",
+    "one_site_tdvp_sweep_site_evolutions",
+    "one_site_tdvp_sweep_bond_evolutions",
+    "one_site_tdvp_sweep_left_qr_calls",
+    "one_site_tdvp_sweep_right_rq_calls",
+    "one_site_tdvp_sweep_environment_advances",
 )
 _BLOCK_MOVING_ENV_TIMERS = (
     "environment_plan_build_seconds",
     "environment_plan_advance_seconds",
+    "one_site_tdvp_sweep_seconds",
 )
 _BLOCK_MOVING_ENV_ABSOLUTE = (
     "environment_plan_records",
     "environment_plan_last_routes",
     "environment_plan_last_blocks",
+    "one_site_tdvp_sweep_last_nsites",
 )
 
 
@@ -74,6 +83,7 @@ def _env_int(name, default):
 _BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_CPP_MAX_ROUTE", 20_000_000)
 _BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE", 20_000_000)
 _BLOCK_QR_CPP_MIN_ELEMENTS = _env_int("PYQED_TDVP_BLOCK_QR_CPP_MIN_ELEMENTS", 1_000_000_000)
+_BLOCK_ONE_SITE_CPP_ENGINE = _env_int("PYQED_TDVP_CPP_ONE_SITE_ENGINE", 1)
 _AFFINE_BLOCK_SPARSE_MPO_CACHE = OrderedDict()
 _AFFINE_BLOCK_SPARSE_MPO_CACHE_MAX = 64
 
@@ -922,6 +932,209 @@ def _advance_block_environment(
     if direction == "left":
         return contract_from_left(W, A, env, B)
     return contract_from_right(W, A, env, B)
+
+
+def _cpp_one_site_tdvp_sweep(
+    factors,
+    mpo,
+    target_qn,
+    dt,
+    *,
+    moving_environment=None,
+    env_plan_prefix="tdvp-block",
+    krylov_dim=12,
+    krylov_tol=1.0e-13,
+    krylov_method="lanczos",
+):
+    if not bool(_BLOCK_ONE_SITE_CPP_ENGINE):
+        return None
+    if moving_environment is None or not hasattr(moving_environment, "one_site_tdvp_sweep"):
+        return None
+
+    krylov_key = str(krylov_method).lower().replace("_", "-")
+    if krylov_key in {"lanczos", "hermitian", "hermitian-lanczos"}:
+        callbacks = {}
+    else:
+        def evolve_site(theta, left, W, right, local_dt):
+            return _evolve_block_site(
+                theta,
+                left,
+                W,
+                right,
+                float(local_dt),
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+            )
+
+        def evolve_bond(center, left, right, local_dt):
+            return _evolve_block_bond(
+                center,
+                left,
+                right,
+                float(local_dt),
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+            )
+
+        callbacks = {
+            "evolve_site": evolve_site,
+            "evolve_bond": evolve_bond,
+            "left_qr": _block_left_qr,
+            "right_rq": _block_right_rq,
+            "absorb_center_left": _block_absorb_center_left,
+            "absorb_center_right": _block_absorb_center_right,
+        }
+    try:
+        out_factors, info = moving_environment.one_site_tdvp_sweep(
+            list(factors),
+            list(mpo),
+            initial_E(mpo[0]),
+            initial_F(mpo[-1], target_qn=target_qn),
+            float(dt),
+            AbelianEnvironmentTensorData,
+            callbacks,
+            int(krylov_dim),
+            float(krylov_tol),
+            str(krylov_method),
+            str(env_plan_prefix or "tdvp-block"),
+        )
+    except Exception:
+        return None
+    info = dict(info)
+    info.setdefault("cpp_one_site_engine", True)
+    return list(out_factors), info
+
+
+def _python_one_site_tdvp_sweep(
+    factors,
+    mpo,
+    target_qn,
+    dt,
+    *,
+    moving_environment=None,
+    env_plan_prefix="tdvp-block",
+    krylov_dim=12,
+    krylov_tol=1.0e-13,
+    krylov_method="lanczos",
+):
+    nsites = len(factors)
+    if nsites == 1:
+        factors[0] = _evolve_block_site(
+            factors[0],
+            initial_E(mpo[0]),
+            mpo[0],
+            initial_F(mpo[0], target_qn=target_qn),
+            dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+        )
+        return factors
+
+    half_dt = 0.5 * dt
+    right_envs = _build_block_right_envs(
+        factors,
+        mpo,
+        target_qn,
+        moving_environment=moving_environment,
+        env_plan_prefix=env_plan_prefix,
+    )
+    left_envs = [None] * nsites
+    left_envs[0] = initial_E(mpo[0])
+
+    left = left_envs[0]
+    for i in range(nsites - 1):
+        factors[i] = _evolve_block_site(
+            factors[i],
+            left,
+            mpo[i],
+            right_envs[i + 1],
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+        )
+        q, center = _block_left_qr(factors[i])
+        factors[i] = q
+        left = _advance_block_environment(
+            "left",
+            mpo[i],
+            q,
+            left,
+            q,
+            moving_environment=moving_environment,
+            plan_key=f"{env_plan_prefix}:left-sweep:{i}",
+        )
+        left_envs[i + 1] = left
+        center = _evolve_block_bond(
+            center,
+            left,
+            right_envs[i + 1],
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+        )
+        factors[i + 1] = _block_absorb_center_left(center, factors[i + 1])
+
+    factors[-1] = _evolve_block_site(
+        factors[-1],
+        left_envs[-1],
+        mpo[-1],
+        initial_F(mpo[-1], target_qn=target_qn),
+        half_dt,
+        krylov_dim=krylov_dim,
+        krylov_tol=krylov_tol,
+        krylov_method=krylov_method,
+    )
+
+    right = initial_F(mpo[-1], target_qn=target_qn)
+    for i in range(nsites - 1, 0, -1):
+        factors[i] = _evolve_block_site(
+            factors[i],
+            left_envs[i],
+            mpo[i],
+            right,
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+        )
+        center, q = _block_right_rq(factors[i])
+        factors[i] = q
+        right = _advance_block_environment(
+            "right",
+            mpo[i],
+            q,
+            right,
+            q,
+            moving_environment=moving_environment,
+            plan_key=f"{env_plan_prefix}:right-sweep:{i}",
+        )
+        center = _evolve_block_bond(
+            center,
+            left_envs[i],
+            right,
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+        )
+        factors[i - 1] = _block_absorb_center_right(factors[i - 1], center)
+
+    factors[0] = _evolve_block_site(
+        factors[0],
+        initial_E(mpo[0]),
+        mpo[0],
+        right,
+        half_dt,
+        krylov_dim=krylov_dim,
+        krylov_tol=krylov_tol,
+        krylov_method=krylov_method,
+    )
+    return factors
 
 
 def _cpp_payload_to_abelian_tensor(payload, carrier=AbelianSiteTensorData):
@@ -1828,10 +2041,8 @@ def _evolve_bond(
         except Exception:
             pass
 
-    kernel = np.einsum("amb,rms->abrs", left, right, optimize=True)
-
     def apply_heff(local):
-        return np.tensordot(kernel, local, axes=([1, 3], [0, 1]))
+        return _apply_bond_heff(local, left, right)
 
     return _krylov_expm_apply(
         center,
@@ -2118,144 +2329,32 @@ def block_sparse_one_site_tdvp_step(
     if nsites == 0:
         raise ValueError("Cannot propagate an empty MPS.")
 
-    if nsites == 1:
-        left_identity = initial_E(mpo[0])
-        right_identity = initial_F(mpo[0], target_qn=target_qn)
-        factors[0] = _evolve_block_site(
-            factors[0],
-            left_identity,
-            mpo[0],
-            right_identity,
-            dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-        )
-        pre_norm2 = _block_mps_norm2(factors)
-        if normalize:
-            factors, pre_norm2 = _normalize_block_factors_inplace(factors)
-        out = MPS(factors, labels=["lv", "rv", "p"])
-        info = {
-            "backend": "block-sparse",
-            "projection_backend": "block-sparse",
-            "integrator": "tdvp",
-            "target_sector": target_sector,
-            "target_qn": target_qn,
-            "pre_normalization_norm2": float(pre_norm2),
-            "pre_normalization_norm": float(np.sqrt(max(float(pre_norm2), 0.0))),
-            "input_sector_weight": 1.0,
-            "output_sector_weight": 1.0,
-            "input_discarded_sector_weight": 0.0,
-            "output_discarded_sector_weight": 0.0,
-            "mps_blocks": int(sum(len(site.data) for site in factors)),
-            "mpo_blocks": int(sum(len(site.data) for site in mpo)),
-            "mpo_cached": bool(mpo_cached),
-            "state_copied": bool(copy_state),
-        }
-        info.update(_moving_environment_delta_info(moving_environment, moving_stats_before))
-        return (out, info) if return_info else out
-
-    half_dt = 0.5 * dt
-    right_envs = _build_block_right_envs(
+    sweep_info = {"cpp_one_site_engine": False}
+    cpp_sweep = _cpp_one_site_tdvp_sweep(
         factors,
         mpo,
         target_qn,
+        dt,
         moving_environment=moving_environment,
         env_plan_prefix=env_plan_prefix,
-    )
-    left_envs = [None] * nsites
-    left_envs[0] = initial_E(mpo[0])
-
-    left = left_envs[0]
-    for i in range(nsites - 1):
-        factors[i] = _evolve_block_site(
-            factors[i],
-            left,
-            mpo[i],
-            right_envs[i + 1],
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-        )
-        q, center = _block_left_qr(factors[i])
-        factors[i] = q
-        left = _advance_block_environment(
-            "left",
-            mpo[i],
-            q,
-            left,
-            q,
-            moving_environment=moving_environment,
-            plan_key=f"{env_plan_prefix}:left-sweep:{i}",
-        )
-        left_envs[i + 1] = left
-        center = _evolve_block_bond(
-            center,
-            left,
-            right_envs[i + 1],
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-        )
-        factors[i + 1] = _block_absorb_center_left(center, factors[i + 1])
-
-    factors[-1] = _evolve_block_site(
-        factors[-1],
-        left_envs[-1],
-        mpo[-1],
-        initial_F(mpo[-1], target_qn=target_qn),
-        half_dt,
         krylov_dim=krylov_dim,
         krylov_tol=krylov_tol,
         krylov_method=krylov_method,
     )
-
-    right = initial_F(mpo[-1], target_qn=target_qn)
-    for i in range(nsites - 1, 0, -1):
-        factors[i] = _evolve_block_site(
-            factors[i],
-            left_envs[i],
-            mpo[i],
-            right,
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-        )
-        center, q = _block_right_rq(factors[i])
-        factors[i] = q
-        right = _advance_block_environment(
-            "right",
-            mpo[i],
-            q,
-            right,
-            q,
+    if cpp_sweep is None:
+        factors = _python_one_site_tdvp_sweep(
+            factors,
+            mpo,
+            target_qn,
+            dt,
             moving_environment=moving_environment,
-            plan_key=f"{env_plan_prefix}:right-sweep:{i}",
-        )
-        center = _evolve_block_bond(
-            center,
-            left_envs[i],
-            right,
-            half_dt,
+            env_plan_prefix=env_plan_prefix,
             krylov_dim=krylov_dim,
             krylov_tol=krylov_tol,
             krylov_method=krylov_method,
         )
-        factors[i - 1] = _block_absorb_center_right(factors[i - 1], center)
-
-    factors[0] = _evolve_block_site(
-        factors[0],
-        initial_E(mpo[0]),
-        mpo[0],
-        right,
-        half_dt,
-        krylov_dim=krylov_dim,
-        krylov_tol=krylov_tol,
-        krylov_method=krylov_method,
-    )
+    else:
+        factors, sweep_info = cpp_sweep
 
     pre_norm2 = _block_mps_norm2(factors)
     if normalize:
@@ -2278,6 +2377,7 @@ def block_sparse_one_site_tdvp_step(
         "mpo_cached": bool(mpo_cached),
         "state_copied": bool(copy_state),
     }
+    info.update(sweep_info)
     info.update(_moving_environment_delta_info(moving_environment, moving_stats_before))
     return (out, info) if return_info else out
 
@@ -2722,22 +2822,21 @@ class SymmetricTDVP:
         projector, bond_state_counts = self.projector(shape)
         norm2 = _mps_factors_norm2(work.factors)
         out = projector @ work
-        projected_norm2 = _mps_factors_norm2(out.factors)
-        if projected_norm2 <= 0.0:
-            raise ValueError("The requested target sector has zero weight in the supplied state.")
-
         if self.max_bond is not None and max(out.bond_orders()) > int(self.max_bond):
             if not normalize:
                 raise ValueError("SymmetricTDVP cannot compress a projected state while normalize=False.")
             out = out.compress(int(self.max_bond))
-            compressed_norm2 = _mps_factors_norm2(out.factors)
             out = projector @ out
-            projected_norm2_after_compress = _mps_factors_norm2(out.factors)
+            if max(out.bond_orders()) > int(self.max_bond):
+                out = out.compress(int(self.max_bond))
             post_compression_projection = True
         else:
-            compressed_norm2 = projected_norm2
-            projected_norm2_after_compress = projected_norm2
             post_compression_projection = False
+        projected_norm2 = _mps_factors_norm2(out.factors)
+        if projected_norm2 <= 0.0:
+            raise ValueError("The requested target sector has zero weight in the supplied state.")
+        compressed_norm2 = projected_norm2
+        projected_norm2_after_compress = projected_norm2
         if normalize:
             _normalize_mps_factors_inplace(out, projected_norm2_after_compress)
 

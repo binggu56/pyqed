@@ -49,7 +49,8 @@ def _mpo_to_dense_matrix(mpo):
     if not factors:
         raise ValueError("Cannot convert an empty MPO to a dense matrix.")
 
-    acc = np.asarray(factors[0])
+    factors = [_mpo_site_to_dense_factor(factor) for factor in factors]
+    acc = factors[0]
     if acc.shape[0] != 1:
         raise ValueError("Unexpected left MPO bond dimension while densifying.")
     acc = acc[0]
@@ -68,6 +69,44 @@ def _mpo_to_dense_matrix(mpo):
     out_dim = int(np.prod([np.asarray(w).shape[2] for w in factors], dtype=np.int64))
     in_dim = int(np.prod([np.asarray(w).shape[3] for w in factors], dtype=np.int64))
     return tens.reshape(out_dim, in_dim)
+
+
+def _mpo_site_to_dense_factor(site):
+    if not hasattr(site, "qns"):
+        return np.asarray(site)
+    if len(site.qns) != 4:
+        raise ValueError("Expected a rank-4 Abelian MPO site tensor.")
+
+    dim_by_leg_q = []
+    for leg, qlist in enumerate(site.qns):
+        dims = {}
+        for qn in qlist:
+            dims[qn] = max(int(dims.get(qn, 0)), 1)
+        for key, block in site.data.items():
+            dims[key[leg]] = max(int(dims.get(key[leg], 0)), int(block.shape[leg]))
+        dim_by_leg_q.append(dims)
+
+    maps = []
+    shape = []
+    for qlist, dims in zip(site.qns, dim_by_leg_q):
+        mapping = {}
+        offset = 0
+        seen = set()
+        for qn in qlist:
+            if qn in seen:
+                continue
+            seen.add(qn)
+            dim = int(dims[qn])
+            mapping[qn] = list(range(offset, offset + dim))
+            offset += dim
+        maps.append(mapping)
+        shape.append(offset)
+
+    out = np.zeros(tuple(shape), dtype=complex)
+    for key, block in site.data.items():
+        idx_lists = [maps[leg][key[leg]] for leg in range(4)]
+        out[np.ix_(*idx_lists)] += np.asarray(block)
+    return out
 
 
 def _is_block_sparse_tdvp_backend(backend):
@@ -182,7 +221,7 @@ class TDDMRG(DMRG):
 
     def _state_from_dense_vector(self, vec):
         if self.H is not None:
-            dims = tuple(int(np.asarray(w).shape[2]) for w in self.H)
+            dims = tuple(int(_mpo_site_to_dense_factor(w).shape[2]) for w in self.H)
         elif getattr(self, "site", None) == "spatial":
             dims = (4,) * int(self.ncas)
         else:
@@ -254,7 +293,7 @@ class TDDMRG(DMRG):
         self.tdmps = None
         self.pre_normalization_norms = pre_norms
         self.pre_normalization_norm2 = pre_norm2
-        self.substep_pre_normalization_norms = [(float(norm),) for norm in pre_norms]
+        self.substep_pre_normalization_norms = None
         self.energy_times = np.concatenate(([float(t0)], self.times))
         self.static_energies = np.asarray(static_energies, dtype=complex)
         self.energy_drift = self.static_energies - self.static_energies[0]
@@ -314,6 +353,37 @@ class TDDMRG(DMRG):
         super().run(*args, **kwargs)
         return self
 
+    def _has_ground_state(self):
+        dmrg = getattr(self, "dmrg", None)
+        if dmrg is None:
+            return False
+        if getattr(dmrg, "ground_state", None) is not None:
+            return True
+        states = getattr(dmrg, "states", None)
+        if states is None:
+            return False
+        try:
+            return len(states) > 0
+        except TypeError:
+            return True
+
+    def _auto_ground_state_kwargs(self, *, tdvp_projection_backend=None):
+        del tdvp_projection_backend
+        return {
+            "D": self._set_bond_dim(),
+            "symmetry_list": ["charge", "sz"],
+            "compute_s2": False,
+        }
+
+    def _ensure_ground_state_for_run(self, *, tdvp_projection_backend=None):
+        if self._has_ground_state():
+            return
+        kwargs = self._auto_ground_state_kwargs(
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
+        kwargs.setdefault("D", self._set_bond_dim())
+        self.optimize_ground_state(**kwargs)
+
     def _ensure_dense_mps(self, psi, *, copy=True):
         if not isinstance(psi, MPS):
             raise TypeError(f"Expected an MPS initial state, got {type(psi)}.")
@@ -327,7 +397,7 @@ class TDDMRG(DMRG):
         return psi.copy() if copy else psi
 
     def _default_initial_state(self):
-        if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
+        if self._has_ground_state():
             return self.export_ground_state(dense=True)
 
         guess = self.init_guess
@@ -350,6 +420,8 @@ class TDDMRG(DMRG):
         )
 
     def _default_block_sparse_initial_state(self):
+        if self._has_ground_state():
+            return self.export_ground_state(dense=False)
         guess = self.init_guess
         if isinstance(guess, MPS) and hasattr(guess.factors[0], "qns"):
             return guess.copy()
@@ -370,6 +442,9 @@ class TDDMRG(DMRG):
             and hasattr(self, "_tdvp_sector_settings")
         )
         if psi0 is None:
+            self._ensure_ground_state_for_run(
+                tdvp_projection_backend=tdvp_projection_backend,
+            )
             if block_sparse:
                 return self._default_block_sparse_initial_state()
             return self._default_initial_state()
@@ -395,7 +470,11 @@ class TDDMRG(DMRG):
                 if key in {"h", "ham", "hamiltonian"}:
                     if self.H is None:
                         self.build()
-                    normalized.append(TensorMPO([w.copy() for w in self.H], homogenous=False))
+                    h_mpo = TensorMPO([w.copy() for w in self.H], homogenous=False)
+                    cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
+                    if cache_key is not None:
+                        h_mpo._pyqed_cache_key = cache_key
+                    normalized.append(h_mpo)
                     continue
                 if key in {"mu_x", "dipole_x"}:
                     normalized.append(self.get_interaction_mpo(axis=0))
@@ -413,7 +492,11 @@ class TDDMRG(DMRG):
                 continue
 
             if _is_mpo_like(op):
-                normalized.append(TensorMPO(_copy_mpo_factors(op.factors), homogenous=False))
+                copied = TensorMPO(_copy_mpo_factors(op.factors), homogenous=False)
+                cache_key = getattr(op, "_pyqed_cache_key", None)
+                if cache_key is not None:
+                    copied._pyqed_cache_key = cache_key
+                normalized.append(copied)
                 continue
 
             if _is_mpo_factor_list(op):
@@ -429,7 +512,11 @@ class TDDMRG(DMRG):
             self.build(mo_coeff=mo_coeff)
         elif self.H is None:
             self.build()
-        return TensorMPO([w.copy() for w in self.H], homogenous=False)
+        out = TensorMPO([w.copy() for w in self.H], homogenous=False)
+        cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
+        if cache_key is not None:
+            out._pyqed_cache_key = cache_key
+        return out
 
     def get_interaction_ao(self):
         op = np.asarray(self.mf.dipole(basis='ao'), dtype=float)
@@ -637,6 +724,7 @@ class TDDMRG(DMRG):
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
         tdvp_projection_backend=None,
+        tdvp_split_dynamic_block_sparse=False,
         measure_observables=True,
         track_energy=True,
         progress=True,
@@ -681,6 +769,7 @@ class TDDMRG(DMRG):
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
             tdvp_projection_backend=tdvp_projection_backend,
+            tdvp_split_dynamic_block_sparse=tdvp_split_dynamic_block_sparse,
             **sector_kwargs,
         )
         self.tdmps.run(

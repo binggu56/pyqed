@@ -1100,7 +1100,6 @@ class TDMPS:
         pre_norms = np.empty(steps, dtype=float)
         pre_norm2 = np.empty(steps, dtype=float)
         tdvp_truncation_errors = np.zeros(steps, dtype=float)
-        substep_norms = []
         energy_times = [float(t0)]
             
         psi = psi0
@@ -1151,9 +1150,7 @@ class TDMPS:
                     )
                 else:
                     psi = self.step(psi, integrator=integrator)
-                step_norms = tuple(getattr(self, "_last_step_pre_normalization_norms", ()))
                 step_norm2 = tuple(getattr(self, "_last_step_pre_normalization_norm2", ()))
-                substep_norms.append(step_norms)
                 if step_norm2:
                     full_step_norm2 = float(np.prod(step_norm2))
                     pre_norm2[total_step] = full_step_norm2
@@ -1189,7 +1186,7 @@ class TDMPS:
         self.fields = fields
         self.pre_normalization_norms = pre_norms
         self.pre_normalization_norm2 = pre_norm2
-        self.substep_pre_normalization_norms = substep_norms
+        self.substep_pre_normalization_norms = None
         self.tdvp_truncation_errors = tdvp_truncation_errors
         self.energy_times = np.asarray(energy_times, dtype=float)
         self.static_energies = np.asarray(static_energies, dtype=complex)

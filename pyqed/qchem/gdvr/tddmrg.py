@@ -7,20 +7,24 @@ import warnings
 import numpy as np
 from scipy.linalg import expm
 
-from pyqed.qchem.dmrg.tddmrg import TDDMRG as BaseTDDMRG
+from pyqed.qchem.dmrg.tddmrg import TDDMRG as BaseTDDMRG, _mpo_site_to_dense_factor
 from pyqed.qchem.dmrg.dmrg import (
     _accumulate_symbolic_term,
     _build_spatial_active_hamiltonian_matrix,
     _build_tensor_mpo_from_symbolic_terms,
     _group_spin_orbital_mpo_pairs,
+    _materialize_symbolic_terms,
     get_jw_term_spec,
 )
 from pyqed.qchem.dmrg.overlap import _unitary_rotation_mpo
+from pyqed.mps.abelian_storage import make_abelian_site_tensor
+from pyqed.mps.autompo.automatic_mpo_helper import construct_symbolic_mpo, _terms_to_table
 from pyqed.mps.autompo.basis import BasisSimpleElectron
+from pyqed.mps.autompo.model import Model
 from pyqed.mps.decompose import decompose
 from pyqed.mps.mps import MPS
 from pyqed.mps.mps import MPO as TensorMPO
-from pyqed.mps.symmetry import AbelianSector
+from pyqed.mps.symmetry import AbelianSector, BlockTensor, zero_like_sector
 from pyqed.mps.tdvp import TDVPEngine, one_site_tdvp_step, two_site_tdvp_step
 from pyqed.qchem.dmrg.spatial_terms import (
     BasisSpatialFermion,
@@ -260,6 +264,151 @@ def gdvr_spatial_hamiltonian_term_map(hcore, eri_j, nz, m, *, cutoff=1.0e-12):
     return term_map
 
 
+def _spatial_site_qn_map(basis_site):
+    labels = ("charge", "sz")
+    return {
+        state: AbelianSector(labels, tuple(int(x) for x in np.asarray(qn).reshape(-1)))
+        for state, qn in enumerate(basis_site.sigmaqn)
+    }
+
+
+def _symbolic_local_matrix(basis_site, terms, dtype):
+    mat = np.zeros((basis_site.nbas, basis_site.nbas), dtype=dtype)
+    for term in terms:
+        mat += np.asarray(basis_site.op_mat(term), dtype=dtype)
+    return mat
+
+
+def _symbolic_mo_to_abelian_site_tensor(
+    basis_site,
+    symbolic_mo,
+    current_nodes,
+    *,
+    dtype,
+    cutoff=1.0e-12,
+):
+    site_qn_map = _spatial_site_qn_map(basis_site)
+    all_phys_qns = []
+    phys_by_q = {}
+    for state, qn in site_qn_map.items():
+        if qn not in phys_by_q:
+            all_phys_qns.append(qn)
+        phys_by_q.setdefault(qn, []).append(int(state))
+    phys_by_q = {qn: sorted(states) for qn, states in phys_by_q.items()}
+
+    valid_incoming = {}
+    for left_idx, q_left in current_nodes:
+        valid_incoming.setdefault(int(left_idx), set()).add(q_left)
+
+    next_nodes = set()
+    entries = {}
+    for (left_idx, right_idx), terms in np.ndenumerate(symbolic_mo):
+        if int(left_idx) not in valid_incoming or not terms:
+            continue
+        mat = _symbolic_local_matrix(basis_site, terms, dtype)
+        out_states, in_states = np.nonzero(np.abs(mat) > cutoff)
+        for out_s, in_s in zip(out_states, in_states):
+            value = mat[int(out_s), int(in_s)]
+            if abs(value) <= cutoff:
+                continue
+            q_out = site_qn_map[int(out_s)]
+            q_in = site_qn_map[int(in_s)]
+            flux = q_out - q_in
+            for q_left in valid_incoming[int(left_idx)]:
+                q_right = q_left - flux
+                next_nodes.add((int(right_idx), q_right))
+                key = (q_left, q_right, q_out, q_in)
+                entries.setdefault(key, []).append(
+                    (
+                        (int(left_idx), q_left),
+                        (int(right_idx), q_right),
+                        int(out_s),
+                        int(in_s),
+                        value,
+                    )
+                )
+
+    left_map = {
+        qn: sorted([node for node in current_nodes if node[1] == qn])
+        for qn in set(qn for _idx, qn in current_nodes)
+    }
+    right_map = {
+        qn: sorted([node for node in next_nodes if node[1] == qn])
+        for qn in set(qn for _idx, qn in next_nodes)
+    }
+
+    data = {}
+    for key, block_entries in entries.items():
+        q_left, q_right, q_out, q_in = key
+        if q_left not in left_map or q_right not in right_map:
+            continue
+        left_nodes = left_map[q_left]
+        right_nodes = right_map[q_right]
+        out_basis = phys_by_q[q_out]
+        in_basis = phys_by_q[q_in]
+        left_lookup = {node: idx for idx, node in enumerate(left_nodes)}
+        right_lookup = {node: idx for idx, node in enumerate(right_nodes)}
+        out_lookup = {state: idx for idx, state in enumerate(out_basis)}
+        in_lookup = {state: idx for idx, state in enumerate(in_basis)}
+        block = np.zeros(
+            (len(left_nodes), len(right_nodes), len(out_basis), len(in_basis)),
+            dtype=dtype,
+        )
+        for left_node, right_node, out_s, in_s, value in block_entries:
+            block[
+                left_lookup[left_node],
+                right_lookup[right_node],
+                out_lookup[out_s],
+                in_lookup[in_s],
+            ] += value
+        data[key] = block
+
+    qns_left = sorted(left_map)
+    qns_right = sorted(right_map)
+    tensor = make_abelian_site_tensor(
+        data,
+        [qns_left, qns_right, all_phys_qns, all_phys_qns],
+        [-1, 1, 1, -1],
+        native_site_storage=True,
+        copy=False,
+    )
+    return tensor, next_nodes
+
+
+def _build_spatial_abelian_mpo_from_symbolic_terms(
+    basis_sites,
+    term_map,
+    *,
+    cutoff=1.0e-12,
+    algo="qr",
+):
+    terms = _materialize_symbolic_terms(term_map, tol=cutoff)
+    if not terms:
+        raise ValueError("Terms contain nothing.")
+    model = Model(basis=basis_sites, ham_terms=terms)
+    table, primary_ops, factor = _terms_to_table(model, terms, 0.0)
+    symbolic_mpo, _mpoqn, _qntot, _qnidx, _out_ops, _primary_ops = construct_symbolic_mpo(
+        table,
+        primary_ops,
+        factor,
+        algo=algo,
+    )
+    dtype = np.result_type(factor, complex)
+    first_qn = _spatial_site_qn_map(basis_sites[0])[0]
+    current_nodes = {(0, zero_like_sector(first_qn))}
+    factors = []
+    for basis_site, symbolic_site in zip(basis_sites, symbolic_mpo):
+        tensor, current_nodes = _symbolic_mo_to_abelian_site_tensor(
+            basis_site,
+            symbolic_site,
+            current_nodes,
+            dtype=dtype,
+            cutoff=cutoff,
+        )
+        factors.append(tensor)
+    return TensorMPO(factors, homogenous=False), len(terms)
+
+
 def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
     """Build the GDVR electronic Hamiltonian MPO on d=4 spatial sites."""
     if mol.hcore is None or mol.eri_j is None or mol.shapes is None:
@@ -275,7 +424,7 @@ def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr
         m,
         cutoff=cutoff,
     )
-    mpo, term_count = _build_tensor_mpo_from_symbolic_terms(
+    mpo, term_count = _build_spatial_abelian_mpo_from_symbolic_terms(
         basis_sites,
         term_map,
         cutoff=cutoff,
@@ -283,7 +432,8 @@ def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr
     )
     info = {
         "representation": "gdvr_direct_spatial_mpo",
-        "pipeline": "gdvr_collocated_blocks->spatial_d4_autompo",
+        "pipeline": "gdvr_collocated_blocks->spatial_d4_autompo->native_abelian_mpo",
+        "native_abelian_mpo": True,
         "symbolic_terms": int(term_count),
         "mpo_max_bond": int(max(mpo.bond_orders())),
         "site": "spatial",
@@ -329,6 +479,12 @@ def cap_operator(mol, *, width=2.0, strength=0.005, order=2):
         strength=strength,
         order=order,
     )
+
+
+def cap_profile(mol, *, width=2.0, strength=0.005, order=2):
+    """Return the nonnegative one-orbital CAP profile ``W_p`` in the GDVR basis."""
+    op = cap_operator(mol, width=width, strength=strength, order=order)
+    return np.real_if_close(1j * np.diag(op), tol=1000).real
 
 
 def cap_mpo(mol, *, width=2.0, strength=0.005, order=2, cutoff=1.0e-12, symbolic_algo="qr"):
@@ -392,9 +548,23 @@ def force_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
 
 
 def _mpo_product(left, right, chi_max=None):
+    left = _dense_mpo_for_product(left)
+    right = _dense_mpo_for_product(right)
     if chi_max is None:
         return left @ right
     return left.matmul(right, chi_max=int(chi_max))
+
+
+def _dense_mpo_for_product(mpo):
+    factors = mpo.factors if hasattr(mpo, "factors") else mpo
+    if factors and hasattr(factors[0], "qns"):
+        return TensorMPO(
+            [_mpo_site_to_dense_factor(site) for site in factors],
+            homogenous=False,
+        )
+    if isinstance(mpo, TensorMPO):
+        return mpo
+    return TensorMPO(factors, homogenous=False)
 
 
 def acceleration_mpo(hamiltonian_mpo, dipole_mpo, *, chi_max=None):
@@ -419,6 +589,87 @@ def build_gdvr_spatial_z_phase_mpo(mol, field_z, dt):
         phase = np.exp(-1j * float(dt) * float(field_z) * float(zi) * occupation)
         factors.append(np.diag(phase).reshape(1, 1, 4, 4))
     return TensorMPO(factors, homogenous=False)
+
+
+class GDVRSpatialLocalPhase:
+    """Exact local phase/damping operator diagonal in GDVR occupations."""
+
+    preserves_bond_dimension = True
+    preserves_abelian_sectors = True
+
+    def __init__(self, phases):
+        phases = [np.asarray(phase, dtype=complex).reshape(-1) for phase in phases]
+        if any(phase.size != 4 for phase in phases):
+            raise ValueError("GDVR spatial local phases must have four local occupation phases.")
+        self.phases = tuple(phases)
+        self.L = len(self.phases)
+        self.preserves_norm = all(
+            np.allclose(np.abs(phase), 1.0, atol=1.0e-14, rtol=1.0e-14)
+            for phase in self.phases
+        )
+
+    @classmethod
+    def from_mol(cls, mol, dt, *, field_z=0.0, cap_values=None):
+        z = np.asarray(mol.z, dtype=float).reshape(-1)
+        m = int(mol.shapes["M"])
+        z_values = np.repeat(z, m)
+        occupation = np.array([0.0, 1.0, 1.0, 2.0])
+        if cap_values is None:
+            cap_values = np.zeros_like(z_values, dtype=float)
+        cap_values = np.asarray(cap_values, dtype=float).reshape(-1)
+        if cap_values.size != z_values.size:
+            raise ValueError("CAP profile length must match the number of GDVR spatial orbitals.")
+
+        phases = []
+        for zi, wi in zip(z_values, cap_values):
+            # H_int = E_z z_i n_i and H_CAP = -i W_i n_i.
+            exponent = -1j * float(dt) * float(field_z) * float(zi) * occupation
+            exponent = exponent - float(dt) * float(wi) * occupation
+            phases.append(np.exp(exponent))
+        return cls(phases)
+
+    def _primitive_phase_by_sector(self, site_tensor, phase):
+        mapping = {}
+        for state, qn in enumerate(site_tensor.qns[2]):
+            mapping.setdefault(qn, []).append(phase[state])
+        return mapping
+
+    def _apply_block_tensor(self, tensor, phase):
+        phase_by_sector = self._primitive_phase_by_sector(tensor, phase)
+        data = {}
+        for key, block in tensor.data.items():
+            q_phys = key[2]
+            values = np.asarray(phase_by_sector[q_phys], dtype=complex)
+            if values.size == block.shape[2]:
+                data[key] = block * values.reshape((1, 1, values.size))
+            elif values.size == 1:
+                data[key] = block * values[0]
+            else:
+                raise ValueError(
+                    "Cannot apply a local phase to a block-sparse physical sector "
+                    "with incompatible degeneracy."
+                )
+        return BlockTensor(data, [list(q) for q in tensor.qns], list(tensor.dirs))
+
+    def __matmul__(self, psi):
+        if not isinstance(psi, MPS):
+            raise TypeError("GDVRSpatialLocalPhase can only act on an MPS.")
+        if psi.L != self.L:
+            raise ValueError(f"Phase length {self.L} does not match MPS length {psi.L}.")
+
+        if psi.factors and hasattr(psi.factors[0], "qns"):
+            factors = [
+                self._apply_block_tensor(site, phase)
+                for site, phase in zip(psi.factors, self.phases)
+            ]
+            return MPS(factors, labels=list(psi.labels))
+
+        work = psi.to_order(["lv", "p", "rv"])
+        factors = [
+            np.asarray(site, dtype=complex) * phase.reshape((1, phase.size, 1))
+            for site, phase in zip(work.factors, self.phases)
+        ]
+        return MPS(factors, labels=["lv", "p", "rv"])
 
 
 def _dense_matrix_to_mpo(matrix, dims):
@@ -748,6 +999,41 @@ def _spatial_product_mps(nsites, nelec, *, spin=0):
     return MPS(factors, labels=["lv", "p", "rv"])
 
 
+def _single_closed_shell_orbital_mps(orbital, *, max_bond=None):
+    r"""Direct MPS for ``a^\dagger_phi,alpha a^\dagger_phi,beta |0>``."""
+    coeff = np.asarray(orbital, dtype=complex).reshape(-1)
+    norm = np.linalg.norm(coeff)
+    if norm <= 0.0:
+        raise ValueError("occupied orbital has zero norm.")
+    coeff = coeff / norm
+    states = ((0, 0), (1, 0), (0, 1), (1, 1))
+    local_bits = ((0, 0), (1, 0), (0, 1), (1, 1))
+    factors = []
+    for site, value in enumerate(coeff):
+        left_states = (states[0],) if site == 0 else states
+        right_states = (states[-1],) if site == coeff.size - 1 else states
+        right_index = {state: idx for idx, state in enumerate(right_states)}
+        tensor = np.zeros((len(left_states), 4, len(right_states)), dtype=complex)
+        for left_idx, left_state in enumerate(left_states):
+            for phys, local in enumerate(local_bits):
+                right_state = (left_state[0] + local[0], left_state[1] + local[1])
+                if right_state not in right_index or right_state[0] > 1 or right_state[1] > 1:
+                    continue
+                amp = 1.0 + 0.0j
+                if local[0]:
+                    amp *= value
+                if local[1]:
+                    amp *= value
+                    if not local[0] and left_state[0] == 0:
+                        amp *= -1.0
+                tensor[left_idx, phys, right_index[right_state]] = amp
+        factors.append(tensor)
+    out = MPS(factors, labels=["lv", "p", "rv"]).normalize()
+    if max_bond is not None and max(out.bond_orders()) > int(max_bond):
+        out = out.compress(int(max_bond)).normalize()
+    return out
+
+
 def _apply_spatial_orbital_transform(
     psi,
     transform,
@@ -813,13 +1099,19 @@ def rhf_determinant_mps(
     if not np.allclose(occ[occ_idx], 2.0, atol=1.0e-8):
         raise ValueError("RHF determinant initializer currently expects closed-shell occupations.")
 
+    nelec = int(round(np.sum(occ)))
+    spin = getattr(mf.mol, "spin", 0)
+    spin = 0 if spin is None else int(spin)
+    if occ_idx.size == 1 and nelec == 2 and int(spin) == 0:
+        return _single_closed_shell_orbital_mps(coeff[:, occ_idx[0]], max_bond=max_bond)
+
     order = np.concatenate(
         (occ_idx, np.setdiff1d(np.arange(coeff.shape[1]), occ_idx, assume_unique=True))
     )
     base = _spatial_product_mps(
         coeff.shape[1],
-        int(round(np.sum(occ))),
-        spin=getattr(mf.mol, "spin", 0),
+        nelec,
+        spin=spin,
     )
     return _apply_spatial_orbital_transform(
         base,
@@ -827,8 +1119,8 @@ def rhf_determinant_mps(
         max_bond=max_bond,
         cutoff=cutoff,
         preserve_quantum_numbers=preserve_quantum_numbers,
-        nelec=int(round(np.sum(occ))),
-        spin=getattr(mf.mol, "spin", 0),
+        nelec=nelec,
+        spin=spin,
     )
 
 
@@ -2248,11 +2540,7 @@ class TDDMRG(BaseTDDMRG):
                 adapter,
                 ncas=nspatial,
                 nelecas=nelecas,
-                init_guess=rhf_determinant_mps(
-                    mf,
-                    max_bond=None,
-                    preserve_quantum_numbers=True,
-                ),
+                init_guess="hf",
                 m_warmup=m_warmup,
                 spin=spin,
                 tol=tol,
@@ -2266,6 +2554,7 @@ class TDDMRG(BaseTDDMRG):
         self.gdvr_mpo_cutoff = float(cutoff)
         self.gdvr_symbolic_algo = str(symbolic_algo)
         self._cap_mpo = None
+        self._local_cap_values = None
         self.cap_settings = None
 
     def set_cap(self, cap=True, **kwargs):
@@ -2303,28 +2592,72 @@ class TDDMRG(BaseTDDMRG):
     def clear_cap(self):
         """Remove any propagation-time complex absorbing potential."""
         self._cap_mpo = None
+        self._local_cap_values = None
         self.cap_settings = None
+        return self
+
+    def _set_local_cap(self, cap=True):
+        if cap is None or cap is False:
+            self._local_cap_values = None
+            self.cap_settings = None
+            return self
+        if hasattr(cap, "factors"):
+            raise TypeError("MPO CAPs must use cap_mode='hamiltonian'.")
+        settings = {}
+        if isinstance(cap, dict):
+            settings.update(cap)
+        elif cap is not True:
+            raise TypeError("cap must be None, True, a settings dict, or an MPO-like object.")
+        self.cap_settings = {
+            "source": "gdvr-local-phase",
+            "width": float(settings.get("width", 2.0)),
+            "strength": float(settings.get("strength", 0.005)),
+            "order": int(settings.get("order", 2)),
+        }
+        self._local_cap_values = cap_profile(
+            self.gdvr_mf.mol,
+            width=self.cap_settings["width"],
+            strength=self.cap_settings["strength"],
+            order=self.cap_settings["order"],
+        )
         return self
 
     def optimize_ground_state(self, *args, **kwargs):
         """Optimize the GDVR ground state with a symmetry-native default guess.
 
-        The constructor normally provides a sector-preserving RHF determinant
-        MPS.  If a caller replaced it with a non-MPS sentinel, fall back to the
-        built-in symmetry-native HF guess instead of trying to coerce it here.
+        The constructor keeps only a lightweight guess sentinel so building a
+        time-dependent driver does not first construct the exact RHF determinant
+        MPS.  DMRG then expands that sentinel into its symmetry-native HF/CID
+        starting state.
         """
+        if "symmetry" not in kwargs and "symmetry_list" not in kwargs:
+            kwargs["symmetry_list"] = ["charge", "sz"]
+        kwargs.setdefault("compute_s2", False)
+        kwargs.setdefault("nsweeps", 4)
         if "initial_guess" not in kwargs and not isinstance(self.init_guess, MPS):
             kwargs["initial_guess"] = "hf"
         return super().optimize_ground_state(*args, **kwargs)
 
+    def _auto_ground_state_kwargs(self, *, tdvp_projection_backend=None):
+        kwargs = super()._auto_ground_state_kwargs(
+            tdvp_projection_backend=tdvp_projection_backend,
+        )
+        kwargs.setdefault("symmetry_list", ["charge", "sz"])
+        kwargs.setdefault("compute_s2", False)
+        kwargs.setdefault("nsweeps", 4)
+        kwargs.setdefault("initial_guess", "hf")
+        return kwargs
+
     def _default_initial_state(self):
-        if hasattr(self, "dmrg") and self.dmrg is not None and self.dmrg.ground_state is not None:
+        if self._has_ground_state():
             return self.export_ground_state(dense=True)
 
         max_bond = self.bond_dim if self.bond_dim is not None else self.D
         return rhf_determinant_mps(self.gdvr_mf, max_bond=max_bond)
 
     def _default_block_sparse_initial_state(self):
+        if self._has_ground_state():
+            return self.export_ground_state(dense=False)
         if isinstance(self.init_guess, MPS) and hasattr(self.init_guess.factors[0], "qns"):
             return self.init_guess.copy()
         max_bond = self.bond_dim if self.bond_dim is not None else self.D
@@ -2403,19 +2736,28 @@ class TDDMRG(BaseTDDMRG):
         hamiltonian = super()._get_td_hamiltonian(mo_coeff=mo_coeff)
         if self._cap_mpo is None:
             return hamiltonian
+        if hamiltonian.factors and hasattr(hamiltonian.factors[0], "qns"):
+            hamiltonian = TensorMPO(
+                [_mpo_site_to_dense_factor(site) for site in hamiltonian.factors],
+                homogenous=False,
+            )
         absorber = TensorMPO([np.asarray(w).copy() for w in self._cap_mpo.factors], homogenous=False)
         return hamiltonian + absorber
 
     def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
         del order, scale
         field_vec = self._field_vector(time, field)
-        if not np.any(field_vec):
+        has_cap = self._local_cap_values is not None and np.any(np.abs(self._local_cap_values) > 0.0)
+        if not np.any(field_vec) and not has_cap:
             return None
         if abs(field_vec[0]) > 1.0e-14 or abs(field_vec[1]) > 1.0e-14:
             raise NotImplementedError("Direct spatial GDVR-TDDMRG currently supports z-polarized fields.")
-        if abs(field_vec[2]) <= 1.0e-14:
-            return None
-        return build_gdvr_spatial_z_phase_mpo(self.gdvr_mf.mol, field_vec[2], dt)
+        return GDVRSpatialLocalPhase.from_mol(
+            self.gdvr_mf.mol,
+            dt,
+            field_z=field_vec[2],
+            cap_values=self._local_cap_values,
+        )
 
     def get_interaction_mpo(self, axis=None):
         axis_idx = None if axis is None else _axis_index(axis)
@@ -2429,10 +2771,25 @@ class TDDMRG(BaseTDDMRG):
                 symbolic_algo=self.gdvr_symbolic_algo,
             )
             self._interaction_mpo_cache = (zero, zero, mu_z)
+            for idx, mpo in enumerate(self._interaction_mpo_cache):
+                mpo._pyqed_cache_key = (
+                    "gdvr_direct_interaction",
+                    idx,
+                    id(self.gdvr_mf.mol),
+                    self.gdvr_mpo_cutoff,
+                    self.gdvr_symbolic_algo,
+                )
         if axis is None:
-            return [type(mpo)([w.copy() for w in mpo.factors], homogenous=False) for mpo in self._interaction_mpo_cache]
+            out = []
+            for mpo in self._interaction_mpo_cache:
+                copied = type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+                copied._pyqed_cache_key = getattr(mpo, "_pyqed_cache_key", None)
+                out.append(copied)
+            return out
         mpo = self._interaction_mpo_cache[axis_idx]
-        return type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+        copied = type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+        copied._pyqed_cache_key = getattr(mpo, "_pyqed_cache_key", None)
+        return copied
 
     def get_interaction_spatial(self, axis=None):
         if axis is None:
@@ -2442,16 +2799,36 @@ class TDDMRG(BaseTDDMRG):
             return np.zeros((self.ncas, self.ncas))
         return gdvr_z_operator(self.gdvr_mf.mol, electronic=True)
 
-    def run(self, *args, cap=None, **kwargs):
+    def run(self, *args, cap=None, cap_mode="local-phase", gdvr_interaction_mode="local-phase", **kwargs):
         old_cap = self._cap_mpo
+        old_local_cap = self._local_cap_values
         old_settings = self.cap_settings
+        use_local_cap = cap is not None and str(cap_mode).lower().replace("_", "-") in {
+            "local",
+            "local-phase",
+            "split",
+        }
+        use_local_interaction = str(gdvr_interaction_mode).lower().replace("_", "-") in {
+            "local",
+            "local-phase",
+            "split",
+        }
         if cap is not None:
-            self.set_cap(cap)
+            if use_local_cap and not self._use_exact_dense_td():
+                self._set_local_cap(cap)
+            else:
+                self.set_cap(cap)
         if self._cap_mpo is not None and "krylov_method" not in kwargs:
             kwargs["krylov_method"] = "arnoldi"
+        if use_local_interaction:
+            kwargs.setdefault("tdvp_split_dynamic_block_sparse", True)
+            kwargs.setdefault("tdvp_dynamic_mode", "interaction-split")
+        if self._local_cap_values is not None and kwargs.get("field") is None:
+            kwargs["field"] = lambda _time: np.zeros(3, dtype=float)
         try:
             return super().run(*args, **kwargs)
         finally:
             if cap is not None:
                 self._cap_mpo = old_cap
+                self._local_cap_values = old_local_cap
                 self.cap_settings = old_settings

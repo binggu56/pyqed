@@ -106,8 +106,7 @@ def test_tdmps_dynamic_run_uses_split_propagation_without_full_rebuild():
 
     np.testing.assert_allclose(td.times, np.array([0.1, 0.2, 0.3]))
     np.testing.assert_allclose(td.pre_normalization_norms, np.ones(3))
-    assert len(td.substep_pre_normalization_norms) == 3
-    assert len(td.substep_pre_normalization_norms[0]) == 3
+    assert td.substep_pre_normalization_norms is None
     assert td.static_energies.shape == (4,)
     assert td.energy_drift.shape == (4,)
 
@@ -617,6 +616,53 @@ def test_symmetric_tdvp_block_sparse_step_matches_exact_fixed_sector():
     np.testing.assert_allclose(abs(np.vdot(exact, actual)), 1.0, atol=1.0e-12)
 
 
+def test_block_sparse_tdvp_native_one_site_sweep_matches_python(monkeypatch):
+    _cpp_davidson_or_skip()
+
+    identity = np.eye(2, dtype=complex)
+    create = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=complex)
+    destroy = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=complex)
+    w0 = np.zeros((1, 3, 2, 2), dtype=complex)
+    w1 = np.zeros((3, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w0[0, 1] = create
+    w0[0, 2] = destroy
+    w1[1, 0] = destroy
+    w1[2, 0] = create
+    h_mpo = MPO([w0, w1], homogenous=False)
+
+    vec = np.zeros((2, 2), dtype=complex)
+    vec[1, 0] = 0.8
+    vec[0, 1] = 0.6j
+    vec = vec / np.linalg.norm(vec.reshape(-1))
+    psi0 = MPS(decompose(vec, rank=2), labels=["lv", "p", "rv"]).normalize()
+
+    def run(native):
+        monkeypatch.setattr(tdvp_module, "_BLOCK_ONE_SITE_CPP_ENGINE", int(native))
+        engine = SymmetricTDVP(
+            h_mpo,
+            local_sectors=[0, 1],
+            target_sector=1,
+            projection_backend="block-sparse",
+            krylov_dim=8,
+        )
+        psi = psi0.copy()
+        info = {}
+        for _ in range(2):
+            psi, info = engine.step(psi, 0.07, return_info=True)
+        dense = tdvp_module.symmetric_to_dense(psi)
+        tensor = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+        return tensor, info
+
+    py_tensor, py_info = run(False)
+    native_tensor, native_info = run(True)
+
+    assert py_info["cpp_one_site_engine"] is False
+    assert native_info["cpp_one_site_engine"] is True
+    assert native_info["cpp_one_site_engine_native_kernels"] is True
+    np.testing.assert_allclose(native_tensor, py_tensor, atol=1.0e-12)
+
+
 def test_symmetric_tdvp_block_sparse_accepts_spatial_sector_tuples():
     nsites = 2
     phys_dim = 4
@@ -686,6 +732,43 @@ def test_symmetric_tdvp_block_sparse_reuses_native_mpo(monkeypatch):
     assert info2["mpo_cached"] is True
     assert engine.canonicalize_first is False
     assert hasattr(out.factors[0], "qns")
+
+
+def test_block_sparse_tdvp_reuses_global_static_mpo_cache(monkeypatch):
+    identity = np.eye(2, dtype=complex)
+    w0 = np.zeros((1, 1, 2, 2), dtype=complex)
+    w1 = np.zeros((1, 1, 2, 2), dtype=complex)
+    w0[0, 0] = identity
+    w1[0, 0] = identity
+    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo._pyqed_cache_key = ("test-static-mpo-cache", 2)
+
+    site_qn_maps, _target_qn = tdvp_module._block_sparse_site_qn_maps(
+        [0, 1],
+        2,
+        (2, 2),
+        1,
+    )
+    tdvp_module._BLOCK_SPARSE_MPO_CACHE.clear()
+    calls = {"count": 0}
+    original = tdvp_module.dense_to_symmetric_mpo
+
+    def _counting_dense_to_symmetric_mpo(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tdvp_module,
+        "dense_to_symmetric_mpo",
+        _counting_dense_to_symmetric_mpo,
+    )
+
+    first = tdvp_module._as_block_sparse_mpo(h_mpo, site_qn_maps)
+    second = tdvp_module._as_block_sparse_mpo(h_mpo, site_qn_maps)
+
+    assert calls["count"] == 1
+    assert first[0] is second[0]
+    tdvp_module._BLOCK_SPARSE_MPO_CACHE.clear()
 
 
 def test_block_sparse_tdvp_cpp_heff_kernels_match_python():
@@ -813,7 +896,8 @@ def test_cpp_lapack_qr_matches_numpy_reduced_qr():
     np.testing.assert_allclose(np.abs(np.diag(r_cpp)), np.abs(np.diag(r_np)), atol=1.0e-12)
 
 
-def test_block_sparse_symmetric_tdvp_reuses_native_state_after_first_step():
+def test_block_sparse_symmetric_tdvp_reuses_native_state_after_first_step(monkeypatch):
+    monkeypatch.setattr(tdvp_module, "_BLOCK_ONE_SITE_CPP_ENGINE", 1)
     identity = np.eye(2, dtype=complex)
     w0 = np.zeros((1, 1, 2, 2), dtype=complex)
     w1 = np.zeros((1, 1, 2, 2), dtype=complex)
@@ -838,6 +922,11 @@ def test_block_sparse_symmetric_tdvp_reuses_native_state_after_first_step():
     assert info1["state_copied"] is True
     assert info2["state_copied"] is False
     if info2.get("cpp_moving_environment"):
+        assert info1["cpp_one_site_engine"] is True
+        assert info2["cpp_one_site_engine"] is True
+        assert info1["cpp_one_site_engine_native_kernels"] is True
+        assert info2["cpp_one_site_engine_native_kernels"] is True
+        assert info1["cpp_one_site_tdvp_sweep_calls"] == 1
         assert info1["cpp_environment_plan_advance_calls"] > 0
         assert info2["cpp_environment_plan_cache_hits"] > 0
 
