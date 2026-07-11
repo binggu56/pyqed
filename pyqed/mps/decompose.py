@@ -297,16 +297,24 @@ def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
         # W = np.dot(C,Z.T.conj())
         chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
 
-        # Obtain the new values for B and l #
-        invsq = np.sqrt(sum(Y[:chi2]**2))
+        # Obtain the new values for B and l.
+        #
+        # For MPS state compression, normalizing the kept singular values is
+        # convenient. For MPO algebra this changes the operator scale, so the
+        # caller must be able to disable it.
+        if renormalize:
+            invsq = np.sqrt(sum(Y[:chi2]**2))
+            kept_s = Y[:chi2] / invsq
+        else:
+            kept_s = Y[:chi2]
 
-        s_list[i2] = Y[:chi2]/invsq
+        s_list[i2] = kept_s
 
         # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
 
         B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
 
-        B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
+        B_list[i2] = np.reshape(np.diag(kept_s)@Z[:chi2,:],(chi2, d2, chi3))
 
     if return_singular_values:
         return B_list, s_list
