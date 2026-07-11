@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  VECLIB_MAXIMUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
+
+jobs:
+  build:
+    name: Build and verify release
+    if: github.repository == 'binggu56/pyqed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Require the tag to match the package version
+        run: >-
+          python -c 'import os, runpy;
+          package_version = runpy.run_path("pyqed/_version.py")["__version__"];
+          tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v");
+          assert tag_version == package_version,
+          f"tag {tag_version!r} does not match package {package_version!r}"'
+      - name: Install release tools and run acceptance tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python -m pytest -q tests/test_release_smoke.py
+      - name: Build and inspect the universal wheel and source distribution
+        run: |
+          python -m build
+          python -m twine check dist/*
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          from zipfile import ZipFile
+
+          def is_conflict_copy(name):
+              lowered = name.lower()
+              return "gugroup" in lowered or "bing" in lowered and "mac" in lowered
+
+          wheel = next(Path("dist").glob("*.whl"))
+          assert wheel.name.endswith("-py3-none-any.whl")
+          with ZipFile(wheel) as archive:
+              wheel_names = archive.namelist()
+          assert not any(name.endswith((".so", ".pyd", ".dylib")) for name in wheel_names)
+          assert not any(is_conflict_copy(name) for name in wheel_names)
+
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+          assert not any(is_conflict_copy(name) for name in sdist_names)
+          PY
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv /tmp/pyqed-release
+          /tmp/pyqed-release/bin/python -m pip install --upgrade pip
+          /tmp/pyqed-release/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/pyqed-release/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
+          /tmp/pyqed-release/bin/python -c 'from importlib.metadata import version; from importlib.util import find_spec; import pyqed; from pyqed.gw import BSE, GW, TDA; from pyqed.qchem import MP2, Molecule; names=("pyqed.HEOM", "pyqed.floquet", "pyqed.gw", "pyqed.md", "pyqed.ml", "pyqed.narg", "pyqed.mps.nonabelian", "pyqed.qchem.mp"); assert pyqed.__version__ == version("pyqed"); assert all(find_spec(name) is not None for name in names); assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule))'
+          /tmp/pyqed-release/bin/python -m compileall -q /tmp/pyqed-release/lib/python3.13/site-packages/pyqed
+      - name: Store verified distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyqed
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Retrieve verified distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -28,8 +28,7 @@ Basic Example
 
    from pyqed.qchem import Molecule
    from pyqed.qchem.hf import RHF
-   from pyqed.gw.gw import GW
-   from pyqed.gw.bse import BSE, TDA
+   from pyqed.gw import GW, BSE, TDA
 
    mol = Molecule(
        atom="H 0 0 0; H 0 0 0.74",
@@ -88,13 +87,9 @@ Experimental scGW Prototype
 ``pyqed.gw.scgw.SCGW`` is a small finite-basis imaginary-axis prototype for
 self-consistent GW.  It stores full matrix Green's functions, polarizabilities,
 screened interactions, and correlation self-energies on a symmetric imaginary
-<<<<<<< HEAD
 frequency grid.  The default grid is a tangent-mapped Gauss-Legendre
 quadrature over the full imaginary axis.  The older finite uniform grid remains
 available with ``grid="linear"`` for debugging.  Two modes are available:
-=======
-frequency grid.  Two modes are available:
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
 * ``scgw0``: update ``G`` and ``Sigma`` while keeping the initial screened
   interaction ``W0`` fixed.
@@ -122,11 +117,8 @@ Green's-function density matrix.
    print(scgw.converged)
    print(scgw.mu, scgw.nelec)
    print(scgw.e_qp)       # static imaginary-axis diagnostic estimate
-<<<<<<< HEAD
    print(scgw.e_tot)      # Galitskii-Migdal total energy
    print(scgw.energy_components)
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
    print(scgw.G.shape)    # (nfreq, nso, nso)
 
 The same functionality is also exposed through the normal GW driver:
@@ -146,7 +138,6 @@ the prototype keeps ``P`` and ``W`` in the auxiliary factor space instead of
 expanding the four-index ERI tensor.  Dense integrals are still supported for
 small reference calculations.
 
-<<<<<<< HEAD
 For grid checks, use the convergence helper.  The default tangent-mapped
 imaginary-frequency quadrature covers the infinite axis and is usually more
 useful than the small uniform finite-cutoff grid for the convolution prototype.
@@ -191,12 +182,6 @@ continuation and forces are still future work.  The current chemical-potential
 control fixes the electron count with a tail-corrected Matsubara sum of the
 interacting Green's function and expands the chemical-potential bracket when
 the interacting density lies outside the static frontier-orbital window.
-=======
-This is not yet a production scGW implementation.  In particular, analytic
-continuation and Galitskii-Migdal/Luttinger-Ward total energies are still
-future work.  The current chemical-potential control fixes the electron count
-with a tail-corrected Matsubara sum of the interacting Green's function.
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
 scGW Theory
 -----------
@@ -277,9 +262,8 @@ The current PyQED prototype uses dense tensors and numerical interpolation on
 finite imaginary-frequency grids.  It is therefore a reference implementation
 for algorithm development, not yet a high-accuracy production scGW solver.
 
-<<<<<<< HEAD
 Galitskii-Migdal and Luttinger-Ward Energies
--------------------------------------------
+--------------------------------------------
 
 For an electronic Hamiltonian
 
@@ -370,8 +354,6 @@ and the Galitskii-Migdal total energy are identical for the self-consistent GW
 solution.  PyQED reports both ``e_tot_gm`` and ``e_tot_lw``; their difference
 is a useful implementation and convergence diagnostic.
 
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 BSE and TDA
 -----------
 

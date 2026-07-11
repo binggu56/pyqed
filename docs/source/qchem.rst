@@ -46,8 +46,8 @@ Main Components
   including the in-progress OM2/MRCI API.
 * ``pyqed.qchem.dmrg`` contains DMRG and spin-adapted/non-Abelian development
   paths.
-* ``pyqed.gw`` contains dense GW, eigenvalue-self-consistent GW, qsGW, and BSE
-  reference implementations.
+* ``pyqed.gw`` contains dense molecular GW, eigenvalue-self-consistent GW,
+  qsGW, and BSE reference implementations.
 
 Integral Backends
 -----------------

@@ -3,55 +3,76 @@
 
 """The setup script."""
 
-from setuptools import setup, find_packages
+import os
+from pathlib import Path
 
-with open('README.rst') as readme_file:
-    readme = readme_file.read()
+from setuptools import Extension, setup
+from setuptools.command.build_py import build_py as _build_py
 
-with open('HISTORY.rst') as history_file:
-    history = history_file.read()
 
-requirements = ['Click>=6.0', 'numpy', 'scipy' ]
+def _is_sync_conflict_copy(module_path):
+    """Exclude OneDrive conflict copies without deleting a developer's files."""
+    filename = Path(module_path).name.lower()
+    return "gugroup" in filename or "bing" in filename and "mac" in filename
 
-setup_requirements = ['pytest-runner', ]
 
-test_requirements = ['pytest', ]
+_EXCLUDED_LEGACY_MODULES = {
+    "pyqed/dvr/sd.py",
+    "pyqed/gw/dmft.py",
+    "pyqed/integral.py",
+    "pyqed/models/ShinMetiuTBE.py",
+    "pyqed/mps/results.py",
+    "pyqed/namd/eckart.py",
+    "pyqed/namd/gmat.py",
+    "pyqed/qchem/dvr/sd.py",
+}
 
+
+def _is_excluded_legacy_module(module_path):
+    normalized = Path(module_path).as_posix()
+    return any(normalized.endswith(path) for path in _EXCLUDED_LEGACY_MODULES)
+
+
+class _CleanBuildPy(_build_py):
+    def find_package_modules(self, package, package_dir):
+        modules = super().find_package_modules(package, package_dir)
+        return [
+            module
+            for module in modules
+            if not _is_sync_conflict_copy(module[2])
+            and not _is_excluded_legacy_module(module[2])
+        ]
+
+
+def _optional_extensions():
+    enabled = os.environ.get("PYQED_BUILD_EXTENSIONS", "0")
+    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+        return []
+
+    try:
+        import numpy as np
+    except Exception:
+        return []
+
+    return [
+        Extension(
+            "pyqed.qchem._basis_cy",
+            ["pyqed/qchem/_basis_cy.c"],
+            include_dirs=[np.get_include()],
+            optional=True,
+        ),
+        Extension(
+            "pyqed.qchem._rys_cy",
+            ["pyqed/qchem/_rys_cy.c"],
+            include_dirs=[np.get_include()],
+            optional=True,
+        ),
+    ]
+
+
+# Project metadata lives in pyproject.toml.  This small compatibility hook is
+# retained solely for the optional native extensions.
 setup(
-    author="Bing Gu",
-    author_email='binggu56@gmail.com',
-    classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Natural Language :: English',
-        "Programming Language :: Python :: 2",
-        'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-    ],
-    description=" ultrafast spectroscopy, cavity quantum electrodynamics",
-    entry_points={
-        'console_scripts': [
-            'pyqed=pyqed.cli:main',
-        ],
-    },
-    install_requires=requirements,
-    license="MIT license",
-    long_description=readme + '\n\n' + history,
-    include_package_data=True,
-    keywords='pyqed',
-    name='pyqed',
-    packages=find_packages(),
-#    packages=['pyqed.qchem'],
-    setup_requires=setup_requirements,
-    test_suite='tests',
-    tests_require=test_requirements,
-#    package_dir={'': 'pyqed'},
-    url='https://github.com/binggu56/pyqed',
-    version='0.1.3',
-    zip_safe=False,
+    cmdclass={"build_py": _CleanBuildPy},
+    ext_modules=_optional_extensions(),
 )

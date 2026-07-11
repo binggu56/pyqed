@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "description": "Tracked PyQED benchmark entry points. Candidate means that a script exists but no release-level result is asserted by this catalog.",
+  "status_definitions": {
+    "candidate": "Runnable entry point awaiting a reviewed standardized result manifest.",
+    "reviewed": "A specific result has a complete manifest and reviewed artifacts."
+  },
+  "benchmarks": [
+    {
+      "id": "h2-sto3g-rhf-pyscf",
+      "kind": ["external_validation"],
+      "status": "candidate",
+      "source": "benchmarks/h2-sto3g-rhf-pyscf/run.py",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
+      "optional_dependencies": ["pyscf"],
+      "claim_scope": "Total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G compared with PySCF 2.12.1; no performance or broader accuracy claim."
+    },
+    {
+      "id": "native-h4-casscf-representations",
+      "kind": ["independent_internal_validation", "performance"],
+      "status": "candidate",
+      "source": "examples/qchem/casscf_factor_vs_dense.py",
+      "command": "PYTHONPATH=. python examples/qchem/casscf_factor_vs_dense.py",
+      "optional_dependencies": [],
+      "claim_scope": "Dense versus factorized CASSCF for the H4/STO-3G/CAS(4,4) workload encoded by the script."
+    },
+    {
+      "id": "fedvr-harmonic-oscillator",
+      "kind": ["analytic_validation"],
+      "status": "candidate",
+      "source": "examples/dvr/fedvr_harmonic_oscillator.py",
+      "command": "PYTHONPATH=. python examples/dvr/fedvr_harmonic_oscillator.py",
+      "optional_dependencies": [],
+      "claim_scope": "Finite-element DVR eigenvalues for the one-dimensional harmonic-oscillator parameters encoded by the script."
+    },
+    {
+      "id": "x2c-rhf-pyscf",
+      "kind": ["external_validation"],
+      "status": "candidate",
+      "source": "examples/qchem/benchmark_x2c_rhf_vs_pyscf.py",
+      "command": "PYTHONPATH=. python examples/qchem/benchmark_x2c_rhf_vs_pyscf.py",
+      "optional_dependencies": ["pyscf"],
+      "claim_scope": "Selected X2C/RHF quantities for the cases encoded by the script compared with the recorded PySCF version."
+    },
+    {
+      "id": "pcm-rhf-pyscf",
+      "kind": ["external_validation"],
+      "status": "candidate",
+      "source": "examples/qchem/benchmark_pcm_rhf_pyscf.py",
+      "command": "PYTHONPATH=. python examples/qchem/benchmark_pcm_rhf_pyscf.py",
+      "optional_dependencies": ["pyscf"],
+      "claim_scope": "Selected PCM/RHF quantities for the cases encoded by the script compared with the recorded PySCF version."
+    }
+  ]
+}

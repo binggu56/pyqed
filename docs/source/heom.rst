@@ -1,7 +1,7 @@
 HEOM module
 ===========
 
-.. automodule:: pyqed.heom.heom
+.. automodule:: pyqed.HEOM
    :members:
    :undoc-members:
    :show-inheritance:

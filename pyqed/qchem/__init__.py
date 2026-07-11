@@ -28,11 +28,6 @@ except (ImportError, OSError):
     pass
 
 try:
-    from .soc import *
-except (ImportError, OSError):
-    pass
-
-try:
     from .relativistic import *
 except (ImportError, OSError):
     pass

@@ -24,11 +24,16 @@ warnings.filterwarnings('ignore', category=SyntaxWarning)
 # -- Project information -----------------------------------------------------
 
 project = 'PyQED'
-copyright = '2022, Bing Gu'
+copyright = '2022-2026, Bing Gu and PyQED contributors'
 author = 'Bing Gu'
 
-# The full version, including alpha/beta/rc tags
-release = '1.0.0'
+# Resolve the documentation version from the package instead of maintaining a
+# second, easily stale version string in this file.
+try:
+    from pyqed import __version__ as release
+except (ImportError, AttributeError):
+    release = '0+unknown'
+version = release
 
 
 # -- General configuration ---------------------------------------------------

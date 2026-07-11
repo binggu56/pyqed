@@ -1,0 +1,13 @@
+Basis Set Exchange data notice
+==============================
+
+The .gbs files in this directory identify themselves as data from Basis Set
+Exchange version 0.11. Project: https://www.basissetexchange.org/
+Source: https://github.com/MolSSI-BSE/basis_set_exchange
+
+License: BSD-3-Clause. The complete license is stored in
+BASIS_SET_EXCHANGE_LICENSE.txt in this directory.
+
+Citation guidance: https://molssi-bse.github.io/basis_set_exchange/
+Current project article: B. P. Pritchard et al., J. Chem. Inf. Model. 2019,
+59(11), 4814-4820. https://doi.org/10.1021/acs.jcim.9b00725

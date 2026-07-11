@@ -1,17 +1,24 @@
 Examples Gallery
 ================
 
-The repository includes small runnable examples under ``examples/``. This page
-groups the most useful entry points by topic.
+The repository includes runnable entry points under ``examples/``. This page
+groups useful starting points by topic. Some are small smoke cases, while
+others are expensive research workflows with external dependencies and cached
+data. A listing here does not promote a workflow beyond the maturity shown in
+:doc:`capabilities`.
+
+Run an example from the repository root and inspect its imports, parameters,
+and output paths before execution. For research use, preserve the exact script
+commit and a :doc:`benchmarks` manifest.
 
 Quantum Chemistry
 -----------------
 
-* ``examples/qchem/h2.py``: minimal H2 quantum chemistry calculation.
-* ``examples/qchem/mol.py``: molecule construction and basic setup.
+* ``examples/qchem/sa_casscf_factor.py``: native factorized,
+  state-averaged CASSCF on a small H4 model.
+* ``examples/qchem/gw_qsgw.py``: native H2 RHF followed by small GW-family
+  workflows.
 * ``examples/qchem/casscf.py``: native CASSCF workflow.
-* ``examples/qchem/sa_casscf_factor.py``: state-averaged CASSCF with factorized
-  integrals.
 * ``examples/qchem/casscf_factor_vs_dense.py``: compare dense and factorized
   CASSCF paths.
 * ``examples/qchem/comp2_h2o.py``: COMP2 example on water.
@@ -93,13 +100,16 @@ Run examples from the repository root so relative data files resolve correctly:
 
 .. code-block:: bash
 
-   PYTHONPATH=. python examples/qchem/h2.py
    PYTHONPATH=. python examples/qchem/sa_casscf_factor.py
-   PYTHONPATH=. python examples/dvr/sddvr.py
+   PYTHONPATH=. python examples/dvr/fedvr_harmonic_oscillator.py
 
 Some examples require optional dependencies or compiled backends. If an example
 imports PySCF, PyVista, libxc, or plotting packages, install those dependencies
 separately before running it.
+
+``examples/qchem/h2.py`` is a PySCF-based potential-curve script despite its
+generic filename; it is not the native PyQED quickstart. Use
+:doc:`quickstart` for the tested native entry path.
 
 Related Pages
 -------------

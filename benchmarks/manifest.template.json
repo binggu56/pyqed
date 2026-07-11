@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "REPLACE_ME",
+  "generated_at": "REPLACE_ME_ISO_8601_UTC",
+  "software": {
+    "pyqed_version": "REPLACE_ME",
+    "git_commit": "REPLACE_ME_40_HEX_COMMIT",
+    "git_dirty": "REPLACE_ME_BOOLEAN",
+    "python_version": "REPLACE_ME",
+    "dependencies": {
+      "numpy": "REPLACE_ME",
+      "scipy": "REPLACE_ME"
+    }
+  },
+  "environment": {
+    "os": "REPLACE_ME",
+    "architecture": "REPLACE_ME",
+    "cpu": "REPLACE_ME",
+    "logical_cores": "REPLACE_ME_INTEGER",
+    "memory_bytes": "REPLACE_ME_INTEGER",
+    "blas": "REPLACE_ME",
+    "threads": {
+      "OPENBLAS_NUM_THREADS": "REPLACE_ME_INTEGER",
+      "OMP_NUM_THREADS": "REPLACE_ME_INTEGER"
+    }
+  },
+  "workload": {
+    "description": "REPLACE_ME",
+    "method": "REPLACE_ME",
+    "system": "REPLACE_ME",
+    "parameters": {
+      "REPLACE_ME_PARAMETER": "REPLACE_ME_VALUE"
+    }
+  },
+  "execution": {
+    "command": "REPLACE_ME_EXACT_COMMAND",
+    "working_directory": "REPLACE_ME",
+    "warmups": "REPLACE_ME_INTEGER",
+    "repeats": "REPLACE_ME_INTEGER"
+  },
+  "metrics": [
+    {
+      "name": "REPLACE_ME",
+      "value": "REPLACE_ME_NUMBER",
+      "unit": "REPLACE_ME",
+      "statistic": "REPLACE_ME"
+    }
+  ],
+  "validation": {
+    "reference": "REPLACE_ME_OR_REMOVE_VALIDATION_OBJECT",
+    "quantity": "REPLACE_ME",
+    "tolerance": "REPLACE_ME_NONNEGATIVE_NUMBER",
+    "observed_difference": "REPLACE_ME_NONNEGATIVE_NUMBER",
+    "passed": "REPLACE_ME_BOOLEAN"
+  },
+  "artifacts": [
+    {
+      "path": "REPLACE_ME",
+      "sha256": "REPLACE_ME_64_HEX_SHA256",
+      "role": "raw_output"
+    }
+  ],
+  "notes": "REPLACE_ME_OR_EMPTY_STRING"
+}

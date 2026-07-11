@@ -1,76 +1,92 @@
-"""
-Top-level convenience imports for :mod:`pyqed`.
+"""Top-level package for :mod:`pyqed`.
 
-Historically this package eagerly imported most submodules (physics, optics,
-qchem, MPS, etc.).  That makes interactive use convenient, but it also makes
-``import pyqed`` fragile because a single optional dependency (e.g. SciPy) can
-break imports for users that only need a small part of the library such as the
-MPS/DMRG code.
-
-To keep backwards compatibility *when dependencies are present* while allowing
-lightweight imports in minimal environments, we guard optional star-imports.
+Keep this initializer lightweight.  Subpackages such as ``pyqed.pbc.gw`` should
+not pay the import cost of plotting, qchem, MPS, or optional accelerator stacks
+just because Python imports the top-level package first.
 """
 
 from __future__ import annotations
 
-# Keep lightweight pieces unconditional.
+from importlib import import_module
+
+import numpy as np
+
+from ._version import __version__
 from .units import *  # noqa: F401,F403
 
-# Optional convenience imports.
-_OPTIONAL_IMPORT_ERRORS = (ModuleNotFoundError, ImportError, OSError, TimeoutError)
-_OPTIONAL_QCHEM_IMPORT_ERRORS = _OPTIONAL_IMPORT_ERRORS + (RuntimeError,)
 
-try:  # pragma: no cover
-    from .phys import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    # Most of pyqed does not require SciPy; allow import to succeed.
-    pass
+def dagger(a):
+    return a.conjugate().transpose()
 
-try:  # pragma: no cover
-    from .mol import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
 
-try:  # pragma: no cover
-    from .style import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
+def dag(a):
+    return a.conjugate().transpose()
 
-try:  # pragma: no cover
-    from .wpd import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
 
-try:  # pragma: no cover
-    from .qchem import Molecule  # noqa: F401
-except _OPTIONAL_QCHEM_IMPORT_ERRORS:
-    # qchem pulls in large dependencies and historically also referenced
-    # top-level symbols during import.  Some optional accelerators can also
-    # raise RuntimeError at decoration/cache setup time, so allow this
-    # convenience import to fail softly.
-    pass
+def is_positive_def(a):
+    try:
+        np.linalg.cholesky(a)
+        return True
+    except np.linalg.LinAlgError:
+        return False
 
-try:  # pragma: no cover
-    from .optics import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
 
-try:  # pragma: no cover
-    from pyqed.polariton.cavity import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
+_LAZY_ATTRS = {
+    "Mol": ("pyqed.mol", "Mol"),
+    "Result": ("pyqed.mol", "Result"),
+    "Molecule": ("pyqed.qchem", "Molecule"),
+    "GW": ("pyqed.gw", "GW"),
+    "BSE": ("pyqed.gw", "BSE"),
+    "TDA": ("pyqed.gw", "TDA"),
+    "commutator": ("pyqed.phys", "commutator"),
+    "anticommutator": ("pyqed.phys", "anticommutator"),
+    "comm": ("pyqed.phys", "comm"),
+    "anticomm": ("pyqed.phys", "anticomm"),
+    "discretize": ("pyqed.phys", "discretize"),
+    "sort": ("pyqed.phys", "sort"),
+    "polar2cartesian": ("pyqed.phys", "polar2cartesian"),
+    "rk4": ("pyqed.phys", "rk4"),
+    "tensor": ("pyqed.phys", "tensor"),
+    "obs": ("pyqed.phys", "obs"),
+    "obs_dm": ("pyqed.phys", "obs_dm"),
+    "overlap": ("pyqed.phys", "overlap"),
+    "interval": ("pyqed.phys", "interval"),
+    "meshgrid": ("pyqed.phys", "meshgrid"),
+    "norm2": ("pyqed.phys", "norm2"),
+    "sinc": ("pyqed.phys", "sinc"),
+    "gwp": ("pyqed.phys", "gwp"),
+    "ket2dm": ("pyqed.phys", "ket2dm"),
+    "expect": ("pyqed.phys", "expect"),
+    "destroy": ("pyqed.phys", "destroy"),
+    "transform": ("pyqed.phys", "transform"),
+    "basis_transform": ("pyqed.phys", "basis_transform"),
+    "cartesian_product": ("pyqed.phys", "cartesian_product"),
+    "eigh": ("pyqed.phys", "eigh"),
+    "expm": ("pyqed.phys", "expm"),
+    "coth": ("pyqed.phys", "coth"),
+    "basis": ("pyqed.phys", "basis"),
+    "boson": ("pyqed.phys", "boson"),
+    "driven_dynamics": ("pyqed.phys", "driven_dynamics"),
+    "pauli": ("pyqed.phys", "pauli"),
+    "sigmax": ("pyqed.phys", "sigmax"),
+    "sigmay": ("pyqed.phys", "sigmay"),
+    "sigmaz": ("pyqed.phys", "sigmaz"),
+    "isherm": ("pyqed.phys", "isherm"),
+    "isunitary": ("pyqed.phys", "isunitary"),
+    "isdiag": ("pyqed.phys", "isdiag"),
+    "hadamard": ("pyqed.qip", "hadamard"),
+    "SpinHalfFermionOperators": (
+        "pyqed.qchem.jordan_wigner.spinful",
+        "SpinHalfFermionOperators",
+    ),
+}
 
-try:  # pragma: no cover
-    from pyqed.dvr.dvr_1d import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
 
-try:  # pragma: no cover
-    from pyqed.mps.mps import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
-
-try:  # pragma: no cover
-    from pyqed.qip import *  # noqa: F401,F403
-except _OPTIONAL_IMPORT_ERRORS:
-    pass
+def __getattr__(name):
+    try:
+        module_name, attr_name = _LAZY_ATTRS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value

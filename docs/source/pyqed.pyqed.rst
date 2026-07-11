@@ -65,10 +65,10 @@ pyqed.pyqed.correlation module
    :undoc-members:
    :show-inheritance:
 
-pyqed.pyqed.deom module
+pyqed.pyqed.heom module
 -----------------------
 
-.. automodule:: pyqed.pyqed.deom
+.. automodule:: pyqed.pyqed.heom
    :members:
    :undoc-members:
    :show-inheritance:
@@ -153,10 +153,10 @@ pyqed.pyqed.optics module
    :undoc-members:
    :show-inheritance:
 
-pyqed.pyqed.oqs module
+pyqed.pyqed.qme module
 ----------------------
 
-.. automodule:: pyqed.pyqed.oqs
+.. automodule:: pyqed.pyqed.qme
    :members:
    :undoc-members:
    :show-inheritance:

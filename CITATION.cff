@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: >-
+  If you use PyQED, please cite the exact software release or Git commit and
+  the method-specific references for the algorithms used.
+title: PyQED
+type: software
+version: 0.2.0
+date-released: 2026-07-11
+authors:
+  - family-names: Gu
+    given-names: Bing
+  - family-names: Chen
+    given-names: Zihao
+repository-code: https://github.com/binggu56/pyqed
+url: https://pyqed.org
+license: MIT

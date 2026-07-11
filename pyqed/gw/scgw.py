@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import numpy as np
 
-<<<<<<< HEAD
 from pyqed.gw.gw import (
     GW,
     _get_hcore_ao,
@@ -26,9 +25,6 @@ from pyqed.gw.gw import (
     _spin_matrix_from_spatial,
     _spin_pair_factors,
 )
-=======
-from pyqed.gw.gw import GW, _reference_total_energy, _spin_pair_factors
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
 
 def _symmetric_frequency_grid(nfreq=17, wmax=20.0):
@@ -45,7 +41,6 @@ def _symmetric_frequency_grid(nfreq=17, wmax=20.0):
     return omega, weights
 
 
-<<<<<<< HEAD
 def _tangent_frequency_grid(nfreq=17, scale=10.0):
     if nfreq < 3:
         raise ValueError("nfreq must be at least 3.")
@@ -67,8 +62,6 @@ def _imaginary_frequency_grid(nfreq=17, wmax=20.0, kind="linear"):
     raise ValueError("grid must be 'linear' or 'tangent'.")
 
 
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 def _fermionic_matsubara_grid(nfreq=129, beta=200.0):
     if nfreq < 3:
         raise ValueError("density_nfreq must be at least 3.")
@@ -94,7 +87,6 @@ def _interp_matrix_grid(grid, values, x):
     return out.reshape(values.shape[1:])
 
 
-<<<<<<< HEAD
 def _interp_green_grid(grid, values, x, mu, static, eta=0.0):
     """Interpolate ``G(iw)`` and use its large-frequency tail off grid.
 
@@ -116,8 +108,6 @@ def _interp_green_grid(grid, values, x, mu, static, eta=0.0):
     return eye / z + np.asarray(static, dtype=np.complex128) / (z * z)
 
 
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 class SCGW:
     """Dense imaginary-axis self-consistent GW prototype.
 
@@ -147,10 +137,7 @@ class SCGW:
         adjust_mu=True,
         target_nelec=None,
         density_nfreq=129,
-<<<<<<< HEAD
         grid="tangent",
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     ):
         self._scf = mf
         self.mol = mf.mol
@@ -161,10 +148,7 @@ class SCGW:
         self.beta = float(beta)
         self.adjust_mu = bool(adjust_mu)
         self.density_nfreq = int(density_nfreq)
-<<<<<<< HEAD
         self.grid = str(grid).lower()
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
 
         # Reuse the existing GW builder for spin-orbital MO integrals,
         # HF eigenvalues, and the static mean-field potential.
@@ -176,11 +160,8 @@ class SCGW:
         self.target_nelec = float(self.nocc if target_nelec is None else target_nelec)
         self.e_mf = np.asarray(ref.e_mf, dtype=float)
         self.v_mf = np.asarray(ref.v_mf, dtype=float)
-<<<<<<< HEAD
         hcore_spatial = ref.mo_coeff.T @ _get_hcore_ao(ref) @ ref.mo_coeff
         self.hcore = _spin_matrix_from_spatial(hcore_spatial)
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         self.backend = "factorized" if ref.eri is None else "dense"
         self.pair_factors = None
         if self.backend == "factorized":
@@ -188,11 +169,7 @@ class SCGW:
             self.eri = None
         else:
             self.eri = np.asarray(ref.eri, dtype=float)
-<<<<<<< HEAD
         self.omega, self.weights = _imaginary_frequency_grid(nfreq, wmax, kind=self.grid)
-=======
-        self.omega, self.weights = _symmetric_frequency_grid(nfreq, wmax)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         self.density_omega = _fermionic_matsubara_grid(density_nfreq, beta)
         self.zero_index = self.nfreq // 2
 
@@ -218,15 +195,11 @@ class SCGW:
         self.e = None
         self.e_qp = None
         self.e_tot = None
-<<<<<<< HEAD
         self.e_tot_gm = None
         self.e_tot_lw = None
         self.energy_components = None
         self.e_scf = _reference_total_energy(ref)
         self.e_nuc = self._nuclear_repulsion_energy()
-=======
-        self.e_scf = _reference_total_energy(ref)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         self.info = None
         self.W0 = None
 
@@ -235,7 +208,6 @@ class SCGW:
         lumo = self.e_mf[self.nocc]
         return 0.5 * (homo + lumo)
 
-<<<<<<< HEAD
     def _nuclear_repulsion_energy(self):
         if hasattr(self._scf, "energy_nuc"):
             return float(self._scf.energy_nuc())
@@ -245,8 +217,6 @@ class SCGW:
             return float(self.mol.nuclear_repulsion())
         return 0.0
 
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     def _exchange_self_energy(self, density_matrix=None):
         if density_matrix is None:
             density_matrix = np.zeros((self.nso, self.nso))
@@ -264,7 +234,6 @@ class SCGW:
             sigma_x = -np.einsum("prsq,rs->pq", self.eri, density_matrix, optimize=True)
         return 0.5 * (sigma_x + sigma_x.T)
 
-<<<<<<< HEAD
     def _hartree_energy(self, density_matrix):
         density_matrix = np.asarray(density_matrix)
         if self.backend == "factorized":
@@ -372,8 +341,6 @@ class SCGW:
         )
         return components
 
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
     def _dyson_green_on_grid(self, sigma_c, omega, mu=None, sigma_x=None):
         if mu is None:
             mu = self.mu
@@ -420,7 +387,6 @@ class SCGW:
 
         nlo = self.particle_number(sigma_c=sigma_c, mu=lo, method="green", sigma_x=sigma_x)
         nhi = self.particle_number(sigma_c=sigma_c, mu=hi, method="green", sigma_x=sigma_x)
-<<<<<<< HEAD
         for _ in range(20):
             if nlo <= self.target_nelec <= nhi:
                 break
@@ -429,8 +395,6 @@ class SCGW:
             hi = float(np.max(energies) + margin)
             nlo = self.particle_number(sigma_c=sigma_c, mu=lo, method="green", sigma_x=sigma_x)
             nhi = self.particle_number(sigma_c=sigma_c, mu=hi, method="green", sigma_x=sigma_x)
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         if not (nlo <= self.target_nelec <= nhi):
             # Fall back to the midpoint of the frontier static eigenvalues.
             idx = int(np.clip(round(self.target_nelec), 1, len(energies) - 1))
@@ -491,23 +455,18 @@ class SCGW:
         dm = self.make_density_matrix(sigma_c=sigma_c, mu=mu, method=method, sigma_x=sigma_x)
         return float(np.trace(dm))
 
-<<<<<<< HEAD
     def _polarizability(self, green, mu=None, sigma_x=None):
         if mu is None:
             mu = self.mu
         if sigma_x is None:
             sigma_x = self.Sigma_x
         static = self.h0 + sigma_x
-=======
-    def _polarizability(self, green):
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         if self.backend == "factorized":
             naux = self.pair_factors.shape[0]
             pol = np.zeros((self.nfreq, naux, naux), dtype=np.complex128)
             for inu, nu in enumerate(self.omega):
                 acc = np.zeros((naux, naux), dtype=np.complex128)
                 for iw, w in enumerate(self.omega):
-<<<<<<< HEAD
                     g_shift = _interp_green_grid(
                         self.omega,
                         green,
@@ -516,9 +475,6 @@ class SCGW:
                         static=static,
                         eta=self.eta,
                     )
-=======
-                    g_shift = _interp_matrix_grid(self.omega, green, w + nu)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
                     g = green[iw]
                     acc -= self.weights[iw] * np.einsum(
                         "Ppq,pr,Qrs,sq->PQ",
@@ -536,7 +492,6 @@ class SCGW:
         for inu, nu in enumerate(self.omega):
             acc = np.zeros((self.nso, self.nso, self.nso, self.nso), dtype=np.complex128)
             for iw, w in enumerate(self.omega):
-<<<<<<< HEAD
                 g_shift = _interp_green_grid(
                     self.omega,
                     green,
@@ -545,9 +500,6 @@ class SCGW:
                     static=static,
                     eta=self.eta,
                 )
-=======
-                g_shift = _interp_matrix_grid(self.omega, green, w + nu)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
                 g = green[iw]
                 acc -= self.weights[iw] * np.einsum("pr,sq->pqrs", g_shift, g, optimize=True)
             pol[inu] = acc.reshape(dim, dim)
@@ -564,16 +516,12 @@ class SCGW:
                 screened[inu] = np.linalg.solve(eye - self.v_pair @ pol[inu], self.v_pair)
         return screened
 
-<<<<<<< HEAD
     def _correlation_self_energy(self, green, screened, mu=None, sigma_x=None):
         if mu is None:
             mu = self.mu
         if sigma_x is None:
             sigma_x = self.Sigma_x
         static = self.h0 + sigma_x
-=======
-    def _correlation_self_energy(self, green, screened):
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         if self.backend == "factorized":
             eye_aux = np.eye(self.pair_factors.shape[0], dtype=np.complex128)
             w_corr = screened - eye_aux[None, :, :]
@@ -583,7 +531,6 @@ class SCGW:
         for iw, w in enumerate(self.omega):
             acc = np.zeros((self.nso, self.nso), dtype=np.complex128)
             for inu, nu in enumerate(self.omega):
-<<<<<<< HEAD
                 g_shift = _interp_green_grid(
                     self.omega,
                     green,
@@ -592,9 +539,6 @@ class SCGW:
                     static=static,
                     eta=self.eta,
                 )
-=======
-                g_shift = _interp_matrix_grid(self.omega, green, w - nu)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
                 if self.backend == "factorized":
                     acc -= self.weights[inu] * np.einsum(
                         "rs,Ppr,PQ,Qqs->pq",
@@ -646,35 +590,23 @@ class SCGW:
         self.mu_history = [self.mu]
         fixed_screened = None
         if not update_screening:
-<<<<<<< HEAD
             pol0 = self._polarizability(green, mu=self.mu, sigma_x=sigma_x)
-=======
-            pol0 = self._polarizability(green)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             fixed_screened = self._screened_interaction(pol0)
             self.W0 = fixed_screened.copy()
 
         for cycle in range(1, int(max_cycle) + 1):
             if update_screening:
-<<<<<<< HEAD
                 pol = self._polarizability(green, mu=self.mu, sigma_x=sigma_x)
-=======
-                pol = self._polarizability(green)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
                 screened = self._screened_interaction(pol)
             else:
                 pol = None
                 screened = fixed_screened
-<<<<<<< HEAD
             sigma_new = self._correlation_self_energy(
                 green,
                 screened,
                 mu=self.mu,
                 sigma_x=sigma_x,
             )
-=======
-            sigma_new = self._correlation_self_energy(green, screened)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             mixed_sigma = (1.0 - damping) * sigma + damping * sigma_new
             if update_exchange:
                 trial_dm = self.make_density_matrix(
@@ -733,17 +665,12 @@ class SCGW:
         self.Sigma_x = sigma_x
         self.sigma_x = self.Sigma_x
         self.G = green
-<<<<<<< HEAD
         self.P = self._polarizability(green, mu=self.mu, sigma_x=self.Sigma_x)
-=======
-        self.P = self._polarizability(green)
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         self.W = self._screened_interaction(self.P) if update_screening else fixed_screened
         self.density_matrix = self.make_density_matrix(method="green", sigma_x=self.Sigma_x)
         self.nelec = float(np.trace(self.density_matrix))
         self.e_qp = self.quasiparticle_estimate()
         self.e = self.e_qp
-<<<<<<< HEAD
         self.energy_components = self.galitskii_migdal_total_energy(
             density_matrix=self.density_matrix,
         )
@@ -751,9 +678,6 @@ class SCGW:
         lw_components = self.luttinger_ward_total_energy(density_matrix=self.density_matrix)
         self.e_tot_lw = lw_components["e_tot"]
         self.e_tot = self.e_tot_gm
-=======
-        self.e_tot = None
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         self.info = {
             "method": (
                 "scgw_imaginary_axis_prototype"
@@ -763,10 +687,7 @@ class SCGW:
             "converged": self.converged,
             "nfreq": self.nfreq,
             "wmax": self.wmax,
-<<<<<<< HEAD
             "grid": self.grid,
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
             "beta": self.beta,
             "mu": self.mu,
             "target_nelec": self.target_nelec,
@@ -777,13 +698,9 @@ class SCGW:
             "density_nfreq": self.density_nfreq,
             "backend": self.backend,
             "density_matrix": "tail_corrected_matsubara_green_function",
-<<<<<<< HEAD
             "total_energy": "galitskii_migdal",
             "e_tot_gm": self.e_tot_gm,
             "e_tot_lw": self.e_tot_lw,
-=======
-            "total_energy": "not_implemented",
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4
         }
         return self
 
@@ -794,7 +711,6 @@ class SCGW:
     def scgw(self, **kwargs):
         kwargs["update_screening"] = True
         return self.run(**kwargs)
-<<<<<<< HEAD
 
 
 def frequency_convergence(
@@ -882,5 +798,3 @@ def frequency_convergence(
         rows.append(row)
         prev = row
     return rows
-=======
->>>>>>> d6d6e73f3eb01265d5d7bf89f474427f6a1ea1d4

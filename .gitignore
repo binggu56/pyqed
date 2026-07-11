@@ -2,6 +2,9 @@
 pyqed/__pycache__/
 pyqed/pyqed/__pycache__/
 build/
+dist/
+*.egg-info/
+.pytest_cache/
 *.pdf
 *.pyc
 *.npz
