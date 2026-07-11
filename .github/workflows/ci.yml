@@ -92,13 +92,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install build twine
+          rm -rf dist
           python -m build
           python -m twine check dist/*
       - name: Install and test the wheel in isolation
         run: |
           python -m venv /tmp/pyqed-wheel
           /tmp/pyqed-wheel/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-wheel/bin/python -m pip install dist/*.whl
+          /tmp/pyqed-wheel/bin/python -m pip install dist/pyqed-0.2.0-py3-none-any.whl
           cd /tmp
           /tmp/pyqed-wheel/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
           /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from importlib.util import find_spec; from pathlib import Path; import pyqed; from pyqed.gw import BSE, GW, TDA; from pyqed.namd import TDDFTDriver; from pyqed.qchem import MP2, Molecule; from pyqed.qchem.basis import _basis_path; from pyqed.qchem.dft import RKS; names=("pyqed.HEOM", "pyqed.HEOM.deom", "pyqed.floquet", "pyqed.gw", "pyqed.md", "pyqed.ml", "pyqed.namd", "pyqed.narg", "pyqed.mps.nonabelian", "pyqed.qchem.dft", "pyqed.qchem.mp"); assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert Path(_basis_path("sto-3g")).is_file(); assert all(find_spec(name) is not None for name in names); assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule, RKS, TDDFTDriver))'
@@ -107,7 +108,7 @@ jobs:
         run: |
           python -m venv /tmp/pyqed-sdist
           /tmp/pyqed-sdist/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-sdist/bin/python -m pip install dist/*.tar.gz
+          /tmp/pyqed-sdist/bin/python -m pip install dist/pyqed-0.2.0.tar.gz
           cd /tmp
           /tmp/pyqed-sdist/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
 

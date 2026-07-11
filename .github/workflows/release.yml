@@ -41,6 +41,7 @@ jobs:
           python -c 'from pyqed.HEOM.heom import HEOMSolver; from pyqed.HEOM.deom import DEOMSolver; assert HEOMSolver is not None and DEOMSolver is not None'
       - name: Build and inspect the universal wheel and source distribution
         run: |
+          rm -rf dist
           python -m build
           python -m twine check dist/*
           python - <<'PY'
@@ -68,7 +69,7 @@ jobs:
         run: |
           python -m venv /tmp/pyqed-release
           /tmp/pyqed-release/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-release/bin/python -m pip install dist/*.whl
+          /tmp/pyqed-release/bin/python -m pip install dist/pyqed-0.2.0-py3-none-any.whl
           cd /tmp
           /tmp/pyqed-release/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
           /tmp/pyqed-release/bin/python -c 'from importlib.metadata import version; from importlib.util import find_spec; import pyqed; from pyqed.gw import BSE, GW, TDA; from pyqed.namd import TDDFTDriver; from pyqed.qchem import MP2, Molecule; from pyqed.qchem.dft import RKS; names=("pyqed.HEOM", "pyqed.HEOM.deom", "pyqed.floquet", "pyqed.gw", "pyqed.md", "pyqed.ml", "pyqed.namd", "pyqed.narg", "pyqed.mps.nonabelian", "pyqed.qchem.dft", "pyqed.qchem.mp"); assert pyqed.__version__ == version("pyqed"); assert all(find_spec(name) is not None for name in names); assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule, RKS, TDDFTDriver))'
