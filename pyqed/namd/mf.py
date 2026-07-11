@@ -13,10 +13,8 @@ Ehrenfest dynamics for model Hamiltonians
 
 
 import numpy as np
-import numba
 import sys
 import math
-import tqdm
 from copy import deepcopy
 from pyqed import au2k, au2angstrom, au2wavenumber, ket2dm
 from opt_einsum import contract

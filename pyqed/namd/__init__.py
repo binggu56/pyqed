@@ -1,32 +1,43 @@
-from .bh import BornHuang2, BornHuang
-from .ehrenfest import (
-    AbInitioEhrenfest,
-    CoupledOscillatorModel,
-    Ehrenfest,
-    EhrenfestTrajectory,
-    GeometricEhrenfest,
-    TDDFTDriver,
-    TDDFTEhrenfest,
-    TDDFTTrajectory,
-)
-from .ldrfg import AbInitioLDRFGAdapter, LDRFG, LDRFGRHS, grad_overlap_from_derivative_couplings
-from .triatomic import Triatom, Triatomic
+"""Nonadiabatic dynamics with lazy optional-feature imports."""
 
-__all__ = [
-    "AbInitioEhrenfest",
-    "BornHuang",
-    "BornHuang2",
-    "CoupledOscillatorModel",
-    "Ehrenfest",
-    "EhrenfestTrajectory",
-    "GeometricEhrenfest",
-    "AbInitioLDRFGAdapter",
-    "LDRFG",
-    "LDRFGRHS",
-    "grad_overlap_from_derivative_couplings",
-    "TDDFTDriver",
-    "TDDFTEhrenfest",
-    "TDDFTTrajectory",
-    "Triatom",
-    "Triatomic",
-]
+from importlib import import_module
+
+
+_EXPORTS = {
+    "AbInitioEhrenfest": (".ehrenfest", "AbInitioEhrenfest"),
+    "AbInitioLDRFGAdapter": (".ldrfg", "AbInitioLDRFGAdapter"),
+    "BornHuang": (".bh", "BornHuang"),
+    "BornHuang2": (".bh", "BornHuang2"),
+    "CoupledOscillatorModel": (".ehrenfest", "CoupledOscillatorModel"),
+    "Ehrenfest": (".ehrenfest", "Ehrenfest"),
+    "EhrenfestTrajectory": (".ehrenfest", "EhrenfestTrajectory"),
+    "GeometricEhrenfest": (".ehrenfest", "GeometricEhrenfest"),
+    "LDRFG": (".ldrfg", "LDRFG"),
+    "LDRFGRHS": (".ldrfg", "LDRFGRHS"),
+    "TDDFTDriver": (".ehrenfest", "TDDFTDriver"),
+    "TDDFTEhrenfest": (".ehrenfest", "TDDFTEhrenfest"),
+    "TDDFTTrajectory": (".ehrenfest", "TDDFTTrajectory"),
+    "Triatom": (".triatomic", "Triatom"),
+    "Triatomic": (".triatomic", "Triatomic"),
+    "grad_overlap_from_derivative_couplings": (
+        ".ldrfg",
+        "grad_overlap_from_derivative_couplings",
+    ),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

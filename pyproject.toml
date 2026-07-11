@@ -13,7 +13,13 @@ description = "Electronic structure, quantum dynamics, and spectroscopy in Pytho
 readme = {file = "README.rst", content-type = "text/x-rst"}
 requires-python = ">=3.10,<3.14"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "pyqed/qchem/basis_set/BASIS_SET_EXCHANGE_LICENSE.txt",
+    "pyqed/qchem/basis_set/PYSCF_APACHE_LICENSE.txt",
+    "pyqed/qchem/basis_set/PYSCF_NOTICE.txt",
+]
 authors = [
     {name = "Bing Gu", email = "gubing@westlake.edu.cn"},
 ]
