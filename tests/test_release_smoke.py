@@ -32,6 +32,7 @@ def test_public_quickstart_runs(capsys):
 def test_documented_package_paths_are_distributed():
     package_paths = (
         "pyqed.HEOM",
+        "pyqed.HEOM.deom",
         "pyqed.floquet",
         "pyqed.gw",
         "pyqed.md",
