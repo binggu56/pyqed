@@ -1,5 +1,12 @@
-# cc-pVDZ-JKFIT converted from the PySCF bundled cc-pvdz-jkfit.dat
-# Original source in PySCF: MOLPRO/Weigend JKFIT library
+# cc-pVDZ-JKFIT converted from PySCF 2.12.1:
+# pyscf/gto/basis/cc-pvdz-jkfit.dat
+# Modified by PyQED only to express the data in Gaussian .gbs syntax.
+# Upstream source: MOLPRO weigend_jkfit.libmol, 11 February 2010.
+# The upstream header says this double-zeta set was formed by truncating the
+# highest-angular-momentum functions from the triple-zeta set.
+# Reference: F. Weigend, Phys. Chem. Chem. Phys. 4, 4285-4291 (2002).
+# DOI: 10.1039/B204199P
+# License: Apache-2.0; see PYSCF_APACHE_LICENSE.txt and PYSCF_NOTICE.txt.
 
 H     0
 S   1   1.00
@@ -1394,4 +1401,3 @@ F   1   1.00
 F   1   1.00
    5.0810000000E-01   1.0000000000E+00
 ****
-

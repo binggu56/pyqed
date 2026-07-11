@@ -18,6 +18,36 @@ History
 * Added a reproducible H2/STO-3G RHF comparison against PySCF, with a
   machine-readable manifest and narrow validation claim.
 
+0.1.5 (2022-10-25)
+------------------
+
+* Maintenance wheel published to PyPI; detailed change notes were not
+  recorded in the historical project changelog.
+
+0.1.4 (2022-10-25)
+------------------
+
+* Maintenance wheel published to PyPI; detailed change notes were not
+  recorded in the historical project changelog.
+
+0.1.3 (2022-10-25)
+------------------
+
+* Maintenance wheel published to PyPI; detailed change notes were not
+  recorded in the historical project changelog.
+
+0.1.2 (2022-10-14)
+------------------
+
+* Maintenance wheel published to PyPI; detailed change notes were not
+  recorded in the historical project changelog.
+
+0.1.1 (2022-07-21)
+------------------
+
+* Maintenance wheel published to PyPI; detailed change notes were not
+  recorded in the historical project changelog.
+
 0.1.0 (2018-08-11)
 ------------------
 

@@ -32,7 +32,7 @@ Dynamics and representations
 
 * :mod:`pyqed.dvr` -- discrete and finite-element variable representations.
 * :mod:`pyqed.namd` -- nonadiabatic and locally diabatic dynamics.
-* :mod:`pyqed.heom` -- hierarchical open-system solvers.
+* :mod:`pyqed.HEOM` -- hierarchical open-system solvers.
 * :mod:`pyqed.floquet` -- periodically driven models.
 * :mod:`pyqed.polariton` -- light--matter model workflows.
 * :mod:`pyqed.mps` -- matrix-product-state and related research methods.
