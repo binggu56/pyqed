@@ -46,8 +46,12 @@ def test_documented_package_paths_are_distributed():
     assert all(find_spec(name) is not None for name in package_paths)
 
     from pyqed.gw import BSE, GW, TDA
+    from pyqed.HEOM.heom import HEOMSolver
     from pyqed.namd import TDDFTDriver
     from pyqed.qchem import MP2, Molecule
     from pyqed.qchem.dft import RKS
 
-    assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule, RKS, TDDFTDriver))
+    assert all(
+        item is not None
+        for item in (BSE, GW, TDA, HEOMSolver, MP2, Molecule, RKS, TDDFTDriver)
+    )

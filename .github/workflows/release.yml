@@ -36,8 +36,9 @@ jobs:
       - name: Install release tools and run acceptance tests
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test]"
+          python -m pip install -e ".[test,heom]"
           python -m pytest -q tests/test_release_smoke.py
+          python -c 'from pyqed.HEOM.heom import HEOMSolver; from pyqed.HEOM.deom import DEOMSolver; assert HEOMSolver is not None and DEOMSolver is not None'
       - name: Build and inspect the universal wheel and source distribution
         run: |
           python -m build

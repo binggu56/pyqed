@@ -60,6 +60,11 @@ accelerators = [
     "numba>=0.59",
     "psutil>=5.9",
 ]
+heom = [
+    "numba>=0.59",
+    "sympy>=1.12",
+    "tqdm>=4.66",
+]
 md = [
     "ase>=3.23",
     "h5py>=3.10",
