@@ -39,9 +39,12 @@ PYTHONPATH=. python path/to/benchmark.py
 Use different thread settings only when parallel scaling is itself part of the
 benchmark, and record every setting.
 
-## Candidate validation records
+## Reviewed validation records
 
-- [`h2-sto3g-rhf-pyscf`](h2-sto3g-rhf-pyscf/run.py) compares one native
-  PyQED RHF total energy with PySCF. The script and exact input are tracked;
-  a completed result, manifest, and hashes are added only after running from a
-  clean, identified source commit.
+- [`h2-sto3g-rhf-pyscf`](h2-sto3g-rhf-pyscf/RESULT.md) compares one native
+  PyQED RHF total energy with PySCF 2.12.1. It was run from clean source commit
+  `7dbb9bcc6625d9e4030627140dd14738c60a0e67` with the observed
+  `rys-cython-blocked` builder. Its
+  [`manifest.json`](h2-sto3g-rhf-pyscf/manifest.json) records the exact input,
+  command, dependencies, environment, tolerance, raw-output and backend hashes,
+  and deliberately narrow claim scope.

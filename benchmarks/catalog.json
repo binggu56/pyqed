@@ -9,11 +9,12 @@
     {
       "id": "h2-sto3g-rhf-pyscf",
       "kind": ["external_validation"],
-      "status": "candidate",
+      "status": "reviewed",
       "source": "benchmarks/h2-sto3g-rhf-pyscf/run.py",
-      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=ignore MPLCONFIGDIR=/private/tmp/pyqed-benchmark-mpl-7dbb9bc OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
       "optional_dependencies": ["pyscf"],
-      "claim_scope": "Total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G compared with PySCF 2.12.1; no performance or broader accuracy claim."
+      "manifest": "benchmarks/h2-sto3g-rhf-pyscf/manifest.json",
+      "claim_scope": "At source commit 7dbb9bcc6625d9e4030627140dd14738c60a0e67, the total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G using the observed rys-cython-blocked builder agrees with PySCF 2.12.1 within 1e-9 hartree; no performance or broader accuracy claim."
     },
     {
       "id": "native-h4-casscf-representations",
