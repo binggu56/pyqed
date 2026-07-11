@@ -13,7 +13,7 @@ from pyqed import dag, tensor, transform
 
 
 from pyqed import SpinHalfFermionOperators, eigh
-from pyqed.mps.mps import MPO, DMRG
+from pyqed.mps.dmrg import MPO, DMRG
 
 
 from scipy.sparse.linalg import eigsh
@@ -23,7 +23,7 @@ from opt_einsum import contract
 
 import numpy as np
 
-from pyqed import TFIM, multispin, Molecule, build_atom_from_coords
+from pyqed import TFIM, multispin, Molecule
 
 # from pyqed.qchem.ci.fci import FCI
 # from pyqed.phys import obs, isdiag
@@ -86,6 +86,22 @@ class FermiHubbard(SpinHalfFermionChain):
         self.eigvecs = None
 
     def exact_diag(self, nstates=1):
+        """
+        exact diag without using any symmetry
+        
+        Check the number of particles and spin.
+
+        Parameters
+        ----------
+        nstates : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        E : TYPE
+            DESCRIPTION.
+
+        """
 
         # # single electron part
         # Ca = mf.mo_coeff[:, :self.ncas]
@@ -456,8 +472,8 @@ class LongRangeChain(FermiHubbard):
 if __name__=='__main__':
     # pass
 
-    hubbard = FermiHubbard(t=1, U=1, nsites=4)
-    hubbard.exact_diag(2)
+    hubbard = FermiHubbard(t=1, U=0., nsites=6)
+    hubbard.exact_diag(10)
 
-    dmrg = hubbard.DMRG(D=10)
-    dmrg.run()
+    # dmrg = hubbard.DMRG(D=10)
+    # dmrg.run()

@@ -1,0 +1,19 @@
+Basis Set Exchange data notice
+==============================
+
+Except for cc-pvdz-jkfit.1.gbs, the .gbs files in this directory identify
+themselves as data from Basis Set Exchange version 0.11.
+Project: https://www.basissetexchange.org/
+Source: https://github.com/MolSSI-BSE/basis_set_exchange
+
+License: BSD-3-Clause. The complete license is stored in
+BASIS_SET_EXCHANGE_LICENSE.txt in this directory.
+
+Citation guidance: https://molssi-bse.github.io/basis_set_exchange/
+Current project article: B. P. Pritchard et al., J. Chem. Inf. Model. 2019,
+59(11), 4814-4820. https://doi.org/10.1021/acs.jcim.9b00725
+
+cc-pvdz-jkfit.1.gbs is instead converted from the PySCF 2.12.1 distribution.
+Its Apache License 2.0 text and upstream NOTICE are stored in
+PYSCF_APACHE_LICENSE.txt and PYSCF_NOTICE.txt. See the file header and the
+repository-level THIRD_PARTY_NOTICES.md for provenance and citation details.

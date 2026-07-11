@@ -1,6 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import NullLocator
 from scipy.linalg import fractional_matrix_power
 
 def getU(A):

@@ -1,0 +1,77 @@
+This is BibTeX, Version 0.99d (TeX Live 2025)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: rovibronic_ldr_theory.aux
+The style file: apsrev4-2.bst
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Database file #1: rovibronic_ldr_theoryNotes.bib
+Warning--I didn't find a database entry for "eckart1935"
+Warning--I didn't find a database entry for "watson1968"
+Warning--I didn't find a database entry for "bunkerjensen1998"
+Warning--I didn't find a database entry for "lauvergnat2016"
+Warning--I didn't find a database entry for "bornhuang1954"
+Warning--I didn't find a database entry for "zare1988"
+Warning--I didn't find a database entry for "varshalovich1988"
+Warning--I didn't find a database entry for "lightcarrington2000"
+control{REVTEX42Control}, control.key{N/A}, control.author{N/A}, control.editor{N/A}, control.title{N/A}, control.pages{N/A}, control.year{N/A}, control.eprint{N/A}, 
+control{apsrev42Control}, control.key{N/A}, control.author{08}, control.editor{1}, control.title{0}, control.pages{0}, control.year{1}, control.eprint{N/A}, 
+Warning--jnrlst (dependency: not reversed) set 1
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
+apsrev4-2.bst 2019-01-14 (MD) hand-edited version of apsrev4-1.bst
+Control: key (0) 
+Control: author (8) initials jnrlst
+Control: editor formatted (1) identically to author
+Control: production of article title (0) allowed
+Control: page (0) single
+Control: year (1) truncated
+Control: production of eprint (0) enabled
+You've used 2 entries,
+            6079 wiz_defined-function locations,
+            1643 strings with 15173 characters,
+and the built_in function-call counts, 991 in all, are:
+= -- 12
+> -- 16
+< -- 35
++ -- 8
+- -- 20
+* -- 131
+:= -- 72
+add.period$ -- 0
+call.type$ -- 2
+change.case$ -- 0
+chr.to.int$ -- 12
+cite$ -- 2
+duplicate$ -- 137
+empty$ -- 17
+format.name$ -- 0
+if$ -- 127
+int.to.chr$ -- 1
+int.to.str$ -- 9
+missing$ -- 28
+newline$ -- 52
+num.names$ -- 0
+pop$ -- 68
+preamble$ -- 1
+purify$ -- 0
+quote$ -- 0
+skip$ -- 33
+stack$ -- 0
+substring$ -- 12
+swap$ -- 110
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 10
+type$ -- 12
+warning$ -- 1
+while$ -- 11
+width$ -- 0
+write$ -- 52
+(There were 9 warnings)

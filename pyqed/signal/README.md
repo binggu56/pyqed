@@ -4,4 +4,5 @@ SOS signals
 - fluorensence 
 - pump-probe
 - sum-frequency generation
+- second-harmonic generation
 - four-wave mixing 

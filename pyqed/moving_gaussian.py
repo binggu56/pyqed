@@ -19,7 +19,7 @@ import scipy
 from scipy.linalg import inv
 from scipy.sparse import kron, eye
 
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 
 
@@ -31,7 +31,8 @@ class GWP:
         """
         normalized multidimensional Gaussian wavepackets
         .. math::
-            g(x) ~ e^{- 1/2 (x-q)^T A (x-q) + ip(x-q) + i \theta}
+            
+            g(x) = N e^{- 1/2 (x-q)^T A (x-q) + ip(x-q) + i p_0 \cdot (x - x_0) + i\theta}
 
         Parameters
         ----------

@@ -2,6 +2,9 @@
 pyqed/__pycache__/
 pyqed/pyqed/__pycache__/
 build/
+dist/
+*.egg-info/
+.pytest_cache/
 *.pdf
 *.pyc
 *.npz
@@ -44,5 +47,12 @@ Checkpoints
 Miniforge3-MacOSX-arm64.sh
 Scan_Results_Nz_32
 .vscode
-examples/qchem/local_test
-pyqed/qchem/gdvr/hf_recontraction_along_z/
+*.png
+*.csv
+*.png
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.tex

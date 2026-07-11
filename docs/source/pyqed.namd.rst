@@ -1,53 +1,14 @@
-pyqed.namd package
-==================
+Nonadiabatic Molecular Dynamics
+===============================
 
-Submodules
-----------
+The :mod:`pyqed.namd` package contains adiabatic and diabatic wavepacket
+dynamics utilities.
 
-pyqed.namd.adiabatic module
----------------------------
+Main source modules:
 
-.. automodule:: pyqed.namd.adiabatic
-   :members:
-   :undoc-members:
-   :show-inheritance:
+* ``pyqed.namd.adiabatic``
+* ``pyqed.namd.diabatic``
+* ``pyqed.namd.ldrfg``
 
-pyqed.namd.diabatic module
---------------------------
-
-.. automodule:: pyqed.namd.diabatic
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.namd.eckart module
-------------------------
-
-.. automodule:: pyqed.namd.eckart
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.namd.gmat module
-----------------------
-
-.. automodule:: pyqed.namd.gmat
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.namd.ldr module
----------------------
-
-.. automodule:: pyqed.namd.ldr
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Module contents
----------------
-
-.. automodule:: pyqed.namd
-   :members:
-   :undoc-members:
-   :show-inheritance:
+This page is static because several legacy NAMD helper files are not currently
+valid importable Python modules, which makes autodoc unsuitable for RTD.

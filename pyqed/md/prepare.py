@@ -6,9 +6,6 @@ Created on Tue Nov 19 17:30:04 2024
 @author: bingg
 """
 
-import numpy as np
-from scipy import constants as cst
-
 class Prepare:
     def __init__(self,
                 ureg, # Pint unit registry

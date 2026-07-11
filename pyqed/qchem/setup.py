@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Dec 30 21:56:03 2025
 
-@author: bingg
-"""
+from setuptools import Extension, setup
 
-from setuptools import setup
+import numpy as np
 from Cython.Build import cythonize
 
+
+extensions = [
+    Extension(
+        name="_basis_cy",
+        sources=["_basis_cy.pyx"],
+        include_dirs=[np.get_include()],
+    ),
+    Extension(
+        name="_rys_cy",
+        sources=["_rys_cy.pyx"],
+        include_dirs=[np.get_include()],
+    ),
+]
+
+
 setup(
-    ext_modules = cythonize("basis.py")
+    ext_modules=cythonize(
+        extensions,
+        compiler_directives={"language_level": "3"},
+    )
 )

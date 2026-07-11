@@ -22,7 +22,7 @@ import warnings
 import logging
 
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct
-from pyqed.qchem.mcscf.casci import make_rdm1
+from pyqed.qchem.mcscf.casci import make_rdm1, spin_square
 from pyqed.qchem.dvr import RHF1D
 import pyqed
 
@@ -36,7 +36,7 @@ def direct_ci(ci0=None):
 
 class CASCI(pyqed.qchem.mcscf.casci.CASCI):
     def __init__(self, mf, ncas, nelecas=None, mu=None):
-        """
+        r"""
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
 
@@ -101,6 +101,9 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
         self.SC1 = None
         self.SC2 = None
         self.e_tot = None
+        self.ss = None
+        self.shift = None
+        self.spin_purification = False
 
     def get_SO_matrix(self, SF=False, H1=None, H2=None):
         """
@@ -181,6 +184,32 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
         # else:
         #     return H1, H2
         return H1, H2
+
+    def _apply_spin_purification(self, h1e, h2e):
+        """Apply the parent CASCI singlet spin-penalty operator to DVR integrals."""
+        if self.ss != 0:
+            raise NotImplementedError('Second-order spin penalty not implemented.')
+
+        shift = self.shift
+        norb = self.ncas
+        h1e = np.array(h1e, copy=True)
+        h2e = np.array(h2e, copy=True)
+
+        h1e += 0.75 * shift * np.eye(norb)[None, :, :]
+
+        delta = np.zeros_like(h2e)
+        for p in range(norb):
+            for q in range(norb):
+                delta[:, :, p, q, q, p] -= shift
+                delta[:, :, p, p, q, q] -= 0.5 * shift
+
+        # DVR same-spin blocks are already antisymmetrized in get_SO_matrix().
+        h2e[0, 0] += delta[0, 0] - delta[0, 0].swapaxes(1, 3)
+        h2e[1, 1] += delta[1, 1] - delta[1, 1].swapaxes(1, 3)
+        h2e[0, 1] += delta[0, 1]
+        h2e[1, 0] += delta[1, 0]
+
+        return h1e, h2e
 
     def natural_orbitals(self, dm=None, nco=None):
         natural_orb_occ, natural_orb_coeff = np.linalg.eigh(dm)
@@ -277,7 +306,6 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
 
     def run(self, nstates=3):
         from pyqed.qchem.ci.fci import SlaterCondon, CI_H
-        from pyqed.qchem.mcscf import spin_square
 
         mf = self.mf
         ncas = self.ncas
@@ -299,7 +327,10 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
 
         # build the 1e and 2e Hamiltonian in MOs
 
-        H1, H2 = self.get_SO_matrix(mf)
+        H1, H2 = self.get_SO_matrix()
+
+        if self.spin_purification:
+            H1, H2 = self._apply_spin_purification(H1, H2)
 
         # build the CI Hamiltonain
         SC1, SC2 = SlaterCondon(Binary)
@@ -326,7 +357,7 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
 
 
     def make_rdm1(self, state_id, with_core=False, with_vir=False, representation='mo'):
-        """
+        r"""
         spin-traced 1e reduced density matrix
         .. math::
 
@@ -362,15 +393,10 @@ class CASCI(pyqed.qchem.mcscf.casci.CASCI):
         else:
             return make_rdm1(ci, self.binary, self.SC1)
 
-    def fix_spin(self,s=0):
-        pass
-
-
-
 # def nonorthogonal_transition_density_matrix(cibra, ciket, h1e=None, h2e=None):
 
 def overlap(cibra, ciket, h1e=None, h2e=None, return_tdm1=False):
-    '''s
+    r'''s
     Overlap between two nonorthogonal determinant wavefunctions with
     a common set of orthonormal AOs.
 

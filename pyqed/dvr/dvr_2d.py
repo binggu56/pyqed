@@ -1,12 +1,4 @@
-"""
-Use Discrete Variable Representation method to solve
-two-dimensional potentials.
 
-A good general introduction to DVR methods is
-Light and Carrington, Adv. Chem. Phys. 114, 263 (2000)
-"""
-
-from matplotlib import pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import scipy.sparse.linalg as sla
@@ -30,6 +22,13 @@ def export_to_matlab(fname, psi, fmt='matlab'):
 
     
 class DVRN(object):
+    """
+    Use Discrete Variable Representation method to solve
+    two-dimensional potentials.
+
+    A good general introduction to DVR methods is
+    Light and Carrington, Adv. Chem. Phys. 114, 263 (2000)
+    """
     
     def __init__(self, domains, levels, ndim=2, mass=None): #xlim=None, nx, ylim, ny, mx=1, my=1):
         
@@ -534,7 +533,33 @@ class DVR2(object):
     #     if doshow: plt.show()
     #     return
 
+    # def td(self, **kwargs):
+    #     if self.H is None:
+    #         self.buildH(**kwargs)
+        
+        
+    def TDSE(self):
+        pass
+    
     def run(self, k=6, **kwargs):
+        """
+        compute eigenstates
+
+        Parameters
+        ----------
+        k : TYPE, optional
+            DESCRIPTION. The default is 6.
+        **kwargs : TYPE
+            DESCRIPTION.
+
+        Returns
+        -------
+        E : TYPE
+            DESCRIPTION.
+        U : TYPE
+            DESCRIPTION.
+
+        """
 
         if self.H is None:
             self.buildH(**kwargs)
@@ -919,7 +944,7 @@ if __name__ == '__main__':
         return 0.5 * (x - x0)**2 + 0.5 * (y - y0)**2 + 2*x*y + x**2 * y + x * y**2 + x**2*y**2
         
     nx, ny = 15, 15
-    dvr = DVR2((-6,6), nx, (-6,6), ny)
+    dvr = DVR2((-6,6), (-6,6), nx, ny)
     
     
     dvr.v(sho)

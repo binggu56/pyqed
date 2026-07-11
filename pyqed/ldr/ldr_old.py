@@ -22,7 +22,6 @@ from scipy.linalg import inv
 from scipy.sparse import kron, eye
 from scipy.linalg import eigh
 
-import matplotlib.pyplot as plt
 # import proplot as plt
 
 # class ResultLDR(Result):

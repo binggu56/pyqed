@@ -32,6 +32,119 @@ class QN(tuple):
     def __lt__(self, other):
         return super().__lt__(other)
 
+    def __reduce__(self):
+        return (QN, tuple(self))
+
+
+class AbelianSector(tuple):
+    """Labelled Abelian sector with qn-like arithmetic."""
+
+    def __new__(cls, labels, components):
+        obj = super().__new__(cls, tuple(components))
+        obj.labels = tuple(str(label).lower() for label in labels)
+        obj.components = tuple(components)
+        return obj
+
+    def _combine(self, other, sign=1):
+        if not isinstance(other, AbelianSector) or self.labels != other.labels:
+            return NotImplemented
+        out = []
+        for label, left, right in zip(self.labels, self.components, other.components):
+            if label in {"pg", "point_group", "abelianpg"}:
+                out.append(int(left) ^ int(right))
+            else:
+                out.append(left + sign * right)
+        return AbelianSector(self.labels, tuple(out))
+
+    def __add__(self, other):
+        return self._combine(other, sign=1)
+
+    def __sub__(self, other):
+        return self._combine(other, sign=-1)
+
+    def __mul__(self, scalar):
+        return AbelianSector(
+            self.labels,
+            tuple(0 if label in {"pg", "point_group", "abelianpg"} else value * scalar
+                  for label, value in zip(self.labels, self.components)),
+        )
+
+    def __rmul__(self, scalar):
+        return self.__mul__(scalar)
+
+    def __neg__(self):
+        return self * -1
+
+    def __repr__(self):
+        return f"AbelianSector({self.labels!r}, {self.components!r})"
+
+    def __reduce__(self):
+        return (AbelianSector, (self.labels, self.components))
+
+
+class Sector(tuple):
+    """Generic labelled product sector, including ``charge x SU(2)``."""
+
+    def __new__(cls, labels, components):
+        obj = super().__new__(cls, tuple(components))
+        obj.labels = tuple(str(label).lower() for label in labels)
+        obj.components = tuple(components)
+        return obj
+
+    def fuse(self, other):
+        if not isinstance(other, Sector) or self.labels != other.labels:
+            return NotImplemented
+        try:
+            from pyqed.mps.su2 import SU2Irrep, fuse_irreps
+        except Exception as exc:
+            raise TypeError("SU(2) sector fusion requires pyqed.mps.su2.") from exc
+
+        partial = [()]
+        for label, left, right in zip(self.labels, self.components, other.components):
+            if label == "su2":
+                if not isinstance(left, SU2Irrep) or not isinstance(right, SU2Irrep):
+                    raise TypeError("SU(2) components must be SU2Irrep instances.")
+                values = fuse_irreps(left, right)
+            elif label in {"pg", "point_group", "abelianpg"}:
+                values = (int(left) ^ int(right),)
+            else:
+                values = (left + right,)
+            partial = [prefix + (value,) for prefix in partial for value in values]
+        return tuple(Sector(self.labels, components) for components in partial)
+
+    def __repr__(self):
+        return f"Sector({self.labels!r}, {self.components!r})"
+
+    def __reduce__(self):
+        return (Sector, (self.labels, self.components))
+
+
+def zero_like_sector(sector):
+    if isinstance(sector, AbelianSector):
+        return sector * 0
+    if isinstance(sector, Sector):
+        try:
+            from pyqed.mps.su2 import SU2Irrep
+        except Exception:
+            SU2Irrep = None
+        comps = []
+        for label, value in zip(sector.labels, sector.components):
+            if label == "su2" and SU2Irrep is not None:
+                comps.append(SU2Irrep(0))
+            else:
+                comps.append(0)
+        return Sector(sector.labels, tuple(comps))
+    if isinstance(sector, QN):
+        return QN(*([0] * len(sector)))
+    if np.isscalar(sector):
+        return type(sector)(0)
+    return type(sector)(*[0] * len(sector))
+
+
+def is_sector_like(value):
+    return isinstance(value, (QN, AbelianSector, Sector))
+
+
 class BlockTensor:
     """
     U(1) Symmetric Tensor with Block Sparsity.
@@ -49,7 +162,7 @@ class BlockTensor:
 
     def copy(self):
         new_data = {k: v.copy() for k, v in self.data.items()}
-        return BlockTensor(new_data, self.qns[:], self.dirs[:])
+        return BlockTensor(new_data, [list(q) for q in self.qns], self.dirs[:])
 
     def __add__(self, other):
         """Tensor addition (A + B)."""
@@ -89,13 +202,15 @@ class BlockTensor:
         total = 0.0
         for k, block_A in self.data.items():
             if k in other.data:
-                # Sum of element-wise products (Frobenius inner product)
-                total += np.sum(block_A.conj() * other.data[k])
+                total += np.vdot(block_A, other.data[k])
         return total
 
     def norm(self):
         """Frobenius norm."""
-        return np.sqrt(np.abs(self.dot(self)))
+        total = 0.0
+        for block in self.data.values():
+            total += float(np.real(np.vdot(block, block)))
+        return np.sqrt(max(total, 0.0))
 
     def transpose(self, *axes):
         """Permute legs."""
@@ -213,37 +328,179 @@ def tensordot(A, B, axes):
 #         return QN(*vals)
 
 class SymmetryManager:
-    def __init__(self, phys_qns, target_qn, sym_types=None):
+    def __init__(self, sym_list=None, target_qn=None, sym_types=None, orb_sym=None):
         """
-        phys_qns: list of QN objects representing the local Hilbert space basis.
-        target_qn: The global target QN object for the right boundary.
-        sym_types: Metadata list for legacy reporting (e.g., ['charge', 'sz']).
+        Shared symmetry-label helper.
+
+        The preferred API is ``SymmetryManager(["charge", "sz"])``.  The older
+        ``SymmetryManager(phys_qns, target_qn, sym_types=...)`` form is still
+        accepted for local tensor code that already owns explicit sector lists.
         """
-        self.phys_qns = phys_qns
-        self.target_qn = target_qn
-        # We store sym_types to satisfy the legacy check_abelian_symmetry method
-        self.sym_types = sym_types if sym_types is not None else ['charge', 'sz']
-        
-        self.rank = len(target_qn) if target_qn else 0
+        labels_like = (
+            target_qn is None
+            and (
+                sym_list is None
+                or sym_list is True
+                or sym_list is False
+                or (
+                    isinstance(sym_list, (list, tuple))
+                    and all(isinstance(item, str) for item in sym_list)
+                )
+            )
+        )
+        self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
+        if labels_like:
+            if sym_list is True:
+                sym_list = ["charge", "sz"]
+            elif sym_list in (None, False):
+                sym_list = []
+            self.sym_types = tuple(str(sym).lower() for sym in sym_list)
+            self.target_qn = None
+            if "su2" in self.sym_types:
+                from pyqed.mps.su2 import SU2Irrep
+
+                self.phys_qns = [
+                    self._sector_component_tuple((0, SU2Irrep(0), 0)),
+                    self._sector_component_tuple((1, SU2Irrep(1), self._pg(0))),
+                    self._sector_component_tuple((2, SU2Irrep(0), 0)),
+                ]
+            elif "sz" in self.sym_types or "pg" in self.sym_types:
+                self.phys_qns = [
+                    self._sector_component_tuple((0, 0, 0)),
+                    self._sector_component_tuple((1, 1, self._pg(0))),
+                    self._sector_component_tuple((1, -1, self._pg(0))),
+                    self._sector_component_tuple((2, 0, 0)),
+                ]
+            elif "charge" in self.sym_types:
+                self.phys_qns = [
+                    self._sector_component_tuple((0, 0, 0)),
+                    self._sector_component_tuple((1, 0, self._pg(0))),
+                ]
+            else:
+                self.phys_qns = []
+        else:
+            self.phys_qns = sym_list
+            self.target_qn = target_qn
+            self.sym_types = tuple(
+                str(sym).lower() for sym in (sym_types if sym_types is not None else ["charge", "sz"])
+            )
+        self.rank = len(self.sym_types)
         self.enabled = self.rank > 0
+        self.has_nonabelian = "su2" in self.sym_types
+
+    def _sector_component_tuple(self, values):
+        charge, spin, pg = values
+        comps = []
+        for sym in self.sym_types:
+            if sym in {"charge", "n", "particle"}:
+                comps.append(charge)
+            elif sym in {"sz", "spin", "s_z"}:
+                comps.append(spin)
+            elif sym == "su2":
+                comps.append(spin)
+            elif sym in {"pg", "point_group", "abelianpg"}:
+                comps.append(pg)
+        if "su2" in self.sym_types:
+            return Sector(self.sym_types, tuple(comps))
+        return AbelianSector(self.sym_types, tuple(comps))
+
+    def _sector(self, components):
+        components = tuple(components)
+        if "su2" in self.sym_types:
+            return Sector(self.sym_types, components)
+        return AbelianSector(self.sym_types, components)
+
+    def _pg(self, site_idx):
+        if self.orb_sym is None:
+            return 0
+        return int(self.orb_sym[int(site_idx) % len(self.orb_sym)])
 
     def get_vac_qn(self):
-        return QN(*[0] * self.rank)
-    
-    def get_target_qn(self, nelec, spin):
-        """
-        Calculates the target QN vector based on the active symmetries.
-        Uses the metadata in sym_types to construct the QN.
-        """
-        vals = []
-        for sym in self.sym_types:
-            if sym in ['charge', 'n', 'particle']:
-                vals.append(int(nelec))
-            elif sym in ['sz', 'spin', 's_z']:
-                vals.append(int(spin))
-        return QN(*vals)
+        if self.has_nonabelian:
+            from pyqed.mps.su2 import SU2Irrep
 
-def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
+            return self._sector(
+                SU2Irrep(0) if sym == "su2" else 0
+                for sym in self.sym_types
+            )
+        if self.phys_qns is not None and self.target_qn is not None:
+            return QN(*[0] * len(self.target_qn))
+        return self._sector(0 for _sym in self.sym_types)
+
+    def combine(self, left, right):
+        if isinstance(left, Sector) or isinstance(right, Sector):
+            fused = left.fuse(right)
+            if fused is NotImplemented:
+                return NotImplemented
+            if len(fused) != 1:
+                raise ValueError(f"Sector product is not uniquely Abelian: {left!r} x {right!r}.")
+            return fused[0]
+        return left + right
+
+    def get_phys_qn(self, site_idx, state_str, site_model=None):
+        state = str(state_str).lower()
+        site_model = None if site_model is None else str(site_model).lower()
+        vals = []
+        if state in {"emp", "empty", "vac", "0"}:
+            charge, sz, pg = 0, 0, 0
+        elif state in {"double", "doubly", "pair", "2"}:
+            charge, sz, pg = 2, 0, 0
+        elif state in {"down", "dn", "d"}:
+            charge, sz, pg = 1, -1, self._pg(site_idx)
+        elif state in {"up", "u"}:
+            charge, sz, pg = 1, 1, self._pg(site_idx)
+        elif state in {"occ", "occupied", "1"}:
+            charge = 1
+            sz = 1 if (site_model == "spatial" or int(site_idx) % 2 == 0) else -1
+            pg = self._pg(site_idx)
+        else:
+            raise ValueError(f"Unknown physical state {state_str!r}.")
+
+        if self.has_nonabelian:
+            from pyqed.mps.su2 import SU2Irrep
+
+            for sym in self.sym_types:
+                if sym in {"charge", "n", "particle"}:
+                    vals.append(charge)
+                elif sym == "su2":
+                    vals.append(SU2Irrep(0 if charge in {0, 2} else 1))
+                elif sym in {"pg", "point_group", "abelianpg"}:
+                    vals.append(pg)
+            return self._sector(vals)
+
+        for sym in self.sym_types:
+            if sym in {"charge", "n", "particle"}:
+                vals.append(charge)
+            elif sym in {"sz", "spin", "s_z"}:
+                vals.append(sz)
+            elif sym in {"pg", "point_group", "abelianpg"}:
+                vals.append(pg)
+        return self._sector(vals)
+
+    def get_target_qn(self, nelec, spin=0):
+        vals = []
+        if self.has_nonabelian:
+            from pyqed.mps.su2 import SU2Irrep
+
+            for sym in self.sym_types:
+                if sym in {"charge", "n", "particle"}:
+                    vals.append(int(nelec))
+                elif sym == "su2":
+                    vals.append(SU2Irrep(int(spin)))
+                elif sym in {"pg", "point_group", "abelianpg"}:
+                    vals.append(0)
+            return self._sector(vals)
+
+        for sym in self.sym_types:
+            if sym in {"charge", "n", "particle"}:
+                vals.append(int(nelec))
+            elif sym in {"sz", "spin", "s_z"}:
+                vals.append(int(spin))
+            elif sym in {"pg", "point_group", "abelianpg"}:
+                vals.append(0)
+        return self._sector(vals)
+
+def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20, preconditioner=None):
     norm_val = v0.norm()
     if norm_val < 1e-12: 
         # Create a random starting vector in the same sector
@@ -299,7 +556,11 @@ def solve_davidson(H_linop, v0, n_eig=1, tol=1e-5, max_iter=20):
         for k in range(1, k_roots):
             resid_sum = resid_sum + (ritz_Hs[k] - ritz_vecs[k] * w[k])
             
-        q = resid_sum * -10.0 
+        q = None
+        if preconditioner is not None:
+            q = preconditioner(resid_sum, w[0])
+        if q is None:
+            q = resid_sum * -10.0
         for vec in V:
             ov = vec.dot(q)
             q = q - vec*ov
@@ -358,6 +619,7 @@ def solve_davidson_block(
     lindep_tol=1e-12,
     resid_add_tol=1e-10,
     verbose=False,
+    preconditioner=None,
 ):
     """
     Block Davidson for BlockTensor-based linear operators.
@@ -480,8 +742,12 @@ def solve_davidson_block(
             if resid_norms[k] < tol:
                 continue
 
-            # Identity preconditioner for now: q = r
-            q = residuals[k]
+            q = None
+            if preconditioner is not None:
+                q = preconditioner(residuals[k], evals[k])
+            if q is None:
+                # Identity preconditioner fallback.
+                q = residuals[k]
 
             # Orthogonalize against current basis and accepted new vectors
             q = _bt_orthonormalize(q, trial_basis, tol=resid_add_tol)

@@ -1,17 +1,16 @@
 import numpy
 import numpy as np
 import scipy
-from pyscf import lib
-# from pyscf.lib import logger
-from pyscf.data import radii
-from pyscf.dft import gen_grid
-from pyscf.solvent import ddcosmo
-from pyscf import df
 
 PI = np.pi
 
 from pyqed import Molecule
-from pyqed.qchem.mol import fakemol_for_charges, intor_cross, make_cintopt
+from pyqed.qchem.atomic_data import atom_names, bohr_to_angs, vdw_radii
+from pyqed.qchem.dft.grid import lebedev_sphere
+from pyqed.qchem.pcm_integrals import (
+    nuclear_potential_at_surface,
+    surface_charge_ao_coulomb,
+)
 from pyqed.qchem.solvent import _attach_solvent
 
 def pcm_for_scf(mf, solvent_obj=None, dm=None):
@@ -31,6 +30,14 @@ def pcm_for_casscf(mc, solvent_obj=None, dm=None):
         else:
             solvent_obj = PCM(mc.mol)
     return _attach_solvent._for_casscf(mc, solvent_obj, dm)
+
+def pcm_for_tdscf(td, solvent_obj=None, dm=None, equilibrium_solvation=False):
+    return _attach_solvent._for_tdscf(
+        td,
+        solvent_obj=solvent_obj,
+        dm=dm,
+        equilibrium_solvation=equilibrium_solvation,
+    )
 
 
 
@@ -67,8 +74,73 @@ XI = {
     5810: 4.90792902522,
 }
 
-modified_Bondi = radii.VDW.copy()
-modified_Bondi[1] = 1.1/radii.BOHR      # modified version
+LEBEDEV_ORDER = {
+    3: 6,
+    5: 14,
+    7: 26,
+    9: 38,
+    11: 50,
+    13: 74,
+    15: 86,
+    17: 110,
+    19: 146,
+    21: 170,
+    23: 194,
+    25: 230,
+    27: 266,
+    29: 302,
+    31: 350,
+    35: 434,
+    41: 590,
+    47: 770,
+    53: 974,
+    59: 1202,
+    65: 1454,
+    71: 1730,
+    77: 2030,
+    83: 2354,
+    89: 2702,
+    95: 3074,
+    101: 3470,
+    107: 3890,
+    113: 4334,
+    119: 4802,
+    125: 5294,
+    131: 5810,
+}
+
+
+def _modified_bondi_radii():
+    """Return a PySCF-compatible vdW radius table indexed by nuclear charge."""
+    fallback = 2.0 / bohr_to_angs
+    table = numpy.full(len(atom_names) + 1, fallback)
+    table[0] = 0.0
+    for charge, symbol in enumerate(atom_names, start=1):
+        table[charge] = vdw_radii.get(symbol, fallback)
+    table[1] = 1.1 / bohr_to_angs
+    return table
+
+
+def _lebedev_order_to_npoints(order):
+    if order in LEBEDEV_ORDER:
+        return LEBEDEV_ORDER[order]
+    if order in XI:
+        return order
+    raise ValueError(f"Unsupported Lebedev order/grid size: {order}")
+
+
+def _prange(start, stop, step):
+    for p0 in range(start, stop, step):
+        yield p0, min(p0 + step, stop)
+
+
+def _current_memory_mb():
+    # The native PCM code only needs an approximate allocator budget for chunking.
+    return 0.0
+
+
+modified_Bondi = _modified_bondi_radii()
+
 
 def switch_h(x):
     '''
@@ -83,7 +155,7 @@ def switch_h(x):
 
 def gen_surface(mol, ng=302, rad=modified_Bondi, vdw_scale=1.2):
     '''J. Phys. Chem. A 1999, 103, 11060-11079'''
-    unit_sphere = gen_grid.MakeAngularGrid(ng)
+    directions, angular_weights = lebedev_sphere(ng)
     atom_coords = mol.atom_coords()
     charges = mol.atom_charges()
     N_J = ng * numpy.ones(mol.natom)
@@ -107,14 +179,14 @@ def gen_surface(mol, ng=302, rad=modified_Bondi, vdw_scale=1.2):
         chg = mol.atom_charge(ia)
         r_vdw = rad[chg]
 
-        atom_grid = r_vdw * unit_sphere[:,:3] + atom_coords[ia,:]
+        atom_grid = r_vdw * directions + atom_coords[ia,:]
         riJ = scipy.spatial.distance.cdist(atom_grid[:,:3], atom_coords)
         diJ = (riJ - R_in_J) / R_sw_J
         diJ[:,ia] = 1.0
         diJ[diJ < 1e-8] = 0.0
         fiJ = switch_h(diJ)
 
-        w = unit_sphere[:,3] * 4.0 * PI
+        w = angular_weights
         swf = numpy.prod(fiJ, axis=1)
         idx = w*swf > 1e-16
 
@@ -123,7 +195,7 @@ def gen_surface(mol, ng=302, rad=modified_Bondi, vdw_scale=1.2):
         grid_coords.append(atom_grid[idx,:3])
         weights.append(w[idx])
         switch_fun.append(swf[idx])
-        norm_vec.append(unit_sphere[idx,:3])
+        norm_vec.append(directions[idx,:3])
         xi = XI[ng] / (r_vdw * w[idx]**0.5)
         charge_exp.append(xi)
         R_vdw.append(numpy.ones(sum(idx)) * r_vdw)
@@ -247,6 +319,15 @@ class PCM:
         `state_id=0` corresponds to the ground state, while `state_id=1` corresponds
         to the first excited state. Default is 0.
 
+    state_average : bool
+        If True, update the solvent from an equal-weight average of all requested
+        electronic-state densities. This is useful for state-averaged CASSCF/CASCI
+        benchmarks.
+
+    state_weights : array_like or None
+        Optional explicit state weights for the solvent density. If set, this
+        overrides state_average.
+
     Saved Results:
     --------------
     e_tot : float
@@ -268,17 +349,16 @@ class PCM:
     _keys = {
         'method', 'vdw_scale', 'surface', 'r_probe',
         'mol', 'radii_table', 'lebedev_order',
-        'eps', 'max_cycle', 'conv_tol', 'state_id', 'frozen',
-        'equilibrium_solvation', 'e', 'v', 'v_grids_n',
+        'eps', 'max_cycle', 'conv_tol', 'state_id', 'state_average',
+        'state_weights', 'frozen',
+        'equilibrium_solvation', 'integral_backend', 'e', 'v', 'v_grids_n',
     }
 
-    kernel = ddcosmo.DDCOSMO.kernel
-    # def kernel(self, dm):
-    #     self._dm = dm 
-    #     print('self._dm', dm)
-    #     self.e, self.v = self._get_vind(dm)
-    #     print('solvent ener', self.e)
-    #     return self.e, self.v
+    def kernel(self, dm):
+        """Compute the PCM energy and AO potential for a density matrix."""
+        self._dm = numpy.asarray(dm)
+        self.e, self.v = self._get_vind(self._dm)
+        return self.e, self.v
 
     def __init__(self, mol):
         self.mol = mol
@@ -298,9 +378,12 @@ class PCM:
         self.max_cycle = 20
         self.conv_tol = 1e-7
         self.state_id = 0
+        self.state_average = False
+        self.state_weights = None
 
         self.frozen = False
         self.equilibrium_solvation = False
+        self.integral_backend = 'auto'
 
         self.surface = {}
         self._intermediates = {}
@@ -310,6 +393,15 @@ class PCM:
         self.v = None
         self._dm = None
 
+    def _resolve_integral_backend(self):
+        backend = str(self.integral_backend).lower()
+        if backend in {'native', 'pyscf'}:
+            return backend
+        if backend == 'auto':
+            return 'native'
+        else:
+            raise ValueError("PCM integral_backend must be 'auto', 'native', or 'pyscf'.")
+
 
     # def dump_flags(self, verbose=None):
     #     logger.info(self, '******** %s (In testing) ********', self.__class__)
@@ -317,7 +409,7 @@ class PCM:
     #                 'still in testing.\nFeatures and APIs may be changed '
     #                 'in the future.')
     #     logger.info(self, 'lebedev_order = %s (%d grids per sphere)',
-    #                 self.lebedev_order, gen_grid.LEBEDEV_ORDER[self.lebedev_order])
+    #                 self.lebedev_order, _lebedev_order_to_npoints(self.lebedev_order))
     #     logger.info(self, 'eps = %s'          , self.eps)
     #     logger.info(self, 'frozen = %s'       , self.frozen)
     #     #logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
@@ -339,27 +431,31 @@ class PCM:
     def build(self, ng=None):
         if self.radii_table is None:
             vdw_scale = self.vdw_scale
-            radii_table = vdw_scale * modified_Bondi + self.r_probe/radii.BOHR
+            radii_table = vdw_scale * modified_Bondi + self.r_probe/bohr_to_angs
         else:
             radii_table = self.radii_table
         # logger.debug2(self, 'radii_table %s', radii_table)
         mol = self.mol
         if ng is None:
-            ng = gen_grid.LEBEDEV_ORDER[self.lebedev_order]
+            ng = _lebedev_order_to_npoints(self.lebedev_order)
 
         self.surface = gen_surface(mol, rad=radii_table, ng=ng)
         self._intermediates = {}
+        backend = self._resolve_integral_backend()
+        self._intermediates['integral_backend'] = backend
         F, A = get_F_A(self.surface)
         D, S = get_D_S(self.surface, with_S=True, with_D=True)
 
         epsilon = self.eps
-        print('eps', self.eps)
+        if self.verbose:
+            print('eps', self.eps)
         if self.method.upper() in ['C-PCM', 'CPCM']:
             f_epsilon = (epsilon-1.)/epsilon if epsilon != float('inf') else 1.0
             K = S
             R = -f_epsilon * numpy.eye(K.shape[0])
-            print('f_epsilon', f_epsilon)
-            print('R[0]', R[0,0])
+            if self.verbose:
+                print('f_epsilon', f_epsilon)
+                print('R[0]', R[0,0])
         elif self.method.upper() == 'COSMO':
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0/2.0) if epsilon != float('inf') else 1.0
             K = S
@@ -394,11 +490,47 @@ class PCM:
         atom_coords = mol.atom_coords()
         atom_charges = mol.atom_charges()
 
-        int2c2e = mol._add_suffix('int2c2e')
-        fakemol = fakemol_for_charges(grid_coords, expnt=charge_exp**2)
-        fakemol_nuc = fakemol_for_charges(atom_coords)
-        v_ng = intor_cross(int2c2e, fakemol_nuc, fakemol)
-        self.v_grids_n = numpy.dot(atom_charges, v_ng)
+        if backend == 'native':
+            self.v_grids_n = nuclear_potential_at_surface(
+                atom_coords,
+                atom_charges,
+                grid_coords,
+                charge_exp**2,
+            )
+        elif backend == 'pyscf':
+            from pyqed.qchem.mol import fakemol_for_charges, intor_cross
+
+            int2c2e = mol._add_suffix('int2c2e')
+            fakemol = fakemol_for_charges(grid_coords, expnt=charge_exp**2)
+            fakemol_nuc = fakemol_for_charges(atom_coords)
+            v_ng = intor_cross(int2c2e, fakemol_nuc, fakemol)
+            self.v_grids_n = numpy.dot(atom_charges, v_ng)
+        else:
+            raise ValueError("PCM integral_backend must be 'native' or 'pyscf'.")
+
+    def _surface_coulomb_tensor(self):
+        v_nj = self._intermediates.get('surface_coulomb_tensor')
+        if v_nj is None:
+            backend = self._intermediates.get('integral_backend', self._resolve_integral_backend())
+            if backend == 'native':
+                v_nj = surface_charge_ao_coulomb(
+                    self.mol,
+                    self.surface['grid_coords'],
+                    self.surface['charge_exp']**2,
+                )
+            elif backend == 'pyscf':
+                from pyscf import df
+                from pyqed.qchem.mol import fakemol_for_charges
+
+                grid_coords = self.surface['grid_coords']
+                exponents = self.surface['charge_exp']
+                int3c2e = self.mol._add_suffix('int3c2e')
+                fakemol = fakemol_for_charges(grid_coords, expnt=exponents**2)
+                v_nj = df.incore.aux_e2(self.mol, fakemol, intor=int3c2e, aosym='s1')
+            else:
+                raise ValueError("PCM integral_backend must be 'native' or 'pyscf'.")
+            self._intermediates['surface_coulomb_tensor'] = v_nj
+        return v_nj
 
     def _get_vind(self, dms):
         if not self._intermediates:
@@ -439,20 +571,16 @@ class PCM:
         '''
         return electrostatic potential on surface
         '''
-        mol = self.mol
         nao = dms.shape[-1]
         grid_coords = self.surface['grid_coords']
-        exponents   = self.surface['charge_exp']
         ngrids = grid_coords.shape[0]
         nset = dms.shape[0]
         v_grids_e = numpy.empty([nset, ngrids])
-        max_memory = self.max_memory - lib.current_memory()[0]
+        v_nj_all = self._surface_coulomb_tensor()
+        max_memory = self.max_memory - _current_memory_mb()
         blksize = int(max(max_memory*.9e6/8/nao**2, 400))
-        int3c2e = mol._add_suffix('int3c2e')
-        cintopt = make_cintopt(mol._atm, mol._bas, mol._env, int3c2e)
-        for p0, p1 in lib.prange(0, ngrids, blksize):
-            fakemol = fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-            v_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e, aosym='s1')
+        for p0, p1 in _prange(0, ngrids, blksize):
+            v_nj = v_nj_all[:, :, p0:p1]
             for i in range(nset):
                 v_grids_e[i,p0:p1] = numpy.einsum('ijL,ij->L',v_nj, dms[i])
 
@@ -462,19 +590,16 @@ class PCM:
         mol = self.mol
         nao = mol.nao
         grid_coords = self.surface['grid_coords']
-        exponents   = self.surface['charge_exp']
         ngrids = grid_coords.shape[0]
         q = q.reshape([-1,ngrids])
         nset = q.shape[0]
         vmat = numpy.zeros([nset,nao,nao])
-        max_memory = self.max_memory - lib.current_memory()[0]
+        v_nj_all = self._surface_coulomb_tensor()
+        max_memory = self.max_memory - _current_memory_mb()
         blksize = int(max(max_memory*.9e6/8/nao**2, 400))
 
-        int3c2e = mol._add_suffix('int3c2e')
-        cintopt = make_cintopt(mol._atm, mol._bas, mol._env, int3c2e)
-        for p0, p1 in lib.prange(0, ngrids, blksize):
-            fakemol = fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-            v_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e, aosym='s1')
+        for p0, p1 in _prange(0, ngrids, blksize):
+            v_nj = v_nj_all[:, :, p0:p1]
             for i in range(nset):
                 vmat[i] += -numpy.einsum('ijL,L->ij', v_nj, q[i,p0:p1])
         return vmat

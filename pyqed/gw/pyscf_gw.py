@@ -62,7 +62,7 @@ def kernel(gw, mo_energy, mo_coeff, td_e, td_xy, eris=None,
                            dft.roks.ROKS    , dft.uks.UKS,
                            dft.rks_symm.RKS , dft.uks_symm.UKS,
                            dft.rks_symm.ROKS, dft.uks_symm.UKS)))
-    assert(gw.frozen is 0 or gw.frozen is None)
+    assert(gw.frozen == 0 or gw.frozen is None)
 
     if eris is None:
         eris = gw.ao2mo(mo_coeff)
@@ -185,7 +185,7 @@ class GW(lib.StreamObject):
         nocc = self.nocc
         nvir = self.nmo - nocc
         log.info('GW nocc = %d, nvir = %d', nocc, nvir)
-        if self.frozen is not 0:
+        if self.frozen != 0:
             log.info('frozen orbitals %s', str(self.frozen))
         logger.info(self, 'use perturbative linearized QP eqn = %s', self.linearized)
         return self
@@ -229,7 +229,7 @@ class GW(lib.StreamObject):
         if td_xy is None:
             td_xy = self._tdscf.xy
 
-        cput0 = (time.clock(), time.time())
+        cput0 = (time.process_time(), time.time())
         self.dump_flags()
         self.converged, self.mo_energy, self.mo_coeff = \
                 kernel(self, mo_energy, mo_coeff, td_e, td_xy,
@@ -298,7 +298,7 @@ class _ChemistsERIs:
         return self
 
 def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
-    cput0 = (time.clock(), time.time())
+    cput0 = (time.process_time(), time.time())
     eris = _ChemistsERIs()
     eris._common_init_(mycc, mo_coeff)
     nocc = eris.nocc
@@ -319,7 +319,7 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     return eris
 
 def _make_eris_outcore(mycc, mo_coeff=None):
-    cput0 = (time.clock(), time.time())
+    cput0 = (time.process_time(), time.time())
     log = logger.Logger(mycc.stdout, mycc.verbose)
     eris = _ChemistsERIs()
     eris._common_init_(mycc, mo_coeff)

@@ -14,7 +14,6 @@ from scipy.linalg import eigh
 # from cmath import log
 
 import sys
-import matplotlib.pyplot as plt
 import math
 
 

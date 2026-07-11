@@ -61,7 +61,15 @@ Created on Tue Jan 27 14:37:35 2026
 
 from pyqed import pauli
 import numpy as np
-from pyqed.nrg.nrg import star_to_chain, Boson
+from pyqed.nrg.nrg import Boson
+from pyqed.models.impurity.spin_boson import (
+    SpinBosonWilsonChain,
+    _default_op_quadrature_order,
+    _normalize_chain_scheme,
+    log_discretized_spin_boson_star_bath,
+    spin_boson_spectral_density,
+)
+from pyqed.models.impurity.wilson import quadrature_star_bath, star_to_wilson_chain
 
 from scipy import integrate
 from scipy.sparse import lil_matrix, csr_matrix, eye, kron
@@ -111,7 +119,19 @@ class SBM:
 
     """
 
-    def __init__(self, Himp, alpha, L=2.0, s=1, omegac=1, epsilon=0, delta=0):
+    def __init__(
+        self,
+        Himp,
+        alpha,
+        L=2.0,
+        s=1,
+        omegac=1,
+        epsilon=0,
+        delta=0,
+        nmodes=None,
+        scheme="wilson",
+        chain_method="lanczos",
+    ):
         """
 
 
@@ -137,11 +157,13 @@ class SBM:
         self.L = L # Lambda for log-discretization
         self.Himp = Himp
 
-        self.nmodes = None
+        self.nmodes = None if nmodes is None else int(nmodes)
         assert(s > -1) # s has to be larger than -1
         self.s = s
         self.omegac = omegac
         self.alpha = alpha
+        self.chain_scheme = _normalize_chain_scheme(scheme)
+        self.chain_method = chain_method
 
 
         self.xi = None
@@ -149,6 +171,8 @@ class SBM:
         ### Wilson chain params
         self.onsite = None
         self.hopping = None
+        self.star_to_chain = None
+        self.chain = None
         
         self.t0 = None
 
@@ -156,9 +180,20 @@ class SBM:
         self.epsilon = epsilon
         self.delta = delta
         self.H = None
+        self.support = None
+        self.quadrature_order = None
         
     def add_coupling(self):
         pass
+
+    def spectral_density(self, omega):
+        """Return the spin-boson spectral density ``J(omega)``."""
+        return spin_boson_spectral_density(
+            omega,
+            alpha=self.alpha,
+            s=self.s,
+            omegac=self.omegac,
+        )
 
     def oscillator_energy(self, n):
         """
@@ -182,7 +217,7 @@ class SBM:
         return (s+1)/(s+2) * (1. - L**(-s-2))/(1. - L**(-s-1)) * omegac * L**(-n)
 
 
-    def discretize(self, N):
+    def discretize(self, N=None, *, scheme=None, support=None, quadrature_order=None):
         # H = -\Delta X + \epsilon Z + \sum_i \xi_i a_i^\dagger a_i + \frac{Z}{2\sqrt{\pi}} \sum_i  \gamma_i (a_i + a_i^\dagger)
         """
         logrithmic discretization
@@ -213,42 +248,19 @@ class SBM:
             DESCRIPTION.
 
         """
-        
-        nmax = N
-        n = np.arange(nmax)
+        if N is None:
+            N = self.nmodes
+        if N is None:
+            raise ValueError("N must be passed to discretize() or the constructor.")
 
-        self.nmodes = N
-
-        L = self.L
-        alpha = self.alpha
-        s = self.s
-        omegac = self.omegac
-
-
-        # star configuration
-        xi = (s+1)/(s+2) * (1. - L**(-s-2))/(1. - L**(-s-1)) * omegac * L**(-n)
-
-        g2 = 2 * np.pi * alpha/(s+1) * omegac**2 * (1 - L**(-s-1))* L**(-n * (s+1))
-        g = np.sqrt(g2)
-        
-        self.g = g
-        self.xi = xi 
-        
-        d, c, U = star_to_chain(xi, g)
-        
-        epsilon = d[1:]
-        t = c[1:]
-            
-            
-        
-        # to chain
-        # eta0 = sum(g2) # \int_0^{\omega_c} J(omega) \dif omega
-        
-        # print(c[0], np.sqrt(eta0) )
-        # eta0 = c[0]
-
-        self.t0 = c[0]
-
+        scheme = self.chain_scheme if scheme is None else _normalize_chain_scheme(scheme)
+        self._set_star_bath(
+            int(N),
+            scheme=scheme,
+            support=support,
+            quadrature_order=quadrature_order,
+        )
+        self.to_chain(scheme=scheme, method=self.chain_method)
 
         # U = np.zeros((N, nmax))
 
@@ -280,14 +292,106 @@ class SBM:
         # epsilon[N-1] = sum(U[N-1]**2 * xi)
         # t[N-1] = np.sqrt( sum( ((xi - epsilon[N-1])* U[N-1] -  t[N-2] * U[N-2])**2) )
 
-        self.onsite = epsilon
-        self.hopping = t
+        return self
 
-        return epsilon, t
+    def _set_star_bath(self, N, *, scheme, support=None, quadrature_order=None):
+        if scheme == "wilson":
+            self.xi, self.g = log_discretized_spin_boson_star_bath(
+                int(N),
+                alpha=self.alpha,
+                Lambda=self.L,
+                s=self.s,
+                omegac=self.omegac,
+            )
+            support = (0.0, self.omegac)
+            quadrature_order = None
+        elif scheme == "orthogonal-polynomial":
+            support = (0.0, self.omegac) if support is None else tuple(map(float, support))
+            quadrature_order = _default_op_quadrature_order(int(N), quadrature_order)
+            self.xi, self.g = quadrature_star_bath(
+                self.spectral_density,
+                support,
+                quadrature_order,
+            )
+        else:
+            raise ValueError("scheme must be 'wilson' or 'orthogonal-polynomial'.")
+        self.nmodes = int(N)
+        self.chain_scheme = scheme
+        self.support = support
+        self.quadrature_order = quadrature_order
+        self.chain = None
 
-    # def to_wilson_chain(self):
-    #     pass
-    def build_H_mpo(self):
+    def to_chain(
+        self,
+        *,
+        scheme=None,
+        N=None,
+        nmodes=None,
+        method=None,
+        support=None,
+        quadrature_order=None,
+    ):
+        """Return the chain representation, building star modes if needed."""
+        scheme = self.chain_scheme if scheme is None else _normalize_chain_scheme(scheme)
+        if nmodes is None:
+            nmodes = N
+        if nmodes is None:
+            nmodes = self.nmodes
+        requested_support = None if support is None else tuple(map(float, support))
+        needs_star = self.xi is None or self.g is None or self.chain_scheme != scheme
+        if nmodes is not None and self.nmodes != int(nmodes):
+            needs_star = True
+        if requested_support is not None and self.support != requested_support:
+            needs_star = True
+        if quadrature_order is not None and self.quadrature_order != int(quadrature_order):
+            needs_star = True
+        if needs_star:
+            if nmodes is None:
+                raise ValueError("N/nmodes must be passed to to_chain() or the constructor.")
+            self._set_star_bath(
+                int(nmodes),
+                scheme=scheme,
+                support=requested_support,
+                quadrature_order=quadrature_order,
+            )
+        method = self.chain_method if method is None else method
+        onsite, hopping, t0, transform = star_to_wilson_chain(
+            self.xi,
+            self.g,
+            method=method,
+        )
+        self.onsite = onsite[: self.nmodes]
+        self.hopping = hopping[: max(0, self.nmodes - 1)]
+        self.t0 = t0
+        self.star_to_chain = transform[: self.nmodes]
+        self.chain_method = method
+        self.chain = SpinBosonWilsonChain(
+            onsite=self.onsite,
+            hopping=self.hopping,
+            impurity_coupling=t0,
+            epsilon=self.epsilon,
+            delta=self.delta,
+            star_frequencies=self.xi,
+            star_couplings=self.g,
+            star_to_chain=self.star_to_chain,
+        )
+        return self.chain
+
+    def to_wilson_chain(self, *, scheme=None, method=None, support=None, quadrature_order=None):
+        """Alias for :meth:`to_chain`."""
+        return self.to_chain(
+            scheme=scheme,
+            method=method,
+            support=support,
+            quadrature_order=quadrature_order,
+        )
+
+    def __iter__(self):
+        if self.onsite is None or self.hopping is None:
+            self.to_chain()
+        return iter((self.onsite, self.hopping))
+
+    def build_H_mpo(self, nb=6):
         
         N = self.nmodes
         # 1. Discretize
@@ -463,8 +567,10 @@ class SBM:
         
         return vals[0]
     
-    def TDDMRG(self, D=40):
+    def TDDMRG(self, D=40, nb=6):
         from pyqed.mps import TDMPS 
+        if self.H is None:
+            self.build_H_mpo(nb=nb)
         return TDMPS(self.H, D)
     
     def build_product_state(self):

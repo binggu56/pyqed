@@ -1,0 +1,132 @@
+[build-system]
+requires = [
+    "setuptools>=77",
+    "wheel",
+    "numpy>=2.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyqed"
+dynamic = ["version"]
+description = "Electronic structure, quantum dynamics, and spectroscopy in Python"
+readme = {file = "README.rst", content-type = "text/x-rst"}
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "pyqed/qchem/basis_set/BASIS_SET_EXCHANGE_LICENSE.txt",
+    "pyqed/qchem/basis_set/PYSCF_APACHE_LICENSE.txt",
+    "pyqed/qchem/basis_set/PYSCF_NOTICE.txt",
+]
+authors = [
+    {name = "Bing Gu", email = "gubing@westlake.edu.cn"},
+]
+keywords = [
+    "quantum chemistry",
+    "quantum dynamics",
+    "spectroscopy",
+    "molecular quantum electrodynamics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=2.0",
+    "opt-einsum>=3.3",
+    "periodictable>=1.7",
+    "scipy>=1.13",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.8",
+    "qc-gbasis>=0.1",
+]
+accelerators = [
+    "numba>=0.59",
+    "psutil>=5.9",
+]
+heom = [
+    "numba>=0.59",
+    "sympy>=1.12",
+    "tqdm>=4.66",
+]
+md = [
+    "ase>=3.23",
+    "h5py>=3.10",
+    "openmm>=8.1",
+]
+ml = [
+    "jax>=0.4.26",
+    "scikit-learn>=1.4",
+    "tensorly>=0.8",
+    "torch>=2.2",
+]
+plot = [
+    "matplotlib>=3.8",
+]
+pyscf = [
+    "pyscf>=2.5",
+]
+ued = [
+    "h5py>=3.10",
+]
+docs = [
+    "Sphinx>=7.3,<9",
+    "roman>=4.1",
+    "sphinx-rtd-theme>=2.0",
+]
+test = [
+    "build>=1.2",
+    "pytest>=8",
+    "twine>=5",
+]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+    "ruff>=0.5",
+    "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://pyqed.org"
+Documentation = "https://docs.pyqed.org"
+Repository = "https://github.com/binggu56/pyqed"
+Issues = "https://github.com/binggu56/pyqed/issues"
+Changelog = "https://github.com/binggu56/pyqed/blob/main/HISTORY.rst"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = {attr = "pyqed._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyqed*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"pyqed.qchem" = [
+    "H2/*.in",
+    "basis_set/*.gbs",
+    "basis_set/*.txt",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"

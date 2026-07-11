@@ -6,8 +6,8 @@ A good general introduction to DVR methods is
 Light and Carrington, Adv. Chem. Phys. 114, 263 (2000)
 """
 
-from matplotlib import pyplot as plt
 import numpy as np
+import scipy.sparse as sp
 import scipy.sparse.linalg as sla
 import scipy.special.orthogonal as ortho
 import scipy
@@ -793,6 +793,446 @@ class SineDVR(DVR):
 #             x_m = np.asarray(x)[:, np.newaxis]
 #         x_n = self.x[np.newaxis, :]
 #         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
+
+
+class PODVR(DVR):
+    r"""Potential-optimized DVR built from a primitive sine DVR.
+
+    The DVR is built by:
+
+    1. constructing a primitive sine DVR on ``[xmin, xmax]``;
+    2. diagonalizing a reference Hamiltonian in that primitive basis;
+    3. retaining the lowest ``npts`` reference eigenfunctions as an FBR;
+    4. diagonalizing the coordinate operator in that truncated FBR.
+
+    The resulting grid points are nonuniform and concentrated in the region
+    important for the chosen reference potential.  If ``v_ref`` is omitted,
+    a Morse-like reference potential is used, which is convenient for
+    stretching coordinates.
+
+    This class exposes the same basic interface as :class:`SineDVR`: ``x``,
+    ``dx``, ``w``, ``t()``, and ``momentum()``.  The kinetic and momentum
+    matrices are the primitive operators projected into the optimized DVR.
+    """
+
+    def __init__(
+        self,
+        xmin,
+        xmax,
+        npts,
+        v_ref=None,
+        De=0.2,
+        a=1.0,
+        re=None,
+        mass=1.0,
+        primitive_npts=None,
+    ):
+        if npts < 1:
+            raise ValueError("npts must be positive.")
+        if xmax <= xmin:
+            raise ValueError("xmax must be larger than xmin.")
+        if v_ref is None and De <= 0:
+            raise ValueError("De must be positive.")
+        if v_ref is None and a <= 0:
+            raise ValueError("a must be positive.")
+
+        self.npts = int(npts)
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.L = self.xmax - self.xmin
+        self.v_ref = v_ref
+        self.De = None if De is None else float(De)
+        self.a = None if a is None else float(a)
+        self.re = 0.5 * (self.xmin + self.xmax) if re is None else float(re)
+        self._mass = float(mass)
+        self.primitive_npts = int(
+            primitive_npts if primitive_npts is not None else max(4 * self.npts + 20, self.npts + 8)
+        )
+        if self.primitive_npts < self.npts:
+            raise ValueError("primitive_npts must be >= npts.")
+
+        primitive = SineDVR(self.xmin, self.xmax, self.primitive_npts, mass=self.mass)
+        V_ref = np.diag(self.reference_potential(primitive.x))
+        H_ref = primitive.t() + V_ref
+        evals, evecs = np.linalg.eigh(H_ref)
+
+        C = evecs[:, :self.npts]
+        x_fbr = C.conj().T @ np.diag(primitive.x) @ C
+        x_grid, U = np.linalg.eigh(x_fbr)
+        order = np.argsort(x_grid)
+
+        self.x = np.asarray(x_grid[order], dtype=float)
+        self.n = np.arange(self.npts)
+        self.U = U[:, order]
+        self.reference_energies = evals[:self.npts]
+        self.primitive = primitive
+        self.fbr = C
+
+        T_fbr = C.conj().T @ primitive.t() @ C
+        P_fbr = C.conj().T @ primitive.momentum() @ C
+        self.T = self.U.conj().T @ T_fbr @ self.U
+        self.P = self.U.conj().T @ P_fbr @ self.U
+        self.T = 0.5 * (self.T + self.T.conj().T)
+        self.P = 0.5 * (self.P + self.P.conj().T)
+
+        self.w = self._voronoi_weights()
+        self.dx = float(np.mean(self.w))
+        self.k_max = None
+        self.v = None
+
+    @property
+    def mass(self):
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        self._mass = float(value)
+
+    def reference_potential(self, x):
+        x = np.asarray(x, dtype=float)
+        if self.v_ref is not None:
+            if callable(self.v_ref):
+                values = self.v_ref(x)
+            else:
+                values = self.v_ref
+            values = np.asarray(values, dtype=float)
+            if values.shape != x.shape:
+                raise ValueError("v_ref must return one value for each grid point.")
+            return values
+        return self.De * (1.0 - np.exp(-self.a * (x - self.re))) ** 2
+
+    def _voronoi_weights(self):
+        if self.npts == 1:
+            return np.asarray([self.L], dtype=float)
+        edges = np.empty(self.npts + 1, dtype=float)
+        edges[0] = self.xmin
+        edges[-1] = self.xmax
+        edges[1:-1] = 0.5 * (self.x[:-1] + self.x[1:])
+        return np.diff(edges)
+
+    def t(self, hc=1.0, mc2=None):
+        if hc != 1.0 or mc2 is not None:
+            scale = hc ** 2
+            if mc2 is not None:
+                scale *= self.mass / mc2
+            return scale * self.T
+        return self.T
+
+    def momentum(self):
+        return self.P
+
+    def fbr2dvr(self):
+        return self.U
+
+    def f(self, x=None):
+        if x is None:
+            x = self.x
+        x = np.asarray(x, dtype=float)
+        primitive_values = np.column_stack([
+            self.primitive.basis(x, a=i) for i in range(self.primitive_npts)
+        ])
+        return primitive_values @ self.fbr @ self.U
+
+    def run(self, v=None, num_eigs=5):
+        if v is None:
+            if self.v is None:
+                raise ValueError("Provide v or set self.v before run().")
+            V = np.diag(self.v)
+        elif callable(v):
+            V = np.diag(v(self.x))
+        else:
+            V = np.diag(np.asarray(v, dtype=float))
+
+        H = self.t() + V
+        if num_eigs == H.shape[0]:
+            E, U = np.linalg.eigh(H)
+        else:
+            E, U = sla.eigsh(H, k=num_eigs, which='LM', sigma=np.diag(V).min())
+        self.eigvals = E
+        self.eigvecs = U
+        return E, U
+
+
+class FEDVR(DVR):
+    r"""One-dimensional finite-element DVR with Gauss-Lobatto points.
+
+    The interval ``[xmin, xmax]`` is split into ``n_elements`` finite elements.
+    Each element uses ``n_lobatto`` Gauss-Lobatto-Legendre nodes and local
+    Lagrange cardinal functions.  Shared element-boundary nodes are merged into
+    bridge functions.  Local potentials are diagonal under Lobatto quadrature,
+    while the kinetic-energy matrix is sparse and block-local.
+
+    By default the two outer boundary nodes are removed, corresponding to
+    Dirichlet boundary conditions on a finite box.
+    """
+
+    def __init__(
+        self,
+        xmin,
+        xmax,
+        n_elements,
+        n_lobatto=5,
+        mass=1.0,
+        boundary="dirichlet",
+    ):
+        if xmax <= xmin:
+            raise ValueError("xmax must be larger than xmin.")
+        if n_elements < 1:
+            raise ValueError("n_elements must be positive.")
+        if n_lobatto < 2:
+            raise ValueError("n_lobatto must be at least 2.")
+        boundary = boundary.lower()
+        if boundary not in ("dirichlet", "none"):
+            raise ValueError("boundary must be 'dirichlet' or 'none'.")
+
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.L = self.xmax - self.xmin
+        self.n_elements = int(n_elements)
+        self.n_lobatto = int(n_lobatto)
+        self._mass = float(mass)
+        self.boundary = boundary
+        self.v = None
+
+        self.ref_x, self.ref_w = self._lobatto_nodes_weights(self.n_lobatto)
+        self.ref_D = self._differentiation_matrix(self.ref_x)
+
+        self._assemble()
+        self.T = None
+        self.P = None
+        self.eigvals = None
+        self.eigvecs = None
+
+    @staticmethod
+    def _lobatto_nodes_weights(n):
+        if n == 2:
+            x = np.array([-1.0, 1.0])
+            w = np.array([1.0, 1.0])
+            return x, w
+
+        poly = np.polynomial.legendre.Legendre.basis(n - 1)
+        interior = poly.deriv().roots()
+        x = np.concatenate(([-1.0], interior, [1.0]))
+        pvals = poly(x)
+        w = 2.0 / (n * (n - 1) * pvals**2)
+        return x, w
+
+    @staticmethod
+    def _differentiation_matrix(x):
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        bary = np.ones(n, dtype=float)
+        for j in range(n):
+            bary[j] = 1.0 / np.prod(x[j] - np.delete(x, j))
+
+        D = np.empty((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    D[i, j] = bary[j] / bary[i] / (x[i] - x[j])
+            D[i, i] = -np.sum(D[i, np.arange(n) != i])
+        return D
+
+    @property
+    def mass(self):
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        self._mass = float(value)
+        self.T = None
+        self.P = None
+
+    def _assemble(self):
+        n_full = self.n_elements * (self.n_lobatto - 1) + 1
+        h = self.L / self.n_elements
+        scale = 0.5 * h
+
+        full_x = np.empty(n_full, dtype=float)
+        full_w = np.zeros(n_full, dtype=float)
+        stiffness = sp.lil_matrix((n_full, n_full), dtype=float)
+        derivative = sp.lil_matrix((n_full, n_full), dtype=float)
+
+        for elem in range(self.n_elements):
+            left = self.xmin + elem * h
+            center = left + scale
+            local_x = center + scale * self.ref_x
+            local_w = scale * self.ref_w
+            local_ids = elem * (self.n_lobatto - 1) + np.arange(self.n_lobatto)
+            full_x[local_ids] = local_x
+            full_w[local_ids] += local_w
+
+            D_x = self.ref_D / scale
+            K_local = D_x.T @ np.diag(local_w) @ D_x
+            for a, ia in enumerate(local_ids):
+                for b, ib in enumerate(local_ids):
+                    stiffness[ia, ib] += K_local[a, b]
+                    derivative[ia, ib] += local_w[a] * D_x[a, b]
+
+        if self.boundary == "dirichlet":
+            active = np.arange(1, n_full - 1)
+        else:
+            active = np.arange(n_full)
+
+        self.full_x = full_x
+        self.full_w = full_w
+        self.active = active
+        self.x = full_x[active]
+        self.w = full_w[active]
+        self.npts = len(self.x)
+        self.n = np.arange(self.npts)
+        self.dx = float(np.mean(np.diff(self.x))) if self.npts > 1 else self.L
+        self.k_max = None
+
+        W_inv_sqrt = sp.diags(1.0 / np.sqrt(full_w[active]))
+        K_active = stiffness.tocsr()[active][:, active]
+        D_active = derivative.tocsr()[active][:, active]
+        self._T_base = W_inv_sqrt @ K_active @ W_inv_sqrt
+        self._D_base = W_inv_sqrt @ D_active @ W_inv_sqrt
+        self._T_base = self._T_base.tocsr()
+        self._D_base = self._D_base.tocsr()
+
+    def t(self, hc=1.0, mc2=None, sparse=False):
+        scale = 0.5 / self.mass
+        if hc != 1.0 or mc2 is not None:
+            scale *= hc**2
+            if mc2 is not None:
+                scale *= self.mass / mc2
+        T = scale * self._T_base
+        self.T = T
+        return T if sparse else T.toarray()
+
+    def kinetic_sparse(self, hc=1.0, mc2=None):
+        return self.t(hc=hc, mc2=mc2, sparse=True)
+
+    def momentum(self, sparse=False):
+        P = -1j * self._D_base
+        self.P = P
+        return P if sparse else P.toarray()
+
+    def h(self, V, sparse=False):
+        values = V(self.x) if callable(V) else np.asarray(V, dtype=float)
+        H = self.kinetic_sparse() + sp.diags(values)
+        return H if sparse else H.toarray()
+
+    def run(self, V=None, num_eigs=5):
+        if V is None:
+            if self.v is None:
+                raise ValueError("Provide V or set self.v before run().")
+            values = np.asarray(self.v, dtype=float)
+        elif callable(V):
+            values = np.asarray(V(self.x), dtype=float)
+        else:
+            values = np.asarray(V, dtype=float)
+        if values.shape != (self.npts,):
+            raise ValueError("Potential values must have shape (npts,).")
+
+        H = self.kinetic_sparse() + sp.diags(values)
+        if num_eigs >= self.npts:
+            E, U = np.linalg.eigh(H.toarray())
+        else:
+            E, U = sla.eigsh(H, k=num_eigs, which="SA")
+            order = np.argsort(E)
+            E, U = E[order], U[:, order]
+        self.eigvals = E
+        self.eigvecs = U
+        return E, U
+
+
+class LegendreDVR(DVR):
+    r"""Gauss-Legendre DVR on a finite interval.
+
+    This DVR is useful for bounded angular coordinates.  The grid points are
+    the Gauss-Legendre quadrature nodes mapped from ``[-1, 1]`` to
+    ``[xmin, xmax]``.  Coordinate-dependent operators are diagonal on this
+    grid.  The derivative/momentum operators are represented with the
+    Lagrange-cardinal differentiation matrix in the quadrature-normalized DVR
+    basis.
+    """
+
+    def __init__(self, xmin, xmax, npts, mass=1.0):
+        if npts < 1:
+            raise ValueError("npts must be positive.")
+        if xmax <= xmin:
+            raise ValueError("xmax must be larger than xmin.")
+
+        self.npts = int(npts)
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.L = self.xmax - self.xmin
+        self._mass = float(mass)
+        self.n = np.arange(self.npts)
+
+        y, wy = np.polynomial.legendre.leggauss(self.npts)
+        scale = 0.5 * self.L
+        shift = 0.5 * (self.xmin + self.xmax)
+        self.y = y
+        self.x = shift + scale * y
+        self.w = scale * wy
+        self.dx = float(np.mean(self.w))
+        self.k_max = None
+        self.v = None
+        self._D = None
+        self._D2 = None
+        self.T = None
+
+    @property
+    def mass(self):
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        self._mass = float(value)
+
+    def _differentiation_matrix(self):
+        if self._D is not None:
+            return self._D
+
+        x = self.x
+        n = self.npts
+        bary = np.ones(n, dtype=float)
+        for j in range(n):
+            bary[j] = 1.0 / np.prod(x[j] - np.delete(x, j))
+
+        D_lagrange = np.empty((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    D_lagrange[i, j] = bary[j] / bary[i] / (x[i] - x[j])
+            D_lagrange[i, i] = -np.sum(D_lagrange[i, np.arange(n) != i])
+
+        root_w = np.sqrt(self.w)
+        self._D = (root_w[:, None] / root_w[None, :]) * D_lagrange
+        return self._D
+
+    def t(self, hc=1.0, mc2=None):
+        D = self._differentiation_matrix()
+        D2 = D @ D
+        self._D2 = D2
+        T = -0.5 / self.mass * D2
+        if hc != 1.0 or mc2 is not None:
+            scale = hc ** 2
+            if mc2 is not None:
+                scale *= self.mass / mc2
+            T = scale * T
+        self.T = 0.5 * (T + T.conj().T)
+        return self.T
+
+    def momentum(self):
+        D = self._differentiation_matrix()
+        return -1j * D
+
+    def f(self, x=None):
+        if x is None:
+            x = self.x
+        x = np.asarray(x, dtype=float)
+        basis = np.empty((x.size, self.npts), dtype=float)
+        for j in range(self.npts):
+            roots = np.delete(self.x, j)
+            denom = np.prod(self.x[j] - roots)
+            basis[:, j] = np.prod(x[:, None] - roots[None, :], axis=1) / denom / np.sqrt(self.w[j])
+        return basis
+
 
 class HermiteDVR(DVR):
     r"""Hermite function basis for non-periodic functions over an interval

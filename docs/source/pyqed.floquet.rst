@@ -1,37 +1,15 @@
-pyqed.floquet package
-=====================
+Floquet
+=======
 
-Submodules
-----------
+The :mod:`pyqed.floquet` package contains utilities for periodically driven
+systems, including Floquet Hamiltonians and Floquet-Bloch models.
 
-pyqed.floquet.Floquet module
-----------------------------
+Main source modules:
 
-.. automodule:: pyqed.floquet.Floquet
-   :members:
-   :undoc-members:
-   :show-inheritance:
+* ``pyqed.floquet.Floquet``
+* ``pyqed.floquet.FloquetBloch``
+* ``pyqed.floquet.free_electron``
 
-pyqed.floquet.FloquetBloch module
----------------------------------
-
-.. automodule:: pyqed.floquet.FloquetBloch
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.floquet.free\_electron module
------------------------------------
-
-.. automodule:: pyqed.floquet.free_electron
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Module contents
----------------
-
-.. automodule:: pyqed.floquet
-   :members:
-   :undoc-members:
-   :show-inheritance:
+The API page is intentionally static because some legacy modules execute
+plotting code at import time, which is not suitable for Read the Docs autodoc
+builds.

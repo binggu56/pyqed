@@ -1,0 +1,90 @@
+{
+  "benchmark_id": "h2-sto3g-rhf-pyscf",
+  "input": {
+    "system": {
+      "atoms": [
+        {
+          "element": "H",
+          "coordinates": [
+            0.0,
+            0.0,
+            -0.7
+          ]
+        },
+        {
+          "element": "H",
+          "coordinates": [
+            0.0,
+            0.0,
+            0.7
+          ]
+        }
+      ],
+      "unit": "bohr",
+      "charge": 0,
+      "spin": 0
+    },
+    "method": {
+      "name": "RHF",
+      "basis": "sto-3g",
+      "pyqed_integral_driver": "builtin",
+      "pyqed_eri_representation": "dense",
+      "pyqed_eri_backend": "rys",
+      "pyqed_ao_symmetry": "s8",
+      "pyqed_eri_screen_tolerance": 0.0,
+      "pyqed_integral_workers": 1,
+      "pyqed_one_electron_cache": false,
+      "coordinate_type": "spherical",
+      "energy_convergence_tolerance_hartree": 1e-12,
+      "pyqed_density_convergence_tolerance": 1e-10,
+      "orbital_gradient_convergence_tolerance": 1e-10,
+      "maximum_scf_cycles": 100
+    },
+    "validation": {
+      "quantity": "total_rhf_energy",
+      "unit": "hartree",
+      "absolute_tolerance": 1e-09
+    }
+  },
+  "runtime": {
+    "python_version": "3.13.5",
+    "pyqed_module": "pyqed/__init__.py",
+    "pyscf_module": "/opt/anaconda3/lib/python3.13/site-packages/pyscf/__init__.py"
+  },
+  "implementations": {
+    "pyqed": {
+      "version": "0.2.0",
+      "integral_driver": "builtin",
+      "eri_representation": "dense",
+      "eri_backend": "rys",
+      "dense_builder": "rys-cython-blocked",
+      "ao_symmetry": "s8",
+      "coordinate_type": "spherical",
+      "geometry_hash": "7084d12932ca5fa97569ef48dc6d8b1774b6dec8",
+      "eri_quartets_computed": 6,
+      "eri_quartets_screened": 0,
+      "solver": "pyqed.qchem.hf.RHF",
+      "converged": true,
+      "scf_iterations": 4,
+      "total_rhf_energy_hartree": -1.1167143251757676
+    },
+    "pyscf": {
+      "version": "2.12.1",
+      "solver": "pyscf.scf.RHF",
+      "converged": true,
+      "total_rhf_energy_hartree": -1.116714325062552
+    }
+  },
+  "validation": {
+    "reference": "PySCF",
+    "quantity": "total_rhf_energy",
+    "unit": "hartree",
+    "absolute_tolerance": 1e-09,
+    "absolute_difference": 1.1321565906996511e-10,
+    "passed": true
+  },
+  "captured_output": {
+    "stdout": "",
+    "stderr": ""
+  }
+}

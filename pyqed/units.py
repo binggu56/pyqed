@@ -1,8 +1,14 @@
-
-import scipy.constants as const
+try:
+    import scipy.constants as const  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    const = None
 
 # proton mass in au
-proton_mass =const.physical_constants["proton-electron mass ratio"][0] 
+if const is None:
+    # CODATA 2018 proton-electron mass ratio (dimensionless).
+    proton_mass = 1836.15267343
+else:
+    proton_mass = const.physical_constants["proton-electron mass ratio"][0]
 
 au2fs = 2.41888432651e-2 # femtoseconds
 
@@ -11,7 +17,8 @@ au2as = 24.1888432651 # attoseconds
 au2k = 315775.13 #K
 
 au2ev = 27.2116
-
+au2kcalmol = 627.5094740631
+kcalmol2au = 1.0 / au2kcalmol
 
 au2tesla = 2.35051756758e5
 tesla = 1/au2tesla
@@ -84,11 +91,13 @@ atomic_mass = {'H' : 1.008,'HE' : 4.003, 'LI' : 6.941, 'BE' : 9.012,\
                  'OG' : 294}
 
 # 
-electronvolt = 1/au2ev
+electronvolt = eV = 1/au2ev
 wavenumber = 1/au2wavenumber
 kelvin = 1/au2k
 attosecond = 1/au2as
-femtosecond = 1/au2fs
+femtosecond = fs = 1/au2fs
+eV_per_angstrom = 0.01944675245116053
+
 
 class AtomicUnits:
     def __init__(self):

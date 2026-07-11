@@ -9,6 +9,7 @@ Subpackages
 
    pyqed.models
    pyqed.polariton
+   pyqed.protein
 
 Submodules
 ----------
@@ -133,10 +134,10 @@ pyqed.optics module
    :undoc-members:
    :show-inheritance:
 
-pyqed.oqs module
+pyqed.qme module
 ---------------
 
-.. automodule:: pyqed.oqs
+.. automodule:: pyqed.qme
    :members:
    :undoc-members:
    :show-inheritance:

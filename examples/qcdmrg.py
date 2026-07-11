@@ -12,7 +12,7 @@ import numpy as np
 from pyqed.qchem.mcscf.direct_ci import CASCI
 from pyqed import Molecule
 from pyqed.qchem.mol import atomic_chain
-from pyqed.qchem.dmrg.dmrg import QCDMRG
+from pyqed.qchem.dmrg.dmrg import DMRG
 
 # np.set_printoptions(precision=10, suppress=True, threshold=10000, linewidth=300)
 
@@ -33,7 +33,7 @@ mol.build(driver='pyscf')
 mf = mol.RHF().run()
 
 
-dmrg = QCDMRG(mf, ncas=4, nelecas=4, D=20) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
+dmrg = DMRG(mf, ncas=4, nelecas=4, D=20) #here we could assign number of electron wanted to be not equal to the number of electron in the HF state.
 dmrg.build().run()
 
 # dm1 = dmrg.make_rdm1(0)

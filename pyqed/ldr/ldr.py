@@ -804,7 +804,7 @@ class LDR2_LvN(LDRN):
             DESCRIPTION.
 
         """
-        from pyqed.heom.deom import HEOMSolver
+        from pyqed.HEOM.heom import HEOMSolver
 
         if self.H is None:
             self.buildH(dt)
@@ -1774,7 +1774,7 @@ class LDR2(WPD2):
         return self.expK @ psi
 
     def HEOM(self):
-        from pyqed.heom.deom import HEOMSolver
+        from pyqed.HEOM.heom import HEOMSolver
 
         if self.H is None:
             self.buildH(dt)

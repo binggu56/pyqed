@@ -194,6 +194,22 @@ class SpinHalfFermionChain:
         return self.brute_force(nstates)
 
     def brute_force(self, nstates=1):
+        """
+        exact diagonalization without using any symmetry
+
+        Parameters
+        ----------
+        nstates : TYPE, optional
+            DESCRIPTION. The default is 1.
+
+        Returns
+        -------
+        E : TYPE
+            DESCRIPTION.
+        X : TYPE
+            DESCRIPTION.
+
+        """
 
         if self.H is None:
             self.jordan_wigner()
@@ -220,6 +236,25 @@ class SpinHalfFermionChain:
 
 
     def run(self, nstates=1):
+        """
+        exact diagonalization exploiting U(1) symmetry of electron number
+
+
+        Parameters
+        ----------
+        nstates : TYPE, optional
+            DESCRIPTION. The default is 1 for the ground state only.
+
+        Raises
+        ------
+        ValueError
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        """
 
         from pyqed.mps.abelian import ConservedSite
 
@@ -301,8 +336,8 @@ class SpinHalfFermionChain:
 
             # e.append(_e.copy())
             # u.append(_u.copy())
-
-            print('e = {}'.format(_e))
+            for i in range(nstates):
+                print('Root {} = {}'.format(i, _e[i]))
 
             self.e_tot = _e
             self.X = _u

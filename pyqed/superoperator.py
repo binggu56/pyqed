@@ -13,7 +13,6 @@ Possible improvements:
     1. merge the Qobj class with QUTIP
 """
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.sparse import kron, identity, issparse
 from scipy.sparse.linalg import eigs
 import scipy
@@ -22,7 +21,7 @@ import math
 
 from numpy import exp
 
-from pyqed import dag, pauli, Result
+from pyqed import dag, pauli
 # from qutip import Qobj as Basic
 
 
@@ -523,6 +522,8 @@ class Lindblad_solver:
 
     def evolve(self, rho0, tlist, e_ops):
 
+        from pyqed import Result
+
         result = Result(times=tlist)
         # evals, evecs_r, evecs_l = self.eigvals, self.eigvecs_right,\
         #     self.eigvecs_left
@@ -865,4 +866,3 @@ if __name__ == '__main__':
     # plt.show()
     # from lime.style import matplot
     # fig, ax = matplot(times, times, cor.real)
-

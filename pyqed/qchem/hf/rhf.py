@@ -15,6 +15,7 @@ from scipy.linalg import eigh
 # from pyscf.scf import _vhf
 # from pyscf import ao2mo
 import sys
+import re
 
 from pyqed import dagger, dag
 from opt_einsum import contract
@@ -23,11 +24,391 @@ from functools import reduce
 import math
 
 
+_AO_LABEL_RE = re.compile(r"^(?P<n>\d+)(?P<l>[a-z])(?P<comp>.*)$", re.IGNORECASE)
+
+
+def _parse_ao_label(label):
+    parts = str(label).split()
+    if len(parts) < 3:
+        raise ValueError(f"Unable to parse AO label '{label}'.")
+    atom_index = int(parts[0])
+    symbol = parts[1]
+    orbital = parts[2]
+    match = _AO_LABEL_RE.match(orbital)
+    if match is None:
+        raise ValueError(f"Unable to parse shell information from AO label '{label}'.")
+    shell = f"{match.group('n')}{match.group('l')}"
+    component = match.group('comp')
+    return {
+        'atom_index': atom_index,
+        'symbol': symbol,
+        'shell': shell,
+        'component': component,
+        'label': str(label),
+    }
+
+
+def _group_ao_indices_by_atom(ao_labels, natom):
+    groups = [[] for _ in range(natom)]
+    for ao_idx, label in enumerate(ao_labels):
+        atom_idx = _parse_ao_label(label)['atom_index']
+        groups[atom_idx].append(ao_idx)
+    return [np.asarray(group, dtype=int) for group in groups]
+
+
+def _cross_ao_overlap_matrix(mol_bra, mol_ket):
+    basis_bra = mol_bra._bas_cart if getattr(mol_bra, "_bas_cart", None) is not None else mol_bra._bas
+    basis_ket = mol_ket._bas_cart if getattr(mol_ket, "_bas_cart", None) is not None else mol_ket._bas
+    if basis_bra is None or basis_ket is None:
+        raise ValueError("Build both molecules before requesting cross AO overlaps.")
+
+    try:
+        from pyqed.qchem.basis import S as native_overlap
+
+        s12 = np.empty((len(basis_bra), len(basis_ket)), dtype=float)
+        for i, bra_ao in enumerate(basis_bra):
+            for j, ket_ao in enumerate(basis_ket):
+                s12[i, j] = float(native_overlap(bra_ao, ket_ao))
+    except Exception:
+        s12 = None
+
+    if s12 is None:
+        try:
+            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+
+            s12 = np.asarray(overlap_integral_asymmetric(basis_bra, basis_ket), dtype=float)
+        except Exception as err:
+            raise ValueError(
+                "Cross-AO overlap requires PyQED builtin AO objects or gbasis shells."
+            ) from err
+
+    transform_bra = getattr(mol_bra, "_ao_cart2sph", None)
+    transform_ket = getattr(mol_ket, "_ao_cart2sph", None)
+    if transform_bra is not None:
+        s12 = np.einsum('pi,pq->iq', transform_bra, s12, optimize=True)
+    if transform_ket is not None:
+        s12 = np.einsum('pq,qj->pj', s12, transform_ket, optimize=True)
+    return s12
+
+
+def _lowdin_sqrt_overlap(overlap, thresh=1e-12):
+    eigvals, eigvecs = eigh(np.asarray(overlap, dtype=float))
+    if np.any(eigvals < -thresh):
+        raise ValueError("AO overlap matrix is not positive semidefinite.")
+    eigvals = np.clip(eigvals, 0.0, None)
+    return (eigvecs * np.sqrt(eigvals)) @ eigvecs.T
+
+
+def _as_xyz_operator(op, name):
+    op = np.asarray(op, dtype=float)
+    if op.ndim != 3:
+        raise ValueError(f"{name} must be a rank-3 array.")
+    if op.shape[0] == 3:
+        return op
+    if op.shape[-1] == 3:
+        return np.moveaxis(op, -1, 0)
+    raise ValueError(f"{name} expects shape (3, nao, nao) or (nao, nao, 3).")
+
+
+def _boys_objective_from_position(r_mo):
+    centers = np.diagonal(r_mo, axis1=1, axis2=2).T
+    return float(np.sum(centers * centers))
+
+
+def _boys_localize(
+    mo_coeff,
+    r_ao,
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    info = {
+        'method': 'boys',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': 0.0,
+        'final_objective': 0.0,
+    }
+    if nloc <= 1:
+        r_mo = contract('xij,ip,jq->xpq', r_ao, coeff, coeff, optimize=True)
+        obj = _boys_objective_from_position(r_mo)
+        info['initial_objective'] = obj
+        info['final_objective'] = obj
+        return coeff, info
+
+    r_mo = contract('xij,ip,jq->xpq', r_ao, coeff, coeff, optimize=True)
+    objective = _boys_objective_from_position(r_mo)
+    info['initial_objective'] = objective
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                center_diff = 0.5 * (r_mo[:, p, p] - r_mo[:, q, q])
+                coupling = r_mo[:, p, q]
+                a2 = float(np.dot(center_diff, center_diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(center_diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = center_diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                rp = r_mo[:, :, p].copy()
+                rq = r_mo[:, :, q].copy()
+                r_mo[:, :, p] = c * rp + s * rq
+                r_mo[:, :, q] = -s * rp + c * rq
+
+                rp = r_mo[:, p, :].copy()
+                rq = r_mo[:, q, :].copy()
+                r_mo[:, p, :] = c * rp + s * rq
+                r_mo[:, q, :] = -s * rp + c * rq
+
+                objective = _boys_objective_from_position(r_mo)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
+def _population_objective(y_coeff, atom_groups):
+    objective = 0.0
+    for group in atom_groups:
+        populations = np.sum(y_coeff[group, :] ** 2, axis=0)
+        objective += float(np.dot(populations, populations))
+    return objective
+
+
+def _mulliken_population_objective(coeff, scoeff, atom_groups):
+    objective = 0.0
+    for group in atom_groups:
+        populations = np.sum(coeff[group, :] * scoeff[group, :], axis=0)
+        objective += float(np.dot(populations, populations))
+    return objective
+
+
+def _pipek_mezey_localize(
+    mo_coeff,
+    overlap,
+    atom_groups,
+    method='pm',
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    overlap = np.asarray(overlap, dtype=float)
+    scoeff = overlap @ coeff
+    objective = _mulliken_population_objective(coeff, scoeff, atom_groups)
+    info = {
+        'method': str(method),
+        'backend': 'native',
+        'population_metric': 'mulliken',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': objective,
+        'final_objective': objective,
+    }
+    if nloc <= 1:
+        return coeff, info
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                diff = np.empty(len(atom_groups), dtype=float)
+                coupling = np.empty(len(atom_groups), dtype=float)
+                for atom_idx, group in enumerate(atom_groups):
+                    cp = coeff[group, p]
+                    cq = coeff[group, q]
+                    sp = scoeff[group, p]
+                    sq = scoeff[group, q]
+                    pop_p = float(np.dot(cp, sp))
+                    pop_q = float(np.dot(cq, sq))
+                    cross = 0.5 * (float(np.dot(cp, sq)) + float(np.dot(cq, sp)))
+                    diff[atom_idx] = 0.5 * (pop_p - pop_q)
+                    coupling[atom_idx] = cross
+
+                a2 = float(np.dot(diff, diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                sp = scoeff[:, p].copy()
+                sq = scoeff[:, q].copy()
+                scoeff[:, p] = c * sp + s * sq
+                scoeff[:, q] = -s * sp + c * sq
+
+                objective = _mulliken_population_objective(coeff, scoeff, atom_groups)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
+def _ibo_localize(
+    mo_coeff,
+    overlap,
+    atom_groups,
+    method='ibo',
+    max_cycle=100,
+    conv_tol=1e-10,
+    rotation_tol=1e-12,
+):
+    coeff = np.array(mo_coeff, dtype=float, copy=True)
+    if coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+
+    nloc = coeff.shape[1]
+    sqrt_overlap = _lowdin_sqrt_overlap(overlap)
+    y_coeff = sqrt_overlap @ coeff
+    objective = _population_objective(y_coeff, atom_groups)
+    info = {
+        'method': str(method),
+        'backend': 'native',
+        'population_metric': 'lowdin',
+        'converged': True,
+        'ncycle': 0,
+        'initial_objective': objective,
+        'final_objective': objective,
+    }
+    if nloc <= 1:
+        return coeff, info
+
+    for cycle in range(1, int(max_cycle) + 1):
+        start_objective = objective
+        max_rotation = 0.0
+
+        for p in range(nloc - 1):
+            for q in range(p + 1, nloc):
+                diff = np.empty(len(atom_groups), dtype=float)
+                coupling = np.empty(len(atom_groups), dtype=float)
+                for atom_idx, group in enumerate(atom_groups):
+                    yp = y_coeff[group, p]
+                    yq = y_coeff[group, q]
+                    diff[atom_idx] = 0.5 * (float(np.dot(yp, yp)) - float(np.dot(yq, yq)))
+                    coupling[atom_idx] = float(np.dot(yp, yq))
+
+                a2 = float(np.dot(diff, diff))
+                b2 = float(np.dot(coupling, coupling))
+                ab = float(np.dot(diff, coupling))
+
+                theta = 0.25 * math.atan2(2.0 * ab, a2 - b2)
+                candidates = (theta, theta + 0.25 * math.pi)
+
+                best_theta = 0.0
+                best_value = a2
+                for trial in candidates:
+                    phi = 2.0 * trial
+                    rotated = diff * math.cos(phi) + coupling * math.sin(phi)
+                    value = float(np.dot(rotated, rotated))
+                    if value > best_value:
+                        best_value = value
+                        best_theta = trial
+
+                if abs(best_theta) < rotation_tol or best_value - a2 < conv_tol * 0.1:
+                    continue
+
+                c = math.cos(best_theta)
+                s = math.sin(best_theta)
+
+                cp = coeff[:, p].copy()
+                cq = coeff[:, q].copy()
+                coeff[:, p] = c * cp + s * cq
+                coeff[:, q] = -s * cp + c * cq
+
+                yp = y_coeff[:, p].copy()
+                yq = y_coeff[:, q].copy()
+                y_coeff[:, p] = c * yp + s * yq
+                y_coeff[:, q] = -s * yp + c * yq
+
+                objective = _population_objective(y_coeff, atom_groups)
+                max_rotation = max(max_rotation, abs(best_theta))
+
+        info['ncycle'] = cycle
+        if objective - start_objective < conv_tol and max_rotation < math.sqrt(rotation_tol):
+            break
+    else:
+        info['converged'] = False
+
+    info['final_objective'] = objective
+    return coeff, info
+
+
 class RHF:
-    def __init__(self, mol, init_guess='h1e'):
+    def __init__(self, mol, init_guess='h1e', verbose=0):
         self.mol = mol
         self.max_cycle = 100
         self.init_guess = init_guess
+        self.verbose = int(verbose)
 
         self.nocc = self.mol.nelec//2
 
@@ -45,10 +426,7 @@ class RHF:
         self.e_ne = None
         self.e_j = None
         self.e_k = None
-        self.dipole_moment = None
 
-        self.atom_coords = self.mol.atom_coords()
-        self.atom_charges = self.mol.atom_charges()
 
 
 
@@ -58,22 +436,218 @@ class RHF:
         self.dm = None
 
         self.eri = mol.eri
+        self.eri_s4 = getattr(mol, 'eri_s4', None)
+        self.eri_s8 = getattr(mol, 'eri_s8', None)
         # self.eri_so = None
 
         self.mo_energy = None
+        self._pyscf_mf = None
+        self.density_fit = False
+        self.auxbasis = None
+        self.cholesky_jk = False
+        self.cholesky_tol = None
+        self.cholesky_max_rank = None
+        self.low_rank_jk = False
+        self.low_rank_tol = None
+        self.low_rank_max_rank = None
+        self.eri_factors = None
+        self.x2c = False
+        self.relativistic = None
+        self._nonrel_hcore = None
+        self.with_solvent = None
+        self._v_solvent = None
+        self._e_solvent = 0.0
+        self.converged = False
+        self.damping = 0.0
+        self.damping_mode = 'density'
+        self.damping_decay = 1.0
+        self.damping_decay_start = 0
+        self.damping_min = 0.0
+        self.level_shift = 0.0
+        self.level_shift_decay = 1.0
+        self.level_shift_decay_start = 0
+        self.level_shift_min = 0.0
+        self.diis = True
+        self.scf_diis = 'cdiis'
+        self.diis_switch_tol = 1e-3
+        self.diis_start_cycle = 2
+        self.diis_space = 6
 
     def run(self, **kwargs):
-        self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
-            self.vhf, self.dm = hartree_fock(self, **kwargs)
-        return self
-    
-    def get_nelec(self):
-        nelec = self.nelec
-        return nelec
+        verbose = int(kwargs.pop('verbose', self.verbose))
+        self.verbose = verbose
+        x2c_kw = kwargs.pop('x2c', False)
+        relativistic = kwargs.pop('relativistic', None)
+        if relativistic is not None:
+            rel_key = str(relativistic).lower()
+            if rel_key in ('none', 'false', 'nonrel', 'nonrelativistic'):
+                x2c_kw = False
+                relativistic = None
+            elif rel_key in ('x2c', 'scalar-x2c', 'sfx2c', 'spin-free-x2c'):
+                x2c_kw = True
+                relativistic = 'x2c'
+            else:
+                raise ValueError("relativistic must be None or 'x2c'.")
+        else:
+            relativistic = 'x2c' if x2c_kw else None
+        x2c_kw = bool(x2c_kw)
+        density_fit = bool(kwargs.pop('density_fit', False))
+        auxbasis = kwargs.pop('auxbasis', None)
+        with_solvent = kwargs.pop('with_solvent', kwargs.pop('solvent', getattr(self, 'with_solvent', None)))
+        cholesky_jk_kw = kwargs.pop('cholesky_jk', None)
+        low_rank_jk_kw = kwargs.pop('low_rank_jk', None)
+        if cholesky_jk_kw is not None and low_rank_jk_kw is not None \
+                and bool(cholesky_jk_kw) != bool(low_rank_jk_kw):
+            raise ValueError("cholesky_jk and low_rank_jk aliases disagree.")
 
-    def get_nao(self):
-        nao = self.nao
-        return nao
+        cholesky_tol_kw = kwargs.pop('cholesky_tol', None)
+        low_rank_tol_kw = kwargs.pop('low_rank_tol', None)
+        if cholesky_tol_kw is not None and low_rank_tol_kw is not None \
+                and float(cholesky_tol_kw) != float(low_rank_tol_kw):
+            raise ValueError("cholesky_tol and low_rank_tol aliases disagree.")
+
+        cholesky_max_rank_kw = kwargs.pop('cholesky_max_rank', None)
+        low_rank_max_rank_kw = kwargs.pop('low_rank_max_rank', None)
+        if cholesky_max_rank_kw is not None and low_rank_max_rank_kw is not None \
+                and cholesky_max_rank_kw != low_rank_max_rank_kw:
+            raise ValueError("cholesky_max_rank and low_rank_max_rank aliases disagree.")
+
+        cholesky_jk = bool(
+            False if cholesky_jk_kw is None and low_rank_jk_kw is None
+            else (cholesky_jk_kw if cholesky_jk_kw is not None else low_rank_jk_kw)
+        )
+        cholesky_tol = (
+            1e-8 if cholesky_tol_kw is None and low_rank_tol_kw is None
+            else (cholesky_tol_kw if cholesky_tol_kw is not None else low_rank_tol_kw)
+        )
+        cholesky_max_rank = (
+            None if cholesky_max_rank_kw is None and low_rank_max_rank_kw is None
+            else (cholesky_max_rank_kw if cholesky_max_rank_kw is not None else low_rank_max_rank_kw)
+        )
+
+        if (
+            cholesky_jk_kw is None
+            and low_rank_jk_kw is None
+            and getattr(self.mol, 'eri_factors', None) is not None
+        ):
+            cholesky_jk = True
+            cholesky_tol = getattr(
+                self.mol, 'builtin_low_rank_tol',
+                getattr(self.mol, 'native_low_rank_tol', cholesky_tol),
+            )
+            cholesky_max_rank = getattr(
+                self.mol, 'builtin_low_rank_max_rank',
+                getattr(self.mol, 'native_low_rank_max_rank', cholesky_max_rank),
+            )
+
+        self.max_cycle = int(kwargs.get('max_cycle', self.max_cycle))
+        self.conv_tol = float(kwargs.get('tol', kwargs.get('conv_tol', 1e-8)))
+        self.conv_tol_dm = float(kwargs.get('conv_tol_dm', 1e-6))
+        self.conv_tol_grad = kwargs.get('conv_tol_grad', None)
+        if self.conv_tol_grad is not None:
+            self.conv_tol_grad = float(self.conv_tol_grad)
+        self.damping = float(kwargs.get('damping', 0.0))
+        self.damping_mode = str(kwargs.get('damping_mode', 'density')).lower()
+        self.damping_decay = float(kwargs.get('damping_decay', 1.0))
+        self.damping_decay_start = int(kwargs.get('damping_decay_start', 0))
+        self.damping_min = float(kwargs.get('damping_min', 0.0))
+        self.level_shift = float(kwargs.get('level_shift', 0.0))
+        self.level_shift_decay = float(kwargs.get('level_shift_decay', 1.0))
+        self.level_shift_decay_start = int(kwargs.get('level_shift_decay_start', 0))
+        self.level_shift_min = float(kwargs.get('level_shift_min', 0.0))
+        self.diis = bool(kwargs.get('diis', True))
+        self.scf_diis = str(kwargs.get('scf_diis', 'cdiis')).lower()
+        self.diis_switch_tol = float(kwargs.get('diis_switch_tol', 1e-3))
+        self.diis_start_cycle = int(kwargs.get('diis_start_cycle', 2))
+        self.diis_space = int(kwargs.get('diis_space', 6))
+
+        if density_fit and cholesky_jk:
+            raise ValueError("density_fit and cholesky_jk are mutually exclusive RHF accelerators.")
+        if density_fit and x2c_kw:
+            raise NotImplementedError("RHF.run(x2c=True) currently supports the native J/K path, not density_fit=True.")
+        if density_fit and with_solvent is not None:
+            raise NotImplementedError("Native PCM-RHF is currently wired for the native J/K path, not density_fit=True.")
+
+        hcore_override = None
+        old_hcore = None
+        if x2c_kw:
+            from pyqed.qchem.relativistic import x2c1e_hcore
+
+            hcore_override = x2c1e_hcore(self.mol)
+            old_hcore = self.mol.hcore
+            self._nonrel_hcore = np.array(old_hcore, copy=True)
+            self.mol.hcore = hcore_override
+
+        try:
+            if density_fit:
+                self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+                    self.vhf, self.dm, self._pyscf_mf = pyscf_density_fit_rhf(
+                        self.mol,
+                        dm0=kwargs.pop('dm0', None),
+                        init_guess=kwargs.pop('init_guess', self.init_guess),
+                        max_cycle=kwargs.pop('max_cycle', 50),
+                        tol=kwargs.pop('tol', 1e-8),
+                        auxbasis=auxbasis,
+                        verbose=verbose,
+                    )
+                self.density_fit = True
+                self.auxbasis = auxbasis
+                self.cholesky_jk = False
+                self.cholesky_tol = None
+                self.cholesky_max_rank = None
+                self.low_rank_jk = False
+                self.low_rank_tol = None
+                self.low_rank_max_rank = None
+                self.eri_factors = None
+                self.converged = bool(getattr(self._pyscf_mf, 'converged', False))
+            else:
+                self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+                    self.vhf, self.dm, self.scf_info = hartree_fock(
+                        self.mol,
+                        low_rank_jk=cholesky_jk,
+                        low_rank_tol=cholesky_tol,
+                        low_rank_max_rank=cholesky_max_rank,
+                        with_solvent=with_solvent,
+                        return_info=True,
+                        verbose=verbose,
+                        **kwargs,
+                    )
+                self._pyscf_mf = None
+                self.density_fit = False
+                self.auxbasis = None
+                self.cholesky_jk = cholesky_jk
+                self.cholesky_tol = cholesky_tol if cholesky_jk else None
+                self.cholesky_max_rank = cholesky_max_rank if cholesky_jk else None
+                self.low_rank_jk = self.cholesky_jk
+                self.low_rank_tol = self.cholesky_tol
+                self.low_rank_max_rank = self.cholesky_max_rank
+                self.eri_factors = (
+                    get_or_build_low_rank_eri_factors(
+                        self.mol,
+                        tol=cholesky_tol,
+                        max_rank=cholesky_max_rank,
+                    )
+                    if cholesky_jk else None
+                )
+                self.converged = bool(self.scf_info.get("converged", False))
+                self.with_solvent = with_solvent
+                self._e_solvent = float(self.scf_info.get("solvent_energy", 0.0))
+                self._v_solvent = None if with_solvent is None else getattr(with_solvent, "v", None)
+        finally:
+            if hcore_override is not None:
+                self.mol.hcore = old_hcore
+
+        self.x2c = x2c_kw
+        self.relativistic = relativistic
+        return self
+
+    def as_scanner(self, build_driver=None):
+        """
+        Return a lightweight scanner that reuses the previous density matrix and,
+        when enabled, low-rank ERI factors across nearby geometries.
+        """
+        return RHFScanner(self, build_driver=build_driver)
+    
 
     def get_eri(self, representation='mo'):
         """
@@ -100,6 +674,45 @@ class RHF:
             eri = contract('abcd, ap, br, cs, dq -> pqrs', self.eri, C.conj(), C, C.conj(), C)
                                     
             return eri
+
+    def dipole(self, center=None, basis='ao'):
+        """
+        Electric-dipole operator integrals from the current RHF reference.
+
+        Parameters
+        ----------
+        center : array_like, optional
+            Dipole origin. Defaults to the nuclear center of mass.
+        basis : {'ao', 'mo'}, optional
+            Basis for the returned operator blocks.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(3, nao, nao)`` for ``basis='ao'`` or ``(3, nmo, nmo)`` for
+            ``basis='mo'``. The returned operator is the electronic dipole
+            operator ``mu = -r``, not the position operator ``r``.
+        """
+        if center is None:
+            center = self.mol.center_of_mass()
+        op = -np.asarray(self.mol.moment_integral(center=center), dtype=float)
+        if op.ndim != 3:
+            raise ValueError("moment_integral() must return a rank-3 array.")
+        if op.shape[0] != 3:
+            if op.shape[-1] == 3:
+                op = np.moveaxis(op, -1, 0)
+            else:
+                raise ValueError("dipole() expects shape (3, nao, nao) or (nao, nao, 3).")
+
+        key = basis.lower()
+        if key == 'ao':
+            return op
+        if key == 'mo':
+            if self.mo_coeff is None:
+                raise ValueError("Run RHF before requesting dipole operators in the MO basis.")
+            coeff = np.asarray(self.mo_coeff)
+            return contract('xij,ip,jq->xpq', op, coeff.conj(), coeff, optimize=True)
+        raise ValueError("basis must be 'ao' or 'mo'.")
 
     def get_eri_so(self):
         """
@@ -139,11 +752,648 @@ class RHF:
         # print("Imag part of ERIs =", np.linalg.norm(eri.imag))
         return eri
 
+    def get_soc_pvxp_ao(self, one_center=True):
+        """
+        Raw three-component p V x p operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_pvxp_ao
+        return get_pvxp_ao(self.mol, one_center=one_center)
+
+    def get_soc_1e_ao(self, one_center=True, with_prefactor=True, light_speed=None):
+        """
+        One-electron Breit-Pauli SOC operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_ao
+        return get_soc_1e_ao(
+            self.mol,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_1e_mo(self, mo_coeff=None, one_center=True, with_prefactor=True,
+                      light_speed=None):
+        """
+        One-electron Breit-Pauli SOC operator in the MO basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_mo
+        return get_soc_1e_mo(
+            self,
+            mo_coeff=mo_coeff,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_1e_so(self, representation='mo', mo_coeff=None, one_center=True,
+                      with_prefactor=True, light_speed=None):
+        """
+        One-electron Breit-Pauli SOC Hamiltonian in a spin-orbital basis.
+        """
+        from pyqed.qchem.soc import get_soc_1e_spin_orbital
+        return get_soc_1e_spin_orbital(
+            self,
+            representation=representation,
+            mo_coeff=mo_coeff,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_2e_somf_ao(self, dm=None, states=None, with_prefactor=True,
+                           light_speed=None):
+        """
+        Two-electron SOMF SOC operator in the AO basis.
+        """
+        from pyqed.qchem.soc import get_soc_2e_somf_ao
+        return get_soc_2e_somf_ao(
+            self,
+            dm=dm,
+            states=states,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_somf_mo(self, mo_coeff=None, dm=None, states=None, include_1e=True,
+                        one_center=True, with_prefactor=True, light_speed=None):
+        """
+        Full SOMF SOC operator in the MO basis.
+        """
+        from pyqed.qchem.soc import get_soc_somf_mo
+        return get_soc_somf_mo(
+            self,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            states=states,
+            include_1e=include_1e,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
+    def get_soc_somf_so(self, representation='mo', mo_coeff=None, dm=None,
+                        states=None, include_1e=True, one_center=True,
+                        with_prefactor=True, light_speed=None):
+        """
+        Full SOMF SOC Hamiltonian in a spin-orbital basis.
+        """
+        from pyqed.qchem.soc import get_soc_somf_spin_orbital
+        return get_soc_somf_spin_orbital(
+            self,
+            representation=representation,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            states=states,
+            include_1e=include_1e,
+            one_center=one_center,
+            with_prefactor=with_prefactor,
+            light_speed=light_speed,
+        )
+
     def make_rdm1(self):
         return make_rdm1(self.mo_coeff, self.mo_occ)
 
     def get_ovlp(self):
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_ovlp()
         return self.mol.overlap
+
+    def Hessian(self):
+        """
+        Native analytic RHF nuclear Hessian using builtin derivative integrals.
+        """
+        from .hessian import RHFHessian
+        return RHFHessian(self)
+
+    def localize_orbitals(
+        self,
+        method='ibo',
+        space='occ',
+        mo_coeff=None,
+        occ_threshold=0.5,
+        return_indices=False,
+        return_info=False,
+        **kwargs,
+    ):
+        """
+        Localize molecular orbitals from the converged RHF solution.
+
+        Examples
+        --------
+        >>> mf = mol.RHF().run()
+        >>> c_ibo = mf.localize_orbitals(method="ibo", space="occ")
+
+        Parameters
+        ----------
+        method : str
+            Localization method. Supports native ``"boys"``, ``"pm"``
+            (Pipek-Mezey), ``"ibo"``, and ``"lm"`` localization.
+        space : str
+            Orbital subspace to localize when ``mo_coeff`` is not supplied.
+            Currently ``"occ"`` is supported.
+        mo_coeff : ndarray, optional
+            MO coefficient block to localize directly. If omitted, orbitals are
+            selected from ``self.mo_coeff`` using ``space``.
+        occ_threshold : float
+            Orbitals with occupation larger than this value are treated as occupied.
+        return_indices : bool
+            If True, return ``(localized_coeff, mo_indices)``.
+        return_info : bool
+            If True, return convergence metadata. With ``return_indices=True``,
+            the return value is ``(localized_coeff, mo_indices, info)``.
+        **kwargs
+            Forwarded to the backend localization routine.
+        """
+        if self.mo_coeff is None or self.mo_occ is None:
+            raise RuntimeError("Run RHF before localizing orbitals.")
+
+        method_key = str(method).lower().replace('-', '_')
+        if method_key in {'intrinsic_bond_orbital', 'intrinsic_bond_orbitals'}:
+            method_key = 'ibo'
+        if method_key in {'lowdin_mulliken', 'lowdin_mulliken_population'}:
+            method_key = 'lm'
+        if method_key in {'pipek_mezey', 'pipek_mezey_population'}:
+            method_key = 'pm'
+        if method_key not in {'ibo', 'boys', 'lm', 'pm'}:
+            raise ValueError("Supported localization methods are 'boys', 'pm', 'ibo', and 'lm'.")
+
+        if mo_coeff is None:
+            space_key = str(space).lower().replace('-', '_')
+            if space_key == 'occupied':
+                space_key = 'occ'
+            if space_key != 'occ':
+                raise ValueError("Only space='occ' is currently supported when mo_coeff is not supplied.")
+
+            coeff = self.mo_coeff
+            occ = np.asarray(self.mo_occ)
+            orb_indices = np.flatnonzero(occ > occ_threshold)
+            if orb_indices.size == 0:
+                raise ValueError("No occupied orbitals found for localization.")
+            orb = coeff[:, orb_indices]
+        else:
+            orb_indices = None
+            orb = mo_coeff
+
+        coeff = np.asarray(orb)
+        if coeff.ndim != 2:
+            raise ValueError("mo_coeff must be a 2D array.")
+        if coeff.shape[0] != self.nao:
+            raise ValueError(f"mo_coeff has {coeff.shape[0]} AO rows, expected {self.nao}.")
+
+        if method_key == 'boys':
+            r_ao = _as_xyz_operator(
+                self.mol.moment_integral(center=np.zeros(3)),
+                'moment_integral()',
+            )
+            max_cycle = kwargs.pop('max_cycle', 100)
+            conv_tol = kwargs.pop('conv_tol', kwargs.pop('tol', 1e-10))
+            rotation_tol = kwargs.pop('rotation_tol', 1e-12)
+            if kwargs:
+                unknown = ', '.join(sorted(kwargs))
+                raise TypeError(f"Unsupported Boys localization keyword(s): {unknown}.")
+            localized, info = _boys_localize(
+                coeff,
+                r_ao,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+            if return_indices and return_info:
+                return localized, orb_indices, info
+            if return_indices:
+                return localized, orb_indices
+            if return_info:
+                return localized, info
+            return localized
+
+        max_cycle = kwargs.pop('max_cycle', 100)
+        conv_tol = kwargs.pop('conv_tol', kwargs.pop('tol', 1e-10))
+        rotation_tol = kwargs.pop('rotation_tol', 1e-12)
+        if kwargs:
+            unknown = ', '.join(sorted(kwargs))
+            raise TypeError(f"Unsupported {method_key.upper()} localization keyword(s): {unknown}.")
+
+        ao_labels = self.mol.ao_labels()
+        atom_groups = _group_ao_indices_by_atom(ao_labels, self.mol.natom)
+        if method_key == 'pm':
+            localized, info = _pipek_mezey_localize(
+                coeff,
+                self.get_ovlp(),
+                atom_groups,
+                method=method_key,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+        else:
+            localized, info = _ibo_localize(
+                coeff,
+                self.get_ovlp(),
+                atom_groups,
+                method=method_key,
+                max_cycle=max_cycle,
+                conv_tol=conv_tol,
+                rotation_tol=rotation_tol,
+            )
+
+        if return_indices and return_info:
+            return localized, orb_indices, info
+        if return_indices:
+            return localized, orb_indices
+        if return_info:
+            return localized, info
+        return localized
+
+    def analyze(self):
+        from .analysis import RHFAnalysis
+        return RHFAnalysis(self)
+
+    def mo_components(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        min_contribution=0.0,
+        sort=True,
+        max_components=None,
+    ):
+        return self.analyze().mo_components(
+            mo_indices=mo_indices,
+            metric=metric,
+            min_contribution=min_contribution,
+            sort=sort,
+            max_components=max_components,
+        )
+
+    def print_mo_components(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        min_contribution=0.0,
+        sort=True,
+        max_components=None,
+    ):
+        return self.analyze().print_mo_components(
+            mo_indices=mo_indices,
+            metric=metric,
+            min_contribution=min_contribution,
+            sort=sort,
+            max_components=max_components,
+        )
+
+    def mulliken_charges(self, dm=None):
+        return self.analyze().mulliken_charges(dm=dm)
+
+    def print_mulliken_charges(self, dm=None):
+        return self.analyze().print_mulliken_charges(dm=dm)
+
+    def lowdin_charges(self, dm=None):
+        return self.analyze().lowdin_charges(dm=dm)
+
+    def print_lowdin_charges(self, dm=None):
+        return self.analyze().print_lowdin_charges(dm=dm)
+
+    def mayer_bond_orders(self, dm=None):
+        return self.analyze().mayer_bond_orders(dm=dm)
+
+    def print_mayer_bond_orders(self, dm=None, min_bond_order=0.0):
+        return self.analyze().print_mayer_bond_orders(dm=dm, min_bond_order=min_bond_order)
+
+    def wiberg_bond_orders(self, dm=None):
+        return self.analyze().wiberg_bond_orders(dm=dm)
+
+    def print_wiberg_bond_orders(self, dm=None, min_bond_order=0.0):
+        return self.analyze().print_wiberg_bond_orders(dm=dm, min_bond_order=min_bond_order)
+
+    def mo_composition(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        group_by='atom+shell',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().mo_composition(
+            mo_indices=mo_indices,
+            metric=metric,
+            group_by=group_by,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def print_mo_composition(
+        self,
+        mo_indices=None,
+        metric='mulliken',
+        group_by='atom+shell',
+        min_contribution=0.0,
+        sort=True,
+    ):
+        return self.analyze().print_mo_composition(
+            mo_indices=mo_indices,
+            metric=metric,
+            group_by=group_by,
+            min_contribution=min_contribution,
+            sort=sort,
+        )
+
+    def mo_overlap(self, other, mo_indices=None, other_mo_indices=None):
+        return self.analyze().mo_overlap(
+            other,
+            mo_indices=mo_indices,
+            other_mo_indices=other_mo_indices,
+        )
+
+    def sample_mo(self, mo_index, coords, screen_basis=True, tol_screen=1e-8):
+        return self.analyze().sample_mo(
+            mo_index,
+            coords,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def electron_density(self, coords, dm=None, screen_basis=True, tol_screen=1e-8):
+        return self.analyze().electron_density(
+            coords,
+            dm=dm,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def sample_mo_grid(
+        self,
+        mo_index,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+    ):
+        return self.analyze().sample_mo_grid(
+            mo_index,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def electron_density_grid(
+        self,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        dm=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+    ):
+        return self.analyze().electron_density_grid(
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            dm=dm,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+        )
+
+    def orbital_cube(
+        self,
+        orbital_index,
+        filename,
+        coeff=None,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        comment=None,
+    ):
+        return self.analyze().orbital_cube(
+            orbital_index,
+            filename,
+            coeff=coeff,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            comment=comment,
+        )
+
+    def density_cube(
+        self,
+        filename,
+        dm=None,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        comment=None,
+    ):
+        from pyqed.qchem.tools import cubegen
+
+        return cubegen.density(
+            self,
+            filename,
+            dm=dm,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            comment=comment,
+        )
+
+    def plot_mo(self, mo_index='homo', save=None, **kwargs):
+        return self.analyze().plot_mo(mo_index, save=save, **kwargs)
+
+    def plot_mo_3d(
+        self,
+        mo_index,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        isovalue=None,
+        isovalue_fraction=0.2,
+        positive_color='#1f77b4',
+        negative_color='#d62728',
+        alpha=0.45,
+        atom_size=60.0,
+        show_atoms=True,
+        show_bonds=None,
+        bond_scale=1.25,
+        bond_color='#555555',
+        bond_linewidth=1.6,
+        atom_colors=None,
+        atom_render='sphere',
+        atom_alpha=None,
+        sphere_quality=20,
+        label_atoms=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        ax=None,
+        figsize=(7.0, 6.0),
+        elev=20.0,
+        azim=-60.0,
+        clean_axes=None,
+        axis_off=None,
+        style='default',
+        title=None,
+        title_fontsize=None,
+        title_pad=None,
+        backend='matplotlib',
+        save=None,
+    ):
+        return self.analyze().plot_mo_3d(
+            mo_index,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            isovalue=isovalue,
+            isovalue_fraction=isovalue_fraction,
+            positive_color=positive_color,
+            negative_color=negative_color,
+            alpha=alpha,
+            atom_size=atom_size,
+            show_atoms=show_atoms,
+            show_bonds=show_bonds,
+            bond_scale=bond_scale,
+            bond_color=bond_color,
+            bond_linewidth=bond_linewidth,
+            atom_colors=atom_colors,
+            atom_render=atom_render,
+            atom_alpha=atom_alpha,
+            sphere_quality=sphere_quality,
+            label_atoms=label_atoms,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            ax=ax,
+            figsize=figsize,
+            elev=elev,
+            azim=azim,
+            clean_axes=clean_axes,
+            axis_off=axis_off,
+            style=style,
+            title=title,
+            title_fontsize=title_fontsize,
+            title_pad=title_pad,
+            backend=backend,
+            save=save,
+        )
+
+    def plot_frontier_mos_3d(self, mo_indices=None, figsize=(12.0, 5.5), save=None, **kwargs):
+        return self.analyze().plot_frontier_mos_3d(
+            mo_indices=mo_indices,
+            figsize=figsize,
+            save=save,
+            **kwargs,
+        )
+
+    def plot_density(
+        self,
+        nx=40,
+        ny=None,
+        nz=None,
+        margin=3.0,
+        bounds=None,
+        dm=None,
+        isovalue=None,
+        isovalues=None,
+        isovalue_fraction=0.2,
+        isovalue_fractions=(0.01, 0.03, 0.08),
+        color='#4c78a8',
+        colors=None,
+        alpha=0.40,
+        alphas=None,
+        atom_size=60.0,
+        show_atoms=True,
+        show_bonds=None,
+        bond_scale=1.25,
+        bond_color='#555555',
+        bond_linewidth=1.6,
+        atom_colors=None,
+        atom_render='sphere',
+        atom_alpha=None,
+        sphere_quality=20,
+        label_atoms=None,
+        screen_basis=True,
+        tol_screen=1e-8,
+        ax=None,
+        figsize=(7.0, 6.0),
+        elev=20.0,
+        azim=-60.0,
+        clean_axes=None,
+        axis_off=None,
+        style='default',
+        title='Electron Density',
+        title_fontsize=None,
+        title_pad=None,
+        smooth_sigma=None,
+        backend='matplotlib',
+        save=None,
+    ):
+        return self.analyze().plot_density(
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            margin=margin,
+            bounds=bounds,
+            dm=dm,
+            isovalue=isovalue,
+            isovalues=isovalues,
+            isovalue_fraction=isovalue_fraction,
+            isovalue_fractions=isovalue_fractions,
+            color=color,
+            colors=colors,
+            alpha=alpha,
+            alphas=alphas,
+            atom_size=atom_size,
+            show_atoms=show_atoms,
+            show_bonds=show_bonds,
+            bond_scale=bond_scale,
+            bond_color=bond_color,
+            bond_linewidth=bond_linewidth,
+            atom_colors=atom_colors,
+            atom_render=atom_render,
+            atom_alpha=atom_alpha,
+            sphere_quality=sphere_quality,
+            label_atoms=label_atoms,
+            screen_basis=screen_basis,
+            tol_screen=tol_screen,
+            ax=ax,
+            figsize=figsize,
+            elev=elev,
+            azim=azim,
+            clean_axes=clean_axes,
+            axis_off=axis_off,
+            style=style,
+            title=title,
+            title_fontsize=title_fontsize,
+            title_pad=title_pad,
+            smooth_sigma=smooth_sigma,
+            backend=backend,
+            save=save,
+        )
 
     def get_fock(self, dm=None):
         
@@ -152,18 +1402,38 @@ class RHF:
             
         hcore = self.get_hcore()
         veff = self.get_veff(dm)
+        with_solvent = getattr(self, 'with_solvent', None)
+        if with_solvent is not None:
+            if not getattr(with_solvent, 'frozen', False):
+                with_solvent.e, with_solvent.v = with_solvent.kernel(dm)
+                self._e_solvent = float(np.real(with_solvent.e))
+                self._v_solvent = with_solvent.v
+            v_solvent = getattr(with_solvent, 'v', None)
+            if v_solvent is not None:
+                veff = veff + v_solvent
         
         return hcore + veff
 
     def get_veff(self, dm):
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_veff(dm=dm)
+        if self.eri_factors is not None:
+            return get_veff(self.mol, dm, eri_factors=self.eri_factors)
         return get_veff(self.mol, dm)
 
     def get_j(self):
-        return get_jk(self.mol, self.dm, with_k=False)[0]
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_j(dm=self.dm)
+        if self.eri_factors is not None:
+            return get_jk(self.mol, self.dm, eri_factors=self.eri_factors)[0]
+        return get_jk(self.mol, self.dm)[0]
     
     def get_jk(self):
-
-        return get_jk(self.mol, self.dm, with_k=True)
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_jk(dm=self.dm)
+        if self.eri_factors is not None:
+            return get_jk(self.mol, self.dm, eri_factors=self.eri_factors)
+        return get_jk(self.mol, self.dm)
 
     def get_hcore(self):
         """
@@ -176,6 +1446,10 @@ class RHF:
 
         """
         # return get_hcore(self.mol)
+        if self._pyscf_mf is not None:
+            return self._pyscf_mf.get_hcore()
+        if self.hcore is not None:
+            return self.hcore
         return self.mol.hcore
 
     def get_hcore_mo(self, mo_coeff=None):
@@ -215,28 +1489,93 @@ class RHF:
         else:
             C = mo_coeff
 
+        eri_source = self.eri
+        if eri_source is None and getattr(self, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            eri_source = unpack_eri_s4(self.eri_s4, self.mol.nao)
+        if eri_source is None and getattr(self, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            eri_source = unpack_eri_s8(self.eri_s8, self.mol.nao)
+        if eri_source is None:
+            eri_source = getattr(self.mol, 'eri', None)
+        if eri_source is None and getattr(self.mol, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            eri_source = unpack_eri_s4(self.mol.eri_s4, self.mol.nao)
+        if eri_source is None and getattr(self.mol, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            eri_source = unpack_eri_s8(self.mol.eri_s8, self.mol.nao)
+
+        eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
+        if eri_source is not None and eri_ndim == 4:
+            if notation == 'chem':
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', eri_source, C.conj(), C, C.conj(), C)
+            elif notation == 'phys':
+                eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', eri_source, C.conj(), C, C.conj(), C)
+            else:
+                raise ValueError("notation must be 'chem' or 'phys'.")
+            return eri_mo
+
+        eri_factors = getattr(self, 'eri_factors', None)
+        if eri_factors is None:
+            eri_factors = getattr(self.mol, 'eri_factors', None)
+        if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
+            eri_factors = eri_source
+        if eri_factors is None:
+            raise ValueError("RHF.get_eri_mo() requires either dense eri or eri_factors.")
+
+        from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
+        pair_factors = transform_ri_factors_to_mo_pair(eri_factors, C)
+        eri_mo = contract('Ppq,Prs->pqrs', pair_factors, pair_factors)
+
         if notation == 'chem':
-            eri_mo = contract('ijkl, ip, jq, kr, ls -> pqrs', self.eri, C.conj(), C, C.conj(), C)
-
-        elif notation == 'phys':
-            eri_mo = contract('ijkl, ip, jq, kr, ls -> prqs', self.eri, C.conj(), C, C.conj(), C)
-
-        return eri_mo
+            return eri_mo
+        if notation == 'phys':
+            return eri_mo.transpose(0, 2, 1, 3)
+        raise ValueError("notation must be 'chem' or 'phys'.")
 
     def to_uhf(self):
         # transform a RHF to UHF format with spin orbitals
-        pass
+        from .uhf import UHF
+
+        uhf = UHF(self.mol, init_guess=self.init_guess)
+        uhf.e_tot = self.e_tot
+        uhf.e_nuc = self.e_nuc
+        uhf.hcore = (self.hcore, self.hcore)
+        uhf.mo_energy = (self.mo_energy.copy(), self.mo_energy.copy())
+        uhf.mo_coeff = (self.mo_coeff.copy(), self.mo_coeff.copy())
+
+        mo_occ_a = np.zeros_like(self.mo_occ, dtype=float)
+        mo_occ_b = np.zeros_like(self.mo_occ, dtype=float)
+        mo_occ_a[:self.nocc] = 1.0
+        mo_occ_b[:self.nocc] = 1.0
+        uhf.mo_occ = (mo_occ_a, mo_occ_b)
+        uhf.dm = np.array((
+            make_rdm1(uhf.mo_coeff[0], mo_occ_a),
+            make_rdm1(uhf.mo_coeff[1], mo_occ_b),
+        ))
+        uhf.vhf = uhf.get_veff(uhf.dm)
+        uhf.converged = self.e_tot is not None
+        uhf.na = self.nocc
+        uhf.nb = self.nocc
+        uhf.nocc = (self.nocc, self.nocc)
+        uhf.nvir = (self.nvir, self.nvir)
+        return uhf
+
+    def RTTDHF(self, interaction_ao=None, field=None, **kwargs):
+        """
+        Convenience constructor for real-time TDHF propagation.
+        """
+        from pyqed.qchem.rttdhf import RTTDHF
+        return RTTDHF(self, interaction_ao=interaction_ao, field=field, **kwargs)
 
 
     def energy_elec(self,dm=None):
-
         if dm is None:
             dm = self.make_rdm1()
 
         return energy_elec(dm, self.hcore, self.vhf)
 
     def energy_nuc(self):
-        self.e_nuc = energy_nuc(self.atom_coords, self.atom_charges)
         return self.e_nuc
 
     def eri_asymm(self):
@@ -260,11 +1599,121 @@ class RHF:
         eri = self.get_eri_mo(notation='phys')
         return eri - np.transpose(eri, (0,1,3,2))
 
-    def get_dipole_moment(self, unit):
 
-        self.dipole_moment = dip_moment(self.mol, self.dm, unit)
+class ROHF(RHF):
+    """Native restricted open-shell Hartree-Fock reference.
 
-        return  self.dipole_moment
+    The implementation uses a Roothaan-style effective Fock matrix built from
+    spin-resolved alpha/beta Fock operators while keeping one shared spatial MO
+    basis.  This provides a native open-shell reference for spin-clean CASCI.
+    """
+
+    def __init__(self, mol, init_guess='minao', verbose=0):
+        super().__init__(mol, init_guess=init_guess, verbose=verbose)
+        self.nalpha, self.nbeta = self._electron_counts()
+        self.nclosed = self.nbeta
+        self.nopen = self.nalpha - self.nbeta
+        self.nocc = self.nalpha
+        self.nvir = self.nmo - self.nocc
+        self.mo_occ_alpha = None
+        self.mo_occ_beta = None
+        self.dm_alpha = None
+        self.dm_beta = None
+        self.converged = False
+
+    def _electron_counts(self):
+        nelec = int(self.mol.nelec)
+        spin = int(getattr(self.mol, 'spin', 0))
+        if spin < 0:
+            raise NotImplementedError("Native ROHF currently expects mol.spin >= 0.")
+        if (nelec + spin) % 2:
+            raise ValueError(f"Incompatible electron count/spin: nelec={nelec}, spin={spin}.")
+        nalpha = (nelec + spin) // 2
+        nbeta = nelec - nalpha
+        if nbeta < 0 or nalpha > self.nmo:
+            raise ValueError("Invalid ROHF electron count for the AO basis size.")
+        return nalpha, nbeta
+
+    def run(self, **kwargs):
+        verbose = int(kwargs.pop('verbose', self.verbose))
+        self.verbose = verbose
+        self.max_cycle = int(kwargs.pop('max_cycle', self.max_cycle))
+        self.conv_tol = float(kwargs.pop('tol', kwargs.pop('conv_tol', 1e-8)))
+        self.conv_tol_dm = float(kwargs.pop('conv_tol_dm', 1e-6))
+        self.damping = float(kwargs.pop('damping', 0.0))
+        self.diis = bool(kwargs.pop('diis', True))
+        self.diis_start_cycle = int(kwargs.pop('diis_start_cycle', 2))
+        self.diis_space = int(kwargs.pop('diis_space', 8))
+        self.e_tot, self.e_nuc, self.mo_energy, self.mo_coeff, self.mo_occ, self.hcore, \
+            self.vhf, self.dm, self.dm_alpha, self.dm_beta, self.converged = rohf(
+                self.mol,
+                dm0=kwargs.pop('dm0', None),
+                init_guess=kwargs.pop('init_guess', self.init_guess),
+                max_cycle=self.max_cycle,
+                tol=self.conv_tol,
+                conv_tol_dm=self.conv_tol_dm,
+                damping=self.damping,
+                diis=self.diis,
+                diis_start_cycle=self.diis_start_cycle,
+                diis_space=self.diis_space,
+                verbose=verbose,
+            )
+        if kwargs:
+            unknown = ', '.join(sorted(kwargs))
+            raise TypeError(f"Unsupported ROHF keyword(s): {unknown}.")
+        self.mo_occ_alpha = (self.mo_occ > 0).astype(float)
+        self.mo_occ_beta = (self.mo_occ > 1).astype(float)
+        self._pyscf_mf = None
+        self.density_fit = False
+        self.eri_factors = None
+        return self
+
+    kernel = run
+
+    def as_scanner(self, build_driver=None):
+        """Return a geometry scanner that reuses the previous ROHF density."""
+        return ROHFScanner(self, build_driver=build_driver)
+
+    def make_rdm1(self, spin_resolved=False):
+        if spin_resolved:
+            if self.dm_alpha is None or self.dm_beta is None:
+                self.dm_alpha, self.dm_beta = make_rohf_spin_rdm1(self.mo_coeff, self.mo_occ)
+            return np.asarray([self.dm_alpha, self.dm_beta])
+        return make_rdm1(self.mo_coeff, self.mo_occ)
+
+    def get_fock(self, dm=None):
+        if dm is None:
+            dm = self.make_rdm1(spin_resolved=True)
+        hcore = self.get_hcore()
+        dm_alpha, dm_beta = np.asarray(dm)
+        fa, fb, _vj, _vka, _vkb = get_uhf_fock_matrices(self.mol, hcore, dm_alpha, dm_beta)
+        return get_rohf_projector_fock_ao(self.get_ovlp(), dm_alpha, dm_beta, fa, fb)
+
+    def energy_elec(self, dm=None):
+        if dm is None:
+            dm = self.make_rdm1(spin_resolved=True)
+        dm_alpha, dm_beta = np.asarray(dm)
+        return rohf_energy_elec(self.mol, self.get_hcore(), dm_alpha, dm_beta)
+
+    def to_uhf(self):
+        from .uhf import UHF
+
+        uhf = UHF(self.mol, init_guess=self.init_guess)
+        uhf.e_tot = self.e_tot
+        uhf.e_nuc = self.e_nuc
+        uhf.hcore = (self.hcore, self.hcore)
+        uhf.mo_energy = (self.mo_energy.copy(), self.mo_energy.copy())
+        uhf.mo_coeff = (self.mo_coeff.copy(), self.mo_coeff.copy())
+        uhf.mo_occ = (self.mo_occ_alpha.copy(), self.mo_occ_beta.copy())
+        uhf.dm = self.make_rdm1(spin_resolved=True)
+        uhf.vhf = uhf.get_veff(uhf.dm)
+        uhf.converged = self.converged
+        uhf.na = self.nalpha
+        uhf.nb = self.nbeta
+        uhf.nocc = (self.nalpha, self.nbeta)
+        uhf.nvir = (self.nmo - self.nalpha, self.nmo - self.nbeta)
+        return uhf
+
 
 # def get_hcore(mol):
 #     '''Core Hamiltonian
@@ -291,14 +1740,9 @@ class RHF:
 #         h += mol.intor_symmetric('ECPscalar')
 #     return h
 
-def energy_nuc(atcoords, atnums):
-    # Compute Nucleus-Nucleus repulsion
-    rab = np.triu(np.linalg.norm(atcoords[:, None]- atcoords, axis=-1))
-    at_charges = np.triu(atnums[:, None] * atnums)[np.where(rab > 0)]
-    nn_e = np.sum(at_charges / rab[rab > 0])
-    return nn_e
 
-def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
+def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
+             eri_factors=None):
     '''Unrestricted Hartree-Fock potential matrix for the given density matrix
 
     .. math::
@@ -343,12 +1787,23 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
     True
     '''
     if dm_last is None:
-        vj, vk = get_jk(mol, np.asarray(dm))
+        vj, vk = get_jk(mol, np.asarray(dm), eri_factors=eri_factors)
         return vj - vk * .5
     else:
         ddm = np.asarray(dm) - np.asarray(dm_last)
-        vj, vk = get_jk(mol, ddm, hermi, vhfopt)
+        vj, vk = get_jk(mol, ddm, eri_factors=eri_factors)
         return vj - vk * .5 + np.asarray(vhf_last)
+
+
+def get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=None):
+    """RHF potential for an idempotent MO density using RI factors when possible."""
+    if eri_factors is None:
+        dm = make_rdm1(mo_coeff, mo_occ)
+        return get_veff(mol, dm)
+    from pyqed.qchem.basis import contract_jk_ri_mo
+
+    vj, vk = contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, mol.nao)
+    return vj - 0.5 * vk
 
 
 # def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
@@ -423,7 +1878,185 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None):
 #     return vj, vk
 
 
-def get_jk(mol, dm):
+def pivoted_cholesky_eri(eri, tol=1e-8, max_rank=None, init_pivots=None, return_pivots=False):
+    """
+    Pivoted-Cholesky factorization of the AO ERI pair matrix.
+
+    The ERI tensor ``(ij|kl)`` is reshaped to the full AO-pair space and
+    approximated as ``(ij|kl) ~= sum_P L_P[i,j] L_P[k,l]``.
+    ``init_pivots`` may be supplied to warm-start nearby geometries.
+    """
+    eri = np.asarray(eri)
+    nao = eri.shape[0]
+    npair = nao * nao
+    pair_mat = eri.reshape(npair, npair)
+
+    if max_rank is None:
+        max_rank = npair
+    max_rank = min(int(max_rank), npair)
+
+    diag = np.real(np.diag(pair_mat)).copy()
+    chol = np.zeros((npair, max_rank), dtype=eri.dtype)
+    rank = 0
+    pivots = []
+
+    if init_pivots is not None:
+        used = set()
+        for pivot in init_pivots:
+            if rank >= max_rank:
+                break
+            pivot = int(pivot)
+            if pivot < 0 or pivot >= npair or pivot in used:
+                continue
+            used.add(pivot)
+
+            delta = float(diag[pivot])
+            if delta <= tol:
+                continue
+
+            col = np.array(pair_mat[:, pivot], copy=True)
+            if rank > 0:
+                col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+
+            delta = float(np.real(col[pivot]))
+            if delta <= tol:
+                diag[pivot] = 0.0
+                continue
+
+            chol[:, rank] = col / np.sqrt(delta)
+            diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+            diag = np.maximum(diag, 0.0)
+            pivots.append(pivot)
+            rank += 1
+
+    for _ in range(rank, max_rank):
+        pivot = int(np.argmax(diag))
+        delta = float(diag[pivot])
+        if delta <= tol:
+            break
+
+        col = np.array(pair_mat[:, pivot], copy=True)
+        if rank > 0:
+            col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+
+        delta = float(np.real(col[pivot]))
+        if delta <= tol:
+            diag[pivot] = 0.0
+            continue
+
+        chol[:, rank] = col / np.sqrt(delta)
+        diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+        diag = np.maximum(diag, 0.0)
+        pivots.append(pivot)
+        rank += 1
+
+    factors = chol[:, :rank].T.reshape(rank, nao, nao)
+    if return_pivots:
+        return factors, tuple(pivots)
+    return factors
+
+
+def _low_rank_cache_family_key(mol):
+    return (
+        tuple(mol.atom_symbols()),
+        repr(mol.basis),
+        int(mol.charge),
+        int(mol.spin),
+        getattr(mol, '_build_driver', None),
+        int(mol.nao),
+    )
+
+
+def _low_rank_cache_geometry_key(mol):
+    return (
+        _low_rank_cache_family_key(mol),
+        mol.geometry_hash() if hasattr(mol, 'geometry_hash') else None,
+        tuple(np.asarray(mol.atom_coords(), dtype=float).shape),
+    )
+
+
+def get_or_build_low_rank_eri_factors(mol, tol=1e-8, max_rank=None, warm_start=True):
+    """
+    Return cached pivoted-Cholesky AO ERI factors for the requested settings.
+
+    The cache is geometry-aware. Repeated calls at the same geometry reuse the
+    exact factors, while nearby geometries can warm-start from the most recent
+    entry in the same molecular/basis family.
+    """
+    existing = getattr(mol, 'eri_factors', None)
+    if getattr(mol, 'eri', None) is None:
+        if existing is not None:
+            return existing
+        if getattr(mol, 'eri_s4', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            mol.eri = unpack_eri_s4(mol.eri_s4, mol.nao)
+        elif getattr(mol, 'eri_s8', None) is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            mol.eri = unpack_eri_s8(mol.eri_s8, mol.nao)
+        else:
+            raise ValueError("mol.eri, mol.eri_s4, mol.eri_s8, or mol.eri_factors is required for the builtin low-rank J/K path.")
+
+    cache = getattr(mol, '_low_rank_eri_cache', None)
+    if cache is None:
+        cache = {}
+        setattr(mol, '_low_rank_eri_cache', cache)
+
+    settings_key = (float(tol), None if max_rank is None else int(max_rank))
+    family_key = _low_rank_cache_family_key(mol)
+    geom_key = _low_rank_cache_geometry_key(mol)
+    key = (settings_key, family_key)
+
+    bucket = cache.get(key)
+    if bucket is None:
+        bucket = {'entries': {}, 'recent_geom_key': None}
+        cache[key] = bucket
+
+    entries = bucket['entries']
+    if geom_key in entries:
+        bucket['recent_geom_key'] = geom_key
+        mol._low_rank_eri_last_info = {
+            'mode': 'exact',
+            'settings_key': settings_key,
+            'geometry_key': geom_key,
+            'rank': entries[geom_key]['factors'].shape[0],
+        }
+        return entries[geom_key]['factors']
+
+    init_pivots = None
+    if warm_start and entries:
+        recent_geom_key = bucket.get('recent_geom_key')
+        if recent_geom_key is not None and recent_geom_key in entries:
+            init_pivots = entries[recent_geom_key].get('pivots')
+        else:
+            init_pivots = next(reversed(entries.values())).get('pivots')
+
+    factors, pivots = pivoted_cholesky_eri(
+        mol.eri,
+        tol=tol,
+        max_rank=max_rank,
+        init_pivots=init_pivots,
+        return_pivots=True,
+    )
+    entries[geom_key] = {'factors': factors, 'pivots': pivots}
+    bucket['recent_geom_key'] = geom_key
+
+    # Keep a short per-family history so geometry scans do not grow forever.
+    while len(entries) > 8:
+        oldest_key = next(iter(entries))
+        if oldest_key == geom_key:
+            break
+        del entries[oldest_key]
+
+    mol._low_rank_eri_last_info = {
+        'mode': 'warm' if init_pivots is not None else 'cold',
+        'settings_key': settings_key,
+        'geometry_key': geom_key,
+        'rank': factors.shape[0],
+    }
+    return factors
+
+
+def get_jk(mol, dm, eri_factors=None):
     """
     get the Colomb and exchange terms in the Fock matrix
 
@@ -446,10 +2079,65 @@ def get_jk(mol, dm):
         DESCRIPTION.
 
     """
-    eri = mol.eri
+    if eri_factors is not None:
+        from pyqed.qchem.basis import contract_jk_ri
+        return contract_jk_ri(eri_factors, dm, mol.nao)
 
-    vj = contract('kl, ijkl -> ij', dm, eri)
-    vk = contract('kl, ilkj -> ij', dm, eri)
+    eri_s4 = getattr(mol, 'eri_s4', None)
+    if eri_s4 is not None:
+        from pyqed.qchem.basis import contract_jk_s4
+        return contract_jk_s4(eri_s4, dm, mol.nao)
+
+    eri_s8 = getattr(mol, 'eri_s8', None)
+    if eri_s8 is not None:
+        from pyqed.qchem.basis import contract_jk_s8
+        return contract_jk_s8(eri_s8, dm, mol.nao)
+
+    direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
+    if direct_jk_data is not None:
+        from pyqed.qchem.basis import _basis_cy
+
+        transform = getattr(mol, '_ao_cart2sph', None)
+        if transform is None and direct_jk_data.get("cache_aosym") == "s8" and hasattr(_basis_cy, "compute_eri_s8"):
+            from pyqed.qchem.basis import contract_jk_s8
+
+            eri_s8, _computed, _skipped = _basis_cy.compute_eri_s8(
+                direct_jk_data["shells"],
+                direct_jk_data["origins"],
+                direct_jk_data["exps"],
+                direct_jk_data["weights"],
+                direct_jk_data["nprim"],
+                direct_jk_data["pair_bounds"],
+                float(direct_jk_data.get("screen_tol", 0.0)),
+            )
+            mol.eri_s8 = eri_s8
+            mol._builtin_direct_jk_data = None
+            return contract_jk_s8(eri_s8, dm, mol.nao)
+
+        dm_work = dm
+        if transform is not None:
+            dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
+        vj, vk = _basis_cy.direct_jk(
+            direct_jk_data["shells"],
+            direct_jk_data["origins"],
+            direct_jk_data["exps"],
+            direct_jk_data["weights"],
+            direct_jk_data["nprim"],
+            direct_jk_data["pair_bounds"],
+            np.ascontiguousarray(dm_work, dtype=np.float64),
+            float(direct_jk_data.get("screen_tol", 0.0)),
+        )
+        if transform is not None:
+            vj = np.einsum('pa,pq,qb->ab', transform, vj, transform, optimize=True)
+            vk = np.einsum('pa,pq,qb->ab', transform, vk, transform, optimize=True)
+        return vj, vk
+
+    eri = mol.eri
+    if eri is None:
+        raise ValueError("get_jk requires mol.eri, mol.eri_s4, mol.eri_s8, mol._builtin_direct_jk_data, or eri_factors.")
+
+    vj = contract('lk, ijkl -> ij', dm, eri)
+    vk = contract('lk, ilkj -> ij', dm, eri)
     return vj, vk
 
 
@@ -516,54 +2204,666 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 # array and modifications to DM array may be ignored.
     return np.dot(mocc*mo_occ[mo_occ>0], mocc.conj().T)
 
-def dip_moment(mol, dm, unit='Debye', **kwargs):
-    r''' Dipole moment calculation
 
-    .. math::
+def _orthogonalizer(overlap, threshold=1e-12):
+    eig, vec = eigh(np.asarray(overlap, dtype=float))
+    if np.any(eig <= threshold):
+        raise np.linalg.LinAlgError("AO overlap matrix is singular.")
+    return vec @ np.diag(eig ** -0.5) @ dagger(vec)
 
-        \mu_x = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|x|\mu) + \sum_A Q_A X_A\\
-        \mu_y = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|y|\mu) + \sum_A Q_A Y_A\\
-        \mu_z = -\sum_{\mu}\sum_{\nu} P_{\mu\nu}(\nu|z|\mu) + \sum_A Q_A Z_A
 
-    where :math:`\mu_x, \mu_y, \mu_z` are the x, y and z components of dipole
-    moment
+def _generalized_eigh(fock, overlap):
+    x = _orthogonalizer(overlap)
+    f_orth = dagger(x) @ fock @ x
+    eig, c_orth = eigh(0.5 * (f_orth + dagger(f_orth)))
+    coeff = x @ c_orth
+    return np.real_if_close(eig), np.real_if_close(coeff)
 
-    Args:
-         mol: an instance of :class:`Mole`
-         dm : a 2D ndarrays density matrices
 
-    Return:
-        A list: the dipole moment on x, y and z component
-    '''
-    charges = mol.atom_charges()
-    coords = mol.atom_coords()
+def _orbitals_from_density(dm, overlap, fallback_fock):
+    """Build an S-orthonormal orbital basis from an AO density guess."""
+    overlap = np.asarray(overlap, dtype=float)
+    dm = np.asarray(dm, dtype=float)
+    eig_s, vec_s = eigh(overlap)
+    if np.any(eig_s <= 1e-12):
+        return _generalized_eigh(fallback_fock, overlap)
 
-    ao_dip = mol.ao_dip
-    el_dip = np.einsum('xji, ij -> x', ao_dip, dm).real
-    nucl_dip = np.einsum('i, ix -> x', charges, coords)
-    mol_dip = nucl_dip - el_dip
+    x = vec_s @ np.diag(eig_s ** -0.5) @ dagger(vec_s)
+    s_half = vec_s @ np.diag(eig_s ** 0.5) @ dagger(vec_s)
+    dm_orth = s_half @ dm @ s_half
+    occ_nat, u = eigh(0.5 * (dm_orth + dagger(dm_orth)))
+    order = np.argsort(occ_nat)[::-1]
+    coeff = x @ u[:, order]
+    f_mo = dagger(coeff) @ fallback_fock @ coeff
+    return np.diag(f_mo).real, np.real_if_close(coeff)
 
-    if unit == 'Debye':
-        mol_dip *= 2.541746231
-        logging.info('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *mol_dip)
+
+def _allocate_atomic_electrons(atom_charges, charge):
+    electrons = np.asarray(atom_charges, dtype=int).copy()
+    delta = int(charge)
+    if delta > 0:
+        for _ in range(delta):
+            idx = int(np.argmax(electrons))
+            if electrons[idx] <= 0:
+                raise ValueError("Cannot remove more electrons from atomic guess.")
+            electrons[idx] -= 1
+    elif delta < 0:
+        for _ in range(-delta):
+            idx = int(np.argmin(electrons))
+            electrons[idx] += 1
+    return electrons
+
+
+def _fractional_occ(norb, nelec):
+    occ = np.zeros(int(norb), dtype=float)
+    remaining = float(nelec)
+    for i in range(len(occ)):
+        if remaining <= 0:
+            break
+        fill = min(1.0, remaining)
+        occ[i] = fill
+        remaining -= fill
+    if remaining > 1e-10:
+        raise ValueError("Atomic ROHF guess has more electrons than atom-centered AOs.")
+    return occ
+
+
+_L_AUFBAU = {
+    's': 0,
+    'p': 1,
+    'd': 2,
+    'f': 3,
+}
+
+
+def _fill_shell_occupations(shell_counts, shell_electrons):
+    occ_by_shell = {}
+    remaining = {shell: float(nelec) for shell, nelec in shell_electrons.items()}
+    for shell, count in shell_counts.items():
+        nelec = max(0.0, remaining.get(shell, 0.0))
+        occ_by_shell[shell] = min(2.0, nelec / max(int(count), 1))
+    return occ_by_shell
+
+
+def _atomic_shell_electron_targets(symbol, nelec_atom, available_shells):
+    """Return total electrons assigned to atom-centered AO shells."""
+    nelec = float(nelec_atom)
+    symbol = str(symbol)
+    available_shells = set(available_shells)
+
+    if symbol.lower() == 'fe' and {'1s', '2s', '2p', '3s', '3p'} <= available_shells:
+        # For Fe cations the 4s shell ionizes before 3d.  The old hcore-sorted
+        # atom guess often filled 4s/4p-like functions before 3d on Fe(II),
+        # which seeded a qualitatively wrong metal occupation.
+        core = [('1s', 2.0), ('2s', 2.0), ('2p', 6.0), ('3s', 2.0), ('3p', 6.0)]
+        used = sum(v for _shell, v in core)
+        out = {shell: value for shell, value in core if shell in available_shells}
+        valence = max(0.0, nelec - used)
+        d_e = min(6.0, valence)
+        s_e = min(2.0, max(0.0, valence - d_e))
+        extra = max(0.0, valence - d_e - s_e)
+        if '3d' in available_shells:
+            out['3d'] = d_e
+        if '4s' in available_shells:
+            out['4s'] = s_e
+        if '4p' in available_shells:
+            out['4p'] = extra
+        return out
+
+    order = [
+        '1s', '2s', '2p', '3s', '3p', '4s', '3d', '4p',
+        '5s', '4d', '5p', '6s', '4f', '5d', '6p',
+    ]
+    out = {}
+    remaining = nelec
+    for shell in order:
+        if shell not in available_shells:
+            continue
+        lchar = shell[-1].lower()
+        capacity = 2.0 * (2 * _L_AUFBAU.get(lchar, 0) + 1)
+        fill = min(capacity, remaining)
+        if fill > 0.0:
+            out[shell] = fill
+        remaining -= fill
+        if remaining <= 1e-10:
+            break
+    return out
+
+
+def _shell_aware_atomic_spin_density(s_atom, labels, nelec_atom):
+    infos = [_parse_ao_label(label) for label in labels]
+    shell_counts = {}
+    for info in infos:
+        shell_counts[info['shell']] = shell_counts.get(info['shell'], 0) + 1
+    shell_electrons = _atomic_shell_electron_targets(
+        infos[0]['symbol'],
+        nelec_atom,
+        shell_counts,
+    )
+    occ_by_shell = _fill_shell_occupations(shell_counts, shell_electrons)
+    dm_spin = np.zeros_like(s_atom, dtype=float)
+    for shell in shell_counts:
+        local_idx = np.asarray(
+            [idx for idx, info in enumerate(infos) if info['shell'] == shell],
+            dtype=int,
+        )
+        if local_idx.size == 0:
+            continue
+        occ_shell = 0.5 * occ_by_shell.get(shell, 0.0)
+        if occ_shell <= 0.0:
+            continue
+        s_shell = np.asarray(s_atom[np.ix_(local_idx, local_idx)], dtype=float)
+        try:
+            coeff = _orthogonalizer(s_shell)
+        except np.linalg.LinAlgError:
+            return None
+        occ = np.full(local_idx.size, occ_shell, dtype=float)
+        dm_spin[np.ix_(local_idx, local_idx)] = make_rdm1(coeff, occ)
+    return dm_spin
+
+
+def _atomic_guess_orbitals_from_shells(mol, assign_charge=False):
+    """Build atom-local occupied orbitals for a native Hückel guess."""
+    ao_labels = mol.ao_labels()
+    atom_groups = _group_ao_indices_by_atom(ao_labels, mol.natom)
+    atom_charges = np.asarray(mol.atom_charges(), dtype=int)
+    if assign_charge:
+        molecular_charge = int(round(float(np.sum(atom_charges)) - float(mol.nelec)))
+        atom_electrons = _allocate_atomic_electrons(atom_charges, molecular_charge)
     else:
-        logging.info('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *mol_dip)
-    
-    return mol_dip
+        atom_electrons = atom_charges.copy()
+    coeffs = []
+    occs = []
 
-def magnetic_dipole(mol, dm, **kwargs):
+    for idx, nelec_atom in zip(atom_groups, atom_electrons):
+        if len(idx) == 0:
+            continue
+        s_atom = np.asarray(mol.overlap[np.ix_(idx, idx)], dtype=float)
+        labels = [ao_labels[i] for i in idx]
+        infos = [_parse_ao_label(label) for label in labels]
+        shell_counts = {}
+        for info in infos:
+            shell_counts[info['shell']] = shell_counts.get(info['shell'], 0) + 1
+        shell_electrons = _atomic_shell_electron_targets(
+            infos[0]['symbol'],
+            nelec_atom,
+            shell_counts,
+        )
+        occ_by_shell = _fill_shell_occupations(shell_counts, shell_electrons)
 
-    pass
+        for shell in shell_counts:
+            local_idx = np.asarray(
+                [i for i, info in enumerate(infos) if info['shell'] == shell],
+                dtype=int,
+            )
+            occ_shell = occ_by_shell.get(shell, 0.0)
+            if occ_shell <= 1e-12:
+                continue
+            s_shell = np.asarray(s_atom[np.ix_(local_idx, local_idx)], dtype=float)
+            try:
+                shell_coeff = _orthogonalizer(s_shell)
+            except np.linalg.LinAlgError:
+                continue
+            for col in range(shell_coeff.shape[1]):
+                c = np.zeros(mol.nao, dtype=float)
+                c[idx[local_idx]] = shell_coeff[:, col]
+                coeffs.append(c)
+                occs.append(float(occ_shell))
+
+    if not coeffs:
+        return None, None
+    return np.column_stack(coeffs), np.asarray(occs, dtype=float)
 
 
-def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
-    
+def _native_rohf_atomic_initial_density(mol, assign_charge=False):
+    ao_labels = mol.ao_labels()
+    atom_groups = _group_ao_indices_by_atom(ao_labels, mol.natom)
+    atom_charges = np.asarray(mol.atom_charges(), dtype=int)
+    if assign_charge:
+        molecular_charge = int(round(float(np.sum(atom_charges)) - float(mol.nelec)))
+        atom_electrons = _allocate_atomic_electrons(atom_charges, molecular_charge)
+    else:
+        atom_electrons = atom_charges.copy()
+    dm_alpha = np.zeros_like(mol.overlap, dtype=float)
+    dm_beta = np.zeros_like(mol.overlap, dtype=float)
+
+    for idx, nelec_atom in zip(atom_groups, atom_electrons):
+        if len(idx) == 0:
+            continue
+        block = np.ix_(idx, idx)
+        s_atom = np.asarray(mol.overlap[block], dtype=float)
+        labels = [ao_labels[i] for i in idx]
+        dm_spin = _shell_aware_atomic_spin_density(s_atom, labels, nelec_atom)
+        if dm_spin is None:
+            h_atom = np.asarray(mol.hcore[block], dtype=float)
+            _eps, coeff = _generalized_eigh(h_atom, s_atom)
+            occ_alpha = _fractional_occ(len(idx), 0.5 * float(nelec_atom))
+            dm_spin = make_rdm1(coeff, occ_alpha)
+        dm_alpha[block] = dm_spin
+        dm_beta[block] = dm_spin
+
+    dm_total = dm_alpha + dm_beta
+    current_nelec = float(np.einsum('ij,ji->', dm_total, mol.overlap).real)
+    target_nelec = float(getattr(mol, 'nelec', current_nelec))
+    if current_nelec > 1e-12 and abs(target_nelec - current_nelec) > 1e-12:
+        scale = target_nelec / current_nelec
+        dm_alpha *= scale
+        dm_beta *= scale
+
+    return np.asarray([dm_alpha, dm_beta])
+
+
+def _gwh_parameter(ei, ej, updated_rule=False):
+    k = 1.75
+    if not updated_rule:
+        return k
+    denom = ei + ej
+    if abs(denom) < 1e-12:
+        return k
+    delta = (ei - ej) / denom
+    return k + delta * delta + delta**4 * (1.0 - k)
+
+
+def _canonical_generalized_eigh(fock, overlap, thresh=1e-10):
+    eig_s, vec_s = eigh(0.5 * (overlap + dagger(overlap)))
+    keep = eig_s > thresh
+    if not np.any(keep):
+        raise np.linalg.LinAlgError("Projected overlap matrix is singular.")
+    x = vec_s[:, keep] @ np.diag(eig_s[keep] ** -0.5)
+    f_orth = dagger(x) @ fock @ x
+    eps, c_orth = eigh(0.5 * (f_orth + dagger(f_orth)))
+    return eps, x @ c_orth
+
+
+def _native_huckel_initial_density(mol, updated_rule=False):
+    atom_dm_spin = _native_rohf_atomic_initial_density(mol)
+    atom_dm = atom_dm_spin[0] + atom_dm_spin[1]
+    atom_coeff, atom_occ = _atomic_guess_orbitals_from_shells(mol)
+    nocc = int(mol.nelec // 2)
+    if atom_coeff is None or atom_coeff.shape[1] < nocc:
+        return atom_dm
+
+    try:
+        vj, vk = get_jk(mol, atom_dm)
+        atom_fock = mol.hcore + vj - 0.5 * vk
+    except Exception:
+        atom_fock = mol.hcore
+
+    atom_energy = np.diag(dagger(atom_coeff) @ atom_fock @ atom_coeff).real
+    atom_overlap = dagger(atom_coeff) @ mol.overlap @ atom_coeff
+    huckel = np.diag(atom_energy)
+    for i in range(atom_energy.size):
+        for j in range(i):
+            hij = (
+                0.5
+                * _gwh_parameter(atom_energy[i], atom_energy[j], updated_rule=updated_rule)
+                * atom_overlap[i, j]
+                * (atom_energy[i] + atom_energy[j])
+            )
+            huckel[i, j] = hij
+            huckel[j, i] = hij
+
+    try:
+        _eps, c_min = _canonical_generalized_eigh(huckel, atom_overlap)
+    except np.linalg.LinAlgError:
+        return atom_dm
+    mo_coeff = atom_coeff @ c_min
+    mo_occ = np.zeros(mo_coeff.shape[1], dtype=float)
+    mo_occ[:nocc] = 2.0
+    dm = make_rdm1(mo_coeff, mo_occ)
+    current_nelec = float(np.einsum('ij,ji->', dm, mol.overlap).real)
+    if current_nelec > 1e-12:
+        dm *= float(mol.nelec) / current_nelec
+    return dm
+
+
+def _rohf_initial_density(mol, key):
+    key = str(key).lower()
+    if key in {'huckel', 'mod_huckel'}:
+        try:
+            return _native_huckel_initial_density(mol, updated_rule=(key == 'mod_huckel'))
+        except Exception:
+            return None
+    if key in {'charged_atom', 'charged_minao'}:
+        try:
+            dm = _native_rohf_atomic_initial_density(mol, assign_charge=True)
+            if dm.shape == (2, mol.nao, mol.nao) or dm.shape == (mol.nao, mol.nao):
+                return dm
+        except Exception:
+            return None
+        return None
+    if key not in {'atom', 'minao'}:
+        return None
+    try:
+        dm = _native_rohf_atomic_initial_density(mol)
+        if dm.shape == (2, mol.nao, mol.nao) or dm.shape == (mol.nao, mol.nao):
+            return dm
+    except Exception:
+        return None
+    return None
+
+
+def _rhf_initial_density(mol, key):
+    key = str(key).lower()
+    if key not in {'atom', 'minao', 'huckel', 'mod_huckel', 'charged_atom', 'charged_minao'}:
+        return None
+    dm = _rohf_initial_density(mol, key)
+    if dm is None:
+        return None
+    dm = np.asarray(dm)
+    if dm.shape == (2, mol.nao, mol.nao):
+        return dm[0] + dm[1]
+    if dm.shape == (mol.nao, mol.nao):
+        return dm
+    return None
+
+
+def rohf_occ(nao, nelec, spin):
+    nelec = int(nelec)
+    spin = int(spin)
+    if spin < 0:
+        raise NotImplementedError("Native ROHF currently expects spin >= 0.")
+    if (nelec + spin) % 2:
+        raise ValueError(f"Incompatible electron count/spin: nelec={nelec}, spin={spin}.")
+    nalpha = (nelec + spin) // 2
+    nbeta = nelec - nalpha
+    if nbeta < 0 or nalpha > nao:
+        raise ValueError("Invalid ROHF electron count for this basis.")
+    occ = np.zeros(nao, dtype=float)
+    occ[:nbeta] = 2.0
+    occ[nbeta:nalpha] = 1.0
+    return occ
+
+
+def make_rohf_spin_rdm1(mo_coeff, mo_occ):
+    mo_occ = np.asarray(mo_occ, dtype=float)
+    occ_alpha = (mo_occ > 0).astype(float)
+    occ_beta = (mo_occ > 1).astype(float)
+    return make_rdm1(mo_coeff, occ_alpha), make_rdm1(mo_coeff, occ_beta)
+
+
+def get_uhf_fock_matrices(mol, hcore, dm_alpha, dm_beta):
+    dm_total = dm_alpha + dm_beta
+    vj, _ = get_jk(mol, dm_total)
+    _, vk_alpha = get_jk(mol, dm_alpha)
+    _, vk_beta = get_jk(mol, dm_beta)
+    return hcore + vj - vk_alpha, hcore + vj - vk_beta, vj, vk_alpha, vk_beta
+
+
+def get_rohf_effective_fock_ao(overlap, mo_coeff, mo_occ, fock_alpha, fock_beta):
+    """Build the Roothaan effective Fock matrix in the AO basis."""
+    occ = np.asarray(mo_occ, dtype=float)
+    core = occ > 1.5
+    open_shell = (occ > 0.5) & (occ < 1.5)
+    vir = occ < 0.5
+
+    fa_mo = dagger(mo_coeff) @ fock_alpha @ mo_coeff
+    fb_mo = dagger(mo_coeff) @ fock_beta @ mo_coeff
+    f_mo = 0.5 * (fa_mo + fb_mo)
+
+    f_mo[np.ix_(core, open_shell)] = fb_mo[np.ix_(core, open_shell)]
+    f_mo[np.ix_(open_shell, core)] = fb_mo[np.ix_(open_shell, core)]
+    f_mo[np.ix_(open_shell, vir)] = fa_mo[np.ix_(open_shell, vir)]
+    f_mo[np.ix_(vir, open_shell)] = fa_mo[np.ix_(vir, open_shell)]
+    f_mo = 0.5 * (f_mo + dagger(f_mo))
+
+    return overlap @ mo_coeff @ f_mo @ dagger(mo_coeff) @ overlap
+
+
+def get_rohf_projector_fock_ao(overlap, dm_alpha, dm_beta, fock_alpha, fock_beta):
+    """Build PySCF-style Roothaan Fock from AO density projectors."""
+    overlap = np.asarray(overlap, dtype=float)
+    dm_alpha = np.asarray(dm_alpha, dtype=float)
+    dm_beta = np.asarray(dm_beta, dtype=float)
+    fc = 0.5 * (fock_alpha + fock_beta)
+
+    pc = dm_beta @ overlap
+    po = (dm_alpha - dm_beta) @ overlap
+    pv = np.eye(overlap.shape[0]) - dm_alpha @ overlap
+
+    fock = 0.5 * dagger(pc) @ fc @ pc
+    fock += 0.5 * dagger(po) @ fc @ po
+    fock += 0.5 * dagger(pv) @ fc @ pv
+    fock += dagger(po) @ fock_beta @ pc
+    fock += dagger(po) @ fock_alpha @ pv
+    fock += dagger(pv) @ fc @ pc
+    fock = fock + dagger(fock)
+    return np.real_if_close(fock)
+
+
+def _rohf_orbital_energies(mo_coeff, fock_eff, fock_alpha, fock_beta):
+    mo_energy = np.diag(dagger(mo_coeff) @ fock_eff @ mo_coeff).real
+    mo_energy_alpha = np.diag(dagger(mo_coeff) @ fock_alpha @ mo_coeff).real
+    mo_energy_beta = np.diag(dagger(mo_coeff) @ fock_beta @ mo_coeff).real
+    return mo_energy, mo_energy_alpha, mo_energy_beta
+
+
+def fill_rohf_occ(mo_energy, mo_energy_alpha, nclosed, nopen):
+    """Assign closed and open ROHF occupations from current orbital energies."""
+    mo_energy = np.asarray(mo_energy, dtype=float)
+    mo_energy_alpha = np.asarray(mo_energy_alpha, dtype=float)
+    mo_occ = np.zeros_like(mo_energy)
+    core_idx = np.argsort(mo_energy)[:int(nclosed)]
+    mo_occ[core_idx] = 2.0
+
+    if int(nopen) > 0:
+        candidates = np.setdiff1d(np.arange(mo_energy.size), core_idx, assume_unique=False)
+        open_order = np.argsort(mo_energy_alpha[candidates])
+        open_idx = candidates[open_order[:int(nopen)]]
+        mo_occ[open_idx] = 1.0
+    return mo_occ
+
+
+def _make_rohf_diis_extrapolator(max_diis=8, start_cycle=2):
+    errors = []
+    focks = []
+    max_diis = max(1, int(max_diis))
+    start_cycle = max(1, int(start_cycle))
+
+    def extrapolate(fock, density, overlap, orth, cycle):
+        fock = np.asarray(fock, dtype=float)
+        density = np.asarray(density, dtype=float)
+
+        error = fock @ density @ overlap - overlap @ density @ fock
+        error = dagger(orth) @ error @ orth
+        error = 0.5 * (error - dagger(error))
+        diis_error = float(np.max(np.abs(error)))
+
+        errors.append(error)
+        focks.append(fock.copy())
+        if len(errors) > max_diis:
+            del errors[0]
+            del focks[0]
+
+        if cycle < start_cycle or len(errors) < 2:
+            return fock, diis_error
+
+        n = len(errors)
+        bmat = -np.ones((n + 1, n + 1), dtype=float)
+        bmat[n, n] = 0.0
+        rhs = np.zeros(n + 1, dtype=float)
+        rhs[n] = -1.0
+        for i in range(n):
+            for j in range(n):
+                bmat[i, j] = np.vdot(errors[i], errors[j]).real
+
+        try:
+            coeff = np.linalg.solve(bmat, rhs)[:n]
+        except np.linalg.LinAlgError:
+            return fock, diis_error
+
+        fock_diis = np.zeros_like(fock)
+        for c, hist_fock in zip(coeff, focks):
+            fock_diis += c * hist_fock
+        return 0.5 * (fock_diis + dagger(fock_diis)), diis_error
+
+    return extrapolate
+
+
+def rohf_energy_elec(mol, hcore, dm_alpha, dm_beta):
+    fa, fb, _vj, _vka, _vkb = get_uhf_fock_matrices(mol, hcore, dm_alpha, dm_beta)
+    e_alpha = np.einsum('ij,ji->', hcore + fa, dm_alpha).real
+    e_beta = np.einsum('ij,ji->', hcore + fb, dm_beta).real
+    return 0.5 * (e_alpha + e_beta)
+
+
+def rohf(
+    mol,
+    dm0=None,
+    init_guess='hcore',
+    max_cycle=100,
+    tol=1e-8,
+    conv_tol_dm=1e-6,
+    damping=0.0,
+    diis=True,
+    diis_start_cycle=2,
+    diis_space=8,
+    verbose=0,
+):
+    """Native Roothaan ROHF SCF driver."""
+    overlap = np.asarray(mol.overlap, dtype=float)
+    hcore = np.asarray(mol.hcore, dtype=float)
+    mo_occ = rohf_occ(mol.nao, mol.nelec, getattr(mol, 'spin', 0))
+    nclosed = int(np.count_nonzero(mo_occ > 1.5))
+    nopen = int(np.count_nonzero((mo_occ > 0.5) & (mo_occ < 1.5)))
+    nuclear_energy = mol.energy_nuc()
+
+    init_key = str(init_guess).lower()
+    if dm0 is None:
+        dm0 = _rohf_initial_density(mol, init_key)
+        if dm0 is None:
+            if init_key not in {
+                'hcore', 'h1e', '1e', 'minao', 'atom', 'huckel', 'mod_huckel',
+                'charged_atom', 'charged_minao',
+            }:
+                raise ValueError("Invalid ROHF init_guess.")
+            mo_energy, mo_coeff = _generalized_eigh(hcore, overlap)
+            dm_alpha, dm_beta = make_rohf_spin_rdm1(mo_coeff, mo_occ)
+        else:
+            dm0 = np.asarray(dm0, dtype=float)
+            if dm0.shape == (2, mol.nao, mol.nao):
+                dm_alpha, dm_beta = dm0[0].copy(), dm0[1].copy()
+                mo_energy, mo_coeff = _orbitals_from_density(
+                    dm_alpha + dm_beta, overlap, hcore
+                )
+            else:
+                nalpha = int(np.count_nonzero(mo_occ > 0))
+                nbeta = int(np.count_nonzero(mo_occ > 1))
+                denom = max(nalpha + nbeta, 1)
+                dm_alpha = dm0 * (nalpha / denom)
+                dm_beta = dm0 * (nbeta / denom)
+                mo_energy, mo_coeff = _orbitals_from_density(dm0, overlap, hcore)
+    else:
+        dm0 = np.asarray(dm0, dtype=float)
+        if dm0.shape == (2, mol.nao, mol.nao):
+            dm_alpha, dm_beta = dm0[0].copy(), dm0[1].copy()
+            mo_energy, mo_coeff = _orbitals_from_density(
+                dm_alpha + dm_beta, overlap, hcore
+            )
+        elif dm0.shape == (mol.nao, mol.nao):
+            if init_key not in {
+                'hcore', 'h1e', '1e', 'dm', 'minao', 'atom', 'huckel',
+                'mod_huckel', 'charged_atom', 'charged_minao',
+            }:
+                raise ValueError("Invalid ROHF init_guess.")
+            nalpha = int(np.count_nonzero(mo_occ > 0))
+            nbeta = int(np.count_nonzero(mo_occ > 1))
+            denom = max(nalpha + nbeta, 1)
+            dm_alpha = dm0 * (nalpha / denom)
+            dm_beta = dm0 * (nbeta / denom)
+            mo_energy, mo_coeff = _orbitals_from_density(dm0, overlap, hcore)
+        else:
+            raise ValueError("dm0 must have shape (nao,nao) or (2,nao,nao).")
+
+    dm_total = dm_alpha + dm_beta
+    e_last = None
+    conv = False
+    vhf = None
+    orth = _orthogonalizer(overlap)
+    diis_extrapolate = (
+        _make_rohf_diis_extrapolator(diis_space, diis_start_cycle)
+        if diis else None
+    )
+    for cycle in range(1, int(max_cycle) + 1):
+        fock_alpha, fock_beta, _vj, _vka, _vkb = get_uhf_fock_matrices(
+            mol, hcore, dm_alpha, dm_beta
+        )
+        fock_eff = get_rohf_projector_fock_ao(
+            overlap, dm_alpha, dm_beta, fock_alpha, fock_beta
+        )
+        diis_error = 0.0
+        if diis_extrapolate is not None:
+            fock_eff, diis_error = diis_extrapolate(
+                fock_eff, dm_total, overlap, orth, cycle
+            )
+        _mo_energy, mo_coeff_new = _generalized_eigh(fock_eff, overlap)
+        mo_energy, mo_energy_alpha, _mo_energy_beta = _rohf_orbital_energies(
+            mo_coeff_new, fock_eff, fock_alpha, fock_beta
+        )
+        mo_occ_new = fill_rohf_occ(mo_energy, mo_energy_alpha, nclosed, nopen)
+        dm_alpha_new, dm_beta_new = make_rohf_spin_rdm1(mo_coeff_new, mo_occ_new)
+        if damping:
+            dm_alpha_new = (1.0 - damping) * dm_alpha_new + damping * dm_alpha
+            dm_beta_new = (1.0 - damping) * dm_beta_new + damping * dm_beta
+
+        e_elec = rohf_energy_elec(mol, hcore, dm_alpha_new, dm_beta_new)
+        e_tot = e_elec + nuclear_energy
+        ddm = np.linalg.norm((dm_alpha_new + dm_beta_new) - dm_total)
+        de = np.inf if e_last is None else abs(e_tot - e_last)
+        if verbose:
+            print(
+                f"cycle= {cycle} E= {e_tot:.14f} "
+                f"delta_E= {0.0 if e_last is None else e_tot - e_last:.3g} "
+                f"|ddm|= {ddm:.3g} |diis|= {diis_error:.3g}"
+            )
+        dm_alpha, dm_beta = dm_alpha_new, dm_beta_new
+        dm_total = dm_alpha + dm_beta
+        mo_coeff = mo_coeff_new
+        mo_occ = mo_occ_new
+        e_last = e_tot
+        if de < tol and ddm < conv_tol_dm:
+            conv = True
+            break
+
+    fock_alpha, fock_beta, vj, vk_alpha, vk_beta = get_uhf_fock_matrices(
+        mol, hcore, dm_alpha, dm_beta
+    )
+    fock_eff = get_rohf_projector_fock_ao(overlap, dm_alpha, dm_beta, fock_alpha, fock_beta)
+    mo_energy, mo_energy_alpha, _mo_energy_beta = _rohf_orbital_energies(
+        mo_coeff, fock_eff, fock_alpha, fock_beta
+    )
+    mo_occ = fill_rohf_occ(mo_energy, mo_energy_alpha, nclosed, nopen)
+    vhf = vj - 0.5 * (vk_alpha + vk_beta)
+    e_tot = rohf_energy_elec(mol, hcore, dm_alpha, dm_beta) + nuclear_energy
+    if verbose:
+        status = "converged" if conv else "not converged"
+        print(f"ROHF {status}: E = {e_tot:.14f}")
+    return e_tot, nuclear_energy, mo_energy, mo_coeff, mo_occ, hcore, vhf, \
+        dm_total, dm_alpha, dm_beta, conv
+
+
+
+
+def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
+                 conv_tol_dm=1e-6, damping=0.0, level_shift=0.0,
+                 damping_mode='density', damping_decay=1.0,
+                 damping_decay_start=0, damping_min=0.0,
+                 level_shift_decay=1.0, level_shift_decay_start=0,
+                 level_shift_min=0.0,
+                 diis=True, diis_start_cycle=2, diis_space=6,
+                 scf_diis='cdiis', diis_switch_tol=1e-3,
+                 conv_tol_grad=None,
+                 low_rank_jk=False, low_rank_tol=1e-8, low_rank_max_rank=None,
+                 with_solvent=None,
+                 verbose=0, return_info=False):
+    verbose = int(verbose)
+
     #calculate the overlap matrix S
     #the matrix should be symmetric with diagonal entries equal to one
     logging.info("building overlap matrix")
 
     # S = mol.intor_symmetric('int1e_ovlp')
-    S = mf.get_ovlp()
+    S = mol.overlap
 
     # for i in range(len(phi)):
     #     for j in range( (i+1),len(phi)):
@@ -604,12 +2904,8 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
 
     # hcore = get_hcore(mol)
 
-    # hcore = mol.hcore
-    hcore = mf.hcore = mf.get_hcore()
-    # print('hcore', hcore)
+    hcore = mol.hcore
 
-    nao = mf.get_nao()
-    
     # print("Hcore: ", Hcore)
 
     #diagonalize overlap matrix to get transformation matrix X
@@ -647,13 +2943,11 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
     old_energy = 0.0
     electronic_energy = 0.0
 
-    # nocc = mol.nelec // 2
-    nocc = mf.get_nelec() // 2
-    # mo_occ = np.zeros(mol.nao)
-    mo_occ = np.zeros(nao)
+    nocc = mol.nelec // 2
+    mo_occ = np.zeros(mol.nao)
     mo_occ[:nocc] = 2
 
-
+    init_key = str(init_guess).lower()
 
     # dm = init_guess_by_hcore(hcore)
     def init_guess_by_h1e(h):
@@ -662,27 +2956,60 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
         return make_rdm1(C, mo_occ)
 
     if dm0 is None:
-        dm = init_guess_by_h1e(hcore)
-
-        # dm = mf.get_init_guess(mol, mf.init_guess, s1e=s1e, **kwargs)
-    elif init_guess == 'hcore':
+        if init_key in ('hcore', 'h1e', '1e'):
+            dm = init_guess_by_h1e(hcore)
+        elif init_key in ('minao', 'atom', 'huckel', 'mod_huckel', 'charged_atom', 'charged_minao'):
+            dm = _rhf_initial_density(mol, init_key)
+            if dm is None:
+                dm = init_guess_by_h1e(hcore)
+        else:
+            raise ValueError("Invalid RHF init_guess.")
+    elif init_key in (
+        'dm', 'hcore', 'h1e', '1e', 'minao', 'atom', 'huckel', 'mod_huckel',
+        'charged_atom', 'charged_minao',
+    ):
         dm = dm0
     else:
-        raise ValueError('Invalid init_guess.')
+        raise ValueError("Invalid RHF init_guess.")
+    _init_eps, mo_coeff = _orbitals_from_density(dm, S, hcore)
+
 
     ### DIIS
-    # nbas = mol.nao
-    nbas = nao
-    print('nbas = ', nbas)
+    nbas = mol.nao
 
     # diis storage
-    maxdiis = 6
-    diis_error_convergence = 1.0e-5
+    maxdiis = max(1, int(diis_space))
 
     diis_error_matrices = np.zeros((maxdiis, nbas, nbas))
     diis_fock_matrices = np.zeros_like(diis_error_matrices)
+    ediis_densities = np.zeros_like(diis_error_matrices)
+    ediis_fock_matrices = np.zeros_like(diis_error_matrices)
+    ediis_energies = np.zeros(maxdiis)
+    ediis_count = 0
 
-    def diis(fock, dens, overlap, orth, iter):
+    use_diis = bool(diis)
+    scf_diis = str(scf_diis).lower()
+    if scf_diis == "diis":
+        scf_diis = "cdiis"
+    if scf_diis not in ("cdiis", "ediis", "adiis", "hybrid"):
+        raise ValueError("scf_diis must be 'cdiis', 'ediis', 'adiis', or 'hybrid'.")
+    diis_switch_tol = float(diis_switch_tol)
+    if diis_switch_tol < 0.0:
+        raise ValueError("diis_switch_tol must be non-negative.")
+
+    def orbital_gradient(fock, dens):
+        error_mat = reduce(np.dot, (fock, dens, S))
+        error_mat -= error_mat.T
+        error_orth = reduce(np.dot, (X.T, error_mat, X))
+        norm = float(np.linalg.norm(error_orth))
+        return (
+            error_orth,
+            float(np.max(np.abs(error_orth))),
+            norm,
+            float(norm / math.sqrt(error_orth.size)),
+        )
+
+    def diis_extrapolate(fock, dens, overlap, orth, iter):
         """
         Extrapolate new fock matrix based on input fock matrix
             and previous fock-matrices.
@@ -695,57 +3022,151 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
         """
         diis_fock = np.zeros_like(fock)
 
-        if iter <= 1:
-            return fock, 0.0
+        error_mat = reduce(np.dot, (fock, dens, overlap))
+        error_mat -= error_mat.T
+        error_orth = reduce(np.dot, (orth.T, error_mat, orth))
+        diis_error = float(np.max(np.abs(error_orth)))
+
+        if (not use_diis) or iter < int(diis_start_cycle):
+            return fock, diis_error
 
         # copy data down to lower storage
-        for k in reversed(range(1, min(iter, maxdiis))):
+        for k in reversed(range(1, maxdiis)):
 
             diis_error_matrices[k] = diis_error_matrices[k-1][:]
             diis_fock_matrices[k] = diis_fock_matrices[k-1][:]
 
-        # calculate error matrix
-        error_mat = reduce(np.dot, (fock, dens, overlap))
-        error_mat -= error_mat.T
-
         # put orthogonal error matrix in storage
         # pulay use S^(-1/2) but here we choose whatever the user has defined
-        diis_error_matrices[0]  = reduce(np.dot, (orth.T, error_mat, orth))
+        diis_error_matrices[0]  = error_orth
         diis_fock_matrices[0] = fock[:]
-        diis_error_index = np.abs(diis_error_matrices[0]).argmax()
-        diis_error = math.fabs(np.ravel(diis_error_matrices[0])[diis_error_index])
 
         # calculate B-matrix and solve for coefficients that reduces error
-        bsize = min(iter, maxdiis)-1
-        bmat = -1.0 * np.ones((bsize+1,bsize+1))
-        rhs = np.zeros(bsize+1)
-        bmat[bsize, bsize] = 0
-        rhs[bsize] = -1
-        for b1 in range(bsize):
-            for b2 in range(bsize):
+        nstored = min(iter - int(diis_start_cycle) + 1, maxdiis)
+        if nstored < 2:
+            return fock, diis_error
+        bsize = nstored + 1
+        bmat = -1.0 * np.ones((bsize, bsize))
+        rhs = np.zeros(bsize)
+        bmat[-1, -1] = 0
+        rhs[-1] = -1
+        for b1 in range(nstored):
+            for b2 in range(nstored):
                 bmat[b1, b2] = np.trace(diis_error_matrices[b1].dot(diis_error_matrices[b2]))
-        
-        # C =  np.linalg.solve(bmat, rhs)
         try:
             C = np.linalg.solve(bmat, rhs)
         except np.linalg.LinAlgError:
-            print("DIIS: singular B matrix, trying regularization")
-            try:
-                bmat[:-1, :-1] += np.eye(bsize) * 1.0e-10
-                C = np.linalg.solve(bmat, rhs)
-            except np.linalg.LinAlgError:
-                print("DIIS: regularized solve failed, trying lstsq")
-                try:
-                    C, *_ = np.linalg.lstsq(bmat, rhs, rcond=None)
-                except np.linalg.LinAlgError:
-                    print("DIIS: lstsq failed, skipping DIIS this iteration")
-                    return fock, diis_error
-        
+            return fock, diis_error
+
         # form new interpolated diis fock matrix
         for i, k in enumerate(C[:-1]):
             diis_fock += k*diis_fock_matrices[i]
 
         return diis_fock, diis_error
+
+    def _positive_simplex_minimize(costf, gradf, ncoeff):
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            return np.full(ncoeff, 1.0 / ncoeff)
+
+        x0 = np.ones(ncoeff)
+        try:
+            res = minimize(costf, x0, method='BFGS', jac=gradf, tol=1e-9)
+        except Exception:
+            return np.full(ncoeff, 1.0 / ncoeff)
+        if not getattr(res, 'success', False) and not np.all(np.isfinite(res.x)):
+            return np.full(ncoeff, 1.0 / ncoeff)
+        x2 = np.asarray(res.x, dtype=float) ** 2
+        denom = float(np.sum(x2))
+        if denom <= 0.0 or not np.isfinite(denom):
+            return np.full(ncoeff, 1.0 / ncoeff)
+        return x2 / denom
+
+    def _ediis_coefficients(energies, densities, focks):
+        ncoeff = len(energies)
+        df = np.einsum('ipq,jqp->ij', densities, focks, optimize=True).real
+        diag = np.diag(df)
+        df = diag[:, None] + diag[None, :] - df - df.T
+
+        def costf(x):
+            x2 = x ** 2
+            c = x2 / x2.sum()
+            return np.einsum('i,i', c, energies) - np.einsum('i,ij,j', c, df, c)
+
+        def gradf(x):
+            x2sum = np.sum(x ** 2)
+            c = x ** 2 / x2sum
+            fc = energies - 2.0 * np.einsum('i,ik->k', c, df, optimize=True)
+            cx = np.diag(x * x2sum) - np.einsum('k,n->kn', x ** 2, x, optimize=True)
+            cx *= 2.0 / x2sum ** 2
+            return np.einsum('k,kn->n', fc, cx, optimize=True)
+
+        return _positive_simplex_minimize(costf, gradf, ncoeff)
+
+    def _adiis_coefficients(densities, focks, newest):
+        ncoeff = len(densities)
+        df = np.einsum('ipq,jqp->ij', densities, focks, optimize=True).real
+        d_fn = df[:, newest]
+        dn_f = df[newest]
+        dn_fn = df[newest, newest]
+        dd_fn = d_fn - dn_fn
+        df = df - d_fn[:, None] - dn_f[None, :] + dn_fn
+
+        def costf(x):
+            x2 = x ** 2
+            c = x2 / x2.sum()
+            return (
+                2.0 * np.einsum('i,i', c, dd_fn, optimize=True)
+                + np.einsum('i,ij,j', c, df, c, optimize=True)
+            )
+
+        def gradf(x):
+            x2sum = np.sum(x ** 2)
+            c = x ** 2 / x2sum
+            fc = 2.0 * dd_fn
+            fc = fc + np.einsum('j,kj->k', c, df, optimize=True)
+            fc = fc + np.einsum('i,ik->k', c, df, optimize=True)
+            cx = np.diag(x * x2sum) - np.einsum('k,n->kn', x ** 2, x, optimize=True)
+            cx *= 2.0 / x2sum ** 2
+            return np.einsum('k,kn->n', fc, cx, optimize=True)
+
+        return _positive_simplex_minimize(costf, gradf, ncoeff)
+
+    def energy_diis_extrapolate(fock, dens, energy, iter, mode):
+        nonlocal ediis_count
+        for k in reversed(range(1, maxdiis)):
+            ediis_densities[k] = ediis_densities[k - 1]
+            ediis_fock_matrices[k] = ediis_fock_matrices[k - 1]
+            ediis_energies[k] = ediis_energies[k - 1]
+        ediis_densities[0] = dens
+        ediis_fock_matrices[0] = fock
+        ediis_energies[0] = energy
+        ediis_count = min(ediis_count + 1, maxdiis)
+        if (not use_diis) or iter < int(diis_start_cycle) or ediis_count < 2:
+            return fock, np.array([1.0])
+
+        densities = ediis_densities[:ediis_count]
+        focks = ediis_fock_matrices[:ediis_count]
+        energies = ediis_energies[:ediis_count]
+        if mode == "adiis":
+            coeff = _adiis_coefficients(densities, focks, 0)
+        else:
+            coeff = _ediis_coefficients(energies, densities, focks)
+        return np.einsum('i,ipq->pq', coeff, focks, optimize=True), coeff
+
+    def scf_extrapolate(fock, dens, energy, iter, grad_rms):
+        if scf_diis == "cdiis":
+            fock_out, err = diis_extrapolate(fock, dens, S, X, iter)
+            return fock_out, err, "cdiis", None
+        if scf_diis in ("ediis", "adiis"):
+            fock_out, coeff = energy_diis_extrapolate(fock, dens, energy, iter, scf_diis)
+            return fock_out, float(np.max(np.abs(coeff))), scf_diis, coeff
+        if grad_rms > diis_switch_tol:
+            fock_out, coeff = energy_diis_extrapolate(fock, dens, energy, iter, "ediis")
+            return fock_out, float(np.max(np.abs(coeff))), "ediis", coeff
+        fock_out, err = diis_extrapolate(fock, dens, S, X, iter)
+        return fock_out, err, "cdiis", None
 
 
     # nuclear energy
@@ -754,46 +3175,130 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
     #     for B in range(A+1,len(Z)):
     #         nuclear_energy += Z[A]*Z[B]/abs(R[A]-R[B])
 
-    # nuclear_energy = mol.energy_nuc()
-    nuclear_energy = mf.energy_nuc()
+    nuclear_energy = mol.energy_nuc()
 
-    print("E_nclr = ", nuclear_energy)
+    if verbose >= 1:
+        print("E_nclr = ", nuclear_energy)
 
-    logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
+    if verbose >= 2:
+        logging.info("\n {:4s} {:13s} de\n".format("iter", "total energy"))
+
+    eri_factors = None
+    if low_rank_jk:
+        eri_factors = get_or_build_low_rank_eri_factors(
+            mol,
+            tol=low_rank_tol,
+            max_rank=low_rank_max_rank,
+        )
 
     conv = False
+    invX = np.linalg.inv(X)
+    damping = float(damping)
+    damping_mode = str(damping_mode).lower()
+    damping_decay = float(damping_decay)
+    damping_decay_start = int(damping_decay_start)
+    damping_min = float(damping_min)
+    level_shift = float(level_shift)
+    level_shift_decay = float(level_shift_decay)
+    level_shift_decay_start = int(level_shift_decay_start)
+    level_shift_min = float(level_shift_min)
+    if damping < 0.0 or damping >= 1.0:
+        raise ValueError("damping must be in the interval [0, 1).")
+    if damping_mode not in ("density", "fock"):
+        raise ValueError("damping_mode must be 'density' or 'fock'.")
+    if damping_decay <= 0.0 or damping_decay > 1.0:
+        raise ValueError("damping_decay must be in the interval (0, 1].")
+    if damping_min < 0.0:
+        raise ValueError("damping_min must be non-negative.")
+    if damping_min > damping and damping > 0.0:
+        raise ValueError("damping_min cannot exceed damping.")
+    if level_shift_decay <= 0.0 or level_shift_decay > 1.0:
+        raise ValueError("level_shift_decay must be in the interval (0, 1].")
+    if level_shift_min < 0.0:
+        raise ValueError("level_shift_min must be non-negative.")
+    if level_shift_min > level_shift and level_shift > 0.0:
+        raise ValueError("level_shift_min cannot exceed level_shift.")
+    conv_tol_grad = math.sqrt(float(tol)) if conv_tol_grad is None else float(conv_tol_grad)
+    if conv_tol_grad <= 0.0:
+        raise ValueError("conv_tol_grad must be positive.")
+
+    def current_damping(iteration):
+        if damping <= 0.0:
+            return 0.0
+        decay_power = max(0, int(iteration) - damping_decay_start)
+        mixed = damping * (damping_decay ** decay_power)
+        return max(damping_min, mixed)
+
+    def current_level_shift(iteration):
+        if level_shift <= 0.0:
+            return 0.0
+        decay_power = max(0, int(iteration) - level_shift_decay_start)
+        shifted = level_shift * (level_shift_decay ** decay_power)
+        return max(level_shift_min, shifted)
+
+    de = float("inf")
+    ddm = float("inf")
+    diis_error = float("inf")
+    orbital_grad_max = float("inf")
+    orbital_grad_norm = float("inf")
+    orbital_grad_rms = float("inf")
+    active_damping = float(damping)
+    active_level_shift = float(level_shift)
+    active_scf_diis = str(scf_diis)
+    active_energy_diis_coeff = None
+    fock_last = None
+    zero_solvent = np.zeros_like(hcore)
+
+    def solvent_kernel(dens):
+        if with_solvent is None:
+            return 0.0, zero_solvent
+        if (
+            getattr(with_solvent, 'frozen', False)
+            and getattr(with_solvent, 'e', None) is not None
+            and getattr(with_solvent, 'v', None) is not None
+        ):
+            return float(np.real(with_solvent.e)), np.asarray(with_solvent.v)
+        e_sol, v_sol = with_solvent.kernel(dens)
+        with_solvent.e = e_sol
+        with_solvent.v = v_sol
+        return float(np.real(e_sol)), np.asarray(v_sol)
+
+    vhf = get_veff(mol, dm, eri_factors=eri_factors)
+    solvent_energy, v_solvent = solvent_kernel(dm)
+    electronic_energy = energy_elec(dm, hcore, vhf)
+    total_energy = electronic_energy + solvent_energy + nuclear_energy
+    scf_iter = -1
     for scf_iter in range(max_cycle):
 
         # calculate the two electron part of the Fock matrix
-        # vhf = get_veff(mol, dm)
-        vhf = mf.vhf = mf.get_veff(dm=dm)
-
-        # F = hcore + vhf
-        F = mf.get_fock(dm=dm)
+        F = hcore + vhf + v_solvent
+        _grad_mat, orbital_grad_max, orbital_grad_norm, orbital_grad_rms = orbital_gradient(F, dm)
+        last_energy = total_energy
 
         # obtain better (interpolated) fock matrix through diis accelleration
 
         # print('DIIS')
-        F, diis_error = diis(F, dm, S, X, scf_iter)
-
-
-        # electronic_energy = energy_elec(dm, hcore, vhf)
-        electronic_energy = mf.energy_elec(dm=dm)
-
-        #print("E_elec = ", electronic_energy)
-
-        total_energy = electronic_energy + nuclear_energy
-
-        logging.info("{:3} {:12.8f} {:12.4e} ".format(scf_iter, total_energy,\
-               total_energy - old_energy))
-
-        if scf_iter > 2 and abs(old_energy - total_energy) < tol:
-            conv = True
-            break
+        active_damping = current_damping(scf_iter)
+        if (
+            damping_mode == "fock"
+            and active_damping > 0.0
+            and fock_last is not None
+            and scf_iter < int(diis_start_cycle) - 1
+        ):
+            F = (1.0 - active_damping) * F + active_damping * fock_last
+        F, diis_error, active_scf_diis, active_energy_diis_coeff = scf_extrapolate(
+            F, dm, electronic_energy + solvent_energy, scf_iter, orbital_grad_rms
+        )
 
         #println("F: ", F)
         #Fprime = X' * F * X
         Fprime = dagger(X).dot(F).dot(X)
+        active_level_shift = current_level_shift(scf_iter)
+        if active_level_shift > 0.0 and mo_coeff is not None:
+            cprime_old = invX @ mo_coeff
+            cvir = cprime_old[:, nocc:]
+            if cvir.size:
+                Fprime = Fprime + active_level_shift * (cvir @ dagger(cvir))
         #println("F': $Fprime")
         mo_energy, Cprime = eigh(Fprime)
         # print("epsilon: ", epsilon)
@@ -807,21 +3312,363 @@ def hartree_fock(mf, dm0=None, init_guess='hcore', max_cycle=200, tol=1e-6):
         # for mu in range(len(phi)):
         #     for v in range(len(phi)):
         #         P[mu,v] = 2. * C[mu,0] * C[v,0]
-        dm = make_rdm1(mo_coeff, mo_occ)
+        dm_pure = make_rdm1(mo_coeff, mo_occ)
+        vhf_pure = (
+            get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
+            if eri_factors is not None
+            else get_veff(mol, dm_pure)
+        )
+        dm_new = dm_pure
+        vhf_new = vhf_pure
+        if damping_mode == "density" and active_damping > 0.0:
+            dm_new = (1.0 - active_damping) * dm_pure + active_damping * dm
+            vhf_new = (1.0 - active_damping) * vhf_pure + active_damping * vhf
+        ddm = np.linalg.norm(dm_new - dm)
+        vhf = vhf_new
+        solvent_energy, v_solvent = solvent_kernel(dm_new)
+        electronic_energy = energy_elec(dm_new, hcore, vhf)
+        total_energy = electronic_energy + solvent_energy + nuclear_energy
+        final_iter_fock = hcore + vhf + v_solvent
+        (
+            _grad_mat,
+            orbital_grad_max,
+            orbital_grad_norm,
+            orbital_grad_rms,
+        ) = orbital_gradient(final_iter_fock, dm_new)
+        de = abs(total_energy - last_energy)
+        if verbose >= 2:
+            logging.info(
+                "{:3} {:12.8f} {:12.4e} {:12.4e} {:12.4e}".format(
+                    scf_iter, total_energy, total_energy - last_energy, ddm, diis_error
+                )
+            )
 
-        old_energy = total_energy
+        fock_last = F
 
-    if not conv: sys.exit('SCF not converged.')
+        if scf_iter > 2 and de < tol and orbital_grad_rms < conv_tol_grad:
+            dm = dm_new
+            conv = True
+            break
 
-    print('E(HF) = ', total_energy)
+        dm = dm_new
+
+    scf_density = np.array(dm, copy=True)
+    scf_total_energy = float(total_energy)
+    scf_electronic_energy = float(electronic_energy)
+    scf_solvent_energy = float(solvent_energy)
+    scf_vhf = np.array(vhf, copy=True)
+    scf_v_solvent = np.array(v_solvent, copy=True)
+
+    final_vhf = scf_vhf
+    final_v_solvent = scf_v_solvent
+    final_solvent_energy = scf_solvent_energy
+    final_fock = hcore + final_vhf + final_v_solvent
+    final_electronic_energy = energy_elec(scf_density, hcore, final_vhf)
+    final_total_energy = final_electronic_energy + final_solvent_energy + nuclear_energy
+    (
+        _final_grad_mat,
+        final_orbital_grad_max,
+        final_orbital_grad_norm,
+        final_orbital_grad_rms,
+    ) = orbital_gradient(
+        final_fock, scf_density
+    )
+    final_fprime = dagger(X).dot(final_fock).dot(X)
+    mo_energy, Cprime = eigh(final_fprime)
+    mo_coeff = np.real(np.dot(X, Cprime))
+    canonical_dm = make_rdm1(mo_coeff, mo_occ)
+    extra_cycle_density_change = float(np.linalg.norm(canonical_dm - scf_density))
+    extra_cycle_energy_change = float(final_total_energy - scf_total_energy)
+    extra_vhf = (
+        get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
+        if eri_factors is not None
+        else get_veff(mol, canonical_dm)
+    )
+    extra_solvent_energy, extra_v_solvent = solvent_kernel(canonical_dm)
+    extra_electronic_energy = energy_elec(canonical_dm, hcore, extra_vhf)
+    extra_total_energy = extra_electronic_energy + extra_solvent_energy + nuclear_energy
+    extra_fock = hcore + extra_vhf + extra_v_solvent
+    (
+        _extra_grad_mat,
+        extra_orbital_grad_max,
+        extra_orbital_grad_norm,
+        extra_orbital_grad_rms,
+    ) = orbital_gradient(extra_fock, canonical_dm)
+    extra_conv_tol = float(tol) * 10.0
+    extra_conv_tol_grad = float(conv_tol_grad) * 3.0
+    extra_cycle_converged = (
+        abs(extra_total_energy - final_total_energy) < extra_conv_tol
+        or extra_orbital_grad_rms < extra_conv_tol_grad
+    )
+    if conv:
+        conv = bool(extra_cycle_converged)
+    dm = canonical_dm
+    vhf = extra_vhf
+    v_solvent = extra_v_solvent
+    solvent_energy = extra_solvent_energy
+    electronic_energy = extra_electronic_energy
+    total_energy = extra_total_energy
+
+    if with_solvent is not None:
+        with_solvent.e = solvent_energy
+        with_solvent.v = v_solvent
+
+    scf_info = {
+        "converged": bool(conv),
+        "iterations": int(scf_iter + 1),
+        "last_energy_change": float(de),
+        "last_density_change": float(ddm),
+        "last_diis_error": float(diis_error),
+        "last_orbital_gradient_max": float(orbital_grad_max),
+        "last_orbital_gradient_norm": float(orbital_grad_norm),
+        "last_orbital_gradient_rms": float(orbital_grad_rms),
+        "final_orbital_gradient_max": float(final_orbital_grad_max),
+        "final_orbital_gradient_norm": float(final_orbital_grad_norm),
+        "final_orbital_gradient_rms": float(final_orbital_grad_rms),
+        "conv_tol_grad": float(conv_tol_grad),
+        "scf_electronic_energy": float(scf_electronic_energy),
+        "scf_solvent_energy": float(scf_solvent_energy),
+        "scf_total_energy": float(scf_total_energy),
+        "extra_cycle_energy_change": float(extra_cycle_energy_change),
+        "extra_cycle_density_change": float(extra_cycle_density_change),
+        "extra_cycle_orbital_gradient_max": float(extra_orbital_grad_max),
+        "extra_cycle_orbital_gradient_norm": float(extra_orbital_grad_norm),
+        "extra_cycle_orbital_gradient_rms": float(extra_orbital_grad_rms),
+        "extra_cycle_converged": bool(extra_cycle_converged),
+        "extra_cycle_conv_tol": float(extra_conv_tol),
+        "extra_cycle_conv_tol_grad": float(extra_conv_tol_grad),
+        "unshifted_final_diagonalization": True,
+        "electronic_energy": float(electronic_energy),
+        "with_solvent": with_solvent is not None,
+        "solvent_energy": float(solvent_energy),
+        "solvent_potential_norm": float(np.linalg.norm(v_solvent)),
+        "solvent_trace_vdm": float(np.einsum('ij,ji->', v_solvent, dm).real),
+        "nuclear_energy": float(nuclear_energy),
+        "total_energy": float(total_energy),
+        "damping": float(damping),
+        "damping_mode": str(damping_mode),
+        "damping_decay": float(damping_decay),
+        "damping_decay_start": int(damping_decay_start),
+        "damping_min": float(damping_min),
+        "final_damping": float(active_damping),
+        "level_shift": float(level_shift),
+        "level_shift_decay": float(level_shift_decay),
+        "level_shift_decay_start": int(level_shift_decay_start),
+        "level_shift_min": float(level_shift_min),
+        "final_level_shift": float(active_level_shift),
+        "diis": bool(diis),
+        "scf_diis": str(scf_diis),
+        "active_scf_diis": str(active_scf_diis),
+        "diis_switch_tol": float(diis_switch_tol),
+        "energy_diis_coefficients": (
+            None if active_energy_diis_coeff is None
+            else [float(x) for x in np.asarray(active_energy_diis_coeff).ravel()]
+        ),
+        "diis_start_cycle": int(diis_start_cycle),
+        "diis_space": int(diis_space),
+    }
+    if with_solvent is not None:
+        surface = getattr(with_solvent, "surface", None) or {}
+        intermediates = getattr(with_solvent, "_intermediates", None) or {}
+        grid_coords = surface.get("grid_coords")
+        scf_info.update({
+            "solvent_method": getattr(with_solvent, "method", None),
+            "solvent_eps": None if getattr(with_solvent, "eps", None) is None else float(with_solvent.eps),
+            "solvent_lebedev_order": getattr(with_solvent, "lebedev_order", None),
+            "solvent_integral_backend": intermediates.get("integral_backend"),
+            "solvent_ngrids": None if grid_coords is None else int(len(grid_coords)),
+        })
+    if not conv and not return_info:
+        sys.exit('SCF not converged.')
+
+    if verbose >= 1:
+        print(('E(HF) = ' if conv else 'E(HF, not converged) = '), total_energy)
 
     # check if this hartree-fock calculation is for configuration interaction
     # or not, if yes, output the essential information
     # if CI == False:
-    return total_energy, nuclear_energy, mo_energy, mo_coeff, mo_occ, hcore, vhf,\
-        dm
+    result = (total_energy, nuclear_energy, mo_energy, mo_coeff, mo_occ, hcore, vhf, dm)
+    if return_info:
+        return result + (scf_info,)
+    return result
     # else:
     # return C, Hcore, nuclear_energy, two_electron
+
+
+def pyscf_density_fit_rhf(mol, dm0=None, init_guess='hcore', max_cycle=50,
+                          tol=1e-8, auxbasis=None, verbose=0):
+    """
+    Run a PySCF-backed density-fitted RHF calculation and return pyqed-style
+    SCF data plus the underlying PySCF mean-field object.
+    """
+    from pyscf import scf
+
+    pmol = mol.topyscf()
+    pmol.build(verbose=0)
+
+    mf = scf.RHF(pmol).density_fit(auxbasis=auxbasis)
+    mf.max_cycle = max_cycle
+    mf.conv_tol = tol
+    mf.verbose = int(verbose)
+
+    if dm0 is None:
+        key = {'hcore': '1e', 'h1e': '1e'}.get(str(init_guess).lower(), init_guess)
+        dm0 = mf.get_init_guess(key=key)
+
+    total_energy = mf.kernel(dm0=dm0)
+    if not mf.converged:
+        raise RuntimeError("PySCF density-fitted RHF did not converge.")
+
+    dm = mf.make_rdm1()
+    hcore = mf.get_hcore()
+    vhf = mf.get_veff(dm=dm)
+
+    mol.nao = pmol.nao
+    mol.nmo = pmol.nao
+    mol.nbas = pmol.nbas
+    mol.hcore = hcore
+    mol.overlap = mf.get_ovlp()
+    mol.cart = pmol.cart
+    mol._atm = pmol._atm
+    mol._bas = pmol._bas
+    mol._env = pmol._env
+
+    return (
+        total_energy,
+        pmol.energy_nuc(),
+        mf.mo_energy,
+        mf.mo_coeff,
+        mf.mo_occ,
+        hcore,
+        vhf,
+        dm,
+        mf,
+    )
+
+
+class RHFScanner:
+    """
+    Minimal scanner wrapper for repeated RHF evaluations on nearby geometries.
+    """
+
+    def __init__(self, mf, build_driver=None):
+        self.mf = mf
+        self.mol = mf.mol
+        self.build_driver = build_driver or getattr(self.mol, '_build_driver', None) or 'gbasis'
+
+    def __call__(self, mol_or_geom):
+        if isinstance(mol_or_geom, np.ndarray):
+            mol = self.mol
+            mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+            mol.build(driver=self.build_driver)
+        else:
+            mol = mol_or_geom
+            if getattr(mol, 'eri', None) is None or getattr(mol, 'hcore', None) is None:
+                driver = getattr(mol, '_build_driver', None) or self.build_driver
+                mol.build(driver=driver)
+
+        run_kwargs = {
+            'dm0': None if self.mf.dm is None else np.array(self.mf.dm, copy=True),
+            'init_guess': 'hcore',
+            'max_cycle': self.mf.max_cycle,
+            'tol': getattr(self.mf, 'conv_tol', 1e-8),
+            'conv_tol_dm': getattr(self.mf, 'conv_tol_dm', 1e-6),
+            'conv_tol_grad': getattr(self.mf, 'conv_tol_grad', None),
+            'damping': getattr(self.mf, 'damping', 0.0),
+            'damping_mode': getattr(self.mf, 'damping_mode', 'density'),
+            'damping_decay': getattr(self.mf, 'damping_decay', 1.0),
+            'damping_decay_start': getattr(self.mf, 'damping_decay_start', 0),
+            'damping_min': getattr(self.mf, 'damping_min', 0.0),
+            'level_shift': getattr(self.mf, 'level_shift', 0.0),
+            'level_shift_decay': getattr(self.mf, 'level_shift_decay', 1.0),
+            'level_shift_decay_start': getattr(self.mf, 'level_shift_decay_start', 0),
+            'level_shift_min': getattr(self.mf, 'level_shift_min', 0.0),
+            'diis': getattr(self.mf, 'diis', True),
+            'scf_diis': getattr(self.mf, 'scf_diis', 'cdiis'),
+            'diis_switch_tol': getattr(self.mf, 'diis_switch_tol', 1e-3),
+            'diis_start_cycle': getattr(self.mf, 'diis_start_cycle', 2),
+            'diis_space': getattr(self.mf, 'diis_space', 6),
+        }
+
+        if self.mf.density_fit:
+            run_kwargs['density_fit'] = True
+            run_kwargs['auxbasis'] = self.mf.auxbasis
+        elif self.mf.cholesky_jk:
+            run_kwargs['cholesky_jk'] = True
+            run_kwargs['cholesky_tol'] = self.mf.cholesky_tol
+            run_kwargs['cholesky_max_rank'] = self.mf.cholesky_max_rank
+
+        new_mf = RHF(mol, init_guess=self.mf.init_guess)
+        new_mf.max_cycle = self.mf.max_cycle
+        new_mf.run(**run_kwargs)
+
+        self.mf = new_mf
+        self.mol = mol
+        return new_mf.e_tot
+
+
+class ROHFScanner:
+    """
+    Minimal scanner wrapper for repeated ROHF evaluations on nearby geometries.
+
+    The previous spin-resolved density is used as the next initial guess, which
+    is usually much more stable for open-shell scans than restarting every point
+    from the one-electron Hamiltonian.
+    """
+
+    def __init__(self, mf, build_driver=None):
+        self.mf = mf
+        self.mol = mf.mol
+        self.build_driver = build_driver or getattr(self.mol, '_build_driver', None) or 'builtin'
+        self._guess_mf = mf
+
+    def __getattr__(self, name):
+        return getattr(self.mf, name)
+
+    def _get_mol(self, mol_or_geom):
+        if isinstance(mol_or_geom, np.ndarray):
+            mol = self.mol
+            mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+            mol.build(driver=self.build_driver)
+            return mol
+
+        mol = mol_or_geom
+        if getattr(mol, 'eri', None) is None or getattr(mol, 'hcore', None) is None:
+            driver = getattr(mol, '_build_driver', None) or self.build_driver
+            mol.build(driver=driver)
+        return mol
+
+    def _initial_density(self, mol):
+        guess_mf = self._guess_mf
+        if guess_mf.dm_alpha is None or guess_mf.dm_beta is None:
+            return None
+        dm0 = np.asarray([guess_mf.dm_alpha, guess_mf.dm_beta], dtype=float)
+        if dm0.shape[1:] != (mol.nao, mol.nao):
+            return None
+        return np.array(dm0, copy=True)
+
+    def __call__(self, mol_or_geom):
+        mol = self._get_mol(mol_or_geom)
+        new_mf = ROHF(mol, init_guess=self.mf.init_guess, verbose=self.mf.verbose)
+        new_mf.max_cycle = self.mf.max_cycle
+        new_mf.run(
+            dm0=self._initial_density(mol),
+            init_guess='dm',
+            max_cycle=getattr(self.mf, 'max_cycle', 100),
+            conv_tol=getattr(self.mf, 'conv_tol', 1e-8),
+            conv_tol_dm=getattr(self.mf, 'conv_tol_dm', 1e-6),
+            damping=getattr(self.mf, 'damping', 0.0),
+            diis=getattr(self.mf, 'diis', True),
+            diis_start_cycle=getattr(self.mf, 'diis_start_cycle', 2),
+            diis_space=getattr(self.mf, 'diis_space', 8),
+            verbose=getattr(self.mf, 'verbose', 0),
+        )
+
+        self.mf = new_mf
+        self.mol = mol
+        if new_mf.converged:
+            self._guess_mf = new_mf
+        return new_mf.e_tot
 
 
 def ao2mo(op, C):
@@ -844,39 +3691,15 @@ def ao2mo(op, C):
     return dag(C) @ op @ C
 
 if __name__ == '__main__':
-
-
-    from pyqed import Molecule
-    mol = Molecule(atom='Li 0.6 2 0; F 0 0 1.4', unit='b', basis='sto6g')
-    # mol.build(driver = 'gbasis')
-    mol.build(driver = 'pyscf')
-    
-    # hartree_fock(mol)
-    hf = RHF(mol)
-    hf.run()
-    print(hf.energy_elec() + hf.energy_nuc())
-    # hf.get_dipole_moment(unit='au')
-    # print('pyqed dipole moment', hf.dipole_moment)
-
-    
-
-
-    # '''compare with pyscf'''
-    from pyscf import gto, scf
-
-    # Create molecule
-    mol = gto.M(atom='Li 0.6 2 0;F 0 0 1.4', unit='b', basis='sto6g')
-
-    # Run SCF calculation
-    mf = scf.RHF(mol).run()
-
-    # # Calculate dipole moment
-    # dipole = mf.dip_moment(unit='au')  # or 'au'
-    # print(f"pyscf Dipole moment: {dipole} ")
-
-
     # from pyscf import gto, scf
     # mol = gto.M(atom='H 0 0 0; H 0 0 1.1', unit='b', basis='631g')
     # conv, e, mo_e, mo, mo_occ = scf.hf.kernel(scf.hf.SCF(mol), dm0=np.eye(mol.nao_nr()))
     # print('conv = %s, E(HF) = %.12f' % (conv, e))
     # conv = True, E(HF) = -1.081170784378
+
+    from pyqed import Molecule
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.1', unit='a', basis='6311g**')
+    mol.build()
+    # hartree_fock(mol)
+    hf = RHF(mol)
+    hf.run()

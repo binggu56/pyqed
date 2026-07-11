@@ -1,297 +1,362 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jan  9 19:32:53 2024
+Generic Davidson eigensolvers used across pyqed.
 
-Src: 
-    https://github.com/NLESC-JCER/DavidsonPython/blob/master/davidson.py
-
-
+The original module bundled a dense-matrix demo implementation.  This version
+keeps the same public ``davidson(A, neigen, ...)`` entry point, but upgrades it
+to a proper block Davidson routine with thick restart, explicit residual-based
+convergence checks, optional matrix-free matvec support, and a compatibility
+wrapper ``davidson_solver`` used by some older model code.
 """
 
-import numpy as np
-import math
-import time 
+from __future__ import annotations
+
 import logging
+from typing import Callable
+
+import numpy as np
 
 
-def digaonal_dominant(n,sparsity=1E-4):
-    
-    A = np.zeros((n,n))
-    for i in range(0,n):
-        A[i,i] = 1E3*np.random.rand() 
-        #A[i,i] = i+1
-    A = A + sparsity*np.random.randn(n,n) 
-    A = (A.T + A)/2 
+LOGGER = logging.getLogger(__name__)
+
+
+def digaonal_dominant(n, sparsity=1e-4):
+    A = np.zeros((n, n))
+    for i in range(n):
+        A[i, i] = 1e3 * np.random.rand()
+    A = A + sparsity * np.random.randn(n, n)
+    A = (A.T + A) / 2
     return A
 
-def diag_non_tda(n,sparsity=1E-4):
 
-    A = digaonal_dominant(n)
-    C = sparsity*np.random.rand(n,n)
-
-    return np.block([ [A,C],[-C.T,-A.T] ])
-
+def diag_non_tda(n, sparsity=1e-4):
+    A = digaonal_dominant(n, sparsity=sparsity)
+    C = sparsity * np.random.rand(n, n)
+    return np.block([[A, C], [-C.T, -A.T]])
 
 
-def jacobi_correction(uj,A,thetaj):
+def jacobi_correction(uj, A, thetaj):
     I = np.eye(A.shape[0])
-    Pj = I-np.dot(uj,uj.T)
-    rj = np.dot((A - thetaj*I),uj) 
+    Pj = I - np.outer(uj, uj)
+    rj = (A - thetaj * I) @ uj
+    w = Pj @ ((A - thetaj * I) @ Pj)
+    return np.linalg.solve(w, rj)
 
-    w = np.dot(Pj,np.dot((A-thetaj*I),Pj))
-    return np.linalg.solve(w,rj)
 
-
-def get_initial_guess(A,neigen):
-    nrows, ncols = A.shape
+def get_initial_guess(A, neigen):
+    A = np.asarray(A)
     d = np.diag(A)
     index = np.argsort(d)
-    guess = np.zeros((nrows,neigen))
-    for i in range(neigen):
-        guess[index[i],i] = 1
-    
+    guess = np.zeros((A.shape[0], neigen), dtype=A.dtype)
+    for i in range(min(neigen, A.shape[0])):
+        guess[index[i], i] = 1
     return guess
 
 
 def reorder_matrix(A):
-    
+    A = np.asarray(A)
     n = A.shape[0]
-    tmp = np.zeros((n,n))
-
+    tmp = np.zeros((n, n), dtype=A.dtype)
     index = np.argsort(np.diagonal(A))
-
     for i in range(n):
-        for j in range(i,n):
-            tmp[i,j] = A[index[i],index[j]]
-            tmp[j,i] = tmp[i,j]
+        for j in range(i, n):
+            tmp[i, j] = A[index[i], index[j]]
+            tmp[j, i] = tmp[i, j]
     return tmp
 
-def davidson(A, neigen, tol=1E-6, itermax = 1000, jacobi=False):
-    """Davidosn solver for eigenvalue problem
-    
-    Seems quite slow!
 
-    Args :
-        A (numpy matrix) : the matrix to diagonalize
-        neigen (int)     : the number of eigenvalue requied
-        tol (float)      : the rpecision required
-        itermax (int)    : the maximum number of iteration
-        jacobi (bool)    : do the jacobi correction
-    Returns :
-        eigenvalues (array) : lowest eigenvalues
-        eigenvectors (numpy.array) : eigenvectors
-    """
-    n = A.shape[0]
-    k = 2*neigen            # number of initial guess vectors 
-    V = np.eye(n,k)         # set of k unit vectors as guess
-    I = np.eye(n)           # identity matrix same dimen as A
-    Adiag = np.diag(A)
-
-    V = get_initial_guess(A,k)
-    
-    print('\n'+'='*20)
-    print("= Davidson Solver ")
-    print('='*20)
-
-    #invA = np.linalg.inv(A)
-    #inv_approx_0 = 2*I - A
-    #invA2 = np.dot(invA,invA)
-    #invA3 = np.dot(invA2,invA)
-
-    norm = np.zeros(neigen)
-
-    # Begin block Davidson routine
-    logging.info("iter size norm (%e)" %tol)
-    for i in range(itermax):
-    
-        # QR of V t oorthonormalize the V matrix
-        # this uses GrahmShmidtd in the back
-        V,R = np.linalg.qr(V)
-
-        # form the projected matrix 
-        T = np.dot(V.T,np.dot(A,V))
+def _orthonormalize_columns(V, tol=1e-12):
+    if V.size == 0:
+        return np.zeros((V.shape[0], 0), dtype=V.dtype)
+    Q, R = np.linalg.qr(V, mode="reduced")
+    keep = np.abs(np.diag(R)) > tol
+    if not np.any(keep):
+        return np.zeros((V.shape[0], 0), dtype=V.dtype)
+    return Q[:, keep]
 
 
-        # Diagonalize the projected matrix
-        theta,s = np.linalg.eigh(T)
+def _infer_dimension(A, diag=None, guess=None):
+    if diag is not None:
+        return np.asarray(diag).size
+    if guess is not None:
+        guess_arr = np.asarray(guess)
+        return guess_arr.shape[0]
+    if hasattr(A, "shape") and A.shape is not None:
+        return int(A.shape[0])
+    raise ValueError("Cannot infer Davidson dimension; provide diag or guess.")
 
-        # Ritz eigenvector
-        q = np.dot(V,s)
 
-        # compute the residual append append it to the 
-        # set of eigenvectors
-        
-        for j in range(neigen):
+def _resolve_matvec(A):
+    if callable(A):
+        return A
+    if hasattr(A, "dot"):
+        return lambda x: np.asarray(A.dot(x))
+    A_arr = np.asarray(A)
+    return lambda x: A_arr @ x
 
-            # residue vetor
-            res = np.dot((A - theta[j]*I),q[:,j]) 
-            norm[j] = np.linalg.norm(res)
 
-            # correction vector
-            if(jacobi):
-            	delta = jacobi_correction(q[:,j],A,theta[j])
-            else:
-            	delta = res / (theta[j]-Adiag+1E-16)
-                #C = inv_approx_0 + theta[j]*I
-                #delta = -np.dot(C,res)
+def _resolve_diag(A, diag, n):
+    if diag is not None:
+        diag_arr = np.asarray(diag, dtype=float).reshape(n)
+        return diag_arr
+    if callable(A):
+        raise ValueError("Matrix-free Davidson requires a diagonal preconditioner.")
+    A_arr = np.asarray(A)
+    if A_arr.shape[0] != A_arr.shape[1]:
+        raise ValueError("Davidson expects a square matrix.")
+    return np.asarray(np.diag(A_arr), dtype=float)
 
-            delta /= np.linalg.norm(delta)
 
-            # expand the basis
-            V = np.hstack((V,delta.reshape(-1,1)))
-
-        # comute the norm to se if eigenvalue converge
-        logging.info(" %03d %03d %e" %(i,V.shape[1],np.max(norm)))
-        if np.all(norm < tol):
-            print("= Davidson has converged")
+def _build_guess(diag, neigen, guess=None):
+    n = diag.size
+    cols = []
+    dtype = complex if guess is not None and np.iscomplexobj(guess) else float
+    if guess is not None:
+        guess_arr = np.asarray(guess, dtype=dtype)
+        if guess_arr.ndim == 1:
+            cols.append(guess_arr.reshape(n))
+        else:
+            cols.extend(guess_arr[:, i].reshape(n) for i in range(guess_arr.shape[1]))
+    for idx in np.argsort(diag):
+        e = np.zeros(n, dtype=dtype)
+        e[idx] = 1.0
+        cols.append(e)
+        if len(cols) >= max(2 * neigen, neigen):
             break
-        
-    return theta[:neigen], q[:,:neigen]
+    return _orthonormalize_columns(np.column_stack(cols))
 
 
+def _projected_residual_norms(ritz, aritz, theta):
+    resid = aritz - ritz * theta
+    return resid, np.linalg.norm(resid, axis=0)
 
 
-def block_davidson(A, neig=3, max_iterations=20, tol = 1e-9):
+def _resolve_preconditioner(A, diag, jacobi=False, precond=None):
+    if precond is not None:
+        if callable(precond):
+            return precond
+        precond_arr = np.asarray(precond, dtype=float)
+
+        def _diag_precond(resid, theta, vec):
+            denom = theta - precond_arr
+            safe = np.where(
+                np.abs(denom) > 1e-12,
+                denom,
+                np.where(denom >= 0, 1e-12, -1e-12),
+            )
+            return resid / safe
+
+        return _diag_precond
+
+    if jacobi:
+        if callable(A):
+            raise ValueError("jacobi=True requires an explicit matrix.")
+        explicit_matrix = np.asarray(A)
+
+        def _jacobi_precond(resid, theta, vec):
+            return jacobi_correction(vec, explicit_matrix, theta)
+
+        return _jacobi_precond
+
+    diag_arr = np.asarray(diag, dtype=float)
+
+    def _default_precond(resid, theta, vec):
+        denom = theta - diag_arr
+        safe = np.where(
+            np.abs(denom) > 1e-12,
+            denom,
+            np.where(denom >= 0, 1e-12, -1e-12),
+        )
+        return resid / safe
+
+    return _default_precond
+
+
+def _build_projected_matrix(V, AV):
+    return V.conj().T @ AV
+
+
+def _expand_projected_matrix(T, V, AV, new_block, AV_new):
+    if T.size == 0:
+        return new_block.conj().T @ AV_new
+    cross = V.conj().T @ AV_new
+    lower = new_block.conj().T @ AV
+    diag_block = new_block.conj().T @ AV_new
+    top = np.hstack((T, cross))
+    bottom = np.hstack((lower, diag_block))
+    return np.vstack((top, bottom))
+
+
+def davidson(
+    A,
+    neigen,
+    tol=1e-6,
+    itermax=100,
+    jacobi=False,
+    diag=None,
+    precond=None,
+    guess=None,
+    max_space=None,
+    tol_residual=None,
+    lindep=1e-12,
+    return_info=False,
+    return_partial=False,
+):
     """
-    Bloch davidson algorithm
-
-    Refs
-        [1] https://github.com/sreeganb/davidson_algorithm/blob/master/davidson.py
+    Compute the lowest ``neigen`` eigenpairs of a Hermitian problem.
 
     Parameters
     ----------
-    A : TYPE
-        DESCRIPTION.
-    neig : TYPE, optional
-        DESCRIPTION. The default is 3.
-    max_iterations: TYPE, optional
-        Maximum number of iterations. The default is 20.
-    tol : TYPE, optional
-        Convergence tolerance. The default is 1e-9.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-    TYPE
-        DESCRIPTION.
-
+    A
+        Dense matrix, sparse matrix-like object with ``dot``, or a callable
+        matvec ``A(x)``.
+    neigen : int
+        Number of lowest eigenpairs to compute.
+    tol : float, optional
+        Energy convergence threshold.  The solver also checks residual norms.
+    itermax : int, optional
+        Maximum Davidson macro-iterations.
+    jacobi : bool, optional
+        Use the dense Jacobi correction when ``A`` is an explicit matrix.
+    diag : array_like, optional
+        Diagonal preconditioner. Required for matrix-free use.
+    precond : callable or array_like, optional
+        Custom preconditioner ``precond(resid, theta, vec)``. If an array is
+        given, it is treated as a diagonal preconditioner.
+    guess : array_like, optional
+        Initial guess vector(s), shape ``(n,)`` or ``(n, nguess)``.
+    max_space : int, optional
+        Maximum subspace size before thick restart.
+    tol_residual : float, optional
+        Residual threshold. Defaults to ``sqrt(tol)``.
+    lindep : float, optional
+        Linear-dependence threshold for orthogonalized correction vectors.
+    return_info : bool, optional
+        When true, also return a diagnostics dict.
+    return_partial : bool, optional
+        When true, return the best Ritz pairs found after ``itermax`` instead
+        of raising. The returned diagnostics keep ``converged=False``.
     """
+    if neigen < 1:
+        raise ValueError("neigen must be positive.")
 
-             
-    # Setup the subspace trial vectors
-    k = neig + 1 
-    logging.info('No. of start vectors:',k)
+    n = _infer_dimension(A, diag=diag, guess=guess)
+    if neigen > n:
+        raise ValueError("neigen cannot exceed the problem dimension.")
 
-    logging.info('No. of desired Eigenvalues:',neig)
-    
-    n = A.shape[0]
-    
-    t = np.eye(n,k) # initial trial vectors
-    v = np.zeros((n,n)) # holder for trial vectors as iterations progress
-    I = np.eye(n) # n*n identity matrix
-    
-    ritz = np.zeros((n,n))
-    f = np.zeros((n,n))
-    #-------------------------------------------------------------------------------
-    # Begin iterations  
-    #-------------------------------------------------------------------------------
-    # start = time.time()
-    iter = 0
-    for m in range(k, max_iterations, k):
-        iter = iter + 1
-        logging.info("Iteration no:", iter)
-        if iter==1:  # for first iteration add normalized guess vectors to matrix v
-            for l in range(m):
-                v[:,l] = t[:,l]/(np.linalg.norm(t[:,l]))
-                
-        # Matrix-vector products, form the projected Hamiltonian in the subspace
-        T = np.linalg.multi_dot([v[:,:m].T,A,v[:,:m]]) # selects fastest evaluation order
-        
-        w, vects = sort(*np.linalg.eig(T)) # Diagonalize the subspace Hamiltonian
-        jj = 0
-        # s = w.argsort()
-        # ss = w[s]
-        # vects = vects[:, s]
-        #***************************************************************************
-        # For each eigenvector of T build a Ritz vector, precondition it and check
-        # if the norm is greater than a set threshold.
-        #***************************************************************************
-        for ii in range(m): #for each new eigenvector of T
-            f = np.diag(1./ np.diag((np.diag(np.diag(A)) - w[ii]*I)))
-    #        print (f)
-            
-            ritz[:,ii] = np.dot(f,np.linalg.multi_dot([(A-w[ii]*I),v[:,:m],vects[:,ii]]))
-            if np.linalg.norm(ritz[:,ii]) > 1e-7 :
-                ritz[:,ii] = ritz[:,ii]/(np.linalg.norm(ritz[:,ii]))
-                v[:,m+jj] = ritz[:,ii]
-                jj = jj + 1
-        
-        eigvecs = v[:, :m] @ vects
-        
-        q, r = np.linalg.qr(v[:,:m+jj-1])
-        
-        for kk in range(m+jj-1):
-            v[:,kk] = q[:,kk]
-            
-        # for ii in range(neig):
-        #     print (ss[ii])
-        
-        if iter==1: 
-            check_old = w[:neig]
-            check_new = 1
-        elif iter==2:
-            check_new = w[:neig]
-        else: 
-            check_old = check_new
-            check_new = w[:neig]
-            
-        check = np.linalg.norm(check_new - check_old)
-        if check < tol:
-            logging.info('Block Davidson converged at iteration no.:',iter)
-            break
-    
-    # end = time.time()
-    # print('Block Davidson time:',end-start)
-    
-    # print(ritz.shape)
-    
-    return w[:neig], eigvecs
+    matvec = _resolve_matvec(A)
+    diag_arr = _resolve_diag(A, diag, n)
+    if max_space is None:
+        max_space = min(n, max(24, 12 * neigen))
+    tol_res = np.sqrt(tol) if tol_residual is None else tol_residual
 
-if __name__=='__main__':
-    
-    from pyqed import sort
-    import proplot as plt
-    # Build a fake sparse symmetric matrix 
-    n = 1000
-    print('Dimension of the matrix',n,'*',n)
-    sparsity = 0.01
-    A = np.zeros((n,n))
-    for i in range(0,n) : 
-        A[i,i] = i-9
-    A = A + sparsity*np.random.randn(n,n)
-    A = (A.T + A)/2
-    
-    neig = 3
-    start = time.time()
-    w, u = davidson(A, neig)
-    print(w)
-    end = time.time() 
-    print ('Davidson Diagonalization time:',end-start)
-    
-    start = time.time()
-    eig, eigvecs = sort(*np.linalg.eig(A))
-    end = time.time() 
-    # s = eig.argsort()
-    # ss = eig[s]
-    print(np.allclose(np.abs(u[:, 1]), np.abs(eigvecs[:, 1]), atol=1e-6, rtol=1e-5))
-    # fig, ax = plt.subplots()
-    # ax.plot(u[:, 0], '--')
-    # ax.plot(eigvecs[:, 0])
+    V = _build_guess(diag_arr, neigen, guess=guess)
+    AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+    T = _build_projected_matrix(V, AV)
+    precondition = _resolve_preconditioner(A, diag_arr, jacobi=jacobi, precond=precond)
 
-    print('Exact Diagonalization:')
+    prev_theta = None
+    locked = np.zeros(neigen, dtype=bool)
+    info = {
+        "converged": False,
+        "iterations": 0,
+        "residual_norms": None,
+        "energy_change": None,
+        "subspace_dim": V.shape[1],
+        "locked_roots": 0,
+        "restarts": 0,
+    }
 
-    print(eig[:neig])
-    #print(ss[:neig])
-    print ('Exact Diagonalization time:',end-start)
+    for iteration in range(1, itermax + 1):
+        theta_all, alpha_all = np.linalg.eigh(T)
+        order = np.argsort(theta_all)
+        theta = theta_all[order][:neigen]
+        alpha = alpha_all[:, order[:neigen]]
+
+        ritz = V @ alpha
+        aritz = AV @ alpha
+        resid, resid_norms = _projected_residual_norms(ritz, aritz, theta)
+        de = theta if prev_theta is None else theta - prev_theta
+        max_de = np.max(np.abs(de))
+
+        root_conv = resid_norms < tol_res
+        locked |= root_conv
+
+        info.update(
+            iterations=iteration,
+            residual_norms=resid_norms.copy(),
+            energy_change=de.copy(),
+            subspace_dim=V.shape[1],
+            locked_roots=int(np.count_nonzero(locked)),
+        )
+
+        LOGGER.debug(
+            "Davidson iter=%d space=%d max|de|=%.3e max|r|=%.3e",
+            iteration,
+            V.shape[1],
+            max_de,
+            np.max(resid_norms),
+        )
+
+        if np.all(locked):
+            info["converged"] = True
+            if return_info:
+                return theta, ritz, info
+            return theta, ritz
+
+        new_vecs = []
+        for root in range(neigen):
+            if locked[root]:
+                continue
+
+            corr_raw = np.asarray(precondition(resid[:, root], theta[root], ritz[:, root]))
+            corr = np.asarray(corr_raw, dtype=np.result_type(V.dtype, corr_raw.dtype, resid.dtype))
+            corr -= V @ (V.conj().T @ corr)
+            for prev in new_vecs:
+                corr -= prev * np.vdot(prev, corr)
+
+            norm = np.linalg.norm(corr)
+            if norm > lindep:
+                new_vecs.append(corr / norm)
+
+        if not new_vecs:
+            info["converged"] = np.all(locked)
+            if return_info:
+                return theta, ritz, info
+            return theta, ritz
+
+        new_block = np.column_stack(new_vecs)
+        if V.shape[1] + new_block.shape[1] > max_space:
+            keep = min(theta_all.size, max(2 * neigen + 2, neigen + 1))
+            restart_cols = [V @ alpha_all[:, order[i]] for i in range(keep)]
+            restart_cols.extend(new_block[:, i] for i in range(new_block.shape[1]))
+            V = _orthonormalize_columns(np.column_stack(restart_cols))
+            AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+            T = _build_projected_matrix(V, AV)
+            info["restarts"] += 1
+        else:
+            AV_new = np.column_stack([matvec(new_block[:, i]) for i in range(new_block.shape[1])])
+            T = _expand_projected_matrix(T, V, AV, new_block, AV_new)
+            V = np.column_stack((V, new_block))
+            AV = np.column_stack((AV, AV_new))
+
+        prev_theta = theta.copy()
+
+    if return_partial:
+        info["converged"] = False
+        info["max_iterations_reached"] = True
+        if return_info:
+            return theta, ritz, info
+        return theta, ritz
+    raise RuntimeError("Davidson solver did not converge within itermax iterations.")
+
+
+def davidson_solver(A, neigen, **kwargs):
+    """Backward-compatible wrapper used by older model code."""
+    return davidson(A, neigen=neigen, **kwargs)
+
+
+def block_davidson(A, neig=3, max_iterations=20, tol=1e-9):
+    """Compatibility alias to the upgraded block Davidson implementation."""
+    return davidson(A, neigen=neig, tol=tol, itermax=max_iterations)

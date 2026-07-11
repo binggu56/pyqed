@@ -5,7 +5,6 @@ from scipy.linalg import eigh
 # from cmath import log
 
 import sys
-import matplotlib.pyplot as plt
 
 
 from pyqed import boson, interval, sigmax, sort, ket2dm, overlap,\

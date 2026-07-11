@@ -1,0 +1,122 @@
+{
+  "atom": "Li 0 0 0; F 0 0 1.4",
+  "unit": "bohr",
+  "basis": "631g",
+  "active_space": [
+    4,
+    4
+  ],
+  "pyscf_casscf": -105.49289692773995,
+  "partial_results": [
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.0001,
+      "max_cycle": 20,
+      "energy": -105.48578636508546,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.00548964437823396,
+      "delta_to_pyscf": 0.007110562654489172
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.0001,
+      "max_cycle": 40,
+      "energy": -105.48578636508549,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.005489644378232808,
+      "delta_to_pyscf": 0.00711056265446075
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.001,
+      "max_cycle": 20,
+      "energy": -105.48578636508547,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.005489644378232822,
+      "delta_to_pyscf": 0.007110562654474961
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.001,
+      "max_cycle": 40,
+      "energy": -105.48578636508545,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.005489644378233377,
+      "delta_to_pyscf": 0.007110562654503383
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.01,
+      "max_cycle": 20,
+      "energy": -105.48577828048786,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.0055329376638248995,
+      "delta_to_pyscf": 0.0071186472520849975
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.2,
+      "level_shift": 0.01,
+      "max_cycle": 40,
+      "energy": -105.48577828048785,
+      "converged": false,
+      "macro_cycles": 13,
+      "final_grad_norm": 0.005532937663824608,
+      "delta_to_pyscf": 0.007118647252099208
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.3,
+      "level_shift": 0.0001,
+      "max_cycle": 20,
+      "energy": -105.48645821640378,
+      "converged": false,
+      "macro_cycles": 11,
+      "final_grad_norm": 0.006347014110114069,
+      "delta_to_pyscf": 0.006438711336173242
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.3,
+      "level_shift": 0.0001,
+      "max_cycle": 40,
+      "energy": -105.4864582164038,
+      "converged": false,
+      "macro_cycles": 11,
+      "final_grad_norm": 0.0063470141101129585,
+      "delta_to_pyscf": 0.00643871133614482
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.3,
+      "level_shift": 0.001,
+      "max_cycle": 20,
+      "energy": -105.48645850158982,
+      "converged": false,
+      "macro_cycles": 11,
+      "final_grad_norm": 0.006347757136960841,
+      "delta_to_pyscf": 0.00643842615012602
+    },
+    {
+      "step_size": 0.6,
+      "max_step": 0.3,
+      "level_shift": 0.001,
+      "max_cycle": 40,
+      "energy": -105.48645850158978,
+      "converged": false,
+      "macro_cycles": 11,
+      "final_grad_norm": 0.006347757136965726,
+      "delta_to_pyscf": 0.006438426150168652
+    }
+  ]
+}

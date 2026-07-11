@@ -9,10 +9,10 @@ complete active space configuration interaction
 """
 
 import logging
-from functools import reduce
+from functools import lru_cache, reduce
 import numpy as np
 from scipy.linalg import eigh
-from scipy.sparse.linalg import eigsh, LinearOperator
+from scipy.sparse.linalg import eigsh
 
 import sys
 from opt_einsum import contract
@@ -21,15 +21,20 @@ from pyqed import tensor
 from itertools import combinations
 import itertools
 import warnings
+from dataclasses import dataclass
+from numba import njit
 
-from pyqed.qchem import get_veff
 from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
             create, Is #, jordan_wigner_two_body
 
 
-from pyqed.qchem.hf.rhf import ao2mo
-
+from pyqed.qchem.hf.rhf import ao2mo, get_or_build_low_rank_eri_factors
+from pyqed.qchem.soc import (
+    get_soc_1e_spin_orbital,
+    get_soc_somf_spin_orbital,
+    reorder_spin_orbital_matrix,
+)
 
 def cistring(norb, nelec, sz=0):
     """
@@ -120,6 +125,346 @@ def get_combos(mo_occ, space='fci', ncore=None, ncas=None, nvir=None):
         #     mo_occ = mf.mo_occ
 
 
+def _is_uhf_reference(mo_coeff):
+    return isinstance(mo_coeff, (tuple, list)) and len(mo_coeff) == 2
+
+
+def _as_spin_tuple(values):
+    if _is_uhf_reference(values):
+        return values[0], values[1]
+    return values, values
+
+
+def _validate_multiplicity(multiplicity):
+    if multiplicity is None:
+        return None
+    multiplicity = int(round(multiplicity))
+    if multiplicity < 1:
+        raise ValueError("multiplicity must be a positive integer.")
+    return multiplicity
+
+
+def _s2_from_multiplicity(multiplicity):
+    multiplicity = _validate_multiplicity(multiplicity)
+    if multiplicity is None:
+        return None
+    spin_s = 0.5 * (multiplicity - 1)
+    return spin_s * (spin_s + 1.0)
+
+
+def _resolve_ms2(nelecas, mol_ms2, *, spin=None, ms2=None, multiplicity=None):
+    if ms2 is None:
+        ms2 = mol_ms2 if spin is None else spin
+    elif spin is not None and int(round(spin)) != int(round(ms2)):
+        raise ValueError("spin and ms2 both set but disagree; use ms2 for 2*M_S.")
+
+    ms2 = int(round(ms2))
+    multiplicity = _validate_multiplicity(multiplicity)
+    if multiplicity is not None:
+        spin2 = multiplicity - 1
+        if abs(ms2) > spin2 or (spin2 - ms2) % 2:
+            raise ValueError(
+                f"multiplicity={multiplicity} is incompatible with ms2={ms2}."
+            )
+    return ms2
+
+
+def _normalize_active_electrons(nelecas, spin):
+    if isinstance(nelecas, (tuple, list)):
+        if len(nelecas) != 2:
+            raise ValueError('nelecas must be an int or a length-2 (nalpha, nbeta) pair.')
+        na, nb = (int(nelecas[0]), int(nelecas[1]))
+    else:
+        nelecas = int(nelecas)
+        spin = int(round(spin))
+        if (nelecas + spin) % 2 != 0:
+            raise ValueError(
+                f'Incompatible active electron count/spin: nelecas={nelecas}, spin={spin}.'
+            )
+        na = (nelecas + spin) // 2
+        nb = nelecas - na
+
+    if na < 0 or nb < 0:
+        raise ValueError(f'Invalid active electron count: {(na, nb)}')
+    return na, nb
+
+
+def _spin_occupations(mo_occ, ncore, ncas):
+    if _is_uhf_reference(mo_occ):
+        occ_a = np.asarray(mo_occ[0][ncore:ncore+ncas], dtype=np.int8)
+        occ_b = np.asarray(mo_occ[1][ncore:ncore+ncas], dtype=np.int8)
+    else:
+        occ = np.asarray(mo_occ[ncore:ncore+ncas], dtype=np.int8)
+        occ_a = occ_b = occ // 2
+    return [occ_a, occ_b]
+
+
+def _reference_active_occupations(nelecas_spin, ncas):
+    na, nb = nelecas_spin
+    occ_a = np.zeros(ncas, dtype=np.int8)
+    occ_b = np.zeros(ncas, dtype=np.int8)
+    occ_a[:na] = 1
+    occ_b[:nb] = 1
+    return [occ_a, occ_b]
+
+
+def _slice_active_orbitals(mo_coeff, ncore, ncas):
+    if _is_uhf_reference(mo_coeff):
+        core = (
+            mo_coeff[0][:, :ncore],
+            mo_coeff[1][:, :ncore],
+        )
+        cas = (
+            mo_coeff[0][:, ncore:ncore+ncas],
+            mo_coeff[1][:, ncore:ncore+ncas],
+        )
+    else:
+        core = mo_coeff[:, :ncore]
+        cas = mo_coeff[:, ncore:ncore+ncas]
+    return core, cas
+
+
+def _normalize_spin_1e_operator(h1e):
+    """
+    Normalize a one-electron operator into explicit alpha/beta blocks.
+    """
+    if isinstance(h1e, (tuple, list)) and len(h1e) == 2:
+        return np.asarray(h1e[0]), np.asarray(h1e[1])
+
+    h1e = np.asarray(h1e)
+    if h1e.ndim == 3 and h1e.shape[0] == 2:
+        return h1e[0], h1e[1]
+    return h1e, h1e
+
+
+def _transform_1e_operator_ao_to_mo(h1e, mo_coeff):
+    h1a, h1b = _normalize_spin_1e_operator(h1e)
+    if _is_uhf_reference(mo_coeff):
+        return (
+            ao2mo(h1a, mo_coeff[0]),
+            ao2mo(h1b, mo_coeff[1]),
+        )
+    out = ao2mo(h1a, mo_coeff)
+    if h1b is h1a:
+        return out
+    return (out, ao2mo(h1b, mo_coeff))
+
+
+def _get_mf_cholesky_factors(mf):
+    eri_factors = getattr(mf, 'eri_factors', None)
+    if eri_factors is not None:
+        return eri_factors
+
+    tol = getattr(mf, 'cholesky_tol', None)
+    if tol is None:
+        tol = getattr(mf, 'low_rank_tol', None)
+    if tol is None:
+        tol = 1e-8
+
+    max_rank = getattr(mf, 'cholesky_max_rank', None)
+    if max_rank is None:
+        max_rank = getattr(mf, 'low_rank_max_rank', None)
+
+    eri_factors = get_or_build_low_rank_eri_factors(mf.mol, tol=tol, max_rank=max_rank)
+    mf.eri_factors = eri_factors
+    return eri_factors
+
+
+def _resolve_use_cholesky_integrals(mf, use_cholesky=None):
+    """
+    Enable the factor/Cholesky CASCI path automatically for factor-only RHF.
+    """
+    if use_cholesky is not None:
+        return bool(use_cholesky)
+    if bool(getattr(mf, 'cholesky_jk', False)):
+        return True
+    return getattr(mf, 'eri', None) is None and (
+        getattr(mf, 'eri_factors', None) is not None
+        or getattr(getattr(mf, 'mol', None), 'eri_factors', None) is not None
+    )
+
+
+def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+    """
+    Transform AO Cholesky factors ``L_P[mu,nu]`` to an MO pair basis.
+    """
+    if mo_right is None:
+        mo_right = mo_left
+    from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
+    return transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+
+
+def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):
+    """
+    Assemble a spatial ERI tensor from transformed Cholesky pair factors.
+    """
+    if pair_factors_rs is None:
+        pair_factors_rs = pair_factors_pq
+    return contract('Ppq,Prs->pqrs', pair_factors_pq, pair_factors_rs)
+
+
+def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None,
+                                use_cholesky=False, eri_factors=None):
+    """
+    Transform AO spatial ERIs to MO form, optionally via AO Cholesky factors.
+    """
+    if mo_right is None:
+        mo_right = mo_left
+    if mo_left_2 is None:
+        mo_left_2 = mo_left
+    if mo_right_2 is None:
+        mo_right_2 = mo_right
+
+    if use_cholesky:
+        if eri_factors is None:
+            eri_factors = _get_mf_cholesky_factors(mf)
+        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        if (
+            mo_left_2 is mo_left and mo_right_2 is mo_right
+        ) or (
+            np.array_equal(mo_left_2, mo_left) and np.array_equal(mo_right_2, mo_right)
+        ):
+            pair_factors_rs = pair_factors_pq
+        else:
+            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+        return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
+
+    eri_source = getattr(mf, 'eri', None)
+    if eri_source is None and getattr(mf, 'eri_s4', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+        eri_source = unpack_eri_s4(mf.eri_s4, mf.mol.nao)
+    if eri_source is None and getattr(mf, 'eri_s8', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+        eri_source = unpack_eri_s8(mf.eri_s8, mf.mol.nao)
+    mol = getattr(mf, 'mol', None)
+    if eri_source is None and mol is not None:
+        eri_source = getattr(mol, 'eri', None)
+    if eri_source is None and mol is not None and getattr(mol, 'eri_s4', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+        eri_source = unpack_eri_s4(mol.eri_s4, mol.nao)
+    if eri_source is None and mol is not None and getattr(mol, 'eri_s8', None) is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+        eri_source = unpack_eri_s8(mol.eri_s8, mol.nao)
+    eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
+    if eri_source is not None and eri_ndim == 4:
+        return contract(
+            'ip, jq, ijkl, kr, ls -> pqrs',
+            mo_left.conj(),
+            mo_right,
+            eri_source,
+            mo_left_2.conj(),
+            mo_right_2,
+        )
+
+    if eri_factors is None:
+        eri_factors = getattr(mf, 'eri_factors', None)
+    if eri_factors is None:
+        eri_factors = getattr(getattr(mf, 'mol', None), 'eri_factors', None)
+    if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
+        eri_factors = eri_source
+    if eri_factors is not None:
+        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        if (
+            mo_left_2 is mo_left and mo_right_2 is mo_right
+        ) or (
+            np.array_equal(mo_left_2, mo_left) and np.array_equal(mo_right_2, mo_right)
+        ):
+            pair_factors_rs = pair_factors_pq
+        else:
+            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+        return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
+
+    raise ValueError(
+        "transform_spatial_eri_to_mo requires dense 4-index ERIs or RI/Cholesky "
+        "factors. Got mf.eri with ndim={}.".format(eri_ndim)
+    )
+
+
+def _validate_matching_active_spaces(cibra_obj, ciket_obj):
+    if cibra_obj.ncas != ciket_obj.ncas:
+        raise ValueError(
+            f"CASCI objects must have the same ncas for spin-orbital TDMs: "
+            f"{cibra_obj.ncas} != {ciket_obj.ncas}."
+        )
+    if cibra_obj.mo_cas is None or ciket_obj.mo_cas is None:
+        raise ValueError("Run CASCI before requesting spin-orbital transition densities.")
+
+    bra_mo = np.asarray(cibra_obj.mo_cas)
+    ket_mo = np.asarray(ciket_obj.mo_cas)
+    if bra_mo.shape != ket_mo.shape or not np.allclose(bra_mo, ket_mo):
+        raise ValueError(
+            "CASCI objects must share the same active orbitals for spin-orbital "
+            "transition densities."
+        )
+
+
+def _binary_to_grouped_spin_orbital_occ(binary):
+    binary = np.asarray(binary, dtype=np.int8)
+    return np.concatenate((binary[0], binary[1])).astype(np.int8, copy=False)
+
+
+def make_tdm1_spin_orbital(cibra, ciket, binary_bra, binary_ket, order='grouped'):
+    """
+    One-particle transition density matrix in a full spin-orbital basis.
+
+    The returned matrix follows the convention
+
+    ``D[u, v] = <Psi_bra | a_u^\dagger a_v | Psi_ket>``.
+
+    Parameters
+    ----------
+    cibra, ciket : ndarray
+        CI coefficient vectors in determinant bases ``binary_bra`` and
+        ``binary_ket``.
+    binary_bra, binary_ket : ndarray
+        Determinant occupations with shape ``(ndet, 2, norb)``.
+    order : {'grouped', 'interleaved'}
+        Spin-orbital ordering of the returned matrix.
+    """
+    cibra = np.asarray(cibra)
+    ciket = np.asarray(ciket)
+    binary_bra = np.asarray(binary_bra, dtype=np.int8)
+    binary_ket = np.asarray(binary_ket, dtype=np.int8)
+    if binary_bra.ndim != 3 or binary_ket.ndim != 3 or binary_bra.shape[1] != 2 or binary_ket.shape[1] != 2:
+        raise ValueError("binary_bra and binary_ket must have shape (ndet, 2, norb).")
+    if binary_bra.shape[2] != binary_ket.shape[2]:
+        raise ValueError("binary_bra and binary_ket must have the same number of spatial orbitals.")
+
+    nso = 2 * binary_bra.shape[2]
+    dtype = np.result_type(cibra, ciket, complex)
+    tdm = np.zeros((nso, nso), dtype=dtype)
+
+    bra_occ = [_binary_to_grouped_spin_orbital_occ(det) for det in binary_bra]
+    ket_occ = [_binary_to_grouped_spin_orbital_occ(det) for det in binary_ket]
+    bra_lookup = {occ.tobytes(): idx for idx, occ in enumerate(bra_occ)}
+
+    for j, occ in enumerate(ket_occ):
+        coeff_ket = ciket[j]
+        if coeff_ket == 0:
+            continue
+        occupied = np.flatnonzero(occ)
+        for v in occupied:
+            sign_ann = -1 if int(np.sum(occ[:v])) % 2 else 1
+            occ_after_ann = occ.copy()
+            occ_after_ann[v] = 0
+            unoccupied = np.flatnonzero(1 - occ_after_ann)
+            for u in unoccupied:
+                sign_cre = -1 if int(np.sum(occ_after_ann[:u])) % 2 else 1
+                occ_final = occ_after_ann.copy()
+                occ_final[u] = 1
+                i = bra_lookup.get(occ_final.tobytes())
+                if i is None:
+                    continue
+                tdm[u, v] += cibra[i].conj() * coeff_ket * (sign_ann * sign_cre)
+
+    order = order.lower()
+    if order == 'grouped':
+        return tdm
+    if order == 'interleaved':
+        return reorder_spin_orbital_matrix(tdm, source='grouped', target='interleaved')
+    raise ValueError("order must be 'grouped' or 'interleaved'.")
+
+
 
 # def ao2mo(mf, mo_coeff=None, spin_flip=False, H1=None, H2=None):
 #     """
@@ -196,8 +541,7 @@ def get_combos(mo_occ, space='fci', ncore=None, ncas=None, nvir=None):
 #     #     return H1, H2
 #     return H1, H2
 
-def h1e_for_cas(self, mo_coeff=None):
-
+def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
     '''CAS space effective one-electron hamiltonian
 
     Args:
@@ -207,21 +551,45 @@ def h1e_for_cas(self, mo_coeff=None):
         A tuple, the first is the effective one-electron hamiltonian defined in CAS space,
         the second is the electronic energy from core.
     '''
-    mf, ncas, ncore = self.mf, self.ncas, self.ncore
-    if mo_coeff is None: mo_coeff = mf.mo_coeff
-    # if ncas is None: ncas = .ncas
-    # if ncore is None: ncore = casci.ncore
-    mo_core = mo_coeff[:,:ncore]
-    mo_cas = mo_coeff[:,ncore:ncore+ncas]
+    if mo_coeff is None:
+        mo_coeff = mf.mo_coeff
 
-    # hcore = mf.get_hcore()
-    hcore = self.get_hcore()
+    mo_core, mo_cas = _slice_active_orbitals(mo_coeff, ncore, ncas)
+    hcore = mf.get_hcore()
+
+    if _is_uhf_reference(mo_coeff):
+        hcore_a, hcore_b = _as_spin_tuple(hcore)
+        mo_core_a, mo_core_b = mo_core
+        mo_cas_a, mo_cas_b = mo_cas
+
+        energy_core = mf.energy_nuc()
+        if mo_core_a.size == 0:
+            corevhf = (0, 0)
+        else:
+            core_dm = np.array((
+                np.dot(mo_core_a, mo_core_a.conj().T),
+                np.dot(mo_core_b, mo_core_b.conj().T),
+            ))
+            corevhf = mf.get_veff(core_dm)
+            energy_core += np.einsum('ij,ji', core_dm[0], hcore_a).real
+            energy_core += np.einsum('ij,ji', core_dm[1], hcore_b).real
+            energy_core += 0.5 * np.einsum('ij,ji', core_dm[0], corevhf[0]).real
+            energy_core += 0.5 * np.einsum('ij,ji', core_dm[1], corevhf[1]).real
+
+        h1eff = np.array((
+            reduce(np.dot, (mo_cas_a.conj().T, hcore_a + corevhf[0], mo_cas_a)),
+            reduce(np.dot, (mo_cas_b.conj().T, hcore_b + corevhf[1], mo_cas_b)),
+        ))
+        return h1eff, energy_core
+
+    mo_core = mo_core
+    mo_cas = mo_cas
     energy_core = mf.energy_nuc()
     if mo_core.size == 0:
         corevhf = 0
     else:
         core_dm = np.dot(mo_core, mo_core.conj().T) * 2
-        corevhf = get_veff(mf.mol, core_dm)
+        corevhf = mf.get_veff(core_dm)
         energy_core += np.einsum('ij,ji', core_dm, hcore).real
         energy_core += np.einsum('ij,ji', core_dm, corevhf).real * .5
 
@@ -229,40 +597,18 @@ def h1e_for_cas(self, mo_coeff=None):
     return h1eff, energy_core
 
 
-def add_electric_field(mol, electric_field=np.array([0,0,0])):
-    """add external electric field interaction term
-    math::
-    V_{int} = - \hat{\mu} \cdot E
-    where mu is electric dipole, E is electric field
-
-    Parameters
-    ----------
-    mol : _type_
-        _description_
-    electric_field : electric_field=np.array([Ex, Ey, Ez])
-        _description_, by default np.array([0,0,0])
-
-    Returns
-    -------
-    _type_
-        _description_
-    """    
-    hcore_with_field =  np.einsum('ijk,i -> jk', mol.ao_dip, electric_field)
-
-    return hcore_with_field
-
-def add_vector_potential(mol, vector_potential=np.array([0,0,0])):
-
-    A = vector_potential
-    print('A^2', np.dot(A, A))
-    hcore_with_vector_potential = -np.einsum('ijk,i -> jk', mol.ao_moment, vector_potential).astype(complex) \
-        + 0.5 * np.dot(A, A) * mol.overlap
-
-
-    return hcore_with_vector_potential
-
 class CASCI:
-    def __init__(self, mf, ncas, nelecas, ncore=None, spin=None):
+    def __init__(
+        self,
+        mf,
+        ncas,
+        nelecas,
+        ncore=None,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
+        verbose=0,
+    ):
         """
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
@@ -296,9 +642,32 @@ class CASCI:
 
         """
         self.ncas = ncas # number of MOs in active space
-        self.nelecas = nelecas
+        self.verbose = int(verbose)
 
-        ncore = mf.nelec//2 - self.nelecas//2 # core orbs
+        self.ms2 = _resolve_ms2(
+            nelecas,
+            mf.mol.spin,
+            spin=spin,
+            ms2=ms2,
+            multiplicity=multiplicity,
+        )
+        self.spin = self.ms2  # backward-compatible alias for 2*M_S
+        self.multiplicity = _validate_multiplicity(multiplicity)
+        self.target_s2 = _s2_from_multiplicity(self.multiplicity)
+        self.spin_selection_tol = 1.0e-5
+        self.spin_root_cushion = 8
+
+        self.nelecas = nelecas
+        self.nelecas_spin = _normalize_active_electrons(nelecas, self.ms2)
+        self.nelecas_total = sum(self.nelecas_spin)
+
+        ncore_electrons = mf.nelec - self.nelecas_total
+        if ncore_electrons < 0 or ncore_electrons % 2 != 0:
+            raise ValueError(
+                'Frozen-core CASCI currently requires the inactive space to contain '
+                'an even number of electrons.'
+            )
+        ncore = ncore_electrons // 2
         assert(ncore >= 0)
 
         self.ncore = ncore
@@ -316,10 +685,6 @@ class CASCI:
 
         self.mo_core = None
         self.mo_cas = None
-
-        if spin is None:
-            spin = mf.mol.spin
-        self.spin = spin
         self.ss = None
         self.shift = None
         self.spin_purification = False
@@ -342,35 +707,202 @@ class CASCI:
         self.Nd = None
         self.binary = None
         self.SC1 = None # SlaterCondon rule 1
-        self.SC2 = None # SlaterCondon rule 2
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
+        self.use_cholesky_integrals = False
+        self._property_operator_cache = {}
 
 
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
 
-        self.electric_dipole = None
-        self.magnetic_dipole = None
+    def as_scanner(
+        self,
+        nstates=None,
+        method='direct_ci',
+        build_driver=None,
+        run_kwargs=None,
+        reuse_ci=False,
+        **kwargs,
+    ):
+        """Return a stateful CASCI scanner for nearby geometries.
 
-        hcore = mf.get_hcore()
-        self.dtype = hcore.dtype
-        # print('hcore', hcore.dtype)
-        if hcore.dtype == complex:
-            self.dtype = np.complex128
-        else:
-            self.dtype = np.float64
+        The scanner reuses the underlying mean-field scanner, then runs a fresh
+        CASCI calculation at each geometry. It returns the computed CASCI object
+        so downstream LDR code can use energies, overlaps, and density matrices
+        from the same electronic calculation.
+        """
+        options = dict(run_kwargs or {})
+        options.update(kwargs)
+        return CASCIScanner(
+            self,
+            nstates=nstates,
+            method=method,
+            build_driver=build_driver,
+            run_kwargs=options,
+            reuse_ci=reuse_ci,
+        )
 
-        self.v_solvent = None   # AO PCM potential
 
-        # print('self.add_electric',self.add_electric)
-        # print('self.electric_field',self.electric_field)
+    def PCM(self, solvent_obj=None, dm=None, **kwargs):
+        """
+        Attach a PCM solvent model and return a chainable CASCI+PCM object.
 
-    def get_hcore(self):
-        return self.mf.get_hcore()
+        Examples
+        --------
+        >>> mc = CASCI(mf, ncas=6, nelecas=6).PCM(eps=2.3653).run(nstates=4)
+
+        Parameters
+        ----------
+        solvent_obj
+            Optional preconfigured ``pyqed.qchem.solvent.pcm.PCM`` object.
+            If omitted, a PCM object is created for ``self.mol``.
+        dm
+            Optional density matrix used to freeze the solvent potential.
+        **kwargs
+            PCM attributes to set on the solvent object, such as ``eps``,
+            ``method``, ``state_id``, ``state_average``, ``state_weights``,
+            ``max_cycle``, or ``conv_tol``.
+        """
+        from pyqed.qchem.solvent.pcm import PCM, pcm_for_casci
+
+        if solvent_obj is None:
+            solvent_obj = PCM(self.mol)
+
+        for key, value in kwargs.items():
+            if not hasattr(solvent_obj, key):
+                raise ValueError(f"Unknown PCM option '{key}'.")
+            setattr(solvent_obj, key, value)
+
+        return pcm_for_casci(self, solvent_obj, dm)
+
+    def _make_lr_pcm_fast_solvent(self, eps):
+        if _is_uhf_reference(self.mo_coeff):
+            raise NotImplementedError(
+                "Determinant-space LR-PCM currently supports restricted CASCI references only."
+            )
+        from pyqed.qchem.solvent.pcm import PCM
+
+        solvent = PCM(self.mol)
+        reference = getattr(self, "with_solvent", None)
+        if reference is not None:
+            for key in (
+                "method",
+                "vdw_scale",
+                "r_probe",
+                "radii_table",
+                "lebedev_order",
+                "max_memory",
+                "verbose",
+            ):
+                if hasattr(reference, key):
+                    setattr(solvent, key, getattr(reference, key))
+        solvent.eps = float(eps)
+        solvent.equilibrium_solvation = False
+        return solvent
+
+    def _active_tdm_to_ao(self, active_tdm):
+        full_mo = np.zeros((int(self.mf.nmo), int(self.mf.nmo)), dtype=float)
+        ncore = int(self.ncore)
+        ncas = int(self.ncas)
+        full_mo[ncore:ncore + ncas, ncore:ncore + ncas] = active_tdm
+        coeff = np.asarray(self.mo_coeff)
+        return coeff @ full_mo @ coeff.conj().T
+
+    def _lr_pcm_determinant_kernel(self, ground_ci, eps=1.78):
+        """
+        Build the LR-PCM response kernel in the CAS determinant basis.
+
+        The kernel is constructed from transition densities between each
+        determinant-basis vector and a fixed ground-state CI vector, then
+        projected to leave the reference ground vector unchanged.
+        """
+        solvent = self._make_lr_pcm_fast_solvent(eps)
+        ndet = len(ground_ci)
+        tdms = []
+        potentials = []
+        for idx in range(ndet):
+            unit = np.zeros(ndet, dtype=float)
+            unit[idx] = 1.0
+            active_tdm = make_tdm1(unit, ground_ci, self.binary, self.SC1)
+            tdm_ao = self._active_tdm_to_ao(active_tdm)
+            tdms.append(tdm_ao)
+            potentials.append(solvent._B_dot_x(tdm_ao))
+
+        kernel = np.empty((ndet, ndet), dtype=float)
+        for i, tdm_i in enumerate(tdms):
+            for j, v_j in enumerate(potentials):
+                kernel[i, j] = np.einsum("ij,ji->", v_j, tdm_i, optimize=True).real
+        kernel = 0.5 * (kernel + kernel.T)
+
+        ground_ci = np.asarray(ground_ci, dtype=float)
+        ground_ci = ground_ci / np.linalg.norm(ground_ci)
+        projector = np.eye(ndet) - np.outer(ground_ci, ground_ci)
+        return projector @ kernel @ projector
+
+    @staticmethod
+    def _lowest_dense_eigensystem(matrix, nstates):
+        nstates = int(nstates)
+        if nstates <= 0:
+            raise ValueError("nstates must be positive.")
+        evals, evecs = eigh(np.asarray(matrix))
+        nout = min(nstates, evals.size)
+        return evals[:nout], evecs[:, :nout]
+
+    def _spin_selected_nstates(self, requested_nstates, ndet, spin_root_cushion=None):
+        requested_nstates = int(requested_nstates)
+        if self.multiplicity is None:
+            return requested_nstates
+        if spin_root_cushion is None:
+            spin_root_cushion = self.spin_root_cushion
+        nsolve = requested_nstates + max(0, int(spin_root_cushion))
+        return min(nsolve, max(1, int(ndet) - 1))
+
+    def _apply_multiplicity_selection(self, energies, vectors, requested_nstates,
+                                      spin_selection_tol=None):
+        energies = np.asarray(energies)
+        vectors = np.asarray(vectors)
+        requested_nstates = int(requested_nstates)
+        if self.multiplicity is None:
+            order = np.argsort(energies)[:requested_nstates]
+            return energies[order], vectors[:, order]
+
+        if spin_selection_tol is None:
+            spin_selection_tol = self.spin_selection_tol
+        spin_selection_tol = float(spin_selection_tol)
+
+        old_e_tot = self.e_tot
+        old_ci = self.ci
+        self.e_tot = energies + self.e_core
+        self.ci = [vectors[:, i] for i in range(vectors.shape[1])]
+        s2 = np.asarray([self.spin_square(i) for i in range(vectors.shape[1])], dtype=float)
+        self.e_tot = old_e_tot
+        self.ci = old_ci
+
+        target_s2 = self.target_s2
+        selected = [
+            i for i in np.argsort(energies)
+            if abs(s2[i] - target_s2) <= spin_selection_tol
+        ]
+        if len(selected) < requested_nstates:
+            ranked = sorted(
+                range(len(energies)),
+                key=lambda i: (abs(s2[i] - target_s2), energies[i]),
+            )
+            detail = ", ".join(
+                f"root {i}: S^2={s2[i]:.6g}" for i in ranked[:min(6, len(ranked))]
+            )
+            raise ValueError(
+                f"Found {len(selected)} roots with multiplicity={self.multiplicity} "
+                f"(target S^2={target_s2:.6g}) among {len(energies)} solved roots; "
+                f"need {requested_nstates}. Increase spin_root_cushion or nstates. "
+                f"Closest roots: {detail}."
+            )
+        selected = selected[:requested_nstates]
+        return energies[selected], vectors[:, selected]
 
 
-    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None):
+    def get_SO_matrix(self, spin_flip=False, H1=None, H2=None, use_cholesky=None):
         """
         Given a rhf object get Spin-Orbit Matrices
 
@@ -385,11 +917,15 @@ class CASCI:
         # from pyscf import ao2mo
 
         mf = self.mf
+        if use_cholesky is None:
+            use_cholesky = self.use_cholesky_integrals
+        use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
 
         # molecular orbitals
-        Ca, Cb = [self.mo_cas, ] * 2
+        Ca, Cb = _as_spin_tuple(self.mo_cas)
 
-        H, energy_core = self.h1e_for_cas()
+        H, energy_core = h1e_for_cas(mf, ncas=self.ncas, ncore=self.ncore, \
+                                     mo_coeff=self.mo_coeff)
 
         self.e_core = energy_core
 
@@ -404,16 +940,42 @@ class CASCI:
 
         # nmo = Ca.shape[1] # n
 
-        eri = mf.eri  # (pq||rs) = (pq|rs) - (ps|qr) 1^* 1 2^* 2
+        same_spin_orbitals = Ca is Cb or np.array_equal(Ca, Cb)
+        eri_factors = _get_mf_cholesky_factors(mf) if use_cholesky else None
 
-        ### compute SO antisymmetrized ERIs (MO)
-        eri_aa = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Ca.conj(), Ca)
-        # eri_aa -= eri_aa.swapaxes(1,3)
-
-        eri_bb = eri_aa.copy()
-
-        eri_ab = contract('ip, jq, ijkl, kr, ls -> pqrs', Ca.conj(), Ca, eri, Cb.conj(), Cb)
-        eri_ba = contract('ip, jq, ijkl, kr, ls -> pqrs', Cb.conj(), Cb, eri, Ca.conj(), Ca)
+        if same_spin_orbitals:
+            # Restricted references use the same spatial active orbitals for both
+            # spin channels, so all spin blocks share one spatial ERI transform.
+            eri_spatial = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_aa = eri_spatial
+            eri_ab = eri_spatial
+            eri_ba = eri_spatial
+            eri_bb = eri_spatial
+        else:
+            eri_aa = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_bb = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ab = transform_spatial_eri_to_mo(
+                mf, Ca, Ca, Cb, Cb,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
+            eri_ba = transform_spatial_eri_to_mo(
+                mf, Cb, Cb, Ca, Ca,
+                use_cholesky=use_cholesky,
+                eri_factors=eri_factors,
+            )
 
 
 
@@ -437,7 +999,10 @@ class CASCI:
 
         # H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca),
                          # np.einsum("AB, Ap, Bq -> pq", H, Cb, Cb)])
-        H1 = [H, H]
+        if isinstance(H, np.ndarray) and H.ndim == 3:
+            H1 = [H[0], H[1]]
+        else:
+            H1 = [H, H]
 
         if spin_flip:
             raise NotImplementedError('Spin-flip matrix elements not implemented yet')
@@ -454,8 +1019,6 @@ class CASCI:
         # else:
         #     return H1, H2
         return H1, H2
-
-
 
     def natural_orbitals(self, dm, nco=None):
         natural_orb_occ, natural_orb_coeff = np.linalg.eigh(dm)
@@ -478,7 +1041,7 @@ class CASCI:
             Ca = mf.mo_coeff[:, self.ncore:self.ncore + self.ncas]
             # hcore_mo = contract('ia, ij, jb -> ab', Ca.conj(), mf.hcore, Ca)
 
-            h1eff, e_core = self.h1e_for_cas()
+            h1eff, e_core = h1e_for_cas(self.mf, ncas=self.ncas, ncore=self.ncore)
 
             self.e_core = e_core
 
@@ -518,8 +1081,9 @@ class CASCI:
 
         I = tensor(Is(self.ncas))
 
-        self.H += shift * ((Na - self.nelecas/2 * I) @ (Na - self.nelecas/2 * I) + \
-            (Nb - self.nelecas/2 * I) @ (Nb - self.nelecas/2 * I))
+        target = self.nelecas_total / 2
+        self.H += shift * ((Na - target * I) @ (Na - target * I) + \
+            (Nb - target * I) @ (Nb - target * I))
 
     def jordan_wigner(self, h1e, v):
         """
@@ -640,10 +1204,19 @@ class CASCI:
             # second-order spin penalty
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
-    def h1e_for_cas(self):
-        return h1e_for_cas(self, self.mo_coeff)
 
-    def run(self, nstates=1, mo_coeff=None, method='ci', ci0=None):
+    def run(
+        self,
+        nstates=1,
+        mo_coeff=None,
+        method='direct_ci',
+        ci0=None,
+        use_cholesky=None,
+        solvent_response=None,
+        solvent_response_eps=1.78,
+        spin_root_cushion=None,
+        spin_selection_tol=None,
+    ):
         """
         solve the full CI in the active space, more efficient than the JW solver
 
@@ -655,9 +1228,10 @@ class CASCI:
             Default is canonical MOs.
         method : TYPE, optional
             choose which solver to use.
-            'ci' is the standard CI solver.
+            'direct_ci' is the default matrix-free direct-CI backend.
+            'ci' is the standard dense CI solver.
             'jw' is the exact diagonalizaion by Jordan-Wigner transformation.
-            The default is 'ci'.
+            The default is 'direct_ci'.
 
         TODO: spin
 
@@ -672,7 +1246,19 @@ class CASCI:
         # print('------------------------------')
         # print("             CASCI              ")
         # print('------------------------------\n')
+        solvent_response_model = None
+        if solvent_response is not None:
+            solvent_response_model = str(solvent_response).lower()
+            if solvent_response_model in {"none", "false"}:
+                solvent_response_model = None
+            elif solvent_response_model not in {"lr", "lr_pcm", "lr-pcm"}:
+                raise ValueError("solvent_response must be None or 'lr_pcm'.")
+            else:
+                solvent_response_model = "lr_pcm"
+                method = "ci"
+
         self.nstates = nstates
+        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
 
         # if method == 'ci':
 
@@ -688,25 +1274,73 @@ class CASCI:
         else:
             self.mo_coeff = mo_coeff
 
-        self.mo_core = self.mo_coeff[:, :ncore]
-        self.mo_cas = self.mo_coeff[:, ncore:ncore+ncas]
+        self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
+        self._property_operator_cache = {}
 
 
         if self.binary is None:
-            mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
+            mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
         else:
             binary = self.binary
+        solve_nstates = self._spin_selected_nstates(
+            nstates,
+            binary.shape[0],
+            spin_root_cushion=spin_root_cushion,
+        )
+
+        if solvent_response_model is None and (method == 'direct_ci' or (
+            method == 'ci' and self.use_cholesky_integrals and not self.spin_purification
+        )):
+            from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
+
+            direct_solver = DirectCASCI(
+                self.mf,
+                ncas=self.ncas,
+                nelecas=self.nelecas,
+                ncore=self.ncore,
+                ms2=self.ms2,
+                multiplicity=self.multiplicity,
+                tol=getattr(self, 'tol', 0),
+                verbose=self.verbose,
+            )
+            direct_solver.spin_root_cushion = self.spin_root_cushion
+            direct_solver.spin_selection_tol = self.spin_selection_tol
+            direct_solver.binary = binary
+            direct_solver.run(
+                nstates=nstates,
+                mo_coeff=self.mo_coeff,
+                method='direct_ci',
+                ci0=ci0,
+                use_cholesky=use_cholesky,
+                spin_root_cushion=spin_root_cushion,
+                spin_selection_tol=spin_selection_tol,
+            )
+
+            self.mo_coeff = direct_solver.mo_coeff
+            self.mo_core = direct_solver.mo_core
+            self.mo_cas = direct_solver.mo_cas
+            self.binary = direct_solver.binary
+            self.e_core = direct_solver.e_core
+            self.e_tot = direct_solver.e_tot
+            self.ci = direct_solver.ci
+            self.hcore = direct_solver.hcore
+            self.eri_so = direct_solver.eri_so
+            self.h2e_cas = getattr(direct_solver, 'h2e_cas', None)
+            self.SC1 = getattr(direct_solver, 'SC1', None)
+            self.SC2 = getattr(direct_solver, 'SC2', None)
+            self.solver_backend = getattr(direct_solver, 'solver_backend', 'direct_ci_factor_conn')
+            return self
 
         # print('Number of determinants', binary.shape[0])
 
         # effective hamiltonian in the CAS
-        h1e, h2e = self.get_SO_matrix()
+        h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
 
         if self.spin_purification:
 
-            logging.info('Purify spin by energy penalty')
+            # logging.info('Purify spin by energy penalty')
 
             # if self.shift is not None:
             # H1, H2 = self.fix_spin(H1, H2, ss=ss, shift=shift)
@@ -749,21 +1383,39 @@ class CASCI:
 
 
         H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
-        E, X = eigsh(H_CI, k=nstates, which='SA')
+        self.lr_pcm_response_matrix = None
+        self.lr_pcm_response_eps = None
+        self.lr_pcm_raw_e_tot = None
+        if solvent_response_model == "lr_pcm":
+            raw_E, raw_X = self._lowest_dense_eigensystem(H_CI, max(1, nstates))
+            lr_kernel = self._lr_pcm_determinant_kernel(raw_X[:, 0], eps=solvent_response_eps)
+            H_CI = H_CI + lr_kernel
+            E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
+            self.lr_pcm_response_matrix = lr_kernel
+            self.lr_pcm_response_eps = float(solvent_response_eps)
+            self.lr_pcm_raw_e_tot = raw_E[:len(E)] + self.e_core
+        else:
+            if solve_nstates >= H_CI.shape[0]:
+                E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
+            else:
+                E, X = eigsh(H_CI, k=solve_nstates, which='SA')
 
-        sort_idx = np.argsort(E)
-        E = E[sort_idx]
-        X = X[:, sort_idx]
-        # print('E = ', E)
+        E, X = self._apply_multiplicity_selection(
+            E,
+            X,
+            nstates,
+            spin_selection_tol=spin_selection_tol,
+        )
 
 
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
         self.ci = [X[:, n] for n in range(nstates)]
 
-        for i in range(nstates):
-            ss = spin_square(*self.make_rdm12(i))
-            print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
+        if self.verbose >= 1:
+            for i in range(nstates):
+                ss = spin_square(*self.make_rdm12(i))
+                print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
         return self
 
@@ -795,24 +1447,37 @@ class CASCI:
 
         ci = self.ci[state_id]
         if representation.lower() == 'ao':
-            C = self.mf.mo_coeff
-            h1e = ao2mo(h1e, C)
+            h1e = _transform_1e_operator_ao_to_mo(h1e, self.mf.mo_coeff)
 
         ncore = self.ncore
         ncas = self.ncas
 
+        h1a, h1b = _normalize_spin_1e_operator(h1e)
         if ncore > 0:
-            c_core = 2 * np.trace(h1e[:ncore,:ncore])
+            c_core = np.trace(h1a[:ncore, :ncore]) + np.trace(h1b[:ncore, :ncore])
         else:
             c_core = 0
 
-        h1e = h1e[ncore:ncas+ncore, ncore:ncas+ncore]
+        h1e = (
+            h1a[ncore:ncas+ncore, ncore:ncas+ncore],
+            h1b[ncore:ncas+ncore, ncore:ncas+ncore],
+        )
 
         c_cas = contract_with_rdm1(ci, self.binary, self.SC1, h1e=h1e)
 
         return c_core + c_cas
 
-    def make_rdm1(self, state_id, with_core=False, with_vir=False, representation='mo'):
+    def contract_with_rdm1(self, state_id, h1e=None, representation='ao'):
+        return self.make_rdm1_contract(state_id, h1e=h1e, representation=representation)
+
+    def make_rdm1(
+        self,
+        state_id,
+        with_core=False,
+        with_vir=False,
+        representation='mo',
+        repr=None,
+    ):
         """
         spin-traced 1e reduced density matrix
         .. math::
@@ -831,7 +1496,6 @@ class CASCI:
         """
 
         ci = self.ci[state_id]
-        # print('rdm1 ci dtype', ci.dtype)
         # if representation.lower() == 'ao':
         #     C = self.mf.mo_coeff
         #     h1e = ao2mo(h1e, C)
@@ -844,30 +1508,45 @@ class CASCI:
         #     c_core = 2 * np.trace(h1e[:ncore,:ncore])
         # else:
         #     c_core = 0
+        if repr is not None:
+            representation = repr
+        representation = str(representation).lower()
+        if representation not in ("mo", "ao"):
+            raise ValueError("representation must be 'mo' or 'ao'.")
+
         if with_core and not with_vir:
-            # print('casci rdm1')
 
             norb = ncas + ncore
-            D = np.zeros((norb, norb), dtype=self.dtype)
+            D = np.zeros((norb, norb), dtype=float)
 
             if ncore > 0: 
                 for i in range(ncore): 
                     D[i, i] = 2
             D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
 
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, :norb]
+                return C @ D @ C.conj().T
             return D
 
         if with_core and with_vir:
 
-            D = np.zeros((nmo, nmo), dtype=self.dtype)
+            D = np.zeros((nmo, nmo), dtype=float)
             if ncore > 0: 
                 for i in range(ncore): 
                     D[i, i] = 2
             D[ncore:ncore+ncas, ncore:ncore+ncas] = make_rdm1(ci, self.binary, self.SC1)
 
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)
+                return C @ D @ C.conj().T
             return D
         else:
-            return make_rdm1(ci, self.binary, self.SC1)
+            D = make_rdm1(ci, self.binary, self.SC1)
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, ncore:ncore+ncas]
+                return C @ D @ C.conj().T
+            return D
 
 
     def make_rdm1s(self, state_id):
@@ -884,7 +1563,8 @@ class CASCI:
 
         """
 
-        raise NotImplementedError()
+        ci = self.ci[state_id]
+        return make_rdm1s(ci, self.binary, self.SC1)
 
     def make_rdm2(self, state_id=0, with_core=False, with_vir=False):
         """
@@ -914,7 +1594,7 @@ class CASCI:
             # nmo = self.mf.nmo
             nmo = ncore + ncas
 
-            D = np.zeros((nmo, nmo, nmo, nmo), dtype=self.dtype)
+            D = np.zeros((nmo, nmo, nmo, nmo))
 
             assert ncore > 0
 
@@ -996,32 +1676,145 @@ class CASCI:
         """
 
         if bra_id == ket_id:
+            return self.contract_with_rdm1(bra_id, h1e=h1e, representation=representation)
 
-            print("CI ket and bra are the same. Computing 1e RDM instead.")
-            return self.make_rdm1(ket_id, h1e)
+        if representation.lower() == 'ao':
+            h1e = _transform_1e_operator_ao_to_mo(h1e, self.mf.mo_coeff)
 
+        h1a, h1b = _normalize_spin_1e_operator(h1e)
+        ncore = self.ncore
+        ncas = self.ncas
+
+        if ncore > 0:
+            state_overlap = np.vdot(self.ci[bra_id], self.ci[ket_id])
+            c_core = (
+                np.trace(h1a[:ncore, :ncore])
+                + np.trace(h1b[:ncore, :ncore])
+            ) * state_overlap
         else:
+            c_core = 0
 
-            if representation.lower() == 'ao':
-                C = self.mf.mo_coeff
-                h1e = ao2mo(h1e, C)
-
-            ncore = self.ncore
-            ncas = self.ncas
-
-            if ncore > 0:
-                c_core = 2 * np.trace(h1e[:ncore,:ncore])
-            else:
-                c_core = 0
-
-            h1e = h1e[ncore:ncas+ncore, ncore:ncas+ncore]
-
-
-            c_cas = make_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e)
+        h1e_cas = (
+            h1a[ncore:ncas+ncore, ncore:ncas+ncore],
+            h1b[ncore:ncas+ncore, ncore:ncas+ncore],
+        )
+        c_cas = contract_with_tdm1(self.ci[bra_id], self.ci[ket_id], self.binary, self.SC1, h1e_cas)
 
         return c_cas + c_core
 
-    def make_tdm1(self, bra_id, ket_id=0):
+    def _electric_dipole_ao(self, center=None):
+        if hasattr(self.mf, "dipole"):
+            op = self.mf.dipole(center=center, basis="ao")
+        else:
+            if center is None:
+                center = self.mol.center_of_mass()
+            op = -np.asarray(
+                self.mol.moment_integral(center=np.asarray(center, dtype=float)),
+                dtype=float,
+            )
+        op = np.asarray(op)
+        if op.ndim != 3:
+            raise ValueError("Dipole operator must be a rank-3 array.")
+        if op.shape[0] != 3:
+            if op.shape[-1] == 3:
+                op = np.moveaxis(op, -1, 0)
+            else:
+                raise ValueError("Dipole operator must have shape (3, nao, nao) or (nao, nao, 3).")
+        return op
+
+    def _electric_dipole_mo(self, center=None):
+        if center is None:
+            center_key = None
+        else:
+            center_key = tuple(np.asarray(center, dtype=float).ravel())
+        cache_key = ("electric_dipole_mo", center_key, id(self.mo_coeff))
+        cache = getattr(self, "_property_operator_cache", None)
+        if cache is None:
+            cache = self._property_operator_cache = {}
+        if cache_key in cache:
+            return cache[cache_key]
+
+        dipole_ao = self._electric_dipole_ao(center=center)
+        transformed = [
+            _transform_1e_operator_ao_to_mo(dipole_ao[xyz], self.mo_coeff)
+            for xyz in range(3)
+        ]
+        if _is_uhf_reference(self.mo_coeff):
+            dipole_mo = (
+                np.asarray([op[0] for op in transformed]),
+                np.asarray([op[1] for op in transformed]),
+            )
+        else:
+            dipole_mo = np.asarray(transformed)
+        cache[cache_key] = dipole_mo
+        return dipole_mo
+
+    def transition_dipole_moment(self, bra_id=None, ket_id=0, center=None, state_ids=None):
+        """
+        Electronic transition dipole moments between CASCI roots.
+
+        The operator is the electronic dipole ``mu = -r``. If ``bra_id`` is
+        omitted, moments from ``ket_id`` to all other computed roots are
+        returned with shape ``(nroots - 1, 3)``. Supplying ``bra_id`` returns a
+        single ``(3,)`` vector.
+        """
+        if self.ci is None:
+            raise ValueError("Run CASCI before requesting transition dipoles.")
+        if bra_id is not None and state_ids is not None:
+            raise ValueError("Specify either bra_id or state_ids, not both.")
+
+        dipole_mo = self._electric_dipole_mo(center=center)
+        if isinstance(dipole_mo, tuple):
+            dipole_a, dipole_b = dipole_mo
+        else:
+            dipole_a = dipole_mo
+            dipole_b = dipole_a
+
+        ncore = int(self.ncore)
+        ncas = int(self.ncas)
+        active = slice(ncore, ncore + ncas)
+
+        def contract_one(bra):
+            bra = int(bra)
+            ket = int(ket_id)
+            tdm1a, tdm1b = make_tdm1s(
+                self.ci[bra],
+                self.ci[ket],
+                self.binary,
+                self.SC1,
+            )
+            value = (
+                np.einsum("xpq,pq->x", dipole_a[:, active, active], tdm1a, optimize=True)
+                + np.einsum("xpq,pq->x", dipole_b[:, active, active], tdm1b, optimize=True)
+            )
+            if ncore > 0:
+                core_trace = (
+                    np.trace(dipole_a[:, :ncore, :ncore], axis1=1, axis2=2)
+                    + np.trace(dipole_b[:, :ncore, :ncore], axis1=1, axis2=2)
+                )
+                value = value + core_trace * np.vdot(self.ci[bra], self.ci[ket])
+            return value
+
+        if bra_id is not None:
+            return contract_one(bra_id)
+
+        if state_ids is None:
+            state_ids = [idx for idx in range(len(self.ci)) if idx != int(ket_id)]
+        return np.asarray([contract_one(idx) for idx in state_ids])
+
+    def transition_dipole(self, *args, **kwargs):
+        """Alias for :meth:`transition_dipole_moment`."""
+        return self.transition_dipole_moment(*args, **kwargs)
+
+    def make_tdm1(
+        self,
+        bra_id,
+        ket_id=0,
+        representation='mo',
+        repr=None,
+        with_core=False,
+        with_vir=False,
+    ):
         """
         TDM
 
@@ -1037,201 +1830,227 @@ class CASCI:
         None.
 
         """
+        if repr is not None:
+            representation = repr
+        representation = str(representation).lower()
+        if representation not in ("mo", "ao"):
+            raise ValueError("representation must be 'mo' or 'ao'.")
+
+        if bra_id == ket_id:
+            return self.make_rdm1(
+                bra_id,
+                with_core=with_core,
+                with_vir=with_vir,
+                representation=representation,
+            )
+
+        cibra = self.ci[bra_id]
+        ciket = self.ci[ket_id]
+        D_active = make_tdm1(cibra, ciket, self.binary, self.SC1)
+
+        if not with_core and not with_vir:
+            if representation == "ao":
+                C = np.asarray(self.mf.mo_coeff)[:, self.ncore:self.ncore + self.ncas]
+                return C @ D_active @ C.conj().T
+            return D_active
+
+        ncore = self.ncore
+        ncas = self.ncas
+        nmo = self.mf.nmo if with_vir else ncore + ncas
+        D = np.zeros((nmo, nmo), dtype=np.result_type(D_active, complex))
+        D[ncore:ncore + ncas, ncore:ncore + ncas] = D_active
+
+        if representation == "ao":
+            C = np.asarray(self.mf.mo_coeff)[:, :nmo]
+            return C @ D @ C.conj().T
+        return D
+
+    def vibronic_couplings(
+        self,
+        state_ids=None,
+        modes=None,
+        return_terms=False,
+    ):
+        """
+        First- and second-order electronic Hamiltonian derivatives.
+
+        Parameters
+        ----------
+        state_ids : sequence of int, optional
+            Electronic states to include. If omitted, all available CASCI roots
+            are used.
+        modes : ndarray, optional
+            Normal-mode or other collective-coordinate vectors with shape
+            ``(nmodes, natom, 3)``, ``(nmodes, 3*natom)``, or
+            ``(3*natom, nmodes)``.
+        return_terms : bool, optional
+            If true, also return the underlying ``BOHamiltonianDerivatives``
+            object.
+
+        Returns
+        -------
+        F, G : ndarray
+            If ``modes`` is provided, the shapes are
+            ``(nstates, nstates, nmodes)`` and
+            ``(nstates, nstates, nmodes, nmodes)``.  Otherwise, Cartesian
+            derivatives are returned with shapes ``(nstates, nstates, natom, 3)``
+            and ``(nstates, nstates, natom, 3, natom, 3)``.
+        """
+        from pyqed.qchem.geometric import bo_hamiltonian_derivatives
+
+        terms = bo_hamiltonian_derivatives(
+            self,
+            state_ids=state_ids,
+            mode_vectors=modes,
+        )
+        if modes is not None:
+            f = np.moveaxis(terms.F_projected, 0, -1)
+            g = np.moveaxis(terms.G_projected, (0, 1), (-2, -1))
+        else:
+            natom = self.mol.natom
+            f_cart = terms.F_cartesian.reshape(
+                natom,
+                3,
+                *terms.F_cartesian.shape[1:],
+            )
+            f = np.moveaxis(f_cart, (0, 1), (-2, -1))
+            g_cart = terms.G_cartesian.reshape(
+                natom,
+                3,
+                natom,
+                3,
+                *terms.G_cartesian.shape[2:],
+            )
+            g = np.moveaxis(g_cart, (0, 1, 2, 3), (-4, -3, -2, -1))
+        if return_terms:
+            return f, g, terms
+        return f, g
+
+    def make_tdm1s(self, bra_id, ket_id=0):
+        """
+        Spin-resolved one-particle transition density matrices in MO basis.
+        """
         cibra = self.ci[bra_id]
         ciket = self.ci[ket_id]
 
-        return make_tdm1(cibra, ciket, self.binary, self.SC1)
+        return make_tdm1s(cibra, ciket, self.binary, self.SC1)
 
-    # def make_tdm1_tmp(self, bra_id, ket_id=0, with_core=False, with_vir=False):
-    #     """
-    #     TDM
+    def make_tdm1_spin_orbital(self, bra_id, ket_id=0, other=None, order='grouped'):
+        """
+        One-particle transition density matrix in a full spin-orbital basis.
 
-    #     Parameters
-    #     ----------
-    #     bra_id : TYPE
-    #         DESCRIPTION.
-    #     ket_id : TYPE, optional
-    #         DESCRIPTION. The default is 0.
+        Parameters
+        ----------
+        bra_id : int
+            Bra-state index on ``self``.
+        ket_id : int, optional
+            Ket-state index on ``other``. Defaults to ``0``.
+        other : CASCI, optional
+            Ket-side CASCI object. Defaults to ``self``.
+        order : {'grouped', 'interleaved'}
+            Spin-orbital ordering of the returned matrix.
+        """
+        if other is None:
+            other = self
+        _validate_matching_active_spaces(self, other)
+        return make_tdm1_spin_orbital(
+            self.ci[bra_id],
+            other.ci[ket_id],
+            self.binary,
+            other.binary,
+            order=order,
+        )
 
-    #     Returns
-    #     -------
-    #     None.
+    def contract_with_tdm1_spin_orbital(self, bra_id, ket_id=0, h1e=None, other=None,
+                                        order='grouped'):
+        """
+        Contract a spin-orbital one-body operator with a CASCI transition density.
 
-    #     """
-    #     cibra = self.ci[bra_id]
-    #     ciket = self.ci[ket_id]
-    #     ncore = self.ncore
-    #     ncas = self.ncas
-    #     nmo = self.mf.nmo
+        Parameters
+        ----------
+        bra_id : int
+            Bra-state index on ``self``.
+        ket_id : int, optional
+            Ket-state index on ``other``. Defaults to ``0``.
+        h1e : ndarray
+            One-body operator in the active spin-orbital basis.
+        other : CASCI, optional
+            Ket-side CASCI object. Defaults to ``self``.
+        order : {'grouped', 'interleaved'}
+            Ordering shared by ``h1e`` and the returned TDM.
+        """
+        if h1e is None:
+            raise ValueError("h1e is required for spin-orbital contractions.")
+        tdm = self.make_tdm1_spin_orbital(bra_id, ket_id=ket_id, other=other, order=order)
+        h1e = np.asarray(h1e)
+        if h1e.shape != tdm.shape:
+            raise ValueError(
+                f"h1e shape {h1e.shape} is incompatible with spin-orbital TDM shape {tdm.shape}."
+            )
+        return np.einsum('uv,uv->', h1e, tdm, optimize=True)
 
-    #     # if ncore > 0:
-    #     #     c_core = 2 * np.trace(h1e[:ncore,:ncore])
-    #     # else:
-    #     #     c_core = 0
-    #     if with_core and not with_vir:
+    def soc_matrix_element(self, bra_id, ket_id=0, other=None, hso=None,
+                           one_center=True, with_prefactor=True,
+                           light_speed=None, order='grouped',
+                           soc_model='1e', dm=None, states=None):
+        """
+        SOC matrix element between CASCI states.
 
-    #         norb = ncas + ncore
-    #         D = np.zeros((norb, norb), dtype=float)
-
-    #         if ncore > 0: 
-    #             # for i in range(ncore): 
-    #             #     D[i, i] = 2
-    #             if bra_id == ket_id:
-    #                 D = self.make_rdm1(bra_id, with_core)
-    #             else:
-    #                 D[ncore:ncore+ncas, ncore:ncore+ncas] = make_tdm1(cibra, ciket, self.binary, self.SC1)
-
-    #         return D
-
-    #     if with_core and with_vir:
-
-    #         D = np.zeros((nmo, nmo), dtype=float)
-    #         if ncore > 0: 
-    #             for i in range(ncore): 
-    #                 D[i, i] = 2
-    #         D[ncore:ncore+ncas, ncore:ncore+ncas] = make_tdm1(cibra, ciket, self.binary, self.SC1)
-
-    #         return D
-    #     else:
-    #         return make_tdm1(cibra, ciket, self.binary, self.SC1)
+        If ``hso`` is not provided, the active-space SOC operator is built from
+        the current active orbitals.
+        """
+        if other is None:
+            other = self
+        _validate_matching_active_spaces(self, other)
+        if hso is None:
+            model = soc_model.lower()
+            if model == '1e':
+                hso = get_soc_1e_spin_orbital(
+                    self.mf,
+                    representation='mo',
+                    mo_coeff=self.mo_cas,
+                    one_center=one_center,
+                    with_prefactor=with_prefactor,
+                    light_speed=light_speed,
+                    order=order,
+                )
+            elif model == 'somf':
+                hso = get_soc_somf_spin_orbital(
+                    self.mf,
+                    representation='mo',
+                    mo_coeff=self.mo_cas,
+                    dm=dm,
+                    states=states,
+                    one_center=one_center,
+                    with_prefactor=with_prefactor,
+                    light_speed=light_speed,
+                    order=order,
+                )
+            else:
+                raise ValueError("soc_model must be '1e' or 'somf'.")
+        return self.contract_with_tdm1_spin_orbital(
+            bra_id,
+            ket_id=ket_id,
+            h1e=hso,
+            other=other,
+            order=order,
+        )
 
     def make_tdm2(self, bra_id, ket_id=0):
         """
-        spin-traced 1e transition density matrix in MO
+        Spin-traced two-particle transition density matrix in MO basis.
 
         .. math::
 
-            \gamma_{pq}^{\beta \alpha} = <\Psi_\beta | \hat{E}_{qp} | \Psi_\alpha >
-
-        E_{qp} = q_alpha^\dagger p_alpha + q_beta^\dagger p_beta
+            \Gamma_{pqrs}^{\beta \alpha}
+            = \sum_{\sigma\tau}<\Psi_\beta|
+              p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
+              |\Psi_\alpha>
         """
-        raise NotImplementedError('TDM not implemented')
+        cibra = self.ci[bra_id]
+        ciket = self.ci[ket_id]
+        return make_tdm2(cibra, ciket, self.binary, self.SC1, self.SC2)
 
-    def get_electric_dip(self, initial_state, final_state, unit, **kwargs):
-
-
-        tdm1 = self.make_tdm1(final_state, initial_state)
-        # print('tdm',tdm1)
-        # tdm1 = self.make_tdm1(final_state, initial_state)
-
-        mo_coeff = self.mo_coeff[:, self.ncore:self.ncas + self.ncore]
-
-
-
-        dip = electric_dipole(self.mol, tdm1, mo_coeff, unit)
-
-        self.electric_dipole = dip
-        print('initial state : {}; final state {}; transitoion electric dipole : {} {}'.format(initial_state, final_state, dip, unit))
-
-
-
-        # D = 2*np.eye(self.ncore)
-        # print(D)
-        # print('*'*100)
-        # orbcas = self.mo_coeff[:, 0:self.ncore]
-        # t_dm1_ao = reduce(np.dot, (orbcas, D, orbcas.T))
-        # ao_dip = mol2.ao_dip
-        # print("$$$", np.einsum('xij,ji->x', ao_dip, t_dm1_ao))
-
-        return dip
-
-    def get_magnetic_dip(self, initial_state, final_state, **kwargs):
-
-        tdm1 = self.make_tdm1(final_state, initial_state)
-        mo_coeff = self.mo_coeff[:, self.ncore:self.ncas + self.ncore]
-        mag_dip = orbital_magnetic_dipole(self.mol, tdm1, mo_coeff)
-
-        self.magnetic_dipole = mag_dip
-        print('initial state : {}; final state {}; transitoion magnetic dipole : {}'.format(initial_state, final_state, mag_dip))
-        return mag_dip
-
-def electric_dipole(mol, tdm1, mo_coeff, unit='Debye', **kwargs):
-
-    # from pyscf.gto.moleintor import getints
-    """dipole moment calculation
-
-    math:
-        x^hat = \sum_{p,q} x_{p,q} a_p^dagger a_q
-        y^hat = \sum_{p,q}yx_{p,q} a_p^dagger a_q
-        z^hat = \sum_{p,q} z_{p,q} a_p^dagger a_q
-
-        dip_x = -\sum_{p,q} x_{p,q} dm1_pq + \sum_A Q_A X_A
-        dip_y = -\sum_{p,q} y_{p,q} dm1_pq + \sum_A Q_A Y_A
-        dip_z = -\sum_{p,q} z_{p,q} dm1_pq + \sum_A Q_A Z_A
-        
-    Parameters
-    ----------
-    mol : _type_
-        _description_
-    tdm1 : _type_
-        one body transition density matrix 
-    ao_dip : _type_
-        x_{p,q}
-    """    
-
-    # charges = mol.atom_charges()
-    # coords = mol.atom_coords()
-
-
-    # print('tdm', tdm1)
-    # print('coeff',mo_coeff)
-    
-    # nuc_charge_center = np.einsum('z,zx->x', charges, coords) / charges.sum()
-    # mol.build
-
-    
-    ao_dip = mol.ao_dip
-    # ao_dip = getints('int1e_r', atm= , bas= , comp=3, env=nuc_charge_center)
-    # print('ao_dip', ao_dip)
-    # print('ao_dip shape', np.shape(ao_dip))
-    mo_dip = np.einsum('ik, xkl, lj -> xij', mo_coeff.T, ao_dip, mo_coeff)
-    # print('mo_dip shape', np.shape(mo_dip))
-
-    el_dip = np.einsum('xji, ij -> x', mo_dip, tdm1).real
-
-    # nucl_dip = np.einsum('i, ix -> x', charges, coords)
-    # nucl_dip = 0
-    # mol_dip = nucl_dip - el_dip
-
-
-
-
-    if unit == 'Debye':
-        el_dip *= 2.541746231
-        logging.info('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *el_dip)
-        # print('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *mol_dip)
-    else:
-        logging.info('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *el_dip)
-        # print('Dipole moment(X, Y, Z, a.u.): %8.5f, %8.5f, %8.5f', *mol_dip)
-    
-    return el_dip
-
-def magnetic_dipole():
-
-    pass
-
-def spin_magnetic_dipole():
-    """spin magnetic dipole calculation
-
-    math:
-
-    """    
-    pass
-
-def orbital_magnetic_dipole(mol, tdm1, mo_coeff, **kwargs):
-    """orbital magnetic dipole calculation
-
-    math:
-        mu = - e / 2m * L
-        L = r × p
-        magnetic_dip = -0.5 * \sum_{i,j} (r × p)_{i,j} dm1_{i,j}
-    """    
-    ao_mag_dip = mol.ao_magnetic_dip
-    mo_mag_dip = np.einsum('ik, xkl, lj -> xij', mo_coeff.T, ao_mag_dip, mo_coeff)
-    mol_mag_dip = -0.5 * np.einsum('xji, ij -> x', mo_mag_dip, tdm1).real
-    logging.info('magnetic dipole moment(X, Y, Z): %8.5f, %8.5f, %8.5f', *mol_mag_dip)
-    
-    return mo_mag_dip
 
 # def get_SO_matrix(mo_coeff, eri, spin_flip=False, H1=None, H2=None):
 #     """
@@ -1399,8 +2218,7 @@ def contract_with_tdm1(cibra, ciket, binary, SC1, h1e):
     HCI: CI Hamiltonian
     """
 
-    if isinstance(h1e, np.ndarray): # spin-independent 1e operator
-        h1e = [h1e, h1e]
+    h1e = _normalize_spin_1e_operator(h1e)
 
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
 
@@ -1443,8 +2261,7 @@ def contract_with_rdm1(ci, binary, SC1, h1e):
     HCI: CI Hamiltonian
     """
 
-    if isinstance(h1e, np.ndarray): # spin-independent 1e operator
-        h1e = [h1e, h1e]
+    h1e = _normalize_spin_1e_operator(h1e)
 
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
 
@@ -1459,6 +2276,31 @@ def contract_with_rdm1(ci, binary, SC1, h1e):
 
 
     return np.einsum('I, IJ, J -> ', ci.conj(), H, ci)
+
+def _build_spin_rdm1_operators(binary, SC1):
+    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
+
+    nsd, _, nmo = binary.shape
+    H_a = np.zeros((nsd, nsd, nmo, nmo))
+    H_b = np.zeros((nsd, nsd, nmo, nmo))
+
+    for I in range(nsd):
+        for p in range(nmo):
+            H_a[I, I, p, p] = binary[I, 0, p]
+            H_b[I, I, p, p] = binary[I, 1, p]
+
+    H_a[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
+    H_b[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
+
+    return H_a, H_b
+
+
+def make_rdm1s(ci, binary, SC1):
+    """
+    Make spin-resolved 1e RDMs in MO basis.
+    """
+    return _make_tdm1s_link_contractions(ci, ci, binary)
+
 
 def make_rdm1(ci, binary, SC1):
     """
@@ -1488,29 +2330,15 @@ def make_rdm1(ci, binary, SC1):
     ======
     HCI: CI Hamiltonian
     """
+    dm1a, dm1b = make_rdm1s(ci, binary, SC1)
+    return dm1a + dm1b
 
 
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', ci.conj(), H, ci).T
+def make_tdm1s(cibra, ciket, binary, SC1):
+    """
+    Make spin-resolved 1e TDMs in MO basis.
+    """
+    return _make_tdm1s_link_contractions(cibra, ciket, binary)
 
 def make_tdm1(cibra, ciket, binary, SC1):
     """
@@ -1540,29 +2368,8 @@ def make_tdm1(cibra, ciket, binary, SC1):
     ======
     HCI: CI Hamiltonian
     """
-
-
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-
-
-    # sum of MO energies
-    # H = np.einsum("ISp -> Ip", binary, optimize=True)
-    # H = binary[:, 0, :] + binary[:, 1, :]
-
-    # H = np.diag(H)
-
-    nsd, _, nmo = binary.shape
-    H = np.zeros((nsd, nsd, nmo, nmo))
-    for I in range(nsd):
-        for p in range(nmo):
-            H[I, I, p, p] = sum(binary[I, :, p])
-
-    ## Rule 1
-    H[I_A, J_A] -= np.einsum("Kp, Kq -> Kpq", a_t, a, optimize=True)
-    H[I_B, J_B] -= np.einsum("Kp, Kq -> Kpq", b_t, b, optimize=True)
-
-
-    return np.einsum('I, IJpq, J -> pq', cibra.conj(), H, ciket)
+    tdm1a, tdm1b = make_tdm1s(cibra, ciket, binary, SC1)
+    return tdm1a + tdm1b
 
 
 
@@ -1604,6 +2411,399 @@ def contract_with_rdm2(ci, H2, Binary, SC1, SC2):
 
     return np.einsum('I, IJ, J -> ', ci.conj(), H_CI, ci)
 
+def _annihilate_bit(bits, idx):
+    if not ((bits >> idx) & 1):
+        return None, 0
+    phase = -1 if (bits & ((1 << idx) - 1)).bit_count() % 2 else 1
+    return bits ^ (1 << idx), phase
+
+
+def _create_bit(bits, idx):
+    if (bits >> idx) & 1:
+        return None, 0
+    phase = -1 if (bits & ((1 << idx) - 1)).bit_count() % 2 else 1
+    return bits | (1 << idx), phase
+
+
+def _determinant_bits_from_binary(binary):
+    """Encode PyQED alpha/beta occupation strings as ordered spin-orbitals."""
+    bits = []
+    _, _, nmo = binary.shape
+    for occ in binary:
+        det_bits = 0
+        for spin in range(2):
+            for orb in range(nmo):
+                if occ[spin, orb]:
+                    det_bits |= 1 << (spin * nmo + orb)
+        bits.append(det_bits)
+    return bits
+
+
+def _spin_string_bits(strings):
+    bits = []
+    for occ in strings:
+        det_bits = 0
+        for orb, occupied in enumerate(occ):
+            if occupied:
+                det_bits |= 1 << orb
+        bits.append(det_bits)
+    return bits
+
+
+def _unique_spin_strings_from_binary(binary, spin):
+    strings = []
+    seen = set()
+    for occ in binary[:, spin, :]:
+        key = tuple(int(x) for x in occ)
+        if key not in seen:
+            seen.add(key)
+            strings.append(key)
+    return np.asarray(strings, dtype=np.int8)
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_basis(shape, data):
+    binary = np.frombuffer(data, dtype=np.int8).reshape(shape)
+    alpha = _unique_spin_strings_from_binary(binary, 0)
+    beta = _unique_spin_strings_from_binary(binary, 1)
+    alpha_index = {tuple(row): idx for idx, row in enumerate(alpha)}
+    beta_index = {tuple(row): idx for idx, row in enumerate(beta)}
+    alpha_det = np.empty(shape[0], dtype=np.int64)
+    beta_det = np.empty(shape[0], dtype=np.int64)
+
+    for det_id, occ in enumerate(binary):
+        alpha_det[det_id] = alpha_index[tuple(int(x) for x in occ[0])]
+        beta_det[det_id] = beta_index[tuple(int(x) for x in occ[1])]
+
+    return alpha, beta, alpha_det, beta_det
+
+
+def _ci_to_spin_string_matrix(ci, binary):
+    alpha, beta, alpha_det, beta_det = _cached_spin_string_basis(
+        tuple(binary.shape),
+        np.ascontiguousarray(binary, dtype=np.int8).tobytes(),
+    )
+    coeff = np.zeros((len(alpha), len(beta)), dtype=np.asarray(ci).dtype)
+    coeff[alpha_det, beta_det] = ci
+
+    return alpha, beta, coeff
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_ops(bit_tuple, nmo):
+    bits = list(bit_tuple)
+    nstr = len(bits)
+    bit_index = {bits_i: idx for idx, bits_i in enumerate(bits)}
+
+    one = np.zeros((nmo, nmo, nstr, nstr))
+    two = np.zeros((nmo, nmo, nmo, nmo, nstr, nstr))
+
+    for ket, bits0 in enumerate(bits):
+        for q in range(nmo):
+            bits1, phase1 = _annihilate_bit(bits0, q)
+            if phase1 == 0:
+                continue
+            for p in range(nmo):
+                bits2, phase2 = _create_bit(bits1, p)
+                if phase2 == 0:
+                    continue
+                bra = bit_index.get(bits2)
+                if bra is not None:
+                    one[p, q, bra, ket] += phase1 * phase2
+
+            for s in range(nmo):
+                bits2, phase2 = _annihilate_bit(bits1, s)
+                if phase2 == 0:
+                    continue
+                phase12 = phase1 * phase2
+                for r in range(nmo):
+                    bits3, phase3 = _create_bit(bits2, r)
+                    if phase3 == 0:
+                        continue
+                    phase123 = phase12 * phase3
+                    for p in range(nmo):
+                        bits4, phase4 = _create_bit(bits3, p)
+                        if phase4 == 0:
+                            continue
+                        bra = bit_index.get(bits4)
+                        if bra is not None:
+                            two[p, q, r, s, bra, ket] += phase123 * phase4
+
+    return one, two
+
+
+def _spin_string_ops(strings):
+    _, nmo = strings.shape
+    bits = tuple(_spin_string_bits(strings))
+    return _cached_spin_string_ops(bits, nmo)
+
+
+@lru_cache(maxsize=16)
+def _cached_spin_string_links(bit_tuple, nmo):
+    bits = list(bit_tuple)
+    bit_index = {bits_i: idx for idx, bits_i in enumerate(bits)}
+    one_links = []
+    two_links = []
+
+    for ket, bits0 in enumerate(bits):
+        for q in range(nmo):
+            bits1, phase1 = _annihilate_bit(bits0, q)
+            if phase1 == 0:
+                continue
+            for p in range(nmo):
+                bits2, phase2 = _create_bit(bits1, p)
+                if phase2 == 0:
+                    continue
+                bra = bit_index.get(bits2)
+                if bra is not None:
+                    one_links.append((p, q, bra, ket, phase1 * phase2))
+
+            for s in range(nmo):
+                bits2, phase2 = _annihilate_bit(bits1, s)
+                if phase2 == 0:
+                    continue
+                phase12 = phase1 * phase2
+                for r in range(nmo):
+                    bits3, phase3 = _create_bit(bits2, r)
+                    if phase3 == 0:
+                        continue
+                    phase123 = phase12 * phase3
+                    for p in range(nmo):
+                        bits4, phase4 = _create_bit(bits3, p)
+                        if phase4 == 0:
+                            continue
+                        bra = bit_index.get(bits4)
+                        if bra is not None:
+                            two_links.append((p, q, r, s, bra, ket, phase123 * phase4))
+
+    if one_links:
+        one = tuple(np.asarray(col, dtype=np.int64) for col in zip(*one_links))
+    else:
+        one = tuple(np.asarray([], dtype=np.int64) for _ in range(5))
+    if two_links:
+        two = tuple(np.asarray(col, dtype=np.int64) for col in zip(*two_links))
+    else:
+        two = tuple(np.asarray([], dtype=np.int64) for _ in range(7))
+    return one, two
+
+
+def _spin_string_links(strings):
+    _, nmo = strings.shape
+    bits = tuple(_spin_string_bits(strings))
+    return _cached_spin_string_links(bits, nmo)
+
+
+@njit
+def _scatter_same_spin_rdm2_numba(dm2, p, q, r, s, bra, ket, phase, overlap):
+    for link in range(p.shape[0]):
+        dm2[p[link], q[link], r[link], s[link]] += (
+            phase[link] * overlap[bra[link], ket[link]]
+        )
+
+
+@njit
+def _scatter_spin_rdm1_numba(dm1, p, q, bra, ket, phase, overlap):
+    for link in range(p.shape[0]):
+        dm1[p[link], q[link]] += phase[link] * overlap[bra[link], ket[link]]
+
+
+@njit
+def _scatter_opposite_spin_rdm2_numba(
+    dm2,
+    pa,
+    qa,
+    bra_a,
+    ket_a,
+    phase_a,
+    rb,
+    sb,
+    bra_b,
+    ket_b,
+    phase_b,
+    cbra,
+    cket,
+):
+    for la in range(pa.shape[0]):
+        for lb in range(rb.shape[0]):
+            dm2[pa[la], qa[la], rb[lb], sb[lb]] += (
+                phase_a[la]
+                * phase_b[lb]
+                * cbra[bra_a[la], bra_b[lb]]
+                * cket[ket_a[la], ket_b[lb]]
+            )
+
+
+def _scatter_same_spin_rdm2(dm2, links, overlap):
+    p, q, r, s, bra, ket, phase = links
+    if len(p) == 0:
+        return
+    _scatter_same_spin_rdm2_numba(dm2, p, q, r, s, bra, ket, phase, overlap)
+
+
+def _scatter_spin_rdm1(dm1, links, overlap):
+    p, q, bra, ket, phase = links
+    if len(p) == 0:
+        return
+    _scatter_spin_rdm1_numba(dm1, p, q, bra, ket, phase, overlap)
+
+
+def _scatter_opposite_spin_rdm2(dm2, alpha_links, beta_links, cbra, cket):
+    pa, qa, bra_a, ket_a, phase_a = alpha_links
+    rb, sb, bra_b, ket_b, phase_b = beta_links
+    if len(pa) == 0 or len(rb) == 0:
+        return
+    _scatter_opposite_spin_rdm2_numba(
+        dm2,
+        pa,
+        qa,
+        bra_a,
+        ket_a,
+        phase_a,
+        rb,
+        sb,
+        bra_b,
+        ket_b,
+        phase_b,
+        cbra,
+        cket,
+    )
+
+
+def _make_tdm1s_link_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, _ = _spin_string_links(alpha_bra)
+    beta_one, _ = _spin_string_links(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    nmo = binary.shape[2]
+    dm1a = np.zeros((nmo, nmo), dtype=dtype)
+    dm1b = np.zeros((nmo, nmo), dtype=dtype)
+
+    _scatter_spin_rdm1(dm1a, alpha_one, cbra @ cket.T)
+    _scatter_spin_rdm1(dm1b, beta_one, cbra.T @ cket)
+
+    return dm1a, dm1b
+
+
+def _make_tdm2_link_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, alpha_two = _spin_string_links(alpha_bra)
+    beta_one, beta_two = _spin_string_links(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    dm2 = np.zeros((binary.shape[2],) * 4, dtype=dtype)
+
+    _scatter_same_spin_rdm2(dm2, alpha_two, cbra @ cket.T)
+    _scatter_same_spin_rdm2(dm2, beta_two, cbra.T @ cket)
+
+    _scatter_opposite_spin_rdm2(dm2, alpha_one, beta_one, cbra, cket)
+    _scatter_opposite_spin_rdm2(dm2, beta_one, alpha_one, cbra.T, cket.T)
+
+    return dm2
+
+
+def _make_tdm2_string_contractions(cibra, ciket, binary):
+    if cibra is ciket:
+        alpha_bra, beta_bra, cket = _ci_to_spin_string_matrix(ciket, binary)
+        alpha_ket, beta_ket, cbra = alpha_bra, beta_bra, cket
+    else:
+        alpha_bra, beta_bra, cbra = _ci_to_spin_string_matrix(cibra, binary)
+        alpha_ket, beta_ket, cket = _ci_to_spin_string_matrix(ciket, binary)
+
+    if not np.array_equal(alpha_bra, alpha_ket) or not np.array_equal(beta_bra, beta_ket):
+        raise ValueError("Bra and ket CI vectors must use the same determinant basis.")
+
+    alpha_one, alpha_two = _spin_string_ops(alpha_bra)
+    beta_one, beta_two = _spin_string_ops(beta_bra)
+    cbra = cbra.conj()
+    dtype = np.result_type(cbra, cket, float)
+    dm2 = np.zeros((binary.shape[2],) * 4, dtype=dtype)
+
+    # Same-spin blocks: spectator spin is contracted out first.
+    alpha_overlap = np.einsum('ai,bi->ab', cbra, cket, optimize=True)
+    beta_overlap = np.einsum('ai,aj->ij', cbra, cket, optimize=True)
+    dm2 += np.einsum('pqrsab,ab->pqrs', alpha_two, alpha_overlap, optimize=True)
+    dm2 += np.einsum('pqrsij,ij->pqrs', beta_two, beta_overlap, optimize=True)
+
+    # Opposite-spin blocks factor into alpha and beta one-body string operators.
+    alpha_projected = np.einsum('ai,pqab,bj->pqij', cbra, alpha_one, cket, optimize=True)
+    dm2 += np.einsum('pqij,rsij->pqrs', alpha_projected, beta_one, optimize=True)
+
+    beta_projected = np.einsum('ai,pqij,bj->pqab', cbra, beta_one, cket, optimize=True)
+    dm2 += np.einsum('pqab,rsab->pqrs', beta_projected, alpha_one, optimize=True)
+
+    return dm2
+
+
+def _make_tdm2_explicit(cibra, ciket, binary):
+    cibra = np.asarray(cibra)
+    ciket = np.asarray(ciket)
+    _, _, nmo = binary.shape
+    det_bits = _determinant_bits_from_binary(binary)
+    det_index = {bits: idx for idx, bits in enumerate(det_bits)}
+    dtype = np.result_type(cibra, ciket, float)
+    dm2 = np.zeros((nmo, nmo, nmo, nmo), dtype=dtype)
+
+    for ket, bits0 in enumerate(det_bits):
+        ket_coeff = ciket[ket]
+        if ket_coeff == 0:
+            continue
+
+        for sigma in range(2):
+            spin_offset_sigma = sigma * nmo
+            for tau in range(2):
+                spin_offset_tau = tau * nmo
+
+                for q in range(nmo):
+                    bits1, phase1 = _annihilate_bit(bits0, spin_offset_sigma + q)
+                    if phase1 == 0:
+                        continue
+                    for s in range(nmo):
+                        bits2, phase2 = _annihilate_bit(bits1, spin_offset_tau + s)
+                        if phase2 == 0:
+                            continue
+                        phase12 = phase1 * phase2
+
+                        for r in range(nmo):
+                            bits3, phase3 = _create_bit(bits2, spin_offset_tau + r)
+                            if phase3 == 0:
+                                continue
+                            phase123 = phase12 * phase3
+                            for p in range(nmo):
+                                bits4, phase4 = _create_bit(bits3, spin_offset_sigma + p)
+                                if phase4 == 0:
+                                    continue
+                                bra = det_index.get(bits4)
+                                if bra is None:
+                                    continue
+                                dm2[p, q, r, s] += (
+                                    cibra[bra].conj()
+                                    * ket_coeff
+                                    * phase123
+                                    * phase4
+                                )
+
+    return dm2
+
+
 def make_rdm2(ci, Binary, SC1, SC2):
     """
     build the spin-traced 2-particle operator with the 2e RDM
@@ -1611,8 +2811,6 @@ def make_rdm2(ci, Binary, SC1, SC2):
     .. math::
 
         \Gamma_{pqrs} = \sum_{\sigma, \tau} p^\dagger_\sigma r^\dagger_\tau s_\tau q_\sigma
-
-    TODO: fix it
 
     Params
     ------
@@ -1624,41 +2822,394 @@ def make_rdm2(ci, Binary, SC1, SC2):
     J. Chem. Theory Comput. 2022, 18, 6690−6699
 
     """
-    I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
-    I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
+    return _make_tdm2_link_contractions(ci, ci, Binary)
 
-    nsd, _, nmo = Binary.shape
-    I = np.eye(nmo)
 
-    H_CI = np.zeros((nsd, nsd, nmo, nmo, nmo, nmo)) # slow implementation
+def make_tdm2(cibra, ciket, Binary, SC1, SC2):
+    """
+    Build the spin-traced two-particle transition density matrix.
 
-    # diagonal elements
-    D = np.einsum("I, ISp, ITr, pq, rs -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True).astype(ci.dtype)
-    D -= np.einsum("I, ISp, ISr, ps, rq -> pqrs", np.abs(ci)**2, Binary, Binary, I, I, optimize=True)
+    The convention matches ``make_rdm2``:
 
-    ## Rule 1
-    H_CI[I_A , J_A ] = -2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs",  a_t, a, ca, I, optimize=True)
-    H_CI[I_A , J_A ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", a_t, a, Binary[I_A,1], I, optimize=True)
+    ``Gamma[p,q,r,s] = sum_{sigma,tau} <bra| p^+_sigma r^+_tau s_tau q_sigma |ket>``.
+    """
+    return _make_tdm2_link_contractions(cibra, ciket, Binary)
 
-    H_CI[I_B , J_B ] -= 2 * np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, cb, I, optimize=True)
-    H_CI[I_B , J_B ] -= np.einsum("Kp, Kq, Kr, rs -> Kpqrs", b_t, b, Binary[I_B,0], I, optimize=True)
 
-    ## Rule 2
-    if len(I_AA) > 0:
+def _compute_ci_mo_overlap(cibra, ciket, s=None):
+    if s is not None:
+        return s
 
-        H_CI[I_AA, J_AA] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", aa_t[0], aa[0],
-        aa_t[1], aa[1], optimize=True)
+    try:
+        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+    except (ImportError, AttributeError, TypeError):
+        from pyscf import gto
+        mol_bra = cibra.mol.topyscf()
+        mol_ket = ciket.mol.topyscf()
+        mol_bra.build()
+        mol_ket.build()
+        s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
+    return reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
 
-    if len(I_BB) > 0:
-        H_CI[I_BB, J_BB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", bb_t[0], bb[0],
-        bb_t[1], bb[1], optimize=True)
 
-    H_CI[I_AB, J_AB] = 2 * np.einsum("Kp, Kq, Kr, Ks -> Kpqrs", ab_t, ab, ba_t, ba,
-        optimize=True)
+def _as_state_ci_matrix(ci, ndet):
+    ci_arr = np.asarray(ci)
+    if ci_arr.ndim == 1:
+        if ci_arr.shape[0] != ndet:
+            raise ValueError(f"CI vector length {ci_arr.shape[0]} does not match ndet={ndet}.")
+        return ci_arr.reshape(1, ndet)
+    if ci_arr.ndim == 2 and ci_arr.shape[1] == ndet:
+        return ci_arr
+    raise ValueError(f"Unsupported CI coefficient shape {ci_arr.shape}; expected (*, {ndet}).")
 
-    D += contract('I, IJpqrs, J -> pqrs', ci.conj(), H_CI, ci)
 
-    return D
+def _unique_rows_first(rows):
+    rows = np.asarray(rows, dtype=np.int8)
+    if rows.shape[0] == 0:
+        return rows
+    _, first_idx = np.unique(rows, axis=0, return_index=True)
+    return rows[np.sort(first_idx)]
+
+
+def _occupation_lists(strings):
+    return [np.flatnonzero(row) for row in strings]
+
+
+def _string_overlap_matrix(saa_eff, bra_occ, ket_occ, dtype):
+    out = np.empty((len(bra_occ), len(ket_occ)), dtype=dtype)
+    for i, occ_i in enumerate(bra_occ):
+        for j, occ_j in enumerate(ket_occ):
+            out[i, j] = np.linalg.det(saa_eff[np.ix_(occ_i, occ_j)])
+    return out
+
+
+def _string_transform_matrix(orbital_transform, occ_strings, dtype):
+    """Induced determinant-space transform for an active-orbital rotation."""
+    occ_lists = _occupation_lists(occ_strings)
+    nstr = len(occ_lists)
+    out = np.empty((nstr, nstr), dtype=dtype)
+    for i, occ_i in enumerate(occ_lists):
+        for j, occ_j in enumerate(occ_lists):
+            out[i, j] = np.linalg.det(orbital_transform[np.ix_(occ_i, occ_j)])
+    return out
+
+
+def _string_singular_weights(sigma, occ_strings):
+    """Diagonal singular-value weights in the determinant/string representation."""
+    occ_lists = _occupation_lists(occ_strings)
+    if len(occ_lists) == 0:
+        return np.empty((0,), dtype=sigma.dtype)
+    out = np.empty((len(occ_lists),), dtype=sigma.dtype)
+    for i, occ in enumerate(occ_lists):
+        out[i] = np.prod(sigma[occ]) if len(occ) > 0 else 1.0
+    return out
+
+
+def _reconstruct_string_overlap_from_svd(u, sigma, right_vh, occ_strings, dtype):
+    """Exact determinant-space reconstruction from the orbital-space SVD.
+
+    For a fixed-electron string basis built from all combinations of occupied
+    orbitals in a given one-particle space, Cauchy-Binet gives
+
+    ``W(S) = W(U) @ diag(w(sigma)) @ W(Vh)``
+
+    where ``S = U diag(sigma) Vh`` and ``W`` denotes the induced transform in
+    determinant/string space. The right factor must be passed in ``Vh``
+    orientation; using ``V`` instead gives the wrong determinant-space map.
+    """
+    left = _string_transform_matrix(u, occ_strings, dtype)
+    right = _string_transform_matrix(right_vh, occ_strings, dtype)
+    weights = np.diag(_string_singular_weights(sigma, occ_strings))
+    return left @ weights @ right
+
+
+def _biorthogonalize_active_overlap(saa_eff):
+    """Balanced SVD biorthogonalization of the active-space overlap block."""
+    u, sigma, vh = np.linalg.svd(saa_eff, full_matrices=False)
+    if sigma.size == 0:
+        return u, sigma, vh, saa_eff.copy(), saa_eff.copy()
+    tol = np.finfo(sigma.dtype).eps * max(saa_eff.shape) * sigma.max()
+    if np.min(sigma) <= tol:
+        raise np.linalg.LinAlgError(
+            "Active-space overlap is numerically singular and cannot be biorthogonalized "
+            f"(min sigma={sigma.min():.3e}, tol={tol:.3e})."
+        )
+    sigma_inv_sqrt = sigma ** -0.5
+    x_left = u * sigma_inv_sqrt[np.newaxis, :]
+    x_right = vh.conj().T * sigma_inv_sqrt[np.newaxis, :]
+    return u, sigma, vh, x_left, x_right
+
+
+@dataclass
+class _BiorthogonalOverlapPrep:
+    s_mo: np.ndarray
+    core_factor: complex
+    saa_eff: np.ndarray
+    scc: np.ndarray
+    scc_u: np.ndarray
+    scc_sigma: np.ndarray
+    scc_vh: np.ndarray
+    saa_u: np.ndarray
+    saa_sigma: np.ndarray
+    saa_vh: np.ndarray
+    x_left: np.ndarray
+    x_right: np.ndarray
+
+
+def _svd_inverse(matrix, *, tol=None):
+    """SVD-based inverse used as the first exact biorthogonalization step."""
+    u, sigma, vh = np.linalg.svd(matrix, full_matrices=False)
+    if sigma.size == 0:
+        return u, sigma, vh, matrix.copy()
+    if tol is None:
+        tol = np.finfo(sigma.dtype).eps * max(matrix.shape) * sigma.max()
+    if np.min(sigma) <= tol:
+        raise np.linalg.LinAlgError(
+            "Overlap block is numerically singular and cannot be biorthogonalized "
+            f"(min sigma={sigma.min():.3e}, tol={tol:.3e})."
+        )
+    inv = (vh.conj().T / sigma) @ u.conj().T
+    return u, sigma, vh, inv
+
+
+def _active_orbital_slices(ncore_bra, ncore_ket, ncas_bra, ncas_ket):
+    bra_active = slice(ncore_bra, ncore_bra + ncas_bra)
+    ket_active = slice(ncore_ket, ncore_ket + ncas_ket)
+    return bra_active, ket_active
+
+
+def _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, dtype):
+    """Prepare exact overlap data with SVD-based core biorthogonalization."""
+    if ncore_bra != ncore_ket:
+        raise ValueError(
+            "Different numbers of core orbitals are not supported in overlap: "
+            f"{ncore_bra} != {ncore_ket}."
+        )
+
+    bra_active, ket_active = _active_orbital_slices(ncore_bra, ncore_ket, ncas_bra, ncas_ket)
+    scc = np.asarray(s[:ncore_bra, :ncore_ket], dtype=dtype)
+    sca = np.asarray(s[:ncore_bra, ket_active], dtype=dtype)
+    sac = np.asarray(s[bra_active, :ncore_ket], dtype=dtype)
+    saa = np.asarray(s[bra_active, ket_active], dtype=dtype)
+
+    if ncore_bra == 0:
+        saa_u, saa_sigma, saa_vh, x_left, x_right = _biorthogonalize_active_overlap(saa)
+        return _BiorthogonalOverlapPrep(
+            s_mo=np.asarray(s, dtype=dtype),
+            core_factor=dtype.type(1),
+            saa_eff=saa,
+            scc=scc,
+            scc_u=np.empty((0, 0), dtype=dtype),
+            scc_sigma=np.empty((0,), dtype=float),
+            scc_vh=np.empty((0, 0), dtype=dtype),
+            saa_u=saa_u,
+            saa_sigma=saa_sigma,
+            saa_vh=saa_vh,
+            x_left=x_left,
+            x_right=x_right,
+        )
+
+    scc_u, scc_sigma, scc_vh, scc_inv = _svd_inverse(scc)
+    saa_eff = saa - sac @ scc_inv @ sca
+    saa_u, saa_sigma, saa_vh, x_left, x_right = _biorthogonalize_active_overlap(saa_eff)
+
+    return _BiorthogonalOverlapPrep(
+        s_mo=np.asarray(s, dtype=dtype),
+        core_factor=np.linalg.det(scc) ** 2,
+        saa_eff=saa_eff,
+        scc=scc,
+        scc_u=scc_u,
+        scc_sigma=scc_sigma,
+        scc_vh=scc_vh,
+        saa_u=saa_u,
+        saa_sigma=saa_sigma,
+        saa_vh=saa_vh,
+        x_left=x_left,
+        x_right=x_right,
+    )
+
+
+def _effective_active_overlap(
+    s,
+    ncore_bra,
+    ncore_ket,
+    ncas_bra,
+    ncas_ket,
+    dtype,
+):
+    prep = _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, dtype)
+    return prep.core_factor, prep.saa_eff
+
+
+def _overlap_slow_from_mo_overlap(
+    cibra,
+    ciket,
+    s,
+):
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+    S = np.zeros((nsd_bra, nsd_ket), dtype=dtype)
+
+    ncore_bra = cibra.ncore
+    ncore_ket = ciket.ncore
+    core_factor, saa_eff = _effective_active_overlap(
+        s,
+        ncore_bra,
+        ncore_ket,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+
+    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
+    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
+    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
+    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
+
+    for I in range(nsd_bra):
+        occidx1_a = occ_bra_a[I]
+        occidx1_b = occ_bra_b[I]
+        for J in range(nsd_ket):
+            occidx2_a = occ_ket_a[J]
+            occidx2_b = occ_ket_b[J]
+            S[I, J] = (
+                core_factor
+                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
+                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
+            )
+
+    return contract(
+        'BI, IJ, AJ -> BA',
+        _as_state_ci_matrix(cibra.ci, nsd_bra).conj(),
+        S,
+        _as_state_ci_matrix(ciket.ci, nsd_ket),
+    )
+
+
+def _factorized_ci_overlap(
+    cibra,
+    ciket,
+    s=None,
+):
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+
+    ncore_bra = cibra.ncore
+    ncore_ket = ciket.ncore
+    prep = _prepare_biorthogonal_overlap(
+        s,
+        ncore_bra,
+        ncore_ket,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+
+    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
+    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
+    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
+    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+
+    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
+    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
+
+    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
+        return _overlap_slow_from_mo_overlap(
+            cibra,
+            ciket,
+            s,
+        )
+
+    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
+        return _overlap_slow_from_mo_overlap(
+            cibra,
+            ciket,
+            s,
+        )
+
+    try:
+        return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
+    except (np.linalg.LinAlgError, ValueError):
+        ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
+        ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
+
+        overlap_alpha = _string_overlap_matrix(
+            prep.saa_eff, _occupation_lists(bra_alpha), _occupation_lists(ket_alpha), dtype
+        )
+        overlap_beta = _string_overlap_matrix(
+            prep.saa_eff, _occupation_lists(bra_beta), _occupation_lists(ket_beta), dtype
+        )
+
+        return prep.core_factor * contract(
+            'Xab,ac,bd,Ycd->XY',
+            ci_bra.conj(),
+            overlap_alpha,
+            overlap_beta,
+            ci_ket,
+        )
+
+
+def _transform_ci_tensors_to_biorthogonal_basis(ci_tensors, alpha_transform, beta_transform):
+    """Apply inverse determinant-space transforms to CI tensors state by state."""
+    out = np.empty(ci_tensors.shape, dtype=np.result_type(ci_tensors, alpha_transform, beta_transform))
+    for i, ci in enumerate(ci_tensors):
+        alpha_rot = np.linalg.solve(alpha_transform, ci)
+        out[i] = np.linalg.solve(beta_transform, alpha_rot.T).T
+    return out
+
+
+def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
+    """Biorthogonal CI overlap from precomputed active-space overlap prep."""
+    nsd_bra = cibra.binary.shape[0]
+    nsd_ket = ciket.binary.shape[0]
+    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
+    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
+    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
+    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+
+    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
+    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
+
+    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
+        raise ValueError("Biorthogonal overlap candidate requires separable alpha/beta determinant grids.")
+    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
+        raise ValueError("Biorthogonal overlap candidate requires matching alpha and beta string bases.")
+
+    ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
+    ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
+
+    g_left_alpha = _string_transform_matrix(prep.x_left, bra_alpha, dtype)
+    g_left_beta = _string_transform_matrix(prep.x_left, bra_beta, dtype)
+    g_right_alpha = _string_transform_matrix(prep.x_right, ket_alpha, dtype)
+    g_right_beta = _string_transform_matrix(prep.x_right, ket_beta, dtype)
+
+    ci_bra_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_bra, g_left_alpha, g_left_beta)
+    ci_ket_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_ket, g_right_alpha, g_right_beta)
+
+    return prep.core_factor * contract('Xab,Yab->XY', ci_bra_bio.conj(), ci_ket_bio)
+
+
+def _biorthogonal_ci_overlap_candidate(cibra, ciket, s=None):
+    """Private candidate overlap using active-space biorthogonal CI transforms."""
+    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+
+    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
+
+    prep = _prepare_biorthogonal_overlap(
+        s,
+        cibra.ncore,
+        ciket.ncore,
+        cibra.ncas,
+        ciket.ncas,
+        dtype,
+    )
+    return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
 
 def overlap(cibra, ciket, s=None):
     """
@@ -1696,82 +3247,91 @@ def overlap(cibra, ciket, s=None):
     None.
 
     """
-    # nstates = len(cibra) + 1
-
-    # overlap matrix between MOs at different geometries
-    if s is None:
-
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
-        s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
+    return _factorized_ci_overlap(
+        cibra,
+        ciket,
+        s=s,
+    )
 
 
-    nsd_bra = cibra.binary.shape[0]
-    nsd_ket = ciket.binary.shape[0]
-    S = np.zeros((nsd_bra, nsd_ket)) # overlap between determinants
+class CASCIScanner:
+    """Stateful multi-state CASCI scanner.
 
-    ncore_bra = cibra.ncore
-    ncore_ket = ciket.ncore
+    Calling the scanner with Cartesian coordinates or a Molecule-like object
+    updates the HF reference through ``mf.as_scanner()``, runs CASCI, stores the
+    result as ``last_result``, and returns the CASCI object.
+    """
 
-    scc = s[:ncore_bra, :ncore_ket]
-    sca = s[:ncore_bra, ncore_ket:]
-    sac = s[ncore_bra:, :ncore_ket]
-    saa = s[ncore_bra:, ncore_ket:]
+    def __init__(
+        self,
+        mc,
+        nstates=None,
+        method='direct_ci',
+        build_driver=None,
+        run_kwargs=None,
+        reuse_ci=False,
+    ):
+        self.template = mc
+        self.mf = mc.mf
+        self.mol = mc.mol
+        self.nstates = int(nstates if nstates is not None else (mc.nstates or 1))
+        self.method = method
+        self.run_kwargs = dict(run_kwargs or {})
+        self.reuse_ci = bool(reuse_ci)
+        self.last_result = None
+        self._mf_scanner = (
+            self.mf.as_scanner(build_driver=build_driver)
+            if hasattr(self.mf, "as_scanner")
+            else None
+        )
 
-    scc_det = np.linalg.det(scc)
-    scc_inv = np.linalg.inv(scc)
+    def __call__(self, mol_or_geom):
+        if self._mf_scanner is not None:
+            self._mf_scanner(mol_or_geom)
+            mf = self._mf_scanner.mf
+        else:
+            mf = self.mf
+            if hasattr(mf, "mol") and isinstance(mol_or_geom, np.ndarray):
+                mol = mf.mol
+                mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
+                mol.build(driver=getattr(mol, "_build_driver", None) or "gbasis")
+                mf.run()
+            elif mol_or_geom is not None and mol_or_geom is not getattr(mf, "mol", None):
+                mf.mol = mol_or_geom
+                mf.run()
 
-    for I in range(nsd_bra):
-        occidx1_a  = [i for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-        occidx1_b  = [i for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
+        scanner_mc = self.template.__class__(
+            mf,
+            ncas=self.template.ncas,
+            nelecas=self.template.nelecas,
+            spin=self.template.spin,
+            verbose=self.template.verbose,
+        )
+        scanner_mc.binary = self.template.binary
+        scanner_mc.spin_purification = self.template.spin_purification
+        scanner_mc.ss = self.template.ss
+        scanner_mc.shift = self.template.shift
+        scanner_mc.use_cholesky_integrals = self.template.use_cholesky_integrals
 
-        for J in range(nsd_ket):
-            occidx2_a  =  [i for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-            occidx2_b  =  [i for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
+        options = dict(self.run_kwargs)
+        method = options.pop("method", self.method)
+        ci0 = options.pop("ci0", None)
+        if ci0 is None and self.reuse_ci and self.last_result is not None:
+            ci0 = getattr(self.last_result, "ci", None)
+        scanner_mc.run(
+            nstates=self.nstates,
+            method=method,
+            ci0=ci0,
+            **options,
+        )
 
-            # print('b', occidx2_a, occidx2_b)
-            # print(ciket.binary[J])
+        self.mf = mf
+        self.mol = mf.mol
+        self.last_result = scanner_mc
+        return scanner_mc
 
-    # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-            saa_occ_a = saa[np.ix_(occidx1_a, occidx2_a)]
-            sca_occ_a = sca[:, occidx2_a]
-            sac_occ_a = sac[occidx1_a, :]
-
-            saa_occ_b = saa[np.ix_(occidx1_b, occidx2_b)]
-            sca_occ_b = sca[:, occidx2_b]
-            sac_occ_b = sac[occidx1_b, :]
-
-
-            S[I, J] = scc_det**2 * np.linalg.det(saa_occ_a - sac_occ_a @ scc_inv @ sca_occ_a)*\
-                np.linalg.det(saa_occ_b - sac_occ_b @ scc_inv @ sca_occ_b)
-
-
-
-    # core_bra = list(range(cibra.ncore))
-    # core_ket = list(range(ciket.ncore))
-
-
-
-
-    # for I in range(nsd_bra):
-    #     occidx1_a  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 0]) if char == 1]
-    #     occidx1_b  = core_bra + [i + ncore_bra for i, char in enumerate(cibra.binary[I, 1]) if char == 1]
-
-    #     for J in range(nsd_ket):
-    #         occidx2_a  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 0]) if char == 1]
-    #         occidx2_b  = core_ket + [i + ncore_ket for i, char in enumerate(ciket.binary[J, 1]) if char == 1]
-
-    #         # print('b', occidx2_a, occidx2_b)
-    #         # print(ciket.binary[J])
-
-    # # TODO: the overlap matrix can be efficiently computed for CAS factoring out the core-electron overlap.
-
-    #         S[I, J] = np.linalg.det(s[np.ix_(occidx1_a, occidx2_a)]) * \
-    #                   np.linalg.det(s[np.ix_(occidx1_b, occidx2_b)])
-
-
-    return contract('BI, IJ, AJ -> BA', np.array(cibra.ci).conj(), S, np.array(ciket.ci))
+    def overlap(self, left, right):
+        return overlap(left, right)
 
 if __name__ == "__main__":
     from pyqed import Molecule
@@ -1813,115 +3373,26 @@ if __name__ == "__main__":
     #     casci.e_tot
 
     #### test overlap
-    # mol2 = Molecule(atom = [
-    # ['Li' , (0. , 0. , 0)],
-    # ['H' , (0. , 0. , 1.4)], ])
-    # mol2.basis = 'sto6g'
+    mol2 = Molecule(atom = [
+    ['Li' , (0. , 0. , 0)],
+    ['Li' , (0. , 0. , 1.4)], ])
+    mol2.basis = '631g'
 
-    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='sto3g')
     # mol.unit = 'b'
-    mol.build()
-    mol.molecular_frame()
-    nstates = 4
+    mol2.build()
 
-    mf = mol.RHF().run()
-
-    ncas, nelecas = (6,6)
-    mc = CASCI(mf, ncas, nelecas)
-    mc.fix_spin(ss=0, shift=0.2)
-    mc.run(nstates)
-
-    # rdm1 = mc.make_rdm1(state_id=0, with_core=True)
-    # print('rdm1', rdm1.shape)
-
-    # C = mc.mo_coeff[:, :mc.ncore+ mc.ncas]
-    # print('c', C.shape)
-
-    # print('e_tot', mc.e_tot[0])
-
-    # # C0 = mf.mo_coeff
-
-    # hcore0 = mf.get_hcore()
-    # # print('hcore ===',hcore0.all() == mol2.hcore.all())
-    # # print('hcore0', hcore0)
+    mf2 = mol2.RHF().run()
 
 
+    ncas, nelecas = (4,2)
+    mc = CASCI(mf2, ncas, nelecas)
+    mc.run(5)
 
-    # # add electric field or vector potential
-    # E_vec=np.array([0,0,0.1])
-    # # A_vec=np.array([0.0,0,0.01])
-    # hcore_electric_field = add_electric_field(mol, electric_field=E_vec)
-    # # hcore_vector_potential = add_vector_potential(mol2, vector_potential=A_vec)
-    # # print('hcore_vector_potential', hcore_vector_potential)
+    print('Fix spin by penalty')
 
-    # # mol2.hcore = hcore0 - hcore_electric_field + hcore_vector_potential
-    # mol.hcore = hcore0 - hcore_electric_field
-    # mf2 = mol.RHF().run()
-    # # CA = mf2.mo_coeff
-
-
-
-    # s0 = mol2.overlap
-    # coords = -mol2.ao_dip # <mu | r | nu>
-    # A_dot_r = np.einsum('i,imn->mn', A_vec, coords)
-    # # S_exp = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r)
-    # # S_exp = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r) + 1j/6 * (A_dot_r @ np.linalg.inv(s0) @ A_dot_r @ np.linalg.inv(s0) @ A_dot_r)
-
-    # s, U = eigh(mol2.overlap)
-    # # building transformation matrix S^{-1/2}
-    # X = U.dot(np.diagflat(s**(-0.5)).dot(U.conj().T))
-    # C0_p = np.linalg.inv(X) @ C0
-    # CA_p = np.linalg.inv(X) @ CA
-    # overlap = C0.conj().T @ CA
-    # phase = s0 - 1j * A_dot_r - 0.5 * (A_dot_r @ s0 @ A_dot_r)
-    # print('-'*100)
-    # print('hcore+A', mf2.get_hcore())
-    # print('fock', mf2.get_fock())
-    # h0000 = mf2.get_fock()
-
-    # print('CA',CA)
-    # print('exp(-iAr)C0', S_exp @ C0)
-    # print('phase', CA[:,0] - S_exp @ C0[:,0])
-
-    # S_prime = C0.conj().T @ S_exp @ CA
-    # print('s0',s0)
-    # print('S_prime', S_prime)
-    # print('overlap', np.einsum('ii->', S_prime)- np.sum(S_prime.diagonal())) 
-
-    # print(f"{'MO Index':<10} | {'|Overlap|':<12} ")
-    # print("-" * 30)
-    # for i in range(mol2.nelec // 2):
-    #     overlap = S_prime[i, i]
-    #     print(f"{i:<10} | {np.abs(overlap):<12.6f} ")
-
-    # # CASCI 
-    # wavefunction_2 = mf2.mo_coeff
-    # ncas, nelecas = (2,2)
-    # nstates = 4
     # mc = CASCI(mf2, ncas, nelecas)
-    # # mc.run(nstates=nstates, method='ci')
-
-    # print('Fix spin by penalty')
-
-    # # mc = CASCI(mf2, ncas, nelecas)
-    # mc.fix_spin(ss=0, shift=0.2)
-    # mc.run(nstates=nstates)
-    # for state_id in range(nstates):
-    #     mc.get_electric_dip(initial_state=0, final_state=state_id, unit='au')
-
-
-
-
-
-
-
-
-
-    # print("dip",mol2.ao_dip)
-    # print('pyqed casci electric dip', mc.electric_dipole)
-
-    # mc.get_magnetic_dip(initial_state=0, final_state=1)
-    # print('pyqed casci magnetic dip', mc.magnetic_dipole)
+    mc.fix_spin(ss=0, shift=0.2)
+    mc.run(5)
 
     # casci.run()
     # S = overlap(casci, casci2)

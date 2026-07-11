@@ -12,7 +12,6 @@ from scipy import linalg
 from scipy.special import jv
 from pyqed.mol import Mol, dag
 from sklearn.cluster import KMeans
-import matplotlib.pyplot as plt
 # from tqdm import tqdm
 import time
 import os

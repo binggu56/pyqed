@@ -3,7 +3,7 @@
 
 import numpy as np
 #import numba
-# import proplot as plt
+from pyqed import interval 
 
 from numpy.core.multiarray import normalize_axis_index
 from numpy.core import swapaxes
@@ -70,7 +70,10 @@ def fft(a, x=None, axis=-1, **kwargs):
 def ifft(a, x=None, axis=-1):
     """
     customized fourier transform of function f
-    g = int dt f(t) * exp(i * freq * t)
+    .. math::
+        
+        g = \int dt f(t)  exp(i \omega  t)
+    
     return:
         freq: frequencies where f are evaluated
         g: the fourier transform of f
@@ -121,9 +124,46 @@ def fft2(f, dx=1, dy=1):
     g = g * dx * dy
 
     freqx = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    freqy = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, d=dy))
+    freqy = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
 
-    return freqx, freqy, g
+    return g, freqx, freqy
+
+def fft3(f, x, y, z):
+    """
+    customized FFT for 3D function
+    
+    .. math::
+        g(r) = \iiint dx dy dz f(r) * e^{- i \mathbf{k r} }
+    
+    input:
+        f: 2d array,
+            input array
+    return:
+        freq: 1d array
+            frequencies
+        g: 2d array
+            fourier transform of f
+    """
+    nx, ny, nz = f.shape
+
+    g = np.fft.fftn(f)
+    g = np.fft.fftshift(g)
+    
+    dx = interval(x)
+    dy = interval(y)
+    dz = interval(z)
+
+    g = g * dx * dy * dz
+
+    kx = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    ky = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    kz = 2. * np.pi * np.fft.fftshift(np.fft.fftfreq(nz, d=dz))
+
+    Kx, Ky, Kz = np.meshgrid(kx, ky, kz)
+    
+    return g * np.exp(-1j * Kx * x[0] - 1j * Ky * y[0] - 1j * Kz * z[0]), kx, ky, kz
+
+
 
 def dft(x, f, k):
     '''
@@ -137,8 +177,8 @@ def dft(x, f, k):
     for i in range(len(k)):
         g[i] = np.sum(f * np.exp(-1j * k[i] * x)) * dx
 
-    fig, ax = plt.subplots()
-    ax.plot(k, np.abs(g))
+    # fig, ax = plt.subplots()
+    # ax.plot(k, np.abs(g))
 
     return g
 
@@ -165,11 +205,30 @@ if __name__ == '__main__':
     from pyqed.optics import Pulse 
     from pyqed.units import au2fs, au2ev 
     
-    pulse = Pulse(tau=1./au2fs)
-    times = np.linspace(-10, 10, 100)/au2fs
+    import ultraplot as plt
+    
+    # pulse = Pulse(tau=1./au2fs)
+    # times = np.linspace(-10, 10, 100)/au2fs
 
-    # test ifft
-    E, w = ifft(pulse.efield(times), times)
+    # # test ifft
+    # E, w = ifft(pulse.efield(times), times)
 
+    # fig, ax = plt.subplots()
+    # ax.plot(w*au2ev, E)
+    
+    
+    x = np.linspace(-10, 10, 32)
+    y = np.linspace(-10, 10, 32)
+    z = np.linspace(-10, 10, 32)
+
+    X, Y, Z = np.meshgrid(x, y, z)
+    
+    f = np.exp(-X**2 - Y**2 - Z**2 + 1j * X)
+
+    # +  np.sin(Y) + np.sin(Z)
+    
+    g, kx, ky, kz = fft3(f, x, y, z)
+    
+    
     fig, ax = plt.subplots()
-    ax.plot(w*au2ev, E)
+    ax.contour(kx, ky, g[:,:,16].real)

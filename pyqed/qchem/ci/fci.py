@@ -14,7 +14,6 @@ https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/651592
 import numpy as np
 
 from itertools import combinations
-from pyscf import ao2mo
 from scipy.sparse.linalg import eigsh
 # from functools import reduce
 
@@ -23,6 +22,23 @@ from opt_einsum import contract
 
 from pyqed.qchem.hf.rhf import RHF
 # from pyqed.qchem.ci.cisd import get_SO_matrix
+
+
+def _transform_spatial_eri_to_mo(eri_ao, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
+    if mo_right is None:
+        mo_right = mo_left
+    if mo_left_2 is None:
+        mo_left_2 = mo_left
+    if mo_right_2 is None:
+        mo_right_2 = mo_right
+    return contract(
+        'pqrs,pi,qj,rk,sl->ijkl',
+        eri_ao,
+        mo_left.conj(),
+        mo_right,
+        mo_left_2.conj(),
+        mo_right_2,
+    )
 
 def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     """
@@ -43,9 +59,19 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     # molecular orbitals
     # if isinstance(mf, RHF):
 
-    Ca, Cb = [mf.mo_coeff, ] * 2
+    mo_coeff = np.asarray(mf.mo_coeff)
+    if mo_coeff.ndim == 2:
+        Ca = Cb = mo_coeff
+    elif mo_coeff.ndim == 3 and mo_coeff.shape[0] == 2:
+        Ca, Cb = mo_coeff
+    else:
+        raise ValueError(f"Unsupported MO coefficient shape for spin-orbital build: {mo_coeff.shape}")
 
-    eri = mf.mol.eri
+    eri = getattr(mf, '_eri', None)
+    if eri is None:
+        eri = getattr(mf.mol, 'eri', None)
+    if eri is None:
+        raise ValueError("Mean-field object does not provide AO ERIs for CI.")
 
 
     # elif isinstance(mf, scf.uhf.UHF):
@@ -65,6 +91,14 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
 
     # H1e in AO
     H = mf.get_hcore()
+    if isinstance(H, tuple):
+        Ha, Hb = H
+    else:
+        H_arr = np.asarray(H)
+        if H_arr.ndim == 3 and H_arr.shape[0] == 2:
+            Ha, Hb = H_arr
+        else:
+            Ha = Hb = H
     # H = dag(Ca) @ H @ Ca
 
     n = nmo = Ca.shape[1] # n
@@ -88,28 +122,36 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     # eri = ao2mo.get_ao_eri(mf.mol, compact=False).reshape(nmo, nmo, nmo, nmo)
     # print(eri.shape)
 
-    eri_aa = (ao2mo.general( eri , (Ca, Ca, Ca, Ca),
-                            compact=False)).reshape((n,n,n,n), order="C")
-    eri_aa -= eri_aa.swapaxes(1,3)
+    if hasattr(mf, 'get_eri_mo'):
+        eri_mo = np.asarray(mf.get_eri_mo(notation='chem'))
+        if eri_mo.ndim == 4:
+            eri_spatial = eri_mo
+            eri_aa = eri_spatial - eri_spatial.swapaxes(1, 3)
+            eri_bb = eri_aa.copy()
+            eri_ab = eri_spatial.copy()
+            eri_ba = eri_spatial.copy()
+        elif eri_mo.ndim == 6 and eri_mo.shape[:2] == (2, 2):
+            eri_aa = eri_mo[0, 0] - eri_mo[0, 0].swapaxes(1, 3)
+            eri_bb = eri_mo[1, 1] - eri_mo[1, 1].swapaxes(1, 3)
+            eri_ab = eri_mo[0, 1]
+            eri_ba = eri_mo[1, 0]
+        else:
+            raise ValueError(f"Unsupported MO ERI shape for CI: {eri_mo.shape}")
+    else:
+        eri_aa = _transform_spatial_eri_to_mo(eri, Ca, Ca, Ca, Ca)
+        eri_aa -= eri_aa.swapaxes(1, 3)
 
+        eri_bb = _transform_spatial_eri_to_mo(eri, Cb, Cb, Cb, Cb)
+        eri_bb -= eri_bb.swapaxes(1, 3)
 
-    eri_bb = (ao2mo.general( eri , (Cb, Cb, Cb, Cb),
-    compact=False)).reshape((n,n,n,n), order="C")
-    eri_bb -= eri_bb.swapaxes(1,3)
-
-    # eri_bb = eri_aa.copy()
-
-
-    eri_ab = (ao2mo.general( eri , (Ca, Ca, Cb, Cb),
-    compact=False)).reshape((n,n,n,n), order="C")
-    #eri_ba = (1.*eri_ab).swapaxes(0,3).swapaxes(1,2) ## !! caution depends on symmetry
-
-    eri_ba = (ao2mo.general( eri , (Cb, Cb, Ca, Ca),
-    compact=False)).reshape((n,n,n,n), order="C")
+        eri_ab = _transform_spatial_eri_to_mo(eri, Ca, Ca, Cb, Cb)
+        eri_ba = _transform_spatial_eri_to_mo(eri, Cb, Cb, Ca, Ca)
 
     H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-    H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca), np.einsum("AB, Ap, Bq -> pq",
-    H, Cb, Cb)])
+    H1 = np.asarray([
+        np.einsum("AB, Ap, Bq -> pq", Ha, Ca, Ca),
+        np.einsum("AB, Ap, Bq -> pq", Hb, Cb, Cb),
+    ])
 
     # if SF:
     #     eri_abab = (ao2mo.general( (uhf_pyscf)._eri , (Ca, Cb, Ca, Cb),
@@ -163,8 +205,14 @@ def get_fci_combos(mf=None, mo_occ=None):
 
     N = O_sp.shape[1]
 
-    Λ_α = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[0] ) ) )
-    Λ_β = np.asarray( list(combinations( np.arange(0, N, 1, dtype=np.int8) , N_s[1] ) ) )
+    Λ_α = np.asarray(
+        list(combinations(np.arange(0, N, 1, dtype=np.int8), N_s[0])),
+        dtype=np.int8,
+    )
+    Λ_β = np.asarray(
+        list(combinations(np.arange(0, N, 1, dtype=np.int8), N_s[1])),
+        dtype=np.int8,
+    )
     ΛA, ΛB = SpinOuterProduct(Λ_α, Λ_β)
     Binary = givenΛgetB(ΛA, ΛB, N)
     return Binary
@@ -480,7 +528,8 @@ def CI_H(Binary, H1, H2, SC1, SC2):
     I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
 
     # sum of MO energies I: configuration index, S: spin index, p: MO index
-    H_CI = np.einsum("Spp, ISp -> I", H1, Binary, optimize=True)
+    dtype = np.result_type(np.asarray(H1), H2)
+    H_CI = np.asarray(np.einsum("Spp, ISp -> I", H1, Binary, optimize=True), dtype=dtype)
 
     # ERI
     H_CI += np.einsum("STppqq, ISp, ITq -> I", H2, Binary, Binary, optimize=True)/2
@@ -509,7 +558,7 @@ def CI_H(Binary, H1, H2, SC1, SC2):
     H_CI[I_AB, J_AB] = np.einsum("pqrs, Kp, Kq, Kr, Ks -> K", H2[0,1], ab_t, ab, ba_t, ba,
         optimize=True)
 
-    return H_CI
+    return np.real_if_close(H_CI)
 
 # def CI_H(Binary, H1, H2, SC1, SC2):
 #     """

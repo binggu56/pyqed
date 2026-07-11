@@ -36,6 +36,14 @@ pyqed.signal.nonhermitian module
    :undoc-members:
    :show-inheritance:
 
+pyqed.signal.nlo module
+-----------------------
+
+.. automodule:: pyqed.signal.nlo
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 pyqed.signal.sos module
 -----------------------
 

@@ -1,53 +1,15 @@
-pyqed.polariton package
-=======================
+Polariton
+=========
 
-Submodules
-----------
+The :mod:`pyqed.polariton` package contains cavity-QED and vibrational strong
+coupling models.
 
-pyqed.polariton.cavity module
------------------------------
+Main source modules:
 
-.. automodule:: pyqed.polariton.cavity
-   :members:
-   :undoc-members:
-   :show-inheritance:
+* ``pyqed.polariton.cavity``
+* ``pyqed.polariton.exact``
+* ``pyqed.polariton.tdh``
+* ``pyqed.polariton.vsc``
 
-pyqed.polariton.exact module
-----------------------------
-
-.. automodule:: pyqed.polariton.exact
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.polariton.plt module
---------------------------
-
-.. automodule:: pyqed.polariton.plt
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.polariton.tdh module
---------------------------
-
-.. automodule:: pyqed.polariton.tdh
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-pyqed.polariton.vsc module
---------------------------
-
-.. automodule:: pyqed.polariton.vsc
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Module contents
----------------
-
-.. automodule:: pyqed.polariton
-   :members:
-   :undoc-members:
-   :show-inheritance:
+This page is static because some plotting/data-analysis helpers load local data
+at import time, which is not compatible with RTD autodoc builds.

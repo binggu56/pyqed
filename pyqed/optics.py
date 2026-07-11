@@ -10,7 +10,6 @@ import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg
 from numpy import sqrt, exp, pi
 # import proplot as plt
-import matplotlib.pyplot as plt
 from pyqed.units import au2k, au2ev, alpha, \
     au2watt_per_centimeter_squared, au2fs
 from pyqed.fft import fft, fft2

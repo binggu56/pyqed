@@ -1,77 +1,95 @@
-.. lime documentation master file, created by
-   sphinx-quickstart on Fri May  6 14:23:58 2022.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+PyQED documentation
+===================
 
-Welcome to PyQED's documentation!
-================================
+PyQED is open-source research software for light--matter interactions,
+quantum dynamics, spectroscopy, open quantum systems, and electronic-structure
+workflows.  These pages are organized around tasks: install the package, run a
+small calculation, choose a method, inspect its evidence, and reproduce a
+result.
 
-The goal is to provide a simple-to-use package to study ``how light interacts with matter``.  
+.. important::
 
-Check docs/manual.pdf for theoretical details.
+   PyQED is active research software.  APIs and numerical paths have different
+   maturity levels.  Check :doc:`capabilities` and the limitations on each
+   method page before using a workflow in production research.
 
-Main modules
+Start here
+----------
 
+* :doc:`installation` -- create an isolated environment and verify it.
+* :doc:`quickstart` -- run a native H2 restricted Hartree--Fock calculation.
+* :doc:`tutorials` -- follow a task-oriented learning path.
+* :doc:`examples` -- find an executable repository example.
+* :doc:`capabilities` -- understand Beta and Experimental status.
+* :doc:`benchmarks` -- reproduce validation and performance evidence.
+* :doc:`citing` -- cite the exact code and method used.
 
-* Nonlinear molecular spectroscopy 
- 
+Method areas
+------------
 
-* Molecular quantum dynamics 
---------------------------
-
-- Adiabatic wavepacket dynamics 
-	* Split-operator method 
-	* Discrete variable representation 
-
-- Nonadiabatic wavepacket dynamics 
-	* Split-operator method - For the exact nonadiabatic dynamics of vibronic models in the diabatic representation. 
-	* RK4 -  For the exact nonadiabatic wavepacket dynamics in the adiabatic representation.
-
-
-# Semiclassical quantum trajectory method 
-
-Quantum chemistry
------------------
-* TDDFT core-level excitation 
-** reduced excitation space
-** restricted energy window with full/reduced excitation space
-
-Open quantum systems 
---------------------
-* Lindblad quantum master equation
-* Redfield theory  
-* second-order time-convolutionless master equation 
-* hierarchical equation of motion 
-
-# Quantum transport 
-- Landauer transport 
-
-Soid state materials 
---------------------
-- Band structure from tight-binding Hamiltonians 
-
-Periodically driven matter
---------------------------
-* Floquet spectrum 
-
+The development tree contains workflows for quantum chemistry, discrete and
+finite-element variable representations, nonadiabatic and geometric dynamics,
+open-system dynamics, spectroscopy, Floquet models, light--matter coupling,
+and tensor-network methods.  The presence of a module does not by itself mean
+that every configuration is supported; the capability table links each area
+to its current documentation, examples, and tests.
 
 .. toctree::
-   :maxdepth: 4
-   :caption: Contents:
-   
-   installation.rst
-   guide/guide.rst
-   pyqed/polariton
-   pyqed/namd
-   developers.rst
-   heom.rst
-   Floquet.rst
-   pyqed.pyqed.signal.rst
-   modules
+   :maxdepth: 2
+   :caption: Getting started
 
+   installation
+   quickstart
+   tutorials
+   examples
 
-Indices and tables
-==================
+.. toctree::
+   :maxdepth: 2
+   :caption: Concepts and user guides
+
+   theory
+   guide/guide
+   backends
+   qchem
+   hf_analysis
+   mp2_comp2
+   gw_bse
+   tddft_ehrenfest
+   mps
+   dvr
+   geometric_quantum_dynamics
+   pyqed.floquet
+   pyqed.models
+   pyqed.namd
+   pyqed.polariton
+   heom
+
+.. toctree::
+   :maxdepth: 2
+   :caption: API and implementation
+
+   api
+   qchem_architecture
+   nonabelian_dmrg_design
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Evidence and citation
+
+   capabilities
+   benchmarks
+   citing
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Develop and get help
+
+   development
+   support
+   developers
+
+Indices
+-------
 
 * :ref:`genindex`
 * :ref:`modindex`

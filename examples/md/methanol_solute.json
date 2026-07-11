@@ -1,0 +1,43 @@
+{
+  "name": "methanol",
+  "units": {
+    "length": "angstrom",
+    "energy": "kcal/mol",
+    "angle": "degree"
+  },
+  "atom_types": {
+    "CT": {"lj_epsilon": 0.066, "lj_sigma": 3.50},
+    "OH": {"lj_epsilon": 0.170, "lj_sigma": 3.07},
+    "HC": {"lj_epsilon": 0.030, "lj_sigma": 2.50},
+    "HO": {"lj_epsilon": 0.000, "lj_sigma": 0.00}
+  },
+  "atoms": [
+    {"name": "C", "symbol": "C", "type": "CT", "charge": 0.265, "position": [7.0, 7.0, 7.0]},
+    {"name": "O", "symbol": "O", "type": "OH", "charge": -0.700, "position": [8.43, 7.0, 7.0]},
+    {"name": "H1", "symbol": "H", "type": "HC", "charge": 0.000, "position": [6.63, 8.02, 7.0]},
+    {"name": "H2", "symbol": "H", "type": "HC", "charge": 0.000, "position": [6.63, 6.49, 7.89]},
+    {"name": "H3", "symbol": "H", "type": "HC", "charge": 0.000, "position": [6.63, 6.49, 6.11]},
+    {"name": "HO", "symbol": "H", "type": "HO", "charge": 0.435, "position": [8.83, 7.89, 7.0]}
+  ],
+  "bonds": [
+    [0, 1, 320.0, 1.43],
+    [0, 2, 340.0, 1.09],
+    [0, 3, 340.0, 1.09],
+    [0, 4, 340.0, 1.09],
+    [1, 5, 553.0, 0.96]
+  ],
+  "angles": [
+    [1, 0, 2, 50.0, 109.5],
+    [1, 0, 3, 50.0, 109.5],
+    [1, 0, 4, 50.0, 109.5],
+    [2, 0, 3, 35.0, 109.5],
+    [2, 0, 4, 35.0, 109.5],
+    [3, 0, 4, 35.0, 109.5],
+    [0, 1, 5, 55.0, 108.5]
+  ],
+  "torsions": [
+    [2, 0, 1, 5, 0.15, 3, 0.0],
+    [3, 0, 1, 5, 0.15, 3, 0.0],
+    [4, 0, 1, 5, 0.15, 3, 0.0]
+  ]
+}

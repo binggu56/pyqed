@@ -1,7 +1,4 @@
 import numpy as np
-import pylab as plt
-import matplotlib.pyplot as plt 
-import matplotlib as mpl 
 
 #data = np.genfromtxt(fname='/home/bing/dissipation/energy.dat')
 

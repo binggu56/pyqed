@@ -1,0 +1,32 @@
+{
+  "system": {
+    "atoms": [
+      {"element": "H", "coordinates": [0.0, 0.0, -0.7]},
+      {"element": "H", "coordinates": [0.0, 0.0, 0.7]}
+    ],
+    "unit": "bohr",
+    "charge": 0,
+    "spin": 0
+  },
+  "method": {
+    "name": "RHF",
+    "basis": "sto-3g",
+    "pyqed_integral_driver": "builtin",
+    "pyqed_eri_representation": "dense",
+    "pyqed_eri_backend": "rys",
+    "pyqed_ao_symmetry": "s8",
+    "pyqed_eri_screen_tolerance": 0.0,
+    "pyqed_integral_workers": 1,
+    "pyqed_one_electron_cache": false,
+    "coordinate_type": "spherical",
+    "energy_convergence_tolerance_hartree": 1e-12,
+    "pyqed_density_convergence_tolerance": 1e-10,
+    "orbital_gradient_convergence_tolerance": 1e-10,
+    "maximum_scf_cycles": 100
+  },
+  "validation": {
+    "quantity": "total_rhf_energy",
+    "unit": "hartree",
+    "absolute_tolerance": 1e-9
+  }
+}
