@@ -1,3 +1,6 @@
+.. meta::
+   :description: Install PyQED and run a native H2 restricted Hartree--Fock calculation from molecular geometry to a converged energy.
+
 Five-minute quickstart
 ======================
 

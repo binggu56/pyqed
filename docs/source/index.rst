@@ -1,3 +1,6 @@
+.. meta::
+   :description: Official PyQED documentation for quantum chemistry, nonadiabatic dynamics, open quantum systems, spectroscopy, and tensor-network methods.
+
 PyQED documentation
 ===================
 
