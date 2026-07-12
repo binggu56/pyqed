@@ -48,7 +48,7 @@ Current development-branch matrix
      - Beta
      - :doc:`dvr`
      - ``tests/test_fedvr.py``, ``tests/test_sddvr.py``,
-       ``examples/dvr/fedvr_harmonic_oscillator.py``
+       ``examples/dvr/sine_harmonic_oscillator.py``
    * - Basic superoperators and Lindblad utilities
      - Experimental
      - :doc:`guide/guide_open_dynamics`
@@ -61,7 +61,7 @@ Current development-branch matrix
    * - HEOM and structured-bath workflows
      - Experimental
      - :doc:`heom`
-     - ``examples/heom.py`` and repository examples
+     - ``examples/heom_compact.py``, ``examples/heom.py``
    * - Molecular GW/BSE
      - Experimental
      - :doc:`gw_bse`

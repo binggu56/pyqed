@@ -1,122 +1,160 @@
-Examples Gallery
+Examples gallery
 ================
 
-The repository includes runnable entry points under ``examples/``. This page
-groups useful starting points by topic. Some are small smoke cases, while
-others are expensive research workflows with external dependencies and cached
-data. A listing here does not promote a workflow beyond the maturity shown in
-:doc:`capabilities`.
+The repository contains many scripts under ``examples/``.  This page puts the
+smallest maintained entry points first and labels larger files as research
+workflows.  A filename in the inventory does not imply that every option is
+validated; consult :doc:`capabilities` before using a result as evidence.
 
-Run an example from the repository root and inspect its imports, parameters,
-and output paths before execution. For research use, preserve the exact script
-commit and a :doc:`benchmarks` manifest.
+Run source-tree examples from the repository root with ``PYTHONPATH=.``.  The
+code shown here is included directly from the tracked files, so the web guide
+and executable examples stay synchronized.
 
-Quantum Chemistry
------------------
+Three verified starting points
+------------------------------
 
-* ``examples/qchem/sa_casscf_factor.py``: native factorized,
-  state-averaged CASSCF on a small H4 model.
-* ``examples/qchem/gw_qsgw.py``: native H2 RHF followed by small GW-family
-  workflows.
-* ``examples/qchem/casscf.py``: native CASSCF workflow.
-* ``examples/qchem/casscf_factor_vs_dense.py``: compare dense and factorized
-  CASSCF paths.
-* ``examples/qchem/comp2_h2o.py``: COMP2 example on water.
-* ``examples/qchem/gw_qsgw.py``: G0W0, eigenvalue-self-consistent GW, and qsGW
-  on H2.
-* ``examples/qchem/rttdhf_h2_kick_spectrum.py``: real-time TDHF kick spectrum
-  for H2.
-* ``examples/qchem/tddmrg_h2_threeway_compare.py``: time-dependent DMRG
-  comparison example.
+Native H2 restricted Hartree--Fock
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Multiconfigurational Methods
-----------------------------
+**Use for:** checking an installation and learning the molecular
+model--build--solve pattern.  **Requirements:** the base PyQED installation.
+**Typical runtime:** less than a minute on a laptop.
 
-* ``examples/qchem/mcscf/secondorder_casscf.py``: second-order CASSCF example.
-* ``examples/qchem/mcscf/cas_pyscf.py``: CAS comparison workflow.
-* ``examples/qchem/mcscf/wfn_overlap.py``: wavefunction overlap example.
-* ``examples/qchem/lif_casscf_scan.py``: LiF CASSCF scan.
-* ``examples/qchem/casscf_compare_vs_pyscf.py``: CASSCF comparison against
-  PySCF.
+.. literalinclude:: ../../examples/quickstart.py
+   :language: python
+   :linenos:
 
-DVR and Grid Dynamics
----------------------
-
-* ``examples/dvr/sddvr.py``: simultaneous-diagonalization DVR.
-* ``examples/dvr/gwp_sddvr_2d_independent_ho.py``: Gaussian-wavepacket SD-DVR
-  on a two-dimensional harmonic oscillator.
-* ``examples/dvr/shin_metiu.py``: Shin-Metiu DVR model.
-* ``examples/qchem/gdvr_h2_rhf.py``: grid-DVR RHF example for H2.
-* ``examples/qchem/gdvr_h4_rhf.py``: grid-DVR RHF example for H4.
-
-Nonadiabatic Dynamics
----------------------
-
-* ``examples/namd/ehrenfest.py``: Ehrenfest dynamics.
-* ``examples/namd/ehrenfest_histories.py``: trajectory/history handling.
-* ``examples/namd/abinitio_ehrenfest_pyscf.py``: ab initio Ehrenfest workflow
-  using PySCF as a backend.
-* ``examples/namd/lif_population_dynamics.py``: LiF population dynamics.
-
-Geometric Quantum Dynamics
---------------------------
-
-* ``examples/ldr/ldr.py``: locally diabatic representation dynamics.
-* ``examples/ldr/abinitio.py``: ab initio LDR workflow.
-* ``examples/ldr/abinitio_pyscf.py``: PySCF-backed ab initio LDR workflow.
-* ``examples/ldr/overlap_matrix_approximation_2D.py``: approximate electronic
-  overlap matrices on a two-dimensional grid.
-* ``examples/ldr/h3/1scan_PES_H3+.py``: H3+ adiabatic potential scan.
-* ``examples/ldr/h3/2calculate_overlap_nearest_neighbor.py``: nearest-neighbor
-  electronic-state overlaps.
-* ``examples/qchem/bo_hamiltonian_derivatives.py``: BO Hamiltonian derivative
-  construction.
-* ``examples/qchem/bo_hamiltonian_derivatives_normal_modes.py``: BO derivative
-  projection onto normal modes.
-
-Floquet and Light-Matter Models
--------------------------------
-
-* ``examples/floquet/two_level_system.py``: driven two-level model.
-* ``examples/floquet/RiceMele.py``: Rice-Mele model.
-* ``examples/floquet/Floquet_topological_phase_diagram.py``: Floquet phase
-  diagram example.
-* ``examples/test_cavity.py``: cavity-QED smoke example.
-
-Open Quantum Systems and Spectroscopy
--------------------------------------
-
-* ``examples/heom.py``: hierarchical equations of motion example.
-* ``examples/deom.py``: dissipaton equation of motion example.
-* ``examples/redfield.py``: Redfield dynamics example.
-* ``examples/signals/absorption.py``: absorption signal example.
-* ``examples/2DES.py``: two-dimensional electronic spectroscopy example.
-* ``examples/TPA.py``: two-photon absorption example.
-
-Running Examples
-----------------
-
-Run examples from the repository root so relative data files resolve correctly:
+Run it with:
 
 .. code-block:: bash
 
-   PYTHONPATH=. python examples/qchem/sa_casscf_factor.py
-   PYTHONPATH=. python examples/dvr/fedvr_harmonic_oscillator.py
+   PYTHONPATH=. python examples/quickstart.py
 
-Some examples require optional dependencies or compiled backends. If an example
-imports PySCF, PyVista, libxc, or plotting packages, install those dependencies
-separately before running it.
+The final line is approximately ``RHF energy: -1.116759307396 Eh``.  See
+:doc:`quickstart` for the explanation and :doc:`qchem` before changing the
+molecule or electronic-structure method.
 
-``examples/qchem/h2.py`` is a PySCF-based potential-curve script despite its
-generic filename; it is not the native PyQED quickstart. Use
-:doc:`quickstart` for the tested native entry path.
+Sine-DVR harmonic oscillator
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Related Pages
--------------
+**Use for:** learning grid construction, local potentials, and a known
+analytic spectrum.  **Requirements:** the base PyQED installation.
+**Typical runtime:** a few seconds.
 
-* :doc:`hf_analysis`
-* :doc:`mp2_comp2`
-* :doc:`gw_bse`
-* :doc:`tddft_ehrenfest`
-* :doc:`geometric_quantum_dynamics`
-* :doc:`guide/guide_qchem_mcscf`
+.. literalinclude:: ../../examples/dvr/sine_harmonic_oscillator.py
+   :language: python
+   :linenos:
+
+Run it with:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/dvr/sine_harmonic_oscillator.py
+
+Expected output is ``[0.5 1.5 2.5 3.5]``.  The :doc:`dvr` guide explains why
+both the box and number of points must be converged for a new potential.
+
+Compact HEOM spin--boson dynamics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Use for:** exercising the current one-exponential Drude--Lorentz HEOM path.
+**Requirements:** the base installation for this compact solver; the
+``pyqed[heom]`` extra is needed for separate DEOM/structured-bath helpers.
+**Typical runtime:** less than a minute.
+
+.. literalinclude:: ../../examples/heom_compact.py
+   :language: python
+   :linenos:
+
+Run it with:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/heom_compact.py
+
+The final line is ``Final <sigma_z>: -0.96907844``.  Read :doc:`heom` before
+interpreting the parameter called ``temperature`` or changing the time step,
+bath decomposition, or hierarchy depth.
+
+Choose a larger workflow
+------------------------
+
+The scripts below are useful next destinations, but many have optional
+dependencies, longer runtimes, model-specific inputs, or research interfaces.
+Inspect their imports, parameters, data files, and output paths before running
+them.
+
+Quantum chemistry
+~~~~~~~~~~~~~~~~~
+
+* ``examples/qchem/sa_casscf_factor.py`` -- native factorized,
+  state-averaged CASSCF on a small H4 model.
+* ``examples/qchem/casscf_factor_vs_dense.py`` -- compare dense and factorized
+  CASSCF paths.
+* ``examples/qchem/comp2_h2o.py`` -- COMP2 on water.
+* ``examples/qchem/gw_qsgw.py`` -- G0W0, eigenvalue-self-consistent GW, and
+  qsGW on H2.
+* ``examples/qchem/rttdhf_h2_kick_spectrum.py`` -- real-time TDHF kick
+  spectrum for H2.
+
+Read :doc:`qchem`, :doc:`backends`, and the relevant method page before
+scaling these calculations.
+
+Grid and nonadiabatic dynamics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``examples/dvr/fedvr_vs_sine_quartic.py`` -- compare two grid
+  representations for a quartic potential.
+* ``examples/dvr/gwp_sddvr_2d_independent_ho.py`` -- Gaussian-wavepacket
+  SD-DVR for a two-dimensional oscillator.
+* ``examples/dvr/shin_metiu.py`` -- an early Shin--Metiu research script; it
+  is not maintained as a first-run example, so inspect and adapt it rather
+  than expecting a turnkey smoke test.
+* ``examples/namd/ehrenfest.py`` -- model Ehrenfest dynamics.
+* ``examples/namd/ldrfg_avoided_crossing.py`` -- an avoided-crossing LDRFG
+  workflow.
+* ``examples/namd/abinitio_ehrenfest_pyscf.py`` -- an ab initio workflow with
+  an optional PySCF backend.
+
+Continue with :doc:`geometric_quantum_dynamics` and :doc:`pyqed.namd`.
+
+Open systems and spectroscopy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``examples/heom.py`` -- the longer historical HEOM exploration script.
+* ``examples/deom.py`` -- a dissipaton-equation-of-motion research workflow.
+* ``examples/redfield.py`` -- Redfield dynamics.
+* ``examples/signals/absorption.py`` -- an absorption-signal calculation.
+* ``examples/2DES.py`` -- a larger two-dimensional spectroscopy workflow.
+
+See :doc:`guide/guide_open_dynamics`, :doc:`heom`, and
+:doc:`guide/guide_spectroscopy` for the governing assumptions.
+
+Floquet, light--matter, and tensor networks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``examples/floquet/two_level_system.py`` -- a driven two-level model.
+* ``examples/floquet/RiceMele.py`` -- a Rice--Mele model.
+* ``examples/floquet/Floquet_topological_phase_diagram.py`` -- a phase-diagram
+  workflow.
+* ``examples/test_cavity.py`` -- a cavity-QED smoke script.
+* ``examples/qchem/tddmrg_h2_threeway_compare.py`` -- a time-dependent DMRG
+  comparison.
+
+Read :doc:`pyqed.floquet`, :doc:`pyqed.polariton`, and :doc:`mps` before
+adapting them.
+
+Turn an example into evidence
+-----------------------------
+
+Before publishing a result derived from an example:
+
+* pin the PyQED release or full Git commit and record whether the tree changed;
+* preserve the exact input, random seed, units, basis or grid, backend, and
+  solver tolerances;
+* establish convergence with respect to every relevant numerical control;
+* compare a small case with an analytic or independent reference; and
+* use the :doc:`benchmarks` manifest for validation or performance claims.
+
+If an example fails, report the smallest reproducible command using the
+:doc:`support` checklist.

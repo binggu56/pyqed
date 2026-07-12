@@ -1,5 +1,6 @@
-Sphinx>=7.3,<9
-sphinx-rtd-theme>=2.0
+Sphinx>=8,<9
+pydata-sphinx-theme>=0.16,<0.20
+sphinx-copybutton>=0.5
 roman>=4.1
 
 numpy>=2.0

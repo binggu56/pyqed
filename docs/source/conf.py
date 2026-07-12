@@ -46,7 +46,12 @@ extensions = [
     'sphinx.ext.napoleon',
     'sphinx.ext.mathjax',
     'sphinx.ext.viewcode',
+    'sphinx_copybutton',
 ]
+
+# Copy runnable commands without their shell or interpreter prompts.
+copybutton_prompt_text = r'>>> |\.\.\. |\$ '
+copybutton_prompt_is_regexp = True
 
 #.. autoclass:: lime.oqs.LindbladSolver
 
@@ -93,7 +98,30 @@ autodoc_mock_imports = [
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'sphinx_rtd_theme'
+html_theme = 'pydata_sphinx_theme'
+html_title = 'PyQED User Guide'
+html_context = {
+    'default_mode': 'auto',
+}
+html_theme_options = {
+    'show_nav_level': 2,
+    'navigation_depth': 4,
+    'show_toc_level': 2,
+    'show_prev_next': True,
+    'navigation_with_keys': True,
+    'search_bar_text': 'Search the PyQED guide...',
+    'navbar_align': 'content',
+    'header_links_before_dropdown': 6,
+    'secondary_sidebar_items': ['page-toc', 'sourcelink'],
+    'icon_links': [
+        {
+            'name': 'GitHub',
+            'url': 'https://github.com/binggu56/pyqed',
+            'icon': 'fa-brands fa-square-github',
+            'type': 'fontawesome',
+        },
+    ],
+}
 
 # Consolidate Read the Docs aliases and historical versions around the public
 # documentation domain. Sphinx emits a per-page canonical link from this base.

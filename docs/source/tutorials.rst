@@ -5,6 +5,10 @@ PyQED is broad, so the safest route is to start with one small, inspectable
 workflow and follow its linked guide, example, and test.  The paths below do
 not imply that every combination of options is supported.
 
+Before choosing a method, read :doc:`guide/core_workflow` for the shared
+model--build--solve--inspect--validate lifecycle.  Each path below begins with
+a small calculation and then points toward the more specialized material.
+
 Quantum chemistry
 -----------------
 
@@ -22,12 +26,19 @@ GW and response calculations are separate advanced paths; begin with
 Grid and wavepacket dynamics
 ----------------------------
 
-1. Read the representation overview in :doc:`dvr`.
-2. Run ``examples/dvr/fedvr_harmonic_oscillator.py``.  It prints computed
-   eigenvalues beside the analytic harmonic-oscillator sequence.
-3. Compare grid families with ``examples/dvr/fedvr_vs_sine_quartic.py``.
-4. Move to ``examples/dvr/gwp_sddvr_2d_independent_ho.py`` only after the
-   one-dimensional smoke case is understood.
+1. Read :doc:`dvr`, including its boundary-condition and convergence advice.
+2. Run the maintained Sine-DVR smoke case:
+
+   .. code-block:: bash
+
+      PYTHONPATH=. python examples/dvr/sine_harmonic_oscillator.py
+
+   Its first four energies should be ``[0.5 1.5 2.5 3.5]``.
+3. Vary both the box and grid size until the states of interest are stable.
+4. Compare representations with ``examples/dvr/fedvr_vs_sine_quartic.py``
+   only after the one-dimensional Sine-DVR calculation is understood.
+5. Treat multidimensional and Shin--Metiu scripts as research workflows: read
+   the code and verify their model assumptions before execution.
 
 Nonadiabatic and geometric dynamics
 -----------------------------------
@@ -42,11 +53,19 @@ Nonadiabatic and geometric dynamics
 Open systems and spectroscopy
 -----------------------------
 
-1. Read :doc:`guide/guide_open_dynamics` and :doc:`heom` for open-system
-   conventions.
-2. Use ``examples/heom.py`` as an entry point, then inspect focused tests for
-   the exact solver path being used.
-3. For spectroscopy, read :doc:`guide/guide_spectroscopy` and inspect
+1. Read :doc:`guide/guide_open_dynamics` to choose between time-local master
+   equations and hierarchy-based dynamics.
+2. Run the compact, documented :doc:`HEOM <heom>` calculation:
+
+   .. code-block:: bash
+
+      PYTHONPATH=. python examples/heom_compact.py
+
+   It should finish with ``Final <sigma_z>: -0.96907844``.  Then vary the time
+   step and hierarchy depth before changing the physical model.
+3. Use ``examples/heom.py`` only when you need the longer exploratory script;
+   it contains historical comparison material and plotting imports.
+4. For spectroscopy, read :doc:`guide/guide_spectroscopy` and inspect
    ``examples/signals/absorption.py`` before the larger ``examples/2DES.py``
    workflow.
 
