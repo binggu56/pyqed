@@ -17,6 +17,14 @@ control can render that metadata.  A reproducible citation should include:
 * the repository URL, https://github.com/binggu56/pyqed; and
 * the access or release year required by the target citation style.
 
+The Zenodo software archive provides:
+
+* an all-versions DOI, https://doi.org/10.5281/zenodo.21316543; and
+* an exact v0.2.0 DOI, https://doi.org/10.5281/zenodo.21316544.
+
+Use the version-specific DOI when citing v0.2.0.  Use the all-versions DOI for
+a general PyQED citation that should resolve to the latest archived release.
+
 Project paper
 -------------
 
@@ -28,9 +36,9 @@ paper:
   Physics* (2026), https://doi.org/10.1063/1674-0068/cjcp2510161.
 
 The DOI above identifies the journal article, not an archived software
-release.  No software DOI is asserted in the repository at present.  If a
-future release is deposited in an archive, use the DOI shown by that specific
-archived release; do not reuse the article DOI.
+release.  It is distinct from both Zenodo software DOIs.  For a reproducible
+software citation, use the DOI shown by the specific archived release; do not
+reuse the article DOI.
 
 Method citations
 ----------------
