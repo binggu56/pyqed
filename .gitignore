@@ -5,6 +5,8 @@ build/
 dist/
 *.egg-info/
 .pytest_cache/
+# Keep generated plots, checkpoints, and numerical data out of example sources.
+examples/_outputs/
 *.pdf
 *.pyc
 *.npz
