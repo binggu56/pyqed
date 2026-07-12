@@ -111,10 +111,16 @@ Citing PyQED
 ------------
 
 Use the metadata in ``CITATION.cff`` and record the exact PyQED release or Git
-commit used.  No project DOI is asserted until one appears in an archived
-release.  See the `citation guide
-<https://docs.pyqed.org/en/latest/citing.html>`_ for a reproducibility
-checklist.
+commit used.  Also cite the project paper:
+
+  Yujuan Xie, Xiaotong Zhu, and Bing Gu, “PyQED: A Python Framework for
+  *Ab Initio* Geometric Quantum Dynamics,” *Chinese Journal of Chemical
+  Physics* (2026), https://doi.org/10.1063/1674-0068/cjcp2510161.
+
+The article DOI is distinct from any present or future software-archive DOI.
+See the `citation guide
+<https://docs.pyqed.org/en/latest/citing.html>`_ for method-citation and
+reproducibility guidance.
 
 License
 -------

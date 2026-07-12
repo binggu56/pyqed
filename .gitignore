@@ -29,6 +29,10 @@ pyqed/FCIDUMP
 pyqed/qchem/dvr/rhf-Bing的Mac Studio.py
 venv/
 .eggs/
+.tmp_*
+*-gugroup*
+*-Bing*MacBook Pro*
+*-Bing*Mac Studio*
 
 MacBook_local_data
 local_data

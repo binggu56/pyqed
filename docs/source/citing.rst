@@ -17,9 +17,20 @@ control can render that metadata.  A reproducible citation should include:
 * the repository URL, https://github.com/binggu56/pyqed; and
 * the access or release year required by the target citation style.
 
-No project DOI is asserted in the repository at present.  If a future release
-is deposited in an archive, use the DOI shown by that specific archived
-release; do not infer or reuse a placeholder DOI.
+Project paper
+-------------
+
+In addition to the exact software release or commit, cite the PyQED project
+paper:
+
+  Yujuan Xie, Xiaotong Zhu, and Bing Gu, “PyQED: A Python Framework for
+  *Ab Initio* Geometric Quantum Dynamics,” *Chinese Journal of Chemical
+  Physics* (2026), https://doi.org/10.1063/1674-0068/cjcp2510161.
+
+The DOI above identifies the journal article, not an archived software
+release.  No software DOI is asserted in the repository at present.  If a
+future release is deposited in an archive, use the DOI shown by that specific
+archived release; do not reuse the article DOI.
 
 Method citations
 ----------------

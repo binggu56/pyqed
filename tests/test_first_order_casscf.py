@@ -159,6 +159,29 @@ def test_second_order_orbital_pspace_prioritizes_critical_rotations():
     assert len(selected) == 3
 
 
+def test_second_order_batched_derivative_sigma_matches_direct_loop():
+    mf, mo_guess = _distorted_lih_reference()
+    mc = CASCI(mf, ncas=4, nelecas=4).run(
+        nstates=1,
+        mo_coeff=mo_guess,
+        method="direct_ci",
+    )
+    so = SecondOrderCASSCF(mf, ncas=4, nelecas=4)
+    h1_mo, eri_mo = so._get_integrals(mo_guess)
+    ci = mc.ci[0]
+
+    dh1_basis, deri_basis = so._active_integral_derivative_basis(mc, h1_mo, eri_mo)
+    reference = np.asarray(
+        [
+            so._make_active_sigma_casci(mc, dh1_basis[i], deri_basis[i]).ci_sigma(ci)
+            for i in range(dh1_basis.shape[0])
+        ]
+    )
+    batched = so._derivative_sigma_basis(mc, h1_mo, eri_mo, ci)
+
+    np.testing.assert_allclose(batched, reference, atol=1.0e-12)
+
+
 def test_davidson_augmented_hessian_can_return_diagnostics():
     grad = np.array([0.15, -0.05, 0.02])
     hdiag = np.array([0.8, 1.2, 1.5])
