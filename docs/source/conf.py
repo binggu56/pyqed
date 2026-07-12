@@ -45,6 +45,7 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.napoleon',
     'sphinx.ext.mathjax',
+    'sphinx.ext.viewcode',
 ]
 
 #.. autoclass:: lime.oqs.LindbladSolver
@@ -106,3 +107,4 @@ html_baseurl = os.environ.get(
 # so a file named "default.css" will overwrite the builtin "default.css".
 _static_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '_static'))
 html_static_path = ['../_static'] if os.path.isdir(_static_path) else []
+html_js_files = ['analytics.js'] if html_static_path else []
