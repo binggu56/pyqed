@@ -22,6 +22,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      - name: Reject unresolved merge markers
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> )' -- '*.py' '*.pyx' '*.rst' '*.md' '*.toml' '*.yml' '*.yaml'; then
+            echo "Unresolved merge-conflict markers found."
+            exit 1
+          fi
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -69,7 +75,7 @@ jobs:
         run: |
           python -m venv /tmp/pyqed-release
           /tmp/pyqed-release/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-release/bin/python -m pip install dist/pyqed-0.2.0-py3-none-any.whl
+          /tmp/pyqed-release/bin/python -m pip install dist/*.whl
           cd /tmp
           /tmp/pyqed-release/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
           /tmp/pyqed-release/bin/python -c 'from importlib.metadata import version; from importlib.util import find_spec; import pyqed; from pyqed.gw import BSE, GW, TDA; from pyqed.namd import TDDFTDriver; from pyqed.qchem import MP2, Molecule; from pyqed.qchem.dft import RKS; names=("pyqed.HEOM", "pyqed.HEOM.deom", "pyqed.floquet", "pyqed.gw", "pyqed.md", "pyqed.ml", "pyqed.namd", "pyqed.narg", "pyqed.mps.nonabelian", "pyqed.qchem.dft", "pyqed.qchem.mp"); assert pyqed.__version__ == version("pyqed"); assert all(find_spec(name) is not None for name in names); assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule, RKS, TDDFTDriver))'
