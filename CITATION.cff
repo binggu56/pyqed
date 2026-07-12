@@ -9,8 +9,6 @@ date-released: 2026-07-11
 authors:
   - family-names: Gu
     given-names: Bing
-  - family-names: Chen
-    given-names: Zihao
 repository-code: https://github.com/binggu56/pyqed
 url: https://pyqed.org
 license: MIT
