@@ -21,21 +21,22 @@ Start here
 
 * :doc:`installation` -- create an isolated environment and verify it.
 * :doc:`quickstart` -- run a native H2 restricted Hartree--Fock calculation.
+* :doc:`guide/guide` -- choose a scientific task from the complete user guide.
 * :doc:`tutorials` -- follow a task-oriented learning path.
 * :doc:`examples` -- find an executable repository example.
 * :doc:`capabilities` -- understand Beta and Experimental status.
 * :doc:`benchmarks` -- reproduce validation and performance evidence.
 * :doc:`citing` -- cite the exact code and method used.
 
-Method areas
-------------
+User guide
+----------
 
-The development tree contains workflows for quantum chemistry, discrete and
-finite-element variable representations, nonadiabatic and geometric dynamics,
-open-system dynamics, spectroscopy, Floquet models, light--matter coupling,
-and tensor-network methods.  The presence of a module does not by itself mean
-that every configuration is supported; the capability table links each area
-to its current documentation, examples, and tests.
+The :doc:`PyQED user guide <guide/guide>` is the main map of the documentation.
+It groups existing material into foundations, electronic structure, quantum
+dynamics, open systems, light--matter models, and tensor networks.  Start with
+:doc:`how PyQED calculations work <guide/core_workflow>` if you are moving
+between method families: it explains the shared model--build--solve--validate
+workflow without making you learn every module first.
 
 .. toctree::
    :maxdepth: 2
@@ -43,42 +44,15 @@ to its current documentation, examples, and tests.
 
    installation
    quickstart
+   guide/guide
    tutorials
    examples
 
 .. toctree::
    :maxdepth: 2
-   :caption: Concepts and user guides
-
-   theory
-   guide/guide
-   backends
-   qchem
-   hf_analysis
-   mp2_comp2
-   gw_bse
-   tddft_ehrenfest
-   mps
-   dvr
-   geometric_quantum_dynamics
-   pyqed.floquet
-   pyqed.models
-   pyqed.namd
-   pyqed.polariton
-   heom
-
-.. toctree::
-   :maxdepth: 2
-   :caption: API and implementation
+   :caption: Reference and evidence
 
    api
-   qchem_architecture
-   nonabelian_dmrg_design
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Evidence and citation
-
    capabilities
    benchmarks
    citing

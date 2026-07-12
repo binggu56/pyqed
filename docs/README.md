@@ -1,61 +1,28 @@
-# Welcome to LIght-Matter Everything!
+# PyQED documentation
 
-The ultimate goal is to provide a simple-to-use package to study how light interacts with matter.  
+The public user guide is built from the reStructuredText sources in
+`docs/source/` with Sphinx. Read the Docs uses `.readthedocs.yaml` and
+`docs/requirements.txt` from the repository root.
 
-Check manual.pdf for documentation! 
+Build the same strict HTML documentation locally from the repository root:
 
-Main modules
+```bash
+python -m pip install -r docs/requirements.txt
+python -m sphinx -W --keep-going -b html docs/source /tmp/pyqed-docs
+```
 
-# Nonlinear molecular spectroscopy 
-* sum-of-states for multilevel system
+Open `/tmp/pyqed-docs/index.html` after the build succeeds.
 
-Pros: computationally cheap 
-Cons: decay is introduced phenomelogically; pure dephasing cannot be addressed 
+Documentation principles:
 
-* correlation function approach --  Direct computing the many-point correlation functions with the quantum regression theorem 
+- Keep one canonical page for each method and link to it from the guide hub.
+- Put a minimal runnable example and expected result near the top of a method
+  page.
+- State units, convergence controls, limitations, maturity, and optional
+  dependencies explicitly.
+- Use `literalinclude` for tracked examples when practical so code on the web
+  stays synchronized with executable files.
+- Run the strict Sphinx command above before submitting documentation changes.
 
-
-Valid for open quantum systems where environment effects can be rigirously described with open quantum system techniques. 
-
-Visulize with double-sided Feynman diagrams instead of the time-loop diagrams. 
-
-
-* non-perturbative approah -- valid for ALL systems provided the quantum dynamics can be compuated 
-
-Simulating the laser-driven dynamics including explicitly all laser pulses    
-
-# Molecular quantum dynamics 
-- Wavepacket dynamics 
--- Split-operator method 
-
-- Nonadiabatic dynamics 
-- Split-operator method 
-
-For the exact nonadiabatic dynamics of vibronic models in the diabatic representation. 
-
-# Semiclassical quantum trajectory method 
-
-# Quantum chemistry 
-
-# Open quantum systems 
-- Lindblad quantum master equation
-- Redfield theory  
-- second-order time-convolutionless master equation 
-- hierarchical equation of motion 
-
-# Quantum transport 
-- Landauer transport 
-
-# Soid state materials 
-- Band structure from tight-binding Hamiltonians 
-
-# Periodically driven matter 
-- Floquet spectrum 
-
-# Others 
-- Schmidt decomposition 
-
-
-
-
-
+The project overview at `pyqed.org` should remain concise; detailed scientific
+guidance belongs here and is published at `docs.pyqed.org`.
