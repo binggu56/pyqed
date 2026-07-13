@@ -87,8 +87,9 @@ ued = [
 ]
 docs = [
     "Sphinx>=7.3,<9",
+    "pydata-sphinx-theme>=0.16",
     "roman>=4.1",
-    "sphinx-rtd-theme>=2.0",
+    "sphinx-copybutton>=0.5.2",
 ]
 test = [
     "build>=1.2",
