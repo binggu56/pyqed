@@ -32,6 +32,11 @@ def is_positive_def(a):
 
 
 _LAZY_ATTRS = {
+    "view": ("pyqed.visualization", "view"),
+    "MoleculeView": ("pyqed.visualization", "MoleculeView"),
+    "ScalarField3D": ("pyqed.visualization", "ScalarField3D"),
+    "SceneView": ("pyqed.visualization", "SceneView"),
+    "VolumeView": ("pyqed.visualization", "VolumeView"),
     "Mol": ("pyqed.mol", "Mol"),
     "Result": ("pyqed.mol", "Result"),
     "Molecule": ("pyqed.qchem", "Molecule"),

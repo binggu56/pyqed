@@ -1234,6 +1234,12 @@ class Molecule:
     def atom_symbols(self):
         return [self.atom_symbol(i) for i in range(self.natom)]
 
+    def view(self, **kwargs):
+        """Show this molecule in PyQED's interactive 3D viewer."""
+        from pyqed.visualization import view
+
+        return view(self, **kwargs)
+
     def _set_builtin_options(self, options):
         """
         Apply builtin backend options and keep legacy aliases in sync.

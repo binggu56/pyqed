@@ -1,5 +1,20 @@
 # Third-party notices
 
+## Website molecular viewer
+
+### 3Dmol.js 2.5.5
+
+The interactive molecular-field viewer served by `pyqed.org` uses 3Dmol.js
+version 2.5.5. 3Dmol.js is distributed under the BSD 3-Clause license and
+incorporates code from GLmol, Three.js, and jQuery under the terms reproduced
+in the upstream license file.
+
+- Project: https://3dmol.org/
+- Source: https://github.com/3dmol/3Dmol.js/tree/v2.5.5
+- Package: https://www.npmjs.com/package/3dmol/v/2.5.5
+- License and incorporated-code notices:
+  `website/public/licenses/3dmol-2.5.5-LICENSE.txt`
+
 ## Basis-set data
 
 ### Basis Set Exchange collection
