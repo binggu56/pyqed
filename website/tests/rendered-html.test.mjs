@@ -106,6 +106,21 @@ test("exports the release-pinned examples library", async () => {
   assert.doesNotMatch(html, /chatgpt\.site/i);
 });
 
+test("exports the interactive molecular viewer", async () => {
+  const html = await page("/viewer");
+  const viewerSource = await readFile(
+    new URL("app/viewer/molecule-viewer.tsx", projectRoot),
+    "utf8",
+  );
+
+  assert.match(html, /<title>Interactive Molecular Viewer \| PyQED<\/title>/i);
+  assert.match(html, /Interactive Molecular Viewer/i);
+  assert.match(html, /rel="canonical" href="https:\/\/pyqed\.org\/viewer\/?"/i);
+  assert.match(viewerSource, /window\.location\.hash/);
+  assert.match(viewerSource, /parameters\.get\("xyz"\)/);
+  assert.match(viewerSource, /representation/);
+});
+
 test("uses a static, repository-owned deployment", async () => {
   const [layout, copyButton, privacy, nextConfig, packageText, workflow] =
     await Promise.all([
@@ -132,6 +147,7 @@ test("uses a static, repository-owned deployment", async () => {
   for (const artifact of [
     "index.html",
     "examples/index.html",
+    "viewer/index.html",
     "privacy/index.html",
     "robots.txt",
     "sitemap.xml",

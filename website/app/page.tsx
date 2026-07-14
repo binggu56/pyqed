@@ -259,6 +259,7 @@ const softwareJsonLd = {
 
 const navigation = [
   ["Workflows", "#workflows"],
+  ["Viewer", "/viewer"],
   ["Quickstart", "#quickstart"],
   ["Examples", "/examples"],
   ["Evidence", "#evidence"],
