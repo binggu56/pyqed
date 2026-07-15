@@ -31,6 +31,25 @@ export type VolumeField = {
   range: [number, number];
 };
 
+export type NormalMode = {
+  name: string;
+  label: string;
+  sourceIndex?: number;
+  frequencyCm1: number;
+  shape: [number, 3];
+  displacements: Float32Array;
+  normalization: "max-atom-displacement";
+  reducedMassAmu?: number;
+  intensity?: number;
+  intensityUnit?: string;
+};
+
+export type NormalModeCollection = {
+  modes: NormalMode[];
+  activeModeIndex: number;
+  amplitudeAngstrom: number;
+};
+
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export type ValidatedScene = {
@@ -41,27 +60,32 @@ export type ValidatedScene = {
     representation: "ball-stick" | "space-fill" | "wireframe";
     labels: boolean;
   } | null;
-  vibration: {
-    modeIndex: number;
-    frequencyCm1: number;
-    displacements: [number, number, number][];
-    amplitudeAngstrom: number;
-    frames: number;
-    interval: number;
-  } | null;
   fields: VolumeField[];
   activeFieldIndex: number;
+  normalModes: NormalModeCollection | null;
 };
 
 export const BOHR_TO_ANGSTROM: number;
 export const MAX_ATOMS: number;
 export const MAX_FIELDS: number;
+export const MAX_NORMAL_MODES: number;
+export const MAX_NORMAL_MODE_COMPONENTS: number;
 export const MAX_GRID_POINTS: number;
 export const MAX_TOTAL_GRID_POINTS: number;
 export const MAX_CUBE_FILE_BYTES: number;
 
 export function parseGeometry(text: string, unit?: "angstrom" | "bohr"): Atom[];
 export function xyzFor(atoms: Atom[], comment?: string): string;
+export function displacedAtoms(
+  atoms: Atom[],
+  mode: NormalMode | undefined,
+  amplitudeAngstrom: number,
+  phase: number,
+): Atom[];
+export function symmetricNormalModeFrame(
+  phase: number,
+  frameSteps?: number,
+): { frame: number; displacementScale: number };
 export function validateSceneMessage(message: unknown): ValidatedScene;
 export function parseCube(text: string, options?: { fileName?: string }): ValidatedScene;
 export function suggestIsovalue(values: Iterable<number>, kind?: FieldKind): number;

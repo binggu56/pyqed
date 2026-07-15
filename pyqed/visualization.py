@@ -13,6 +13,7 @@ import base64
 from dataclasses import dataclass, field
 from html import escape
 import json
+from numbers import Integral
 from pathlib import Path
 import re
 import tempfile
@@ -32,13 +33,18 @@ _SCENE_KIND = "pyqed-scene"
 _SCENE_VERSION = 1
 _MAX_ATOMS = 500
 _MAX_FIELDS = 512
+_MAX_NORMAL_MODES = 512
 _MAX_AXIS_SIZE = 2048
 _MAX_FIELD_POINTS = 2_000_000
 _MAX_SCENE_POINTS = 8_000_000
+_MAX_MODE_COMPONENTS = _MAX_NORMAL_MODES * _MAX_ATOMS * 3
 _MAX_SERIALIZED_BYTES = 64_000_000
 _MAX_CUBE_BYTES = 80_000_000
 _MAX_GEOMETRY_CHARS = 1_000_000
 _MAX_FLOAT32 = float(np.finfo(np.float32).max)
+_MAX_SAFE_INTEGER = (1 << 53) - 1
+_MIN_MODE_AMPLITUDE_ANGSTROM = 0.01
+_MAX_MODE_AMPLITUDE_ANGSTROM = 10.0
 _COLOR_PATTERN = re.compile(
     r"^(?:#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8}|[a-z][a-z0-9_-]{0,31})$",
     re.IGNORECASE,
@@ -167,15 +173,28 @@ def _validate_xyz_payload(xyz: str) -> str:
     return xyz
 
 
-def _xyz_from_arrays(symbols, coordinates_angstrom) -> str:
+def _xyz_atom_count(xyz: str) -> int:
+    """Return the atom count from an already validated XYZ payload."""
+    raw_lines = [line.strip() for line in xyz.strip().splitlines()]
+    if raw_lines[0].isdigit():
+        return int(raw_lines[0])
+    return sum(
+        1
+        for line in raw_lines
+        for row in line.split(";")
+        if row.strip()
+    )
+
+
+def _xyz_from_arrays(symbols, coordinates, *, coordinates_unit: str = "angstrom") -> str:
     class _ArrayMolecule:
         def atom_symbols(self):
             return symbols
 
         def atom_coords(self):
-            return coordinates_angstrom
+            return coordinates
 
-    return _molecule_xyz(_ArrayMolecule(), coordinates_unit="angstrom")
+    return _molecule_xyz(_ArrayMolecule(), coordinates_unit=coordinates_unit)
 
 
 def _in_notebook() -> bool:
@@ -303,6 +322,148 @@ def _metadata_payload(value):
     if isinstance(value, tuple):
         return [_metadata_payload(entry) for entry in value]
     return value
+
+
+def _clean_line_text(value, *, name: str, maximum: int) -> str:
+    text = str(value).strip()
+    if not text or len(text) > maximum or any(
+        ord(character) < 32 or ord(character) == 127 for character in text
+    ):
+        raise ValueError(
+            f"{name} must fit on one line and contain at most {maximum} characters"
+        )
+    return text
+
+
+@dataclass(frozen=True)
+class NormalMode:
+    """One normalized Cartesian displacement pattern for the web viewer.
+
+    ``displacements`` has shape ``(natom, 3)``.  Its overall normalization is
+    arbitrary in harmonic analysis, so the stored vectors are rescaled such
+    that the largest per-atom norm is one.  :class:`SceneView` supplies the
+    visual display amplitude separately in Angstrom.
+    """
+
+    name: str
+    displacements: np.ndarray
+    frequency_cm1: float
+    label: str | None = None
+    reduced_mass_amu: float | None = None
+    intensity: float | None = None
+    intensity_unit: str | None = None
+    source_index: int | None = None
+
+    def __post_init__(self) -> None:
+        name = _clean_line_text(self.name, name="normal-mode name", maximum=80)
+        label = name if self.label is None else _clean_line_text(
+            self.label,
+            name="normal-mode label",
+            maximum=120,
+        )
+        displacements = _real_array(
+            self.displacements,
+            name=f"normal mode {name!r} displacements",
+        )
+        if (
+            displacements.ndim != 2
+            or displacements.shape[1:] != (3,)
+            or not 1 <= displacements.shape[0] <= _MAX_ATOMS
+        ):
+            raise ValueError(
+                "normal-mode displacements must have shape (natom, 3) with "
+                f"1 <= natom <= {_MAX_ATOMS}"
+            )
+        if np.max(np.abs(displacements), initial=0.0) > _MAX_FLOAT32:
+            raise ValueError("normal-mode displacements must fit in float32")
+        maximum_norm = float(np.max(np.linalg.norm(displacements, axis=1)))
+        if maximum_norm <= np.finfo(np.float32).tiny:
+            raise ValueError("normal-mode displacements cannot all be zero")
+        displacements = np.asarray(displacements / maximum_norm, dtype=np.float32)
+        displacements.setflags(write=False)
+
+        frequency = float(self.frequency_cm1)
+        if not np.isfinite(frequency) or abs(frequency) > _MAX_FLOAT32:
+            raise ValueError("frequency_cm1 must be a finite 32-bit value")
+
+        reduced_mass = self.reduced_mass_amu
+        if reduced_mass is not None:
+            reduced_mass = float(reduced_mass)
+            if (
+                not np.isfinite(reduced_mass)
+                or reduced_mass <= 0.0
+                or reduced_mass > _MAX_FLOAT32
+            ):
+                raise ValueError("reduced_mass_amu must be positive and finite")
+
+        intensity = self.intensity
+        if intensity is not None:
+            intensity = float(intensity)
+            if (
+                not np.isfinite(intensity)
+                or intensity < 0.0
+                or intensity > _MAX_FLOAT32
+            ):
+                raise ValueError("normal-mode intensity must be non-negative and finite")
+        intensity_unit = self.intensity_unit
+        if intensity_unit is not None:
+            if intensity is None:
+                raise ValueError("intensity_unit requires an intensity")
+            intensity_unit = _clean_line_text(
+                intensity_unit,
+                name="normal-mode intensity unit",
+                maximum=40,
+            )
+
+        source_index = self.source_index
+        if source_index is not None:
+            if isinstance(source_index, (bool, np.bool_)) or not isinstance(
+                source_index,
+                Integral,
+            ):
+                raise TypeError("source_index must be a non-negative integer")
+            integer = int(source_index)
+            if integer < 0 or integer > _MAX_SAFE_INTEGER:
+                raise ValueError(
+                    "source_index must be a non-negative JavaScript-safe integer"
+                )
+            source_index = integer
+
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "displacements", displacements)
+        object.__setattr__(self, "frequency_cm1", frequency)
+        object.__setattr__(self, "reduced_mass_amu", reduced_mass)
+        object.__setattr__(self, "intensity", intensity)
+        object.__setattr__(self, "intensity_unit", intensity_unit)
+        object.__setattr__(self, "source_index", source_index)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(int(size) for size in self.displacements.shape)
+
+    def to_payload(self) -> dict[str, Any]:
+        encoded = base64.b64encode(
+            np.asarray(self.displacements, dtype="<f4").ravel(order="C").tobytes()
+        ).decode("ascii")
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "label": self.label,
+            "frequency_cm1": self.frequency_cm1,
+            "shape": list(self.shape),
+            "displacements": encoded,
+            "displacement_encoding": "float32-le-base64",
+            "normalization": "max-atom-displacement",
+        }
+        if self.reduced_mass_amu is not None:
+            payload["reduced_mass_amu"] = self.reduced_mass_amu
+        if self.intensity is not None:
+            payload["intensity"] = self.intensity
+        if self.intensity_unit is not None:
+            payload["intensity_unit"] = self.intensity_unit
+        if self.source_index is not None:
+            payload["source_index"] = self.source_index
+        return payload
 
 
 @dataclass(frozen=True)
@@ -457,74 +618,21 @@ def _viewer_origin(viewer_url: str) -> str:
     return origin
 
 
-@dataclass(frozen=True)
-class NormalModeAnimation:
-    """Browser-ready displacement data for one harmonic normal mode."""
-
-    mode_index: int
-    frequency_cm1: float
-    displacements: np.ndarray
-    amplitude_angstrom: float
-    frames: int = 24
-    interval: int = 30
-
-    def __post_init__(self) -> None:
-        mode_index = int(self.mode_index)
-        frequency = float(self.frequency_cm1)
-        displacements = np.array(self.displacements, dtype=float, copy=True)
-        amplitude = float(self.amplitude_angstrom)
-        frames = int(self.frames)
-        interval = int(self.interval)
-        if mode_index < 0:
-            raise ValueError("mode_index must be non-negative")
-        if not np.isfinite(frequency):
-            raise ValueError("frequency_cm1 must be finite")
-        if displacements.ndim != 2 or displacements.shape[1] != 3:
-            raise ValueError("normal-mode displacements must have shape (natom, 3)")
-        if not np.all(np.isfinite(displacements)):
-            raise ValueError("normal-mode displacements must be finite")
-        if not np.isfinite(amplitude) or amplitude <= 0.0 or amplitude > 10.0:
-            raise ValueError("amplitude_angstrom must be in the interval (0, 10]")
-        if frames < 8 or frames > 120:
-            raise ValueError("frames must be between 8 and 120")
-        if interval < 16 or interval > 1000:
-            raise ValueError("interval must be between 16 and 1000 milliseconds")
-        displacements.setflags(write=False)
-        object.__setattr__(self, "mode_index", mode_index)
-        object.__setattr__(self, "frequency_cm1", frequency)
-        object.__setattr__(self, "displacements", displacements)
-        object.__setattr__(self, "amplitude_angstrom", amplitude)
-        object.__setattr__(self, "frames", frames)
-        object.__setattr__(self, "interval", interval)
-
-    @property
-    def label(self) -> str:
-        return f"Mode {self.mode_index}: {self.frequency_cm1:.1f} cm^-1"
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "mode_index": self.mode_index,
-            "frequency_cm1": self.frequency_cm1,
-            "displacements": self.displacements.tolist(),
-            "amplitude_angstrom": self.amplitude_angstrom,
-            "frames": self.frames,
-            "interval": self.interval,
-        }
-
-
 @dataclass
 class SceneView:
-    """A geometry and zero or more regular scalar fields for the web viewer."""
+    """A geometry with optional scalar fields or normal modes."""
 
     xyz: str | None = None
     fields: tuple[ScalarField3D, ...] = ()
+    normal_modes: tuple[NormalMode, ...] = ()
     representation: str = "ball-stick"
     labels: bool = False
     width: int = 900
     height: int = 640
     title: str | None = None
     active_field: str | int | None = None
-    vibration: NormalModeAnimation | None = None
+    active_mode: str | int | None = None
+    mode_amplitude: float = 0.25
     viewer_url: str = _VIEWER_URL
 
     def __post_init__(self) -> None:
@@ -541,6 +649,19 @@ class SceneView:
             raise ValueError(f"a scene can contain at most {_MAX_FIELDS} fields")
         if sum(item.values.size for item in self.fields) > _MAX_SCENE_POINTS:
             raise ValueError(f"scene exceeds the {_MAX_SCENE_POINTS:,}-point limit")
+        self.normal_modes = tuple(self.normal_modes)
+        if any(not isinstance(item, NormalMode) for item in self.normal_modes):
+            raise TypeError("normal_modes must contain NormalMode objects")
+        if len(self.normal_modes) > _MAX_NORMAL_MODES:
+            raise ValueError(
+                f"a scene can contain at most {_MAX_NORMAL_MODES} normal modes"
+            )
+        if sum(item.displacements.size for item in self.normal_modes) > _MAX_MODE_COMPONENTS:
+            raise ValueError(
+                f"normal modes exceed the {_MAX_MODE_COMPONENTS:,}-component limit"
+            )
+        if self.fields and self.normal_modes:
+            raise ValueError("normal modes cannot be combined with scalar fields")
         names = [item.name for item in self.fields]
         if len(names) != len(set(names)):
             raise ValueError("field names must be unique within a scene")
@@ -574,15 +695,53 @@ class SceneView:
                 self.active_field = index
         elif self.fields:
             self.active_field = self.fields[0].name
+        mode_names = [item.name for item in self.normal_modes]
+        if len(mode_names) != len(set(mode_names)):
+            raise ValueError("normal-mode names must be unique within a scene")
+        if self.active_mode is not None:
+            if isinstance(self.active_mode, str):
+                if self.active_mode not in mode_names:
+                    raise ValueError(
+                        f"active_mode {self.active_mode!r} is not in the scene"
+                    )
+            else:
+                if isinstance(self.active_mode, (bool, np.bool_)) or not isinstance(
+                    self.active_mode,
+                    Integral,
+                ):
+                    raise TypeError("active_mode must be a mode name or integer index")
+                index = int(self.active_mode)
+                if index < 0 or index >= len(self.normal_modes):
+                    raise IndexError("active_mode index is out of range")
+                self.active_mode = self.normal_modes[index].name
+        elif self.normal_modes:
+            self.active_mode = self.normal_modes[0].name
+        if isinstance(self.mode_amplitude, (bool, np.bool_)):
+            raise TypeError("mode_amplitude must be a positive number in Angstrom")
+        self.mode_amplitude = float(self.mode_amplitude)
+        if (
+            not np.isfinite(self.mode_amplitude)
+            or not _MIN_MODE_AMPLITUDE_ANGSTROM
+            <= self.mode_amplitude
+            <= _MAX_MODE_AMPLITUDE_ANGSTROM
+        ):
+            raise ValueError(
+                "mode_amplitude must lie in ["
+                f"{_MIN_MODE_AMPLITUDE_ANGSTROM:g}, "
+                f"{_MAX_MODE_AMPLITUDE_ANGSTROM:g}] Angstrom"
+            )
+        if self.normal_modes and self.xyz is None:
+            raise ValueError("normal modes require molecular geometry")
         if self.xyz is None and not self.fields:
             raise ValueError("a scene must contain geometry or at least one scalar field")
         if self.xyz is not None:
             self.xyz = _validate_xyz_payload(self.xyz)
-        if self.vibration is not None:
-            if not isinstance(self.vibration, NormalModeAnimation):
-                raise TypeError("vibration must be a NormalModeAnimation")
-            if self.xyz is None:
-                raise ValueError("normal-mode animation requires molecular geometry")
+        if self.normal_modes:
+            atom_count = _xyz_atom_count(self.xyz)
+            if any(item.shape != (atom_count, 3) for item in self.normal_modes):
+                raise ValueError(
+                    "each normal mode must contain one displacement vector per atom"
+                )
         if self.title is not None:
             self.title = str(self.title).strip()
             if not self.title or len(self.title) > 160 or any(
@@ -595,11 +754,11 @@ class SceneView:
     def url(self) -> str:
         """Return the direct viewer URL.
 
-        Only geometry-only scenes use the legacy fragment.  Volumetric data is
-        deliberately absent from this property and is transported by
+        Only geometry-only scenes use the legacy fragment.  Volumetric and
+        normal-mode data is deliberately absent here and is transported by
         :meth:`open` or :meth:`_repr_html_` using ``postMessage``.
         """
-        if self.fields or self.vibration is not None:
+        if self.fields or self.normal_modes:
             return self.viewer_url
         fragment = urlencode(
             {
@@ -624,10 +783,14 @@ class SceneView:
             "fields": [item.to_payload() for item in self.fields],
             "active_field": self.active_field,
         }
-        if self.vibration is not None:
-            scene["vibration"] = self.vibration.to_payload()
         if self.title:
             scene["title"] = self.title
+        if self.normal_modes:
+            scene["normal_modes"] = {
+                "modes": [item.to_payload() for item in self.normal_modes],
+                "active_mode": self.active_mode,
+                "amplitude_angstrom": self.mode_amplitude,
+            }
         return scene
 
     def _encoded_payload(self) -> str:
@@ -685,7 +848,7 @@ class SceneView:
 
     def open(self) -> bool:
         """Open the scene in the default browser."""
-        if not self.fields and self.vibration is None:
+        if not self.fields and not self.normal_modes:
             return webbrowser.open_new_tab(self.url)
         handle = tempfile.NamedTemporaryFile(
             mode="w",
@@ -708,7 +871,7 @@ class SceneView:
 
     def _repr_html_(self) -> str:
         """Render the interactive viewer inline in a Jupyter frontend."""
-        if self.fields or self.vibration is not None:
+        if self.fields or self.normal_modes:
             return self._launcher_html(full_page=False)
         src = escape(self.url, quote=True)
         return (
@@ -741,97 +904,6 @@ def _molecule_from_object(obj):
         if candidate is not None and callable(getattr(candidate, "atom_coords", None)):
             return candidate
     raise TypeError("could not find molecular geometry on the supplied object")
-
-
-def _normal_mode_animation(
-    hessian,
-    molecule,
-    *,
-    mode,
-    amplitude,
-    coordinates_unit,
-    frames,
-    interval,
-) -> NormalModeAnimation:
-    analysis_method = getattr(hessian, "vibrational_analysis", None)
-    if not callable(analysis_method):
-        raise TypeError("mode viewing requires a completed Hessian object")
-    try:
-        analysis = analysis_method()
-    except ValueError as exc:
-        raise ValueError(
-            "run the Hessian calculation before calling view(hessian, mode=...)"
-        ) from exc
-    if not isinstance(analysis, Mapping):
-        raise TypeError("vibrational_analysis() must return a mapping")
-
-    raw_modes = analysis.get("modes", analysis.get("norm_mode"))
-    if raw_modes is None:
-        raise ValueError("vibrational analysis did not return normal modes")
-    modes = np.asarray(raw_modes, dtype=float)
-    if modes.ndim != 3 or modes.shape[2] != 3:
-        raise ValueError("normal modes must have shape (nmodes, natom, 3)")
-    if isinstance(mode, (bool, np.bool_)):
-        raise TypeError("mode must be an integer index")
-    mode_index = int(mode)
-    if mode_index != mode:
-        raise TypeError("mode must be an integer index")
-    if mode_index < 0 or mode_index >= modes.shape[0]:
-        raise IndexError(f"mode index {mode_index} is outside [0, {modes.shape[0]})")
-
-    coordinates = np.asarray(molecule.atom_coords(), dtype=float)
-    displacement = np.asarray(modes[mode_index], dtype=float)
-    if displacement.shape != coordinates.shape:
-        raise ValueError("normal-mode shape does not match the molecule")
-    if not np.all(np.isfinite(displacement)):
-        raise ValueError("normal-mode displacements must be finite")
-    maximum = float(np.max(np.linalg.norm(displacement, axis=1)))
-    if maximum <= np.finfo(float).eps:
-        raise ValueError("selected normal mode has zero displacement")
-
-    unit = str(coordinates_unit).lower()
-    if unit in {"bohr", "b", "au", "a.u."}:
-        coordinates_angstrom = coordinates * au2angstrom
-    elif unit in {"angstrom", "angstroms", "a", "å"}:
-        coordinates_angstrom = coordinates
-    else:
-        raise ValueError("coordinates_unit must be 'bohr' or 'angstrom'")
-    if amplitude == "auto":
-        span = float(np.max(np.ptp(coordinates_angstrom, axis=0)))
-        amplitude_angstrom = min(0.5, max(0.12, 0.18 * max(span, 1.0)))
-    else:
-        amplitude_angstrom = float(amplitude)
-        if (
-            not np.isfinite(amplitude_angstrom)
-            or amplitude_angstrom <= 0.0
-            or amplitude_angstrom > 10.0
-        ):
-            raise ValueError("amplitude must be 'auto' or a value in (0, 10] angstrom")
-    displacement_angstrom = displacement * (amplitude_angstrom / maximum)
-
-    if "freq_cm1" in analysis:
-        frequencies = analysis["freq_cm1"]
-    elif "freq_wavenumber" in analysis:
-        frequencies = analysis["freq_wavenumber"]
-    elif "freq_au" in analysis:
-        frequencies = np.asarray(analysis["freq_au"]) * au2wavenumber
-    else:
-        raise ValueError("vibrational analysis did not return frequencies")
-    frequencies = np.asarray(frequencies)
-    if frequencies.shape != (modes.shape[0],):
-        raise ValueError("vibrational frequencies do not match the normal modes")
-    frequency = np.real_if_close(frequencies[mode_index])
-    if np.iscomplexobj(frequency):
-        frequency = frequency.real - abs(frequency.imag)
-
-    return NormalModeAnimation(
-        mode_index=mode_index,
-        frequency_cm1=float(frequency),
-        displacements=displacement_angstrom,
-        amplitude_angstrom=amplitude_angstrom,
-        frames=frames,
-        interval=interval,
-    )
 
 
 def _scf_reference(obj):
@@ -1677,6 +1749,314 @@ def _nto_fields(
     return result
 
 
+def _mapping_first(data: Mapping[str, Any], names: tuple[str, ...]):
+    for name in names:
+        if name in data and data[name] is not None:
+            return data[name]
+    return None
+
+
+def _normal_mode_source_mapping(obj, *, _seen=None) -> Mapping[str, Any]:
+    """Return harmonic-analysis arrays without triggering a new calculation."""
+    if isinstance(obj, Mapping):
+        return obj
+
+    if _seen is None:
+        _seen = set()
+    marker = id(obj)
+    if marker in _seen:
+        raise TypeError("normal-mode source references itself")
+    _seen.add(marker)
+
+    public_frequencies = getattr(obj, "frequencies", None)
+    public_modes = getattr(obj, "modes", None)
+    if public_modes is None:
+        candidate = getattr(obj, "normal_modes", None)
+        if not callable(candidate):
+            public_modes = candidate
+    if (
+        public_frequencies is not None
+        and not callable(public_frequencies)
+        and public_modes is not None
+        and not callable(public_modes)
+    ):
+        return {
+            "frequencies": public_frequencies,
+            "modes": public_modes,
+            "reduced_mass_amu": getattr(
+                obj,
+                "reduced_masses",
+                getattr(obj, "reduced_mass", None),
+            ),
+            "intensities": getattr(obj, "intensities", None),
+            "frequency_unit": getattr(obj, "frequency_unit", "cm^-1"),
+            "intensity_unit": getattr(obj, "intensity_unit", None),
+        }
+
+    private_frequencies = getattr(obj, "_frequencies", None)
+    private_modes = getattr(obj, "_modes", None)
+    if private_frequencies is not None and private_modes is not None:
+        return {
+            "frequencies": private_frequencies,
+            "modes": private_modes,
+            "reduced_mass_amu": getattr(obj, "_reduced_masses", None),
+            "intensities": getattr(obj, "_intensities", None),
+            "frequency_unit": getattr(obj, "frequency_unit", "cm^-1"),
+            "intensity_unit": getattr(obj, "intensity_unit", None),
+        }
+
+    analysis = getattr(obj, "vibrational_analysis", None)
+    if callable(analysis):
+        data = analysis()
+        if not isinstance(data, Mapping):
+            raise TypeError("vibrational_analysis() must return a mapping")
+        return data
+
+    backend = getattr(obj, "backend", None)
+    if backend is not None:
+        return _normal_mode_source_mapping(backend, _seen=_seen)
+
+    raise TypeError(
+        "normal_modes requires completed harmonic data, an IR object, or a "
+        "completed Hessian with vibrational_analysis()"
+    )
+
+
+def _signed_frequency_array(values, *, name: str) -> np.ndarray:
+    try:
+        array = np.asarray(values, dtype=complex)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must contain numeric values") from exc
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    real = array.real
+    imaginary = array.imag
+    scale = np.maximum(1.0, np.maximum(np.abs(real), np.abs(imaginary)))
+    real_frequency = np.abs(imaginary) <= 1.0e-10 * scale
+    imaginary_frequency = np.abs(real) <= 1.0e-10 * scale
+    if np.any(~(real_frequency | imaginary_frequency)):
+        raise ValueError(
+            f"{name} may contain real or purely imaginary frequencies, not mixed values"
+        )
+    result = np.where(real_frequency, real, -np.abs(imaginary)).astype(float)
+    if not np.all(np.isfinite(result)) or np.max(np.abs(result), initial=0.0) > _MAX_FLOAT32:
+        raise ValueError(f"{name} must contain finite 32-bit values")
+    return result
+
+
+def _frequencies_cm1(data: Mapping[str, Any]) -> np.ndarray:
+    if "freq_cm1" in data and data["freq_cm1"] is not None:
+        return _signed_frequency_array(data["freq_cm1"], name="freq_cm1")
+    if "freq_wavenumber" in data and data["freq_wavenumber"] is not None:
+        return _signed_frequency_array(
+            data["freq_wavenumber"],
+            name="freq_wavenumber",
+        )
+    if "freq_au" in data and data["freq_au"] is not None:
+        values = _signed_frequency_array(data["freq_au"], name="freq_au")
+        converted = values * au2wavenumber
+        if np.max(np.abs(converted), initial=0.0) > _MAX_FLOAT32:
+            raise ValueError("converted frequencies must fit in float32")
+        return converted
+
+    values = _mapping_first(data, ("frequencies", "freq"))
+    if values is None:
+        raise ValueError("harmonic data must include vibrational frequencies")
+    frequencies = _signed_frequency_array(values, name="frequencies")
+    unit = str(data.get("frequency_unit", "cm^-1")).strip().lower()
+    if unit in {"cm^-1", "cm-1", "wavenumber", "wavenumbers", "1/cm"}:
+        return frequencies
+    if unit in {"au", "a.u.", "hartree", "eh"}:
+        converted = frequencies * au2wavenumber
+        if np.max(np.abs(converted), initial=0.0) > _MAX_FLOAT32:
+            raise ValueError("converted frequencies must fit in float32")
+        return converted
+    raise ValueError("normal-mode frequency_unit must be 'cm^-1' or 'au'")
+
+
+def _optional_mode_values(data, names, nmodes, *, name, positive=False):
+    values = _mapping_first(data, names)
+    if values is None:
+        return None
+    array = _real_array(values, name=name)
+    if array.shape != (nmodes,):
+        raise ValueError(f"{name} must have one value per normal mode")
+    if positive:
+        if np.any(array <= 0.0):
+            raise ValueError(f"{name} values must be positive")
+    elif np.any(array < 0.0):
+        raise ValueError(f"{name} values must be non-negative")
+    if np.max(np.abs(array), initial=0.0) > _MAX_FLOAT32:
+        raise ValueError(f"{name} values must fit in float32")
+    return array
+
+
+def _normal_mode_indices(selector, nmodes: int) -> list[int]:
+    if selector is True or (isinstance(selector, str) and selector.strip().lower() == "all"):
+        indices = list(range(nmodes))
+    elif isinstance(selector, str):
+        raise ValueError("normal_modes must be an integer index, a list, or 'all'")
+    elif isinstance(selector, (bool, np.bool_)):
+        raise TypeError("normal-mode indices cannot be boolean")
+    elif isinstance(selector, Integral):
+        indices = [int(selector)]
+    else:
+        try:
+            requested = list(selector)
+        except TypeError as exc:
+            raise TypeError(
+                "normal_modes must be an integer index, a list, or 'all'"
+            ) from exc
+        if not requested:
+            raise ValueError("normal_modes selector cannot be empty")
+        if any(
+            isinstance(item, (bool, np.bool_)) or not isinstance(item, Integral)
+            for item in requested
+        ):
+            raise TypeError("normal-mode indices must be integers")
+        indices = [int(item) for item in requested]
+
+    if not indices:
+        raise ValueError("harmonic data contains no normal modes")
+    if len(indices) > _MAX_NORMAL_MODES:
+        raise ValueError(f"select at most {_MAX_NORMAL_MODES} normal modes")
+    if len(indices) != len(set(indices)):
+        raise ValueError("normal-mode selector contains duplicate indices")
+    if any(index < 0 or index >= nmodes for index in indices):
+        raise IndexError(f"normal-mode index is outside [0, {nmodes})")
+    return indices
+
+
+def _normal_mode_objects(obj, selector) -> tuple[NormalMode, ...]:
+    data = _normal_mode_source_mapping(obj)
+    frequencies = _frequencies_cm1(data)
+    raw_modes = _mapping_first(data, ("modes", "norm_mode", "normal_modes"))
+    if raw_modes is None:
+        raise ValueError("harmonic data must include modes or norm_mode")
+    modes = _real_array(raw_modes, name="normal modes")
+    if modes.ndim != 3 or modes.shape[-1] != 3:
+        raise ValueError("normal modes must have shape (nmodes, natom, 3)")
+    if modes.shape[0] != frequencies.size:
+        raise ValueError("frequencies and normal modes must have the same length")
+    if not 1 <= modes.shape[1] <= _MAX_ATOMS:
+        raise ValueError(f"normal modes must contain between 1 and {_MAX_ATOMS} atoms")
+
+    nmodes = frequencies.size
+    reduced_masses = _optional_mode_values(
+        data,
+        ("reduced_mass_amu", "reduced_masses", "reduced_mass"),
+        nmodes,
+        name="reduced masses",
+        positive=True,
+    )
+    intensities = _optional_mode_values(
+        data,
+        ("intensities", "intensity"),
+        nmodes,
+        name="intensities",
+    )
+    intensity_unit = data.get("intensity_unit") if intensities is not None else None
+
+    result = []
+    for index in _normal_mode_indices(selector, nmodes):
+        frequency = float(frequencies[index])
+        result.append(
+            NormalMode(
+                name=f"mode-{index + 1}",
+                label=f"Mode {index + 1}",
+                displacements=modes[index],
+                frequency_cm1=frequency,
+                reduced_mass_amu=(
+                    None if reduced_masses is None else reduced_masses[index]
+                ),
+                intensity=None if intensities is None else intensities[index],
+                intensity_unit=intensity_unit,
+                source_index=index,
+            )
+        )
+    return tuple(result)
+
+
+def _normal_mode_geometry_arrays(obj):
+    if isinstance(obj, Mapping):
+        coords = _mapping_first(obj, ("coords", "atom_coords", "coordinates"))
+        symbols = _mapping_first(obj, ("atom_symbols", "symbols"))
+    else:
+        coords = getattr(obj, "coords", None)
+        symbols = getattr(obj, "atom_symbols", None)
+        if callable(symbols):
+            symbols = symbols()
+        if coords is None:
+            coords = getattr(obj, "_coords", None)
+        if symbols is None:
+            symbols = getattr(obj, "_atom_symbols", None)
+    if coords is None or symbols is None:
+        return None
+    return symbols, coords
+
+
+def _normal_mode_xyz(obj, molecule, *, coordinates_unit: str) -> str:
+    candidates = []
+    if molecule is not None:
+        candidates.append(molecule)
+    else:
+        candidates.append(obj)
+        if isinstance(obj, Mapping):
+            embedded = _mapping_first(obj, ("molecule", "mol"))
+            if embedded is not None:
+                candidates.append(embedded)
+        backend = getattr(obj, "backend", None)
+        if backend is not None:
+            candidates.append(backend)
+
+    for candidate in candidates:
+        try:
+            source = _molecule_from_object(candidate)
+        except TypeError:
+            continue
+        if (
+            molecule is None
+            and candidate is obj
+            and getattr(obj, "hess", None) is not None
+        ):
+            stored_coords = getattr(obj, "coords", getattr(obj, "_coords", None))
+            if stored_coords is not None:
+                stored_coords = np.asarray(stored_coords, dtype=float)
+                current_coords = np.asarray(source.atom_coords(), dtype=float)
+                if (
+                    stored_coords.shape == current_coords.shape
+                    and not np.allclose(
+                        stored_coords,
+                        current_coords,
+                        rtol=1.0e-10,
+                        atol=1.0e-12,
+                    )
+                ):
+                    raise ValueError(
+                        "the Hessian molecule geometry changed after the Hessian was built; "
+                        "rebuild the Hessian or pass molecule= explicitly"
+                    )
+        return _molecule_xyz(source, coordinates_unit=coordinates_unit)
+
+    array_sources = [obj]
+    backend = getattr(obj, "backend", None)
+    if backend is not None:
+        array_sources.append(backend)
+    for source in array_sources:
+        arrays = _normal_mode_geometry_arrays(source)
+        if arrays is not None:
+            symbols, coords = arrays
+            return _xyz_from_arrays(
+                symbols,
+                coords,
+                coordinates_unit=coordinates_unit,
+            )
+
+    raise TypeError(
+        "normal-mode geometry is missing; pass molecule=mol for harmonic-analysis data"
+    )
+
+
 _ELEMENT_SYMBOLS = (
     "X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na",
     "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V",
@@ -1824,10 +2204,6 @@ def _read_cube(path: Path, *, dataset: int | str = 0):
 def view(
     obj,
     *,
-    mode: int | None = None,
-    amplitude: str | float = "auto",
-    frames: int = 24,
-    interval: int = 30,
     orbital=None,
     coeff=None,
     orbital_spin: str = "auto",
@@ -1839,6 +2215,10 @@ def view(
     nto_method: str = "x",
     fields: ScalarField3D | Iterable[ScalarField3D] | None = None,
     active_field: str | int | None = None,
+    normal_modes=None,
+    active_mode: str | int | None = None,
+    mode_amplitude: float = 0.25,
+    molecule=None,
     dataset: int | str = 0,
     nx: int = 40,
     ny: int | None = None,
@@ -1859,42 +2239,43 @@ def view(
 
     Examples
     --------
-    ``view(mol)`` shows geometry and ``view(hessian, mode=0)`` animates one
-    harmonic normal mode.  For a converged SCF object, use
+    ``view(mol)`` shows geometry.  For a converged SCF object, use
     ``view(mf, orbital=['homo', 'lumo'])``, ``orbital='all'``,
     ``density='all'`` (including unrestricted spin density), or ``esp=True``.
     ``view(td, nto='all')`` builds NTO hole/particle layers for every exposed
-    excited-state amplitude.  A Gaussian cube path is accepted directly.
+    excited-state amplitude.  ``view(hess, normal_modes='all')`` animates a
+    completed Hessian's normal modes.  For a standalone harmonic-analysis
+    mapping, supply its geometry with ``molecule=mol``.  A Gaussian cube path
+    is accepted directly.
 
     Coordinates in generated grids are sampled in Bohr and transported to the
-    browser in Angstrom.  Scalar values retain their documented atomic units.
-    Volumetric data is never encoded in a URL fragment.
+    browser in Angstrom.  ``mode_amplitude`` is the largest displayed atomic
+    displacement in Angstrom.  Scalar values retain their documented atomic
+    units.  Volumetric and normal-mode data is never encoded in a URL fragment.
     """
     esp_requested = esp is not None and esp is not False
     density_requested = density is not None and density is not False
     nto_requested = nto is not None and nto is not False
-    mode_requested = mode is not None
-    if mode_requested and (
-        orbital is not None
-        or coeff is not None
-        or density_requested
-        or nto_requested
-        or fields is not None
-        or esp_requested
+    modes_requested = normal_modes is not None and normal_modes is not False
+    if not modes_requested and (
+        active_mode is not None
+        or molecule is not None
+        or mode_amplitude != 0.25
     ):
-        raise ValueError("normal-mode animation cannot be combined with scalar fields")
+        raise ValueError(
+            "active_mode, mode_amplitude, and molecule require normal_modes"
+        )
     if isinstance(obj, SceneView):
         if (
-            mode_requested
-            or amplitude != "auto"
-            or orbital is not None
+            orbital is not None
             or coeff is not None
             or density_requested
             or nto_requested
             or fields is not None
             or esp_requested
+            or modes_requested
         ):
-            raise ValueError("cannot add computed fields when obj is already a SceneView")
+            raise ValueError("cannot add computed data when obj is already a SceneView")
         result = obj
     elif isinstance(obj, (str, Path)):
         path = Path(obj).expanduser()
@@ -1903,16 +2284,15 @@ def view(
         if path.suffix.lower() not in {".cube", ".cub"}:
             raise ValueError("view(path) currently accepts .cube and .cub files")
         if (
-            mode_requested
-            or amplitude != "auto"
-            or orbital is not None
+            orbital is not None
             or coeff is not None
             or density_requested
             or nto_requested
             or fields is not None
             or esp_requested
+            or modes_requested
         ):
-            raise ValueError("computed field options cannot be combined with a cube path")
+            raise ValueError("computed data options cannot be combined with a cube path")
         xyz, cube_fields = _read_cube(path, dataset=dataset)
         result = VolumeView(
             xyz=xyz,
@@ -1924,20 +2304,40 @@ def view(
             title=title or cube_fields[0].label,
             active_field=active_field,
         )
-    else:
-        molecule = _molecule_from_object(obj)
-        xyz = _molecule_xyz(molecule, coordinates_unit=coordinates_unit)
-        vibration = None
-        if mode_requested:
-            vibration = _normal_mode_animation(
-                obj,
-                molecule,
-                mode=mode,
-                amplitude=amplitude,
-                coordinates_unit=coordinates_unit,
-                frames=frames,
-                interval=interval,
+    elif modes_requested:
+        if (
+            orbital is not None
+            or coeff is not None
+            or density_requested
+            or nto_requested
+            or fields is not None
+            or esp_requested
+            or active_field is not None
+        ):
+            raise ValueError(
+                "normal modes cannot be combined with scalar fields, orbitals, "
+                "densities, ESP, or NTOs"
             )
+        mode_objects = _normal_mode_objects(obj, normal_modes)
+        xyz = _normal_mode_xyz(
+            obj,
+            molecule,
+            coordinates_unit=coordinates_unit,
+        )
+        result = SceneView(
+            xyz=xyz,
+            normal_modes=mode_objects,
+            representation=representation,
+            labels=bool(labels),
+            width=width,
+            height=height,
+            title=title,
+            active_mode=active_mode,
+            mode_amplitude=mode_amplitude,
+        )
+    else:
+        molecular_geometry = _molecule_from_object(obj)
+        xyz = _molecule_xyz(molecular_geometry, coordinates_unit=coordinates_unit)
         external_fields: list[ScalarField3D] = []
         if fields is not None:
             if isinstance(fields, ScalarField3D):
@@ -1958,7 +2358,7 @@ def view(
             if reference is None:
                 raise TypeError("orbital, density, ESP, and NTO views require an SCF reference")
             cube = _grid(
-                molecule,
+                molecular_geometry,
                 nx=nx,
                 ny=ny,
                 nz=nz,
@@ -2038,9 +2438,8 @@ def view(
             labels=bool(labels),
             width=width,
             height=height,
-            title=title or (vibration.label if vibration is not None else None),
+            title=title,
             active_field=active_field,
-            vibration=vibration,
         )
 
     should_open = not _in_notebook() if open_browser is None else bool(open_browser)
@@ -2049,4 +2448,11 @@ def view(
     return result
 
 
-__all__ = ["MoleculeView", "ScalarField3D", "SceneView", "VolumeView", "view"]
+__all__ = [
+    "MoleculeView",
+    "NormalMode",
+    "ScalarField3D",
+    "SceneView",
+    "VolumeView",
+    "view",
+]

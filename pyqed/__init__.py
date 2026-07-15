@@ -11,7 +11,7 @@ from importlib import import_module
 
 import numpy as np
 
-from ._version import __version__
+from ._version import __version__ as __version__
 from .units import *  # noqa: F401,F403
 
 
@@ -34,6 +34,7 @@ def is_positive_def(a):
 _LAZY_ATTRS = {
     "view": ("pyqed.visualization", "view"),
     "MoleculeView": ("pyqed.visualization", "MoleculeView"),
+    "NormalMode": ("pyqed.visualization", "NormalMode"),
     "ScalarField3D": ("pyqed.visualization", "ScalarField3D"),
     "SceneView": ("pyqed.visualization", "SceneView"),
     "VolumeView": ("pyqed.visualization", "VolumeView"),

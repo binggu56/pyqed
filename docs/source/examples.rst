@@ -10,7 +10,7 @@ Run source-tree examples from the repository root with ``PYTHONPATH=.``.  The
 code shown here is included directly from the tracked files, so the web guide
 and executable examples stay synchronized.
 
-Three verified starting points
+Four verified starting points
 ------------------------------
 
 Native H2 restricted Hartree--Fock
@@ -33,6 +33,31 @@ Run it with:
 The final line is approximately ``RHF energy: -1.116759307396 Eh``.  See
 :doc:`quickstart` for the explanation and :doc:`qchem` before changing the
 molecule or electronic-structure method.
+
+H2O harmonic normal-mode viewer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Use for:** calculating a native RHF Hessian and animating all three water
+normal modes. **Requirements:** the base PyQED installation; opening the
+interactive scene requires a browser that can reach ``https://pyqed.org``.
+**Typical runtime:** a few seconds on a laptop. PySCF is not required.
+
+.. literalinclude:: ../../examples/qchem/h2o_normal_modes_viewer.py
+   :language: python
+   :linenos:
+
+Run it with:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/qchem/h2o_normal_modes_viewer.py
+
+For a terminal or continuous-integration smoke run, add ``--no-browser``. The
+example prints the signed harmonic frequencies and still validates the viewer
+scene without opening a window. It uses a geometry optimized at the same
+RHF/STO-3G level. These frequencies illustrate the API; they are not benchmark
+spectroscopic predictions. See :doc:`hf_analysis` for the mode-animation
+conventions and Hessian backend constraints.
 
 Sine-DVR harmonic oscillator
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

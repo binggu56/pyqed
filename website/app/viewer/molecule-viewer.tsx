@@ -14,15 +14,18 @@ import {
 } from "react";
 import type {
   Atom,
+  NormalMode,
   ValidatedScene,
   VolumeField,
 } from "./volume-data.mjs";
 import {
   MAX_CUBE_FILE_BYTES,
+  displacedAtoms,
   fieldToCube,
   gridsMatch,
   parseCube,
   parseGeometry,
+  symmetricNormalModeFrame,
   validateSceneMessage,
   xyzFor,
 } from "./volume-data.mjs";
@@ -30,10 +33,9 @@ import {
 type Bond = [number, number];
 type RenderMode = "ball-stick" | "space-fill" | "wireframe";
 type SurfaceMode = "both" | "positive" | "negative" | "esp-map" | "hidden";
-type Vibration = NonNullable<ValidatedScene["vibration"]>;
 
 type ViewerApi = {
-  animate(options: Record<string, unknown>): unknown;
+  addArrow(options: Record<string, unknown>): unknown;
   addIsosurface(data: unknown, options: Record<string, unknown>): unknown;
   addLabel(text: string, options: Record<string, unknown>): unknown;
   addModel(data: string, format: string): unknown;
@@ -49,16 +51,11 @@ type ViewerApi = {
   removeAllSurfaces(): unknown;
   render(callback?: () => void): unknown;
   resize(): unknown;
+  setFrame(frame: number): Promise<unknown>;
   setStyle(selection: Record<string, never>, style: Record<string, unknown>): unknown;
   setView(view: number[]): unknown;
   spin(axis: string | false, speed?: number): unknown;
-  stopAnimate(): unknown;
-  vibrate(
-    frames: number,
-    amplitude: number,
-    bothWays: boolean,
-    arrowSpec?: Record<string, unknown>,
-  ): unknown;
+  vibrate(frames: number, amplitude: number, bothWays: boolean): unknown;
   zoomTo(): unknown;
 };
 
@@ -135,6 +132,33 @@ const FIELD_KIND_LABELS: Record<VolumeField["kind"], string> = {
   esp: "Electrostatic potential",
   generic: "Scalar field",
 };
+
+const NORMAL_MODE_FRAME_STEPS = 30;
+const NORMAL_MODE_BASE_CYCLES_PER_SECOND = 0.75;
+
+function frequencyLabel(frequencyCm1: number): string {
+  const magnitude = Math.abs(frequencyCm1).toLocaleString("en-US", {
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 1,
+  });
+  return frequencyCm1 < 0 ? `${magnitude} i cm⁻¹` : `${magnitude} cm⁻¹`;
+}
+
+function xyzWithMode(atoms: Atom[], normalMode: NormalMode): string {
+  const rows = atoms.map((atom, index) => {
+    const offset = index * 3;
+    return [
+      atom.element,
+      atom.x.toPrecision(12),
+      atom.y.toPrecision(12),
+      atom.z.toPrecision(12),
+      normalMode.displacements[offset].toPrecision(9),
+      normalMode.displacements[offset + 1].toPrecision(9),
+      normalMode.displacements[offset + 2].toPrecision(9),
+    ].join(" ");
+  });
+  return `${atoms.length}\n${normalMode.label} · normalized displacement vectors\n${rows.join("\n")}\n`;
+}
 
 function inferBonds(atoms: Atom[]): Bond[] {
   const bonds: Bond[] = [];
@@ -213,44 +237,49 @@ function modelStyle(mode: RenderMode): Record<string, unknown> {
   };
 }
 
-function vibrationalXyz(atoms: Atom[], vibration: Vibration): string {
-  const rows = atoms.map((atom, index) => {
-    const [dx, dy, dz] = vibration.displacements[index];
-    return `${atom.element.padEnd(2)} ${atom.x.toFixed(10)} ${atom.y.toFixed(10)} ${atom.z.toFixed(10)} ${dx.toFixed(10)} ${dy.toFixed(10)} ${dz.toFixed(10)}`;
-  });
-  return `${atoms.length}\nMode ${vibration.modeIndex}: ${vibration.frequencyCm1.toFixed(3)} cm^-1\n${rows.join("\n")}\n`;
-}
-
 function MolecularFieldCanvas({
   atoms,
   fields,
   activeFieldIndex,
+  normalMode,
+  modeAmplitude,
+  modeSpeed,
+  modePlaying,
+  modePhaseRequest,
+  showModeArrows,
+  onModePhase,
   mode,
   labels,
   autoRotate,
   surfaceMode,
   isovalue,
   resetSignal,
-  vibration,
-  vibrationPlaying,
 }: {
   atoms: Atom[];
   fields: VolumeField[];
   activeFieldIndex: number;
+  normalMode: NormalMode | undefined;
+  modeAmplitude: number;
+  modeSpeed: number;
+  modePlaying: boolean;
+  modePhaseRequest: { phase: number; serial: number };
+  showModeArrows: boolean;
+  onModePhase: (phase: number) => void;
   mode: RenderMode;
   labels: boolean;
   autoRotate: boolean;
   surfaceMode: SurfaceMode;
   isovalue: number;
   resetSignal: number;
-  vibration: Vibration | null;
-  vibrationPlaying: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<ViewerApi | null>(null);
   const libraryRef = useRef<ThreeDmolApi | null>(null);
   const hasRendered = useRef(false);
   const renderRevision = useRef(0);
+  const modePhaseRef = useRef(0);
+  const modeNameRef = useRef<string | null>(null);
+  const renderedFrameRef = useRef(-1);
   const volumeCacheRef = useRef<WeakMap<VolumeField, unknown>>(new WeakMap());
   const [rendererStatus, setRendererStatus] = useState<"loading" | "ready" | "error">("loading");
 
@@ -281,7 +310,6 @@ function MolecularFieldCanvas({
     return () => {
       cancelled = true;
       renderRevision.current += 1;
-      viewerRef.current?.stopAnimate();
       viewerRef.current?.spin(false);
       viewerRef.current = null;
       libraryRef.current = null;
@@ -290,38 +318,49 @@ function MolecularFieldCanvas({
     };
   }, []);
 
+  const setNormalModeFrame = useCallback((viewer: ViewerApi, phase: number) => {
+    if (!normalMode) return;
+    const { frame, displacementScale } = symmetricNormalModeFrame(
+      phase,
+      NORMAL_MODE_FRAME_STEPS,
+    );
+    if (frame === renderedFrameRef.current) return;
+    renderedFrameRef.current = frame;
+    onModePhase(Math.asin(displacementScale));
+    void viewer.setFrame(frame).then(
+      () => {
+        if (viewerRef.current === viewer) viewer.render();
+      },
+      () => undefined,
+    );
+  }, [normalMode, onModePhase]);
+
   useEffect(() => {
     if (rendererStatus !== "ready") return;
     const viewer = viewerRef.current;
     if (!viewer) return;
     const previousView = hasRendered.current ? viewer.getView() : null;
 
-    viewer.stopAnimate();
+    if (modeNameRef.current !== (normalMode?.name ?? null)) {
+      modeNameRef.current = normalMode?.name ?? null;
+      modePhaseRef.current = 0;
+      onModePhase(0);
+    }
+    renderedFrameRef.current = -1;
     viewer.removeAllLabels();
     viewer.removeAllModels();
     if (atoms.length > 0) {
-      viewer.addModel(
-        vibration ? vibrationalXyz(atoms, vibration) : xyzFor(atoms),
-        "xyz",
-      );
+      viewer.addModel(normalMode ? xyzWithMode(atoms, normalMode) : xyzFor(atoms), "xyz");
       viewer.setStyle({}, modelStyle(mode));
-      if (vibration) {
-        viewer.vibrate(vibration.frames, 1, true, {
-          color: "#35d6e3",
-          radius: 0.045,
-          radiusRatio: 1.7,
-        });
-        if (vibrationPlaying) {
-          viewer.animate({
-            interval: vibration.interval,
-            loop: "backAndForth",
-            reps: 0,
-          });
-        }
+      if (normalMode) {
+        const scaledModeAmplitude =
+          modeAmplitude * NORMAL_MODE_FRAME_STEPS / (NORMAL_MODE_FRAME_STEPS - 1);
+        viewer.vibrate(NORMAL_MODE_FRAME_STEPS, scaledModeAmplitude, true);
+        setNormalModeFrame(viewer, modePhaseRef.current);
       }
     }
 
-    if (labels && atoms.length > 0 && !vibration) {
+    if (labels && atoms.length > 0 && !normalMode) {
       atoms.forEach((atom, index) => {
         viewer.addLabel(`${atom.element}${index + 1}`, {
           position: { x: atom.x, y: atom.y, z: atom.z },
@@ -340,7 +379,24 @@ function MolecularFieldCanvas({
     else if (previousView) viewer.setView(previousView);
     viewer.render();
     hasRendered.current = true;
-  }, [atoms, labels, mode, rendererStatus, vibration, vibrationPlaying]);
+  }, [
+    atoms,
+    labels,
+    mode,
+    modeAmplitude,
+    normalMode,
+    onModePhase,
+    rendererStatus,
+    setNormalModeFrame,
+  ]);
+
+  useEffect(() => {
+    if (rendererStatus !== "ready" || !normalMode) return;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    modePhaseRef.current = modePhaseRequest.phase;
+    setNormalModeFrame(viewer, modePhaseRequest.phase);
+  }, [modePhaseRequest, normalMode, rendererStatus, setNormalModeFrame]);
 
   useEffect(() => {
     if (rendererStatus !== "ready") return;
@@ -431,14 +487,73 @@ function MolecularFieldCanvas({
       }
     }
 
+    if (normalMode && showModeArrows) {
+      atoms.forEach((atom, atomIndex) => {
+        const offset = atomIndex * 3;
+        const x = normalMode.displacements[offset];
+        const y = normalMode.displacements[offset + 1];
+        const z = normalMode.displacements[offset + 2];
+        if (Math.hypot(x, y, z) < 1e-7) return;
+        viewer.addArrow({
+          start: { x: atom.x, y: atom.y, z: atom.z },
+          end: {
+            x: atom.x + x * modeAmplitude,
+            y: atom.y + y * modeAmplitude,
+            z: atom.z + z * modeAmplitude,
+          },
+          color: "#f3c969",
+          radius: 0.045,
+          radiusRatio: 1.7,
+          mid: 0.74,
+        });
+      });
+    }
+
     viewer.render();
   }, [
     activeFieldIndex,
     atoms,
     fields,
     isovalue,
+    modeAmplitude,
+    normalMode,
     rendererStatus,
+    showModeArrows,
     surfaceMode,
+  ]);
+
+  useEffect(() => {
+    if (rendererStatus !== "ready" || !normalMode || !modePlaying) return;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    let animationFrame = 0;
+    let previousTime: number | null = null;
+
+    const animate = (time: number) => {
+      if (document.hidden) {
+        previousTime = null;
+      } else {
+        if (previousTime !== null) {
+          const elapsed = Math.min(time - previousTime, 100);
+          modePhaseRef.current = (
+            modePhaseRef.current +
+            (elapsed / 1000) * modeSpeed * NORMAL_MODE_BASE_CYCLES_PER_SECOND * Math.PI * 2
+          ) % (Math.PI * 2);
+          setNormalModeFrame(viewer, modePhaseRef.current);
+        }
+        previousTime = time;
+      }
+      animationFrame = window.requestAnimationFrame(animate);
+    };
+    animationFrame = window.requestAnimationFrame(animate);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [
+    modePlaying,
+    modeSpeed,
+    normalMode,
+    onModePhase,
+    rendererStatus,
+    setNormalModeFrame,
   ]);
 
   useEffect(() => {
@@ -469,7 +584,9 @@ function MolecularFieldCanvas({
   }, []);
 
   const activeField = fields[activeFieldIndex];
-  const description = activeField
+  const description = normalMode
+    ? `normal mode “${normalMode.label}” at ${frequencyLabel(normalMode.frequencyCm1)}`
+    : activeField
     ? `${FIELD_KIND_LABELS[activeField.kind]} “${activeField.label}” on ${activeField.shape.join(" by ")} grid points`
     : atoms.length > 0 ? "molecular geometry" : "an empty scene";
 
@@ -490,6 +607,7 @@ function MolecularFieldCanvas({
         </p>
       ) : null}
       <p className="viewer-canvas-hint" aria-hidden="true">
+        {normalMode ? "Normal-mode motion is visually scaled · " : ""}
         Drag to rotate · scroll to zoom · right-drag to pan
       </p>
     </div>
@@ -501,9 +619,14 @@ export function MoleculeViewer() {
   const [unit, setUnit] = useState<"angstrom" | "bohr">("angstrom");
   const [atoms, setAtoms] = useState<Atom[]>(() => parseGeometry(PRESETS.Water, "angstrom"));
   const [fields, setFields] = useState<VolumeField[]>([]);
-  const [vibration, setVibration] = useState<Vibration | null>(null);
-  const [vibrationPlaying, setVibrationPlaying] = useState(false);
   const [activeFieldIndex, setActiveFieldIndex] = useState(-1);
+  const [normalModes, setNormalModes] = useState<NormalMode[]>([]);
+  const [activeModeIndex, setActiveModeIndex] = useState(-1);
+  const [modeAmplitude, setModeAmplitude] = useState(0.25);
+  const [renderedModeAmplitude, setRenderedModeAmplitude] = useState(0.25);
+  const [modeSpeed, setModeSpeed] = useState(1);
+  const [modePlaying, setModePlaying] = useState(false);
+  const [showModeArrows, setShowModeArrows] = useState(true);
   const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("hidden");
   const [isovalue, setIsovalue] = useState(0.02);
   const [sceneTitle, setSceneTitle] = useState("Water");
@@ -514,9 +637,16 @@ export function MoleculeViewer() {
   const [autoRotate, setAutoRotate] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [resetSignal, setResetSignal] = useState(0);
+  const [modePhaseRequest, setModePhaseRequest] = useState({ phase: 0, serial: 0 });
+  const [modePhaseScale, setModePhaseScale] = useState(0);
+  const reducedMotionRef = useRef(false);
+  const initialAutoRotateBlockedRef = useRef(false);
+  const modePhaseRef = useRef(0);
+  const modeAmplitudeTimerRef = useRef<number | null>(null);
   const bonds = useMemo(() => inferBonds(atoms), [atoms]);
   const formula = useMemo(() => formulaFor(atoms), [atoms]);
   const activeField = fields[activeFieldIndex];
+  const activeNormalMode = normalModes[activeModeIndex];
   const activeEsp = activeField?.kind === "electron-density"
     ? espForDensity(activeField, fields)
     : undefined;
@@ -525,16 +655,62 @@ export function MoleculeViewer() {
     : undefined;
   const renderedIsovalue = useDeferredValue(isovalue);
 
+  const clearModeAmplitudeTimer = useCallback(() => {
+    if (modeAmplitudeTimerRef.current !== null) {
+      window.clearTimeout(modeAmplitudeTimerRef.current);
+      modeAmplitudeTimerRef.current = null;
+    }
+  }, []);
+
+  const replaceModeAmplitude = useCallback((value: number) => {
+    clearModeAmplitudeTimer();
+    setModeAmplitude(value);
+    setRenderedModeAmplitude(value);
+  }, [clearModeAmplitudeTimer]);
+
+  const scheduleModeAmplitude = useCallback((value: number) => {
+    setModeAmplitude(value);
+    clearModeAmplitudeTimer();
+    modeAmplitudeTimerRef.current = window.setTimeout(() => {
+      setRenderedModeAmplitude(value);
+      modeAmplitudeTimerRef.current = null;
+    }, 120);
+  }, [clearModeAmplitudeTimer]);
+
+  const resetModePhase = useCallback(() => {
+    modePhaseRef.current = 0;
+    setModePhaseScale(0);
+    setModePhaseRequest((request) => ({ phase: 0, serial: request.serial + 1 }));
+  }, []);
+
+  const scrubModePhase = useCallback((displacementScale: number) => {
+    const normalizedScale = Math.max(-1, Math.min(1, displacementScale));
+    const phase = Math.asin(normalizedScale);
+    modePhaseRef.current = phase;
+    setModePhaseScale(normalizedScale);
+    setModePhaseRequest((request) => ({ phase, serial: request.serial + 1 }));
+  }, []);
+
+  useEffect(() => clearModeAmplitudeTimer, [clearModeAmplitudeTimer]);
+
   useEffect(() => {
     const reducedMotion = typeof window.matchMedia === "function"
       ? window.matchMedia("(prefers-reduced-motion: reduce)")
       : null;
+    reducedMotionRef.current = reducedMotion?.matches ?? false;
     const frame = window.requestAnimationFrame(() => {
-      if (!reducedMotion?.matches) setAutoRotate(true);
+      if (!reducedMotionRef.current && !initialAutoRotateBlockedRef.current) {
+        setAutoRotate(true);
+      }
     });
     if (!reducedMotion) return () => window.cancelAnimationFrame(frame);
     const disableAnimation = (event: MediaQueryListEvent) => {
-      if (event.matches) setAutoRotate(false);
+      reducedMotionRef.current = event.matches;
+      if (event.matches) {
+        setAutoRotate(false);
+        setModePhaseScale(Math.sin(modePhaseRef.current));
+        setModePlaying(false);
+      }
     };
     reducedMotion.addEventListener("change", disableAnimation);
     return () => {
@@ -548,27 +724,64 @@ export function MoleculeViewer() {
     setActiveFieldIndex(nextField ? nextIndex : -1);
     setSurfaceMode(defaultSurface(nextField));
     setIsovalue(initialIsovalue(nextField, nextFields));
-  }, [fields]);
+    if (nextField) {
+      setActiveModeIndex(-1);
+      setModePlaying(false);
+      resetModePhase();
+    }
+  }, [fields, resetModePhase]);
+
+  const chooseNormalMode = useCallback((nextIndex: number) => {
+    const nextMode = normalModes[nextIndex];
+    setActiveModeIndex(nextMode ? nextIndex : -1);
+    setModePlaying(Boolean(nextMode) && !reducedMotionRef.current);
+    resetModePhase();
+    if (nextMode) {
+      setActiveFieldIndex(-1);
+      setSurfaceMode("hidden");
+      setAutoRotate(false);
+      setStatus(`Showing ${nextMode.label} at ${frequencyLabel(nextMode.frequencyCm1)}`);
+    }
+  }, [normalModes, resetModePhase]);
+
+  const updateModePhase = useCallback((phase: number) => {
+    modePhaseRef.current = phase;
+  }, []);
 
   const applyScene = useCallback((scene: ValidatedScene, nextStatus: string) => {
     setAtoms(scene.atoms);
     setSource(scene.molecule?.xyz ?? "");
     setUnit("angstrom");
     setFields(scene.fields);
-    setVibration(scene.vibration);
-    setVibrationPlaying(scene.vibration !== null);
     setSceneTitle(scene.title);
     setMode(scene.molecule?.representation ?? "ball-stick");
     setLabels(scene.molecule?.labels ?? false);
-    if (scene.vibration) setAutoRotate(false);
     setError(null);
     setStatus(nextStatus);
-    const nextField = scene.fields[scene.activeFieldIndex];
-    setActiveFieldIndex(nextField ? scene.activeFieldIndex : -1);
-    setSurfaceMode(defaultSurface(nextField));
-    setIsovalue(initialIsovalue(nextField, scene.fields));
+    const nextModes = scene.normalModes?.modes ?? [];
+    const nextMode = scene.normalModes
+      ? nextModes[scene.normalModes.activeModeIndex]
+      : undefined;
+    initialAutoRotateBlockedRef.current = Boolean(nextMode);
+    setNormalModes(nextModes);
+    setActiveModeIndex(nextMode ? (scene.normalModes?.activeModeIndex ?? -1) : -1);
+    replaceModeAmplitude(scene.normalModes?.amplitudeAngstrom ?? 0.25);
+    setModeSpeed(1);
+    setShowModeArrows(true);
+    setModePlaying(Boolean(nextMode) && !reducedMotionRef.current);
+    resetModePhase();
+    if (nextMode) {
+      setActiveFieldIndex(-1);
+      setSurfaceMode("hidden");
+      setAutoRotate(false);
+    } else {
+      const nextField = scene.fields[scene.activeFieldIndex];
+      setActiveFieldIndex(nextField ? scene.activeFieldIndex : -1);
+      setSurfaceMode(defaultSurface(nextField));
+      setIsovalue(initialIsovalue(nextField, scene.fields));
+    }
     setResetSignal((value) => value + 1);
-  }, []);
+  }, [replaceModeAmplitude, resetModePhase]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -582,9 +795,11 @@ export function MoleculeViewer() {
         setSource(geometry);
         setUnit("angstrom");
         setFields([]);
-        setVibration(null);
-        setVibrationPlaying(false);
         setActiveFieldIndex(-1);
+        setNormalModes([]);
+        setActiveModeIndex(-1);
+        setModePlaying(false);
+        resetModePhase();
         setSurfaceMode("hidden");
         setSceneTitle("Linked geometry");
         setStatus("Geometry loaded from link");
@@ -609,7 +824,7 @@ export function MoleculeViewer() {
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, []);
+  }, [resetModePhase]);
 
   useEffect(() => {
     function receiveScene(event: MessageEvent<unknown>) {
@@ -628,11 +843,20 @@ export function MoleculeViewer() {
       }
       try {
         const scene = validateSceneMessage(event.data);
+        const surfaceCount = scene.fields.length;
+        const modeCount = scene.normalModes?.modes.length ?? 0;
+        const parts: string[] = [];
+        if (surfaceCount > 0) {
+          parts.push(`${surfaceCount} ${surfaceCount === 1 ? "surface" : "states / surfaces"}`);
+        }
+        if (modeCount > 0) {
+          parts.push(`${modeCount} normal ${modeCount === 1 ? "mode" : "modes"}`);
+        }
         applyScene(
           scene,
-          scene.vibration
-            ? `Normal mode ${scene.vibration.modeIndex} received from PyQED`
-            : `${scene.fields.length} ${scene.fields.length === 1 ? "surface" : "states / surfaces"} received from PyQED`,
+          parts.length > 0
+            ? `${parts.join(" · ")} received from PyQED`
+            : "Geometry received from PyQED",
         );
       } catch (sceneError) {
         setError(
@@ -667,9 +891,11 @@ export function MoleculeViewer() {
     try {
       setAtoms(parseGeometry(nextSource, nextUnit));
       setFields([]);
-      setVibration(null);
-      setVibrationPlaying(false);
       setActiveFieldIndex(-1);
+      setNormalModes([]);
+      setActiveModeIndex(-1);
+      setModePlaying(false);
+      resetModePhase();
       setSurfaceMode("hidden");
       setSceneTitle(nextTitle);
       setStatus("Geometry updated");
@@ -714,9 +940,11 @@ export function MoleculeViewer() {
         setUnit("angstrom");
         setAtoms(nextAtoms);
         setFields([]);
-        setVibration(null);
-        setVibrationPlaying(false);
         setActiveFieldIndex(-1);
+        setNormalModes([]);
+        setActiveModeIndex(-1);
+        setModePlaying(false);
+        resetModePhase();
         setSurfaceMode("hidden");
         setSceneTitle(file.name.replace(/\.xyz$/i, ""));
         setStatus(`Geometry loaded from ${file.name}`);
@@ -752,10 +980,23 @@ export function MoleculeViewer() {
 
   function downloadXyz() {
     if (atoms.length === 0) return;
-    const url = URL.createObjectURL(new Blob([xyzFor(atoms)], { type: "chemical/x-xyz" }));
+    const exportAtoms = activeNormalMode
+      ? displacedAtoms(
+          atoms,
+          activeNormalMode,
+          renderedModeAmplitude,
+          modePhaseRef.current,
+        )
+      : atoms;
+    const comment = activeNormalMode
+      ? `${activeNormalMode.label} · displayed normal-mode displacement`
+      : "Exported from the PyQED molecular viewer";
+    const url = URL.createObjectURL(
+      new Blob([xyzFor(exportAtoms, comment)], { type: "chemical/x-xyz" }),
+    );
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `${formula.toLowerCase() || "molecule"}.xyz`;
+    anchor.download = `${formula.toLowerCase() || "molecule"}${activeNormalMode ? `-${activeNormalMode.name}` : ""}.xyz`;
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -835,17 +1076,17 @@ export function MoleculeViewer() {
         <div className="volume-input-note">
           <span>02</span>
           <div>
-            <strong>Scalar fields</strong>
+            <strong>Scalar fields + normal modes</strong>
             <p>
               Drop a Gaussian cube file onto the viewer, or call <code>view(...)</code> in
-              PyQED. Multi-state files remain selectable and never enter the page URL.
+              PyQED. Multi-state files remain selectable, and vibrational modes never enter the page URL.
             </p>
           </div>
         </div>
       </aside>
 
       <div
-        className={`viewer-display-panel${isDraggingFile ? " is-file-dragging" : ""}`}
+        className={`viewer-display-panel${normalModes.length > 0 ? " has-normal-modes" : ""}${isDraggingFile ? " is-file-dragging" : ""}`}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
@@ -853,16 +1094,15 @@ export function MoleculeViewer() {
         <div className="viewer-toolbar">
           <div className="molecule-identity">
             <span>
-              {vibration ? "Normal mode" : activeField ? FIELD_KIND_LABELS[activeField.kind] : "Live structure"}
+              {activeNormalMode
+                ? "Normal mode"
+                : activeField ? FIELD_KIND_LABELS[activeField.kind] : "Live structure"}
             </span>
-            <strong>
-              {vibration
-                ? `Mode ${vibration.modeIndex} · ${vibration.frequencyCm1.toFixed(1)} cm⁻¹`
-                : activeField?.label ?? formula}
-            </strong>
+            <strong>{activeNormalMode?.label ?? activeField?.label ?? formula}</strong>
             <small>
               {sceneTitle} · {atoms.length} atoms · {bonds.length} inferred bonds
               {fields.length > 0 ? ` · ${fields.length} ${fields.length === 1 ? "surface" : "states / surfaces"}` : ""}
+              {normalModes.length > 0 ? ` · ${normalModes.length} normal ${normalModes.length === 1 ? "mode" : "modes"}` : ""}
             </small>
           </div>
           <div className="viewer-controls" aria-label="Viewer controls">
@@ -935,6 +1175,8 @@ export function MoleculeViewer() {
               type="button"
               className={labels ? "is-active" : ""}
               aria-pressed={labels}
+              disabled={Boolean(activeNormalMode)}
+              title={activeNormalMode ? "Atom labels are hidden during normal-mode playback" : undefined}
               onClick={() => setLabels((value) => !value)}
             >
               Labels
@@ -943,38 +1185,144 @@ export function MoleculeViewer() {
               type="button"
               className={autoRotate ? "is-active" : ""}
               aria-pressed={autoRotate}
-              onClick={() => setAutoRotate((value) => !value)}
+              onClick={() => {
+                if (!autoRotate) {
+                  setModePhaseScale(Math.sin(modePhaseRef.current));
+                  setModePlaying(false);
+                }
+                setAutoRotate((value) => !value);
+              }}
             >
               Auto-rotate
             </button>
-            {vibration ? (
-              <button
-                type="button"
-                className={vibrationPlaying ? "is-active" : ""}
-                aria-pressed={vibrationPlaying}
-                onClick={() => setVibrationPlaying((value) => !value)}
-              >
-                {vibrationPlaying ? "Pause mode" : "Play mode"}
-              </button>
-            ) : null}
             <button type="button" onClick={() => setResetSignal((value) => value + 1)}>
               Reset view
             </button>
           </div>
         </div>
 
+        {normalModes.length > 0 ? (
+          <div className="normal-mode-panel" aria-label="Normal mode controls">
+            <label className="normal-mode-select">
+              Normal mode
+              <select
+                value={activeModeIndex}
+                onChange={(event) => chooseNormalMode(Number(event.target.value))}
+              >
+                <option value={-1}>No normal mode</option>
+                {normalModes.map((normalMode, index) => (
+                  <option key={normalMode.name} value={index}>
+                    {normalMode.label} · {frequencyLabel(normalMode.frequencyCm1)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="normal-mode-frequency" aria-live="polite">
+              <span>Frequency</span>
+              <strong>{activeNormalMode ? frequencyLabel(activeNormalMode.frequencyCm1) : "—"}</strong>
+              {activeNormalMode && activeNormalMode.frequencyCm1 < 0 ? (
+                <em>Imaginary mode</em>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className={`normal-mode-play${modePlaying ? " is-active" : ""}`}
+              aria-pressed={modePlaying}
+              disabled={!activeNormalMode}
+              onClick={() => {
+                if (modePlaying) {
+                  setModePhaseScale(Math.sin(modePhaseRef.current));
+                }
+                setModePlaying((value) => {
+                  if (!value) setAutoRotate(false);
+                  return !value;
+                });
+              }}
+            >
+              {modePlaying ? "Pause" : "Play"}
+            </button>
+            <label className="normal-mode-slider">
+              <span>Amplitude <output>{modeAmplitude.toFixed(2)} Å</output></span>
+              <input
+                type="range"
+                min="0.01"
+                max="10"
+                step="0.01"
+                value={modeAmplitude}
+                disabled={!activeNormalMode}
+                onChange={(event) => scheduleModeAmplitude(Number(event.target.value))}
+                onPointerUp={(event) => replaceModeAmplitude(Number(event.currentTarget.value))}
+                onKeyUp={(event) => replaceModeAmplitude(Number(event.currentTarget.value))}
+                onBlur={(event) => replaceModeAmplitude(Number(event.currentTarget.value))}
+              />
+            </label>
+            <label className="normal-mode-slider">
+              <span>
+                Mode phase <output>{modePlaying ? "Playing" : `${(modePhaseScale * 100).toFixed(0)}%`}</output>
+              </span>
+              <input
+                type="range"
+                min="-1"
+                max="1"
+                step={1 / (NORMAL_MODE_FRAME_STEPS - 1)}
+                value={modePhaseScale}
+                disabled={!activeNormalMode || modePlaying}
+                title={modePlaying ? "Pause playback to scrub the mode phase" : undefined}
+                onChange={(event) => scrubModePhase(Number(event.target.value))}
+              />
+            </label>
+            <label className="normal-mode-slider">
+              <span>Playback speed <output>{modeSpeed.toFixed(2)}×</output></span>
+              <input
+                type="range"
+                min="0.25"
+                max="2"
+                step="0.05"
+                value={modeSpeed}
+                disabled={!activeNormalMode}
+                onChange={(event) => setModeSpeed(Number(event.target.value))}
+              />
+            </label>
+            <button
+              type="button"
+              className={showModeArrows ? "is-active" : ""}
+              aria-pressed={showModeArrows}
+              disabled={!activeNormalMode}
+              onClick={() => setShowModeArrows((value) => !value)}
+            >
+              Displacement arrows
+            </button>
+            {activeNormalMode ? (
+              <p className="normal-mode-details">
+                {activeNormalMode.reducedMassAmu !== undefined
+                  ? `Reduced mass ${activeNormalMode.reducedMassAmu.toPrecision(4)} amu · `
+                  : ""}
+                {activeNormalMode.intensity !== undefined
+                  ? `Intensity ${activeNormalMode.intensity.toPrecision(4)}${activeNormalMode.intensityUnit ? ` ${activeNormalMode.intensityUnit}` : ""} · `
+                  : ""}
+                Visual amplitude is scaled; the overall arrow direction is arbitrary.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
         <MolecularFieldCanvas
           atoms={atoms}
           fields={fields}
           activeFieldIndex={activeFieldIndex}
+          normalMode={activeNormalMode}
+          modeAmplitude={renderedModeAmplitude}
+          modeSpeed={modeSpeed}
+          modePlaying={modePlaying}
+          modePhaseRequest={modePhaseRequest}
+          showModeArrows={showModeArrows}
+          onModePhase={updateModePhase}
           mode={mode}
           labels={labels}
           autoRotate={autoRotate}
           surfaceMode={surfaceMode}
           isovalue={renderedIsovalue}
           resetSignal={resetSignal}
-          vibration={vibration}
-          vibrationPlaying={vibrationPlaying}
         />
 
         {isDraggingFile ? (
@@ -1007,11 +1355,14 @@ export function MoleculeViewer() {
               {activeField && surfaceMode === "esp-map" ? (
                 <span className="esp-gradient-key"><i />negative ESP · neutral · positive ESP</span>
               ) : null}
+              {activeNormalMode && showModeArrows ? (
+                <span><i className="normal-mode-vector" />normalized displacement vector</span>
+              ) : null}
             </div>
             <p className="viewer-file-status" aria-live="polite">{status}</p>
           </div>
           <button type="button" className="export-button" onClick={downloadXyz} disabled={atoms.length === 0}>
-            Export XYZ <span aria-hidden="true">↓</span>
+            {activeNormalMode ? "Export displaced XYZ" : "Export XYZ"} <span aria-hidden="true">↓</span>
           </button>
         </div>
       </div>

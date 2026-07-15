@@ -6,9 +6,10 @@ import pytest
 
 import pyqed
 from pyqed.qchem import Molecule
-from pyqed.units import au2angstrom
+from pyqed.units import au2angstrom, au2wavenumber
 from pyqed.visualization import (
     MoleculeView,
+    NormalMode,
     ScalarField3D,
     SceneView,
     VolumeView,
@@ -22,17 +23,6 @@ class TinyMolecule:
 
     def atom_coords(self):
         return np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
-
-
-class TinyHessian:
-    mol = TinyMolecule()
-
-    def vibrational_analysis(self):
-        return {
-            "freq_cm1": np.array([1234.5]),
-            "modes": np.array([[[0.0, 0.0, -2.0], [0.0, 0.0, 1.0]]]),
-            "reduced_mass_amu": np.array([1.2]),
-        }
 
 
 def fragment_parameters(result):
@@ -77,50 +67,6 @@ def test_view_provides_an_inline_notebook_representation():
     assert "allow-scripts" in html
 
 
-def test_view_hessian_builds_browser_normal_mode_animation():
-    default_result = view(TinyHessian(), mode=0, open_browser=False)
-    assert default_result.payload()["vibration"]["interval"] == 30
-
-    result = view(
-        TinyHessian(),
-        mode=0,
-        amplitude=0.25,
-        frames=32,
-        interval=45,
-        open_browser=False,
-    )
-
-    payload = result.payload()
-    vibration = payload["vibration"]
-    assert result.url == "https://pyqed.org/viewer"
-    assert result.title == "Mode 0: 1234.5 cm^-1"
-    assert vibration["mode_index"] == 0
-    assert vibration["frequency_cm1"] == pytest.approx(1234.5)
-    assert vibration["frames"] == 32
-    assert vibration["interval"] == 45
-    assert vibration["amplitude_angstrom"] == pytest.approx(0.25)
-    displacement = np.asarray(vibration["displacements"])
-    assert displacement.shape == (2, 3)
-    assert np.max(np.linalg.norm(displacement, axis=1)) == pytest.approx(0.25)
-    assert "postMessage" in result._repr_html_()
-
-
-def test_view_hessian_rejects_invalid_or_unavailable_modes():
-    with pytest.raises(IndexError, match="outside"):
-        view(TinyHessian(), mode=1, open_browser=False)
-    with pytest.raises(TypeError, match="integer"):
-        view(TinyHessian(), mode=True, open_browser=False)
-    with pytest.raises(TypeError, match="completed Hessian"):
-        view(TinyMolecule(), mode=0, open_browser=False)
-
-    class PendingHessian(TinyHessian):
-        def vibrational_analysis(self):
-            raise ValueError("run first")
-
-    with pytest.raises(ValueError, match="run the Hessian"):
-        view(PendingHessian(), mode=0, open_browser=False)
-
-
 def test_top_level_and_molecule_convenience_apis():
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="angstrom")
 
@@ -129,6 +75,7 @@ def test_top_level_and_molecule_convenience_apis():
 
     assert fragment_parameters(direct)["xyz"] == fragment_parameters(method)["xyz"]
     assert "0.7400000000" in fragment_parameters(method)["xyz"][0]
+    assert pyqed.NormalMode is NormalMode
     assert pyqed.ScalarField3D is ScalarField3D
     assert pyqed.SceneView is SceneView
     assert pyqed.VolumeView is VolumeView
@@ -441,3 +388,313 @@ def test_cube_uses_both_header_lines_and_can_load_all_datasets(tmp_path):
     assert all(field.kind == "orbital" for field in scene.fields)
     np.testing.assert_array_equal(scene.fields[0].values.ravel(), np.arange(8.0))
     np.testing.assert_array_equal(scene.fields[1].values.ravel(), np.arange(10.0, 18.0))
+
+
+def test_normal_mode_owns_normalized_float32_data_and_serializes_base64():
+    vectors = np.array([[2.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+    mode = NormalMode(
+        "mode-1",
+        vectors,
+        -321.5,
+        label="Mode 1",
+        reduced_mass_amu=1.5,
+        intensity=8.0,
+        intensity_unit="km/mol",
+        source_index=0,
+    )
+    vectors[:] = 0.0
+    payload = mode.to_payload()
+    decoded = np.frombuffer(
+        base64.b64decode(payload["displacements"]),
+        dtype="<f4",
+    ).reshape(payload["shape"])
+
+    assert mode.displacements.dtype == np.float32
+    assert not mode.displacements.flags.writeable
+    np.testing.assert_allclose(decoded, [[1.0, 0.0, 0.0], [0.0, -0.5, 0.0]])
+    assert payload["frequency_cm1"] == -321.5
+    assert payload["displacement_encoding"] == "float32-le-base64"
+    assert payload["normalization"] == "max-atom-displacement"
+    assert payload["reduced_mass_amu"] == 1.5
+    assert payload["intensity_unit"] == "km/mol"
+
+    with pytest.raises(ValueError, match="cannot all be zero"):
+        NormalMode("zero", np.zeros((2, 3)), 1.0)
+    with pytest.raises(ValueError, match="shape"):
+        NormalMode("bad", np.ones((2, 2)), 1.0)
+    with pytest.raises(ValueError, match="positive"):
+        NormalMode("bad", np.ones((2, 3)), 1.0, reduced_mass_amu=0.0)
+    with pytest.raises(ValueError, match="non-negative"):
+        NormalMode("bad", np.ones((2, 3)), 1.0, intensity=-1.0)
+    with pytest.raises(ValueError, match="JavaScript-safe"):
+        NormalMode(
+            "bad",
+            np.ones((2, 3)),
+            1.0,
+            source_index=1 << 53,
+        )
+
+
+def test_view_extracts_all_hessian_modes_with_signed_frequencies_and_metadata():
+    class TinyHessian:
+        mol = TinyMolecule()
+
+        def __init__(self):
+            self.calls = 0
+
+        def vibrational_analysis(self):
+            self.calls += 1
+            return {
+                "freq_cm1": np.array([1200.0, -250.0]),
+                "modes": np.array(
+                    [
+                        [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                        [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
+                    ]
+                ),
+                "reduced_mass_amu": np.array([1.2, 2.4]),
+            }
+
+    hessian = TinyHessian()
+    scene = view(
+        hessian,
+        normal_modes="all",
+        active_mode=1,
+        mode_amplitude=0.3,
+        open_browser=False,
+    )
+    payload = scene.payload()
+
+    assert hessian.calls == 1
+    assert [mode.name for mode in scene.normal_modes] == ["mode-1", "mode-2"]
+    assert scene.active_mode == "mode-2"
+    assert scene.url == "https://pyqed.org/viewer"
+    assert urlsplit(scene.url).fragment == ""
+    assert "postMessage" in scene._repr_html_()
+    assert f"{2.0 * au2angstrom:.10f}" in scene.xyz
+    assert payload["normal_modes"]["active_mode"] == "mode-2"
+    assert payload["normal_modes"]["amplitude_angstrom"] == 0.3
+    assert payload["normal_modes"]["modes"][1]["frequency_cm1"] == -250.0
+    assert payload["normal_modes"]["modes"][1]["source_index"] == 1
+    assert payload["normal_modes"]["modes"][1]["label"] == "Mode 2"
+
+
+def test_view_accepts_completed_ir_style_objects_and_mode_subsets():
+    class CompletedIR:
+        frequencies = np.array([500.0, 1600.0])
+        modes = np.array(
+            [
+                [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+                [[0.0, 2.0, 0.0], [0.0, -1.0, 0.0]],
+            ]
+        )
+        reduced_masses = np.array([1.0, 3.0])
+        intensities = np.array([2.0, 7.0])
+        frequency_unit = "cm^-1"
+        intensity_unit = "km/mol"
+        coords = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
+        atom_symbols = ("H", "F")
+
+    scene = view(CompletedIR(), normal_modes=[1], open_browser=False)
+    mode = scene.normal_modes[0]
+
+    assert mode.name == "mode-2"
+    assert mode.frequency_cm1 == 1600.0
+    assert mode.reduced_mass_amu == 3.0
+    assert mode.intensity == 7.0
+    assert mode.intensity_unit == "km/mol"
+    np.testing.assert_allclose(
+        mode.displacements,
+        [[0.0, 1.0, 0.0], [0.0, -0.5, 0.0]],
+    )
+
+
+def test_view_does_not_call_generic_normal_modes_methods():
+    class UnpreparedDriver:
+        mol = TinyMolecule()
+
+        def __init__(self):
+            self.calls = 0
+
+        def normal_modes(self):
+            self.calls += 1
+            raise AssertionError("normal_modes() must not be called implicitly")
+
+    driver = UnpreparedDriver()
+    with pytest.raises(TypeError, match="completed harmonic data"):
+        view(driver, normal_modes="all", open_browser=False)
+    assert driver.calls == 0
+
+
+def test_view_rejects_a_hessian_whose_live_geometry_has_changed():
+    class ChangedMolecule(TinyMolecule):
+        def atom_coords(self):
+            return np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 9.0]])
+
+    class StaleHessian:
+        mol = ChangedMolecule()
+        coords = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
+        hess = np.eye(6)
+
+        def vibrational_analysis(self):
+            return {
+                "freq_cm1": [1000.0],
+                "modes": [[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]],
+            }
+
+    with pytest.raises(ValueError, match="geometry changed"):
+        view(StaleHessian(), normal_modes="all", open_browser=False)
+
+
+def test_view_accepts_unrun_ir_built_from_harmonic_analysis():
+    from pyqed.qchem import IR
+
+    ir = IR.from_harmonic_analysis(
+        {
+            "freq_cm1": [750.0],
+            "modes": [[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]],
+            "reduced_mass_amu": [1.7],
+            "coords": [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
+            "atom_symbols": ["H", "F"],
+        },
+        intensities=[4.5],
+    )
+
+    scene = view(ir, normal_modes="all", open_browser=False)
+
+    assert scene.normal_modes[0].frequency_cm1 == 750.0
+    assert scene.normal_modes[0].reduced_mass_amu == 1.7
+    assert scene.normal_modes[0].intensity == 4.5
+    assert scene.normal_modes[0].intensity_unit == "au"
+
+
+def test_view_accepts_harmonic_mapping_with_explicit_molecule_and_au_frequencies():
+    data = {
+        "freq_au": np.array([0.01j, 0.02]),
+        "norm_mode": np.array(
+            [
+                [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+                [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            ]
+        ),
+        "reduced_mass": np.array([1.0, 2.0]),
+    }
+    scene = view(
+        data,
+        molecule=TinyMolecule(),
+        normal_modes="all",
+        open_browser=False,
+    )
+
+    assert scene.normal_modes[0].frequency_cm1 == pytest.approx(-0.01 * au2wavenumber)
+    assert scene.normal_modes[1].frequency_cm1 == pytest.approx(0.02 * au2wavenumber)
+
+    with pytest.raises(TypeError, match="pass molecule"):
+        view(data, normal_modes="all", open_browser=False)
+
+
+@pytest.mark.parametrize(
+    ("selector", "error", "message"),
+    [
+        (False, ValueError, "require normal_modes"),
+        ([], ValueError, "cannot be empty"),
+        ([0, 0], ValueError, "duplicate"),
+        ([2], IndexError, "outside"),
+        ([True], TypeError, "integers"),
+        ([0.0], TypeError, "integers"),
+    ],
+)
+def test_normal_mode_selectors_are_strict(selector, error, message):
+    data = {
+        "freq_cm1": [100.0, 200.0],
+        "modes": np.ones((2, 2, 3)),
+    }
+    kwargs = {"active_mode": 0} if selector is False else {}
+    with pytest.raises(error, match=message):
+        view(
+            data,
+            molecule=TinyMolecule() if selector is not False else None,
+            normal_modes=selector,
+            open_browser=False,
+            **kwargs,
+        )
+
+
+def test_normal_mode_views_reject_inconsistent_or_misleading_scenes():
+    data = {
+        "freq_cm1": [100.0],
+        "modes": np.ones((1, 2, 3)),
+    }
+    field = ScalarField3D("field", np.ones((2, 2, 2)), (0, 0, 0), np.eye(3))
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        view(
+            data,
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            fields=field,
+            open_browser=False,
+        )
+    with pytest.raises(ValueError, match="same length"):
+        view(
+            {"freq_cm1": [1.0, 2.0], "modes": np.ones((1, 2, 3))},
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            open_browser=False,
+        )
+    with pytest.raises(ValueError, match="purely imaginary"):
+        view(
+            {"freq_cm1": [1.0 + 2.0j], "modes": np.ones((1, 2, 3))},
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            open_browser=False,
+        )
+    with pytest.raises(ValueError, match="one displacement vector per atom"):
+        SceneView(
+            xyz="H 0 0 0",
+            normal_modes=(NormalMode("mode-1", np.ones((2, 3)), 100.0),),
+        )
+    with pytest.raises(ValueError, match="mode_amplitude"):
+        view(
+            data,
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            mode_amplitude=0.0,
+            open_browser=False,
+        )
+    with pytest.raises(ValueError, match="mode_amplitude"):
+        view(
+            data,
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            mode_amplitude=0.009,
+            open_browser=False,
+        )
+    with pytest.raises(ValueError, match="at most 512"):
+        view(
+            {
+                "freq_cm1": np.arange(513.0),
+                "modes": np.ones((513, 2, 3)),
+            },
+            molecule=TinyMolecule(),
+            normal_modes="all",
+            open_browser=False,
+        )
+
+
+def test_normal_mode_scene_opens_a_launcher_not_a_fragment(monkeypatch):
+    opened = []
+    monkeypatch.setattr("webbrowser.open_new_tab", lambda url: opened.append(url) or True)
+    scene = view(
+        {
+            "freq_cm1": [100.0],
+            "modes": np.ones((1, 2, 3)),
+        },
+        molecule=TinyMolecule(),
+        normal_modes="all",
+        open_browser=True,
+    )
+
+    assert scene.url == "https://pyqed.org/viewer"
+    assert len(opened) == 1
+    assert opened[0].startswith("file:")

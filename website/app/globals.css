@@ -325,7 +325,8 @@ summary:focus-visible {
 }
 
 .preset-row button,
-.viewer-controls button {
+.viewer-controls button,
+.normal-mode-panel button {
   min-height: 36px;
   border: 1px solid rgba(168, 238, 242, 0.23);
   background: rgba(255, 255, 255, 0.025);
@@ -342,12 +343,15 @@ summary:focus-visible {
 
 .preset-row button:hover,
 .viewer-controls button:hover,
-.viewer-controls button.is-active {
+.viewer-controls button.is-active,
+.normal-mode-panel button:hover:not(:disabled),
+.normal-mode-panel button.is-active {
   border-color: var(--cyan);
   color: var(--cyan-soft);
 }
 
-.viewer-controls button.is-active {
+.viewer-controls button.is-active,
+.normal-mode-panel button.is-active {
   background: rgba(53, 214, 227, 0.1);
 }
 
@@ -380,7 +384,10 @@ summary:focus-visible {
 .viewer-input-panel textarea:focus,
 .viewer-input-panel select:focus,
 .viewer-controls select:focus,
-.viewer-controls input:focus {
+.viewer-controls input:focus,
+.normal-mode-panel select:focus,
+.normal-mode-panel input:focus-visible,
+.normal-mode-panel button:focus-visible {
   border-color: var(--cyan);
   box-shadow: 0 0 0 2px rgba(53, 214, 227, 0.1);
 }
@@ -518,6 +525,10 @@ summary:focus-visible {
   background: #071720;
 }
 
+.viewer-display-panel.has-normal-modes {
+  grid-template-rows: auto auto minmax(480px, 1fr) auto;
+}
+
 .viewer-toolbar {
   display: flex;
   min-height: 90px;
@@ -594,9 +605,119 @@ summary:focus-visible {
 }
 
 .viewer-controls select:disabled,
-.viewer-controls input:disabled {
+.viewer-controls input:disabled,
+.viewer-controls button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
+}
+
+.normal-mode-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) repeat(3, minmax(0, 1fr));
+  align-items: end;
+  gap: 0.7rem;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid var(--rule-dark);
+  background: #081923;
+}
+
+.normal-mode-select {
+  grid-column: span 2;
+}
+
+.normal-mode-panel label,
+.normal-mode-frequency {
+  display: grid;
+  gap: 0.3rem;
+  color: #aec0c5;
+  font-size: 0.64rem;
+  font-weight: 760;
+  letter-spacing: 0.065em;
+  text-transform: uppercase;
+}
+
+.normal-mode-panel select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 0.55rem;
+  border: 1px solid rgba(168, 238, 242, 0.24);
+  border-radius: 0;
+  outline: none;
+  background: #071720;
+  color: #d8e6e8;
+  font-family: var(--mono);
+  font-size: 0.69rem;
+  text-transform: none;
+}
+
+.normal-mode-frequency {
+  position: relative;
+  align-self: stretch;
+  justify-content: center;
+  padding: 0.2rem 0.75rem;
+  border-left: 2px solid #f3c969;
+  background: rgba(243, 201, 105, 0.055);
+}
+
+.normal-mode-frequency strong {
+  color: #f4dc9d;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.normal-mode-frequency em {
+  color: #ffb0ac;
+  font-size: 0.58rem;
+  font-style: normal;
+}
+
+.normal-mode-panel button {
+  min-height: 36px;
+  padding: 0.4rem 0.65rem;
+}
+
+.normal-mode-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.normal-mode-play {
+  min-width: 68px;
+}
+
+.normal-mode-slider > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.normal-mode-slider output {
+  color: #f4dc9d;
+  font-family: var(--mono);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.normal-mode-slider input {
+  width: 100%;
+  min-height: 18px;
+  accent-color: #f3c969;
+  cursor: pointer;
+}
+
+.normal-mode-slider input:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.normal-mode-details {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #768f98;
+  font-size: 0.62rem;
+  line-height: 1.45;
 }
 
 .molecule-canvas-wrap {
@@ -733,6 +854,14 @@ summary:focus-visible {
 .element-legend i.surface-negative {
   border-radius: 2px;
   background: #f38b6b;
+}
+
+.element-legend i.normal-mode-vector {
+  width: 22px;
+  height: 3px;
+  border: 0;
+  border-radius: 1px;
+  background: #f3c969;
 }
 
 .element-legend .esp-gradient-key i {
@@ -2283,6 +2412,10 @@ footer {
     justify-content: flex-start;
   }
 
+  .normal-mode-details {
+    grid-column: 1 / -1;
+  }
+
   .hero-content {
     min-height: 650px;
     grid-template-columns: minmax(0, 1fr) minmax(300px, 0.6fr);
@@ -2373,6 +2506,26 @@ footer {
 
   .viewer-display-panel {
     grid-template-rows: auto 430px auto;
+  }
+
+  .viewer-display-panel.has-normal-modes {
+    grid-template-rows: auto auto 430px auto;
+  }
+
+  .normal-mode-panel {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: stretch;
+    padding: 0.85rem 1rem;
+  }
+
+  .normal-mode-select,
+  .normal-mode-details {
+    grid-column: 1 / -1;
+  }
+
+  .normal-mode-panel button,
+  .normal-mode-frequency {
+    align-self: stretch;
   }
 
   .molecule-canvas,

@@ -60,6 +60,46 @@ page URL: PyQED writes a local launcher and transfers validated float32 field
 data directly to the viewer. The website renders it locally in the browser
 and offers a field/state menu plus adjustable isovalues.
 
+Normal Modes
+------------
+
+A completed RHF Hessian can be sent to the same viewer. Keep the Hessian
+object itself: ``run()`` returns its Cartesian Hessian array, while the object
+retains that Hessian and the molecular geometry. The viewer derives the
+harmonic analysis from the stored Hessian without rerunning it.
+
+.. code-block:: python
+
+   from pyqed import view
+
+   hess = mf.Hessian()
+   hess.run()
+   view(hess, normal_modes="all")
+
+This call does not silently calculate a Hessian. The Hessian must already have
+been run; the viewer then calls ``vibrational_analysis()`` on the stored
+Cartesian Hessian. For the native RHF implementation, use the exact built-in
+J/K path, such as a molecule built with ``driver="builtin", eri="s8"``;
+density fitting, RI, low-rank J/K, and Cholesky J/K are not supported by that
+Hessian.
+
+Normal-mode scenes animate the reference geometry only. The amplitude control
+uses a normalized visual scale so the relative atomic displacements are clear;
+the accepted range is 0.01--10 Angstrom. It is not a physical normal-coordinate
+amplitude or a time-dependent nuclear trajectory. Frequencies retain their
+sign, and a negative frequency marks an imaginary mode. The sign of an
+individual displacement vector is arbitrary.
+Pause playback to scrub the phase between the two turning points or return to
+the reference geometry before exporting the displayed structure as XYZ.
+Raw mappings and completed IR-like objects must provide Cartesian atomic
+displacements with shape ``(nmodes, natom, 3)``, not mass-weighted
+eigenvectors; the viewer rescales each mode by one global factor.
+
+Reference-geometry molecular orbitals or density fields are intentionally not
+shown at the same time as a moving geometry, because stretching a fixed scalar
+field would be misleading. To inspect a field at a displaced structure, build
+that geometry and rerun the electronic-structure calculation.
+
 Basic Usage
 -----------
 
