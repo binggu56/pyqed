@@ -326,6 +326,56 @@ test("validates encoded scalar fields and ESP density mappings", () => {
   );
 });
 
+test("validates normal-mode scenes and atom-aligned displacements", () => {
+  const message = {
+    type: "pyqed:scene",
+    scene: {
+      version: 1,
+      kind: "pyqed-scene",
+      title: "Mode 0: 4401.2 cm^-1",
+      molecule: {
+        xyz: "2\nH2\nH 0 0 -0.37\nH 0 0 0.37",
+        representation: "ball-stick",
+        labels: false,
+      },
+      vibration: {
+        mode_index: 0,
+        frequency_cm1: 4401.2,
+        displacements: [[0, 0, -0.15], [0, 0, 0.15]],
+        amplitude_angstrom: 0.15,
+        frames: 24,
+        interval: 60,
+      },
+      fields: [],
+      active_field: null,
+    },
+  };
+
+  const scene = validateSceneMessage(message);
+  assert.equal(scene.vibration.modeIndex, 0);
+  assert.equal(scene.vibration.frequencyCm1, 4401.2);
+  assert.deepEqual(scene.vibration.displacements[1], [0, 0, 0.15]);
+  assert.equal(scene.vibration.frames, 24);
+
+  assert.throws(
+    () => validateSceneMessage({
+      ...message,
+      scene: {
+        ...message.scene,
+        vibration: { ...message.scene.vibration, displacements: [[0, 0, 0.1]] },
+      },
+    }),
+    /one vector per atom/i,
+  );
+  assert.throws(
+    () => validateSceneMessage({
+      ...message,
+      scene: { ...message.scene, molecule: null },
+    }),
+    /requires a molecule/i,
+  );
+});
+
 test("parses single and multi-state Gaussian cube files in C order", () => {
   const singleCube = `Water field
 MO test
@@ -408,6 +458,8 @@ test("uses a static, repository-owned deployment", async () => {
   assert.match(moleculeViewer, /validateSceneMessage\(event\.data\)/);
   assert.match(moleculeViewer, /import\("3dmol"\)/);
   assert.match(moleculeViewer, /pyqed:viewer-ready/);
+  assert.match(moleculeViewer, /viewer\.vibrate\(vibration\.frames/);
+  assert.match(moleculeViewer, /Pause mode/);
   assert.ok(
     moleculeViewer.indexOf('window.addEventListener("message", receiveScene)') <
       moleculeViewer.indexOf('type: "pyqed:viewer-ready"'),

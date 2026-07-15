@@ -23,7 +23,7 @@ import webbrowser
 
 import numpy as np
 
-from pyqed.units import au2angstrom
+from pyqed.units import au2angstrom, au2wavenumber
 
 
 _VIEWER_URL = "https://pyqed.org/viewer"
@@ -457,6 +457,61 @@ def _viewer_origin(viewer_url: str) -> str:
     return origin
 
 
+@dataclass(frozen=True)
+class NormalModeAnimation:
+    """Browser-ready displacement data for one harmonic normal mode."""
+
+    mode_index: int
+    frequency_cm1: float
+    displacements: np.ndarray
+    amplitude_angstrom: float
+    frames: int = 24
+    interval: int = 60
+
+    def __post_init__(self) -> None:
+        mode_index = int(self.mode_index)
+        frequency = float(self.frequency_cm1)
+        displacements = np.array(self.displacements, dtype=float, copy=True)
+        amplitude = float(self.amplitude_angstrom)
+        frames = int(self.frames)
+        interval = int(self.interval)
+        if mode_index < 0:
+            raise ValueError("mode_index must be non-negative")
+        if not np.isfinite(frequency):
+            raise ValueError("frequency_cm1 must be finite")
+        if displacements.ndim != 2 or displacements.shape[1] != 3:
+            raise ValueError("normal-mode displacements must have shape (natom, 3)")
+        if not np.all(np.isfinite(displacements)):
+            raise ValueError("normal-mode displacements must be finite")
+        if not np.isfinite(amplitude) or amplitude <= 0.0 or amplitude > 10.0:
+            raise ValueError("amplitude_angstrom must be in the interval (0, 10]")
+        if frames < 8 or frames > 120:
+            raise ValueError("frames must be between 8 and 120")
+        if interval < 16 or interval > 1000:
+            raise ValueError("interval must be between 16 and 1000 milliseconds")
+        displacements.setflags(write=False)
+        object.__setattr__(self, "mode_index", mode_index)
+        object.__setattr__(self, "frequency_cm1", frequency)
+        object.__setattr__(self, "displacements", displacements)
+        object.__setattr__(self, "amplitude_angstrom", amplitude)
+        object.__setattr__(self, "frames", frames)
+        object.__setattr__(self, "interval", interval)
+
+    @property
+    def label(self) -> str:
+        return f"Mode {self.mode_index}: {self.frequency_cm1:.1f} cm^-1"
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "mode_index": self.mode_index,
+            "frequency_cm1": self.frequency_cm1,
+            "displacements": self.displacements.tolist(),
+            "amplitude_angstrom": self.amplitude_angstrom,
+            "frames": self.frames,
+            "interval": self.interval,
+        }
+
+
 @dataclass
 class SceneView:
     """A geometry and zero or more regular scalar fields for the web viewer."""
@@ -469,6 +524,7 @@ class SceneView:
     height: int = 640
     title: str | None = None
     active_field: str | int | None = None
+    vibration: NormalModeAnimation | None = None
     viewer_url: str = _VIEWER_URL
 
     def __post_init__(self) -> None:
@@ -522,6 +578,11 @@ class SceneView:
             raise ValueError("a scene must contain geometry or at least one scalar field")
         if self.xyz is not None:
             self.xyz = _validate_xyz_payload(self.xyz)
+        if self.vibration is not None:
+            if not isinstance(self.vibration, NormalModeAnimation):
+                raise TypeError("vibration must be a NormalModeAnimation")
+            if self.xyz is None:
+                raise ValueError("normal-mode animation requires molecular geometry")
         if self.title is not None:
             self.title = str(self.title).strip()
             if not self.title or len(self.title) > 160 or any(
@@ -538,7 +599,7 @@ class SceneView:
         deliberately absent from this property and is transported by
         :meth:`open` or :meth:`_repr_html_` using ``postMessage``.
         """
-        if self.fields:
+        if self.fields or self.vibration is not None:
             return self.viewer_url
         fragment = urlencode(
             {
@@ -563,6 +624,8 @@ class SceneView:
             "fields": [item.to_payload() for item in self.fields],
             "active_field": self.active_field,
         }
+        if self.vibration is not None:
+            scene["vibration"] = self.vibration.to_payload()
         if self.title:
             scene["title"] = self.title
         return scene
@@ -622,7 +685,7 @@ class SceneView:
 
     def open(self) -> bool:
         """Open the scene in the default browser."""
-        if not self.fields:
+        if not self.fields and self.vibration is None:
             return webbrowser.open_new_tab(self.url)
         handle = tempfile.NamedTemporaryFile(
             mode="w",
@@ -645,7 +708,7 @@ class SceneView:
 
     def _repr_html_(self) -> str:
         """Render the interactive viewer inline in a Jupyter frontend."""
-        if self.fields:
+        if self.fields or self.vibration is not None:
             return self._launcher_html(full_page=False)
         src = escape(self.url, quote=True)
         return (
@@ -678,6 +741,97 @@ def _molecule_from_object(obj):
         if candidate is not None and callable(getattr(candidate, "atom_coords", None)):
             return candidate
     raise TypeError("could not find molecular geometry on the supplied object")
+
+
+def _normal_mode_animation(
+    hessian,
+    molecule,
+    *,
+    mode,
+    amplitude,
+    coordinates_unit,
+    frames,
+    interval,
+) -> NormalModeAnimation:
+    analysis_method = getattr(hessian, "vibrational_analysis", None)
+    if not callable(analysis_method):
+        raise TypeError("mode viewing requires a completed Hessian object")
+    try:
+        analysis = analysis_method()
+    except ValueError as exc:
+        raise ValueError(
+            "run the Hessian calculation before calling view(hessian, mode=...)"
+        ) from exc
+    if not isinstance(analysis, Mapping):
+        raise TypeError("vibrational_analysis() must return a mapping")
+
+    raw_modes = analysis.get("modes", analysis.get("norm_mode"))
+    if raw_modes is None:
+        raise ValueError("vibrational analysis did not return normal modes")
+    modes = np.asarray(raw_modes, dtype=float)
+    if modes.ndim != 3 or modes.shape[2] != 3:
+        raise ValueError("normal modes must have shape (nmodes, natom, 3)")
+    if isinstance(mode, (bool, np.bool_)):
+        raise TypeError("mode must be an integer index")
+    mode_index = int(mode)
+    if mode_index != mode:
+        raise TypeError("mode must be an integer index")
+    if mode_index < 0 or mode_index >= modes.shape[0]:
+        raise IndexError(f"mode index {mode_index} is outside [0, {modes.shape[0]})")
+
+    coordinates = np.asarray(molecule.atom_coords(), dtype=float)
+    displacement = np.asarray(modes[mode_index], dtype=float)
+    if displacement.shape != coordinates.shape:
+        raise ValueError("normal-mode shape does not match the molecule")
+    if not np.all(np.isfinite(displacement)):
+        raise ValueError("normal-mode displacements must be finite")
+    maximum = float(np.max(np.linalg.norm(displacement, axis=1)))
+    if maximum <= np.finfo(float).eps:
+        raise ValueError("selected normal mode has zero displacement")
+
+    unit = str(coordinates_unit).lower()
+    if unit in {"bohr", "b", "au", "a.u."}:
+        coordinates_angstrom = coordinates * au2angstrom
+    elif unit in {"angstrom", "angstroms", "a", "å"}:
+        coordinates_angstrom = coordinates
+    else:
+        raise ValueError("coordinates_unit must be 'bohr' or 'angstrom'")
+    if amplitude == "auto":
+        span = float(np.max(np.ptp(coordinates_angstrom, axis=0)))
+        amplitude_angstrom = min(0.5, max(0.12, 0.18 * max(span, 1.0)))
+    else:
+        amplitude_angstrom = float(amplitude)
+        if (
+            not np.isfinite(amplitude_angstrom)
+            or amplitude_angstrom <= 0.0
+            or amplitude_angstrom > 10.0
+        ):
+            raise ValueError("amplitude must be 'auto' or a value in (0, 10] angstrom")
+    displacement_angstrom = displacement * (amplitude_angstrom / maximum)
+
+    if "freq_cm1" in analysis:
+        frequencies = analysis["freq_cm1"]
+    elif "freq_wavenumber" in analysis:
+        frequencies = analysis["freq_wavenumber"]
+    elif "freq_au" in analysis:
+        frequencies = np.asarray(analysis["freq_au"]) * au2wavenumber
+    else:
+        raise ValueError("vibrational analysis did not return frequencies")
+    frequencies = np.asarray(frequencies)
+    if frequencies.shape != (modes.shape[0],):
+        raise ValueError("vibrational frequencies do not match the normal modes")
+    frequency = np.real_if_close(frequencies[mode_index])
+    if np.iscomplexobj(frequency):
+        frequency = frequency.real - abs(frequency.imag)
+
+    return NormalModeAnimation(
+        mode_index=mode_index,
+        frequency_cm1=float(frequency),
+        displacements=displacement_angstrom,
+        amplitude_angstrom=amplitude_angstrom,
+        frames=frames,
+        interval=interval,
+    )
 
 
 def _scf_reference(obj):
@@ -1670,6 +1824,10 @@ def _read_cube(path: Path, *, dataset: int | str = 0):
 def view(
     obj,
     *,
+    mode: int | None = None,
+    amplitude: str | float = "auto",
+    frames: int = 24,
+    interval: int = 60,
     orbital=None,
     coeff=None,
     orbital_spin: str = "auto",
@@ -1701,7 +1859,8 @@ def view(
 
     Examples
     --------
-    ``view(mol)`` shows geometry.  For a converged SCF object, use
+    ``view(mol)`` shows geometry and ``view(hessian, mode=0)`` animates one
+    harmonic normal mode.  For a converged SCF object, use
     ``view(mf, orbital=['homo', 'lumo'])``, ``orbital='all'``,
     ``density='all'`` (including unrestricted spin density), or ``esp=True``.
     ``view(td, nto='all')`` builds NTO hole/particle layers for every exposed
@@ -1714,9 +1873,21 @@ def view(
     esp_requested = esp is not None and esp is not False
     density_requested = density is not None and density is not False
     nto_requested = nto is not None and nto is not False
+    mode_requested = mode is not None
+    if mode_requested and (
+        orbital is not None
+        or coeff is not None
+        or density_requested
+        or nto_requested
+        or fields is not None
+        or esp_requested
+    ):
+        raise ValueError("normal-mode animation cannot be combined with scalar fields")
     if isinstance(obj, SceneView):
         if (
-            orbital is not None
+            mode_requested
+            or amplitude != "auto"
+            or orbital is not None
             or coeff is not None
             or density_requested
             or nto_requested
@@ -1732,7 +1903,9 @@ def view(
         if path.suffix.lower() not in {".cube", ".cub"}:
             raise ValueError("view(path) currently accepts .cube and .cub files")
         if (
-            orbital is not None
+            mode_requested
+            or amplitude != "auto"
+            or orbital is not None
             or coeff is not None
             or density_requested
             or nto_requested
@@ -1754,6 +1927,17 @@ def view(
     else:
         molecule = _molecule_from_object(obj)
         xyz = _molecule_xyz(molecule, coordinates_unit=coordinates_unit)
+        vibration = None
+        if mode_requested:
+            vibration = _normal_mode_animation(
+                obj,
+                molecule,
+                mode=mode,
+                amplitude=amplitude,
+                coordinates_unit=coordinates_unit,
+                frames=frames,
+                interval=interval,
+            )
         external_fields: list[ScalarField3D] = []
         if fields is not None:
             if isinstance(fields, ScalarField3D):
@@ -1854,8 +2038,9 @@ def view(
             labels=bool(labels),
             width=width,
             height=height,
-            title=title,
+            title=title or (vibration.label if vibration is not None else None),
             active_field=active_field,
+            vibration=vibration,
         )
 
     should_open = not _in_notebook() if open_browser is None else bool(open_browser)
