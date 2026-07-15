@@ -1,12 +1,15 @@
 export const BOHR_TO_ANGSTROM = 0.529177210903;
 export const MAX_ATOMS = 500;
 export const MAX_FIELDS = 512;
+export const MAX_NORMAL_MODES = 512;
+export const MAX_NORMAL_MODE_COMPONENTS = 768_000;
 export const MAX_GRID_POINTS = 2_000_000;
 export const MAX_TOTAL_GRID_POINTS = 8_000_000;
 export const MAX_CUBE_FILE_BYTES = 80_000_000;
 
 const MAX_GEOMETRY_CHARS = 1_000_000;
 const MAX_FLOAT32 = 3.4028234663852886e38;
+const MIN_NORMAL_MODE_NORM = 1.1754943508222875e-38;
 const FIELD_KINDS = new Set([
   "orbital",
   "electron-density",
@@ -228,9 +231,9 @@ export function xyzFor(atoms, comment = "Exported from the PyQED molecular viewe
   return `${atoms.length}\n${comment} · coordinates in angstrom\n${rows.join("\n")}\n`;
 }
 
-function decodeFloat32Base64(value, pointCount, context) {
+function decodeFloat32Base64(value, pointCount, context, encodingName = "value_encoding") {
   if (typeof value !== "string") {
-    fail(`${context} must be base64 text when value_encoding is float32-le-base64.`);
+    fail(`${context} must be base64 text when ${encodingName} is float32-le-base64.`);
   }
   const byteLength = pointCount * Float32Array.BYTES_PER_ELEMENT;
   const expectedLength = Math.ceil(byteLength / 3) * 4;
@@ -274,6 +277,183 @@ function decodeFloat32Base64(value, pointCount, context) {
     values[index] = data.getFloat32(index * Float32Array.BYTES_PER_ELEMENT, true);
   }
   return values;
+}
+
+function validateNormalMode(rawMode, index, atomCount) {
+  const context = `scene.normal_modes.modes[${index}]`;
+  if (!isRecord(rawMode)) fail(`${context} must be an object.`);
+  assertAllowedKeys(
+    rawMode,
+    new Set([
+      "name", "label", "source_index", "frequency_cm1", "shape",
+      "displacements", "displacement_encoding", "normalization",
+      "reduced_mass_amu", "intensity", "intensity_unit",
+    ]),
+    context,
+  );
+
+  const name = cleanLine(rawMode.name, `${context}.name`, 80);
+  const label = cleanLine(rawMode.label, `${context}.label`, 120, name);
+  let sourceIndex;
+  if (rawMode.source_index !== undefined) {
+    if (!Number.isSafeInteger(rawMode.source_index) || rawMode.source_index < 0) {
+      fail(`${context}.source_index must be a non-negative integer.`);
+    }
+    sourceIndex = rawMode.source_index;
+  }
+  const frequencyCm1 = finiteNumber(rawMode.frequency_cm1, `${context}.frequency_cm1`);
+  if (
+    !Array.isArray(rawMode.shape) ||
+    rawMode.shape.length !== 2 ||
+    rawMode.shape[0] !== atomCount ||
+    rawMode.shape[1] !== 3
+  ) {
+    fail(`${context}.shape must be [${atomCount}, 3] to match the molecule.`);
+  }
+  if (rawMode.displacement_encoding !== "float32-le-base64") {
+    fail(`${context}.displacement_encoding must be float32-le-base64.`);
+  }
+  if (rawMode.normalization !== "max-atom-displacement") {
+    fail(`${context}.normalization must be max-atom-displacement.`);
+  }
+
+  const componentCount = atomCount * 3;
+  const decoded = decodeFloat32Base64(
+    rawMode.displacements,
+    componentCount,
+    `${context}.displacements`,
+    "displacement_encoding",
+  );
+  let maximumNorm = 0;
+  for (let atomIndex = 0; atomIndex < atomCount; atomIndex += 1) {
+    const offset = atomIndex * 3;
+    const x = finiteNumber(decoded[offset], `${context}.displacements[${offset}]`);
+    const y = finiteNumber(decoded[offset + 1], `${context}.displacements[${offset + 1}]`);
+    const z = finiteNumber(decoded[offset + 2], `${context}.displacements[${offset + 2}]`);
+    maximumNorm = Math.max(maximumNorm, Math.hypot(x, y, z));
+  }
+  if (!(maximumNorm > MIN_NORMAL_MODE_NORM)) {
+    fail(`${context}.displacements cannot be all zero.`);
+  }
+
+  // Python emits max-atom-normalized vectors. Renormalizing here keeps the
+  // browser amplitude meaningful after float32 serialization or custom input.
+  const displacements = new Float32Array(componentCount);
+  for (let component = 0; component < componentCount; component += 1) {
+    displacements[component] = decoded[component] / maximumNorm;
+  }
+
+  let reducedMassAmu;
+  if (rawMode.reduced_mass_amu !== undefined) {
+    reducedMassAmu = finiteNumber(rawMode.reduced_mass_amu, `${context}.reduced_mass_amu`);
+    if (reducedMassAmu <= 0) fail(`${context}.reduced_mass_amu must be greater than zero.`);
+  }
+  let intensity;
+  if (rawMode.intensity !== undefined) {
+    intensity = finiteNumber(rawMode.intensity, `${context}.intensity`);
+    if (intensity < 0) fail(`${context}.intensity cannot be negative.`);
+  }
+  let intensityUnit;
+  if (rawMode.intensity_unit !== undefined) {
+    intensityUnit = cleanLine(rawMode.intensity_unit, `${context}.intensity_unit`, 40);
+    if (intensity === undefined) fail(`${context}.intensity_unit requires intensity.`);
+  }
+
+  return {
+    name,
+    label,
+    sourceIndex,
+    frequencyCm1,
+    shape: [atomCount, 3],
+    displacements,
+    normalization: "max-atom-displacement",
+    reducedMassAmu,
+    intensity,
+    intensityUnit,
+  };
+}
+
+function validateNormalModes(rawNormalModes, atomCount) {
+  const context = "scene.normal_modes";
+  if (!isRecord(rawNormalModes)) fail(`${context} must be an object.`);
+  assertAllowedKeys(
+    rawNormalModes,
+    new Set(["modes", "active_mode", "amplitude_angstrom"]),
+    context,
+  );
+  if (atomCount === 0) fail(`${context} requires a molecular geometry.`);
+  if (
+    !Array.isArray(rawNormalModes.modes) ||
+    rawNormalModes.modes.length === 0 ||
+    rawNormalModes.modes.length > MAX_NORMAL_MODES
+  ) {
+    fail(`${context}.modes must contain between 1 and ${MAX_NORMAL_MODES} modes.`);
+  }
+  const componentCount = rawNormalModes.modes.length * atomCount * 3;
+  if (componentCount > MAX_NORMAL_MODE_COMPONENTS) {
+    fail(`${context} exceeds the ${MAX_NORMAL_MODE_COMPONENTS.toLocaleString()}-component limit.`);
+  }
+  const modes = rawNormalModes.modes.map((mode, index) =>
+    validateNormalMode(mode, index, atomCount),
+  );
+  const names = new Set();
+  for (const mode of modes) {
+    if (names.has(mode.name)) fail(`Normal mode name “${mode.name}” is duplicated.`);
+    names.add(mode.name);
+  }
+
+  let activeModeIndex = 0;
+  if (rawNormalModes.active_mode !== undefined && rawNormalModes.active_mode !== null) {
+    if (Number.isInteger(rawNormalModes.active_mode)) {
+      activeModeIndex = rawNormalModes.active_mode;
+    } else if (typeof rawNormalModes.active_mode === "string") {
+      activeModeIndex = modes.findIndex((mode) => mode.name === rawNormalModes.active_mode);
+    } else {
+      fail(`${context}.active_mode must be a mode name or integer index.`);
+    }
+    if (activeModeIndex < 0 || activeModeIndex >= modes.length) {
+      fail(`${context}.active_mode does not identify a supplied mode.`);
+    }
+  }
+
+  const amplitudeAngstrom = rawNormalModes.amplitude_angstrom === undefined
+    ? 0.25
+    : finiteNumber(rawNormalModes.amplitude_angstrom, `${context}.amplitude_angstrom`);
+  if (amplitudeAngstrom < 0.01 || amplitudeAngstrom > 10) {
+    fail(`${context}.amplitude_angstrom must be between 0.01 and 10.`);
+  }
+  return { modes, activeModeIndex, amplitudeAngstrom };
+}
+
+export function displacedAtoms(atoms, mode, amplitudeAngstrom, phase) {
+  if (!mode) return atoms.map((atom) => ({ ...atom }));
+  if (!Number.isFinite(amplitudeAngstrom) || amplitudeAngstrom < 0) {
+    fail("Normal-mode amplitude must be a non-negative finite number.");
+  }
+  if (!Number.isFinite(phase)) fail("Normal-mode phase must be finite.");
+  if (mode.displacements.length !== atoms.length * 3) {
+    fail("Normal-mode displacements do not match the molecule.");
+  }
+  const scale = amplitudeAngstrom * Math.sin(phase);
+  return atoms.map((atom, index) => ({
+    ...atom,
+    x: atom.x + mode.displacements[index * 3] * scale,
+    y: atom.y + mode.displacements[index * 3 + 1] * scale,
+    z: atom.z + mode.displacements[index * 3 + 2] * scale,
+  }));
+}
+
+export function symmetricNormalModeFrame(phase, frameSteps = 30) {
+  if (!Number.isFinite(phase)) fail("Normal-mode phase must be finite.");
+  if (!Number.isSafeInteger(frameSteps) || frameSteps < 2) {
+    fail("Normal-mode frame steps must be an integer of at least two.");
+  }
+  const symmetricSteps = frameSteps - 1;
+  const displacementStep = Math.round(Math.sin(phase) * symmetricSteps);
+  return {
+    frame: frameSteps + displacementStep,
+    displacementScale: displacementStep / symmetricSteps,
+  };
 }
 
 function validateField(rawField, index) {
@@ -427,53 +607,6 @@ function validateField(rawField, index) {
   };
 }
 
-function validateVibration(rawVibration, atomCount) {
-  const context = "message.scene.vibration";
-  if (!isRecord(rawVibration)) fail(`${context} must be an object.`);
-  assertAllowedKeys(
-    rawVibration,
-    new Set([
-      "mode_index", "frequency_cm1", "displacements", "amplitude_angstrom",
-      "frames", "interval",
-    ]),
-    context,
-  );
-  const modeIndex = rawVibration.mode_index;
-  if (!Number.isSafeInteger(modeIndex) || modeIndex < 0) {
-    fail(`${context}.mode_index must be a non-negative integer.`);
-  }
-  const frequencyCm1 = finiteNumber(rawVibration.frequency_cm1, `${context}.frequency_cm1`);
-  const amplitudeAngstrom = finiteNumber(
-    rawVibration.amplitude_angstrom,
-    `${context}.amplitude_angstrom`,
-  );
-  if (amplitudeAngstrom <= 0 || amplitudeAngstrom > 10) {
-    fail(`${context}.amplitude_angstrom must be greater than zero and at most 10.`);
-  }
-  if (!Array.isArray(rawVibration.displacements) || rawVibration.displacements.length !== atomCount) {
-    fail(`${context}.displacements must contain one vector per atom.`);
-  }
-  const displacements = rawVibration.displacements.map((vector, index) =>
-    finiteVector(vector, `${context}.displacements[${index}]`),
-  );
-  const frames = rawVibration.frames;
-  if (!Number.isSafeInteger(frames) || frames < 8 || frames > 120) {
-    fail(`${context}.frames must be an integer between 8 and 120.`);
-  }
-  const interval = rawVibration.interval;
-  if (!Number.isSafeInteger(interval) || interval < 16 || interval > 1000) {
-    fail(`${context}.interval must be an integer between 16 and 1000 milliseconds.`);
-  }
-  return {
-    modeIndex,
-    frequencyCm1,
-    displacements,
-    amplitudeAngstrom,
-    frames,
-    interval,
-  };
-}
-
 export function validateSceneMessage(message) {
   if (!isRecord(message)) fail("The PyQED message must be an object.");
   assertAllowedKeys(message, new Set(["type", "scene"]), "message");
@@ -482,7 +615,10 @@ export function validateSceneMessage(message) {
   const scene = message.scene;
   assertAllowedKeys(
     scene,
-    new Set(["version", "kind", "title", "molecule", "fields", "active_field", "vibration"]),
+    new Set([
+      "version", "kind", "title", "molecule", "fields", "active_field",
+      "normal_modes",
+    ]),
     "message.scene",
   );
   if (scene.version !== 1 || scene.kind !== "pyqed-scene") {
@@ -507,12 +643,6 @@ export function validateSceneMessage(message) {
     molecule = { xyz, representation, labels };
   }
 
-  let vibration = null;
-  if (scene.vibration !== undefined && scene.vibration !== null) {
-    if (!molecule) fail("message.scene.vibration requires a molecule.");
-    vibration = validateVibration(scene.vibration, atoms.length);
-  }
-
   if (!Array.isArray(scene.fields) || scene.fields.length > MAX_FIELDS) {
     fail(`message.scene.fields must be an array with at most ${MAX_FIELDS} entries.`);
   }
@@ -526,7 +656,6 @@ export function validateSceneMessage(message) {
     }
     fields.push(field);
   }
-  if (!molecule && fields.length === 0) fail("A scene must contain a molecule or at least one scalar field.");
   const names = new Set();
   for (const field of fields) {
     if (names.has(field.name)) fail(`Field name “${field.name}” is duplicated.`);
@@ -557,13 +686,23 @@ export function validateSceneMessage(message) {
     }
   }
 
+  const normalModes = scene.normal_modes === undefined
+    ? null
+    : validateNormalModes(scene.normal_modes, atoms.length);
+  if (normalModes && fields.length > 0) {
+    fail("Normal modes cannot be combined with scalar fields in one scene.");
+  }
+  if (!molecule && fields.length === 0 && !normalModes) {
+    fail("A scene must contain a molecule or at least one scalar field.");
+  }
+
   return {
     title,
     atoms,
     molecule,
-    vibration,
     fields,
     activeFieldIndex,
+    normalModes,
   };
 }
 
@@ -758,9 +897,9 @@ export function parseCube(text, options = {}) {
       representation: "ball-stick",
       labels: false,
     },
-    vibration: null,
     fields,
     activeFieldIndex: fields.length > 0 ? 0 : -1,
+    normalModes: null,
   };
 }
 

@@ -4,9 +4,13 @@ import test from "node:test";
 import {
   BOHR_TO_ANGSTROM,
   MAX_GRID_POINTS,
+  MAX_NORMAL_MODE_COMPONENTS,
+  MAX_NORMAL_MODES,
+  displacedAtoms,
   fieldToCube,
   parseCube,
   parseGeometry,
+  symmetricNormalModeFrame,
   validateSceneMessage,
 } from "../app/viewer/volume-data.mjs";
 
@@ -326,54 +330,211 @@ test("validates encoded scalar fields and ESP density mappings", () => {
   );
 });
 
-test("validates normal-mode scenes and atom-aligned displacements", () => {
+test("validates, normalizes, and displaces nested normal-mode scenes", () => {
+  const realMode = {
+    name: "mode-1",
+    label: "Symmetric stretch",
+    source_index: 5,
+    frequency_cm1: 1595.23,
+    shape: [2, 3],
+    displacements: float32Base64([2, 0, 0, 0, 1, 0]),
+    displacement_encoding: "float32-le-base64",
+    normalization: "max-atom-displacement",
+    reduced_mass_amu: 1.234,
+    intensity: 42.5,
+    intensity_unit: "km mol^-1",
+  };
+  const imaginaryMode = {
+    ...realMode,
+    name: "mode-2",
+    label: "Reaction coordinate",
+    source_index: 6,
+    frequency_cm1: -462.75,
+    displacements: float32Base64([0, 0, 1, 0, 0, -1]),
+    reduced_mass_amu: undefined,
+    intensity: undefined,
+    intensity_unit: undefined,
+  };
   const message = {
     type: "pyqed:scene",
     scene: {
       version: 1,
       kind: "pyqed-scene",
-      title: "Mode 0: 4401.2 cm^-1",
-      molecule: {
-        xyz: "2\nH2\nH 0 0 -0.37\nH 0 0 0.37",
-        representation: "ball-stick",
-        labels: false,
-      },
-      vibration: {
-        mode_index: 0,
-        frequency_cm1: 4401.2,
-        displacements: [[0, 0, -0.15], [0, 0, 0.15]],
-        amplitude_angstrom: 0.15,
-        frames: 24,
-        interval: 60,
-      },
+      molecule: { xyz: "H 0 0 0; H 0 0 0.74" },
       fields: [],
-      active_field: null,
+      normal_modes: {
+        modes: [realMode, imaginaryMode],
+        active_mode: "mode-2",
+        amplitude_angstrom: 0.6,
+      },
     },
   };
 
   const scene = validateSceneMessage(message);
-  assert.equal(scene.vibration.modeIndex, 0);
-  assert.equal(scene.vibration.frequencyCm1, 4401.2);
-  assert.deepEqual(scene.vibration.displacements[1], [0, 0, 0.15]);
-  assert.equal(scene.vibration.frames, 24);
+  assert.equal(scene.normalModes.activeModeIndex, 1);
+  assert.equal(scene.normalModes.amplitudeAngstrom, 0.6);
+  assert.equal(scene.normalModes.modes[0].sourceIndex, 5);
+  assert.equal(scene.normalModes.modes[1].frequencyCm1, -462.75);
+  assert.equal(scene.normalModes.modes[0].reducedMassAmu, 1.234);
+  assert.equal(scene.normalModes.modes[0].intensityUnit, "km mol^-1");
+  assert.ok(Math.abs(scene.normalModes.modes[0].displacements[0] - 1) < 1e-7);
+  assert.ok(Math.abs(scene.normalModes.modes[0].displacements[4] - 0.5) < 1e-7);
 
+  const equilibrium = displacedAtoms(scene.atoms, scene.normalModes.modes[0], 0.4, 0);
+  const positiveTurningPoint = displacedAtoms(
+    scene.atoms,
+    scene.normalModes.modes[0],
+    0.4,
+    Math.PI / 2,
+  );
+  assert.deepEqual(equilibrium, scene.atoms);
+  assert.ok(Math.abs(positiveTurningPoint[0].x - 0.4) < 1e-7);
+  assert.equal(scene.atoms[0].x, 0, "displacement helpers must not mutate equilibrium atoms");
+  assert.equal(MAX_NORMAL_MODES, 512);
+  assert.equal(MAX_NORMAL_MODE_COMPONENTS, 768_000);
+});
+
+test("maps normal-mode animation onto symmetric 3Dmol frames", () => {
+  assert.deepEqual(symmetricNormalModeFrame(0), {
+    frame: 30,
+    displacementScale: 0,
+  });
+  assert.deepEqual(symmetricNormalModeFrame(Math.PI / 2), {
+    frame: 59,
+    displacementScale: 1,
+  });
+  assert.deepEqual(symmetricNormalModeFrame(3 * Math.PI / 2), {
+    frame: 1,
+    displacementScale: -1,
+  });
+
+  for (const phase of [0.13, 0.47, 1.2, 2.1]) {
+    const positive = symmetricNormalModeFrame(phase);
+    const negative = symmetricNormalModeFrame(phase + Math.PI);
+    assert.equal(positive.frame + negative.frame, 60);
+    assert.ok(Math.abs(positive.displacementScale + negative.displacementScale) < 1e-12);
+    assert.ok(positive.frame >= 1 && positive.frame <= 59);
+  }
+  assert.throws(() => symmetricNormalModeFrame(Number.NaN), /phase must be finite/i);
+  assert.throws(() => symmetricNormalModeFrame(0, 1), /at least two/i);
+});
+
+test("rejects malformed or unsafe normal-mode payloads", () => {
+  const mode = {
+    name: "mode-1",
+    label: "Stretch",
+    source_index: 0,
+    frequency_cm1: 1000,
+    shape: [1, 3],
+    displacements: float32Base64([1, 0, 0]),
+    displacement_encoding: "float32-le-base64",
+    normalization: "max-atom-displacement",
+    reduced_mass_amu: 1,
+  };
+  const build = (normalModes, molecule = { xyz: "H 0 0 0" }) => ({
+    type: "pyqed:scene",
+    scene: {
+      version: 1,
+      kind: "pyqed-scene",
+      molecule,
+      fields: [],
+      normal_modes: normalModes,
+    },
+  });
+  const set = (overrides = {}) => ({
+    modes: [mode],
+    active_mode: 0,
+    amplitude_angstrom: 0.45,
+    ...overrides,
+  });
+
+  assert.throws(() => validateSceneMessage(build(set(), null)), /requires a molecular geometry/i);
+  assert.throws(
+    () => validateSceneMessage(build(null)),
+    /normal_modes must be an object/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ script: "alert(1)" }))),
+    /unsupported property/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, shape: [2, 3] }] }))),
+    /shape must be \[1, 3\]/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, displacements: "AAAA" }] }))),
+    /Float32 values require/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({
+      modes: [{ ...mode, displacements: float32Base64([NaN, 0, 0]) }],
+    }))),
+    /finite 32-bit floating-point/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({
+      modes: [{ ...mode, displacements: float32Base64([0, 0, 0]) }],
+    }))),
+    /cannot be all zero/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [mode, { ...mode }] }))),
+    /duplicated/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: Array(MAX_NORMAL_MODES + 1).fill(mode) }))),
+    /between 1 and 512 modes/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ active_mode: "missing" }))),
+    /does not identify/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, reduced_mass_amu: 0 }] }))),
+    /greater than zero/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, source_index: 2 ** 53 }] }))),
+    /non-negative integer/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, normalization: "unit-vector" }] }))),
+    /max-atom-displacement/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ modes: [{ ...mode, intensity_unit: "km mol^-1" }] }))),
+    /requires intensity/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ amplitude_angstrom: 0 }))),
+    /between 0\.01 and 10/i,
+  );
+  assert.throws(
+    () => validateSceneMessage(build(set({ amplitude_angstrom: 0.009 }))),
+    /between 0\.01 and 10/i,
+  );
   assert.throws(
     () => validateSceneMessage({
-      ...message,
+      ...build(set()),
       scene: {
-        ...message.scene,
-        vibration: { ...message.scene.vibration, displacements: [[0, 0, 0.1]] },
+        ...build(set()).scene,
+        fields: [{
+          name: "rho",
+          kind: "electron-density",
+          shape: [2, 2, 2],
+          origin: [0, 0, 0],
+          axes: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+          values: Array(8).fill(0),
+        }],
       },
     }),
-    /one vector per atom/i,
+    /cannot be combined with scalar fields/i,
   );
-  assert.throws(
-    () => validateSceneMessage({
-      ...message,
-      scene: { ...message.scene, molecule: null },
-    }),
-    /requires a molecule/i,
-  );
+
+  const { source_index: ignoredSourceIndex, ...withoutSourceIndex } = mode;
+  assert.equal(ignoredSourceIndex, 0);
+  const optionalSource = validateSceneMessage(build(set({ modes: [withoutSourceIndex] })));
+  assert.equal(optionalSource.normalModes.modes[0].sourceIndex, undefined);
 });
 
 test("parses single and multi-state Gaussian cube files in C order", () => {
@@ -458,8 +619,6 @@ test("uses a static, repository-owned deployment", async () => {
   assert.match(moleculeViewer, /validateSceneMessage\(event\.data\)/);
   assert.match(moleculeViewer, /import\("3dmol"\)/);
   assert.match(moleculeViewer, /pyqed:viewer-ready/);
-  assert.match(moleculeViewer, /viewer\.vibrate\(vibration\.frames/);
-  assert.match(moleculeViewer, /Pause mode/);
   assert.ok(
     moleculeViewer.indexOf('window.addEventListener("message", receiveScene)') <
       moleculeViewer.indexOf('type: "pyqed:viewer-ready"'),
@@ -467,14 +626,23 @@ test("uses a static, repository-owned deployment", async () => {
   );
   assert.match(moleculeViewer, /WeakMap<VolumeField, unknown>/);
   assert.equal((moleculeViewer.match(/new library\.VolumeData/g) ?? []).length, 1);
-  assert.match(
-    moleculeViewer,
-    /\}, \[\s*activeFieldIndex,\s*atoms,\s*fields,\s*isovalue,\s*rendererStatus,\s*surfaceMode,\s*\]\);/,
-  );
   assert.match(moleculeViewer, /useDeferredValue\(isovalue\)/);
   assert.match(moleculeViewer, /prefers-reduced-motion: reduce/);
+  assert.match(moleculeViewer, /viewer\.vibrate\(NORMAL_MODE_FRAME_STEPS, scaledModeAmplitude, true\)/);
+  assert.match(moleculeViewer, /viewer\.setFrame\(frame\)/);
+  assert.match(moleculeViewer, /viewer\.addArrow\(/);
+  assert.match(moleculeViewer, /window\.requestAnimationFrame\(animate\)/);
+  assert.match(moleculeViewer, /document\.hidden/);
+  assert.match(moleculeViewer, /renderedModeAmplitude/);
+  assert.match(moleculeViewer, /scheduleModeAmplitude/);
+  assert.match(moleculeViewer, /Mode phase/);
+  assert.match(moleculeViewer, /Imaginary mode/);
+  assert.match(moleculeViewer, /Displacement arrows/);
+  assert.match(moleculeViewer, /setActiveFieldIndex\(-1\);[\s\S]*setSurfaceMode\("hidden"\)/);
   assert.doesNotMatch(moleculeViewer, /https?:\/\/.*3dmol/i);
   assert.match(css, /\.file-button:focus-within/);
+  assert.match(css, /\.normal-mode-panel/);
+  assert.match(css, /grid-template-columns:\s*minmax\(0, 1\.25fr\) repeat\(3, minmax\(0, 1fr\)\)/);
   assert.match(css, /animation-duration:\s*0\.01ms\s*!important/);
 
   for (const artifact of [
