@@ -78,6 +78,9 @@ def test_view_provides_an_inline_notebook_representation():
 
 
 def test_view_hessian_builds_browser_normal_mode_animation():
+    default_result = view(TinyHessian(), mode=0, open_browser=False)
+    assert default_result.payload()["vibration"]["interval"] == 30
+
     result = view(
         TinyHessian(),
         mode=0,

@@ -466,7 +466,7 @@ class NormalModeAnimation:
     displacements: np.ndarray
     amplitude_angstrom: float
     frames: int = 24
-    interval: int = 60
+    interval: int = 30
 
     def __post_init__(self) -> None:
         mode_index = int(self.mode_index)
@@ -1827,7 +1827,7 @@ def view(
     mode: int | None = None,
     amplitude: str | float = "auto",
     frames: int = 24,
-    interval: int = 60,
+    interval: int = 30,
     orbital=None,
     coeff=None,
     orbital_spin: str = "auto",
