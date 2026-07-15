@@ -56,6 +56,13 @@ test("exports the research-first PyQED homepage", async () => {
   );
   assert.match(html, /href="\/examples\/?"[^>]*>Examples/i);
   assert.match(html, /href="\/viewer\/?"[^>]*>Viewer/i);
+  const header = html.match(/<header\b[\s\S]*?<\/header>/i)?.[0];
+  assert.ok(header, "homepage header should be rendered");
+  assert.equal(
+    (header.match(/href="\/viewer\/?"[^>]*>Viewer<\/a>/gi) ?? []).length,
+    2,
+    "render exactly one Viewer link in each desktop and mobile navigation",
+  );
 
   const workflows = section(html, "workflows");
   assert.equal((workflows.match(/data-workflow=/gi) ?? []).length, 4);
