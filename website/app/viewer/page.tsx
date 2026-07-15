@@ -3,15 +3,15 @@ import Link from "next/link";
 import { MoleculeViewer } from "./molecule-viewer";
 
 export const metadata: Metadata = {
-  title: "Interactive Molecular Viewer",
+  title: "Molecular Orbitals and Density Viewer",
   description:
-    "Explore molecular geometries in the browser and export coordinates for PyQED calculations.",
+    "Explore molecular geometries, orbitals, electron and spin densities, difference fields, and electrostatic potential in the browser.",
   alternates: { canonical: "/viewer" },
   openGraph: {
     url: "https://pyqed.org/viewer",
-    title: "Interactive Molecular Viewer | PyQED",
+    title: "Molecular Orbitals and Density Viewer | PyQED",
     description:
-      "Rotate, inspect, and export molecular geometries for PyQED calculations.",
+      "Rotate molecular structures and inspect every orbital or scalar-field state produced by PyQED.",
   },
 };
 
@@ -28,7 +28,7 @@ export default function ViewerPage() {
             <span className="wordmark-mark">P</span>
             <span>PyQED</span>
           </Link>
-          <p>Molecular viewer</p>
+          <p>Molecular field viewer</p>
           <div className="nav-actions">
             <Link href="/examples">Examples</Link>
             <Link className="nav-github" href="/">
@@ -42,11 +42,12 @@ export default function ViewerPage() {
         <section className="viewer-intro shell" aria-labelledby="viewer-heading">
           <div>
             <p className="kicker">PyQED laboratory</p>
-            <h1 id="viewer-heading">See the geometry before you calculate.</h1>
+            <h1 id="viewer-heading">See every state, not just the geometry.</h1>
           </div>
           <p>
-            Paste PyQED coordinates or open an XYZ file. Rotate, zoom, inspect
-            inferred bonds, and export a clean geometry for your next calculation.
+            Open XYZ and Gaussian cube files, or send a scene directly from
+            <code> view(...)</code>. Rotate the structure, compare every orbital or
+            density state, and map electrostatic potential without uploading the data.
             Everything runs locally in your browser.
           </p>
         </section>

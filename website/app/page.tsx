@@ -295,6 +295,7 @@ export default function Home() {
           </div>
 
           <div className="nav-actions">
+            <Link href="/viewer">Viewer</Link>
             <a href={links.userGuide}>User Guide</a>
             <a className="nav-github" href={links.github}>
               GitHub <span aria-hidden="true">↗</span>
@@ -307,6 +308,7 @@ export default function Home() {
                     {label}
                   </a>
                 ))}
+                <Link href="/viewer">Viewer</Link>
                 <a href={links.userGuide}>User Guide</a>
                 <a href={links.docs}>Stable documentation</a>
               </nav>
@@ -676,6 +678,7 @@ export default function Home() {
           </div>
           <div className="footer-links">
             <Link href="/examples">Examples</Link>
+            <Link href="/viewer">Viewer</Link>
             <a href={links.userGuide}>User Guide</a>
             <a href={links.docs}>Stable docs</a>
             <a href={links.developmentDocs}>Development docs</a>
