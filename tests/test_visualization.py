@@ -24,6 +24,17 @@ class TinyMolecule:
         return np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
 
 
+class TinyHessian:
+    mol = TinyMolecule()
+
+    def vibrational_analysis(self):
+        return {
+            "freq_cm1": np.array([1234.5]),
+            "modes": np.array([[[0.0, 0.0, -2.0], [0.0, 0.0, 1.0]]]),
+            "reduced_mass_amu": np.array([1.2]),
+        }
+
+
 def fragment_parameters(result):
     return parse_qs(urlsplit(result.url).fragment)
 
@@ -64,6 +75,47 @@ def test_view_provides_an_inline_notebook_representation():
     assert 'height="480"' in html
     assert "PyQED molecular viewer" in html
     assert "allow-scripts" in html
+
+
+def test_view_hessian_builds_browser_normal_mode_animation():
+    result = view(
+        TinyHessian(),
+        mode=0,
+        amplitude=0.25,
+        frames=32,
+        interval=45,
+        open_browser=False,
+    )
+
+    payload = result.payload()
+    vibration = payload["vibration"]
+    assert result.url == "https://pyqed.org/viewer"
+    assert result.title == "Mode 0: 1234.5 cm^-1"
+    assert vibration["mode_index"] == 0
+    assert vibration["frequency_cm1"] == pytest.approx(1234.5)
+    assert vibration["frames"] == 32
+    assert vibration["interval"] == 45
+    assert vibration["amplitude_angstrom"] == pytest.approx(0.25)
+    displacement = np.asarray(vibration["displacements"])
+    assert displacement.shape == (2, 3)
+    assert np.max(np.linalg.norm(displacement, axis=1)) == pytest.approx(0.25)
+    assert "postMessage" in result._repr_html_()
+
+
+def test_view_hessian_rejects_invalid_or_unavailable_modes():
+    with pytest.raises(IndexError, match="outside"):
+        view(TinyHessian(), mode=1, open_browser=False)
+    with pytest.raises(TypeError, match="integer"):
+        view(TinyHessian(), mode=True, open_browser=False)
+    with pytest.raises(TypeError, match="completed Hessian"):
+        view(TinyMolecule(), mode=0, open_browser=False)
+
+    class PendingHessian(TinyHessian):
+        def vibrational_analysis(self):
+            raise ValueError("run first")
+
+    with pytest.raises(ValueError, match="run the Hessian"):
+        view(PendingHessian(), mode=0, open_browser=False)
 
 
 def test_top_level_and_molecule_convenience_apis():

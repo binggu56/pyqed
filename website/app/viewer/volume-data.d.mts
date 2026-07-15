@@ -41,6 +41,14 @@ export type ValidatedScene = {
     representation: "ball-stick" | "space-fill" | "wireframe";
     labels: boolean;
   } | null;
+  vibration: {
+    modeIndex: number;
+    frequencyCm1: number;
+    displacements: [number, number, number][];
+    amplitudeAngstrom: number;
+    frames: number;
+    interval: number;
+  } | null;
   fields: VolumeField[];
   activeFieldIndex: number;
 };

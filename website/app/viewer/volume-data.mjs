@@ -427,6 +427,53 @@ function validateField(rawField, index) {
   };
 }
 
+function validateVibration(rawVibration, atomCount) {
+  const context = "message.scene.vibration";
+  if (!isRecord(rawVibration)) fail(`${context} must be an object.`);
+  assertAllowedKeys(
+    rawVibration,
+    new Set([
+      "mode_index", "frequency_cm1", "displacements", "amplitude_angstrom",
+      "frames", "interval",
+    ]),
+    context,
+  );
+  const modeIndex = rawVibration.mode_index;
+  if (!Number.isSafeInteger(modeIndex) || modeIndex < 0) {
+    fail(`${context}.mode_index must be a non-negative integer.`);
+  }
+  const frequencyCm1 = finiteNumber(rawVibration.frequency_cm1, `${context}.frequency_cm1`);
+  const amplitudeAngstrom = finiteNumber(
+    rawVibration.amplitude_angstrom,
+    `${context}.amplitude_angstrom`,
+  );
+  if (amplitudeAngstrom <= 0 || amplitudeAngstrom > 10) {
+    fail(`${context}.amplitude_angstrom must be greater than zero and at most 10.`);
+  }
+  if (!Array.isArray(rawVibration.displacements) || rawVibration.displacements.length !== atomCount) {
+    fail(`${context}.displacements must contain one vector per atom.`);
+  }
+  const displacements = rawVibration.displacements.map((vector, index) =>
+    finiteVector(vector, `${context}.displacements[${index}]`),
+  );
+  const frames = rawVibration.frames;
+  if (!Number.isSafeInteger(frames) || frames < 8 || frames > 120) {
+    fail(`${context}.frames must be an integer between 8 and 120.`);
+  }
+  const interval = rawVibration.interval;
+  if (!Number.isSafeInteger(interval) || interval < 16 || interval > 1000) {
+    fail(`${context}.interval must be an integer between 16 and 1000 milliseconds.`);
+  }
+  return {
+    modeIndex,
+    frequencyCm1,
+    displacements,
+    amplitudeAngstrom,
+    frames,
+    interval,
+  };
+}
+
 export function validateSceneMessage(message) {
   if (!isRecord(message)) fail("The PyQED message must be an object.");
   assertAllowedKeys(message, new Set(["type", "scene"]), "message");
@@ -435,7 +482,7 @@ export function validateSceneMessage(message) {
   const scene = message.scene;
   assertAllowedKeys(
     scene,
-    new Set(["version", "kind", "title", "molecule", "fields", "active_field"]),
+    new Set(["version", "kind", "title", "molecule", "fields", "active_field", "vibration"]),
     "message.scene",
   );
   if (scene.version !== 1 || scene.kind !== "pyqed-scene") {
@@ -458,6 +505,12 @@ export function validateSceneMessage(message) {
     const labels = scene.molecule.labels ?? false;
     if (typeof labels !== "boolean") fail("message.scene.molecule.labels must be true or false.");
     molecule = { xyz, representation, labels };
+  }
+
+  let vibration = null;
+  if (scene.vibration !== undefined && scene.vibration !== null) {
+    if (!molecule) fail("message.scene.vibration requires a molecule.");
+    vibration = validateVibration(scene.vibration, atoms.length);
   }
 
   if (!Array.isArray(scene.fields) || scene.fields.length > MAX_FIELDS) {
@@ -508,6 +561,7 @@ export function validateSceneMessage(message) {
     title,
     atoms,
     molecule,
+    vibration,
     fields,
     activeFieldIndex,
   };
@@ -704,6 +758,7 @@ export function parseCube(text, options = {}) {
       representation: "ball-stick",
       labels: false,
     },
+    vibration: null,
     fields,
     activeFieldIndex: fields.length > 0 ? 0 : -1,
   };

@@ -30,8 +30,10 @@ import {
 type Bond = [number, number];
 type RenderMode = "ball-stick" | "space-fill" | "wireframe";
 type SurfaceMode = "both" | "positive" | "negative" | "esp-map" | "hidden";
+type Vibration = NonNullable<ValidatedScene["vibration"]>;
 
 type ViewerApi = {
+  animate(options: Record<string, unknown>): unknown;
   addIsosurface(data: unknown, options: Record<string, unknown>): unknown;
   addLabel(text: string, options: Record<string, unknown>): unknown;
   addModel(data: string, format: string): unknown;
@@ -50,6 +52,13 @@ type ViewerApi = {
   setStyle(selection: Record<string, never>, style: Record<string, unknown>): unknown;
   setView(view: number[]): unknown;
   spin(axis: string | false, speed?: number): unknown;
+  stopAnimate(): unknown;
+  vibrate(
+    frames: number,
+    amplitude: number,
+    bothWays: boolean,
+    arrowSpec?: Record<string, unknown>,
+  ): unknown;
   zoomTo(): unknown;
 };
 
@@ -204,6 +213,14 @@ function modelStyle(mode: RenderMode): Record<string, unknown> {
   };
 }
 
+function vibrationalXyz(atoms: Atom[], vibration: Vibration): string {
+  const rows = atoms.map((atom, index) => {
+    const [dx, dy, dz] = vibration.displacements[index];
+    return `${atom.element.padEnd(2)} ${atom.x.toFixed(10)} ${atom.y.toFixed(10)} ${atom.z.toFixed(10)} ${dx.toFixed(10)} ${dy.toFixed(10)} ${dz.toFixed(10)}`;
+  });
+  return `${atoms.length}\nMode ${vibration.modeIndex}: ${vibration.frequencyCm1.toFixed(3)} cm^-1\n${rows.join("\n")}\n`;
+}
+
 function MolecularFieldCanvas({
   atoms,
   fields,
@@ -214,6 +231,8 @@ function MolecularFieldCanvas({
   surfaceMode,
   isovalue,
   resetSignal,
+  vibration,
+  vibrationPlaying,
 }: {
   atoms: Atom[];
   fields: VolumeField[];
@@ -224,6 +243,8 @@ function MolecularFieldCanvas({
   surfaceMode: SurfaceMode;
   isovalue: number;
   resetSignal: number;
+  vibration: Vibration | null;
+  vibrationPlaying: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<ViewerApi | null>(null);
@@ -260,6 +281,7 @@ function MolecularFieldCanvas({
     return () => {
       cancelled = true;
       renderRevision.current += 1;
+      viewerRef.current?.stopAnimate();
       viewerRef.current?.spin(false);
       viewerRef.current = null;
       libraryRef.current = null;
@@ -274,14 +296,32 @@ function MolecularFieldCanvas({
     if (!viewer) return;
     const previousView = hasRendered.current ? viewer.getView() : null;
 
+    viewer.stopAnimate();
     viewer.removeAllLabels();
     viewer.removeAllModels();
     if (atoms.length > 0) {
-      viewer.addModel(xyzFor(atoms), "xyz");
+      viewer.addModel(
+        vibration ? vibrationalXyz(atoms, vibration) : xyzFor(atoms),
+        "xyz",
+      );
       viewer.setStyle({}, modelStyle(mode));
+      if (vibration) {
+        viewer.vibrate(vibration.frames, 1, true, {
+          color: "#35d6e3",
+          radius: 0.045,
+          radiusRatio: 1.7,
+        });
+        if (vibrationPlaying) {
+          viewer.animate({
+            interval: vibration.interval,
+            loop: "backAndForth",
+            reps: 0,
+          });
+        }
+      }
     }
 
-    if (labels && atoms.length > 0) {
+    if (labels && atoms.length > 0 && !vibration) {
       atoms.forEach((atom, index) => {
         viewer.addLabel(`${atom.element}${index + 1}`, {
           position: { x: atom.x, y: atom.y, z: atom.z },
@@ -300,7 +340,7 @@ function MolecularFieldCanvas({
     else if (previousView) viewer.setView(previousView);
     viewer.render();
     hasRendered.current = true;
-  }, [atoms, labels, mode, rendererStatus]);
+  }, [atoms, labels, mode, rendererStatus, vibration, vibrationPlaying]);
 
   useEffect(() => {
     if (rendererStatus !== "ready") return;
@@ -461,6 +501,8 @@ export function MoleculeViewer() {
   const [unit, setUnit] = useState<"angstrom" | "bohr">("angstrom");
   const [atoms, setAtoms] = useState<Atom[]>(() => parseGeometry(PRESETS.Water, "angstrom"));
   const [fields, setFields] = useState<VolumeField[]>([]);
+  const [vibration, setVibration] = useState<Vibration | null>(null);
+  const [vibrationPlaying, setVibrationPlaying] = useState(false);
   const [activeFieldIndex, setActiveFieldIndex] = useState(-1);
   const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("hidden");
   const [isovalue, setIsovalue] = useState(0.02);
@@ -513,9 +555,12 @@ export function MoleculeViewer() {
     setSource(scene.molecule?.xyz ?? "");
     setUnit("angstrom");
     setFields(scene.fields);
+    setVibration(scene.vibration);
+    setVibrationPlaying(scene.vibration !== null);
     setSceneTitle(scene.title);
     setMode(scene.molecule?.representation ?? "ball-stick");
     setLabels(scene.molecule?.labels ?? false);
+    if (scene.vibration) setAutoRotate(false);
     setError(null);
     setStatus(nextStatus);
     const nextField = scene.fields[scene.activeFieldIndex];
@@ -537,6 +582,8 @@ export function MoleculeViewer() {
         setSource(geometry);
         setUnit("angstrom");
         setFields([]);
+        setVibration(null);
+        setVibrationPlaying(false);
         setActiveFieldIndex(-1);
         setSurfaceMode("hidden");
         setSceneTitle("Linked geometry");
@@ -583,7 +630,9 @@ export function MoleculeViewer() {
         const scene = validateSceneMessage(event.data);
         applyScene(
           scene,
-          `${scene.fields.length} ${scene.fields.length === 1 ? "surface" : "states / surfaces"} received from PyQED`,
+          scene.vibration
+            ? `Normal mode ${scene.vibration.modeIndex} received from PyQED`
+            : `${scene.fields.length} ${scene.fields.length === 1 ? "surface" : "states / surfaces"} received from PyQED`,
         );
       } catch (sceneError) {
         setError(
@@ -618,6 +667,8 @@ export function MoleculeViewer() {
     try {
       setAtoms(parseGeometry(nextSource, nextUnit));
       setFields([]);
+      setVibration(null);
+      setVibrationPlaying(false);
       setActiveFieldIndex(-1);
       setSurfaceMode("hidden");
       setSceneTitle(nextTitle);
@@ -663,6 +714,8 @@ export function MoleculeViewer() {
         setUnit("angstrom");
         setAtoms(nextAtoms);
         setFields([]);
+        setVibration(null);
+        setVibrationPlaying(false);
         setActiveFieldIndex(-1);
         setSurfaceMode("hidden");
         setSceneTitle(file.name.replace(/\.xyz$/i, ""));
@@ -799,8 +852,14 @@ export function MoleculeViewer() {
       >
         <div className="viewer-toolbar">
           <div className="molecule-identity">
-            <span>{activeField ? FIELD_KIND_LABELS[activeField.kind] : "Live structure"}</span>
-            <strong>{activeField?.label ?? formula}</strong>
+            <span>
+              {vibration ? "Normal mode" : activeField ? FIELD_KIND_LABELS[activeField.kind] : "Live structure"}
+            </span>
+            <strong>
+              {vibration
+                ? `Mode ${vibration.modeIndex} · ${vibration.frequencyCm1.toFixed(1)} cm⁻¹`
+                : activeField?.label ?? formula}
+            </strong>
             <small>
               {sceneTitle} · {atoms.length} atoms · {bonds.length} inferred bonds
               {fields.length > 0 ? ` · ${fields.length} ${fields.length === 1 ? "surface" : "states / surfaces"}` : ""}
@@ -888,6 +947,16 @@ export function MoleculeViewer() {
             >
               Auto-rotate
             </button>
+            {vibration ? (
+              <button
+                type="button"
+                className={vibrationPlaying ? "is-active" : ""}
+                aria-pressed={vibrationPlaying}
+                onClick={() => setVibrationPlaying((value) => !value)}
+              >
+                {vibrationPlaying ? "Pause mode" : "Play mode"}
+              </button>
+            ) : null}
             <button type="button" onClick={() => setResetSignal((value) => value + 1)}>
               Reset view
             </button>
@@ -904,6 +973,8 @@ export function MoleculeViewer() {
           surfaceMode={surfaceMode}
           isovalue={renderedIsovalue}
           resetSignal={resetSignal}
+          vibration={vibration}
+          vibrationPlaying={vibrationPlaying}
         />
 
         {isDraggingFile ? (
