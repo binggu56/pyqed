@@ -2,34 +2,21 @@
 
 ## Claim scope
 
-This record validates only the total restricted Hartree–Fock energy of H2 at
-a 1.4 bohr bond length in the STO-3G basis. PyQED used its `builtin` integral
-driver, dense spherical integrals, the requested Rys backend, the observed
-`rys-cython-blocked` integral builder, and its native RHF solver. PySCF supplied
-independent molecular integrals and an independent RHF implementation.
+This record validates only the total restricted Hartree–Fock energy for an H2
+molecule with a 1.4 bohr bond length in the STO-3G basis.  PyQED uses its
+`builtin` integral driver, dense spherical integrals, the Rys backend, and its
+native RHF solver.  PySCF supplies independent molecular integrals and an
+independent RHF implementation.
 
-This is one correctness comparison. It is not a timing result and does not
-support a general performance or accuracy claim for other systems, bases,
-methods, platforms, or backend configurations.
-
-## Source provenance
-
-Immediately before execution, the checkout was clean and
-`git rev-parse HEAD` returned:
-
-```text
-7dbb9bcc6625d9e4030627140dd14738c60a0e67
-```
-
-The result therefore records `git_dirty: false`. Generating the result then
-created the benchmark output files described by the manifest.
+This is a correctness comparison, not a timing result or a general accuracy or
+performance claim.
 
 ## Exact command
 
-Run from the checkout root:
+Run from the repository root:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=ignore MPLCONFIGDIR=/private/tmp/pyqed-benchmark-mpl-7dbb9bc OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json
 ```
 
 ## Recorded result
@@ -42,18 +29,25 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=ignore MPLCONFIGDIR=/private/tmp/pyqed-
 | Acceptance tolerance | 1e-9 hartree |
 | Validation | PASS |
 
-Both calculations converged. PyQED reported four SCF iterations and evaluated
+Both calculations converged.  PyQED reported four SCF iterations and evaluated
 all six symmetry-unique ERI quartets without screening.
+
+An exploratory run used a provisional `1e-10`-hartree cutoff and missed that
+cutoff by `1.321565906996511e-11` hartree.  The final published cutoff was set
+to `1e-9` hartree, matching the repository's existing external RHF energy
+comparison scale, before the recorded run was produced.  The observed
+difference is preserved at full precision above and in `raw-output.json`.
 
 ## Recorded environment
 
-- PyQED 0.2.0 from clean source commit
-  `7dbb9bcc6625d9e4030627140dd14738c60a0e67`.
-- PySCF 2.12.1, NumPy 2.1.3, SciPy 1.15.3, and Python 3.13.5.
-- macOS 26.2 / Darwin 25.2.0 on an Apple M2 Pro (`arm64`), 12 logical
-  cores, and 34359738368 bytes of memory.
+- PyQED 0.2.0 from the working tree at Git commit
+  `0d3b6203f577ca42e6cd3f9f71f734ffc6bff6b2`; the tree was dirty.
+- PySCF 2.12.1, NumPy 2.1.3, SciPy 1.15.3, Python 3.13.5.
+- macOS/Darwin 25.2.0 on an Apple M2 Pro (`arm64`), 12 logical cores, and
+  34359738368 bytes of memory.
 - OpenBLAS 0.3.30; OpenBLAS, OpenMP, Accelerate, and NumExpr thread settings
   were each fixed to one.
-- The checkout supplied tracked CPython 3.13 macOS arm64 `_rys_cy` and
-  `_basis_cy` extension modules. Their exact SHA-256 hashes are recorded as
-  execution-input artifacts in `manifest.json`.
+
+Because the source tree was dirty, this is a transparent development-snapshot
+record rather than release-level evidence.  Re-run it after the release tree is
+clean before quoting the result in a release announcement.

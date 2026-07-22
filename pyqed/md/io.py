@@ -53,9 +53,10 @@ def write_pdb(atoms, fileobj, positions=None):
             record = "ATOM  " if str(resname).upper() in {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"} else "HETATM"
             fileobj.write(
                 f"{record}{index % 100000:5d} {_pdb_atom_name(name, symbol)} "
-                f"{_pdb_resname(resname):>4s}{str(chain)[:1]:1s}{_pdb_resid(resid):4d}    "
+                f"{_pdb_resname(resname):>3s} {str(chain)[:1]:1s}{_pdb_resid(resid):4d}    "
                 f"{xyz[0]:8.3f}{xyz[1]:8.3f}{xyz[2]:8.3f}  1.00  0.00          {str(symbol).upper()[:2]:>2s}\n"
             )
+        _write_conect_records(fileobj, atoms, natoms)
         fileobj.write("END\n")
     finally:
         if close:
@@ -155,6 +156,9 @@ def _string_array(atoms, name, default):
 
 
 def _chain_ids(atoms, natoms):
+    if hasattr(atoms, "has") and atoms.has("chain_ids"):
+        chain_ids = np.asarray(atoms.get_array("chain_ids"), dtype=str)
+        return np.asarray([(str(chain).strip() or "A")[:1] for chain in chain_ids], dtype=str)
     if hasattr(atoms, "has") and atoms.has("leaflets"):
         leaflets = atoms.get_array("leaflets")
         result = []
@@ -181,7 +185,32 @@ def _pdb_resid(value):
 
 
 def _pdb_resname(value):
-    return (str(value).strip().upper() or "MOL")[:4]
+    return (str(value).strip().upper() or "MOL")[:3]
+
+
+def _write_conect_records(fileobj, atoms, natoms):
+    adjacency = [set() for _ in range(natoms)]
+    for i, j in _pdb_conect_pairs(atoms):
+        if 0 <= i < natoms and 0 <= j < natoms and i != j:
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+    for index, neighbors in enumerate(adjacency, start=1):
+        sorted_neighbors = sorted(neighbor + 1 for neighbor in neighbors)
+        for start in range(0, len(sorted_neighbors), 4):
+            chunk = sorted_neighbors[start : start + 4]
+            fileobj.write(f"CONECT{index:5d}" + "".join(f"{neighbor:5d}" for neighbor in chunk) + "\n")
+
+
+def _pdb_conect_pairs(atoms):
+    if hasattr(atoms, "pdb_bonds"):
+        return [(int(i), int(j)) for i, j in getattr(atoms, "pdb_bonds")]
+    pairs = []
+    topology = getattr(atoms, "topology", None)
+    if topology is not None:
+        for bond in getattr(topology, "bonds", ()) or ():
+            if len(bond) >= 2:
+                pairs.append((int(bond[0]), int(bond[1])))
+    return pairs
 
 
 class MCBarostatLogger:

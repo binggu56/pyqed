@@ -138,6 +138,206 @@ def _normal_quasi_sample(engine, ndim):
     return ndtri(sample)
 
 
+def _centered_fourier_indices(n):
+    if n % 2 == 0:
+        return np.arange(-n // 2 + 1, n // 2 + 1)
+    return np.arange(-(n // 2), n // 2 + 1)
+
+
+class PeriodicVonNeumannBasis:
+    """
+    One-dimensional projected periodic von Neumann basis on a Fourier grid.
+
+    The PvN functions are Gaussian wavepackets projected into the finite
+    Fourier/sinc grid before evaluation.  The biorthogonal partner ``B`` is
+    built from the PvN overlap ``S`` so that ``dx * B.conj().T @ G = I``.
+    """
+
+    def __init__(
+        self,
+        n_position,
+        n_momentum,
+        length,
+        x_min=0.0,
+        hbar=1.0,
+        sigma_x=None,
+        s_thresh=1e-12,
+    ):
+        self.n_position = int(n_position)
+        self.n_momentum = int(n_momentum)
+        if self.n_position <= 0 or self.n_momentum <= 0:
+            raise ValueError("n_position and n_momentum must be positive.")
+
+        self.nbasis = self.n_position * self.n_momentum
+        self.length = float(length)
+        self.x_min = float(x_min)
+        self.hbar = float(hbar)
+        self.s_thresh = float(s_thresh)
+        if self.length <= 0.0:
+            raise ValueError("length must be positive.")
+        if self.hbar <= 0.0:
+            raise ValueError("hbar must be positive.")
+
+        self.dx = self.length / self.nbasis
+        self.position_spacing = self.length / self.n_position
+        self.momentum_spacing = 2.0 * np.pi * self.hbar / self.position_spacing
+        if sigma_x is None:
+            sigma_x = np.sqrt(
+                self.hbar * self.position_spacing / self.momentum_spacing
+            )
+        self.sigma_x = float(sigma_x)
+        if self.sigma_x <= 0.0:
+            raise ValueError("sigma_x must be positive.")
+
+        y_grid = np.arange(self.nbasis, dtype=float) * self.dx
+        self.grid = self.x_min + y_grid
+        self.positions = self.x_min + np.arange(self.n_position) * self.position_spacing
+        bandwidth = np.pi * self.hbar * self.nbasis / self.length
+        self.momenta = (
+            -bandwidth
+            + (np.arange(self.n_momentum, dtype=float) + 0.5)
+            * self.momentum_spacing
+        )
+
+        self.fourier_indices = _centered_fourier_indices(self.nbasis)
+        self.wave_numbers = 2.0 * np.pi * self.fourier_indices / self.length
+        self.values = self._build_projected_values(y_grid)
+        self.overlap = self.dx * (self.values.conj().T @ self.values)
+        self.biorthogonal_values = self._build_biorthogonal_values()
+
+    def _build_projected_values(self, y_grid):
+        eikx = np.exp(1j * np.outer(y_grid, self.wave_numbers)) / np.sqrt(self.length)
+        norm = (1.0 / (2.0 * np.pi * self.sigma_x**2)) ** 0.25
+        gaussian_ft = norm * np.sqrt(4.0 * np.pi * self.sigma_x**2)
+
+        columns = []
+        for q_abs in self.positions:
+            q = q_abs - self.x_min
+            phase = np.exp(-1j * self.wave_numbers * q)
+            for p in self.momenta:
+                coeff = gaussian_ft * np.exp(
+                    -self.sigma_x**2 * (self.wave_numbers - p / self.hbar) ** 2
+                ) * phase
+                values = eikx @ coeff
+                col_norm = np.sqrt(self.dx * np.vdot(values, values).real)
+                if col_norm <= 0.0:
+                    raise ValueError("Projected PvN function has zero grid norm.")
+                columns.append(values / col_norm)
+        return np.column_stack(columns)
+
+    def _build_biorthogonal_values(self):
+        evals = np.linalg.eigvalsh(0.5 * (self.overlap + self.overlap.conj().T))
+        if np.min(evals) <= self.s_thresh:
+            raise ValueError(
+                "PvN overlap is linearly dependent or ill-conditioned; "
+                "adjust the grid or lower s_thresh."
+            )
+        return np.linalg.solve(self.overlap.T, self.values.T).T
+
+    def _fourier_grid_operator(self, diagonal):
+        diagonal = np.asarray(diagonal)
+        if diagonal.shape != (self.nbasis,):
+            raise ValueError("diagonal must have shape (nbasis,).")
+        y_grid = self.grid - self.x_min
+        fourier = np.exp(1j * np.outer(y_grid, self.wave_numbers)) / np.sqrt(self.length)
+        return fourier @ np.diag(diagonal) @ (self.dx * fourier.conj().T)
+
+    def momentum_grid_operator(self):
+        """Momentum operator acting on grid-value vectors."""
+        return self._fourier_grid_operator(self.hbar * self.wave_numbers)
+
+    def kinetic_grid_operator(self, mass=1.0):
+        """Kinetic-energy operator acting on grid-value vectors."""
+        mass = float(mass)
+        if mass <= 0.0:
+            raise ValueError("mass must be positive.")
+        return self._fourier_grid_operator(
+            (self.hbar * self.wave_numbers) ** 2 / (2.0 * mass)
+        )
+
+    def pvb_operator(self, grid_operator):
+        """
+        Return mixed PvB matrix elements ``<g_i|O|b_j>``.
+        """
+        op = np.asarray(grid_operator)
+        if op.shape != (self.nbasis, self.nbasis):
+            raise ValueError("grid_operator must have shape (nbasis, nbasis).")
+        return self.dx * (self.values.conj().T @ op @ self.biorthogonal_values)
+
+    def local_operator(self, values):
+        """
+        Return ``<g_i|f(x)|b_j>`` from values on the coordinate grid.
+        """
+        values = np.asarray(values)
+        if values.shape != (self.nbasis,):
+            raise ValueError("values must have shape (nbasis,).")
+        weighted_b = values[:, None] * self.biorthogonal_values
+        return self.dx * (self.values.conj().T @ weighted_b)
+
+    def local_matrix_operator(self, values):
+        """
+        Return ``<g_i|V_ab(x)|b_j>`` for grid-local matrix-valued operators.
+        """
+        values = np.asarray(values)
+        if values.ndim != 3 or values.shape[0] != self.nbasis:
+            raise ValueError("values must have shape (nbasis, nrow, ncol).")
+        return self.dx * np.einsum(
+            "xi,xab,xj->iajb",
+            self.values.conj(),
+            values,
+            self.biorthogonal_values,
+            optimize=True,
+        )
+
+    def kinetic_operator(self, mass=1.0):
+        """Return mixed PvB matrix elements of ``p^2 / (2 mass)``."""
+        return self.pvb_operator(self.kinetic_grid_operator(mass=mass))
+
+    def pvn_coefficients(self, wavefunction):
+        """
+        Return ``<g_j|psi>`` coefficients for expansion in the biorthogonal basis.
+        """
+        psi = np.asarray(wavefunction, dtype=complex)
+        if psi.shape != (self.nbasis,):
+            raise ValueError("wavefunction must have shape (nbasis,).")
+        return self.dx * (self.values.conj().T @ psi)
+
+    def biorthogonal_coefficients(self, wavefunction):
+        """
+        Return ``<b_j|psi>`` coefficients for expansion in the PvN basis.
+        """
+        psi = np.asarray(wavefunction, dtype=complex)
+        if psi.shape != (self.nbasis,):
+            raise ValueError("wavefunction must have shape (nbasis,).")
+        return self.dx * (self.biorthogonal_values.conj().T @ psi)
+
+    def reconstruct_from_pvn_coefficients(self, coefficients):
+        """
+        Reconstruct from localized PvN overlaps using the biorthogonal basis.
+        """
+        coeff = np.asarray(coefficients, dtype=complex)
+        if coeff.shape != (self.nbasis,):
+            raise ValueError("coefficients must have shape (nbasis,).")
+        return self.biorthogonal_values @ coeff
+
+    def reconstruct_from_biorthogonal_coefficients(self, coefficients):
+        """
+        Reconstruct from biorthogonal overlaps using the PvN basis.
+        """
+        coeff = np.asarray(coefficients, dtype=complex)
+        if coeff.shape != (self.nbasis,):
+            raise ValueError("coefficients must have shape (nbasis,).")
+        return self.values @ coeff
+
+    def biorthogonal_exchange(self, wavefunction):
+        """
+        PvB exchange: project with PvN functions and reconstruct with BvN functions.
+        """
+        return self.reconstruct_from_pvn_coefficients(
+            self.pvn_coefficients(wavefunction)
+        )
+
+
 class GaussianWavepacketFBR:
     """
     Product Gaussian-wavepacket finite basis in arbitrary dimension.

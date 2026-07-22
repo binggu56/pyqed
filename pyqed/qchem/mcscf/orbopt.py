@@ -5,7 +5,27 @@ Lightweight orbital-optimization helpers for native first-order CASSCF.
 """
 
 import numpy as np
+import importlib
 from scipy.linalg import expm
+
+_CASSCF_CPP_UNINITIALIZED = object()
+_casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+
+
+def _cpp_attr(*names):
+    global _casscf_cpp
+    if _casscf_cpp is _CASSCF_CPP_UNINITIALIZED:
+        try:
+            _casscf_cpp = importlib.import_module("pyqed.qchem._casscf_cpp")
+        except Exception:  # pragma: no cover - optional accelerator
+            _casscf_cpp = None
+    if _casscf_cpp is None:
+        return None
+    for name in names:
+        attr = getattr(_casscf_cpp, name, None)
+        if attr is not None:
+            return attr
+    return None
 
 
 def embed_rdm2(dm2, nmo):
@@ -116,6 +136,19 @@ def orbital_hessian_action_from_integrals(h1_mo, eri_mo, dm1, dm2, kappa):
     differentiates the MO one- and two-electron integrals with respect to the
     orbital-rotation generator ``kappa``.
     """
+    hessian_action = _cpp_attr("orbital_hessian_action_from_integrals")
+    if hessian_action is not None:
+        try:
+            return hessian_action(
+                np.ascontiguousarray(h1_mo, dtype=np.float64),
+                np.ascontiguousarray(eri_mo, dtype=np.float64),
+                np.ascontiguousarray(dm1, dtype=np.float64),
+                np.ascontiguousarray(dm2, dtype=np.float64),
+                np.ascontiguousarray(kappa, dtype=np.float64),
+            )
+        except Exception:
+            pass
+
     dh1 = orbital_h1_response(h1_mo, kappa)
     deri = orbital_eri_response(eri_mo, kappa)
     dfock = generalized_fock(dh1, deri, dm1, dm2)
@@ -558,6 +591,8 @@ def davidson_augmented_hessian_direction(
             seed_cols.append(col / norm)
     if not seed_cols:
         seed_cols = [(-grad_vec / np.linalg.norm(grad_vec))]
+    if max_subspace is not None and int(max_subspace) > 0:
+        seed_cols = seed_cols[: int(max_subspace)]
 
     V = _orthonormalize_columns(np.column_stack(seed_cols))
     W = np.column_stack([np.asarray(matvec(V[:, i]), dtype=float) for i in range(V.shape[1])])
@@ -651,6 +686,8 @@ def davidson_augmented_hessian_direction(
             info["converged"] = True
             step = np.asarray(candidate["step"], dtype=float)
             return (step, info) if return_info else step
+        if cycle + 1 >= int(max_cycle):
+            break
 
         denom = hess_model - candidate["eigenvalue"]
         safe = np.where(
@@ -669,6 +706,8 @@ def davidson_augmented_hessian_direction(
             keep = []
             keep.append(candidate["step"])
             keep.append(-grad_vec / hess_model)
+            if max_subspace is not None and int(max_subspace) > 0:
+                keep = keep[: int(max_subspace)]
             V = _orthonormalize_columns(np.column_stack(keep))
             W = np.column_stack([np.asarray(matvec(V[:, i]), dtype=float) for i in range(V.shape[1])])
             continue

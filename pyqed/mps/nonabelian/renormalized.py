@@ -17,14 +17,129 @@ import time
 
 import numpy as np
 
+from .su2_kernel import (
+    SU2LocalAction,
+    build_component_parent_blocks as _su2_build_component_parent_blocks,
+    cython_available as _su2_cython_available,
+    project_component_orthonormal_blocks as _su2_project_component_orthonormal_blocks,
+    resolve_backend as _resolve_su2_kernel_backend,
+)
+
 _ORTHONORMAL_BLOCK_DENSE_MATVEC_MAX_ELEMENTS = 1_000_000
 _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_ELEMENTS = 65536
 _COMPLEMENTARY_FAMILY_NATIVE_KERNEL_MAX_TOTAL_ELEMENTS = 8_000_000
 _COMPLEMENTARY_FAMILY_KERNEL_BACKEND = "auto"
 _COMPLEMENTARY_FAMILY_FACTOR_BATCH_MIN_ENTRIES = 4
+_ORTHONORMAL_BLOCK_BATCH_MIN_ENTRIES = 4
 _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS = 16_000_000
 _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS = 16_000_000
+_SU2_QCHEM_DIRECT_PARENT_BLOCKS = False
+_SU2_KERNEL_BACKEND = "auto"
+_SU2_KERNEL_DEBUG_CHECK = False
+_SU2_KERNEL_DEBUG_CHECK_TOL = 1.0e-10
 _UNSET = object()
+_SYMBOLIC_MPO_TRANSITION_CACHE = {}
+_SYMBOLIC_TRANSITION_SUMMARY_CACHE = {}
+
+
+def get_su2_kernel_policy():
+    """Return the SU(2) local-action backend policy."""
+
+    requested = str(_SU2_KERNEL_BACKEND)
+    try:
+        actual = _resolve_su2_kernel_backend(requested)
+    except RuntimeError:
+        actual = "unavailable"
+    return {
+        "backend": requested,
+        "actual": actual,
+        "cython_available": bool(_su2_cython_available()),
+        "debug_check": bool(_SU2_KERNEL_DEBUG_CHECK),
+        "debug_check_tol": float(_SU2_KERNEL_DEBUG_CHECK_TOL),
+    }
+
+
+def configure_su2_kernel_policy(*, backend=None, debug_check=None, debug_check_tol=None):
+    """
+    Configure the SU(2) local-action backend.
+
+    :param backend: ``"auto"``, ``"cython"``, or ``"python"``.
+    :returns: Previous policy dictionary, suitable for restoring later.
+    """
+
+    global _SU2_KERNEL_BACKEND
+    global _SU2_KERNEL_DEBUG_CHECK
+    global _SU2_KERNEL_DEBUG_CHECK_TOL
+
+    previous = get_su2_kernel_policy()
+    if backend is not None:
+        normalized = str(backend).lower().replace("-", "_")
+        if normalized == "default":
+            normalized = "auto"
+        if normalized not in {"auto", "cython", "python"}:
+            raise ValueError("su2_kernel_backend must be 'auto', 'cython', or 'python'.")
+        if normalized == "cython":
+            _resolve_su2_kernel_backend(normalized)
+        _SU2_KERNEL_BACKEND = normalized
+    if debug_check is not None:
+        _SU2_KERNEL_DEBUG_CHECK = bool(debug_check)
+    if debug_check_tol is not None:
+        _SU2_KERNEL_DEBUG_CHECK_TOL = float(debug_check_tol)
+    return previous
+
+
+def get_direct_factorized_orthonormal_kernel_policy():
+    """
+    Return the direct-factorized orthonormal local-kernel policy.
+
+    The dense local-matrix cap remains configurable because the fastest choice
+    is workload dependent: component-block matvecs reduce setup and memory,
+    while dense local matrices can win when Davidson needs many matvecs.
+    """
+
+    return {
+        "orthonormal_block_max_elements": int(
+            _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS
+        ),
+        "orthonormal_dense_max_elements": int(
+            _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS
+        ),
+        "su2_qchem_direct_parent_blocks": bool(_SU2_QCHEM_DIRECT_PARENT_BLOCKS),
+    }
+
+
+def configure_direct_factorized_orthonormal_kernel_policy(
+    *,
+    orthonormal_block_max_elements=None,
+    orthonormal_dense_max_elements=None,
+    su2_qchem_direct_parent_blocks=None,
+):
+    """
+    Configure direct-factorized orthonormal local-kernel materialization.
+
+    :param orthonormal_block_max_elements: Maximum total transformed
+        component-block elements. Set to ``0`` to use parent component blocks.
+    :param orthonormal_dense_max_elements: Maximum dense local matrix elements.
+        Set to ``0`` to avoid a global dense local matrix.
+    :returns: Previous policy dictionary, suitable for restoring later.
+    """
+
+    global _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS
+    global _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS
+    global _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+
+    previous = get_direct_factorized_orthonormal_kernel_policy()
+    if orthonormal_block_max_elements is not None:
+        _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS = max(
+            0, int(orthonormal_block_max_elements)
+        )
+    if orthonormal_dense_max_elements is not None:
+        _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS = max(
+            0, int(orthonormal_dense_max_elements)
+        )
+    if su2_qchem_direct_parent_blocks is not None:
+        _SU2_QCHEM_DIRECT_PARENT_BLOCKS = bool(su2_qchem_direct_parent_blocks)
+    return previous
 
 
 def get_complementary_family_kernel_policy():
@@ -573,6 +688,42 @@ class SymbolicRenormalizedOperatorTable:
         )
         return table.with_numeric_payload(block)
 
+    @staticmethod
+    def _pack_rank_coupled_numeric_payload(block_map, *, side, bond, active_channels=None):
+        """
+        Pack a rank-coupled boundary block map for symbolic payload ownership.
+
+        :returns: Packed boundary table or ``None`` when the block map is not a
+            supported rank-coupled payload.
+        """
+
+        try:
+            from .su2_qchem_plan import pack_rank_coupled_boundary_table_from_block_map
+
+            return pack_rank_coupled_boundary_table_from_block_map(
+                block_map,
+                active_channels=active_channels,
+                side=side,
+                bond=bond,
+                representation="rank_coupled_by_ket",
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _filter_rank_coupled_numeric_payload(packed_table, active_channels):
+        """Filter a packed rank-coupled payload to active symbolic channels."""
+
+        try:
+            from .su2_qchem_plan import filter_rank_coupled_boundary_table_channels
+
+            return filter_rank_coupled_boundary_table_channels(
+                packed_table,
+                active_channels,
+            )
+        except Exception:
+            return None
+
     def advance_left(self, W, *, bond, block=None, parent_key=None):
         """
         Advance this symbolic table by absorbing an MPO core on the right.
@@ -585,7 +736,20 @@ class SymbolicRenormalizedOperatorTable:
         """
 
         transitions, used_metadata = symbolic_mpo_core_transitions(W)
-        active = None if block is None else _active_boundary_channels(block)
+        packed_payload = None
+        if block is None:
+            active = None
+        else:
+            packed_payload = self._pack_rank_coupled_numeric_payload(
+                block,
+                side="left",
+                bond=bond,
+            )
+            active = (
+                _active_boundary_channels(block)
+                if packed_payload is None
+                else set(int(channel) for channel in packed_payload.channel_ids)
+            )
         terms_by_channel = _compact_advance_symbolic_terms(
             self.terms_by_channel,
             transitions,
@@ -600,7 +764,14 @@ class SymbolicRenormalizedOperatorTable:
             parent_key=parent_key,
             used_mpo_symbolic_metadata=used_metadata,
         )
-        return table if block is None else table.with_numeric_payload(block)
+        if block is None:
+            return table
+        if packed_payload is not None:
+            packed_payload = self._filter_rank_coupled_numeric_payload(
+                packed_payload,
+                table.channels,
+            )
+        return table.with_numeric_payload(block, packed_boundary_table=packed_payload)
 
     def advance_right(self, W, *, bond, block=None, parent_key=None):
         """
@@ -614,7 +785,20 @@ class SymbolicRenormalizedOperatorTable:
         """
 
         transitions, used_metadata = symbolic_mpo_core_transitions(W)
-        active = None if block is None else _active_boundary_channels(block)
+        packed_payload = None
+        if block is None:
+            active = None
+        else:
+            packed_payload = self._pack_rank_coupled_numeric_payload(
+                block,
+                side="right",
+                bond=bond,
+            )
+            active = (
+                _active_boundary_channels(block)
+                if packed_payload is None
+                else set(int(channel) for channel in packed_payload.channel_ids)
+            )
         terms_by_channel = _compact_advance_symbolic_terms(
             self.terms_by_channel,
             transitions,
@@ -629,9 +813,16 @@ class SymbolicRenormalizedOperatorTable:
             parent_key=parent_key,
             used_mpo_symbolic_metadata=used_metadata,
         )
-        return table if block is None else table.with_numeric_payload(block)
+        if block is None:
+            return table
+        if packed_payload is not None:
+            packed_payload = self._filter_rank_coupled_numeric_payload(
+                packed_payload,
+                table.channels,
+            )
+        return table.with_numeric_payload(block, packed_boundary_table=packed_payload)
 
-    def with_numeric_payload(self, block_map):
+    def with_numeric_payload(self, block_map, *, packed_boundary_table=None):
         """
         Return a copy of this table owning numeric renormalized payloads.
 
@@ -639,10 +830,28 @@ class SymbolicRenormalizedOperatorTable:
         :returns: Symbolic table carrying numeric boundary payloads.
         """
 
-        payloads, payload_kind = _symbolic_numeric_payloads_from_block_map(
-            block_map,
-            self.channels,
-        )
+        payloads = None
+        payload_kind = "none"
+        if packed_boundary_table is None:
+            packed_boundary_table = self._pack_rank_coupled_numeric_payload(
+                block_map,
+                active_channels=self.channels,
+                side=self.side,
+                bond=self.bond,
+            )
+        try:
+            from .su2_qchem_plan import PackedRankCoupledBoundaryPayloads
+
+            if packed_boundary_table is not None:
+                payloads = PackedRankCoupledBoundaryPayloads(packed_boundary_table)
+                payload_kind = "rank_coupled_packed"
+        except Exception:
+            payloads = None
+        if payloads is None:
+            payloads, payload_kind = _symbolic_numeric_payloads_from_block_map(
+                block_map,
+                self.channels,
+            )
         return type(self)(
             side=self.side,
             bond=self.bond,
@@ -950,20 +1159,45 @@ class ComplementaryFamilyRenormalizedOperatorTable:
         payloads_by_channel = {}
         payload_norms_by_channel = {}
         payload_elements_by_channel = {}
-        for key, payload in symbolic_table.numeric_payloads.items():
-            channel = None if len(key) < 3 else key[2]
-            if channel is None:
-                continue
-            arr = np.asarray(payload)
-            payloads_by_channel.setdefault(int(channel), []).append(key)
-            payload_norms_by_channel[int(channel)] = (
-                payload_norms_by_channel.get(int(channel), 0.0)
-                + float(np.linalg.norm(arr)) ** 2
-            )
-            payload_elements_by_channel[int(channel)] = (
-                payload_elements_by_channel.get(int(channel), 0)
-                + int(arr.size)
-            )
+        packed_payload = getattr(symbolic_table.numeric_payloads, "packed_table", None)
+        if packed_payload is not None:
+            sectors = tuple(packed_payload.sector_codec.sectors)
+            for row_idx, ket_id in enumerate(packed_payload.ket_sector_ids):
+                q_in = sectors[int(ket_id)]
+                entry_start = int(packed_payload.entry_offsets[row_idx])
+                entry_stop = int(packed_payload.entry_offsets[row_idx + 1])
+                for entry_idx in range(entry_start, entry_stop):
+                    q_out = sectors[int(packed_payload.out_sector_ids[entry_idx])]
+                    channel_start = int(packed_payload.channel_offsets[entry_idx])
+                    channel_stop = int(packed_payload.channel_offsets[entry_idx + 1])
+                    for channel_idx in range(channel_start, channel_stop):
+                        channel = int(packed_payload.channel_ids[channel_idx])
+                        key = (q_out, q_in, channel)
+                        arr = np.asarray(packed_payload.block_pool.array(channel_idx))
+                        payloads_by_channel.setdefault(channel, []).append(key)
+                        payload_norms_by_channel[channel] = (
+                            payload_norms_by_channel.get(channel, 0.0)
+                            + float(np.linalg.norm(arr)) ** 2
+                        )
+                        payload_elements_by_channel[channel] = (
+                            payload_elements_by_channel.get(channel, 0)
+                            + int(arr.size)
+                        )
+        else:
+            for key, payload in symbolic_table.numeric_payloads.items():
+                channel = None if len(key) < 3 else key[2]
+                if channel is None:
+                    continue
+                arr = np.asarray(payload)
+                payloads_by_channel.setdefault(int(channel), []).append(key)
+                payload_norms_by_channel[int(channel)] = (
+                    payload_norms_by_channel.get(int(channel), 0.0)
+                    + float(np.linalg.norm(arr)) ** 2
+                )
+                payload_elements_by_channel[int(channel)] = (
+                    payload_elements_by_channel.get(int(channel), 0)
+                    + int(arr.size)
+                )
 
         blocks = {}
         for family in family_names:
@@ -1230,6 +1464,11 @@ class ComplementaryNativePairBoundaryOperatorTable:
         """Return a stored renormalized pair boundary operator."""
 
         return self.operators.get(tuple(key))
+
+    def get(self, key):
+        """Return stored validated component entries for one ``P`` key."""
+
+        return self.entries.get(tuple(key))
 
     def add_operator(self, key, operator):
         """Store one renormalized pair boundary operator."""
@@ -1538,7 +1777,10 @@ class ComplementaryNativeExactPatternComponentTable:
     ):
         """Store component entries for one family and return them."""
 
-        entries = tuple(entries or ())
+        entries_is_packed = bool(
+            getattr(entries, "_pyqed_packed_direct_family_entries", False)
+        )
+        entries = entries if entries_is_packed else tuple(entries or ())
         if records is None:
             records = self.family_records.get(str(family_name), ())
         records = tuple(records or ())
@@ -1547,6 +1789,19 @@ class ComplementaryNativeExactPatternComponentTable:
             policy = "none"
         if policy not in {"none", "auto", "structural"}:
             policy = "auto"
+        if (
+            policy == "auto"
+            and max_group_size is not None
+            and int(max_group_size) <= 1
+        ):
+            family_entries = ComplementaryNativeExactPatternFamilyEntries(
+                family_name=str(family_name),
+                entries=entries,
+                entry_groups=(),
+                group_keys=(),
+            )
+            self.families[str(family_name)] = family_entries
+            return family_entries
         grouped = {}
         for index, entry in enumerate(entries):
             key = (
@@ -1555,17 +1810,6 @@ class ComplementaryNativeExactPatternComponentTable:
                 else ((), ())
             )
             grouped.setdefault(key, []).append(entry)
-
-        def _axis_dim(blocks, entry_index, q_mid, axis):
-            dims = set()
-            for key, block in blocks:
-                if key[axis] == q_mid:
-                    dims.add(int(block.shape[axis]))
-            if len(dims) != 1:
-                raise ValueError(
-                    f"inconsistent middle dimension for entry {entry_index}"
-                )
-            return dims.pop()
 
         def _direct_sum_w_pair(group):
             if len(group) <= 1:
@@ -1578,16 +1822,32 @@ class ComplementaryNativeExactPatternComponentTable:
                     W_left, W_right = W_pair
                 except Exception:
                     return tuple(group)
-                left_mids = {key[1] for key in getattr(W_left, "data", {})}
-                right_mids = {key[0] for key in getattr(W_right, "data", {})}
+                left_data = getattr(W_left, "data", {}) or {}
+                right_data = getattr(W_right, "data", {}) or {}
+                left_mid_dims = {}
+                right_mid_dims = {}
+                for key, block in left_data.items():
+                    q_mid = key[1]
+                    dim = int(np.asarray(block).shape[1])
+                    old = left_mid_dims.get(q_mid)
+                    if old is not None and int(old) != int(dim):
+                        return tuple(group)
+                    left_mid_dims[q_mid] = int(dim)
+                for key, block in right_data.items():
+                    q_mid = key[0]
+                    dim = int(np.asarray(block).shape[0])
+                    old = right_mid_dims.get(q_mid)
+                    if old is not None and int(old) != int(dim):
+                        return tuple(group)
+                    right_mid_dims[q_mid] = int(dim)
+                left_mids = set(left_mid_dims)
+                right_mids = set(right_mid_dims)
                 mids = left_mids.intersection(right_mids)
                 if not mids:
                     return tuple(group)
-                left_blocks = tuple(getattr(W_left, "data", {}).items())
-                right_blocks = tuple(getattr(W_right, "data", {}).items())
                 for q_mid in mids:
-                    left_dim = _axis_dim(left_blocks, entry_index, q_mid, 1)
-                    right_dim = _axis_dim(right_blocks, entry_index, q_mid, 0)
+                    left_dim = int(left_mid_dims[q_mid])
+                    right_dim = int(right_mid_dims[q_mid])
                     if left_dim != right_dim:
                         return tuple(group)
                     mid_dims[(entry_index, q_mid)] = int(left_dim)
@@ -1631,7 +1891,7 @@ class ComplementaryNativeExactPatternComponentTable:
                     return False
                 slices = [slice(None)] * len(shape)
                 slices[axis] = slice(int(start), int(start) + int(block.shape[axis]))
-                data[key][tuple(slices)] += block
+                data[key][tuple(slices)] = block
                 return True
 
             for entry_index, (_E, W_left, W_right, _F, _mids) in enumerate(parsed):
@@ -1671,6 +1931,18 @@ class ComplementaryNativeExactPatternComponentTable:
                 return tuple(group)
             return ((E_term, [W_left, W_right], F_term),)
 
+        def _compressed_group(group):
+            group = tuple(group)
+            if len(group) <= 1:
+                return group
+            if (
+                policy == "auto"
+                and max_group_size is not None
+                and int(len(group)) > int(max_group_size)
+            ):
+                return group
+            return _direct_sum_w_pair(group)
+
         if policy == "none":
             group_items = tuple(
                 (key, tuple(grouped[key]))
@@ -1678,7 +1950,10 @@ class ComplementaryNativeExactPatternComponentTable:
             )
         else:
             group_items = tuple(
-                (key, _direct_sum_w_pair(tuple(grouped[key])))
+                (
+                    key,
+                    _compressed_group(grouped[key]),
+                )
                 for key in sorted(grouped, key=repr)
             )
         compressed_entries = tuple(
@@ -2173,7 +2448,9 @@ def _nonzero_rank_coupled_blocks_for_channels(blocks, active_channels, *, tol=0.
         if idx not in active_channels:
             continue
         arr = np.asarray(block)
-        if arr.size and np.any(np.abs(arr) > tol):
+        if arr.size and (
+            np.any(arr) if float(tol) <= 0.0 else np.any(np.abs(arr) > float(tol))
+        ):
             out.append((idx, arr))
     return tuple(out)
 
@@ -2224,9 +2501,13 @@ def symbolic_mpo_core_transitions(core):
     :returns: ``(transitions, used_metadata)``.
     """
 
+    cache_key = id(core)
+    cached = _SYMBOLIC_MPO_TRANSITION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     records = tuple(getattr(core, "symbolic_transitions", ()) or ())
     if records:
-        return (
+        result = (
             tuple(
                 SymbolicMPOTransition(
                     kind=record[0],
@@ -2238,6 +2519,10 @@ def symbolic_mpo_core_transitions(core):
             ),
             True,
         )
+        if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
+            _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
+        _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+        return result
     transitions = {}
     dense_blocks = getattr(core, "dense_blocks", None)
     if dense_blocks is None:
@@ -2276,7 +2561,11 @@ def symbolic_mpo_core_transitions(core):
                 label=label,
             )
             transitions[transition.key] = transition
-    return tuple(transitions.values()), False
+    result = (tuple(transitions.values()), False)
+    if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
+        _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
+    _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+    return result
 
 
 def _accumulate_symbolic_term(out, term):
@@ -2302,6 +2591,37 @@ def _finalize_symbolic_terms(items):
     }
 
 
+def _symbolic_transition_summary(transitions, direction):
+    """
+    Return cached ``(parent, child, families)`` transition records.
+    """
+
+    key = (id(transitions), str(direction))
+    cached = _SYMBOLIC_TRANSITION_SUMMARY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    summary = []
+    for transition in transitions:
+        if direction == "left":
+            parent_channel = int(transition.left_channel)
+            child_channel = int(transition.right_channel)
+        else:
+            parent_channel = int(transition.right_channel)
+            child_channel = int(transition.left_channel)
+        summary.append(
+            (
+                parent_channel,
+                child_channel,
+                tuple(sorted(_family_names_from_symbolic_label(transition.label))),
+            )
+        )
+    out = tuple(summary)
+    if len(_SYMBOLIC_TRANSITION_SUMMARY_CACHE) > 512:
+        _SYMBOLIC_TRANSITION_SUMMARY_CACHE.clear()
+    _SYMBOLIC_TRANSITION_SUMMARY_CACHE[key] = out
+    return out
+
+
 def _compact_advance_symbolic_terms(terms_by_channel, transitions, *, active=None, direction):
     """
     Advance symbolic boundary terms in compressed virtual-channel form.
@@ -2324,32 +2644,33 @@ def _compact_advance_symbolic_terms(terms_by_channel, transitions, *, active=Non
     if direction not in {"left", "right"}:
         raise ValueError(f"Unknown symbolic advance direction {direction!r}.")
     active = None if active is None else {int(channel) for channel in active}
-    counts = {}
+    parent_summary = {}
     depth = 0
-    for terms in terms_by_channel.values():
+    for channel, terms in terms_by_channel.items():
+        multiplicity = 0
+        families = set()
         for term in terms:
+            multiplicity += int(term.multiplicity)
             depth = max(depth, len(term.path))
+            for path_item in tuple(term.path):
+                if len(path_item) >= 4:
+                    families.update(_family_names_from_symbolic_label(path_item[3]))
+        parent_summary[int(channel)] = (int(multiplicity), tuple(sorted(families)))
     child_depth = int(depth) + 1
+    counts = {}
     family_sets = {}
-    for transition in transitions:
-        if direction == "left":
-            parent_channel = int(transition.left_channel)
-            child_channel = int(transition.right_channel)
-        else:
-            parent_channel = int(transition.right_channel)
-            child_channel = int(transition.left_channel)
+    for parent_channel, child_channel, transition_families in _symbolic_transition_summary(
+        transitions,
+        direction,
+    ):
         if active is not None and child_channel not in active:
             continue
-        parent_terms = tuple(terms_by_channel.get(parent_channel, ()))
-        multiplicity = sum(int(term.multiplicity) for term in parent_terms)
+        multiplicity, parent_families = parent_summary.get(parent_channel, (0, ()))
         if multiplicity:
             counts[child_channel] = counts.get(child_channel, 0) + multiplicity
             families = family_sets.setdefault(child_channel, set())
-            families.update(_family_names_from_symbolic_label(transition.label))
-            for term in parent_terms:
-                for path_item in tuple(term.path):
-                    if len(path_item) >= 4:
-                        families.update(_family_names_from_symbolic_label(path_item[3]))
+            families.update(transition_families)
+            families.update(parent_families)
     return {
         channel: (
             SymbolicRenormalizedOperatorTerm(
@@ -2475,6 +2796,32 @@ class RenormalizedSideOperatorTable:
     source: str = "lazy"
     derived_from: object | None = None
     hits: int = 0
+    packed_table: object | None = field(default=None, compare=False, repr=False)
+    qchem_sweep_plan_cache: dict = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    qchem_sweep_plan_cache_stats: dict = field(
+        default_factory=lambda: {"hits": 0, "misses": 0, "puts": 0},
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self):
+        if self.packed_table is not None:
+            return
+        try:
+            from .su2_qchem_plan import pack_side_operator_table
+
+            self.packed_table = pack_side_operator_table(
+                self.grouped_by_ket,
+                side=self.owner_side,
+                bond=self.owner_bond,
+                representation=self.representation,
+            )
+        except Exception:
+            self.packed_table = None
 
     def mark_hit(self):
         """
@@ -2486,6 +2833,99 @@ class RenormalizedSideOperatorTable:
         self.hits += 1
         return self
 
+    def get_qchem_sweep_plan(self, key):
+        """
+        Return a cached packed SU(2) qchem plan for this side table.
+
+        :param key: Structural key describing the opposite table/boundaries.
+        :returns: Cached plan or ``None``.
+        """
+
+        if key not in self.qchem_sweep_plan_cache:
+            self.qchem_sweep_plan_cache_stats["misses"] += 1
+            return None
+        self.qchem_sweep_plan_cache_stats["hits"] += 1
+        return self.qchem_sweep_plan_cache[key]
+
+    def put_qchem_sweep_plan(self, key, plan):
+        """
+        Store a packed SU(2) qchem plan owned by this side table.
+
+        :param key: Structural key describing the opposite table/boundaries.
+        :param plan: :class:`SU2QChemSweepPlan` instance.
+        :returns: Stored plan.
+        """
+
+        self.qchem_sweep_plan_cache[key] = plan
+        self.qchem_sweep_plan_cache_stats["puts"] += 1
+        return plan
+
+    def grouped_payload(self):
+        """
+        Return the legacy grouped payload, materializing it from packed storage.
+
+        The packed SU(2) qchem path does not call this in the hot local-action
+        route.  It exists so the Python reference path can still be requested
+        explicitly without forcing every boundary advance to rebuild dicts.
+        """
+
+        if self.grouped_by_ket is not None:
+            return self.grouped_by_ket
+        packed = getattr(self, "packed_table", None)
+        if packed is None:
+            return None
+        if getattr(packed, "representation", None) == "rank_coupled_by_ket":
+            sectors = tuple(packed.sector_codec.sectors)
+            grouped = {}
+            for row_idx, ket_id in enumerate(packed.ket_sector_ids):
+                q_ket = sectors[int(ket_id)]
+                entries = []
+                start = int(packed.entry_offsets[row_idx])
+                stop = int(packed.entry_offsets[row_idx + 1])
+                for entry_idx in range(start, stop):
+                    q_out = sectors[int(packed.out_sector_ids[entry_idx])]
+                    channel_blocks = {}
+                    c_start = int(packed.channel_offsets[entry_idx])
+                    c_stop = int(packed.channel_offsets[entry_idx + 1])
+                    for channel_idx in range(c_start, c_stop):
+                        channel = int(packed.channel_ids[channel_idx])
+                        channel_blocks[channel] = packed.block_pool.array(channel_idx)
+                    if channel_blocks:
+                        entries.append((q_out, channel_blocks))
+                if entries:
+                    grouped[q_ket] = tuple(entries)
+            self.grouped_by_ket = grouped
+            return self.grouped_by_ket
+        if str(getattr(packed, "representation", "")).startswith("rank_coupled_"):
+            boundary_sectors = tuple(packed.boundary_codec.sectors)
+            physical_sectors = tuple(packed.physical_codec.sectors)
+            grouped = {}
+            for row_idx, (boundary_id, phys_id) in enumerate(
+                zip(packed.key_boundary_ids, packed.key_physical_ids)
+            ):
+                key = (
+                    boundary_sectors[int(boundary_id)],
+                    physical_sectors[int(phys_id)],
+                )
+                entries = []
+                start = int(packed.entry_offsets[row_idx])
+                stop = int(packed.entry_offsets[row_idx + 1])
+                for entry_idx in range(start, stop):
+                    families = packed.families(entry_idx)
+                    entry = (
+                        boundary_sectors[int(packed.out_boundary_ids[entry_idx])],
+                        physical_sectors[int(packed.out_physical_ids[entry_idx])],
+                        int(packed.middle_ids[entry_idx]),
+                        packed.factor(entry_idx),
+                        families,
+                    )
+                    entries.append(entry)
+                if entries:
+                    grouped[key] = tuple(entries)
+            self.grouped_by_ket = grouped
+            return self.grouped_by_ket
+        return None
+
     def derive(
         self,
         *,
@@ -2496,6 +2936,7 @@ class RenormalizedSideOperatorTable:
         owner_bond=None,
         parent_key=None,
         source="prepared",
+        packed_table=None,
     ):
         """
         Return a side table derived from this table.
@@ -2524,9 +2965,19 @@ class RenormalizedSideOperatorTable:
             parent_key=parent_key,
             source=str(source),
             derived_from=self.key,
+            packed_table=packed_table,
         )
 
-    def advance_left(self, *, key, grouped_by_ket, owner_bond, parent_key=None, source="advanced_left"):
+    def advance_left(
+        self,
+        *,
+        key,
+        grouped_by_ket,
+        owner_bond,
+        parent_key=None,
+        source="advanced_left",
+        packed_table=None,
+    ):
         """
         Return the table produced by advancing this left-side table one site.
 
@@ -2550,9 +3001,19 @@ class RenormalizedSideOperatorTable:
             owner_bond=owner_bond,
             parent_key=parent_key,
             source=source,
+            packed_table=packed_table,
         )
 
-    def advance_right(self, *, key, grouped_by_ket, owner_bond, parent_key=None, source="advanced_right"):
+    def advance_right(
+        self,
+        *,
+        key,
+        grouped_by_ket,
+        owner_bond,
+        parent_key=None,
+        source="advanced_right",
+        packed_table=None,
+    ):
         """
         Return the table produced by advancing this right-side table one site.
 
@@ -2572,18 +3033,27 @@ class RenormalizedSideOperatorTable:
             owner_bond=owner_bond,
             parent_key=parent_key,
             source=source,
+            packed_table=packed_table,
         )
 
     @property
     def n_ket_sectors(self):
         """Return the number of ket-sector groups in the table."""
 
+        if self.grouped_by_ket is None:
+            packed = getattr(self, "packed_table", None)
+            if packed is None:
+                return 0
+            return int(getattr(packed, "n_keys", getattr(packed, "n_ket_sectors", 0)))
         return int(len(self.grouped_by_ket))
 
     @property
     def n_terms(self):
         """Return the number of grouped boundary terms."""
 
+        if self.grouped_by_ket is None:
+            packed = getattr(self, "packed_table", None)
+            return int(0 if packed is None else getattr(packed, "n_entries", 0))
         return int(sum(len(entries) for entries in self.grouped_by_ket.values()))
 
     @property
@@ -2605,6 +3075,24 @@ class RenormalizedSideOperatorTable:
             "n_ket_sectors": int(self.n_ket_sectors),
             "n_terms": int(self.n_terms),
             "hits": int(self.hits),
+            "packed_only": bool(
+                self.grouped_by_ket is None and self.packed_table is not None
+            ),
+            "packed_table": (
+                None
+                if self.packed_table is None
+                else getattr(self.packed_table, "stats", None)
+            ),
+            "qchem_sweep_plan_cache_size": int(len(self.qchem_sweep_plan_cache)),
+            "qchem_sweep_plan_cache_hits": int(
+                self.qchem_sweep_plan_cache_stats["hits"]
+            ),
+            "qchem_sweep_plan_cache_misses": int(
+                self.qchem_sweep_plan_cache_stats["misses"]
+            ),
+            "qchem_sweep_plan_cache_puts": int(
+                self.qchem_sweep_plan_cache_stats["puts"]
+            ),
         }
 
 
@@ -2848,6 +3336,7 @@ class RenormalizedBlockEntry:
         derived_from=None,
         parent_table=None,
         advance_direction=None,
+        packed_table=None,
     ):
         """
         Store a grouped one-sided renormalized operator table.
@@ -2877,6 +3366,7 @@ class RenormalizedBlockEntry:
                     owner_bond=self.bond,
                     parent_key=self.parent_key,
                     source=source,
+                    packed_table=packed_table,
                 )
             elif advance_direction == "right":
                 table = parent_table.advance_right(
@@ -2885,6 +3375,7 @@ class RenormalizedBlockEntry:
                     owner_bond=self.bond,
                     parent_key=self.parent_key,
                     source=source,
+                    packed_table=packed_table,
                 )
         elif parent_table is not None:
             table = parent_table.derive(
@@ -2895,6 +3386,7 @@ class RenormalizedBlockEntry:
                 owner_bond=self.bond,
                 parent_key=self.parent_key,
                 source=source,
+                packed_table=packed_table,
             )
         else:
             table = RenormalizedSideOperatorTable(
@@ -2906,6 +3398,7 @@ class RenormalizedBlockEntry:
                 parent_key=self.parent_key,
                 source=str(source),
                 derived_from=derived_from,
+                packed_table=packed_table,
             )
         self.side_operator_tables[key] = table
         self.side_operator_table_stats["puts"] += 1
@@ -3580,7 +4073,11 @@ class RenormalizedBlockStack:
             key = ("side_operator_table", str(representation), entry.signature)
             if key in entry.side_operator_tables:
                 continue
-            grouped_by_ket, used_symbolic_table = self._build_side_operator_table_payload(
+            (
+                grouped_by_ket,
+                used_symbolic_table,
+                packed_table,
+            ) = self._build_side_operator_table_payload(
                 entry,
                 str(representation),
                 builder,
@@ -3607,6 +4104,7 @@ class RenormalizedBlockStack:
                 derived_from=derived_from,
                 parent_table=parent_table,
                 advance_direction=advance_direction,
+                packed_table=packed_table,
             )
         return entry
 
@@ -3617,13 +4115,55 @@ class RenormalizedBlockStack:
         :param entry: Boundary entry whose numeric block payload is grouped.
         :param representation: Requested side-table representation.
         :param fallback_builder: Numeric grouping fallback.
-        :returns: Grouped boundary blocks by ket sector.
+        :returns: ``(grouped_by_ket, used_symbolic_table, packed_table)``.
         """
 
         symbolic_table = getattr(entry, "symbolic_operator_table", None)
+        if representation == "rank_coupled_by_ket":
+            packed_table = None
+            try:
+                from .su2_qchem_plan import (
+                    pack_rank_coupled_boundary_table_from_block_map,
+                    pack_rank_coupled_boundary_table_from_payloads,
+                )
+
+                if symbolic_table is not None and getattr(
+                    symbolic_table,
+                    "numeric_payloads",
+                    None,
+                ):
+                    packed_table = pack_rank_coupled_boundary_table_from_payloads(
+                        symbolic_table.numeric_payloads,
+                        active_channels=getattr(symbolic_table, "channels", None),
+                        side=entry.side,
+                        bond=entry.bond,
+                        representation=representation,
+                    )
+                    if packed_table is not None:
+                        return None, True, packed_table
+                active_channels = (
+                    None
+                    if symbolic_table is None
+                    else getattr(symbolic_table, "channels", None)
+                )
+                packed_table = pack_rank_coupled_boundary_table_from_block_map(
+                    entry.block,
+                    active_channels=active_channels,
+                    side=entry.side,
+                    bond=entry.bond,
+                    representation=representation,
+                )
+                if packed_table is not None:
+                    return None, symbolic_table is not None, packed_table
+            except Exception:
+                packed_table = None
         if symbolic_table is not None:
-            return symbolic_table.group_boundary_blocks(representation=representation), True
-        return fallback_builder(entry.block), False
+            return (
+                symbolic_table.group_boundary_blocks(representation=representation),
+                True,
+                None,
+            )
+        return fallback_builder(entry.block), False, None
 
     def advance_left(
         self,
@@ -4106,6 +4646,11 @@ class CompiledOrthonormalBlockTable:
             term.apply(vector, out)
         return out
 
+    def dense_operator_matrix(self):
+        """Return the materialized orthonormal matrix when already owned."""
+
+        return self.dense_matrix
+
     @property
     def stats(self):
         """
@@ -4506,6 +5051,37 @@ def _group_factor_batch_entries(entries):
     return groups
 
 
+def _component_block_residual(blocks, reference_blocks):
+    """Return relative residual between two component-block tables."""
+
+    if blocks is None or reference_blocks is None:
+        return float("inf")
+    table = {
+        (int(in_comp), int(out_comp)): np.asarray(block, dtype=complex)
+        for in_comp, out_comp, block in blocks
+    }
+    reference = {
+        (int(in_comp), int(out_comp)): np.asarray(block, dtype=complex)
+        for in_comp, out_comp, block in reference_blocks
+    }
+    keys = set(table) | set(reference)
+    diff_norm = 0.0
+    ref_norm = 0.0
+    for key in keys:
+        a = table.get(key)
+        b = reference.get(key)
+        if a is None:
+            diff_norm += float(np.linalg.norm(b.reshape(-1)) ** 2)
+            ref_norm += float(np.linalg.norm(b.reshape(-1)) ** 2)
+            continue
+        if b is None:
+            diff_norm += float(np.linalg.norm(a.reshape(-1)) ** 2)
+            continue
+        diff_norm += float(np.linalg.norm((a - b).reshape(-1)) ** 2)
+        ref_norm += float(np.linalg.norm(b.reshape(-1)) ** 2)
+    return float(np.sqrt(diff_norm) / max(np.sqrt(ref_norm), 1.0))
+
+
 @dataclass(frozen=True)
 class DirectOrthonormalFactorizedTable:
     """
@@ -4532,34 +5108,116 @@ class DirectOrthonormalFactorizedTable:
     components: tuple | None = None
 
     def __post_init__(self):
-        component_direct_plan = self._build_component_direct_plan()
+        timing = {}
+        t0 = time.perf_counter()
+        qchem_parent_blocks = (
+            self._build_qchem_component_parent_blocks()
+            if _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+            else None
+        )
+        timing["direct_table_qchem_parent_blocks"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        component_direct_plan = (
+            None
+            if qchem_parent_blocks is not None
+            else self._build_component_direct_plan()
+        )
+        timing["direct_table_component_plan"] = time.perf_counter() - t0
         object.__setattr__(
             self,
             "_component_direct_plan",
             component_direct_plan,
         )
         use_family_tensor = self.uses_complementary_payload_tensor_kernel
+        t0 = time.perf_counter()
+        family_table = (
+            self._build_complementary_family_tensor_table(
+                component_direct_plan
+            )
+            if use_family_tensor
+            else None
+        )
+        timing["direct_table_family_table"] = time.perf_counter() - t0
         object.__setattr__(
             self,
             "_complementary_family_tensor_table",
-            (
-                self._build_complementary_family_tensor_table(
-                    component_direct_plan
-                )
-                if use_family_tensor
-                else None
-            ),
+            family_table,
         )
+        t0 = time.perf_counter()
         component_parent_blocks = (
-            None
-            if use_family_tensor
-            else self._build_component_parent_blocks(component_direct_plan)
+            None if use_family_tensor else qchem_parent_blocks
         )
+        if component_parent_blocks is None and not use_family_tensor:
+            component_parent_blocks = self._build_component_parent_blocks(
+                component_direct_plan
+            )
+        timing["direct_table_parent_blocks"] = (
+            timing.get("direct_table_parent_blocks", 0.0)
+            + (time.perf_counter() - t0)
+        )
+        t0 = time.perf_counter()
         component_orthonormal_blocks = self._build_component_orthonormal_blocks(
             component_parent_blocks,
         )
+        timing["direct_table_orthonormal_blocks"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         component_orthonormal_dense_matrix = self._build_component_orthonormal_dense_matrix(
             component_orthonormal_blocks,
+        )
+        timing["direct_table_dense_matrix"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        component_orthonormal_block_batches = (
+            None
+            if component_orthonormal_dense_matrix is not None
+            else self._build_component_orthonormal_block_batches(
+                component_orthonormal_blocks,
+            )
+        )
+        timing["direct_table_orthonormal_block_batches"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        if family_table is not None:
+            su2_action = SU2LocalAction.from_family_table(
+                self.component_basis,
+                family_table,
+                backend=_SU2_KERNEL_BACKEND,
+            )
+        elif component_orthonormal_blocks is None:
+            su2_action = SU2LocalAction.from_parent_blocks(
+                self.component_basis,
+                component_parent_blocks,
+                backend=_SU2_KERNEL_BACKEND,
+            )
+        else:
+            su2_action = None
+        timing["direct_table_su2_action"] = time.perf_counter() - t0
+        su2_residual = None
+        if su2_action is not None and _SU2_KERNEL_DEBUG_CHECK:
+            t0 = time.perf_counter()
+            rng = np.random.default_rng(1234)
+            probe = rng.normal(size=self.dim) + 1j * rng.normal(size=self.dim)
+            reference = (
+                family_table.matvec(probe, self.component_basis)
+                if family_table is not None
+                else self._component_parent_block_matvec(
+                    probe,
+                    component_parent_blocks,
+                )
+            )
+            candidate = su2_action.matvec(probe)
+            scale = max(float(np.linalg.norm(reference)), 1.0)
+            su2_residual = float(np.linalg.norm(candidate - reference) / scale)
+            if su2_residual > float(_SU2_KERNEL_DEBUG_CHECK_TOL):
+                raise RuntimeError(
+                    "SU2 local action disagrees with Python reference: "
+                    f"residual={su2_residual:.3e}"
+                )
+            timing["direct_table_su2_debug_check"] = time.perf_counter() - t0
+        object.__setattr__(self, "_build_timing", timing)
+        object.__setattr__(self, "_su2_action", su2_action)
+        object.__setattr__(
+            self,
+            "_su2_action_reference_residual",
+            su2_residual,
         )
         object.__setattr__(
             self,
@@ -4570,6 +5228,11 @@ class DirectOrthonormalFactorizedTable:
             self,
             "_component_orthonormal_blocks",
             component_orthonormal_blocks,
+        )
+        object.__setattr__(
+            self,
+            "_component_orthonormal_block_batches",
+            component_orthonormal_block_batches,
         )
         object.__setattr__(
             self,
@@ -4593,16 +5256,28 @@ class DirectOrthonormalFactorizedTable:
 
         vector = np.asarray(vector, dtype=complex).reshape(self.dim)
         family_table = getattr(self, "_complementary_family_tensor_table", None)
+        su2_action = getattr(self, "_su2_action", None)
         if family_table is not None:
+            if su2_action is not None:
+                return su2_action.matvec(vector)
             return family_table.matvec(vector, self.component_basis)
         orthonormal_dense = getattr(self, "_component_orthonormal_dense_matrix", None)
         if orthonormal_dense is not None:
             return orthonormal_dense @ vector
         orthonormal_blocks = getattr(self, "_component_orthonormal_blocks", None)
         if orthonormal_blocks is not None:
+            batches = getattr(self, "_component_orthonormal_block_batches", None)
+            if batches is not None:
+                return self._component_orthonormal_batched_block_matvec(
+                    vector,
+                    batches,
+                )
             return self._component_orthonormal_block_matvec(vector, orthonormal_blocks)
         parent_blocks = getattr(self, "_component_parent_blocks", None)
         if parent_blocks is not None:
+            su2_action = getattr(self, "_su2_action", None)
+            if su2_action is not None:
+                return su2_action.matvec(vector)
             return self._component_parent_block_matvec(vector, parent_blocks)
         plan = getattr(self, "_component_direct_plan", None)
         if plan is not None:
@@ -4621,6 +5296,11 @@ class DirectOrthonormalFactorizedTable:
                 @ parent_out[indices]
             )
         return out
+
+    def dense_operator_matrix(self):
+        """Return the materialized orthonormal matrix when already owned."""
+
+        return getattr(self, "_component_orthonormal_dense_matrix", None)
 
     @property
     def uses_component_direct_kernel(self):
@@ -4776,7 +5456,140 @@ class DirectOrthonormalFactorizedTable:
                     return None
                 out_comp, out_slice = out_info
                 plan.append((int(in_comp), int(out_comp), in_slice, out_slice, term))
+        if not plan:
+            return None
         return tuple(plan)
+
+    def _build_qchem_component_parent_blocks(self):
+        """
+        Build component parent blocks directly from a packed SU(2) qchem plan.
+
+        :returns: Parent component blocks, or ``None`` when unavailable.
+        """
+
+        compiled = self.compiled_factorized_terms
+        components = self.components
+        basis = getattr(self.component_basis, "parent_basis", None)
+        qchem_plan = getattr(compiled, "su2_qchem_sweep_plan_object", None)
+        if compiled is None or components is None or basis is None:
+            return None
+        compiled_basis = getattr(compiled, "basis", None)
+        if compiled_basis is not basis and not basis.compatible_with_layout(
+            getattr(compiled_basis, "entries", basis.entries)
+        ):
+            return None
+        component_dims = tuple(
+            int(np.asarray(indices).size)
+            for indices in self.component_basis.component_indices
+        )
+        builder = getattr(compiled, "build_component_parent_blocks", None)
+        if builder is not None:
+            object.__setattr__(
+                self,
+                "_component_parent_block_builder_backend",
+                "packed_qchem_matches",
+            )
+            blocks = builder(components, component_dims)
+            try:
+                from . import su2_qchem_plan as qchem_plan_mod
+            except Exception:
+                qchem_plan_mod = None
+            if (
+                qchem_plan_mod is not None
+                and getattr(qchem_plan_mod, "_DEBUG_PACKED_COMPILED_TERMS", False)
+                and hasattr(compiled, "in_indices")
+            ):
+                matches = (
+                    compiled.in_indices,
+                    compiled.out_indices,
+                    compiled.left_indices,
+                    compiled.right_indices,
+                )
+                legacy = qchem_plan._compile_factorized_terms_from_matches(
+                    basis,
+                    matches,
+                )
+                legacy_blocks = self._build_component_parent_blocks_from_compiled(
+                    legacy,
+                    components,
+                    basis,
+                    component_dims,
+                )
+                residual = _component_block_residual(blocks, legacy_blocks)
+                if residual > 1.0e-10:
+                    raise RuntimeError(
+                        "Packed SU2 qchem parent blocks disagree with legacy "
+                        f"parent blocks: residual={residual:.3e}"
+                    )
+            return blocks
+        if qchem_plan is None:
+            return None
+        object.__setattr__(
+            self,
+            "_component_parent_block_builder_backend",
+            "packed_qchem_python",
+        )
+        return qchem_plan.build_component_parent_blocks(
+            basis,
+            components,
+            component_dims,
+            use_matches=False,
+        )
+
+    @staticmethod
+    def _build_component_parent_blocks_from_compiled(
+        compiled,
+        components,
+        basis,
+        component_dims,
+    ):
+        entry_to_component = {}
+        for comp_idx, component in enumerate(components):
+            cursor = 0
+            for entry_idx in component:
+                entry = basis.entries[int(entry_idx)]
+                entry_to_component[int(entry_idx)] = (
+                    int(comp_idx),
+                    slice(cursor, cursor + int(entry.size)),
+                )
+                cursor += int(entry.size)
+        blocks = {}
+        for in_idx, terms in enumerate(getattr(compiled, "items", ())):
+            in_info = entry_to_component.get(int(in_idx))
+            if in_info is None:
+                return None
+            in_comp, in_slice = in_info
+            for term in terms:
+                out_idx = basis.entry_index(term.output_entry.key)
+                out_info = entry_to_component.get(int(out_idx))
+                if out_info is None:
+                    return None
+                out_comp, out_slice = out_info
+                key = (int(in_comp), int(out_comp))
+                block = blocks.get(key)
+                if block is None:
+                    block = np.zeros(
+                        (
+                            int(component_dims[int(out_comp)]),
+                            int(component_dims[int(in_comp)]),
+                        ),
+                        dtype=complex,
+                    )
+                    blocks[key] = block
+                kernel = term.kernel_matrix(
+                    term.input_entry.shape,
+                    max_elements=max(
+                        int(term.input_entry.size) * int(term.output_entry.size),
+                        1,
+                    ),
+                )
+                if kernel is None:
+                    return None
+                block[out_slice, in_slice] += np.asarray(kernel, dtype=complex)
+        return tuple(
+            (in_comp, out_comp, np.ascontiguousarray(block))
+            for (in_comp, out_comp), block in sorted(blocks.items())
+        )
 
     def _build_component_parent_blocks(self, plan=None):
         """
@@ -4795,6 +5608,20 @@ class DirectOrthonormalFactorizedTable:
             int(np.asarray(indices).size)
             for indices in self.component_basis.component_indices
         )
+        object.__setattr__(self, "_component_parent_block_builder_backend", "python")
+        if str(_SU2_KERNEL_BACKEND).lower().replace("-", "_") != "python":
+            blocks, actual = _su2_build_component_parent_blocks(
+                plan,
+                component_dims,
+                backend=_SU2_KERNEL_BACKEND,
+            )
+            object.__setattr__(
+                self,
+                "_component_parent_block_builder_backend",
+                str(actual),
+            )
+            if actual != "python" or blocks is not None:
+                return blocks
         blocks = {}
         for in_comp, out_comp, in_slice, out_slice, term in plan:
             key = (int(in_comp), int(out_comp))
@@ -4825,6 +5652,25 @@ class DirectOrthonormalFactorizedTable:
         if parent_blocks is None:
             return None
         transforms = self.component_basis.component_transforms
+        object.__setattr__(
+            self,
+            "_component_orthonormal_block_builder_backend",
+            "python",
+        )
+        if str(_SU2_KERNEL_BACKEND).lower().replace("-", "_") != "python":
+            blocks, actual = _su2_project_component_orthonormal_blocks(
+                parent_blocks,
+                transforms,
+                _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS,
+                backend=_SU2_KERNEL_BACKEND,
+            )
+            object.__setattr__(
+                self,
+                "_component_orthonormal_block_builder_backend",
+                str(actual),
+            )
+            if actual != "python" or blocks is not None:
+                return blocks
         total_elements = 0
         for in_comp, out_comp, _block in parent_blocks:
             total_elements += (
@@ -4861,6 +5707,44 @@ class DirectOrthonormalFactorizedTable:
             matrix[out_slice, in_slice] += np.asarray(block, dtype=complex)
         return np.ascontiguousarray(matrix)
 
+    def _build_component_orthonormal_block_batches(self, orthonormal_blocks):
+        """
+        Group same-shape orthonormal component blocks for batched matvecs.
+        """
+
+        if orthonormal_blocks is None:
+            return None
+        groups = OrderedDict()
+        singles = []
+        for in_comp, out_comp, block in tuple(orthonormal_blocks):
+            block = np.asarray(block, dtype=complex)
+            key = tuple(int(dim) for dim in block.shape)
+            groups.setdefault(key, []).append((int(in_comp), int(out_comp), block))
+        batches = []
+        for _shape, entries in groups.items():
+            if len(entries) < _ORTHONORMAL_BLOCK_BATCH_MIN_ENTRIES:
+                singles.extend(entries)
+                continue
+            blocks = np.ascontiguousarray(
+                np.stack([entry[2] for entry in entries], axis=0)
+            )
+            in_slices = tuple(
+                self.component_basis._orth_slice(int(entry[0])) for entry in entries
+            )
+            out_slices = tuple(
+                self.component_basis._orth_slice(int(entry[1])) for entry in entries
+            )
+            batches.append((blocks, in_slices, out_slices))
+        if not batches:
+            return None
+        return {
+            "batches": tuple(batches),
+            "singles": tuple(singles),
+            "n_batches": int(len(batches)),
+            "n_batched_blocks": int(sum(batch[0].shape[0] for batch in batches)),
+            "n_single_blocks": int(len(singles)),
+        }
+
     def _component_orthonormal_block_matvec(self, vector, orthonormal_blocks):
         """
         Apply transformed component blocks directly in orthonormal coordinates.
@@ -4868,6 +5752,25 @@ class DirectOrthonormalFactorizedTable:
 
         out = np.zeros(self.dim, dtype=complex)
         for in_comp, out_comp, block in orthonormal_blocks:
+            in_slice = self.component_basis._orth_slice(int(in_comp))
+            out_slice = self.component_basis._orth_slice(int(out_comp))
+            out[out_slice] += block @ vector[in_slice]
+        return out
+
+    def _component_orthonormal_batched_block_matvec(self, vector, batch_table):
+        """
+        Apply transformed orthonormal blocks with grouped batched GEMVs.
+        """
+
+        out = np.zeros(self.dim, dtype=complex)
+        for blocks, in_slices, out_slices in batch_table.get("batches", ()):
+            inputs = np.ascontiguousarray(
+                np.stack([vector[in_slice] for in_slice in in_slices], axis=0)
+            )
+            contribs = np.matmul(blocks, inputs[:, :, None])[:, :, 0]
+            for out_slice, contrib in zip(out_slices, contribs):
+                out[out_slice] += contrib
+        for in_comp, out_comp, block in batch_table.get("singles", ()):
             in_slice = self.component_basis._orth_slice(int(in_comp))
             out_slice = self.component_basis._orth_slice(int(out_comp))
             out[out_slice] += block @ vector[in_slice]
@@ -4938,6 +5841,7 @@ class DirectOrthonormalFactorizedTable:
         """
 
         family_table = getattr(self, "_complementary_family_tensor_table", None)
+        su2_action = getattr(self, "_su2_action", None)
         plan = getattr(self, "_component_direct_plan", None)
         if family_table is None or plan is None:
             return None
@@ -4987,7 +5891,28 @@ class DirectOrthonormalFactorizedTable:
         family_term_counts = dict(
             getattr(self.compiled_factorized_terms, "family_term_counts", {}) or {}
         )
+        su2_qchem_sweep_plan = getattr(
+            self.compiled_factorized_terms,
+            "su2_qchem_sweep_plan",
+            None,
+        )
+        su2_qchem_factor_match_backend = getattr(
+            self.compiled_factorized_terms,
+            "su2_qchem_factor_match_backend",
+            None,
+        )
+        su2_qchem_factor_match_count = getattr(
+            self.compiled_factorized_terms,
+            "su2_qchem_factor_match_count",
+            None,
+        )
         family_table = getattr(self, "_complementary_family_tensor_table", None)
+        su2_action = getattr(self, "_su2_action", None)
+        orthonormal_block_batches = getattr(
+            self,
+            "_component_orthonormal_block_batches",
+            None,
+        ) or {}
         orthonormal_block_elements = int(
             sum(
                 np.asarray(block).size
@@ -5048,6 +5973,24 @@ class DirectOrthonormalFactorizedTable:
             "component_orthonormal_dense_kernel": bool(
                 self.uses_component_orthonormal_dense_kernel
             ),
+            "component_orthonormal_block_batch_kernel": bool(
+                orthonormal_block_batches
+            ),
+            "component_orthonormal_block_batch_groups": int(
+                orthonormal_block_batches.get("n_batches", 0)
+            ),
+            "component_orthonormal_block_batched_terms": int(
+                orthonormal_block_batches.get("n_batched_blocks", 0)
+            ),
+            "component_orthonormal_block_single_terms": int(
+                orthonormal_block_batches.get("n_single_blocks", 0)
+            ),
+            "component_parent_block_builder_backend": str(
+                getattr(self, "_component_parent_block_builder_backend", "python")
+            ),
+            "component_orthonormal_block_builder_backend": str(
+                getattr(self, "_component_orthonormal_block_builder_backend", "python")
+            ),
             "complementary_payload_tensor_kernel": bool(
                 self.uses_complementary_payload_tensor_kernel
                 and self.uses_component_direct_kernel
@@ -5060,6 +6003,17 @@ class DirectOrthonormalFactorizedTable:
             ),
             "complementary_family_table": (
                 None if family_table is None else family_table.stats
+            ),
+            "su2_local_action": (
+                None if su2_action is None else su2_action.stats
+            ),
+            "su2_reference_residual": getattr(
+                self,
+                "_su2_action_reference_residual",
+                None,
+            ),
+            "su2_kernel_backend_actual": (
+                "python" if su2_action is None else str(su2_action.backend)
             ),
             "complementary_family_table_source": (
                 None if family_table is None else str(family_table.source)
@@ -5081,6 +6035,13 @@ class DirectOrthonormalFactorizedTable:
             "family_resolved_tensor_kernel": bool(family_names),
             "family_names": family_names,
             "family_term_counts": family_term_counts,
+            "su2_qchem_sweep_plan": su2_qchem_sweep_plan,
+            "su2_qchem_factor_match_backend": su2_qchem_factor_match_backend,
+            "su2_qchem_factor_match_count": (
+                None
+                if su2_qchem_factor_match_count is None
+                else int(su2_qchem_factor_match_count)
+            ),
             "component_parent_block_elements": int(
                 sum(
                     np.asarray(block).size
@@ -5091,6 +6052,10 @@ class DirectOrthonormalFactorizedTable:
             ),
             "component_orthonormal_block_elements": orthonormal_block_elements,
             "component_orthonormal_dense_elements": orthonormal_dense_elements,
+            "build_timing": {
+                str(key): float(value)
+                for key, value in (getattr(self, "_build_timing", None) or {}).items()
+            },
         }
 
 
@@ -5323,6 +6288,22 @@ class RenormalizedComponentBasis:
         vector = np.asarray(vector, dtype=complex).reshape(self.orthonormal_dim)
         return self.block_table.matvec(vector)
 
+    def dense_operator_matrix(self):
+        """Return the materialized orthonormal matrix when already owned."""
+
+        getter = getattr(self.block_table, "dense_operator_matrix", None)
+        if getter is not None:
+            return getter()
+        return None
+
+    def dense_operator_matrix(self):
+        """Return the materialized orthonormal matrix when already owned."""
+
+        getter = getattr(self.block_table, "dense_operator_matrix", None)
+        if getter is not None:
+            return getter()
+        return None
+
     def metric_matvec(self, vector):
         """
         Apply the parent-basis component-block local metric.
@@ -5462,6 +6443,14 @@ class ComponentOrthonormalizedLocalProblem:
 
         vector = np.asarray(vector, dtype=complex).reshape(self.orthonormal_dim)
         return self.block_table.matvec(vector)
+
+    def dense_operator_matrix(self):
+        """Return the materialized orthonormal matrix when already owned."""
+
+        getter = getattr(self.block_table, "dense_operator_matrix", None)
+        if getter is not None:
+            return getter()
+        return None
 
 
 def compile_orthonormal_block_table(block_terms, block_transforms, orth_offsets):

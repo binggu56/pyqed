@@ -44,6 +44,8 @@ from pyqed import au2ev, au2angstrom, obs
 from pyqed.dvr import SineDVR
 # from pyqed import scf
 
+from pyqed.qchem.gto.rhf import make_rdm1, energy_elec
+
 # from numba import vectorize, float64, jit
 import sys
 from opt_einsum import contract

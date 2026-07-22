@@ -1243,6 +1243,7 @@ class HermiteDVR(DVR):
     @param[in] npts number of points
     @param[in] xmax "right" end of interval
     @param[in] x0 shifted center of interval
+    @param[in] mass particle mass used by the kinetic energy matrix
     @attribute a step size
     @attribute n vector of x-domain indices
     @attribute x discretized x-domain
@@ -1252,11 +1253,12 @@ class HermiteDVR(DVR):
     @method h return hamiltonian matrix
     @method f return DVR basis vectors
     """
-    def __init__(self, npts, xmax=None, x0=0.):
+    def __init__(self, npts, xmax=None, x0=0., mass=1.):
         assert (npts < 269), \
             "Must make npts < 269 for numpy to find quadrature points."
         self.npts = npts
         self.x0 = float(x0)
+        self._mass = mass
         self.n = np.arange(npts)
         c = np.zeros(npts+1)
         c[-1] = 1.
@@ -1272,8 +1274,18 @@ class HermiteDVR(DVR):
         self.L = self.x.max() - self.x.min()
         self.a = None
         self.k_max = None
+        self.T = None
+        self.P = None
 
-    def t(self, hc=1., mc2=1.):
+    @property
+    def mass(self):
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        self._mass = value
+
+    def t(self, hc=1.):
         """Return the kinetic energy matrix.
         Usage:
             T = self.t(V)
@@ -1293,8 +1305,24 @@ class HermiteDVR(DVR):
         T += np.diag((2. * self.npts + 1.
                       - np.square(self.x)) / 3.)
         T *= self.gamma
-        T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
+        T *= 0.5 * hc**2. / self.mass   # (pc)^2 / (2 mc^2)
+        self.T = T
         return T
+
+    def momentum(self, hbar=1.):
+        """Return the Hermite DVR momentum matrix."""
+        _i = self.n[:, np.newaxis]
+        _j = self.n[np.newaxis, :]
+        _xi = self.x[:, np.newaxis]
+        _xj = self.x[np.newaxis, :]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            D = (-1.)**(_i-_j) / (_xi-_xj)
+
+        D[self.n, self.n] = 0.
+        self.P = -1j * hbar * D
+        return self.P
 
 #     def f(self, x=None):
 #         """Return the DVR basis vectors"""

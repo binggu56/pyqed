@@ -4,8 +4,6 @@ message: >-
   the method-specific references for the algorithms used.
 title: PyQED
 type: software
-version: 0.2.0
-date-released: 2026-07-11
 authors:
   - family-names: Gu
     given-names: Bing

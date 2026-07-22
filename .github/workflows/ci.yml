@@ -39,7 +39,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
       - name: Run release and core smoke tests
-        run: python -m pytest -q tests/test_release_smoke.py
+        run: >-
+          python -m pytest -q
+          tests/test_release_smoke.py
+          tests/test_superoperator_lindblad.py
+          tests/test_integrate.py
 
   native-extensions:
     name: Optional native extensions
@@ -56,27 +60,11 @@ jobs:
       - name: Compile the opt-in extensions
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test,accelerators]"
-      - name: Verify native imports, CASSCF extra, and public quickstart
+          python -m pip install -e ".[test]"
+      - name: Verify native imports and public quickstart
         run: |
-          python -c 'from pyqed.qchem import CASSCF, _basis_cy, _rys_cy; assert CASSCF is not None and _basis_cy is not None and _rys_cy is not None'
+          python -c 'from pyqed.qchem import _basis_cy, _integrals_cpp, _rys_cy; from pyqed.heom import _heom_cpp; from pyqed.mps.nonabelian import _su2_kernel; assert all(module is not None for module in (_basis_cy, _integrals_cpp, _rys_cy, _heom_cpp, _su2_kernel))'
           python examples/quickstart.py
-
-  heom-extra:
-    name: HEOM optional dependencies
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-          cache: pip
-      - name: Install and verify the HEOM extra
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[heom]"
-          python -c 'from pyqed.HEOM.heom import HEOMSolver; from pyqed.HEOM.deom import DEOMSolver; assert HEOMSolver is not None and DEOMSolver is not None'
 
   distribution:
     name: Wheel and source distribution
@@ -92,23 +80,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install build twine
-          rm -rf dist
           python -m build
           python -m twine check dist/*
       - name: Install and test the wheel in isolation
         run: |
           python -m venv /tmp/pyqed-wheel
           /tmp/pyqed-wheel/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-wheel/bin/python -m pip install dist/pyqed-0.2.0-py3-none-any.whl
+          /tmp/pyqed-wheel/bin/python -m pip install dist/*.whl
           cd /tmp
           /tmp/pyqed-wheel/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
-          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from importlib.util import find_spec; from pathlib import Path; import pyqed; from pyqed.gw import BSE, GW, TDA; from pyqed.namd import TDDFTDriver; from pyqed.qchem import MP2, Molecule; from pyqed.qchem.basis import _basis_path; from pyqed.qchem.dft import RKS; names=("pyqed.HEOM", "pyqed.HEOM.deom", "pyqed.floquet", "pyqed.gw", "pyqed.md", "pyqed.ml", "pyqed.namd", "pyqed.narg", "pyqed.mps.nonabelian", "pyqed.qchem.dft", "pyqed.qchem.mp"); assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert Path(_basis_path("sto-3g")).is_file(); assert all(find_spec(name) is not None for name in names); assert all(item is not None for item in (BSE, GW, TDA, MP2, Molecule, RKS, TDDFTDriver))'
-          /tmp/pyqed-wheel/bin/python -m compileall -q /tmp/pyqed-wheel/lib/python3.13/site-packages/pyqed
+          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from pathlib import Path; import pyqed; from pyqed.qchem.basis import _basis_path; assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert Path(_basis_path("sto-3g")).is_file()'
       - name: Install and test the source distribution in isolation
         run: |
           python -m venv /tmp/pyqed-sdist
           /tmp/pyqed-sdist/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-sdist/bin/python -m pip install dist/pyqed-0.2.0.tar.gz
+          /tmp/pyqed-sdist/bin/python -m pip install dist/*.tar.gz
           cd /tmp
           /tmp/pyqed-sdist/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
 

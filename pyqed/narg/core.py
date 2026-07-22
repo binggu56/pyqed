@@ -330,12 +330,17 @@ class NARGBase:
                 step = self.grow_one(block, site, keep)
                 block = step.block
                 steps.append(step)
+            meta = self.step_meta(start, steps)
+            if len(steps) == 1:
+                meta.update(steps[0].meta)
+            elif any(step.meta for step in steps):
+                meta["substep_meta"] = [dict(step.meta) for step in steps]
             yield Step(
                 site=steps[0].site,
                 block=block,
                 tensor=self.fuse_steps(steps),
                 qn=steps[-1].qn,
-                meta=self.step_meta(start, steps),
+                meta=meta,
             )
             site_id += pair_size
 

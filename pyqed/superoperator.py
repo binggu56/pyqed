@@ -14,18 +14,18 @@ Possible improvements:
 """
 import numpy as np
 from scipy.sparse import kron, identity, issparse
-from scipy.sparse.linalg import eigs
+from scipy.sparse.linalg import LinearOperator, eigs
 import scipy
 import math
 # from numba import jit
 
 from numpy import exp
 
-from pyqed import dag, pauli
+from pyqed import dag, pauli, Result
 # from qutip import Qobj as Basic
 
 
-def liouvillian(H, c_ops):
+def liouvillian(H, c_ops=None, matrix_free=False):
     '''
     Construct the Liouvillian out of the Hamiltonian and collapse operators
 
@@ -35,6 +35,9 @@ def liouvillian(H, c_ops):
         DESCRIPTION.
     c_ops : TYPE
         DESCRIPTION.
+    matrix_free : bool, optional
+        If true, return a ``scipy.sparse.linalg.LinearOperator`` instead of
+        constructing the explicit Liouville-space matrix.
 
     Returns
     -------
@@ -42,10 +45,11 @@ def liouvillian(H, c_ops):
         DESCRIPTION.
 
     '''
-    # dissipator = 0.
-
     if c_ops is None:
         c_ops = []
+
+    if matrix_free:
+        return _matrix_free_liouvillian(H, c_ops)
 
     l = -1j * operator_to_superoperator(H)
 
@@ -55,6 +59,49 @@ def liouvillian(H, c_ops):
     # l = operator_to_superoperator(H) + 1j * dissipator
 
     return l
+
+
+def _matrix_free_liouvillian(H, c_ops=None):
+    """Return a matrix-free Lindblad Liouvillian as a ``LinearOperator``.
+
+    The operator uses the same row-major vectorization convention as
+    :func:`dm2vec` and :func:`liouvillian`, but applies the Lindblad RHS in
+    matrix form instead of constructing the explicit ``N**2 x N**2`` matrix.
+    """
+    if c_ops is None:
+        c_ops = []
+
+    dim = H.shape[-1]
+    shape = (dim * dim, dim * dim)
+    hamiltonian = H
+    collapse_ops = list(c_ops)
+    collapse_daggers = [dag(c_op) for c_op in collapse_ops]
+    collapse_products = [
+        c_dag @ c_op for c_dag, c_op in zip(collapse_daggers, collapse_ops)
+    ]
+    dtype = np.result_type(
+        getattr(H, "dtype", complex),
+        *[getattr(c_op, "dtype", complex) for c_op in collapse_ops],
+        complex,
+    )
+
+    def right_multiply(rho, operator):
+        return (operator.T @ rho.T).T
+
+    def matvec(vector):
+        rho = np.asarray(vector).reshape((dim, dim))
+        rhs = -1j * (hamiltonian @ rho - right_multiply(rho, hamiltonian))
+        for c_op, c_dag, c_dag_c in zip(
+            collapse_ops,
+            collapse_daggers,
+            collapse_products,
+        ):
+            jump = right_multiply(c_op @ rho, c_dag)
+            anticommutator = c_dag_c @ rho + right_multiply(rho, c_dag_c)
+            rhs = rhs + jump - 0.5 * anticommutator
+        return np.asarray(rhs).reshape(-1)
+
+    return LinearOperator(shape, matvec=matvec, dtype=dtype)
 
 class Qobj():
     def __init__(self, data=None, dims=None):
@@ -91,14 +138,14 @@ class Qobj():
     def to_vector(self):
         return operator_to_vector(self.data)
 
-    def to_super(self, type='commutator'):
+    def to_super(self, kind='commutator'):
 
-        return operator_to_superoperator(self.data, type=type)
+        return operator_to_superoperator(self.data, kind=kind)
 
-    def to_linblad(self, gamma=1.):
+    def to_lindblad(self, gamma=1.):
         l = self.data
         return gamma * (kron(l, l.conj()) - \
-                operator_to_superoperator(dag(l).dot(l), type='anticommutator'))
+                0.5 * operator_to_superoperator(dag(l).dot(l), kind='anticommutator'))
 
 
 def liouville_space(N):
@@ -405,7 +452,7 @@ def absorption(mol, omegas, c_ops):
 
     gamma = 0.02
 
-    l = op2sop(H) + 1j * c_op.to_linblad(gamma=gamma)
+    l = op2sop(H) + 1j * c_op.to_lindblad(gamma=gamma)
 
 
     ntrans = 3 * nstates # number of transitions
@@ -521,8 +568,6 @@ class Lindblad_solver:
         return w, vr, vl
 
     def evolve(self, rho0, tlist, e_ops):
-
-        from pyqed import Result
 
         result = Result(times=tlist)
         # evals, evecs_r, evecs_l = self.eigvals, self.eigvecs_right,\
@@ -791,7 +836,7 @@ if __name__ == '__main__':
     c_op = dip
     gamma = 0.05
 
-    # l = h.to_super() + 1j * c_op.to_linblad(gamma=gamma)
+    # l = h.to_super() + 1j * c_op.to_lindblad(gamma=gamma)
     # l = liouvillian(H, c_ops=[gamma*c_op])
 
     # ntrans = 3 * nstates # number of transitions

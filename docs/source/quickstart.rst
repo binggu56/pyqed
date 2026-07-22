@@ -1,6 +1,3 @@
-.. meta::
-   :description: Install PyQED and run a native H2 restricted Hartree--Fock calculation from molecular geometry to a converged energy.
-
 Five-minute quickstart
 ======================
 
@@ -64,15 +61,7 @@ mean-field solver.
 Continue to correlated and active-space methods
 -----------------------------------------------
 
-Once RHF converges, the mean-field object can seed other solvers.  The current
-CASSCF implementation uses the optional Numba accelerator stack, so install it
-before running the active-space example:
-
-.. code-block:: bash
-
-   python -m pip install "pyqed[accelerators]"
-
-Then, for example:
+Once RHF converges, the mean-field object can seed other solvers.  For example:
 
 .. code-block:: python
 

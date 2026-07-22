@@ -39,11 +39,11 @@ def _get_uhf_eri_factors(mf):
     return eri_factors
 
 
-def _transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+def _mo_pair_factors(eri_factors, mo_left, mo_right=None):
     if mo_right is None:
         mo_right = mo_left
-    from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
-    return transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+    from pyqed.qchem.basis import mo_pair_factors
+    return mo_pair_factors(eri_factors, mo_left, mo_right)
 
 
 def _reference_density_rhf(mo_coeff, nocc):
@@ -353,7 +353,7 @@ class MP2:
         if eri_factors is not None:
             cocc = self.mo_coeff[:, :self.nocc]
             cvir = self.mo_coeff[:, self.nocc:]
-            pair_factors_ov = _transform_eri_factors_to_mo_pair(eri_factors, cocc, cvir)
+            pair_factors_ov = _mo_pair_factors(eri_factors, cocc, cvir)
             self.e_corr, self.t2 = _rmp2_kernel_factors(
                 self.nocc,
                 self.nmo,
@@ -449,7 +449,7 @@ class COMP2(MP2):
         h1_mo = np.asarray(self.mf.get_hcore_mo(mo_coeff))
         eri_factors = _get_rhf_eri_factors(self.mf)
         if eri_factors is not None:
-            pair_factors_mo = _transform_eri_factors_to_mo_pair(eri_factors, mo_coeff)
+            pair_factors_mo = _mo_pair_factors(eri_factors, mo_coeff)
             pair_factors_ov = pair_factors_mo[:, :self.nocc, self.nocc:]
             e_corr, t2 = _rmp2_kernel_factors(
                 self.nocc,
@@ -584,12 +584,12 @@ class UMP2:
         if eri_factors is not None:
             ca, cb = self.mo_coeff
             nocca, noccb = self.nocc
-            pair_factors_ov_a = _transform_eri_factors_to_mo_pair(
+            pair_factors_ov_a = _mo_pair_factors(
                 eri_factors,
                 ca[:, :nocca],
                 ca[:, nocca:],
             )
-            pair_factors_ov_b = _transform_eri_factors_to_mo_pair(
+            pair_factors_ov_b = _mo_pair_factors(
                 eri_factors,
                 cb[:, :noccb],
                 cb[:, noccb:],

@@ -729,6 +729,8 @@ class OM2Reference:
         return self
 
     def build_mrci_hamiltonian(self, driver):
+        if not self.converged:
+            raise RuntimeError("OM2 reference is not converged; MRCI requires orbitals consistent with the SCF density.")
         binary = driver.build_configurations(self)
         h1_spatial = self.get_hcore_mo()
         eri_spatial = self.get_eri_mo()
@@ -1306,19 +1308,23 @@ class MRCI:
         self.ci = np.asarray(v)
         self.nstates = int(len(self.e))
         self.s2 = self._compute_spin_square_values(ref)
-        spin = 0.5 * (np.sqrt(1.0 + 4.0 * np.maximum(self.s2, 0.0)) - 1.0)
-        self.spin_multiplicity = 2.0 * spin + 1.0
+        if self.s2 is None:
+            self.spin_multiplicity = None
+        else:
+            spin = 0.5 * (np.sqrt(1.0 + 4.0 * np.maximum(self.s2, 0.0)) - 1.0)
+            self.spin_multiplicity = 2.0 * spin + 1.0
         if self.verbose:
             if penalty is not None:
                 print(
                     f"spin penalty lambda={self.spin_penalty:g}, "
                     f"target <S^2>={target_s2:.8f}"
                 )
-            for root, value in enumerate(self.s2):
-                print(
-                    f"root {root}: <S^2> = {value:.8f}, "
-                    f"2S+1 ~= {self.spin_multiplicity[root]:.6f}"
-                )
+            if self.s2 is not None:
+                for root, value in enumerate(self.s2):
+                    print(
+                        f"root {root}: <S^2> = {value:.8f}, "
+                        f"2S+1 ~= {self.spin_multiplicity[root]:.6f}"
+                    )
         return self
 
     def spin_square_matrix(self):

@@ -119,7 +119,7 @@ def main() -> int:
                 "dense_builder": molecule._builtin_build_info["dense_builder"],
                 "ao_symmetry": molecule._builtin_build_info["aosym"],
                 "coordinate_type": molecule._builtin_build_info["coord_type"],
-                "geometry_hash": molecule.geometry_hash(),
+                "geometry_hash": molecule._builtin_build_info["geometry_hash"],
                 "eri_quartets_computed": molecule._builtin_build_info["quartets_computed"],
                 "eri_quartets_screened": molecule._builtin_build_info["quartets_screened"],
                 "solver": "pyqed.qchem.hf.RHF",

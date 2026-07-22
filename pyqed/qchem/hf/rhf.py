@@ -472,6 +472,12 @@ class RHF:
         self.diis_switch_tol = 1e-3
         self.diis_start_cycle = 2
         self.diis_space = 6
+        self.symmetry = bool(getattr(mol, 'symmetry', False))
+        self.groupname = getattr(mol, 'groupname', None)
+        self.irrep_names = getattr(mol, 'irrep_names', None)
+        self.orb_irrep_labels = None
+        self.orb_sym = None
+        self.orb_irrep_weights = None
 
     def run(self, **kwargs):
         verbose = int(kwargs.pop('verbose', self.verbose))
@@ -639,6 +645,28 @@ class RHF:
 
         self.x2c = x2c_kw
         self.relativistic = relativistic
+        if getattr(self.mol, 'symmetry_info', None) is not None and self.mo_coeff is not None:
+            from pyqed.qchem.symmetry import assign_mo_irreps, symmetry_adapt_mo_coeff
+
+            self.mo_coeff = symmetry_adapt_mo_coeff(
+                self.mol,
+                self.mo_coeff,
+                mo_energy=self.mo_energy,
+                mo_occ=self.mo_occ,
+                overlap=self.mol.overlap,
+            )
+
+            labels, ids, weights = assign_mo_irreps(
+                self.mol,
+                self.mo_coeff,
+                overlap=self.mol.overlap,
+            )
+            self.symmetry = True
+            self.groupname = self.mol.groupname
+            self.irrep_names = self.mol.irrep_names
+            self.orb_irrep_labels = labels
+            self.orb_sym = ids
+            self.orb_irrep_weights = weights
         return self
 
     def as_scanner(self, build_driver=None):
@@ -852,6 +880,50 @@ class RHF:
 
     def make_rdm1(self):
         return make_rdm1(self.mo_coeff, self.mo_occ)
+
+    def cluster(
+        self,
+        method='spectral',
+        n_clusters=None,
+        max_size=4,
+        weights='integral+rdm',
+        orbitals='canonical',
+        localization='pm',
+        mo_coeff=None,
+        dm=None,
+        active=None,
+        space=None,
+        localize_kwargs=None,
+        return_info=False,
+        return_orbitals=False,
+        **kwargs,
+    ):
+        """Cluster MOs for active-space/NARG workflows."""
+        from pyqed.qchem.orbital_clustering import cluster_mf_orbitals
+
+        return cluster_mf_orbitals(
+            self,
+            method=method,
+            n_clusters=n_clusters,
+            max_size=max_size,
+            weights=weights,
+            orbitals=orbitals,
+            localization=localization,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            active=active,
+            space=space,
+            localize_kwargs=localize_kwargs,
+            return_info=return_info,
+            return_orbitals=return_orbitals,
+            **kwargs,
+        )
+
+    def NARG(self, *args, **kwargs):
+        """Build a qchem NARG solver from this mean-field reference."""
+        from pyqed.narg import NARG
+
+        return NARG(self, *args, **kwargs)
 
     def get_ovlp(self):
         if self._pyscf_mf is not None:
@@ -1468,6 +1540,37 @@ class RHF:
             
         return dag(C) @ self.mol.hcore @ C
 
+    def mo_factors(self, mo_left=None, mo_right=None):
+        """
+        Transform AO RI/Cholesky factors to an MO pair block.
+        """
+        if mo_left is None:
+            mo_left = self.mo_coeff
+        if mo_right is None:
+            mo_right = mo_left
+        if mo_left is None:
+            raise ValueError("mo_left must be supplied before RHF orbitals are available.")
+
+        eri_factors = getattr(self, 'eri_factors', None)
+        if eri_factors is None:
+            eri_factors = getattr(self.mol, 'eri_factors', None)
+        eri_source = getattr(self, 'eri', None)
+        eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
+        if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
+            eri_factors = eri_source
+        if eri_factors is None:
+            raise ValueError("RHF.mo_factors() requires RI/Cholesky factors.")
+
+        from pyqed.qchem.basis import mo_pair_factors
+
+        return mo_pair_factors(eri_factors, mo_left, mo_right)
+
+    def get_eri_mo_factors(self, mo_left=None, mo_right=None):
+        """
+        Compatibility alias for :meth:`mo_factors`.
+        """
+        return self.mo_factors(mo_left, mo_right)
+
     def get_eri_mo(self, mo_coeff=None, notation='chem'):
         """
         get electron repulsion integrals in MOs
@@ -1489,21 +1592,28 @@ class RHF:
         else:
             C = mo_coeff
 
+        def _transform_s8_source(eri_s8_source):
+            if notation not in {'chem', 'phys'}:
+                raise ValueError("notation must be 'chem' or 'phys'.")
+            from pyqed.qchem.basis import ao2mo_s8
+            eri_mo_s8 = ao2mo_s8(eri_s8_source, C)
+            if notation == 'chem':
+                return eri_mo_s8
+            return eri_mo_s8.transpose(0, 2, 1, 3)
+
         eri_source = self.eri
         if eri_source is None and getattr(self, 'eri_s4', None) is not None:
             from pyqed.qchem.basis import unpack_eri_s4
             eri_source = unpack_eri_s4(self.eri_s4, self.mol.nao)
         if eri_source is None and getattr(self, 'eri_s8', None) is not None:
-            from pyqed.qchem.basis import unpack_eri_s8
-            eri_source = unpack_eri_s8(self.eri_s8, self.mol.nao)
+            return _transform_s8_source(self.eri_s8)
         if eri_source is None:
             eri_source = getattr(self.mol, 'eri', None)
         if eri_source is None and getattr(self.mol, 'eri_s4', None) is not None:
             from pyqed.qchem.basis import unpack_eri_s4
             eri_source = unpack_eri_s4(self.mol.eri_s4, self.mol.nao)
         if eri_source is None and getattr(self.mol, 'eri_s8', None) is not None:
-            from pyqed.qchem.basis import unpack_eri_s8
-            eri_source = unpack_eri_s8(self.mol.eri_s8, self.mol.nao)
+            return _transform_s8_source(self.mol.eri_s8)
 
         eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
         if eri_source is not None and eri_ndim == 4:
@@ -1523,8 +1633,7 @@ class RHF:
         if eri_factors is None:
             raise ValueError("RHF.get_eri_mo() requires either dense eri or eri_factors.")
 
-        from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
-        pair_factors = transform_ri_factors_to_mo_pair(eri_factors, C)
+        pair_factors = self.mo_factors(C)
         eri_mo = contract('Ppq,Prs->pqrs', pair_factors, pair_factors)
 
         if notation == 'chem':
@@ -1741,6 +1850,63 @@ class ROHF(RHF):
 #     return h
 
 
+def _record_direct_jk_stats(direct_jk_data, mode, computed, skipped):
+    if direct_jk_data is None:
+        return
+    direct_jk_data["last_mode"] = mode
+    direct_jk_data["last_computed"] = int(computed)
+    direct_jk_data["last_skipped"] = int(skipped)
+
+
+def _direct_veff_from_builtin_data(mol, dm, direct_jk_data):
+    transform = getattr(mol, '_ao_cart2sph', None)
+    dm_work = np.asarray(dm)
+    if transform is not None:
+        dm_work = np.einsum('pa,ab,qb->pq', transform, dm_work, transform, optimize=True)
+
+    kernel = str(direct_jk_data.get("kernel", "")).lower()
+    if kernel.startswith("cpp"):
+        from pyqed.qchem.basis import _builtin_worker_count, direct_veff_cartesian_cpp
+
+        direct = direct_veff_cartesian_cpp(
+            direct_jk_data["shells"],
+            direct_jk_data["origins"],
+            direct_jk_data["exps"],
+            direct_jk_data["weights"],
+            direct_jk_data["nprim"],
+            direct_jk_data["pair_bounds"],
+            np.ascontiguousarray(dm_work, dtype=np.float64),
+            float(direct_jk_data.get("screen_tol", 0.0)),
+            workers=_builtin_worker_count(mol, mol.nao),
+        )
+        if direct is not None:
+            veff, computed, skipped = direct
+            _record_direct_jk_stats(direct_jk_data, "veff-cpp", computed, skipped)
+            if transform is not None:
+                veff = np.einsum('pa,pq,qb->ab', transform, veff, transform, optimize=True)
+            return veff
+
+    from pyqed.qchem.basis import _basis_cy
+
+    if _basis_cy is None or not hasattr(_basis_cy, "direct_jk"):
+        raise RuntimeError("direct Veff requires the compiled _integrals_cpp or _basis_cy kernel.")
+    vj, vk = _basis_cy.direct_jk(
+        direct_jk_data["shells"],
+        direct_jk_data["origins"],
+        direct_jk_data["exps"],
+        direct_jk_data["weights"],
+        direct_jk_data["nprim"],
+        direct_jk_data["pair_bounds"],
+        np.ascontiguousarray(dm_work, dtype=np.float64),
+        float(direct_jk_data.get("screen_tol", 0.0)),
+    )
+    _record_direct_jk_stats(direct_jk_data, "veff-cython-jk-fallback", -1, -1)
+    veff = vj - 0.5 * vk
+    if transform is not None:
+        veff = np.einsum('pa,pq,qb->ab', transform, veff, transform, optimize=True)
+    return veff
+
+
 def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
              eri_factors=None):
     '''Unrestricted Hartree-Fock potential matrix for the given density matrix
@@ -1786,6 +1952,38 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
     >>> np.allclose(vhf1, vhf2)
     True
     '''
+    if eri_factors is None:
+        eri_factors = getattr(mol, 'eri_factors', None)
+
+    if eri_factors is not None:
+        from pyqed.qchem.basis import contract_veff_ri
+
+        if dm_last is None:
+            return contract_veff_ri(eri_factors, np.asarray(dm), mol.nao)
+        ddm = np.asarray(dm) - np.asarray(dm_last)
+        return contract_veff_ri(eri_factors, ddm, mol.nao) + np.asarray(vhf_last)
+
+    if getattr(mol, 'eri_s8', None) is not None:
+        from pyqed.qchem.basis import _builtin_worker_count, contract_veff_s8
+
+        workers = _builtin_worker_count(mol, mol.nao)
+        if dm_last is None:
+            veff = contract_veff_s8(mol.eri_s8, np.asarray(dm), mol.nao, workers=workers)
+            if veff is not None:
+                return veff
+        else:
+            ddm = np.asarray(dm) - np.asarray(dm_last)
+            veff = contract_veff_s8(mol.eri_s8, ddm, mol.nao, workers=workers)
+            if veff is not None:
+                return veff + np.asarray(vhf_last)
+
+    direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
+    if direct_jk_data is not None:
+        if dm_last is None:
+            return _direct_veff_from_builtin_data(mol, np.asarray(dm), direct_jk_data)
+        ddm = np.asarray(dm) - np.asarray(dm_last)
+        return _direct_veff_from_builtin_data(mol, ddm, direct_jk_data) + np.asarray(vhf_last)
+
     if dm_last is None:
         vj, vk = get_jk(mol, np.asarray(dm), eri_factors=eri_factors)
         return vj - vk * .5
@@ -1798,12 +1996,35 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
 def get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=None):
     """RHF potential for an idempotent MO density using RI factors when possible."""
     if eri_factors is None:
-        dm = make_rdm1(mo_coeff, mo_occ)
-        return get_veff(mol, dm)
-    from pyqed.qchem.basis import contract_jk_ri_mo
+        eri_factors = getattr(mol, 'eri_factors', None)
 
-    vj, vk = contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, mol.nao)
-    return vj - 0.5 * vk
+    if eri_factors is not None:
+        from pyqed.qchem.basis import _builtin_worker_count, contract_veff_ri_mo
+
+        return contract_veff_ri_mo(
+            eri_factors,
+            mo_coeff,
+            mo_occ,
+            mol.nao,
+            workers=_builtin_worker_count(mol, mol.nao),
+        )
+
+    eri_s8 = getattr(mol, 'eri_s8', None)
+    if eri_s8 is not None:
+        from pyqed.qchem.basis import _builtin_worker_count, contract_veff_s8_mo
+
+        veff = contract_veff_s8_mo(
+            eri_s8,
+            mo_coeff,
+            mo_occ,
+            mol.nao,
+            workers=_builtin_worker_count(mol, mol.nao),
+        )
+        if veff is not None:
+            return veff
+
+    dm = make_rdm1(mo_coeff, mo_occ)
+    return get_veff(mol, dm)
 
 
 # def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None):
@@ -2079,6 +2300,9 @@ def get_jk(mol, dm, eri_factors=None):
         DESCRIPTION.
 
     """
+    if eri_factors is None:
+        eri_factors = getattr(mol, 'eri_factors', None)
+
     if eri_factors is not None:
         from pyqed.qchem.basis import contract_jk_ri
         return contract_jk_ri(eri_factors, dm, mol.nao)
@@ -2090,33 +2314,62 @@ def get_jk(mol, dm, eri_factors=None):
 
     eri_s8 = getattr(mol, 'eri_s8', None)
     if eri_s8 is not None:
-        from pyqed.qchem.basis import contract_jk_s8
-        return contract_jk_s8(eri_s8, dm, mol.nao)
+        from pyqed.qchem.basis import _builtin_worker_count, contract_jk_s8
+        return contract_jk_s8(eri_s8, dm, mol.nao, workers=_builtin_worker_count(mol, mol.nao))
 
     direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
     if direct_jk_data is not None:
-        from pyqed.qchem.basis import _basis_cy
-
         transform = getattr(mol, '_ao_cart2sph', None)
-        if transform is None and direct_jk_data.get("cache_aosym") == "s8" and hasattr(_basis_cy, "compute_eri_s8"):
-            from pyqed.qchem.basis import contract_jk_s8
+        if transform is None and direct_jk_data.get("cache_aosym") == "s8":
+            from pyqed.qchem.basis import _basis_cy
 
-            eri_s8, _computed, _skipped = _basis_cy.compute_eri_s8(
+            from pyqed.qchem.basis import _builtin_worker_count, contract_jk_s8
+
+            if _basis_cy is not None and hasattr(_basis_cy, "compute_eri_s8"):
+                eri_s8, _computed, _skipped = _basis_cy.compute_eri_s8(
+                    direct_jk_data["shells"],
+                    direct_jk_data["origins"],
+                    direct_jk_data["exps"],
+                    direct_jk_data["weights"],
+                    direct_jk_data["nprim"],
+                    direct_jk_data["pair_bounds"],
+                    float(direct_jk_data.get("screen_tol", 0.0)),
+                )
+                mol.eri_s8 = eri_s8
+                mol._builtin_direct_jk_data = None
+                return contract_jk_s8(eri_s8, dm, mol.nao, workers=_builtin_worker_count(mol, mol.nao))
+
+        dm_work = dm
+        if transform is not None:
+            dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
+
+        kernel = str(direct_jk_data.get("kernel", "")).lower()
+        if kernel.startswith("cpp"):
+            from pyqed.qchem.basis import _builtin_worker_count, direct_jk_cartesian_cpp
+
+            direct = direct_jk_cartesian_cpp(
                 direct_jk_data["shells"],
                 direct_jk_data["origins"],
                 direct_jk_data["exps"],
                 direct_jk_data["weights"],
                 direct_jk_data["nprim"],
                 direct_jk_data["pair_bounds"],
+                np.ascontiguousarray(dm_work, dtype=np.float64),
                 float(direct_jk_data.get("screen_tol", 0.0)),
+                workers=_builtin_worker_count(mol, mol.nao),
             )
-            mol.eri_s8 = eri_s8
-            mol._builtin_direct_jk_data = None
-            return contract_jk_s8(eri_s8, dm, mol.nao)
+            if direct is not None:
+                vj, vk, _computed, _skipped = direct
+                _record_direct_jk_stats(direct_jk_data, "jk-cpp", _computed, _skipped)
+                if transform is not None:
+                    vj = np.einsum('pa,pq,qb->ab', transform, vj, transform, optimize=True)
+                    vk = np.einsum('pa,pq,qb->ab', transform, vk, transform, optimize=True)
+                return vj, vk
 
-        dm_work = dm
-        if transform is not None:
-            dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
+        from pyqed.qchem.basis import _basis_cy
+
+        if _basis_cy is None or not hasattr(_basis_cy, "direct_jk"):
+            raise RuntimeError("direct JK requires the compiled _integrals_cpp or _basis_cy kernel.")
         vj, vk = _basis_cy.direct_jk(
             direct_jk_data["shells"],
             direct_jk_data["origins"],
@@ -2127,6 +2380,7 @@ def get_jk(mol, dm, eri_factors=None):
             np.ascontiguousarray(dm_work, dtype=np.float64),
             float(direct_jk_data.get("screen_tol", 0.0)),
         )
+        _record_direct_jk_stats(direct_jk_data, "jk-cython", -1, -1)
         if transform is not None:
             vj = np.einsum('pa,pq,qb->ab', transform, vj, transform, optimize=True)
             vk = np.einsum('pa,pq,qb->ab', transform, vk, transform, optimize=True)
@@ -3263,6 +3517,11 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
         with_solvent.v = v_sol
         return float(np.real(e_sol)), np.asarray(v_sol)
 
+    use_incremental_direct_jk = (
+        eri_factors is None
+        and getattr(mol, '_builtin_direct_jk_data', None) is not None
+        and getattr(mol, 'eri_s8', None) is None
+    )
     vhf = get_veff(mol, dm, eri_factors=eri_factors)
     solvent_energy, v_solvent = solvent_kernel(dm)
     electronic_energy = energy_elec(dm, hcore, vhf)
@@ -3313,11 +3572,16 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
         #     for v in range(len(phi)):
         #         P[mu,v] = 2. * C[mu,0] * C[v,0]
         dm_pure = make_rdm1(mo_coeff, mo_occ)
-        vhf_pure = (
-            get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
-            if eri_factors is not None
-            else get_veff(mol, dm_pure)
-        )
+        if use_incremental_direct_jk:
+            vhf_pure = get_veff(
+                mol,
+                dm_pure,
+                dm_last=dm,
+                vhf_last=vhf,
+                eri_factors=eri_factors,
+            )
+        else:
+            vhf_pure = get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
         dm_new = dm_pure
         vhf_new = vhf_pure
         if damping_mode == "density" and active_damping > 0.0:
@@ -3379,11 +3643,16 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
     canonical_dm = make_rdm1(mo_coeff, mo_occ)
     extra_cycle_density_change = float(np.linalg.norm(canonical_dm - scf_density))
     extra_cycle_energy_change = float(final_total_energy - scf_total_energy)
-    extra_vhf = (
-        get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
-        if eri_factors is not None
-        else get_veff(mol, canonical_dm)
-    )
+    if use_incremental_direct_jk:
+        extra_vhf = get_veff(
+            mol,
+            canonical_dm,
+            dm_last=scf_density,
+            vhf_last=scf_vhf,
+            eri_factors=eri_factors,
+        )
+    else:
+        extra_vhf = get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
     extra_solvent_energy, extra_v_solvent = solvent_kernel(canonical_dm)
     extra_electronic_energy = energy_elec(canonical_dm, hcore, extra_vhf)
     extra_total_energy = extra_electronic_energy + extra_solvent_energy + nuclear_energy

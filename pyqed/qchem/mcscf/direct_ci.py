@@ -9,7 +9,9 @@ complete active space configuration interaction
 """
 
 import logging
+import os
 from functools import reduce
+import importlib
 import numpy as np
 from scipy.linalg import eigh
 from scipy.sparse.linalg import eigsh, LinearOperator
@@ -50,7 +52,7 @@ from pyqed.qchem.mcscf.casci import (
     size_of_cas,
     spin_square as spin_square_from_rdm,
     transform_spatial_eri_to_mo,
-    transform_eri_factors_to_mo_pair,
+    mo_pair_factors,
     _get_mf_cholesky_factors,
     _resolve_use_cholesky_integrals,
 )
@@ -58,10 +60,30 @@ from pyqed.qchem import mcscf
 
 from numba import njit, prange
 
+_CASSCF_CPP_UNINITIALIZED = object()
+_casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+
+
+def _cpp_attr(*names):
+    global _casscf_cpp
+    if _casscf_cpp is _CASSCF_CPP_UNINITIALIZED:
+        try:
+            _casscf_cpp = importlib.import_module("pyqed.qchem._casscf_cpp")
+        except Exception:  # pragma: no cover - optional accelerator
+            _casscf_cpp = None
+    if _casscf_cpp is None:
+        return None
+    for name in names:
+        attr = getattr(_casscf_cpp, name, None)
+        if attr is not None:
+            return attr
+    return None
+
 
 DIRECT_CI_DENSE_FALLBACK_NDETS = 256
 DIRECT_CI_AUTO_EIGSH_NDETS = 10000
 DIRECT_CI_ROOT_CUSHION = 2
+DIRECT_CI_PARALLEL_MIN_NDETS = 4096
 
 
 @dataclass
@@ -142,6 +164,16 @@ class SpinStringConnectivity:
     r_BB: np.ndarray
     s_BB: np.ndarray
     phase_BB: np.ndarray
+    alpha_offsets: np.ndarray | None = None
+    beta_offsets: np.ndarray | None = None
+    alpha_order: np.ndarray | None = None
+    beta_order: np.ndarray | None = None
+    alpha_ordered_I: np.ndarray | None = None
+    alpha_ordered_J: np.ndarray | None = None
+    alpha_ordered_phase: np.ndarray | None = None
+    beta_ordered_I: np.ndarray | None = None
+    beta_ordered_J: np.ndarray | None = None
+    beta_ordered_phase: np.ndarray | None = None
 
 
 def _orthonormalize_columns(V, tol=1e-12):
@@ -162,7 +194,7 @@ def _orthonormalize_columns(V, tol=1e-12):
     return Q[:, keep]
 
 
-def _build_davidson_guess(diag, nroots, guess=None):
+def _build_davidson_guess(diag, nroots, guess=None, min_vectors=None):
     """
     Build an initial Davidson subspace from the diagonal and optional user seeds.
 
@@ -172,6 +204,10 @@ def _build_davidson_guess(diag, nroots, guess=None):
     missing columns from the diagonal guess.
     """
     n = diag.size
+    target_cols = max(nroots, 2 * nroots)
+    if min_vectors is not None:
+        target_cols = max(target_cols, int(min_vectors))
+    target_cols = min(n, target_cols)
     cols = []
 
     if guess is not None:
@@ -183,14 +219,14 @@ def _build_davidson_guess(diag, nroots, guess=None):
                 guess_cols = [arr.reshape(n)]
             else:
                 guess_cols = [arr[:, i].reshape(n) for i in range(arr.shape[1])]
-        cols.extend(guess_cols[:nroots])
+        cols.extend(guess_cols[:target_cols])
 
     order = np.argsort(diag)
     for idx in order:
         e = np.zeros(n, dtype=float)
         e[idx] = 1.0
         cols.append(e)
-        if len(cols) >= max(nroots, 2 * nroots):
+        if len(cols) >= target_cols:
             break
 
     return _orthonormalize_columns(np.column_stack(cols))
@@ -216,8 +252,155 @@ def _select_direct_ci_guess(casci, nstates, ci0=None):
     return None
 
 
+def _resolve_direct_ci_workers(casci, n_det):
+    value = getattr(casci, "direct_ci_workers", None)
+    explicit = value is not None
+    if value is None:
+        value = os.environ.get("PYQED_DIRECT_CI_WORKERS")
+        explicit = value is not None
+    if value is None:
+        value = os.environ.get("PYQED_CI_THREADS")
+        explicit = value is not None
+
+    if value is None:
+        mol = getattr(getattr(casci, "mf", None), "mol", None)
+        parallel_min = int(getattr(casci, "direct_ci_parallel_min_ndet", DIRECT_CI_PARALLEL_MIN_NDETS))
+        if mol is not None and bool(getattr(mol, "builtin_parallel", False)) and n_det >= parallel_min:
+            value = getattr(mol, "builtin_eri_workers", None)
+            if value is None:
+                value = min(os.cpu_count() or 1, 4)
+
+    if value is None or value is False:
+        return 1
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "false", "off", "none"}:
+            return 1
+        if text == "auto":
+            return max(1, min(os.cpu_count() or 1, 4))
+        value = text
+    try:
+        workers = max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+    if not explicit and n_det >= 250_000:
+        workers = max(workers, min(os.cpu_count() or workers, 8))
+    return workers
+
+
+def _spin0_pair_arrays(pairs):
+    pair_array = np.asarray(pairs, dtype=np.intp)
+    left = pair_array[:, 0]
+    right = pair_array[:, 1]
+    same = left == right
+    return left, right, same
+
+
+def _rectangular_spin0_pairs(binary):
+    dets = np.asarray(binary, dtype=np.int8)
+    if dets.ndim != 3 or dets.shape[1] != 2:
+        raise ValueError("binary must have shape (ndet, 2, ncas).")
+
+    n_det = dets.shape[0]
+    n_beta = 0
+    while n_beta < n_det and np.array_equal(dets[n_beta, 0, :], dets[0, 0, :]):
+        n_beta += 1
+    if n_beta == 0 or n_det % n_beta != 0:
+        return None
+
+    n_alpha = n_det // n_beta
+    if n_alpha != n_beta:
+        return None
+
+    alpha_occ = dets[::n_beta, 0, :]
+    beta_occ = dets[:n_beta, 1, :]
+    if not np.array_equal(alpha_occ, beta_occ):
+        return None
+    if not (
+        np.array_equal(dets[:, 0, :], np.repeat(alpha_occ, n_beta, axis=0))
+        and np.array_equal(dets[:, 1, :], np.tile(beta_occ, (n_alpha, 1)))
+    ):
+        return None
+
+    alpha_idx, beta_idx = np.triu_indices(n_alpha)
+    pairs = np.empty((alpha_idx.size, 2), dtype=np.intp)
+    pairs[:, 0] = alpha_idx * n_beta + beta_idx
+    pairs[:, 1] = beta_idx * n_beta + alpha_idx
+    return pairs
+
+
+def _spin0_to_det_vector(c_spin0, left, right, same, ndet):
+    c_spin0 = np.asarray(c_spin0)
+    det_vec = np.zeros(ndet, dtype=c_spin0.dtype)
+    if np.any(same):
+        det_vec[left[same]] = c_spin0[same]
+    offdiag = ~same
+    if np.any(offdiag):
+        scaled = c_spin0[offdiag] * (2.0 ** -0.5)
+        det_vec[left[offdiag]] = scaled
+        det_vec[right[offdiag]] = scaled
+    return det_vec
+
+
+def _det_to_spin0_vector(det_vec, left, right, same):
+    det_vec = np.asarray(det_vec)
+    c_spin0 = np.empty(left.size, dtype=det_vec.dtype)
+    if np.any(same):
+        c_spin0[same] = det_vec[left[same]]
+    offdiag = ~same
+    if np.any(offdiag):
+        c_spin0[offdiag] = (det_vec[left[offdiag]] + det_vec[right[offdiag]]) * (2.0 ** -0.5)
+    return c_spin0
+
+
+def _spin0_pair_diagonal(det_diag, left, right, same):
+    det_diag = np.asarray(det_diag)
+    spin0_diag = np.empty(left.size, dtype=det_diag.dtype)
+    if np.any(same):
+        spin0_diag[same] = det_diag[left[same]]
+    offdiag = ~same
+    if np.any(offdiag):
+        spin0_diag[offdiag] = 0.5 * (det_diag[left[offdiag]] + det_diag[right[offdiag]])
+    return spin0_diag
+
+
+def _project_spin0_guess(guess, left, right, same, ndet):
+    if guess is None:
+        return None
+
+    nspin0 = left.size
+    cols = []
+    if isinstance(guess, (list, tuple)):
+        raw_cols = [np.asarray(v, dtype=float).reshape(-1) for v in guess]
+    else:
+        arr = np.asarray(guess, dtype=float)
+        if arr.ndim == 1:
+            raw_cols = [arr.reshape(-1)]
+        else:
+            raw_cols = [arr[:, i].reshape(-1) for i in range(arr.shape[1])]
+
+    for vec in raw_cols:
+        if vec.size == nspin0:
+            cols.append(vec)
+        elif vec.size == ndet:
+            cols.append(_det_to_spin0_vector(vec, left, right, same))
+        else:
+            raise ValueError(
+                "Spin0 initial guess has length {}, expected {} or {}.".format(
+                    vec.size,
+                    nspin0,
+                    ndet,
+                )
+            )
+
+    if not cols:
+        return None
+    return np.column_stack(cols)
+
+
 def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
-                    max_subspace=None, guess=None):
+                    max_subspace=None, guess=None, matvec_block=None,
+                    trial_block_size=None):
     """
     Solve for the lowest ``nroots`` eigenpairs of a symmetric CI Hamiltonian.
 
@@ -240,33 +423,56 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
         # implementation. Medium-size CASCI problems often need more than a
         # handful of vectors before the diagonal preconditioner becomes useful.
         max_subspace = min(n, max(32, 20 * nroots))
+    if trial_block_size is None or matvec_block is None:
+        trial_block_size = nroots
+    trial_block_size = max(nroots, int(trial_block_size))
+    trial_block_size = min(n, max_subspace, trial_block_size)
 
-    V = _build_davidson_guess(diag, nroots, guess=guess)
-    AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+    def apply_block(block):
+        block = np.asarray(block)
+        if block.ndim == 1:
+            return matvec(block)
+        if block.shape[1] == 0:
+            return np.empty_like(block)
+        if matvec_block is not None:
+            result = np.asarray(matvec_block(block))
+            if result.shape != block.shape:
+                raise ValueError("Davidson block matvec returned an array with the wrong shape.")
+            return result
+        return np.column_stack([matvec(block[:, i]) for i in range(block.shape[1])])
+
+    V = _build_davidson_guess(diag, nroots, guess=guess, min_vectors=trial_block_size)
+    AV = apply_block(V)
 
     for _ in range(max_cycle):
         T = V.T @ AV
         theta_all, alpha_all = eigh(T)
-        order = np.argsort(theta_all)[:nroots]
-        theta = theta_all[order]
-        alpha = alpha_all[:, order]
+        order = np.argsort(theta_all)
+        expand_count = min(trial_block_size, alpha_all.shape[1])
+        expand_order = order[:expand_count]
+        theta_expand = theta_all[expand_order]
+        alpha_expand = alpha_all[:, expand_order]
 
-        ritz = V @ alpha
-        Aritz = AV @ alpha
-        resid = Aritz - ritz * theta
-        resid_norm = np.linalg.norm(resid, axis=0)
+        ritz_expand = V @ alpha_expand
+        Aritz_expand = AV @ alpha_expand
+        resid_expand = Aritz_expand - ritz_expand * theta_expand
+        resid_norm_expand = np.linalg.norm(resid_expand, axis=0)
+
+        theta = theta_expand[:nroots]
+        ritz = ritz_expand[:, :nroots]
+        resid_norm = resid_norm_expand[:nroots]
 
         if np.all(resid_norm < tol):
             return theta, ritz
 
         new_vecs = []
-        for root in range(nroots):
-            if resid_norm[root] < tol:
+        for root in range(expand_count):
+            if resid_norm_expand[root] < tol:
                 continue
 
-            denom = theta[root] - diag
+            denom = theta_expand[root] - diag
             safe = np.where(np.abs(denom) > 1e-12, denom, np.where(denom >= 0, 1e-12, -1e-12))
-            corr = resid[:, root] / safe
+            corr = resid_expand[:, root] / safe
 
             if V.shape[1] > 0:
                 corr -= V @ (V.T @ corr)
@@ -284,18 +490,38 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
             # Use a thick restart rather than collapsing all the way back to
             # the target roots. This preserves nearby Ritz information that is
             # often essential for correlated CI Hamiltonians.
-            extra_block = np.column_stack(new_vecs) if new_vecs else None
-            restart_cols = []
-            keep = min(alpha_all.shape[1], max(2 * nroots + 2, nroots + 1))
-            for i in range(keep):
-                restart_cols.append(V @ alpha_all[:, i])
+            keep = min(alpha_all.shape[1], max(2 * nroots + 2, trial_block_size, nroots + 1))
+            restart_block = V @ alpha_all[:, :keep]
+            restart_av = AV @ alpha_all[:, :keep]
+            restart_cols = [restart_block[:, i] for i in range(restart_block.shape[1])]
+            restart_av_cols = [restart_av[:, i] for i in range(restart_av.shape[1])]
+            extra_block = (
+                new_vecs[0].reshape(-1, 1)
+                if len(new_vecs) == 1
+                else np.column_stack(new_vecs)
+                if new_vecs
+                else None
+            )
             if extra_block is not None:
                 restart_cols.extend(extra_block[:, i] for i in range(extra_block.shape[1]))
-            V = _orthonormalize_columns(np.column_stack(restart_cols))
-            AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+                extra_av = apply_block(extra_block)
+                restart_av_cols.extend(extra_av[:, i] for i in range(extra_av.shape[1]))
+            restart_basis = np.column_stack(restart_cols)
+            restart_sigma = np.column_stack(restart_av_cols)
+            gram = restart_basis.T @ restart_basis
+            if np.allclose(gram, np.eye(gram.shape[0]), atol=1e-8, rtol=1e-8):
+                V = restart_basis
+                AV = restart_sigma
+            else:
+                V = _orthonormalize_columns(restart_basis)
+                AV = apply_block(V)
         else:
-            new_block = np.column_stack(new_vecs)
-            AV_new = np.column_stack([matvec(new_block[:, i]) for i in range(new_block.shape[1])])
+            new_block = (
+                new_vecs[0].reshape(-1, 1)
+                if len(new_vecs) == 1
+                else np.column_stack(new_vecs)
+            )
+            AV_new = apply_block(new_block)
             V = np.column_stack((V, new_block))
             AV = np.column_stack((AV, AV_new))
 
@@ -370,6 +596,24 @@ def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore, use_chol
         )
         return h1, (eri_aa, eri_ab, eri_ba, eri_bb), energy_core
 
+    if (
+        not use_cholesky
+        and type(mf).__name__ == "_FrozenIntegralRHF"
+        and getattr(mf, "eri", None) is not None
+    ):
+        mo_arr = np.asarray(mo_coeff)
+        if mo_arr.ndim == 2 and mo_arr.shape[0] == mo_arr.shape[1]:
+            eye = np.eye(mo_arr.shape[0], dtype=mo_arr.dtype)
+            if np.array_equal(mo_arr, eye):
+                active = slice(ncore, ncore + ncas)
+                eri_mo = np.asarray(mf.eri)
+                if eri_mo.ndim == 4 and eri_mo.shape[0] >= ncore + ncas:
+                    eri_active = np.array(
+                        eri_mo[active, active, active, active],
+                        copy=True,
+                    )
+                    return h1, eri_active, energy_core
+
     mo_cas = mo_coeff[:, ncore:ncore+ncas]
     eri_spatial = transform_spatial_eri_to_mo(
         mf,
@@ -388,6 +632,7 @@ def transform_active_space_pair_factors(mf, mo_coeff, ncas, ncore, eri_factors=N
     Build active-space MO-pair Cholesky factors for the direct-CI solver.
     """
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
+    use_mf_factor_transform = eri_factors is None and hasattr(mf, "mo_factors")
     if eri_factors is None:
         eri_factors = _get_mf_cholesky_factors(mf)
 
@@ -395,13 +640,16 @@ def transform_active_space_pair_factors(mf, mo_coeff, ncas, ncore, eri_factors=N
         mo_cas_a = mo_coeff[0][:, ncore:ncore+ncas]
         mo_cas_b = mo_coeff[1][:, ncore:ncore+ncas]
         pair_factors = (
-            transform_eri_factors_to_mo_pair(eri_factors, mo_cas_a, mo_cas_a),
-            transform_eri_factors_to_mo_pair(eri_factors, mo_cas_b, mo_cas_b),
+            mo_pair_factors(eri_factors, mo_cas_a, mo_cas_a),
+            mo_pair_factors(eri_factors, mo_cas_b, mo_cas_b),
         )
         return h1, pair_factors, energy_core
 
     mo_cas = mo_coeff[:, ncore:ncore+ncas]
-    pair_factors = transform_eri_factors_to_mo_pair(eri_factors, mo_cas, mo_cas)
+    if use_mf_factor_transform:
+        pair_factors = mf.mo_factors(mo_cas, mo_cas)
+    else:
+        pair_factors = mo_pair_factors(eri_factors, mo_cas, mo_cas)
     return h1, pair_factors, energy_core
 
 
@@ -427,6 +675,15 @@ def _string_orbital_phases(strings):
 
 
 def _single_string_links(strings):
+    single_string_links = _cpp_attr("single_string_links")
+    if single_string_links is not None:
+        try:
+            return single_string_links(
+                np.ascontiguousarray(strings, dtype=np.int8)
+            )
+        except Exception:
+            pass
+
     n_string, n_mo = strings.shape
     bits = [_binary_row_to_bits(strings[i]) for i in range(n_string)]
     lookup = {bits[i]: i for i in range(n_string)}
@@ -460,6 +717,15 @@ def _single_string_links(strings):
 
 
 def _double_string_links(strings):
+    double_string_links = _cpp_attr("double_string_links")
+    if double_string_links is not None:
+        try:
+            return double_string_links(
+                np.ascontiguousarray(strings, dtype=np.int8)
+            )
+        except Exception:
+            pass
+
     n_string, n_mo = strings.shape
     bits = [_binary_row_to_bits(strings[i]) for i in range(n_string)]
     lookup = {bits[i]: i for i in range(n_string)}
@@ -505,6 +771,44 @@ def _double_string_links(strings):
     )
 
 
+def _group_string_links_by_transition(p_idx, q_idx, n_mo):
+    p_idx = np.asarray(p_idx, dtype=np.intp)
+    q_idx = np.asarray(q_idx, dtype=np.intp)
+    transitions = p_idx * int(n_mo) + q_idx
+    n_transition = int(n_mo) * int(n_mo)
+    counts = np.bincount(transitions, minlength=n_transition).astype(np.intp, copy=False)
+    offsets = np.empty(n_transition + 1, dtype=np.intp)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    order = np.empty(transitions.size, dtype=np.intp)
+    cursor = offsets[:-1].copy()
+    for link, transition in enumerate(transitions):
+        slot = cursor[transition]
+        order[slot] = link
+        cursor[transition] = slot + 1
+    return np.ascontiguousarray(offsets), np.ascontiguousarray(order)
+
+
+def _ordered_string_link_records(I, J, phase, order):
+    order = np.asarray(order, dtype=np.intp)
+    return (
+        np.ascontiguousarray(np.asarray(I, dtype=np.int32)[order]),
+        np.ascontiguousarray(np.asarray(J, dtype=np.int32)[order]),
+        np.ascontiguousarray(np.asarray(phase, dtype=np.int8)[order]),
+    )
+
+
+def _spin_string_cross_diagonal(eri_cross, occupations):
+    eri_cross = np.asarray(eri_cross, dtype=np.float64)
+    occupations = np.asarray(occupations, dtype=np.float64)
+    diag_terms = np.diagonal(eri_cross, axis1=2, axis2=3)
+    contracted = np.einsum('pqr,ar->pqa', diag_terms, occupations, optimize=True)
+    return np.ascontiguousarray(
+        contracted.reshape(eri_cross.shape[0] * eri_cross.shape[1], occupations.shape[0]),
+        dtype=np.float64,
+    )
+
+
 def build_spin_string_connectivity(Binary):
     """
     Build alpha/beta spin-string links without expanding to determinant pairs.
@@ -528,15 +832,40 @@ def build_spin_string_connectivity(Binary):
         raise ValueError("Spin-string direct-CI expects alpha-major determinant ordering.")
 
     I_A, J_A, p_A, q_A, phase_A = _single_string_links(alpha_occ)
-    I_B, J_B, p_B, q_B, phase_B = _single_string_links(beta_occ)
     I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA = _double_string_links(alpha_occ)
-    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB = _double_string_links(beta_occ)
+    if np.array_equal(alpha_occ, beta_occ):
+        I_B, J_B, p_B, q_B, phase_B = I_A, J_A, p_A, q_A, phase_A
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB = (
+            I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA
+        )
+    else:
+        I_B, J_B, p_B, q_B, phase_B = _single_string_links(beta_occ)
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB = _double_string_links(beta_occ)
+    alpha_offsets, alpha_order = _group_string_links_by_transition(p_A, q_A, alpha_occ.shape[1])
+    if p_B is p_A and q_B is q_A:
+        beta_offsets, beta_order = alpha_offsets, alpha_order
+    else:
+        beta_offsets, beta_order = _group_string_links_by_transition(p_B, q_B, beta_occ.shape[1])
+    alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase = _ordered_string_link_records(
+        I_A, J_A, phase_A, alpha_order,
+    )
+    if beta_order is alpha_order and I_B is I_A and J_B is J_A and phase_B is phase_A:
+        beta_ordered_I, beta_ordered_J, beta_ordered_phase = (
+            alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase
+        )
+    else:
+        beta_ordered_I, beta_ordered_J, beta_ordered_phase = _ordered_string_link_records(
+            I_B, J_B, phase_B, beta_order,
+        )
     return SpinStringConnectivity(
         alpha_occ, beta_occ,
         I_A, J_A, p_A, q_A, phase_A,
         I_B, J_B, p_B, q_B, phase_B,
         I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
         I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+        alpha_offsets, beta_offsets, alpha_order, beta_order,
+        alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase,
+        beta_ordered_I, beta_ordered_J, beta_ordered_phase,
     )
 
 
@@ -590,7 +919,118 @@ def _extract_double_ab_data(I, J, Binary, sign):
     return p, q, r, s, phase
 
 
-def build_direct_connectivity(Binary):
+def _repeat_link_values(values, repeat):
+    if len(values) == 0 or repeat == 0:
+        return np.empty(0, dtype=values.dtype)
+    return np.repeat(values, repeat).astype(values.dtype, copy=False)
+
+
+def _tile_link_values(values, tile):
+    if len(values) == 0 or tile == 0:
+        return np.empty(0, dtype=values.dtype)
+    return np.tile(values, tile).astype(values.dtype, copy=False)
+
+
+def _expand_alpha_links_to_dets(I, J, p, q, phase, n_beta):
+    n_link = len(I)
+    if n_link == 0 or n_beta == 0:
+        return (
+            _empty_int_array(), _empty_int_array(),
+            _empty_int_array(), _empty_int_array(), _empty_phase_array(),
+        )
+    beta = np.arange(n_beta, dtype=np.int32)
+    I_det = (np.asarray(I, dtype=np.int32)[:, None] * np.int32(n_beta) + beta[None, :]).ravel()
+    J_det = (np.asarray(J, dtype=np.int32)[:, None] * np.int32(n_beta) + beta[None, :]).ravel()
+    return (
+        np.ascontiguousarray(I_det, dtype=np.int32),
+        np.ascontiguousarray(J_det, dtype=np.int32),
+        np.ascontiguousarray(_repeat_link_values(np.asarray(p, dtype=np.int32), n_beta), dtype=np.int32),
+        np.ascontiguousarray(_repeat_link_values(np.asarray(q, dtype=np.int32), n_beta), dtype=np.int32),
+        np.ascontiguousarray(_repeat_link_values(np.asarray(phase, dtype=np.int8), n_beta), dtype=np.int8),
+    )
+
+
+def _expand_beta_links_to_dets(I, J, p, q, phase, n_alpha, n_beta):
+    n_link = len(I)
+    if n_link == 0 or n_alpha == 0:
+        return (
+            _empty_int_array(), _empty_int_array(),
+            _empty_int_array(), _empty_int_array(), _empty_phase_array(),
+        )
+    alpha = np.arange(n_alpha, dtype=np.int32)
+    I_det = (alpha[:, None] * np.int32(n_beta) + np.asarray(I, dtype=np.int32)[None, :]).ravel()
+    J_det = (alpha[:, None] * np.int32(n_beta) + np.asarray(J, dtype=np.int32)[None, :]).ravel()
+    return (
+        np.ascontiguousarray(I_det, dtype=np.int32),
+        np.ascontiguousarray(J_det, dtype=np.int32),
+        np.ascontiguousarray(_tile_link_values(np.asarray(p, dtype=np.int32), n_alpha), dtype=np.int32),
+        np.ascontiguousarray(_tile_link_values(np.asarray(q, dtype=np.int32), n_alpha), dtype=np.int32),
+        np.ascontiguousarray(_tile_link_values(np.asarray(phase, dtype=np.int8), n_alpha), dtype=np.int8),
+    )
+
+
+def _build_direct_connectivity_from_spin_strings(Binary):
+    spin_conn = build_spin_string_connectivity(Binary)
+    n_alpha = spin_conn.alpha_occ.shape[0]
+    n_beta = spin_conn.beta_occ.shape[0]
+
+    I_A, J_A, p_A, q_A, phase_A = _expand_alpha_links_to_dets(
+        spin_conn.I_A, spin_conn.J_A, spin_conn.p_A, spin_conn.q_A, spin_conn.phase_A, n_beta
+    )
+    I_B, J_B, p_B, q_B, phase_B = _expand_beta_links_to_dets(
+        spin_conn.I_B, spin_conn.J_B, spin_conn.p_B, spin_conn.q_B, spin_conn.phase_B, n_alpha, n_beta
+    )
+    I_AA, J_AA, p_AA, q_AA, phase_AA_single = _expand_alpha_links_to_dets(
+        spin_conn.I_AA, spin_conn.J_AA, spin_conn.p_AA, spin_conn.q_AA, spin_conn.phase_AA, n_beta
+    )
+    r_AA = np.ascontiguousarray(_repeat_link_values(np.asarray(spin_conn.r_AA, dtype=np.int32), n_beta), dtype=np.int32)
+    s_AA = np.ascontiguousarray(_repeat_link_values(np.asarray(spin_conn.s_AA, dtype=np.int32), n_beta), dtype=np.int32)
+    phase_AA = phase_AA_single
+    I_BB, J_BB, p_BB, q_BB, phase_BB_single = _expand_beta_links_to_dets(
+        spin_conn.I_BB, spin_conn.J_BB, spin_conn.p_BB, spin_conn.q_BB, spin_conn.phase_BB, n_alpha, n_beta
+    )
+    r_BB = np.ascontiguousarray(_tile_link_values(np.asarray(spin_conn.r_BB, dtype=np.int32), n_alpha), dtype=np.int32)
+    s_BB = np.ascontiguousarray(_tile_link_values(np.asarray(spin_conn.s_BB, dtype=np.int32), n_alpha), dtype=np.int32)
+    phase_BB = phase_BB_single
+
+    n_a = len(spin_conn.I_A)
+    n_b = len(spin_conn.I_B)
+    if n_a == 0 or n_b == 0:
+        I_AB = J_AB = p_AB = q_AB = r_AB = s_AB = _empty_int_array()
+        phase_AB = _empty_phase_array()
+    else:
+        I_AB = np.ascontiguousarray(
+            (np.asarray(spin_conn.I_A, dtype=np.int32)[:, None] * np.int32(n_beta)
+             + np.asarray(spin_conn.I_B, dtype=np.int32)[None, :]).ravel(),
+            dtype=np.int32,
+        )
+        J_AB = np.ascontiguousarray(
+            (np.asarray(spin_conn.J_A, dtype=np.int32)[:, None] * np.int32(n_beta)
+             + np.asarray(spin_conn.J_B, dtype=np.int32)[None, :]).ravel(),
+            dtype=np.int32,
+        )
+        p_AB = np.ascontiguousarray(_repeat_link_values(np.asarray(spin_conn.p_A, dtype=np.int32), n_b), dtype=np.int32)
+        q_AB = np.ascontiguousarray(_repeat_link_values(np.asarray(spin_conn.q_A, dtype=np.int32), n_b), dtype=np.int32)
+        r_AB = np.ascontiguousarray(_tile_link_values(np.asarray(spin_conn.p_B, dtype=np.int32), n_a), dtype=np.int32)
+        s_AB = np.ascontiguousarray(_tile_link_values(np.asarray(spin_conn.q_B, dtype=np.int32), n_a), dtype=np.int32)
+        phase_AB = np.ascontiguousarray(
+            (
+                np.asarray(spin_conn.phase_A, dtype=np.int8)[:, None]
+                * np.asarray(spin_conn.phase_B, dtype=np.int8)[None, :]
+            ).ravel(),
+            dtype=np.int8,
+        )
+
+    return DirectConnectivity(
+        I_A, J_A, p_A, q_A, phase_A,
+        I_B, J_B, p_B, q_B, phase_B,
+        I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+        I_AB, J_AB, p_AB, q_AB, r_AB, s_AB, phase_AB,
+    )
+
+
+def _build_direct_connectivity_slow(Binary):
     """
     Enumerate only the determinant pairs that are connected by the Hamiltonian.
 
@@ -622,30 +1062,34 @@ def build_direct_connectivity(Binary):
         for q in occ_a:
             removed = a_bits ^ (1 << q)
             for p in vir_a:
-                I = lookup[(removed | (1 << p), b_bits)]
-                singles_a.append((I, J))
+                I = lookup.get((removed | (1 << p), b_bits))
+                if I is not None:
+                    singles_a.append((I, J))
 
         for q in occ_b:
             removed = b_bits ^ (1 << q)
             for p in vir_b:
-                I = lookup[(a_bits, removed | (1 << p))]
-                singles_b.append((I, J))
+                I = lookup.get((a_bits, removed | (1 << p)))
+                if I is not None:
+                    singles_b.append((I, J))
 
         for iq, q in enumerate(occ_a):
             for is_, s in enumerate(occ_a[iq + 1:], start=iq + 1):
                 removed = a_bits ^ (1 << q) ^ (1 << s)
                 for ip, p in enumerate(vir_a):
                     for ir, r in enumerate(vir_a[ip + 1:], start=ip + 1):
-                        I = lookup[(removed | (1 << p) | (1 << r), b_bits)]
-                        doubles_aa.append((I, J))
+                        I = lookup.get((removed | (1 << p) | (1 << r), b_bits))
+                        if I is not None:
+                            doubles_aa.append((I, J))
 
         for iq, q in enumerate(occ_b):
             for is_, s in enumerate(occ_b[iq + 1:], start=iq + 1):
                 removed = b_bits ^ (1 << q) ^ (1 << s)
                 for ip, p in enumerate(vir_b):
                     for ir, r in enumerate(vir_b[ip + 1:], start=ip + 1):
-                        I = lookup[(a_bits, removed | (1 << p) | (1 << r))]
-                        doubles_bb.append((I, J))
+                        I = lookup.get((a_bits, removed | (1 << p) | (1 << r)))
+                        if I is not None:
+                            doubles_bb.append((I, J))
 
         for q in occ_a:
             a_removed = a_bits ^ (1 << q)
@@ -653,8 +1097,9 @@ def build_direct_connectivity(Binary):
                 b_removed = b_bits ^ (1 << s)
                 for p in vir_a:
                     for r in vir_b:
-                        I = lookup[(a_removed | (1 << p), b_removed | (1 << r))]
-                        doubles_ab.append((I, J))
+                        I = lookup.get((a_removed | (1 << p), b_removed | (1 << r)))
+                        if I is not None:
+                            doubles_ab.append((I, J))
 
     sign = determinantsign(Binary)
 
@@ -682,6 +1127,14 @@ def build_direct_connectivity(Binary):
         I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
         I_AB, J_AB, p_AB, q_AB, r_AB, s_AB, phase_AB,
     )
+
+
+def build_direct_connectivity(Binary):
+    try:
+        return _build_direct_connectivity_from_spin_strings(Binary)
+    except ValueError:
+        return _build_direct_connectivity_slow(Binary)
+
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_diag(H1, H2, Binary):
@@ -1535,6 +1988,398 @@ def _sigma_compact_spin_string_numba(
     return sigma_vec
 
 
+def _sigma_compact_spin_string(
+    h1, eri_same, eri_cross, H_diag, c,
+    alpha_occ, beta_occ,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    alpha_offsets=None,
+    beta_offsets=None,
+    alpha_order=None,
+    beta_order=None,
+    alpha_cross_diag=None,
+    beta_cross_diag=None,
+    alpha_ordered_I=None,
+    alpha_ordered_J=None,
+    alpha_ordered_phase=None,
+    beta_ordered_I=None,
+    beta_ordered_J=None,
+    beta_ordered_phase=None,
+    workers=None,
+):
+    sigma_compact_spin_string = _cpp_attr("sigma_compact_spin_string")
+    if (
+        sigma_compact_spin_string is not None
+        and not (
+            np.iscomplexobj(h1)
+            or np.iscomplexobj(eri_same)
+            or np.iscomplexobj(eri_cross)
+            or np.iscomplexobj(H_diag)
+            or np.iscomplexobj(c)
+        )
+    ):
+        try:
+            args = (
+                np.ascontiguousarray(h1, dtype=np.float64),
+                np.ascontiguousarray(eri_same, dtype=np.float64),
+                np.ascontiguousarray(eri_cross, dtype=np.float64),
+                np.ascontiguousarray(H_diag, dtype=np.float64),
+                np.ascontiguousarray(c, dtype=np.float64),
+                np.ascontiguousarray(alpha_occ, dtype=np.int8),
+                np.ascontiguousarray(beta_occ, dtype=np.int8),
+                np.ascontiguousarray(I_A, dtype=np.int32),
+                np.ascontiguousarray(J_A, dtype=np.int32),
+                np.ascontiguousarray(p_A, dtype=np.int32),
+                np.ascontiguousarray(q_A, dtype=np.int32),
+                np.ascontiguousarray(phase_A, dtype=np.int8),
+                np.ascontiguousarray(I_B, dtype=np.int32),
+                np.ascontiguousarray(J_B, dtype=np.int32),
+                np.ascontiguousarray(p_B, dtype=np.int32),
+                np.ascontiguousarray(q_B, dtype=np.int32),
+                np.ascontiguousarray(phase_B, dtype=np.int8),
+                np.ascontiguousarray(I_AA, dtype=np.int32),
+                np.ascontiguousarray(J_AA, dtype=np.int32),
+                np.ascontiguousarray(p_AA, dtype=np.int32),
+                np.ascontiguousarray(q_AA, dtype=np.int32),
+                np.ascontiguousarray(r_AA, dtype=np.int32),
+                np.ascontiguousarray(s_AA, dtype=np.int32),
+                np.ascontiguousarray(phase_AA, dtype=np.int8),
+                np.ascontiguousarray(I_BB, dtype=np.int32),
+                np.ascontiguousarray(J_BB, dtype=np.int32),
+                np.ascontiguousarray(p_BB, dtype=np.int32),
+                np.ascontiguousarray(q_BB, dtype=np.int32),
+                np.ascontiguousarray(r_BB, dtype=np.int32),
+                np.ascontiguousarray(s_BB, dtype=np.int32),
+                np.ascontiguousarray(phase_BB, dtype=np.int8),
+            )
+            if (
+                alpha_offsets is not None
+                and beta_offsets is not None
+                and alpha_order is not None
+                and beta_order is not None
+                and alpha_cross_diag is not None
+                and beta_cross_diag is not None
+            ):
+                args = args + (
+                    np.ascontiguousarray(alpha_offsets, dtype=np.intp),
+                    np.ascontiguousarray(beta_offsets, dtype=np.intp),
+                    np.ascontiguousarray(alpha_order, dtype=np.intp),
+                    np.ascontiguousarray(beta_order, dtype=np.intp),
+                    np.ascontiguousarray(alpha_cross_diag, dtype=np.float64),
+                    np.ascontiguousarray(beta_cross_diag, dtype=np.float64),
+                )
+                if (
+                    alpha_ordered_I is not None
+                    and alpha_ordered_J is not None
+                    and alpha_ordered_phase is not None
+                    and beta_ordered_I is not None
+                    and beta_ordered_J is not None
+                    and beta_ordered_phase is not None
+                ):
+                    args = args + (
+                        np.ascontiguousarray(alpha_ordered_I, dtype=np.int32),
+                        np.ascontiguousarray(alpha_ordered_J, dtype=np.int32),
+                        np.ascontiguousarray(alpha_ordered_phase, dtype=np.int8),
+                        np.ascontiguousarray(beta_ordered_I, dtype=np.int32),
+                        np.ascontiguousarray(beta_ordered_J, dtype=np.int32),
+                        np.ascontiguousarray(beta_ordered_phase, dtype=np.int8),
+                    )
+                    if workers is not None:
+                        args = args + (int(workers),)
+            return sigma_compact_spin_string(*args)
+        except Exception:
+            pass
+
+    return _sigma_compact_spin_string_numba(
+        h1, eri_same, eri_cross, H_diag, c,
+        alpha_occ, beta_occ,
+        I_A, J_A, p_A, q_A, phase_A,
+        I_B, J_B, p_B, q_B, phase_B,
+        I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    )
+
+
+def _sigma_compact_spin0_pair(
+    h1, eri_same, eri_cross, H_diag, c_pair, pair_left, pair_right,
+    alpha_occ, beta_occ,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    alpha_offsets, beta_offsets, alpha_order, beta_order,
+    alpha_cross_diag, beta_cross_diag,
+    alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase,
+    beta_ordered_I, beta_ordered_J, beta_ordered_phase,
+    workers=None,
+):
+    sigma_compact_spin0_pair = _cpp_attr("sigma_compact_spin0_pair")
+    if (
+        sigma_compact_spin0_pair is not None
+        and not (
+            np.iscomplexobj(h1)
+            or np.iscomplexobj(eri_same)
+            or np.iscomplexobj(eri_cross)
+            or np.iscomplexobj(H_diag)
+            or np.iscomplexobj(c_pair)
+        )
+    ):
+        try:
+            args = (
+                np.ascontiguousarray(h1, dtype=np.float64),
+                np.ascontiguousarray(eri_same, dtype=np.float64),
+                np.ascontiguousarray(eri_cross, dtype=np.float64),
+                np.ascontiguousarray(H_diag, dtype=np.float64),
+                np.ascontiguousarray(c_pair, dtype=np.float64),
+                np.ascontiguousarray(pair_left, dtype=np.intp),
+                np.ascontiguousarray(pair_right, dtype=np.intp),
+                np.ascontiguousarray(alpha_occ, dtype=np.int8),
+                np.ascontiguousarray(beta_occ, dtype=np.int8),
+                np.ascontiguousarray(I_A, dtype=np.int32),
+                np.ascontiguousarray(J_A, dtype=np.int32),
+                np.ascontiguousarray(p_A, dtype=np.int32),
+                np.ascontiguousarray(q_A, dtype=np.int32),
+                np.ascontiguousarray(phase_A, dtype=np.int8),
+                np.ascontiguousarray(I_B, dtype=np.int32),
+                np.ascontiguousarray(J_B, dtype=np.int32),
+                np.ascontiguousarray(p_B, dtype=np.int32),
+                np.ascontiguousarray(q_B, dtype=np.int32),
+                np.ascontiguousarray(phase_B, dtype=np.int8),
+                np.ascontiguousarray(I_AA, dtype=np.int32),
+                np.ascontiguousarray(J_AA, dtype=np.int32),
+                np.ascontiguousarray(p_AA, dtype=np.int32),
+                np.ascontiguousarray(q_AA, dtype=np.int32),
+                np.ascontiguousarray(r_AA, dtype=np.int32),
+                np.ascontiguousarray(s_AA, dtype=np.int32),
+                np.ascontiguousarray(phase_AA, dtype=np.int8),
+                np.ascontiguousarray(I_BB, dtype=np.int32),
+                np.ascontiguousarray(J_BB, dtype=np.int32),
+                np.ascontiguousarray(p_BB, dtype=np.int32),
+                np.ascontiguousarray(q_BB, dtype=np.int32),
+                np.ascontiguousarray(r_BB, dtype=np.int32),
+                np.ascontiguousarray(s_BB, dtype=np.int32),
+                np.ascontiguousarray(phase_BB, dtype=np.int8),
+                np.ascontiguousarray(alpha_offsets, dtype=np.intp),
+                np.ascontiguousarray(beta_offsets, dtype=np.intp),
+                np.ascontiguousarray(alpha_order, dtype=np.intp),
+                np.ascontiguousarray(beta_order, dtype=np.intp),
+                np.ascontiguousarray(alpha_cross_diag, dtype=np.float64),
+                np.ascontiguousarray(beta_cross_diag, dtype=np.float64),
+                np.ascontiguousarray(alpha_ordered_I, dtype=np.int32),
+                np.ascontiguousarray(alpha_ordered_J, dtype=np.int32),
+                np.ascontiguousarray(alpha_ordered_phase, dtype=np.int8),
+                np.ascontiguousarray(beta_ordered_I, dtype=np.int32),
+                np.ascontiguousarray(beta_ordered_J, dtype=np.int32),
+                np.ascontiguousarray(beta_ordered_phase, dtype=np.int8),
+            )
+            if workers is not None:
+                args = args + (int(workers),)
+            return sigma_compact_spin0_pair(*args)
+        except Exception:
+            pass
+
+    ndet = int(np.asarray(H_diag).shape[0])
+    pair_left = np.asarray(pair_left, dtype=np.intp)
+    pair_right = np.asarray(pair_right, dtype=np.intp)
+    same = pair_left == pair_right
+    c_det = _spin0_to_det_vector(c_pair, pair_left, pair_right, same, ndet)
+    sigma_det = _sigma_compact_spin_string(
+        h1, eri_same, eri_cross, H_diag, c_det,
+        alpha_occ, beta_occ,
+        I_A, J_A, p_A, q_A, phase_A,
+        I_B, J_B, p_B, q_B, phase_B,
+        I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+        I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+        alpha_offsets, beta_offsets, alpha_order, beta_order,
+        alpha_cross_diag, beta_cross_diag,
+        alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase,
+        beta_ordered_I, beta_ordered_J, beta_ordered_phase,
+        workers,
+    )
+    return _det_to_spin0_vector(sigma_det, pair_left, pair_right, same)
+
+
+def _make_sigma_compact_spin0_pair_cpp_matvec(
+    h1, eri_same, eri_cross, H_diag, pair_left, pair_right,
+    alpha_occ, beta_occ,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    alpha_offsets, beta_offsets, alpha_order, beta_order,
+    alpha_cross_diag, beta_cross_diag,
+    alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase,
+    beta_ordered_I, beta_ordered_J, beta_ordered_phase,
+    workers=None,
+):
+    sigma_compact_spin0_pair = _cpp_attr("sigma_compact_spin0_pair")
+    if (
+        sigma_compact_spin0_pair is None
+        or np.iscomplexobj(h1)
+        or np.iscomplexobj(eri_same)
+        or np.iscomplexobj(eri_cross)
+        or np.iscomplexobj(H_diag)
+    ):
+        return None
+    try:
+        head = (
+            np.ascontiguousarray(h1, dtype=np.float64),
+            np.ascontiguousarray(eri_same, dtype=np.float64),
+            np.ascontiguousarray(eri_cross, dtype=np.float64),
+            np.ascontiguousarray(H_diag, dtype=np.float64),
+        )
+        tail = (
+            np.ascontiguousarray(pair_left, dtype=np.intp),
+            np.ascontiguousarray(pair_right, dtype=np.intp),
+            np.ascontiguousarray(alpha_occ, dtype=np.int8),
+            np.ascontiguousarray(beta_occ, dtype=np.int8),
+            np.ascontiguousarray(I_A, dtype=np.int32),
+            np.ascontiguousarray(J_A, dtype=np.int32),
+            np.ascontiguousarray(p_A, dtype=np.int32),
+            np.ascontiguousarray(q_A, dtype=np.int32),
+            np.ascontiguousarray(phase_A, dtype=np.int8),
+            np.ascontiguousarray(I_B, dtype=np.int32),
+            np.ascontiguousarray(J_B, dtype=np.int32),
+            np.ascontiguousarray(p_B, dtype=np.int32),
+            np.ascontiguousarray(q_B, dtype=np.int32),
+            np.ascontiguousarray(phase_B, dtype=np.int8),
+            np.ascontiguousarray(I_AA, dtype=np.int32),
+            np.ascontiguousarray(J_AA, dtype=np.int32),
+            np.ascontiguousarray(p_AA, dtype=np.int32),
+            np.ascontiguousarray(q_AA, dtype=np.int32),
+            np.ascontiguousarray(r_AA, dtype=np.int32),
+            np.ascontiguousarray(s_AA, dtype=np.int32),
+            np.ascontiguousarray(phase_AA, dtype=np.int8),
+            np.ascontiguousarray(I_BB, dtype=np.int32),
+            np.ascontiguousarray(J_BB, dtype=np.int32),
+            np.ascontiguousarray(p_BB, dtype=np.int32),
+            np.ascontiguousarray(q_BB, dtype=np.int32),
+            np.ascontiguousarray(r_BB, dtype=np.int32),
+            np.ascontiguousarray(s_BB, dtype=np.int32),
+            np.ascontiguousarray(phase_BB, dtype=np.int8),
+            np.ascontiguousarray(alpha_offsets, dtype=np.intp),
+            np.ascontiguousarray(beta_offsets, dtype=np.intp),
+            np.ascontiguousarray(alpha_order, dtype=np.intp),
+            np.ascontiguousarray(beta_order, dtype=np.intp),
+            np.ascontiguousarray(alpha_cross_diag, dtype=np.float64),
+            np.ascontiguousarray(beta_cross_diag, dtype=np.float64),
+            np.ascontiguousarray(alpha_ordered_I, dtype=np.int32),
+            np.ascontiguousarray(alpha_ordered_J, dtype=np.int32),
+            np.ascontiguousarray(alpha_ordered_phase, dtype=np.int8),
+            np.ascontiguousarray(beta_ordered_I, dtype=np.int32),
+            np.ascontiguousarray(beta_ordered_J, dtype=np.int32),
+            np.ascontiguousarray(beta_ordered_phase, dtype=np.int8),
+        )
+        worker_args = () if workers is None else (int(workers),)
+
+        def matvec(c_pair):
+            return sigma_compact_spin0_pair(
+                *head,
+                np.ascontiguousarray(c_pair, dtype=np.float64),
+                *tail,
+                *worker_args,
+            )
+
+        return matvec
+    except Exception:
+        return None
+
+
+def _davidson_spin0_pair_cpp(
+    h1, eri_same, eri_cross, H_diag, pair_left, pair_right,
+    alpha_occ, beta_occ,
+    I_A, J_A, p_A, q_A, phase_A,
+    I_B, J_B, p_B, q_B, phase_B,
+    I_AA, J_AA, p_AA, q_AA, r_AA, s_AA, phase_AA,
+    I_BB, J_BB, p_BB, q_BB, r_BB, s_BB, phase_BB,
+    alpha_offsets, beta_offsets, alpha_order, beta_order,
+    alpha_cross_diag, beta_cross_diag,
+    alpha_ordered_I, alpha_ordered_J, alpha_ordered_phase,
+    beta_ordered_I, beta_ordered_J, beta_ordered_phase,
+    *,
+    workers=None,
+    nroots=1,
+    tol=1e-8,
+    max_cycle=100,
+    max_subspace=None,
+):
+    davidson_spin0_pair = _cpp_attr("davidson_spin0_pair")
+    if (
+        davidson_spin0_pair is None
+        or int(nroots) != 1
+        or np.iscomplexobj(h1)
+        or np.iscomplexobj(eri_same)
+        or np.iscomplexobj(eri_cross)
+        or np.iscomplexobj(H_diag)
+    ):
+        return None
+    try:
+        n_pair = int(np.asarray(pair_left).shape[0])
+        if n_pair <= 0:
+            return None
+        if max_subspace is None:
+            max_subspace = min(n_pair, max(32, 20 * int(nroots)))
+        c_dummy = np.empty(n_pair, dtype=np.float64)
+        args = (
+            np.ascontiguousarray(h1, dtype=np.float64),
+            np.ascontiguousarray(eri_same, dtype=np.float64),
+            np.ascontiguousarray(eri_cross, dtype=np.float64),
+            np.ascontiguousarray(H_diag, dtype=np.float64),
+            c_dummy,
+            np.ascontiguousarray(pair_left, dtype=np.intp),
+            np.ascontiguousarray(pair_right, dtype=np.intp),
+            np.ascontiguousarray(alpha_occ, dtype=np.int8),
+            np.ascontiguousarray(beta_occ, dtype=np.int8),
+            np.ascontiguousarray(I_A, dtype=np.int32),
+            np.ascontiguousarray(J_A, dtype=np.int32),
+            np.ascontiguousarray(p_A, dtype=np.int32),
+            np.ascontiguousarray(q_A, dtype=np.int32),
+            np.ascontiguousarray(phase_A, dtype=np.int8),
+            np.ascontiguousarray(I_B, dtype=np.int32),
+            np.ascontiguousarray(J_B, dtype=np.int32),
+            np.ascontiguousarray(p_B, dtype=np.int32),
+            np.ascontiguousarray(q_B, dtype=np.int32),
+            np.ascontiguousarray(phase_B, dtype=np.int8),
+            np.ascontiguousarray(I_AA, dtype=np.int32),
+            np.ascontiguousarray(J_AA, dtype=np.int32),
+            np.ascontiguousarray(p_AA, dtype=np.int32),
+            np.ascontiguousarray(q_AA, dtype=np.int32),
+            np.ascontiguousarray(r_AA, dtype=np.int32),
+            np.ascontiguousarray(s_AA, dtype=np.int32),
+            np.ascontiguousarray(phase_AA, dtype=np.int8),
+            np.ascontiguousarray(I_BB, dtype=np.int32),
+            np.ascontiguousarray(J_BB, dtype=np.int32),
+            np.ascontiguousarray(p_BB, dtype=np.int32),
+            np.ascontiguousarray(q_BB, dtype=np.int32),
+            np.ascontiguousarray(r_BB, dtype=np.int32),
+            np.ascontiguousarray(s_BB, dtype=np.int32),
+            np.ascontiguousarray(phase_BB, dtype=np.int8),
+            np.ascontiguousarray(alpha_offsets, dtype=np.intp),
+            np.ascontiguousarray(beta_offsets, dtype=np.intp),
+            np.ascontiguousarray(alpha_order, dtype=np.intp),
+            np.ascontiguousarray(beta_order, dtype=np.intp),
+            np.ascontiguousarray(alpha_cross_diag, dtype=np.float64),
+            np.ascontiguousarray(beta_cross_diag, dtype=np.float64),
+            np.ascontiguousarray(alpha_ordered_I, dtype=np.int32),
+            np.ascontiguousarray(alpha_ordered_J, dtype=np.int32),
+            np.ascontiguousarray(alpha_ordered_phase, dtype=np.int8),
+            np.ascontiguousarray(beta_ordered_I, dtype=np.int32),
+            np.ascontiguousarray(beta_ordered_J, dtype=np.int32),
+            np.ascontiguousarray(beta_ordered_phase, dtype=np.int8),
+            int(workers if workers is not None else 1),
+            int(nroots),
+            float(tol),
+            int(max_cycle),
+            int(max_subspace),
+        )
+        energies, vecs = davidson_spin0_pair(*args)
+        return np.asarray(energies, dtype=np.float64), np.asarray(vecs, dtype=np.float64)
+    except Exception:
+        return None
+
+
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _sigma_compact_derivative_batch_numba(
     h1_batch,
@@ -1784,6 +2629,70 @@ def _sigma_values_conn_numba(
     return sigma_vec
 
 
+def _sigma_values_conn_fast(
+    H_diag, H_A, H_B, H_AA, H_BB, H_AB, c,
+    I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+):
+    """
+    Fast connection-value sigma for one vector or a Davidson trial block.
+    """
+    c_arr = np.asarray(c)
+    if c_arr.ndim == 1:
+        return _sigma_values_conn_numba(
+            H_diag, H_A, H_B, H_AA, H_BB, H_AB, c_arr,
+            I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+        )
+    if c_arr.ndim != 2:
+        raise ValueError("CI sigma vector must be a 1D vector or 2D block.")
+    if c_arr.shape[1] == 1:
+        sigma = _sigma_values_conn_numba(
+            H_diag, H_A, H_B, H_AA, H_BB, H_AB, c_arr[:, 0],
+            I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+        )
+        return sigma.reshape(-1, 1)
+    sigma_values_conn = _cpp_attr("sigma_values_conn")
+    if (
+        sigma_values_conn is not None
+        and not np.iscomplexobj(c_arr)
+        and not np.iscomplexobj(H_diag)
+        and not np.iscomplexobj(H_A)
+        and not np.iscomplexobj(H_B)
+        and not np.iscomplexobj(H_AA)
+        and not np.iscomplexobj(H_BB)
+        and not np.iscomplexobj(H_AB)
+    ):
+        try:
+            return sigma_values_conn(
+                np.ascontiguousarray(H_diag, dtype=np.float64),
+                np.ascontiguousarray(H_A, dtype=np.float64),
+                np.ascontiguousarray(H_B, dtype=np.float64),
+                np.ascontiguousarray(H_AA, dtype=np.float64),
+                np.ascontiguousarray(H_BB, dtype=np.float64),
+                np.ascontiguousarray(H_AB, dtype=np.float64),
+                np.ascontiguousarray(c_arr, dtype=np.float64),
+                np.ascontiguousarray(I_A, dtype=np.int32),
+                np.ascontiguousarray(J_A, dtype=np.int32),
+                np.ascontiguousarray(I_B, dtype=np.int32),
+                np.ascontiguousarray(J_B, dtype=np.int32),
+                np.ascontiguousarray(I_AA, dtype=np.int32),
+                np.ascontiguousarray(J_AA, dtype=np.int32),
+                np.ascontiguousarray(I_BB, dtype=np.int32),
+                np.ascontiguousarray(J_BB, dtype=np.int32),
+                np.ascontiguousarray(I_AB, dtype=np.int32),
+                np.ascontiguousarray(J_AB, dtype=np.int32),
+            )
+        except Exception:
+            pass
+
+    return np.column_stack([
+        _sigma_values_conn_numba(
+            H_diag, H_A, H_B, H_AA, H_BB, H_AB, c_arr[:, col],
+            I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+        )
+        for col in range(c_arr.shape[1])
+    ])
+
+
 def sigma_on_the_fly(Binary, SC1, SC2, H1, H2, H_diag, c):
     """
     Matrix-free CI sigma-vector build without precomputing all excitation values.
@@ -1887,16 +2796,22 @@ class CASCI(mcscf.casci.CASCI):
         )
         self.direct_connectivity = None
         self.spin_string_connectivity = None
-        
+
         self.tol = tol
         self.direct_ci_dense_fallback_ndets = DIRECT_CI_DENSE_FALLBACK_NDETS
+        self.direct_spin0_symm_dense_fallback_nconfigs = DIRECT_CI_DENSE_FALLBACK_NDETS
         self.solver_backend = None
         self.direct_ci_eigensolver = 'davidson'
         self.direct_ci_auto_eigsh_ndets = DIRECT_CI_AUTO_EIGSH_NDETS
         self.direct_ci_root_cushion = DIRECT_CI_ROOT_CUSHION
         self.direct_ci_max_cycle = 100
         self.direct_ci_max_subspace = None
+        self.direct_ci_factor_davidson_block_size = 1
         self.direct_ci_reuse_guess = True
+        self.direct_ci_workers = None
+        self.direct_ci_parallel_min_ndet = DIRECT_CI_PARALLEL_MIN_NDETS
+        self.direct_spin0_native_pair = True
+        self.direct_spin0_native_davidson = True
         self._s2_operator = None
         self._s2_diag = None
         self._direct_spatial_h1 = None
@@ -2281,7 +3196,7 @@ class CASCI(mcscf.casci.CASCI):
             )
         )
         if factor_ready:
-            return _sigma_values_conn_numba(
+            return _sigma_values_conn_fast(
                 self._direct_factor_H_diag,
                 self._direct_factor_H_A,
                 self._direct_factor_H_B,
@@ -2596,6 +3511,365 @@ class CASCI(mcscf.casci.CASCI):
             # second-order spin penalty
             raise NotImplementedError('Second-order spin panelty not implemented.')
 
+    def _direct_spin0_symm_solve(
+        self,
+        binary,
+        requested_nstates,
+        *,
+        ci0=None,
+        use_cholesky=None,
+    ):
+        """
+        Solve singlet, symmetry-filtered CI without materializing the spin0 map.
+
+        The dense helper remains the small-space reference.  For larger spaces we
+        use the spin-string sigma kernel behind a symmetric alpha/beta string-pair
+        interface, with a native C++ pair-space route available when requested.
+        """
+        binary = np.asarray(binary, dtype=np.int8)
+        if tuple(self.nelecas_spin)[0] != tuple(self.nelecas_spin)[1]:
+            raise ValueError("direct_spin0_symm requires N_alpha == N_beta.")
+        pairs = _rectangular_spin0_pairs(binary)
+        if pairs is None:
+            pairs = self._spin0_symm_pairs(binary)
+        nspin0 = len(pairs)
+        requested_nstates = int(requested_nstates)
+        if requested_nstates > nspin0:
+            raise ValueError(
+                f"Requested {requested_nstates} spin0 roots but only "
+                f"{nspin0} singlet configurations are available."
+            )
+
+        dense_limit = self.direct_spin0_symm_dense_fallback_nconfigs
+        if dense_limit is not None and dense_limit > 0 and nspin0 <= dense_limit:
+            self.solver_backend = 'direct_spin0_symm_dense'
+            return self._direct_spin0_symm_dense(
+                binary,
+                requested_nstates,
+                use_cholesky=use_cholesky,
+            )
+
+        if self.spin_purification:
+            raise ValueError("direct_spin0_symm already targets singlets; do not combine it with fix_spin().")
+
+        self.binary = binary
+        self.spin0_pair_indices = pairs
+        self.spin0_symm_transform = None
+        self.direct_connectivity = None
+        left, right, same = _spin0_pair_arrays(pairs)
+        ndet = binary.shape[0]
+        spin0_mv = None
+        spin0_mv_block = None
+        spin0_native_solver = None
+        det_mv_block = None
+
+        factor_data = self.get_direct_factor_hamiltonian(binary, use_cholesky=use_cholesky)
+        if factor_data is not None:
+            (
+                spatial_h1,
+                pair_factors,
+                H_diag,
+                H_A_factor,
+                H_B_factor,
+                H_AA_factor,
+                H_BB_factor,
+                H_AB_factor,
+                energy_core,
+            ) = factor_data
+            h1a, h1b = _normalize_spin_1e_operator(spatial_h1)
+            self.hcore = np.asarray([h1a, h1b])
+            self.h2e_cas = None
+            self.eri_so = None
+            conn = self.direct_connectivity
+            backend = 'direct_spin0_symm_davidson_factor_conn'
+
+            def det_mv(c_det):
+                return _sigma_values_conn_fast(
+                    H_diag,
+                    H_A_factor,
+                    H_B_factor,
+                    H_AA_factor,
+                    H_BB_factor,
+                    H_AB_factor,
+                    c_det,
+                    conn.I_A, conn.J_A,
+                    conn.I_B, conn.J_B,
+                    conn.I_AA, conn.J_AA,
+                    conn.I_BB, conn.J_BB,
+                    conn.I_AB, conn.J_AB,
+                )
+
+            def det_mv_block(c_det_block):
+                return _sigma_values_conn_fast(
+                    H_diag,
+                    H_A_factor,
+                    H_B_factor,
+                    H_AA_factor,
+                    H_BB_factor,
+                    H_AB_factor,
+                    c_det_block,
+                    conn.I_A, conn.J_A,
+                    conn.I_B, conn.J_B,
+                    conn.I_AA, conn.J_AA,
+                    conn.I_BB, conn.J_BB,
+                    conn.I_AB, conn.J_AB,
+                )
+
+        else:
+            spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals(
+                use_cholesky=use_cholesky
+            )
+            h1a, h1b = _normalize_spin_1e_operator(spatial_h1)
+            self.hcore = np.asarray([h1a, h1b])
+            self.h2e_cas = cross_spin_eri
+            self.eri_so = None
+            H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary)
+            spin_string_conn = None
+            try:
+                spin_string_conn = build_spin_string_connectivity(binary)
+            except ValueError:
+                spin_string_conn = None
+
+            if spin_string_conn is not None:
+                self.spin_string_connectivity = spin_string_conn
+                use_native_spin0_pair = bool(getattr(self, "direct_spin0_native_pair", False))
+                backend = (
+                    'direct_spin0_symm_davidson_spin0_pair'
+                    if use_native_spin0_pair
+                    else 'direct_spin0_symm_davidson_spin_string'
+                )
+                spin_string_alpha_cross_diag = _spin_string_cross_diagonal(
+                    cross_spin_eri,
+                    spin_string_conn.alpha_occ,
+                )
+                spin_string_beta_cross_diag = _spin_string_cross_diagonal(
+                    cross_spin_eri,
+                    spin_string_conn.beta_occ,
+                )
+                spin_string_workers = _resolve_direct_ci_workers(self, binary.shape[0])
+
+                if use_native_spin0_pair:
+                    spin0_mv = _make_sigma_compact_spin0_pair_cpp_matvec(
+                        spatial_h1, same_spin_eri, cross_spin_eri, H_diag,
+                        left, right,
+                        spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
+                        spin_string_conn.I_A, spin_string_conn.J_A,
+                        spin_string_conn.p_A, spin_string_conn.q_A,
+                        spin_string_conn.phase_A,
+                        spin_string_conn.I_B, spin_string_conn.J_B,
+                        spin_string_conn.p_B, spin_string_conn.q_B,
+                        spin_string_conn.phase_B,
+                        spin_string_conn.I_AA, spin_string_conn.J_AA,
+                        spin_string_conn.p_AA, spin_string_conn.q_AA,
+                        spin_string_conn.r_AA, spin_string_conn.s_AA,
+                        spin_string_conn.phase_AA,
+                        spin_string_conn.I_BB, spin_string_conn.J_BB,
+                        spin_string_conn.p_BB, spin_string_conn.q_BB,
+                        spin_string_conn.r_BB, spin_string_conn.s_BB,
+                        spin_string_conn.phase_BB,
+                        spin_string_conn.alpha_offsets,
+                        spin_string_conn.beta_offsets,
+                        spin_string_conn.alpha_order,
+                        spin_string_conn.beta_order,
+                        spin_string_alpha_cross_diag,
+                        spin_string_beta_cross_diag,
+                        spin_string_conn.alpha_ordered_I,
+                        spin_string_conn.alpha_ordered_J,
+                        spin_string_conn.alpha_ordered_phase,
+                        spin_string_conn.beta_ordered_I,
+                        spin_string_conn.beta_ordered_J,
+                        spin_string_conn.beta_ordered_phase,
+                        spin_string_workers,
+                    )
+                    if spin0_mv is None:
+                        def spin0_mv(c_spin0):
+                            return _sigma_compact_spin0_pair(
+                                spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c_spin0,
+                                left, right,
+                                spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
+                                spin_string_conn.I_A, spin_string_conn.J_A,
+                                spin_string_conn.p_A, spin_string_conn.q_A,
+                                spin_string_conn.phase_A,
+                                spin_string_conn.I_B, spin_string_conn.J_B,
+                                spin_string_conn.p_B, spin_string_conn.q_B,
+                                spin_string_conn.phase_B,
+                                spin_string_conn.I_AA, spin_string_conn.J_AA,
+                                spin_string_conn.p_AA, spin_string_conn.q_AA,
+                                spin_string_conn.r_AA, spin_string_conn.s_AA,
+                                spin_string_conn.phase_AA,
+                                spin_string_conn.I_BB, spin_string_conn.J_BB,
+                                spin_string_conn.p_BB, spin_string_conn.q_BB,
+                                spin_string_conn.r_BB, spin_string_conn.s_BB,
+                                spin_string_conn.phase_BB,
+                                spin_string_conn.alpha_offsets,
+                                spin_string_conn.beta_offsets,
+                                spin_string_conn.alpha_order,
+                                spin_string_conn.beta_order,
+                                spin_string_alpha_cross_diag,
+                                spin_string_beta_cross_diag,
+                                spin_string_conn.alpha_ordered_I,
+                                spin_string_conn.alpha_ordered_J,
+                                spin_string_conn.alpha_ordered_phase,
+                                spin_string_conn.beta_ordered_I,
+                                spin_string_conn.beta_ordered_J,
+                                spin_string_conn.beta_ordered_phase,
+                                spin_string_workers,
+                            )
+
+                    def spin0_native_solver(nroots, tol, max_cycle, max_subspace):
+                        return _davidson_spin0_pair_cpp(
+                            spatial_h1, same_spin_eri, cross_spin_eri, H_diag,
+                            left, right,
+                            spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
+                            spin_string_conn.I_A, spin_string_conn.J_A,
+                            spin_string_conn.p_A, spin_string_conn.q_A,
+                            spin_string_conn.phase_A,
+                            spin_string_conn.I_B, spin_string_conn.J_B,
+                            spin_string_conn.p_B, spin_string_conn.q_B,
+                            spin_string_conn.phase_B,
+                            spin_string_conn.I_AA, spin_string_conn.J_AA,
+                            spin_string_conn.p_AA, spin_string_conn.q_AA,
+                            spin_string_conn.r_AA, spin_string_conn.s_AA,
+                            spin_string_conn.phase_AA,
+                            spin_string_conn.I_BB, spin_string_conn.J_BB,
+                            spin_string_conn.p_BB, spin_string_conn.q_BB,
+                            spin_string_conn.r_BB, spin_string_conn.s_BB,
+                            spin_string_conn.phase_BB,
+                            spin_string_conn.alpha_offsets,
+                            spin_string_conn.beta_offsets,
+                            spin_string_conn.alpha_order,
+                            spin_string_conn.beta_order,
+                            spin_string_alpha_cross_diag,
+                            spin_string_beta_cross_diag,
+                            spin_string_conn.alpha_ordered_I,
+                            spin_string_conn.alpha_ordered_J,
+                            spin_string_conn.alpha_ordered_phase,
+                            spin_string_conn.beta_ordered_I,
+                            spin_string_conn.beta_ordered_J,
+                            spin_string_conn.beta_ordered_phase,
+                            workers=spin_string_workers,
+                            nroots=nroots,
+                            tol=tol,
+                            max_cycle=max_cycle,
+                            max_subspace=max_subspace,
+                        )
+                else:
+                    def det_mv(c_det):
+                        return _sigma_compact_spin_string(
+                            spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c_det,
+                            spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
+                            spin_string_conn.I_A, spin_string_conn.J_A,
+                            spin_string_conn.p_A, spin_string_conn.q_A,
+                            spin_string_conn.phase_A,
+                            spin_string_conn.I_B, spin_string_conn.J_B,
+                            spin_string_conn.p_B, spin_string_conn.q_B,
+                            spin_string_conn.phase_B,
+                            spin_string_conn.I_AA, spin_string_conn.J_AA,
+                            spin_string_conn.p_AA, spin_string_conn.q_AA,
+                            spin_string_conn.r_AA, spin_string_conn.s_AA,
+                            spin_string_conn.phase_AA,
+                            spin_string_conn.I_BB, spin_string_conn.J_BB,
+                            spin_string_conn.p_BB, spin_string_conn.q_BB,
+                            spin_string_conn.r_BB, spin_string_conn.s_BB,
+                            spin_string_conn.phase_BB,
+                            spin_string_conn.alpha_offsets,
+                            spin_string_conn.beta_offsets,
+                            spin_string_conn.alpha_order,
+                            spin_string_conn.beta_order,
+                            spin_string_alpha_cross_diag,
+                            spin_string_beta_cross_diag,
+                            spin_string_conn.alpha_ordered_I,
+                            spin_string_conn.alpha_ordered_J,
+                            spin_string_conn.alpha_ordered_phase,
+                            spin_string_conn.beta_ordered_I,
+                            spin_string_conn.beta_ordered_J,
+                            spin_string_conn.beta_ordered_phase,
+                            spin_string_workers,
+                        )
+
+            else:
+                self.direct_connectivity = build_direct_connectivity(binary)
+                conn = self.direct_connectivity
+                backend = 'direct_spin0_symm_davidson_compact_conn'
+
+                def det_mv(c_det):
+                    return _sigma_compact_conn_numba(
+                        spatial_h1,
+                        same_spin_eri,
+                        cross_spin_eri,
+                        H_diag,
+                        c_det,
+                        binary,
+                        conn.I_A, conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                        conn.I_B, conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                        conn.I_AA, conn.J_AA, conn.p_AA, conn.q_AA, conn.r_AA, conn.s_AA, conn.phase_AA,
+                        conn.I_BB, conn.J_BB, conn.p_BB, conn.q_BB, conn.r_BB, conn.s_BB, conn.phase_BB,
+                        conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
+                    )
+
+        spin0_diag = _spin0_pair_diagonal(H_diag, left, right, same)
+
+        if spin0_mv is None:
+            def spin0_mv(c_spin0):
+                c_det = _spin0_to_det_vector(c_spin0, left, right, same, ndet)
+                return _det_to_spin0_vector(det_mv(c_det), left, right, same)
+            if det_mv_block is not None:
+                def spin0_mv_block(block_spin0):
+                    block_spin0 = np.asarray(block_spin0)
+                    det_block = np.column_stack([
+                        _spin0_to_det_vector(block_spin0[:, root], left, right, same, ndet)
+                        for root in range(block_spin0.shape[1])
+                    ])
+                    sigma_det = det_mv_block(det_block)
+                    return np.column_stack([
+                        _det_to_spin0_vector(sigma_det[:, root], left, right, same)
+                        for root in range(sigma_det.shape[1])
+                    ])
+
+        guess_source = _select_direct_ci_guess(
+            self,
+            requested_nstates,
+            ci0=ci0 if ci0 is not None or not self.direct_ci_reuse_guess else None,
+        )
+        guess = _project_spin0_guess(guess_source, left, right, same, ndet)
+        davidson_tol = self.tol if self.tol > 0 else 1e-8
+        native_result = None
+        if (
+            spin0_native_solver is not None
+            and bool(getattr(self, "direct_spin0_native_davidson", False))
+            and requested_nstates == 1
+            and guess is None
+        ):
+            native_result = spin0_native_solver(
+                requested_nstates,
+                davidson_tol,
+                self.direct_ci_max_cycle,
+                self.direct_ci_max_subspace,
+            )
+        if native_result is None:
+            energies, vecs_spin0 = davidson_lowest(
+                spin0_mv,
+                spin0_diag,
+                nroots=requested_nstates,
+                tol=davidson_tol,
+                max_cycle=self.direct_ci_max_cycle,
+                max_subspace=self.direct_ci_max_subspace,
+                guess=guess,
+                matvec_block=spin0_mv_block,
+                trial_block_size=(
+                    self.direct_ci_factor_davidson_block_size
+                    if factor_data is not None
+                    else requested_nstates
+                ),
+            )
+        else:
+            energies, vecs_spin0 = native_result
+        self.solver_backend = backend
+        vecs_det = np.column_stack(
+            [_spin0_to_det_vector(vecs_spin0[:, i], left, right, same, ndet) for i in range(vecs_spin0.shape[1])]
+        )
+        return energies, vecs_det
+
 
     def run(
         self,
@@ -2606,6 +3880,8 @@ class CASCI(mcscf.casci.CASCI):
         use_cholesky=None,
         spin_root_cushion=None,
         spin_selection_tol=None,
+        wfnsym=None,
+        target_irrep=None,
     ):
         """
         solve the full CI in the active space
@@ -2639,6 +3915,8 @@ class CASCI(mcscf.casci.CASCI):
         requested_nstates = nstates
         self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
         use_cholesky = self.use_cholesky_integrals
+        method_key = str(method).lower().replace("-", "_")
+        direct_spin0_methods = {"direct_spin0", "direct_spin0_symm", "spin0", "spin0_symm"}
 
         if mo_coeff is None:
             self.mo_coeff = self.mf.mo_coeff  # use HF MOs
@@ -2647,7 +3925,30 @@ class CASCI(mcscf.casci.CASCI):
 
         uhf_reference = _is_uhf_reference(self.mo_coeff)
 
-        if method == 'ci':
+        if method_key in direct_spin0_methods:
+            if uhf_reference:
+                raise NotImplementedError("direct_spin0_symm currently supports restricted references only.")
+
+            ncore = self.ncore
+            ncas = self.ncas
+            self.mo_core, self.mo_cas = _slice_active_orbitals(self.mo_coeff, ncore, ncas)
+
+            if self.binary is None:
+                mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
+                binary = get_fci_combos(mo_occ=mo_occ)
+                self.binary = binary
+            else:
+                binary = self.binary
+            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
+            requested_nstates = int(requested_nstates)
+            E, X = self._direct_spin0_symm_solve(
+                binary,
+                requested_nstates,
+                ci0=ci0,
+                use_cholesky=use_cholesky,
+            )
+
+        elif method_key == 'ci':
             self.solver_backend = 'ci'
 
             # define the core and active space orbitals
@@ -2661,6 +3962,7 @@ class CASCI(mcscf.casci.CASCI):
             mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
+            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
             solve_nstates = self._spin_selected_nstates(
                 requested_nstates,
                 binary.shape[0],
@@ -2721,12 +4023,12 @@ class CASCI(mcscf.casci.CASCI):
                 E, X = self._lowest_dense_eigensystem(H_CI, solve_nstates)
             else:
                 E, X = eigsh(H_CI, k=solve_nstates, which='SA')
-            
+
             # from pyqed.davidson import davidson
-            
+
             # E, X = davidson(H_CI, nstates, tol=1e-13)
 
-        elif method == 'direct_ci':
+        elif method_key == 'direct_ci':
 
             ncore = self.ncore
             ncas = self.ncas
@@ -2741,6 +4043,7 @@ class CASCI(mcscf.casci.CASCI):
 
             else:
                 binary = self.binary
+            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
             solve_nstates = self._spin_selected_nstates(
                 requested_nstates,
                 binary.shape[0],
@@ -2827,6 +4130,8 @@ class CASCI(mcscf.casci.CASCI):
                 and spatial_eri is not None
                 and not uhf_reference
                 and not self.spin_purification
+                and getattr(self, 'det_irrep_filter_indices', None) is None
+                and bool(getattr(self, 'direct_ci_spin_string_backend', True))
             )
             if use_spin_string_backend:
                 if self.spin_string_connectivity is None:
@@ -2877,12 +4182,31 @@ class CASCI(mcscf.casci.CASCI):
                 if conn is None and spin_string_conn is None:
                     self.direct_connectivity = build_direct_connectivity(binary)
                     conn = self.direct_connectivity
+                spin_string_alpha_cross_diag = None
+                spin_string_beta_cross_diag = None
+                spin_string_workers = 1
+                if (
+                    spin_string_conn is not None
+                    and cross_spin_eri is not None
+                    and not np.iscomplexobj(cross_spin_eri)
+                ):
+                    spin_string_workers = _resolve_direct_ci_workers(self, binary.shape[0])
+                    spin_string_alpha_cross_diag = _spin_string_cross_diagonal(
+                        cross_spin_eri,
+                        spin_string_conn.alpha_occ,
+                    )
+                    spin_string_beta_cross_diag = _spin_string_cross_diagonal(
+                        cross_spin_eri,
+                        spin_string_conn.beta_occ,
+                    )
+
+                mv_block = None
 
                 def mv(c):
                     # Keep the Lanczos matvec almost entirely inside compiled
                     # code. The Python closure only forwards cached arrays.
                     if factor_data is not None:
-                        return _sigma_values_conn_numba(
+                        return _sigma_values_conn_fast(
                             H_diag,
                             H_A_factor,
                             H_B_factor,
@@ -2897,7 +4221,7 @@ class CASCI(mcscf.casci.CASCI):
                             conn.I_AB, conn.J_AB,
                         )
                     if spin_string_conn is not None:
-                        return _sigma_compact_spin_string_numba(
+                        return _sigma_compact_spin_string(
                             spatial_h1, same_spin_eri, cross_spin_eri, H_diag, c,
                             spin_string_conn.alpha_occ, spin_string_conn.beta_occ,
                             spin_string_conn.I_A, spin_string_conn.J_A,
@@ -2914,6 +4238,19 @@ class CASCI(mcscf.casci.CASCI):
                             spin_string_conn.p_BB, spin_string_conn.q_BB,
                             spin_string_conn.r_BB, spin_string_conn.s_BB,
                             spin_string_conn.phase_BB,
+                            spin_string_conn.alpha_offsets,
+                            spin_string_conn.beta_offsets,
+                            spin_string_conn.alpha_order,
+                            spin_string_conn.beta_order,
+                            spin_string_alpha_cross_diag,
+                            spin_string_beta_cross_diag,
+                            spin_string_conn.alpha_ordered_I,
+                            spin_string_conn.alpha_ordered_J,
+                            spin_string_conn.alpha_ordered_phase,
+                            spin_string_conn.beta_ordered_I,
+                            spin_string_conn.beta_ordered_J,
+                            spin_string_conn.beta_ordered_phase,
+                            spin_string_workers,
                         )
                     if spatial_eri is not None:
                         return _sigma_compact_conn_numba(
@@ -2948,6 +4285,23 @@ class CASCI(mcscf.casci.CASCI):
                         I_BB, J_BB, bb_t1, bb1, bb_t2, bb2,
                         I_AB, J_AB, ab_t, ab, ba_t, ba)
 
+                if factor_data is not None:
+                    def mv_block(block):
+                        return _sigma_values_conn_fast(
+                            H_diag,
+                            H_A_factor,
+                            H_B_factor,
+                            H_AA_factor,
+                            H_BB_factor,
+                            H_AB_factor,
+                            block,
+                            conn.I_A, conn.J_A,
+                            conn.I_B, conn.J_B,
+                            conn.I_AA, conn.J_AA,
+                            conn.I_BB, conn.J_BB,
+                            conn.I_AB, conn.J_AB,
+                        )
+
                 eigensolver = self.direct_ci_eigensolver
                 if eigensolver == 'auto':
                     auto_eigsh_ndets = self.direct_ci_auto_eigsh_ndets
@@ -2979,6 +4333,12 @@ class CASCI(mcscf.casci.CASCI):
                         max_cycle=self.direct_ci_max_cycle,
                         max_subspace=self.direct_ci_max_subspace,
                         guess=guess,
+                        matvec_block=mv_block,
+                        trial_block_size=(
+                            self.direct_ci_factor_davidson_block_size
+                            if factor_data is not None
+                            else solve_nstates
+                        ),
                     )
                 elif eigensolver == 'eigsh':
                     H = LinearOperator(
@@ -2993,11 +4353,11 @@ class CASCI(mcscf.casci.CASCI):
                             eigensolver
                         )
                     )
-            
 
 
 
-        elif method == 'jw':
+
+        elif method_key == 'jw':
             self.solver_backend = 'jw'
 
 
@@ -3007,7 +4367,10 @@ class CASCI(mcscf.casci.CASCI):
             E, X = eigsh(H, k=nstates, which='SA')
 
         else:
-            raise ValueError("There is no {} solver for CASCI. Use 'ci' or 'jw'".format(method))
+            raise ValueError(
+                "There is no {} solver for CASCI. Use 'ci', 'direct_ci', "
+                "'direct_spin0_symm', or 'jw'.".format(method)
+            )
 
         E, X = self._apply_multiplicity_selection(
             E,

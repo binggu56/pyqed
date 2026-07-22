@@ -13,13 +13,7 @@ description = "Electronic structure, quantum dynamics, and spectroscopy in Pytho
 readme = {file = "README.rst", content-type = "text/x-rst"}
 requires-python = ">=3.10,<3.14"
 license = "MIT"
-license-files = [
-    "LICENSE",
-    "THIRD_PARTY_NOTICES.md",
-    "pyqed/qchem/basis_set/BASIS_SET_EXCHANGE_LICENSE.txt",
-    "pyqed/qchem/basis_set/PYSCF_APACHE_LICENSE.txt",
-    "pyqed/qchem/basis_set/PYSCF_NOTICE.txt",
-]
+license-files = ["LICENSE"]
 authors = [
     {name = "Bing Gu", email = "gubing@westlake.edu.cn"},
 ]
@@ -59,11 +53,6 @@ analysis = [
 accelerators = [
     "numba>=0.59",
     "psutil>=5.9",
-]
-heom = [
-    "numba>=0.59",
-    "sympy>=1.12",
-    "tqdm>=4.66",
 ]
 md = [
     "ase>=3.23",
@@ -107,7 +96,7 @@ Homepage = "https://pyqed.org"
 Documentation = "https://docs.pyqed.org"
 Repository = "https://github.com/binggu56/pyqed"
 Issues = "https://github.com/binggu56/pyqed/issues"
-Changelog = "https://github.com/binggu56/pyqed/blob/main/HISTORY.rst"
+Changelog = "https://github.com/binggu56/pyqed/blob/master/HISTORY.rst"
 
 [tool.setuptools]
 include-package-data = false

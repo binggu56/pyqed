@@ -1,0 +1,93 @@
+{
+  "metadata": {
+    "lx": 4,
+    "ly": 4,
+    "nsites": 16,
+    "geometry": "open x, periodic y",
+    "mps_order": "snake",
+    "letta_order": "dimer-first",
+    "mps_sweeps": 4,
+    "letta_sweeps": 2,
+    "seed": 1234
+  },
+  "rows": [
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -2.0,
+      "initial": "",
+      "exact": -5.999999999999997,
+      "error": 3.9999999999999973,
+      "seconds": 3.726010416634381,
+      "sweeps_completed": 3,
+      "converged": true,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -5.999999999999999,
+      "initial": -5.999999999999999,
+      "exact": -5.999999999999997,
+      "error": -1.7763568394002505e-15,
+      "seconds": 0.04423637501895428,
+      "sweeps_completed": 2,
+      "converged": "",
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -3.488197095616126,
+      "initial": "",
+      "exact": -6.592203096991238,
+      "error": 3.1040060013751116,
+      "seconds": 6.653603207785636,
+      "sweeps_completed": 5,
+      "converged": false,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -6.06155281280883,
+      "initial": -5.999999999999999,
+      "exact": -6.592203096991238,
+      "error": 0.5306502841824079,
+      "seconds": 0.04134749993681908,
+      "sweeps_completed": 2,
+      "converged": "",
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 1.0,
+      "energy": -4.991098901802769,
+      "initial": "",
+      "exact": -9.232906373252217,
+      "error": 4.241807471449447,
+      "seconds": 6.6521682078018785,
+      "sweeps_completed": 5,
+      "converged": false,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 1.0,
+      "energy": -6.2360679774997925,
+      "initial": -5.999999999999999,
+      "exact": -9.232906373252217,
+      "error": 2.996838395752424,
+      "seconds": 0.04156420798972249,
+      "sweeps_completed": 2,
+      "converged": "",
+      "mpo_validation_error": ""
+    }
+  ]
+}

@@ -2636,6 +2636,14 @@ class TDDMRG(BaseTDDMRG):
         kwargs.setdefault("nsweeps", 4)
         if "initial_guess" not in kwargs and not isinstance(self.init_guess, MPS):
             kwargs["initial_guess"] = "hf"
+        if kwargs.get("symmetry", None) is not False and kwargs.get("symmetry_list", True) is not False:
+            options = dict(kwargs.get("abelian_matvec_options") or {})
+            options.setdefault("native_site_storage", True)
+            options.setdefault("moving_environment_cpp_state_owner", False)
+            options.setdefault("moving_environment_cpp_davidson", False)
+            options.setdefault("moving_environment_cpp_matvec", False)
+            options.setdefault("moving_environment_cpp_solve_site_update_owner", False)
+            kwargs["abelian_matvec_options"] = options
         return super().optimize_ground_state(*args, **kwargs)
 
     def _auto_ground_state_kwargs(self, *, tdvp_projection_backend=None):
@@ -2722,7 +2730,10 @@ class TDDMRG(BaseTDDMRG):
             self.gdvr_mpo_cutoff,
             self.gdvr_symbolic_algo,
         )
-        self._symmetric_mpo_cache = {}
+        self._symmetric_mpo_cache = {
+            (("charge", "sz"), "native"): self.H,
+            (("charge",), "native"): self.H,
+        }
         self._active_integral_build_info = {
             **info,
             "factorized_integrals": False,

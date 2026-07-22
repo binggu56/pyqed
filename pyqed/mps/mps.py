@@ -1,40 +1,34 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Oct  6 16:41:46 2024
+"""Finite MPS/MPO data structures and the legacy finite-system DMRG engine.
 
-#####################################################
-
-main DMRG module using MPS/MPO representations
-
-ground state optimization
-
-time-evolving block decimation
-
-# Ian McCulloch August 2017                         #
-#####################################################
-
-
-@author: Bing Gu
+Dense MPS tensors use ``(left bond, physical, right bond)`` ordering.  The
+large Abelian moving-environment implementation remains in this module because
+the legacy DMRG kernels share its internal data structures directly; small
+independent compatibility helpers live in dedicated sibling modules.
 """
 
+from __future__ import annotations
 
-
-import numpy as np
-import scipy
-import scipy.sparse.linalg
-import scipy.sparse as sparse
+import hashlib
+import logging
 import math
 import time
-import hashlib
+import warnings
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
-from scipy.sparse.linalg import eigsh #Lanczos diagonalization for hermitian matrices
-from collections import defaultdict, OrderedDict
-# from pyqed.mps.mps import LeftCanonical, RightCanonical, ZipperLeft, ZipperRight
-from pyqed.mps.decompose import decompose, compress
 
-import logging
+import numpy as np
+import scipy.sparse as sparse
+from scipy.linalg import expm
+from scipy.sparse.linalg import eigsh
+from tensorly.decomposition import tensor_train_matrix
+
+from pyqed.mps.decompose import compress, decompose
+from pyqed.mps.dense_canonical import LeftCanonical, RightCanonical
+from pyqed.mps.legacy_sites import Block, DMRGException, PauliSite, Site
+from pyqed.mps.umps import UniformMPS
+
 logger = logging.getLogger(__name__)
+
 try:
     from numba import njit as _numba_njit
     from numba import prange as _numba_prange
@@ -67,10 +61,6 @@ try:
 except ImportError:
     SYMMETRY_AVAILABLE = False
     BlockTensor = None
-from scipy.linalg import expm, block_diag
-import warnings
-from tensorly.decomposition import tensor_train_matrix
-
 from pyqed.mps.abelian_direct import (
     AbelianCompactBlockDataTable,
     AbelianCompactRenormalizedDataTable,
@@ -170,6 +160,7 @@ from pyqed.mps.abelian_direct import (
     abelian_typed_direct_entry_buckets,
     abelian_generator_owner_from_support,
     abelian_generator_region_from_support,
+    compare_abelian_packed_boundary_tensors,
     compose_abelian_packed_boundary_operators,
     make_contextual_family_records,
     native_p_owner_records,
@@ -2590,10 +2581,6 @@ class HamiltonianMultiplyU1:
         ):
             self._combined_direct_family_plan_cache[cache_key] = None
             return None
-        packed_local_count = 0
-        packed_local_unique = 0
-        packed_local_cancelled = 0
-
         a_entries = []
         dtype_args = []
         for a_key, a_blk in A.data.items():
@@ -2611,11 +2598,6 @@ class HamiltonianMultiplyU1:
         right_eq = "bcvy,clk->bvylk"
         build_start = time.perf_counter()
         emitted = 0
-        packed_identity_accum = OrderedDict()
-        packed_identity_raw_kernels = 0
-        packed_local_generator_accum = OrderedDict()
-        packed_local_generator_raw_kernels = 0
-
         def _left_operator(e_blk, w1_blk):
             key = (id(e_blk), id(w1_blk))
             cached = self._direct_operator_left_kernel_cache.get(key)
@@ -2638,439 +2620,7 @@ class HamiltonianMultiplyU1:
             self._direct_operator_right_kernel_cache[key] = op
             return op
 
-        def _identity_left_stack(e_blk, nx):
-            key = (id(e_blk), int(nx), "identity_left_stack")
-            cached = self._direct_operator_left_kernel_cache.get(key)
-            if cached is not None:
-                return cached
-            arr = np.asarray(e_blk, dtype=np.complex128)
-            if arr.ndim != 3:
-                return None
-            nb, ni, nj = arr.shape
-            nx = int(nx)
-            if nx < 1:
-                return None
-            if nx == 1:
-                stack = np.ascontiguousarray(arr.reshape(nb, ni, nj))
-            else:
-                eye = np.eye(nx, dtype=np.complex128)
-                stack = np.empty((nb, ni * nx, nj * nx), dtype=np.complex128)
-                for b in range(nb):
-                    stack[b] = np.kron(arr[b], eye)
-            self._direct_operator_left_kernel_cache[key] = stack
-            return stack
-
-        def _identity_right_stack(f_blk, ny):
-            key = (id(f_blk), int(ny), "identity_right_stack")
-            cached = self._direct_operator_right_kernel_cache.get(key)
-            if cached is not None:
-                return cached
-            arr = np.asarray(f_blk, dtype=np.complex128)
-            if arr.ndim != 3:
-                return None
-            nb, nl, nk = arr.shape
-            ny = int(ny)
-            if ny < 1:
-                return None
-            if ny == 1:
-                stack = np.ascontiguousarray(arr.transpose(0, 2, 1))
-            else:
-                eye = np.eye(ny, dtype=np.complex128)
-                stack = np.empty((nb, nk * ny, nl * ny), dtype=np.complex128)
-                for b in range(nb):
-                    stack[b] = np.kron(arr[b].T, eye)
-            self._direct_operator_right_kernel_cache[key] = stack
-            return stack
-
-        def _identity_scaled_left_stack(left_base, coeff):
-            key = (
-                id(left_base),
-                complex(coeff),
-                "identity_scaled_left_stack",
-            )
-            cached = self._direct_operator_left_kernel_cache.get(key)
-            if cached is not None:
-                return cached
-            stack = np.ascontiguousarray(
-                left_base * complex(coeff),
-                dtype=np.complex128,
-            )
-            self._direct_operator_left_kernel_cache[key] = stack
-            return stack
-
-        def _collect_packed_identity(entry):
-            nonlocal emitted, packed_identity_raw_kernels
-            E = getattr(entry, "E", None)
-            F = getattr(entry, "F", None)
-            coeff = complex(getattr(entry, "coeff", 1.0))
-            source = str(getattr(entry, "source", ""))
-            if E is None or F is None:
-                return False
-            e_by_ket_l = self._cached_block_index(E, (2,))
-            f_by_mpo_ket_r = self._cached_block_index(F, (0, 2))
-            local_emitted = 0
-
-            def _accumulate(left_base, right_stack, dims, in_start, out_start):
-                nonlocal emitted, local_emitted, packed_identity_raw_kernels
-                if (
-                    not self._packed_local_family_flat_group_identity_csr
-                    or out.get("raw_builder") is not None
-                ):
-                    if (
-                        self._packed_local_family_flat_defer_identity_scale
-                        or out.get("raw_builder") is not None
-                    ):
-                        left_stack = left_base
-                        scale = coeff
-                    else:
-                        left_stack = _identity_scaled_left_stack(left_base, coeff)
-                        scale = 1.0 + 0.0j
-                    self._append_direct_csr_kernel(
-                        out,
-                        left_stack,
-                        right_stack,
-                        dims,
-                        in_start,
-                        out_start,
-                        scale,
-                    )
-                    emitted += 1
-                    local_emitted += 1
-                    packed_identity_raw_kernels += 1
-                    return
-                if "same_side_right" in source:
-                    key = (
-                        "right",
-                        id(left_base),
-                        tuple(int(v) for v in dims),
-                        int(in_start),
-                        int(out_start),
-                        tuple(int(v) for v in right_stack.shape),
-                    )
-                    rec = packed_identity_accum.get(key)
-                    scaled = np.ascontiguousarray(
-                        right_stack * coeff,
-                        dtype=np.complex128,
-                    )
-                    if rec is None:
-                        packed_identity_accum[key] = [
-                            left_base,
-                            scaled,
-                            tuple(int(v) for v in dims),
-                            int(in_start),
-                            int(out_start),
-                        ]
-                    else:
-                        rec[1] += scaled
-                else:
-                    key = (
-                        "left",
-                        id(right_stack),
-                        tuple(int(v) for v in dims),
-                        int(in_start),
-                        int(out_start),
-                        tuple(int(v) for v in left_base.shape),
-                    )
-                    rec = packed_identity_accum.get(key)
-                    scaled = np.ascontiguousarray(
-                        left_base * coeff,
-                        dtype=np.complex128,
-                    )
-                    if rec is None:
-                        packed_identity_accum[key] = [
-                            scaled,
-                            right_stack,
-                            tuple(int(v) for v in dims),
-                            int(in_start),
-                            int(out_start),
-                        ]
-                    else:
-                        rec[0] += scaled
-                local_emitted += 1
-                packed_identity_raw_kernels += 1
-
-            for a_key, a_shape, left_qn, right_qn, p1_in, p2_in in a_entries:
-                if len(a_shape) != 4:
-                    return False
-                nj_a, nk_a, nx, ny = (int(v) for v in a_shape)
-                for e_key, e_blk in e_by_ket_l.get((left_qn,), ()):
-                    if np.asarray(e_blk).ndim != 3:
-                        return False
-                    nb, ni, nj = (int(v) for v in np.asarray(e_blk).shape)
-                    if int(nj) != int(nj_a):
-                        return False
-                    channel = e_key[0]
-                    for f_key, f_blk in f_by_mpo_ket_r.get((channel, right_qn), ()):
-                        if np.asarray(f_blk).ndim != 3:
-                            return False
-                        nb_r, nl, nk = (int(v) for v in np.asarray(f_blk).shape)
-                        if int(nb) != int(nb_r) or int(nk) != int(nk_a):
-                            return False
-                        out_key = (e_key[1], f_key[1], p1_in, p2_in)
-                        out_shape = layout_shapes.get(out_key)
-                        if out_shape is None:
-                            continue
-                        out_shape = tuple(int(v) for v in out_shape)
-                        if out_shape != (int(ni), int(nl), int(nx), int(ny)):
-                            return False
-                        left_base = _identity_left_stack(e_blk, nx)
-                        right_stack = _identity_right_stack(f_blk, ny)
-                        if left_base is None or right_stack is None:
-                            return False
-                        left_stack = np.ascontiguousarray(
-                            left_base * coeff,
-                            dtype=np.complex128,
-                        )
-                        in_start, in_size = offsets[a_key]
-                        out_start, out_size = offsets[out_key]
-                        if (
-                            int(nj) * int(nx) * int(nk) * int(ny) != int(in_size)
-                            or int(ni) * int(nl) * int(nx) * int(ny) != int(out_size)
-                        ):
-                            return False
-                        dims_tuple = (
-                            int(ni),
-                            int(nl),
-                            int(nx),
-                            int(ny),
-                            int(nj),
-                            int(nx),
-                            int(nk),
-                            int(ny),
-                        )
-                        _accumulate(
-                            left_base,
-                            right_stack,
-                            dims_tuple,
-                            in_start,
-                            out_start,
-                        )
-            stats = self.profile_stats.setdefault(
-                "packed_flat_complementary_family_action",
-                {},
-            )
-            stats["packed_identity_local_entries"] = int(
-                stats.get("packed_identity_local_entries", 0)
-            ) + 1
-            stats["packed_identity_local_kernels"] = int(
-                stats.get("packed_identity_local_kernels", 0)
-            ) + int(local_emitted)
-            return True
-
-        def _collect_packed_local_generator(entry):
-            nonlocal emitted, packed_local_generator_raw_kernels
-            E = getattr(entry, "E", None)
-            W_left = getattr(entry, "W_left", None)
-            W_right = getattr(entry, "W_right", None)
-            F = getattr(entry, "F", None)
-            coeff = complex(getattr(entry, "coeff", 1.0))
-            source = str(getattr(entry, "source", "packed_local_generator"))
-            if E is None or W_left is None or W_right is None or F is None:
-                return False
-            e_by_ket_l = self._cached_block_index(E, (2,))
-            w1_by_left_in = self._cached_block_index(W_left, (0, 3))
-            w2_by_left_in = self._cached_block_index(W_right, (0, 3))
-            f_by_mpo_ket_r = self._cached_block_index(F, (0, 2))
-            local_emitted = 0
-
-            def _accumulate_generator(left_stack, right_stack, dims, in_start, out_start):
-                nonlocal emitted, local_emitted, packed_local_generator_raw_kernels
-                dims = tuple(int(v) for v in dims)
-                packed_local_generator_raw_kernels += 1
-                local_emitted += 1
-                if (
-                    not self._packed_local_family_flat_group_local_generator_csr
-                    or out.get("raw_builder") is not None
-                ):
-                    if out.get("raw_builder") is not None:
-                        self._append_direct_csr_kernel(
-                            out,
-                            left_stack,
-                            right_stack,
-                            dims,
-                            in_start,
-                            out_start,
-                            coeff,
-                        )
-                    else:
-                        self._append_direct_csr_kernel(
-                            out,
-                            self._scaled_direct_left_stack(
-                                left_stack,
-                                coeff,
-                                source,
-                            ),
-                            right_stack,
-                            dims,
-                            in_start,
-                            out_start,
-                        )
-                    emitted += 1
-                    return
-                if "right_boundary" in source or "same_side_right" in source:
-                    key = (
-                        "right",
-                        id(left_stack),
-                        dims,
-                        int(in_start),
-                        int(out_start),
-                        tuple(int(v) for v in np.asarray(right_stack).shape),
-                    )
-                    scaled = np.ascontiguousarray(
-                        np.asarray(right_stack, dtype=np.complex128) * coeff,
-                        dtype=np.complex128,
-                    )
-                    rec = packed_local_generator_accum.get(key)
-                    if rec is None:
-                        packed_local_generator_accum[key] = [
-                            left_stack,
-                            scaled,
-                            dims,
-                            int(in_start),
-                            int(out_start),
-                        ]
-                    else:
-                        rec[1] += scaled
-                else:
-                    key = (
-                        "left",
-                        id(right_stack),
-                        dims,
-                        int(in_start),
-                        int(out_start),
-                        tuple(int(v) for v in np.asarray(left_stack).shape),
-                    )
-                    scaled = np.ascontiguousarray(
-                        np.asarray(left_stack, dtype=np.complex128) * coeff,
-                        dtype=np.complex128,
-                    )
-                    rec = packed_local_generator_accum.get(key)
-                    if rec is None:
-                        packed_local_generator_accum[key] = [
-                            scaled,
-                            right_stack,
-                            dims,
-                            int(in_start),
-                            int(out_start),
-                        ]
-                    else:
-                        rec[0] += scaled
-
-            for a_key, a_shape, left_qn, right_qn, p1_in, p2_in in a_entries:
-                for e_key, e_blk in e_by_ket_l.get((left_qn,), ()):
-                    if e_blk.ndim != 3:
-                        return False
-                    for w1_key, w1_blk in w1_by_left_in.get((e_key[0], p1_in), ()):
-                        if w1_blk.ndim != 4:
-                            return False
-                        channel = w1_key[1]
-                        left_op = _left_operator(e_blk, w1_blk)
-                        for w2_key, w2_blk in w2_by_left_in.get((channel, p2_in), ()):
-                            if w2_blk.ndim != 4:
-                                return False
-                            for f_key, f_blk in f_by_mpo_ket_r.get(
-                                (w2_key[1], right_qn),
-                                (),
-                            ):
-                                if f_blk.ndim != 3:
-                                    return False
-                                right_op = _right_operator(w2_blk, f_blk)
-                                if left_op.shape[0] != right_op.shape[0]:
-                                    return False
-                                out_key = (
-                                    e_key[1],
-                                    f_key[1],
-                                    w1_key[2],
-                                    w2_key[2],
-                                )
-                                out_shape = layout_shapes.get(out_key)
-                                if out_shape is None:
-                                    continue
-                                kernel = self._direct_operator_matrix_kernel(
-                                    left_op,
-                                    a_shape,
-                                    right_op,
-                                )
-                                if kernel is None:
-                                    return False
-                                left_stack, right_stack, out_shape_kernel, a_shape_kernel = kernel
-                                in_start, in_size = offsets[a_key]
-                                out_start, out_size = offsets[out_key]
-                                if (
-                                    left_stack.dtype != np.complex128
-                                    or right_stack.dtype != np.complex128
-                                    or tuple(out_shape_kernel) != tuple(out_shape)
-                                    or int(np.prod(a_shape_kernel, dtype=int)) != int(in_size)
-                                    or int(np.prod(out_shape_kernel, dtype=int)) != int(out_size)
-                                ):
-                                    return False
-                                dims_tuple = (
-                                    out_shape_kernel[0],
-                                    out_shape_kernel[1],
-                                    out_shape_kernel[2],
-                                    out_shape_kernel[3],
-                                    a_shape_kernel[0],
-                                    a_shape_kernel[1],
-                                    a_shape_kernel[2],
-                                    a_shape_kernel[3],
-                                )
-                                _accumulate_generator(
-                                    left_stack,
-                                    right_stack,
-                                    dims_tuple,
-                                    in_start,
-                                    out_start,
-                                )
-            stats = self.profile_stats.setdefault(
-                "packed_flat_complementary_family_action",
-                {},
-            )
-            stats["packed_local_generator_entries"] = int(
-                stats.get("packed_local_generator_entries", 0)
-            ) + 1
-            stats["packed_local_generator_kernels"] = int(
-                stats.get("packed_local_generator_kernels", 0)
-            ) + int(local_emitted)
-            return True
-
-        if packed_count:
-            stats = self.profile_stats.setdefault(
-                "packed_flat_complementary_family_action",
-                {},
-            )
-            stats["packed_identity_local_coalesced_entries"] = int(
-                stats.get("packed_identity_local_coalesced_entries", 0)
-            ) + int(packed_count)
-            stats["packed_identity_local_coalesced_unique"] = int(
-                stats.get("packed_identity_local_coalesced_unique", 0)
-            ) + int(packed_unique)
-            stats["packed_identity_local_coalesced_cancelled"] = int(
-                stats.get("packed_identity_local_coalesced_cancelled", 0)
-            ) + int(packed_cancelled)
-        if packed_local_count:
-            stats = self.profile_stats.setdefault(
-                "packed_flat_complementary_family_action",
-                {},
-            )
-            stats["packed_local_generator_coalesced_entries"] = int(
-                stats.get("packed_local_generator_coalesced_entries", 0)
-            ) + int(packed_local_count)
-            stats["packed_local_generator_coalesced_unique"] = int(
-                stats.get("packed_local_generator_coalesced_unique", 0)
-            ) + int(packed_local_unique)
-            stats["packed_local_generator_coalesced_cancelled"] = int(
-                stats.get("packed_local_generator_coalesced_cancelled", 0)
-            ) + int(packed_local_cancelled)
-
         for component in component_entries:
-            if isinstance(component, AbelianPackedIdentityLocalEntry):
-                if not _collect_packed_identity(component):
-                    return False
-                continue
-            if isinstance(component, AbelianPackedLocalGeneratorEntry):
-                if not _collect_packed_local_generator(component):
-                    return False
-                continue
             E, W, F = component
             e_by_ket_l = self._cached_block_index(E, (2,))
             w1_by_left_in = self._cached_block_index(W[0], (0, 3))
@@ -4039,7 +3589,14 @@ class HamiltonianMultiplyU1:
         for index, component in enumerate(component_entries):
             if isinstance(component, AbelianPackedLocalGeneratorEntry):
                 E = component.E
-                W = [component.W_left * complex(component.coeff), component.W_right]
+                W = [
+                    scale_abelian_boundary_tensor(
+                        component.W_left,
+                        component.coeff,
+                        source="combined_direct_family_plan_scale",
+                    ),
+                    component.W_right,
+                ]
                 F = component.F
             else:
                 E, W, F = component
@@ -6034,12 +5591,6 @@ class HamiltonianMultiplyU1:
         min_dim = int(self._packed_local_family_flat_direct_matvec_min_dim)
         if min_dim > 0 and dim < min_dim:
             return None
-        if (
-            _packed_cython is None
-            or not getattr(_packed_cython, "CYTHON_AVAILABLE", False)
-            or getattr(_packed_cython, "direct_operator_entries_matvec", None) is None
-        ):
-            return None
         collected = self._flat_direct_family_csr_kernels(proto, layout)
         if collected is None:
             return None
@@ -6081,6 +5632,8 @@ class HamiltonianMultiplyU1:
         elif backend == "grouped_compiled":
             if (
                 groups is None
+                or _packed_cython is None
+                or not getattr(_packed_cython, "CYTHON_AVAILABLE", False)
                 or getattr(_packed_cython, "direct_operator_groups_matvec", None)
                 is None
             ):
@@ -6151,6 +5704,13 @@ class HamiltonianMultiplyU1:
                 )
                 out[int(out_start) : int(out_start) + out_size] += out_block
         else:
+            if (
+                _packed_cython is None
+                or not getattr(_packed_cython, "CYTHON_AVAILABLE", False)
+                or getattr(_packed_cython, "direct_operator_entries_matvec", None)
+                is None
+            ):
+                return None
             out = _packed_cython.direct_operator_entries_matvec(
                 collected["left"],
                 collected["right"],
@@ -10646,7 +10206,11 @@ class HamiltonianMultiplyU1:
                     if isinstance(component, AbelianPackedLocalGeneratorEntry):
                         E = component.E
                         W = [
-                            component.W_left * complex(component.coeff),
+                            scale_abelian_boundary_tensor(
+                                component.W_left,
+                                component.coeff,
+                                source="direct_symbolic_family_scale",
+                            ),
                             component.W_right,
                         ]
                         F = component.F
@@ -14548,6 +14112,11 @@ class MovingEnvironmentCompiledBackend:
         )
 
     def update_left_environment(self, W, A, E, B):
+        if self.use_cpp_dense_environment_update():
+            updated = self._cpp_dense_update_left_environment(W, A, E, B)
+            if updated is not None:
+                self.environment._last_environment_update_backend = "cpp_dense_environment"
+                return updated
         if self.use_cpp_environment_update():
             updated = self._cpp_update_left_environment(W, A, E, B)
             if updated is not None:
@@ -14557,6 +14126,11 @@ class MovingEnvironmentCompiledBackend:
         return contract_from_left(W, A, E, B)
 
     def update_right_environment(self, W, A, F, B):
+        if self.use_cpp_dense_environment_update():
+            updated = self._cpp_dense_update_right_environment(W, A, F, B)
+            if updated is not None:
+                self.environment._last_environment_update_backend = "cpp_dense_environment"
+                return updated
         if self.use_cpp_environment_update():
             updated = self._cpp_update_right_environment(W, A, F, B)
             if updated is not None:
@@ -14575,6 +14149,117 @@ class MovingEnvironmentCompiledBackend:
                 False,
             )
         )
+
+    def use_cpp_dense_environment_update(self):
+        if _cpp_davidson is None or not getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
+            return False
+        if (
+            getattr(_cpp_davidson, "dense_environment_update_left", None) is None
+            or getattr(_cpp_davidson, "dense_environment_update_right", None) is None
+        ):
+            return False
+        return bool(
+            MovingEnvironment._option_value(
+                self.environment.matvec_options,
+                "moving_environment_dense_cpp_environment_update",
+                False,
+            )
+        )
+
+    @staticmethod
+    def _dense_environment_inputs_supported(W, A, E_or_F, B):
+        return (
+            isinstance(W, np.ndarray)
+            and isinstance(A, np.ndarray)
+            and isinstance(E_or_F, np.ndarray)
+            and isinstance(B, np.ndarray)
+            and W.ndim == 4
+            and A.ndim == 3
+            and E_or_F.ndim == 3
+            and B.ndim == 3
+        )
+
+    def _cpp_dense_update_left_environment(self, W, A, E, B):
+        if not self._dense_environment_inputs_supported(W, A, E, B):
+            return None
+        stats = self.environment.moving_profile_stats
+        start = time.perf_counter()
+        try:
+            updated = _cpp_davidson.dense_environment_update_left(
+                np.asarray(W, dtype=np.complex128),
+                np.asarray(A, dtype=np.complex128),
+                np.asarray(E, dtype=np.complex128),
+                np.asarray(B, dtype=np.complex128),
+            )
+        except Exception as exc:
+            stats["cpp_environment_update_failures"] = int(
+                stats.get("cpp_environment_update_failures", 0)
+            ) + 1
+            stats["dense_cpp_environment_update_failures"] = int(
+                stats.get("dense_cpp_environment_update_failures", 0)
+            ) + 1
+            stats["cpp_environment_update_last_error"] = str(exc)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        stats["cpp_environment_update_left_calls"] = int(
+            stats.get("cpp_environment_update_left_calls", 0)
+        ) + 1
+        stats["cpp_environment_update_calls"] = int(
+            stats.get("cpp_environment_update_calls", 0)
+        ) + 1
+        stats["cpp_environment_update_seconds"] = float(
+            stats.get("cpp_environment_update_seconds", 0.0)
+        ) + elapsed
+        stats["cpp_environment_update_last_seconds"] = elapsed
+        stats["cpp_environment_update_backend_actual"] = "cpp_dense_payload"
+        stats["dense_cpp_environment_update_calls"] = int(
+            stats.get("dense_cpp_environment_update_calls", 0)
+        ) + 1
+        stats["dense_cpp_environment_update_seconds"] = float(
+            stats.get("dense_cpp_environment_update_seconds", 0.0)
+        ) + elapsed
+        return np.asarray(updated)
+
+    def _cpp_dense_update_right_environment(self, W, A, F, B):
+        if not self._dense_environment_inputs_supported(W, A, F, B):
+            return None
+        stats = self.environment.moving_profile_stats
+        start = time.perf_counter()
+        try:
+            updated = _cpp_davidson.dense_environment_update_right(
+                np.asarray(W, dtype=np.complex128),
+                np.asarray(A, dtype=np.complex128),
+                np.asarray(F, dtype=np.complex128),
+                np.asarray(B, dtype=np.complex128),
+            )
+        except Exception as exc:
+            stats["cpp_environment_update_failures"] = int(
+                stats.get("cpp_environment_update_failures", 0)
+            ) + 1
+            stats["dense_cpp_environment_update_failures"] = int(
+                stats.get("dense_cpp_environment_update_failures", 0)
+            ) + 1
+            stats["cpp_environment_update_last_error"] = str(exc)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        stats["cpp_environment_update_right_calls"] = int(
+            stats.get("cpp_environment_update_right_calls", 0)
+        ) + 1
+        stats["cpp_environment_update_calls"] = int(
+            stats.get("cpp_environment_update_calls", 0)
+        ) + 1
+        stats["cpp_environment_update_seconds"] = float(
+            stats.get("cpp_environment_update_seconds", 0.0)
+        ) + elapsed
+        stats["cpp_environment_update_last_seconds"] = elapsed
+        stats["cpp_environment_update_backend_actual"] = "cpp_dense_payload"
+        stats["dense_cpp_environment_update_calls"] = int(
+            stats.get("dense_cpp_environment_update_calls", 0)
+        ) + 1
+        stats["dense_cpp_environment_update_seconds"] = float(
+            stats.get("dense_cpp_environment_update_seconds", 0.0)
+        ) + elapsed
+        return np.asarray(updated)
 
     def _cpp_update_left_environment(self, W, A, E, B):
         stats = self.environment.moving_profile_stats
@@ -14703,7 +14388,10 @@ class MovingEnvironment:
         self.compiled_backend = MovingEnvironmentCompiledBackend(self)
         self.operator = None
         self._operatorless_local_problem_active = False
+        self._dense_operatorless_local_problem_active = False
         self._local_profile_stats = {}
+        self._dense_local_profile_stats = {}
+        self._dense_operatorless_key = None
         self.bond = None
         self.left_environments = None
         self.right_environments = None
@@ -14774,6 +14462,11 @@ class MovingEnvironment:
         self._compact_plan_validation_cache = {}
         self._compact_block_table_cache = {}
         self._environment_advance_plan_cache = {}
+        self._dense_cpp_sweep_workspace = None
+        self._dense_cpp_sweep_bind_signatures = {}
+        self._dense_cpp_sweep_w_signatures = {}
+        self._dense_cpp_coarse_grained_w_cache = {}
+        self._dense_cpp_coarse_grained_w_signatures = {}
         self._cpp_moving_environment = None
         existing_owner = self._option_value(
             matvec_options,
@@ -14968,6 +14661,56 @@ class MovingEnvironment:
             "compact_plan_builds": 0,
             "compact_plan_build_seconds": 0.0,
             "compact_plan_cache_hits": 0,
+            "dense_cpp_sweep_workspace_enabled": False,
+            "dense_cpp_sweep_workspace_creates": 0,
+            "dense_cpp_sweep_workspace_records": 0,
+            "dense_cpp_sweep_workspace_binds": 0,
+            "dense_cpp_sweep_workspace_bind_seconds": 0.0,
+            "dense_cpp_sweep_workspace_boundary_binds": 0,
+            "dense_cpp_sweep_workspace_boundary_bind_seconds": 0.0,
+            "dense_cpp_sweep_workspace_static_w_hits": 0,
+            "dense_cpp_sweep_workspace_bind_cache_hits": 0,
+            "dense_cpp_sweep_workspace_solve_calls": 0,
+            "dense_cpp_sweep_workspace_solve_seconds": 0.0,
+            "dense_cpp_sweep_workspace_two_site_solve_calls": 0,
+            "dense_cpp_sweep_workspace_two_site_solve_accepts": 0,
+            "dense_cpp_sweep_workspace_two_site_solve_rejections": 0,
+            "dense_cpp_sweep_workspace_two_site_solve_seconds": 0.0,
+            "dense_cpp_sweep_workspace_two_site_static_w_reuses": 0,
+            "dense_cpp_sweep_workspace_two_site_mpo_builds": 0,
+            "dense_cpp_sweep_workspace_two_site_mps_builds": 0,
+            "dense_cpp_sweep_workspace_failures": 0,
+            "dense_cpp_sweep_workspace_last_error": None,
+            "dense_cpp_tensor_primitive_calls": 0,
+            "dense_cpp_tensor_primitive_seconds": 0.0,
+            "dense_cpp_tensor_primitive_failures": 0,
+            "dense_cpp_tensor_primitive_last_error": None,
+            "dense_cpp_coarse_grain_mpo_calls": 0,
+            "dense_cpp_coarse_grain_mpo_cache_hits": 0,
+            "dense_cpp_coarse_grain_mps_calls": 0,
+            "dense_cpp_environment_update_calls": 0,
+            "dense_cpp_environment_update_seconds": 0.0,
+            "dense_cpp_environment_update_failures": 0,
+            "dense_local_operator_builds": 0,
+            "dense_local_operator_reuses": 0,
+            "dense_solve_local_calls": 0,
+            "dense_solve_local_accepts": 0,
+            "dense_solve_local_rejections": 0,
+            "dense_solve_local_seconds": 0.0,
+            "dense_solve_local_last_seconds": 0.0,
+            "dense_operatorless_local_problem_binds": 0,
+            "dense_operatorless_local_problem_solve_calls": 0,
+            "dense_operatorless_local_problem_solve_accepts": 0,
+            "dense_operatorless_local_problem_solve_rejections": 0,
+            "dense_operatorless_local_problem_solve_seconds": 0.0,
+            "dense_operatorless_local_problem_solve_last_seconds": 0.0,
+            "dense_operatorless_local_problem_last_error": None,
+            "dense_cpp_split_calls": 0,
+            "dense_cpp_split_accepts": 0,
+            "dense_cpp_split_failures": 0,
+            "dense_cpp_split_seconds": 0.0,
+            "dense_cpp_split_last_seconds": 0.0,
+            "dense_cpp_split_last_error": None,
             "cpp_moving_environment_enabled": self._cpp_moving_environment is not None,
             "cpp_moving_environment_compact_plan_installs": 0,
             "cpp_moving_environment_compact_plan_records": 0,
@@ -17653,6 +17396,8 @@ class MovingEnvironment:
         matvec_options=None,
     ):
         self.bond = None if bond is None else int(bond)
+        self._dense_operatorless_local_problem_active = False
+        self._dense_operatorless_key = None
         families = (
             self.complementary_operator_families
             if complementary_operator_families is None
@@ -17728,6 +17473,916 @@ class MovingEnvironment:
         self.operator._moving_environment = self
         return self
 
+    def _dense_cpp_davidson_enabled(self, options):
+        if not bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson",
+                False,
+            )
+        ):
+            return False
+        return (
+            _cpp_davidson is not None
+            and bool(getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False))
+            and getattr(_cpp_davidson, "DenseSweepWorkspace", None) is not None
+        )
+
+    def _dense_cpp_tensor_primitives_enabled(self, options):
+        if (
+            _cpp_davidson is None
+            or not bool(getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False))
+        ):
+            return False
+        if (
+            getattr(_cpp_davidson, "dense_coarse_grain_mpo", None) is None
+            or getattr(_cpp_davidson, "dense_coarse_grain_mps", None) is None
+        ):
+            return False
+        default = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson",
+                False,
+            )
+        )
+        return bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_tensor_primitives",
+                default,
+            )
+        )
+
+    def dense_coarse_grain_mpo(self, W1, W2, *, bond=None, matvec_options=None):
+        options = self.matvec_options if matvec_options is None else matvec_options
+        if (
+            not self._dense_cpp_tensor_primitives_enabled(options)
+            or not isinstance(W1, np.ndarray)
+            or not isinstance(W2, np.ndarray)
+        ):
+            return coarse_grain_MPO(W1, W2)
+        cache_enabled = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_cache_coarse_grained_w",
+                bool(
+                    self._option_value(
+                        options,
+                        "moving_environment_dense_cpp_davidson",
+                        False,
+                    )
+                ),
+            )
+        )
+        cache_key = None if bond is None else self._dense_cpp_workspace_key(bond)
+        signature = self._dense_cpp_w_pair_signature(
+            W1,
+            W2,
+            bond=bond,
+            options=options,
+        )
+        if (
+            cache_enabled
+            and cache_key is not None
+            and self._dense_cpp_coarse_grained_w_signatures.get(cache_key)
+            == signature
+            and cache_key in self._dense_cpp_coarse_grained_w_cache
+        ):
+            self.moving_profile_stats["dense_cpp_coarse_grain_mpo_cache_hits"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_coarse_grain_mpo_cache_hits",
+                    0,
+                )
+            ) + 1
+            return self._dense_cpp_coarse_grained_w_cache[cache_key]
+        start = time.perf_counter()
+        try:
+            value = _cpp_davidson.dense_coarse_grain_mpo(
+                np.asarray(W1, dtype=np.complex128),
+                np.asarray(W2, dtype=np.complex128),
+            )
+        except Exception as exc:
+            self.moving_profile_stats["dense_cpp_tensor_primitive_failures"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_tensor_primitive_failures",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_cpp_tensor_primitive_last_error"] = str(exc)
+            return coarse_grain_MPO(W1, W2)
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_tensor_primitive_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_tensor_primitive_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_coarse_grain_mpo_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_coarse_grain_mpo_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_tensor_primitive_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_tensor_primitive_seconds", 0.0)
+        ) + elapsed
+        value = np.asarray(value)
+        if cache_enabled and cache_key is not None:
+            self._dense_cpp_coarse_grained_w_cache[cache_key] = value
+            self._dense_cpp_coarse_grained_w_signatures[cache_key] = signature
+        return value
+
+    def dense_coarse_grain_mps(self, A, B, *, matvec_options=None):
+        options = self.matvec_options if matvec_options is None else matvec_options
+        if (
+            not self._dense_cpp_tensor_primitives_enabled(options)
+            or not isinstance(A, np.ndarray)
+            or not isinstance(B, np.ndarray)
+        ):
+            return coarse_grain_MPS(A, B)
+        start = time.perf_counter()
+        try:
+            value = _cpp_davidson.dense_coarse_grain_mps(
+                np.asarray(A, dtype=np.complex128),
+                np.asarray(B, dtype=np.complex128),
+            )
+        except Exception as exc:
+            self.moving_profile_stats["dense_cpp_tensor_primitive_failures"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_tensor_primitive_failures",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_cpp_tensor_primitive_last_error"] = str(exc)
+            return coarse_grain_MPS(A, B)
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_tensor_primitive_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_tensor_primitive_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_coarse_grain_mps_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_coarse_grain_mps_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_tensor_primitive_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_tensor_primitive_seconds", 0.0)
+        ) + elapsed
+        return np.asarray(value)
+
+    def _dense_cpp_workspace_key(self, bond):
+        return "dense-bond:{}".format("none" if bond is None else int(bond))
+
+    @staticmethod
+    def _dense_cpp_array_signature(arr):
+        arr_obj = np.asarray(arr)
+        return (
+            id(arr),
+            tuple(int(x) for x in arr_obj.shape),
+            tuple(int(x) for x in arr_obj.strides),
+            str(arr_obj.dtype),
+        )
+
+    @staticmethod
+    def _dense_cpp_payload_signature(E, W, F):
+        return tuple(MovingEnvironment._dense_cpp_array_signature(arr) for arr in (E, W, F))
+
+    def _dense_cpp_w_signature(self, W, *, bond=None, options=None):
+        arr_obj = np.asarray(W)
+        if (
+            bond is not None
+            and bool(
+                self._option_value(
+                    options,
+                    "moving_environment_dense_cpp_static_w_by_bond",
+                    True,
+                )
+            )
+        ):
+            return (
+                "static-bond",
+                int(bond),
+                tuple(int(x) for x in arr_obj.shape),
+                str(arr_obj.dtype),
+            )
+        return self._dense_cpp_array_signature(W)
+
+    def _dense_cpp_w_pair_signature(self, W1, W2, *, bond=None, options=None):
+        if (
+            bond is not None
+            and bool(
+                self._option_value(
+                    options,
+                    "moving_environment_dense_cpp_static_w_by_bond",
+                    True,
+                )
+            )
+        ):
+            arr1 = np.asarray(W1)
+            arr2 = np.asarray(W2)
+            return (
+                "static-two-site-bond",
+                int(bond),
+                tuple(int(x) for x in arr1.shape),
+                str(arr1.dtype),
+                tuple(int(x) for x in arr2.shape),
+                str(arr2.dtype),
+            )
+        return (
+            self._dense_cpp_array_signature(W1),
+            self._dense_cpp_array_signature(W2),
+        )
+
+    def _dense_cpp_sweep_owner(self, options):
+        if not self._dense_cpp_davidson_enabled(options):
+            return None
+        if self._dense_cpp_sweep_workspace is None:
+            owner_cls = getattr(_cpp_davidson, "DenseSweepWorkspace", None)
+            if owner_cls is None:
+                return None
+            try:
+                self._dense_cpp_sweep_workspace = owner_cls()
+            except Exception as exc:
+                self.moving_profile_stats["dense_cpp_sweep_workspace_failures"] = int(
+                    self.moving_profile_stats.get(
+                        "dense_cpp_sweep_workspace_failures",
+                        0,
+                    )
+                ) + 1
+                self.moving_profile_stats["dense_cpp_sweep_workspace_last_error"] = str(exc)
+                return None
+            self.moving_profile_stats["dense_cpp_sweep_workspace_creates"] = int(
+                self.moving_profile_stats.get("dense_cpp_sweep_workspace_creates", 0)
+            ) + 1
+        self.moving_profile_stats["dense_cpp_sweep_workspace_enabled"] = True
+        return self._dense_cpp_sweep_workspace
+
+    def bind_dense_cpp_workspace(self, E, W, F, *, bond=None, matvec_options=None):
+        options = self.matvec_options if matvec_options is None else matvec_options
+        owner = self._dense_cpp_sweep_owner(options)
+        if owner is None:
+            return None
+        key = self._dense_cpp_workspace_key(bond)
+        signature = self._dense_cpp_payload_signature(E, W, F)
+        w_signature = self._dense_cpp_w_signature(W, bond=bond, options=options)
+        if self._dense_cpp_sweep_bind_signatures.get(key) == signature:
+            self.moving_profile_stats["dense_cpp_sweep_workspace_bind_cache_hits"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_bind_cache_hits",
+                    0,
+                )
+            ) + 1
+            return key
+        reuse_static_w = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_reuse_static_w",
+                True,
+            )
+        )
+        if reuse_static_w and self._dense_cpp_sweep_w_signatures.get(key) == w_signature:
+            start = time.perf_counter()
+            try:
+                owner.bind_boundaries(
+                    key,
+                    np.asarray(E, dtype=np.complex128),
+                    np.asarray(F, dtype=np.complex128),
+                )
+            except Exception as exc:
+                self.moving_profile_stats["dense_cpp_sweep_workspace_failures"] = int(
+                    self.moving_profile_stats.get(
+                        "dense_cpp_sweep_workspace_failures",
+                        0,
+                    )
+                ) + 1
+                self.moving_profile_stats["dense_cpp_sweep_workspace_last_error"] = str(exc)
+            else:
+                elapsed = float(time.perf_counter() - start)
+                self._dense_cpp_sweep_bind_signatures[key] = signature
+                self.moving_profile_stats[
+                    "dense_cpp_sweep_workspace_boundary_binds"
+                ] = int(
+                    self.moving_profile_stats.get(
+                        "dense_cpp_sweep_workspace_boundary_binds",
+                        0,
+                    )
+                ) + 1
+                self.moving_profile_stats[
+                    "dense_cpp_sweep_workspace_boundary_bind_seconds"
+                ] = float(
+                    self.moving_profile_stats.get(
+                        "dense_cpp_sweep_workspace_boundary_bind_seconds",
+                        0.0,
+                    )
+                ) + elapsed
+                self.moving_profile_stats["dense_cpp_sweep_workspace_static_w_hits"] = int(
+                    self.moving_profile_stats.get(
+                        "dense_cpp_sweep_workspace_static_w_hits",
+                        0,
+                    )
+                ) + 1
+                try:
+                    stats = dict(owner.stats())
+                    self.moving_profile_stats["dense_cpp_sweep_workspace_records"] = int(
+                        stats.get("records", 0)
+                    )
+                except Exception:
+                    pass
+                return key
+        start = time.perf_counter()
+        try:
+            owner.bind(
+                key,
+                np.asarray(E, dtype=np.complex128),
+                np.asarray(W, dtype=np.complex128),
+                np.asarray(F, dtype=np.complex128),
+            )
+        except Exception as exc:
+            self.moving_profile_stats["dense_cpp_sweep_workspace_failures"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_failures",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_cpp_sweep_workspace_last_error"] = str(exc)
+            self._dense_cpp_sweep_bind_signatures.pop(key, None)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        self._dense_cpp_sweep_bind_signatures[key] = signature
+        self._dense_cpp_sweep_w_signatures[key] = w_signature
+        self.moving_profile_stats["dense_cpp_sweep_workspace_binds"] = int(
+            self.moving_profile_stats.get("dense_cpp_sweep_workspace_binds", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_sweep_workspace_bind_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_sweep_workspace_bind_seconds", 0.0)
+        ) + elapsed
+        try:
+            stats = dict(owner.stats())
+            self.moving_profile_stats["dense_cpp_sweep_workspace_records"] = int(
+                stats.get("records", 0)
+            )
+        except Exception:
+            pass
+        return key
+
+    def solve_dense_cpp_workspace(
+        self,
+        key,
+        AA,
+        *,
+        tol,
+        max_iter,
+        restart_dim,
+        accept_unconverged,
+        backend,
+        block_davidson=False,
+        block_size=1,
+    ):
+        owner = self._dense_cpp_sweep_workspace
+        if owner is None or key is None:
+            return None
+        start = time.perf_counter()
+        try:
+            if bool(block_davidson) and hasattr(owner, "solve_bound_block"):
+                result = owner.solve_bound_block(
+                    str(key),
+                    np.asarray(AA, dtype=np.complex128).reshape(-1),
+                    float(tol),
+                    int(max_iter),
+                    int(restart_dim),
+                    bool(accept_unconverged),
+                    str(backend),
+                    max(1, int(block_size)),
+                )
+            else:
+                result = owner.solve_bound(
+                    str(key),
+                    np.asarray(AA, dtype=np.complex128).reshape(-1),
+                    float(tol),
+                    int(max_iter),
+                    int(restart_dim),
+                    bool(accept_unconverged),
+                    str(backend),
+                )
+        except Exception as exc:
+            self.moving_profile_stats["dense_cpp_sweep_workspace_failures"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_failures",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_cpp_sweep_workspace_last_error"] = str(exc)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_sweep_workspace_solve_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_sweep_workspace_solve_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_sweep_workspace_solve_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_sweep_workspace_solve_seconds", 0.0)
+        ) + elapsed
+        if bool(result.get("block_davidson", False)):
+            self.moving_profile_stats["dense_cpp_sweep_workspace_block_davidson_calls"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_block_davidson_calls",
+                    0,
+                )
+            ) + 1
+        try:
+            stats = dict(owner.stats())
+            self.moving_profile_stats["dense_cpp_sweep_workspace_records"] = int(
+                stats.get("records", 0)
+            )
+        except Exception:
+            pass
+        return result
+
+    def solve_dense_cpp_two_site_workspace(
+        self,
+        E,
+        W1,
+        W2,
+        F,
+        A,
+        B,
+        *,
+        bond=None,
+        nstates=1,
+        tol=1.0e-9,
+        max_iter=5000,
+        matvec_options=None,
+    ):
+        options = self.matvec_options if matvec_options is None else matvec_options
+        if int(nstates) != 1:
+            return None
+        if not bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_two_site_solve",
+                bool(
+                    self._option_value(
+                        options,
+                        "moving_environment_dense_cpp_davidson",
+                        False,
+                    )
+                ),
+            )
+        ):
+            return None
+        owner = self._dense_cpp_sweep_owner(options)
+        if owner is None or not hasattr(owner, "solve_two_site"):
+            return None
+        if not all(isinstance(x, np.ndarray) for x in (E, W1, W2, F, A, B)):
+            return None
+        key = self._dense_cpp_workspace_key(bond)
+        restart_dim = int(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_restart_dim",
+                min(max(8, int(max_iter)), 64),
+            )
+        )
+        backend = str(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_backend",
+                "blas",
+            )
+        )
+        accept_unconverged = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_accept_unconverged",
+                False,
+            )
+        )
+        reuse_static_w = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_reuse_static_w",
+                True,
+            )
+        )
+        block_davidson = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_block_davidson",
+                False,
+            )
+        )
+        block_size = max(
+            1,
+            int(
+                self._option_value(
+                    options,
+                    "moving_environment_dense_cpp_block_davidson_size",
+                    2,
+                )
+            ),
+        )
+        self.bond = None if bond is None else int(bond)
+        self.operator = None
+        self._operatorless_local_problem_active = False
+        self._dense_operatorless_local_problem_active = True
+        self._dense_operatorless_key = key
+        self.moving_profile_stats["solve_local_calls"] = int(
+            self.moving_profile_stats.get("solve_local_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_solve_local_calls"] = int(
+            self.moving_profile_stats.get("dense_solve_local_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_operatorless_local_problem_solve_calls"] = int(
+            self.moving_profile_stats.get(
+                "dense_operatorless_local_problem_solve_calls",
+                0,
+            )
+        ) + 1
+        start = time.perf_counter()
+        try:
+            if block_davidson and hasattr(owner, "solve_two_site_block"):
+                result = owner.solve_two_site_block(
+                    str(key),
+                    np.asarray(E, dtype=np.complex128),
+                    np.asarray(W1, dtype=np.complex128),
+                    np.asarray(W2, dtype=np.complex128),
+                    np.asarray(F, dtype=np.complex128),
+                    np.asarray(A, dtype=np.complex128),
+                    np.asarray(B, dtype=np.complex128),
+                    float(tol),
+                    int(max_iter),
+                    int(restart_dim),
+                    bool(accept_unconverged),
+                    str(backend),
+                    bool(reuse_static_w),
+                    int(block_size),
+                )
+            else:
+                result = owner.solve_two_site(
+                    str(key),
+                    np.asarray(E, dtype=np.complex128),
+                    np.asarray(W1, dtype=np.complex128),
+                    np.asarray(W2, dtype=np.complex128),
+                    np.asarray(F, dtype=np.complex128),
+                    np.asarray(A, dtype=np.complex128),
+                    np.asarray(B, dtype=np.complex128),
+                    float(tol),
+                    int(max_iter),
+                    int(restart_dim),
+                    bool(accept_unconverged),
+                    str(backend),
+                    bool(reuse_static_w),
+                )
+        except Exception as exc:
+            elapsed = float(time.perf_counter() - start)
+            self.moving_profile_stats["dense_cpp_sweep_workspace_failures"] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_failures",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_cpp_sweep_workspace_last_error"] = str(exc)
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_solve_rejections"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_two_site_solve_rejections",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats["dense_solve_local_seconds"] = float(
+                self.moving_profile_stats.get("dense_solve_local_seconds", 0.0)
+            ) + elapsed
+            return None
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_sweep_workspace_two_site_solve_calls"] = int(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_solve_calls",
+                0,
+            )
+        ) + 1
+        self.moving_profile_stats[
+            "dense_cpp_sweep_workspace_two_site_solve_seconds"
+        ] = float(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_solve_seconds",
+                0.0,
+            )
+        ) + elapsed
+        self.moving_profile_stats["solve_local_seconds"] = float(
+            self.moving_profile_stats.get("solve_local_seconds", 0.0)
+        ) + elapsed
+        self.moving_profile_stats["solve_local_last_seconds"] = elapsed
+        self.moving_profile_stats["dense_solve_local_seconds"] = float(
+            self.moving_profile_stats.get("dense_solve_local_seconds", 0.0)
+        ) + elapsed
+        self.moving_profile_stats["dense_solve_local_last_seconds"] = elapsed
+        self.moving_profile_stats[
+            "dense_operatorless_local_problem_solve_seconds"
+        ] = float(
+            self.moving_profile_stats.get(
+                "dense_operatorless_local_problem_solve_seconds",
+                0.0,
+            )
+        ) + elapsed
+        self.moving_profile_stats[
+            "dense_operatorless_local_problem_solve_last_seconds"
+        ] = elapsed
+        try:
+            stats = dict(owner.stats())
+            self.moving_profile_stats["dense_cpp_sweep_workspace_records"] = int(
+                stats.get("records", 0)
+            )
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_static_w_reuses"
+            ] = int(stats.get("two_site_static_w_reuses", 0))
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_mpo_builds"
+            ] = int(stats.get("two_site_mpo_builds", 0))
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_mps_builds"
+            ] = int(stats.get("two_site_mps_builds", 0))
+            self.moving_profile_stats["dense_cpp_sweep_workspace_binds"] = int(
+                stats.get("bind_calls", 0)
+            )
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_boundary_binds"
+            ] = int(stats.get("boundary_bind_calls", 0))
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_block_solve_bound_calls"
+            ] = int(stats.get("block_solve_bound_calls", 0))
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_block_solve_calls"
+            ] = int(stats.get("two_site_block_solve_calls", 0))
+        except Exception:
+            pass
+        if result is None or not bool(result.get("accepted", False)):
+            self.moving_profile_stats["solve_local_rejections"] = int(
+                self.moving_profile_stats.get("solve_local_rejections", 0)
+            ) + 1
+            self.moving_profile_stats["dense_solve_local_rejections"] = int(
+                self.moving_profile_stats.get("dense_solve_local_rejections", 0)
+            ) + 1
+            self.moving_profile_stats[
+                "dense_operatorless_local_problem_solve_rejections"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_operatorless_local_problem_solve_rejections",
+                    0,
+                )
+            ) + 1
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_two_site_solve_rejections"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_two_site_solve_rejections",
+                    0,
+                )
+            ) + 1
+            return None
+        vector = np.asarray(result["vector"]).reshape(-1)
+        energy = float(result["energy"])
+        meta = dict(result)
+        meta.pop("vector", None)
+        record_stats = {}
+        try:
+            record_stats = dict(owner.record_stats(str(key)))
+        except Exception:
+            record_stats = {}
+        if record_stats:
+            meta["stats"] = record_stats
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_batched_matvec_calls"
+            ] = int(record_stats.get("batched_matvec_calls", 0))
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_batched_matvec_vectors"
+            ] = int(record_stats.get("batched_matvec_vectors", 0))
+        solver_kind = str(meta.get("kind", "cpp_dense_davidson"))
+        self._dense_local_profile_stats = {
+            "bond": self.bond,
+            "matvec_calls": 0,
+            "matvec_seconds": 0.0,
+            "paths": {},
+            "local_solver": {},
+            "cpp_dense_davidson": meta,
+        }
+        matvec_calls = int(meta.get("matvec_calls", 0))
+        matvec_seconds = float(meta.get("seconds", elapsed))
+        self._dense_local_profile_stats["local_solver"] = {
+            "kind": solver_kind,
+            "dimension": int(vector.size),
+            "roots": int(nstates),
+            "seconds": elapsed,
+            "tol": float(tol),
+            "max_iter": int(max_iter),
+            "backend": str(meta.get("backend", backend)),
+            "iterations": int(meta.get("iterations", 0)),
+            "residual_norm": float(meta.get("residual_norm", np.nan)),
+            "workspace_reused": bool(meta.get("workspace_reused", False)),
+            "matvec_calls": matvec_calls,
+            "operatorless": True,
+            "two_site_solver": True,
+            "block_davidson": bool(meta.get("block_davidson", False)),
+            "block_size": int(meta.get("block_size", 1)),
+        }
+        self._record_dense_operatorless_path(
+            (
+                "dense_cpp_block_davidson_"
+                if bool(meta.get("block_davidson", False))
+                else "dense_cpp_davidson_"
+            )
+            + str(meta.get("backend", backend)),
+            matvec_seconds,
+            matvec_calls,
+        )
+        self.moving_profile_stats["solve_local_accepts"] = int(
+            self.moving_profile_stats.get("solve_local_accepts", 0)
+        ) + 1
+        self.moving_profile_stats["dense_solve_local_accepts"] = int(
+            self.moving_profile_stats.get("dense_solve_local_accepts", 0)
+        ) + 1
+        self.moving_profile_stats[
+            "dense_operatorless_local_problem_solve_accepts"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_operatorless_local_problem_solve_accepts",
+                0,
+            )
+        ) + 1
+        self.moving_profile_stats[
+            "dense_cpp_sweep_workspace_two_site_solve_accepts"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_solve_accepts",
+                0,
+            )
+        ) + 1
+        if bool(meta.get("block_davidson", False)):
+            self.moving_profile_stats[
+                "dense_cpp_sweep_workspace_block_davidson_accepts"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_cpp_sweep_workspace_block_davidson_accepts",
+                    0,
+                )
+            ) + 1
+        return np.array([energy]), vector[:, None]
+
+    def dense_cpp_workspace_record_stats(self, key):
+        owner = self._dense_cpp_sweep_workspace
+        if owner is None or key is None:
+            return {}
+        try:
+            return dict(owner.record_stats(str(key)))
+        except Exception:
+            return {}
+
+    def split_dense_single_state_cpp(
+        self,
+        flat,
+        *,
+        chi_left,
+        phys_left,
+        phys_right,
+        chi_right,
+        m_max,
+        direction,
+    ):
+        if (
+            _cpp_davidson is None
+            or not bool(getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False))
+            or getattr(_cpp_davidson, "lapack_svd", None) is None
+        ):
+            return None
+        if not bool(
+            self._option_value(
+                self.matvec_options,
+                "moving_environment_dense_cpp_split",
+                True,
+            )
+        ):
+            return None
+        self.moving_profile_stats["dense_cpp_split_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_split_calls", 0)
+        ) + 1
+        start = time.perf_counter()
+        try:
+            theta = np.asarray(flat, dtype=np.complex128).reshape(
+                int(chi_left),
+                int(phys_left),
+                int(phys_right),
+                int(chi_right),
+            )
+            matrix = theta.reshape(
+                int(chi_left) * int(phys_left),
+                int(phys_right) * int(chi_right),
+            )
+            U, S, V = _cpp_davidson.lapack_svd(matrix)
+            U = np.asarray(U, dtype=np.complex128)
+            S = np.asarray(S, dtype=float)
+            V = np.asarray(V, dtype=np.complex128)
+            U, S, V = _canonicalize_svd_pair(U, S, V)
+            kept = min(int(len(S)), int(m_max))
+            trunc = float(np.sum(S[kept:]))
+            S = S[:kept]
+            A = U[:, :kept].reshape(int(chi_left), int(phys_left), kept)
+            B = V[:kept, :].reshape(kept, int(phys_right), int(chi_right))
+            if str(direction) == "right":
+                B = S[:, None, None] * B
+            else:
+                if str(direction) != "left":
+                    raise ValueError(f"unknown dense split direction {direction!r}")
+                A = A * S[None, None, :]
+        except Exception as exc:
+            self.moving_profile_stats["dense_cpp_split_failures"] = int(
+                self.moving_profile_stats.get("dense_cpp_split_failures", 0)
+            ) + 1
+            self.moving_profile_stats["dense_cpp_split_last_error"] = str(exc)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_split_accepts"] = int(
+            self.moving_profile_stats.get("dense_cpp_split_accepts", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_split_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_split_seconds", 0.0)
+        ) + elapsed
+        self.moving_profile_stats["dense_cpp_split_last_seconds"] = elapsed
+        return A, B, trunc, kept
+
+    def set_dense_bond(self, E, W, F, *, bond=None, matvec_options=None):
+        self.bond = None if bond is None else int(bond)
+        options = self.matvec_options if matvec_options is None else matvec_options
+        self._operatorless_local_problem_active = False
+        self._dense_operatorless_local_problem_active = False
+        self._dense_operatorless_key = None
+        dense_cpp_key = self.bind_dense_cpp_workspace(
+            E,
+            W,
+            F,
+            bond=bond,
+            matvec_options=options,
+        )
+        if (
+            dense_cpp_key is not None
+            and bool(
+                self._option_value(
+                    options,
+                    "moving_environment_dense_cpp_operatorless",
+                    True,
+                )
+            )
+        ):
+            self.operator = None
+            self._dense_operatorless_local_problem_active = True
+            self._dense_operatorless_key = dense_cpp_key
+            self._dense_local_profile_stats = {
+                "bond": self.bond,
+                "matvec_calls": 0,
+                "matvec_seconds": 0.0,
+                "paths": {},
+                "local_solver": {},
+                "cpp_dense_davidson": {},
+            }
+            self.moving_profile_stats["dense_operatorless_local_problem_binds"] = int(
+                self.moving_profile_stats.get(
+                    "dense_operatorless_local_problem_binds",
+                    0,
+                )
+            ) + 1
+            return self
+        reused = False
+        reuse_enabled = bool(
+            self._option_value(
+                options,
+                "moving_environment_reuse_local_operator",
+                True,
+            )
+        )
+        if reuse_enabled and isinstance(self.operator, DenseLocalProblem):
+            reused = bool(
+                self.operator.reset_local_problem(
+                    E,
+                    W,
+                    F,
+                    bond=bond,
+                    matvec_options=options,
+                )
+            )
+        if reused:
+            self.moving_profile_stats["local_operator_reuses"] = int(
+                self.moving_profile_stats.get("local_operator_reuses", 0)
+            ) + 1
+            self.moving_profile_stats["dense_local_operator_reuses"] = int(
+                self.moving_profile_stats.get("dense_local_operator_reuses", 0)
+            ) + 1
+        else:
+            self.operator = DenseLocalProblem(
+                E,
+                W,
+                F,
+                bond=bond,
+                matvec_options=options,
+            )
+            self.moving_profile_stats["local_operator_builds"] = int(
+                self.moving_profile_stats.get("local_operator_builds", 0)
+            ) + 1
+            self.moving_profile_stats["dense_local_operator_builds"] = int(
+                self.moving_profile_stats.get("dense_local_operator_builds", 0)
+            ) + 1
+        self.operator._moving_environment = self
+        self.operator._dense_cpp_sweep_workspace_key = dense_cpp_key
+        return self
+
     def bind_owner_operatorless_local_problem(
         self,
         E,
@@ -17797,7 +18452,10 @@ class MovingEnvironment:
         return self
 
     def local_operator(self):
-        if self._operatorless_local_problem_active:
+        if (
+            self._operatorless_local_problem_active
+            or self._dense_operatorless_local_problem_active
+        ):
             return self
         if self.operator is None:
             raise RuntimeError("MovingEnvironment has no active local operator")
@@ -18124,6 +18782,228 @@ class MovingEnvironment:
             self.moving_profile_stats["solve_local_accepts"] = int(
                 self.moving_profile_stats.get("solve_local_accepts", 0)
             ) + 1
+        return result
+
+    def _record_dense_operatorless_path(self, name, elapsed, calls):
+        paths = self._dense_local_profile_stats.setdefault("paths", {})
+        entry = paths.setdefault(
+            str(name),
+            {"calls": 0, "seconds": 0.0, "last_seconds": 0.0},
+        )
+        entry["calls"] = int(entry.get("calls", 0)) + int(calls)
+        entry["seconds"] = float(entry.get("seconds", 0.0)) + float(elapsed)
+        entry["last_seconds"] = float(elapsed)
+        self._dense_local_profile_stats["matvec_calls"] = int(
+            self._dense_local_profile_stats.get("matvec_calls", 0)
+        ) + int(calls)
+        self._dense_local_profile_stats["matvec_seconds"] = float(
+            self._dense_local_profile_stats.get("matvec_seconds", 0.0)
+        ) + float(elapsed)
+
+    def _solve_dense_operatorless_cpp(
+        self,
+        AA,
+        nstates,
+        *,
+        tol=1.0e-9,
+        max_iter=5000,
+    ):
+        if int(nstates) != 1:
+            self.moving_profile_stats[
+                "dense_operatorless_local_problem_solve_rejections"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_operatorless_local_problem_solve_rejections",
+                    0,
+                )
+            ) + 1
+            return None
+        key = self._dense_operatorless_key
+        if key is None:
+            return None
+        restart_dim = int(
+            self._option_value(
+                self.matvec_options,
+                "moving_environment_dense_cpp_davidson_restart_dim",
+                min(max(8, int(max_iter)), 64),
+            )
+        )
+        backend = str(
+            self._option_value(
+                self.matvec_options,
+                "moving_environment_dense_cpp_davidson_backend",
+                "blas",
+            )
+        )
+        accept_unconverged = bool(
+            self._option_value(
+                self.matvec_options,
+                "moving_environment_dense_cpp_davidson_accept_unconverged",
+                False,
+            )
+        )
+        solver_start = time.perf_counter()
+        result = self.solve_dense_cpp_workspace(
+            key,
+            AA,
+            tol=float(tol),
+            max_iter=int(max_iter),
+            restart_dim=restart_dim,
+            accept_unconverged=accept_unconverged,
+            backend=backend,
+        )
+        solver_seconds = float(time.perf_counter() - solver_start)
+        if result is None or not bool(result.get("accepted", False)):
+            self.moving_profile_stats[
+                "dense_operatorless_local_problem_solve_rejections"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_operatorless_local_problem_solve_rejections",
+                    0,
+                )
+            ) + 1
+            rejection = {} if result is None else dict(result)
+            rejection.pop("vector", None)
+            self._dense_local_profile_stats["cpp_dense_davidson_last_rejection"] = (
+                rejection
+            )
+            return None
+        vector = np.asarray(result["vector"]).reshape(-1)
+        energy = float(result["energy"])
+        meta = dict(result)
+        meta.pop("vector", None)
+        cpp_stats = self.dense_cpp_workspace_record_stats(key)
+        meta["stats"] = cpp_stats
+        self._dense_local_profile_stats["cpp_dense_davidson"] = meta
+        nloc = int(np.asarray(AA).size)
+        matvec_calls = int(meta.get("matvec_calls", 0))
+        matvec_seconds = float(meta.get("seconds", solver_seconds))
+        self._dense_local_profile_stats["local_solver"] = {
+            "kind": "cpp_dense_davidson",
+            "dimension": int(nloc),
+            "roots": int(nstates),
+            "seconds": solver_seconds,
+            "tol": float(tol),
+            "max_iter": int(max_iter),
+            "backend": str(meta.get("backend", backend)),
+            "iterations": int(meta.get("iterations", 0)),
+            "residual_norm": float(meta.get("residual_norm", np.nan)),
+            "workspace_reused": bool(meta.get("workspace_reused", False)),
+            "matvec_calls": matvec_calls,
+            "operatorless": True,
+        }
+        self._record_dense_operatorless_path(
+            "dense_cpp_davidson_" + str(meta.get("backend", backend)),
+            matvec_seconds,
+            matvec_calls,
+        )
+        self.moving_profile_stats[
+            "dense_operatorless_local_problem_solve_accepts"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_operatorless_local_problem_solve_accepts",
+                0,
+            )
+        ) + 1
+        return np.array([energy]), vector[:, None]
+
+    def solve_dense_local(
+        self,
+        AA,
+        *,
+        nstates=1,
+        tol=1.0e-9,
+        max_iter=5000,
+        operator=None,
+    ):
+        if operator is None and self._dense_operatorless_local_problem_active:
+            local_operator = self
+        else:
+            local_operator = self.operator if operator is None else operator
+        if isinstance(local_operator, MovingEnvironment):
+            if local_operator._dense_operatorless_local_problem_active:
+                pass
+            else:
+                local_operator = local_operator.operator
+        dense_operatorless = (
+            isinstance(local_operator, MovingEnvironment)
+            and local_operator._dense_operatorless_local_problem_active
+        )
+        if not dense_operatorless and not isinstance(local_operator, DenseLocalProblem):
+            self.moving_profile_stats["dense_solve_local_rejections"] = int(
+                self.moving_profile_stats.get("dense_solve_local_rejections", 0)
+            ) + 1
+            self.moving_profile_stats["dense_solve_local_rejected_reason"] = (
+                "no_dense_local_problem"
+            )
+            return None
+        self.moving_profile_stats["solve_local_calls"] = int(
+            self.moving_profile_stats.get("solve_local_calls", 0)
+        ) + 1
+        self.moving_profile_stats["dense_solve_local_calls"] = int(
+            self.moving_profile_stats.get("dense_solve_local_calls", 0)
+        ) + 1
+        if dense_operatorless:
+            self.moving_profile_stats[
+                "dense_operatorless_local_problem_solve_calls"
+            ] = int(
+                self.moving_profile_stats.get(
+                    "dense_operatorless_local_problem_solve_calls",
+                    0,
+                )
+            ) + 1
+        start = time.perf_counter()
+        try:
+            if dense_operatorless:
+                result = local_operator._solve_dense_operatorless_cpp(
+                    AA,
+                    int(nstates),
+                    tol=float(tol),
+                    max_iter=int(max_iter),
+                )
+            else:
+                result = local_operator.solve(
+                    AA,
+                    int(nstates),
+                    tol=float(tol),
+                    maxiter=int(max_iter),
+                )
+        finally:
+            elapsed = float(time.perf_counter() - start)
+            self.moving_profile_stats["solve_local_seconds"] = float(
+                self.moving_profile_stats.get("solve_local_seconds", 0.0)
+            ) + elapsed
+            self.moving_profile_stats["solve_local_last_seconds"] = elapsed
+            self.moving_profile_stats["dense_solve_local_seconds"] = float(
+                self.moving_profile_stats.get("dense_solve_local_seconds", 0.0)
+            ) + elapsed
+            self.moving_profile_stats["dense_solve_local_last_seconds"] = elapsed
+            if dense_operatorless:
+                self.moving_profile_stats[
+                    "dense_operatorless_local_problem_solve_seconds"
+                ] = float(
+                    self.moving_profile_stats.get(
+                        "dense_operatorless_local_problem_solve_seconds",
+                        0.0,
+                    )
+                ) + elapsed
+                self.moving_profile_stats[
+                    "dense_operatorless_local_problem_solve_last_seconds"
+                ] = elapsed
+        if result is None:
+            self.moving_profile_stats["solve_local_rejections"] = int(
+                self.moving_profile_stats.get("solve_local_rejections", 0)
+            ) + 1
+            self.moving_profile_stats["dense_solve_local_rejections"] = int(
+                self.moving_profile_stats.get("dense_solve_local_rejections", 0)
+            ) + 1
+            return None
+        self.moving_profile_stats["solve_local_accepts"] = int(
+            self.moving_profile_stats.get("solve_local_accepts", 0)
+        ) + 1
+        self.moving_profile_stats["dense_solve_local_accepts"] = int(
+            self.moving_profile_stats.get("dense_solve_local_accepts", 0)
+        ) + 1
         return result
 
     def split_flat_two_site_svd_data(
@@ -22225,6 +23105,32 @@ class MovingEnvironment:
                     {},
                 ),
             }
+        elif self._dense_operatorless_local_problem_active:
+            paths = self._dense_local_profile_stats.get("paths", {})
+            dominant = None
+            if paths:
+                dominant = max(
+                    paths.items(),
+                    key=lambda item: float(item[1].get("seconds", 0.0)),
+                )[0]
+            summary = {
+                "bond": self.bond,
+                "matvec_calls": int(
+                    self._dense_local_profile_stats.get("matvec_calls", 0)
+                ),
+                "matvec_seconds": float(
+                    self._dense_local_profile_stats.get("matvec_seconds", 0.0)
+                ),
+                "dominant_path": dominant,
+                "paths": dict(paths),
+                "local_solver": dict(
+                    self._dense_local_profile_stats.get("local_solver", {})
+                ),
+                "cpp_dense_davidson": dict(
+                    self._dense_local_profile_stats.get("cpp_dense_davidson", {})
+                ),
+                "operatorless": True,
+            }
         else:
             summary = self.operator.profile_summary()
         summary["moving_environment"] = {
@@ -25743,6 +26649,62 @@ class MovingEnvironment:
                 self.moving_profile_stats.get("sweep_stack_family_count", 0)
             ),
         }
+        for key in (
+            "dense_local_operator_builds",
+            "dense_local_operator_reuses",
+            "dense_solve_local_calls",
+            "dense_solve_local_accepts",
+            "dense_solve_local_rejections",
+            "dense_solve_local_seconds",
+            "dense_solve_local_last_seconds",
+            "dense_cpp_sweep_workspace_enabled",
+            "dense_cpp_sweep_workspace_creates",
+            "dense_cpp_sweep_workspace_records",
+            "dense_cpp_sweep_workspace_binds",
+            "dense_cpp_sweep_workspace_bind_seconds",
+            "dense_cpp_sweep_workspace_boundary_binds",
+            "dense_cpp_sweep_workspace_boundary_bind_seconds",
+            "dense_cpp_sweep_workspace_static_w_hits",
+            "dense_cpp_sweep_workspace_bind_cache_hits",
+            "dense_cpp_sweep_workspace_solve_calls",
+            "dense_cpp_sweep_workspace_solve_seconds",
+            "dense_cpp_sweep_workspace_two_site_solve_calls",
+            "dense_cpp_sweep_workspace_two_site_solve_accepts",
+            "dense_cpp_sweep_workspace_two_site_solve_rejections",
+            "dense_cpp_sweep_workspace_two_site_solve_seconds",
+            "dense_cpp_sweep_workspace_two_site_static_w_reuses",
+            "dense_cpp_sweep_workspace_two_site_mpo_builds",
+            "dense_cpp_sweep_workspace_two_site_mps_builds",
+            "dense_cpp_sweep_workspace_failures",
+            "dense_cpp_sweep_workspace_last_error",
+            "dense_cpp_tensor_primitive_calls",
+            "dense_cpp_tensor_primitive_seconds",
+            "dense_cpp_tensor_primitive_failures",
+            "dense_cpp_tensor_primitive_last_error",
+            "dense_cpp_coarse_grain_mpo_calls",
+            "dense_cpp_coarse_grain_mpo_cache_hits",
+            "dense_cpp_coarse_grain_mps_calls",
+            "dense_cpp_environment_update_calls",
+            "dense_cpp_environment_update_seconds",
+            "dense_cpp_environment_update_failures",
+            "dense_operatorless_local_problem_binds",
+            "dense_operatorless_local_problem_solve_calls",
+            "dense_operatorless_local_problem_solve_accepts",
+            "dense_operatorless_local_problem_solve_rejections",
+            "dense_operatorless_local_problem_solve_seconds",
+            "dense_operatorless_local_problem_solve_last_seconds",
+            "dense_operatorless_local_problem_last_error",
+            "dense_cpp_split_calls",
+            "dense_cpp_split_accepts",
+            "dense_cpp_split_failures",
+            "dense_cpp_split_seconds",
+            "dense_cpp_split_last_seconds",
+            "dense_cpp_split_last_error",
+        ):
+            summary["moving_environment"][key] = self.moving_profile_stats.get(
+                key,
+                False if key.endswith("_enabled") else 0,
+            )
         return summary
 
 def dense_to_symmetric_mpo(
@@ -25929,185 +26891,232 @@ def dense_to_symmetric_mpo(
         if site_idx == 0 and len(final_blocks) > 0:
             sample_key = next(iter(final_blocks.keys()))
             if not is_sector_like(sample_key[0]):
-                 print(f"  [ERROR] Site 0 generated invalid sector keys: {sample_key}.")
+                logger.error("Site 0 generated invalid sector keys: %s", sample_key)
         current_nodes = next_nodes
     return sym_H
 
 
-from pyqed.mps.umps import UniformMPS
-
-
 class MPS:
-    def __init__(self, Bs, Ss=None, bc='finite', \
-                 labels=['lv', 'p', 'rv'], homogenous=False, center=-1, gauge=None):
-        """
-        Base class for matrix product states.
-        supports flexible tensor layouts via the `labels` argument.
+    """Finite matrix-product state.
+
+    Dense site tensors use ``("lv", "p", "rv")`` by default.  This ordering
+    keeps the two matrices used by canonicalization, ``(lv * p, rv)`` and
+    ``(lv, p * rv)``, contiguous in NumPy's row-major storage.  Other declared
+    input layouts remain supported and are converted on demand by
+    :meth:`_get_std_B`.
+    """
+
+    STANDARD_LABELS = ("lv", "p", "rv")
+    _GAUGE_ALIASES = {
+        "left": "left_canonical",
+        "left_canonical": "left_canonical",
+        "lv": "left_canonical",
+        "l": "left_canonical",
+        "right": "right_canonical",
+        "right_canonical": "right_canonical",
+        "rv": "right_canonical",
+        "r": "right_canonical",
+        "mixed": "mixed",
+    }
+
+    def __init__(
+        self,
+        Bs,
+        Ss=None,
+        bc="finite",
+        labels=STANDARD_LABELS,
+        homogenous=False,
+        center=-1,
+        gauge=None,
+    ):
+        """Create a finite MPS.
 
         Parameters
         ----------
-        Bs : list of np.ndarray
-            The site tensors.
-            - Must be a list of rank-3 tensors.
-            - Shape depends on `labels`, e.g., ['lv', 'p', 'rv'] -> means(Bond_L, Phys, Bond_R).
-
-        Ss : list of np.ndarray, optional
-            The bond singular values (Schmidt coefficients).
-            - `Ss[i]` corresponds to the bond between site `i` and `i+1`.
-            - Used for calculating entanglement entropy and handling canonical forms.
-
-        homogenous : bool, optional
-            If True, assumes all sites share the same physical dimension structure. Default is True.
-
-        bc : str, optional
-            Boundary conditions. Options:
-            - 'finite': Open Boundary Conditions (OBC).
-            - 'periodic': periodic Boundary Conditions (IBC/PBC).
-            default is 'finite'.
-
-        labels : list of str, optional
-            Describes the leg index order in tensors `Bs`.
-            The default is ['lv', 'p', 'rv'].
-
-            Supported Keys:
-            - 'lv': Left-Virtual (Bond to the left)
-            - 'rv': Right-Virtual (Bond to the right)
-            - 'p':  Physical (Local Hilbert space)
-
-            Common Examples:
-            - ['lv', 'p', 'rv']: Standard Dense format (Left, Phys, Right).
-            - ['p', 'lv', 'rv']: "Physics" format (Phys, Left, Right).
-            - ['lv', 'rv', 'p']: "BlockTensor" format (Left, Right, Phys).
-
-        Attributes
-        ----------
-        L : int
-            Number of sites (length of the chain).
-        nbonds : int
-            Number of bonds (L-1 for finite, L for periodic).
-        dim : int
-            Physical dimension (d) of the sites.
-        lv_idx, p_idx, rv_idx : int
-            Cached integer positions of the axes based on `labels`.
-        center : int
-            Canonical center site index. Default is -1 (no specific center).
+        Bs
+            Rank-three site tensors in the ordering declared by labels.
+        Ss
+            Optional Schmidt-value arrays, one per bond.
+        bc
+            Either "finite" or "periodic".
+        labels
+            A permutation of ("lv", "p", "rv").
+        homogenous
+            Whether all sites are known to have the same physical dimension.
+        center
+            Orthogonality-center index, or -1 when unspecified.
+        gauge
+            Optional canonical-gauge name or alias.
         """
-        assert bc in ['finite', 'periodic']
+        if bc not in {"finite", "periodic"}:
+            raise ValueError("bc must be either 'finite' or 'periodic'.")
+
+        tensors = list(Bs)
+        if not tensors:
+            raise ValueError("An MPS must contain at least one site tensor.")
+
         self.bc = bc
+        self.L = len(tensors)
+        self.nbonds = self.L - 1 if bc == "finite" else self.L
+        self.Ss = None if Ss is None else list(Ss)
 
-        self.L = len(Bs)
-        self.nbonds = self.L - 1 if self.bc == 'finite' else self.L
-        self.Ss = Ss
+        self.labels = self._validated_labels(labels)
+        self.lv_idx = self.labels.index("lv")
+        self.p_idx = self.labels.index("p")
+        self.rv_idx = self.labels.index("rv")
+        self.center, self.gauge = self._resolved_gauge(center, gauge)
 
-        if (center!= -1) and gauge is None:
-            self.center = center
-            self.gauge = None
-        elif (center == -1) and gauge is not None:
-            # assign canonical center by the canonical form of the assigned MPS state
-            gauge = gauge.lower()
-            self.gauge = gauge
+        self.Bs = tensors
+        self.data = self.Bs
+        self.factors = self.Bs
+        self.homogenous = bool(homogenous)
+        self.dims = [int(tensor.shape[self.p_idx]) for tensor in tensors]
+        if self.homogenous:
+            if len(set(self.dims)) != 1:
+                raise ValueError(
+                    "homogenous=True requires the same physical dimension at every site."
+                )
+            self.dim = self.dims[0]
 
-            if gauge in ['left', 'lv', 'l']:
-                self.center = self.L - 1
-            elif gauge in ['right', 'rv', 'r']:
-                self.center = 0
-            elif gauge in ['mixed']:
-                assert isinstance(center, int)
-                if not 0 <= center <= self.L:
-                    raise ValueError(f"Invalid center index {center} for MPS with {self.L} sites.")
-                self.center = center
-
-            else:
-                raise ValueError('Unrecognized gauge {gauge} for MPS')
-
-        elif (center == -1) and gauge is None:
-            # print('You are creating a MPS without a gauge. Suggest calling right_canonicalize() for canonicalization first.")')
-            self.gauge = None
-            self.center = center
-        else:
-            raise ValueError('Cannot specify both gauge and center. Use only one.')
-
-
-
-        # leg sequence
+    @classmethod
+    def _validated_labels(cls, labels):
         if labels is None:
-            warnings.warn("MPS labels not specified, assuming ['lv', 'p', 'rv'].")
-            self.labels = ['lv', 'p', 'rv']
-        else:
+            labels = cls.STANDARD_LABELS
+        labels = list(labels)
+        if len(labels) != 3 or set(labels) != set(cls.STANDARD_LABELS):
+            raise ValueError(
+                "MPS labels must be a permutation of ['lv', 'p', 'rv']; "
+                f"got {labels!r}."
+            )
+        return labels
 
-            if len(labels) != 3:
-                 warnings.warn(f"Warning: You provided {len(labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
-            self.labels = labels
+    def _resolved_gauge(self, center, gauge):
+        if not isinstance(center, (int, np.integer)):
+            raise TypeError("center must be an integer.")
+        center = int(center)
+
+        if gauge is None:
+            if center != -1 and not 0 <= center < self.L:
+                raise ValueError(
+                    f"Invalid center index {center} for MPS with {self.L} sites."
+                )
+            return center, None
 
         try:
-            self.lv_idx = self.labels.index('lv')
-            self.rv_idx = self.labels.index('rv')
-            self.p_idx = self.labels.index('p')
-        except ValueError as e:
-            missing_label = str(e).split()[-1]
-            raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
+            canonical_gauge = self._GAUGE_ALIASES[str(gauge).lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unrecognized gauge {gauge!r}.") from exc
 
-        # order legs to [left, phys, right]
-        if self.lv_idx != 0 and self.p_idx != 1:
-            Bs = [B.transpose(self.lv_idx, self.p_idx, self.rv_idx) for B in Bs]
+        if canonical_gauge == "left_canonical":
+            inferred_center = self.L - 1
+        elif canonical_gauge == "right_canonical":
+            inferred_center = 0
+        else:
+            if center == -1:
+                raise ValueError("gauge='mixed' requires an explicit center.")
+            inferred_center = center
 
-        self.Bs = self.data = self.factors = Bs
-
-
-        self.homogenous = homogenous
-        if homogenous:
-            try:
-                self.dim = Bs[0].shape[1]
-            except TypeError:
-                if hasattr(Bs[0], 'qns'):
-                    # U(1) tensors in this code are (Left, Right, Phys) -> Index 2 TODO: get that to Left Phy Right
-                    phys_dims = {}
-                    for key, block in Bs[0].data.items():
-                        # key is (qL, qR, qP)
-                        q_p = key[2]
-                        if q_p not in phys_dims:
-                            phys_dims[q_p] = block.shape[2]
-                    self.dim = sum(phys_dims.values())
-                else:
-                    self.dim = 0
-        else:  # inhomogenous
-
-            self.dims = []
-            for B in Bs:
-                try:
-                    self.dims.append(B.shape[1])
-                except TypeError:
-                    if hasattr(B, 'qns'):
-                        phys_dims = {}
-                        for key, block in B.data.items():
-                            q_p = key[2]
-                            if q_p not in phys_dims:
-                                phys_dims[q_p] = block.shape[2]
-                        self.dims.append(sum(phys_dims.values()))
-                    else:
-                        self.dims.append(0)
+        if center != -1 and center != inferred_center:
+            raise ValueError(
+                f"Gauge {canonical_gauge!r} requires center {inferred_center}, "
+                f"not {center}."
+            )
+        if not 0 <= inferred_center < self.L:
+            raise ValueError(
+                f"Invalid center index {inferred_center} for MPS with {self.L} sites."
+            )
+        return inferred_center, canonical_gauge
 
     def check_sanity(self):
-        # TODO make sure the specified gauge is correct
-        pass
+        """Validate tensor ranks, open boundaries, bonds, and metadata."""
+        if self.L == 0:
+            raise ValueError("An MPS must contain at least one site tensor.")
+        if len(self.Bs) != self.L:
+            raise ValueError("The stored MPS length is inconsistent with its tensors.")
+
+        dense_shapes = []
+        for i, tensor in enumerate(self.Bs):
+            rank = getattr(tensor, "rank", getattr(tensor, "ndim", None))
+            if rank != 3:
+                raise ValueError(f"MPS site {i} must have rank 3; got rank {rank}.")
+            if not hasattr(tensor, "qns"):
+                dense_shapes.append(tuple(int(n) for n in self._get_std_B(i).shape))
+
+        if dense_shapes:
+            if len(dense_shapes) != self.L:
+                raise TypeError("Dense and symmetry-blocked site tensors cannot be mixed.")
+            if any(dim <= 0 for shape in dense_shapes for dim in shape):
+                raise ValueError("MPS tensor dimensions must all be positive.")
+            if self.bc == 'finite':
+                if dense_shapes[0][0] != 1 or dense_shapes[-1][2] != 1:
+                    raise ValueError(
+                        "A finite MPS must have unit left and right boundary bonds."
+                    )
+            for i, (left, right) in enumerate(zip(dense_shapes, dense_shapes[1:])):
+                if left[2] != right[0]:
+                    raise ValueError(
+                        f"MPS bond {i} has incompatible dimensions "
+                        f"{left[2]} and {right[0]}."
+                    )
+
+        if self.Ss is not None:
+            if len(self.Ss) != self.nbonds:
+                raise ValueError(
+                    f"Expected {self.nbonds} Schmidt-value arrays, got {len(self.Ss)}."
+                )
+            for i, values in enumerate(self.Ss):
+                if values is not None and np.asarray(values).ndim != 1:
+                    raise ValueError(f"Schmidt values for bond {i} must be one-dimensional.")
+                if dense_shapes and values is not None:
+                    expected = dense_shapes[i][2]
+                    if np.asarray(values).size != expected:
+                        raise ValueError(
+                            f"Bond {i} has dimension {expected}, but its Schmidt "
+                            f"array has length {np.asarray(values).size}."
+                        )
+
+        if self.gauge == 'left_canonical' and self.center != self.L - 1:
+            raise ValueError("A left-canonical MPS must have its center at the last site.")
+        if self.gauge == 'right_canonical' and self.center != 0:
+            raise ValueError("A right-canonical MPS must have its center at the first site.")
+
+        if dense_shapes and self.gauge is not None:
+            atol = 1.0e-10
+            left_stop = self.center if self.gauge == 'mixed' else self.L - 1
+            right_start = self.center + 1 if self.gauge == 'mixed' else 1
+            if self.gauge in {'left_canonical', 'mixed'}:
+                for i in range(left_stop):
+                    B = self._get_std_B(i)
+                    mat = B.reshape(B.shape[0] * B.shape[1], B.shape[2])
+                    if not np.allclose(mat.conj().T @ mat, np.eye(mat.shape[1]), atol=atol):
+                        raise ValueError(f"Site {i} is not left-canonical.")
+            if self.gauge in {'right_canonical', 'mixed'}:
+                for i in range(right_start, self.L):
+                    B = self._get_std_B(i)
+                    mat = B.reshape(B.shape[0], B.shape[1] * B.shape[2])
+                    if not np.allclose(mat @ mat.conj().T, np.eye(mat.shape[0]), atol=atol):
+                        raise ValueError(f"Site {i} is not right-canonical.")
+        return True
 
     def copy(self):
-        return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss] if self.Ss is not None else None, self.bc, labels=self.labels)
+        copied = type(self)(
+            [B.copy() for B in self.Bs],
+            [None if S is None else S.copy() for S in self.Ss]
+            if self.Ss is not None else None,
+            self.bc,
+            labels=self.labels,
+            homogenous=self.homogenous,
+            center=self.center,
+        )
+        copied.gauge = self.gauge
+        return copied
 
     def bond_orders(self):
         """Return right bond dimensions for each site."""
-        orders = []
-        for tensor in self.factors:
-            if hasattr(tensor, "qns"):
-                orders.append(int(tensor.shape[1]))
-            else:
-                orders.append(int(tensor.shape[2]))
-        return orders
+        return [int(tensor.shape[self.rv_idx]) for tensor in self.factors]
 
-    def norm(self):
-        """
-        Calculate the MPS norm :math:`N = \sqrt{<\psi|\psi>}` robustly using standard layouts.
-        """
+    def norm_squared(self):
+        """Return the squared Hilbert-space norm ``<psi|psi>``."""
         if self.Bs and hasattr(self.Bs[0], "qns"):
             identity = [make_identity_mpo_site_from_mps_site(site) for site in self.Bs]
             env = initial_E(identity[0])
@@ -26115,205 +27124,147 @@ class MPS:
                 env = contract_from_left(W, site, env, site)
             return np.abs(abelian_environment_scalar(env))
 
-        if self.gauge is None:
+        if self.gauge in {"right_canonical", "left_canonical", "mixed"}:
+            B = self._get_std_B(self.center)
+            return np.real_if_close(np.vdot(B, B))
 
-            val = np.ones((1, 1), dtype=complex)
-            for i in range(self.L):
-                B = self._get_std_B(i) # (lv, p, rv)
-                val = np.einsum("ab,api,bpj->ij", val, B.conj(), B, optimize=True)
-            return np.abs(val[0, 0])
+        val = np.ones((1, 1), dtype=complex)
+        for i in range(self.L):
+            B = self._get_std_B(i)
+            val = np.einsum("ab,api,bpj->ij", val, B.conj(), B, optimize=True)
+        return np.abs(val[0, 0])
 
-        elif self.gauge == 'right_canonical':
-            B = self.Bs[0]
-            return np.einsum('aib, aib ->', B.conj(), B)
+    def norm(self):
+        """Return ``<psi|psi>`` (the historical squared-norm API).
 
-        elif self.gauge == 'left_canonical':
-            B = self.Bs[-1]
-            return np.einsum('aib, aib ->', B.conj(), B)
-
-        elif self.gauge == 'mixed':
-            B = self.Bs[self.center]
-            return np.einsum('aib, aib ->', B.conj(), B)
+        Use ``sqrt(mps.norm())`` for the Hilbert-space norm.  The explicit
+        :meth:`norm_squared` spelling is available for new code.
+        """
+        return self.norm_squared()
 
     def normalize(self):
-        """
-        normalize a MPS norm :math:`N = \sqrt{<\psi|\psi>}`
-        """
-        if self.Bs and hasattr(self.Bs[0], "qns"):
-            norm2 = self.norm()
-            if norm2 < 1e-12:
-                import warnings
-                warnings.warn(f'Norm {norm2} is too small.')
-            self.Bs[0] = self.Bs[0] * (1.0 / np.sqrt(np.abs(norm2)))
-            self.data = self.factors = self.Bs
-            return self
-
-        if self.gauge is None:
-
-            val = np.ones((1, 1), dtype=complex)
-            for i in range(self.L):
-                B = self._get_std_B(i) # (lv, p, rv)
-                val = np.einsum("ab,api,bpj->ij", val, B.conj(), B, optimize=True)
-
-            # if val < 1e-12: raise warnings.warn('Norm {val} is too small.')
-            val_scalar = np.abs(np.atleast_1d(val)[0])
-            if val_scalar < 1e-12:
-                import warnings
-                warnings.warn(f'Norm {val_scalar} is too small.')
-
-            self.Bs[0] /=  np.sqrt(np.abs(val[0, 0]))
-
-        elif self.gauge == 'right_canonical':
-            B = self.Bs[0]
-            self.Bs[0] /= np.sqrt(np.einsum('aib, aib ->', B.conj(), B))
-
-        elif self.gauge == 'left_canonical':
-            B = self.Bs[-1]
-            self.Bs[-1] /= np.einsum('aib, aib ->', B.conj(), B)
-
-        elif self.gauge == 'mixed':
-            B = self.Bs[self.center]
-            self.Bs[self.center] /= np.einsum('aib, aib ->', B.conj(), B)
-
+        """Normalize the MPS in place to ``<psi|psi> = 1``."""
+        norm2 = float(np.real(self.norm_squared()))
+        if norm2 < 1.0e-24:
+            raise ValueError("Cannot normalize a zero MPS.")
+        site = self.center if self.gauge is not None else 0
+        self.Bs[site] = self.Bs[site] * (1.0 / np.sqrt(norm2))
         return self
 
 
     def set_labels(self, new_labels):
-        """
-        Allow user to manually assign/correct labels after creation.
-
-        Common examples:
-        - ['lv', 'p', 'rv']  (Left-Virtual, Physical, Right-Virtual)
-        - ['lv', 'rv', 'p']  (Left-Virtual, Right-Virtual, Physical)
-        - ['p', 'lv', 'rv']  (Physical, Left-Virtual, Right-Virtual)
-        """
+        """Transpose all tensors in place to ``new_labels`` ordering."""
+        new_labels = self._validated_labels(new_labels)
+        if new_labels == self.labels:
+            return self
+        perm = [self.labels.index(label) for label in new_labels]
+        self.Bs[:] = [tensor.transpose(perm) for tensor in self.Bs]
         self.labels = new_labels
-        try:
-            self.lv_idx = self.labels.index('lv')
-            self.rv_idx = self.labels.index('rv')
-            self.p_idx = self.labels.index('p')
-        except ValueError as e:
-            missing_label = str(e).split()[-1]
-            raise ValueError(f"MPS initialization failed: The label list {self.labels} is missing the required label {missing_label}.")
-        if len(self.labels) != 3:
-             warnings.warn(f"Warning: You provided {len(self.labels)} labels but MPS tensors are usually Rank-3. Ensure your boundaries have dummy indices.")
+        self.lv_idx = self.labels.index('lv')
+        self.rv_idx = self.labels.index('rv')
+        self.p_idx = self.labels.index('p')
+        return self
 
 
     def to_order(self, target_labels):
-        """Returns a new MPS with tensors transposed to target_labels.
-        DEPRECATED. Use transpose()"""
+        """Return a copy with tensors transposed to ``target_labels``."""
+        target_labels = self._validated_labels(target_labels)
         if self.labels == target_labels:
             return self.copy()
 
         perm = [self.labels.index(l) for l in target_labels]
         new_Bs = [B.transpose(perm) for B in self.Bs]
-        return MPS(new_Bs, self.Ss, self.bc, labels=target_labels)
+        result = MPS(
+            new_Bs,
+            self.Ss,
+            self.bc,
+            labels=target_labels,
+            homogenous=self.homogenous,
+            center=self.center,
+        )
+        result.gauge = self.gauge
+        return result
 
     def transpose(self, labels):
-        """
-        transpose ALL tensors to target sequence
-
-        Parameters
-        ----------
-        labels : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
+        """Return a copy with tensors transposed to ``labels`` ordering."""
         return self.to_order(labels)
 
     def _get_std_B(self, i):
-        """
-        Internal Helper: Returns B[i] transposed to standard [Left, Phys, Right].
-        """
+        """Return dense site ``i`` in ``(left, physical, right)`` order."""
         B = self.Bs[i]
-        # Check if it has data AND that data is a dict (BlockTensor structure)
-        if hasattr(B, 'qns') and isinstance(B.data, dict):
+        # Symmetry tensors retain their native (left, right, physical) layout;
+        # their contraction kernels consume that representation directly.
+        if hasattr(B, "qns") and isinstance(B.data, dict):
             return B
         return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
     def get_bond_dimensions(self):
-        try:
-            return [self.Bs[i].shape[self.rv_idx] for i in range(self.nbonds)]
-        except (TypeError, AttributeError):
-             bonds = []
-             for i in range(self.nbonds):
-                 B = self.Bs[i]
-                 bond_dims = {}
-                 for key, block in B.data.items():
-                     q_r = key[2]
-                     if q_r not in bond_dims:
-                         bond_dims[q_r] = block.shape[2]
-                 bonds.append(sum(bond_dims.values()))
-             return bonds
+        """Return the dimension of every internal right bond."""
+        return [int(self.Bs[i].shape[self.rv_idx]) for i in range(self.nbonds)]
 
     def get_singular_values(self, bond_id):
-        pass
+        if not isinstance(bond_id, (int, np.integer)):
+            raise TypeError("bond_id must be an integer.")
+        bond_id = int(bond_id)
+        if not 0 <= bond_id < self.nbonds:
+            raise IndexError(
+                f"Bond {bond_id} out of range for an MPS with {self.nbonds} bonds."
+            )
+        if self.Ss is None or self.Ss[bond_id] is None:
+            raise ValueError(
+                "Schmidt values are unavailable; canonicalize the MPS first."
+            )
+        return np.asarray(self.Ss[bond_id]).copy()
 
     def __add__(self, other):
-        """
-        Sum of two MPS states: |Result> = |self> + |other>
+        """Return the direct-sum MPS representing ``self + other``."""
+        if not isinstance(other, MPS):
+            return NotImplemented
+        if self.L != other.L or self.dims != other.dims:
+            raise ValueError("MPS addition requires matching site dimensions.")
+        if self.bc != "finite" or other.bc != "finite":
+            raise NotImplementedError("MPS addition currently supports finite states only.")
+        if self.L == 1:
+            return type(self)([self._get_std_B(0) + other._get_std_B(0)])
 
-        Logic:
-        - First Site: Concatenate [A, B] horizontally.
-        - Middle Sites: Block Diagonal.
-        - Last Site: Concatenate [[A], [B]] vertically.
-
-        not using block_diag from scipy since first site need to be row vector and last site need to be column vector.
-        """
-        assert self.L == other.L
-
-        C = []
-        for j in range(self.L):
-            A = self._get_std_B(j)
-            B = other._get_std_B(j)
+        factors = []
+        for site in range(self.L):
+            A = self._get_std_B(site)
+            B = other._get_std_B(site)
 
             la, d, ra = A.shape
             lb, _, rb = B.shape
 
-            if j == 0:
-                # first site is Row Vector [A, B]
-                # Left dim stays 1 (assuming La=Lb=1)
-                # Right dim sums: Ra + Rb
+            if site == 0:
                 new_tensor = np.zeros((la, d, ra + rb), dtype=np.result_type(A, B))
                 new_tensor[:, :, :ra] = A
                 new_tensor[:, :, ra:] = B
-
-            elif j == self.L - 1:
-                # last iste is Column Vector [[A], [B]]
-                # Left dim sums: La + Lb
-                # Right dim stays 1 (assuming Ra=Rb=1)
+            elif site == self.L - 1:
                 new_tensor = np.zeros((la + lb, d, ra), dtype=np.result_type(A, B))
                 new_tensor[:la, :, :] = A
                 new_tensor[la:, :, :] = B
-
             else:
-                # middles sites are Block Diagonal
-                # Left sums, Right sums
                 new_tensor = np.zeros((la + lb, d, ra + rb), dtype=np.result_type(A, B))
                 new_tensor[:la, :, :ra] = A
                 new_tensor[la:, :, ra:] = B
+            factors.append(new_tensor)
 
-            C.append(new_tensor)
-
-        return MPS(C, labels=['lv', 'p', 'rv'])
+        return type(self)(factors)
 
     def __getitem__(self, i):
-        """Allows reading site tensors like a list: tensor = mps[i]"""
+        """Return site tensor ``i``."""
         return self.Bs[i]
 
     def __setitem__(self, i, value):
-        """Allows updating site tensors like a list: mps[i] = new_tensor"""
+        """Replace site tensor ``i`` and invalidate canonical metadata."""
         self.Bs[i] = value
-        # Note: Because self.Bs, self.data, and self.factors point to the same list,
-        # updating self.Bs[i] automatically updates the others!
+        self.dims[i] = int(value.shape[self.p_idx])
+        self.Ss = None
+        self.center = -1
+        self.gauge = None
 
     def __len__(self):
-        """Allows getting the number of sites using len(mps)"""
+        """Return the number of sites."""
         return self.L
 
     def entanglement_entropy(self):
@@ -26337,7 +27288,7 @@ class MPS:
         """
         tensor = self._get_std_B(i)
         if self.center == -1:
-            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta1(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+            raise ValueError("Canonicalize the MPS before requesting a center tensor.")
         # Right of Center
         if i > self.center:
             if i == 0:
@@ -26365,17 +27316,15 @@ class MPS:
         """
         j = (i + 1) % self.L
         if self.center < 0 or self.center > self.L -1:
-            raise NotImplementedError("need to first do canonicalization to have a center site for get_theta2(), currently have not implemented the functions for that. TODO: maybe we will do self.shift_center(i) later. Buy me a coffee to prioritize this feature.")
+            raise ValueError("Canonicalize the MPS before requesting a two-site tensor.")
         # The bond (i, j) is the center
         # i is Left-Canonical (A), j is Right-Canonical (B)
         if i == self.center:
-            A_i = self._get_std_B(i) # Pure tensor
-            S_mid = self.Ss[i]
-            B_j = self._get_std_B(j) # Pure tensor
-            # A_i * S_mid
-            temp = np.tensordot(A_i, np.diag(S_mid), axes=([2], [0]))
-            # (A_i * S_mid) * B_j
-            return np.tensordot(temp, B_j, axes=([2], [0]))
+            # The center tensor already carries the Schmidt weights.  Inserting
+            # Ss[i] again would square them and corrupt two-site observables.
+            return np.tensordot(
+                self._get_std_B(i), self._get_std_B(j), axes=([2], [0])
+            )
         # Entire block is to the Right of Center
         # theta1(i) * B_j
         elif self.center != -1 and i > self.center:
@@ -26468,56 +27417,25 @@ class MPS:
         return C
 
     def evolve_v(self, other):
-        """
-        apply the evolution operator due to V(R) to the wavefunction in the TT format
+        """Return the sitewise physical-index product with ``other``."""
+        if not isinstance(other, MPS) or other.L != self.L or other.dims != self.dims:
+            raise ValueError("Sitewise MPS products require matching site dimensions.")
 
-                    |   |
-                ---V---V---
-                    |   |
-                    |   |
-                ---A---A---
-            =
-                    |   |
-                ===B===B===
-
-        .. math::
-
-            U_{\beta_i \beta_{i+1}}^{j_i} A_{\alpha_i \alpha_{i+1}}^{j_i} =
-            A^{j_i}_{\beta_i \alpha_i, \beta_{i+1} \alpha_{i+1}}
-
-        Parameters
-        ----------
-        other : TYPE
-            DESCRIPTION.
-
-        Returns
-        -------
-        MPS object.
-
-        """
-        assert(other.L == self.L)
-        assert(other.dims == self.dims)
-
-        As = []
-        for n in range(self.L):
-
-            A = self._get_std_B(n)
-            V = other._get_std_B(n)
-
-            al, d, ar = A.shape
-            vl, d, vr = V.shape
-
-            c = np.einsum('aib, cid -> acibd', V, A)
-            c = c.reshape((al * vl, d, ar * vr))
-            As.append(c.copy())
-
-        return MPS(As, labels=['lv', 'p', 'rv'])
-
-    # def __add__(self, other):
-    #     pass
-
-    # def evolve_t(self):
-    #     pass
+        factors = []
+        for site in range(self.L):
+            state = self._get_std_B(site)
+            operator = other._get_std_B(site)
+            left_state, physical, right_state = state.shape
+            left_operator, _, right_operator = operator.shape
+            product = np.einsum("aib,cid->acibd", operator, state)
+            factors.append(
+                product.reshape(
+                    left_state * left_operator,
+                    physical,
+                    right_state * right_operator,
+                )
+            )
+        return type(self)(factors)
 
     def left_canonicalize(self):
         """
@@ -26529,39 +27447,36 @@ class MPS:
         """
         if isinstance(self.Bs[0], AbelianSiteTensorData):
             self.center = self.L - 1
+            self.gauge = 'left_canonical'
             return self
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
             self.center = self.L - 1
+            self.gauge = 'left_canonical'
             return self
+        if self.norm_squared() < 1.0e-24:
+            raise ValueError("Cannot canonicalize a zero MPS.")
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
-        # Get permutation
         perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
-        # Sweep Left -> Right
         for i in range(self.L - 1):
             B = self._get_std_B(i)
             dl, dp, dr = B.shape
-            # Reshape (Left * Phys, Right)
             mat = B.reshape(dl * dp, dr)
             U, S, Vh = np.linalg.svd(mat, full_matrices=False)
             chi = len(S)
-            # Update Site i and Reshape to (L,P,R) and Transpose back
             self.Bs[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
-            # Ss[i] is the bond between i and i+1
             self.Ss[i] = S / np.linalg.norm(S)
-            # Pass weights (S * Vh)
-            # Matrix M = diag(S) * Vh  (Shape: chi, dr)
-            M = np.dot(np.diag(S), Vh)
-            # Contract M with B_next on its Left index
-            B_next = self._get_std_B(i+1) # [Left_Old, Phys, Right]
-            B_next_updated = np.tensordot(M, B_next, axes=([1], [0])) # (New_Bond, Phys, Right)
+            transfer = S[:, None] * Vh
+            B_next = self._get_std_B(i + 1)
+            B_next_updated = np.tensordot(
+                transfer, B_next, axes=([1], [0])
+            )
             self.Bs[i+1] = B_next_updated.transpose(perm_inv)
-        # Normalize
         B_last = self._get_std_B(self.L - 1)
         B_last /= np.linalg.norm(B_last)
         self.Bs[self.L - 1] = B_last.transpose(perm_inv)
-        # Update Center
         self.center = self.L - 1
+        self.gauge = "left_canonical"
         return self
 
     def right_canonicalize(self):
@@ -26574,69 +27489,77 @@ class MPS:
         """
         if isinstance(self.Bs[0], AbelianSiteTensorData):
             self.center = 0
+            self.gauge = 'right_canonical'
             return self
         if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
             self.center = 0
+            self.gauge = 'right_canonical'
             return self
+        if self.norm_squared() < 1.0e-24:
+            raise ValueError("Cannot canonicalize a zero MPS.")
         if self.Ss is None or len(self.Ss) != self.nbonds:
             self.Ss = [None] * self.nbonds
-        # Get permutation
         perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
-        # Sweep Right -> Left
         for i in range(self.L - 1, 0, -1):
             B = self._get_std_B(i)
             dl, dp, dr = B.shape
-            # Reshape (Left, Phys * Right)
             mat = B.reshape(dl, dp * dr)
             U, S, Vh = np.linalg.svd(mat, full_matrices=False)
             chi = len(S)
-            # Update Site i (The Isometry Vh)
-            # Reshape Vh to (New_Bond, Phys, Right) and Transpose back
             self.Bs[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
-            # Ss[i-1] is the bond between i-1 and i
             self.Ss[i-1] = S / np.linalg.norm(S)
-            # Pass weights (U * S)
-            # Matrix M = U * diag(S) (Shape: dl, chi)
-            M = np.dot(U, np.diag(S))
-            # Contract B_prev with M on its Right index
-            B_prev = self._get_std_B(i-1) # [Left, Phys, Right_Old]
-            B_prev_updated = np.tensordot(B_prev, M, axes=([2], [0])) # (Left, Phys, New_Bond)
+            transfer = U * S[None, :]
+            B_prev = self._get_std_B(i - 1)
+            B_prev_updated = np.tensordot(
+                B_prev, transfer, axes=([2], [0])
+            )
             self.Bs[i-1] = B_prev_updated.transpose(perm_inv)
-        # Normalize
         B_first = self._get_std_B(0)
         B_first /= np.linalg.norm(B_first)
         self.Bs[0] = B_first.transpose(perm_inv)
-        # Update Center
         self.center = 0
+        self.gauge = "right_canonical"
         return self
 
     def left_to_vidal(self):
-        pass
+        """Return Vidal ``Gamma`` tensors and Schmidt-value arrays.
+
+        The MPS is first put into left-canonical form.  The returned objects
+        reconstruct the state as ``Gamma[0] Lambda[0] Gamma[1] ...``.  They are
+        copies and do not replace the canonical tensors stored by this object.
+        """
+        if self.Bs and hasattr(self.Bs[0], 'qns'):
+            raise NotImplementedError(
+                "Vidal conversion is currently defined only for dense MPS tensors."
+            )
+        self.left_canonicalize()
+        lambdas = [self.get_singular_values(i) for i in range(self.nbonds)]
+        gammas = []
+        for i in range(self.L):
+            A = self._get_std_B(i).copy()
+            if i:
+                values = lambdas[i - 1]
+                inverse = np.zeros_like(values, dtype=np.result_type(values, float))
+                nonzero = np.abs(values) > np.finfo(float).eps
+                inverse[nonzero] = 1.0 / values[nonzero]
+                A = np.einsum('a,aib->aib', inverse, A, optimize=True)
+            gammas.append(A)
+        return gammas, lambdas
 
     def left_to_right(self):
-        pass
-
-    # def build_U_mpo(self):
-    #     # build MPO representation of the short-time propagator
-    #     pass
-
-    # # def run(self, dt=0.1, Nt=10):
-    # #     pass
-
-    # # def obs_local(self, e_op, n):
-    # #     pass
-
-    # def apply_mpo(self):
-    #     pass
+        """Convert the state in place to right-canonical form."""
+        return self.right_canonicalize()
 
     def compress(self, chi_max):
-        compressed_factors = compress(self.factors, chi_max)
+        """Return a normalized dense MPS truncated to ``chi_max``."""
+        dense_factors = [self._get_std_B(i) for i in range(self.L)]
+        compressed_factors = compress(dense_factors, chi_max)
         if isinstance(compressed_factors, tuple):
             compressed_factors = compressed_factors[0]
-        return MPS(compressed_factors, labels=['lv','p','rv'])
+        return type(self)(compressed_factors)
 
     def _calc_local_site_rdms(self, idx=None):
-        """
+        r"""
         Calculate the local reduced density matrix for individual, isolated sites.
         (it is not 1 site rdm getting all <c^\dagger_i c_j>, this function only provides local information, such as the probability of the site being empty, singly occupied, or doubly occupied (<c^\dagger_i c_i>).
 
@@ -26833,7 +27756,7 @@ class MPS:
         return rdm
 
     def make_rdm1(self, sym_mgr=None):
-        """
+        r"""
         Calculate the full global 1-electron reduced density matrix (1-RDM).
 
         The elements are defined as $\\gamma_{ij} = \\langle \Psi | c_i^\\dagger c_j | \\Psi \\rangle$.
@@ -26967,7 +27890,7 @@ class MPS:
             return P
 
     def make_rdm2(self, sym_mgr=None):
-        """
+        r"""
         Calculate the full global 4-index 2-electron reduced density matrix (2-RDM).
 
         The elements are defined as $\\Gamma_{pqrs} = \\langle \Psi | c_p^\\dagger c_r^\\dagger c_s c_q | \\Psi \\rangle$.
@@ -26993,47 +27916,61 @@ class MPS:
 
         if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
             if not sym_mgr:
-                print("[Warning] Symmetric 2-RDM requires sym_mgr.")
+                warnings.warn("Symmetric 2-RDM requires sym_mgr.", stacklevel=2)
                 return G
-            vac_qn = sym_mgr.get_vac_qn()
 
-            # 1. Pre-calculate single holes |phi_q> = a_q |Psi>
             phis = [None] * L
             for q in range(L):
                 spin = 'up' if q % 2 == 0 else 'down'
                 W_q = build_annihilation_mpo_symmetric(q, L, sym_mgr, spin)
                 try:
                     d = apply_mpo_symmetric(W_q, self.Bs)
-                    if d: phis[q] = MPS(d, labels=self.labels, bc=self.bc)
-                except: pass
+                    if d:
+                        phis[q] = MPS(d, labels=self.labels, bc=self.bc)
+                except Exception as exc:
+                    logger.debug("Failed to build one-hole state %d: %s", q, exc)
 
-            # 2. Double loop O(N^4)
             for p in range(L):
-                if phis[p] is None: continue
+                if phis[p] is None:
+                    continue
                 for r in range(L):
-                    # Build |Bra> = a_r |phi_p>
                     spin_r = 'up' if r % 2 == 0 else 'down'
                     W_r = build_annihilation_mpo_symmetric(r, L, sym_mgr, spin_r)
                     try:
                         bra_data = apply_mpo_symmetric(W_r, phis[p].Bs)
-                        if not bra_data: continue
+                        if not bra_data:
+                            continue
                         bra_mps = MPS(bra_data, labels=self.labels, bc=self.bc)
-                    except: continue
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to build two-hole bra (%d, %d): %s", p, r, exc
+                        )
+                        continue
 
                     for s in range(L):
-                        if phis[s] is None: continue
+                        if phis[s] is None:
+                            continue
                         for q in range(L):
-                            if phis[q] is None: continue
-                            if ((p%2) + (r%2)) != ((s%2) + (q%2)): continue
+                            if phis[q] is None:
+                                continue
+                            if (p % 2) + (r % 2) != (s % 2) + (q % 2):
+                                continue
 
-                            # Build |Ket> = a_s |phi_q>
                             spin_s = 'up' if s % 2 == 0 else 'down'
                             W_s = build_annihilation_mpo_symmetric(s, L, sym_mgr, spin_s)
                             try:
                                 ket_data = apply_mpo_symmetric(W_s, phis[q].Bs)
-                                if not ket_data: continue
+                                if not ket_data:
+                                    continue
                                 ket_mps = MPS(ket_data, labels=self.labels, bc=self.bc)
-                            except: continue
+                            except Exception as exc:
+                                logger.debug(
+                                    "Failed to build two-hole ket (%d, %d): %s",
+                                    q,
+                                    s,
+                                    exc,
+                                )
+                                continue
 
                             val = self._mps_dot(bra_mps, ket_mps)
                             G[p, r, s, q] = val
@@ -27072,16 +28009,20 @@ class MPS:
 
             # Double loop O(L^4) for two-hole overlaps
             for p in range(L):
-                if phis[p] is None: continue
+                if phis[p] is None:
+                    continue
                 for r in range(L):
                     bra_mps = apply_annihilation(phis[p], r)
-                    if abs(self._mps_dot(bra_mps, bra_mps)) < 1e-14: continue
+                    if abs(self._mps_dot(bra_mps, bra_mps)) < 1e-14:
+                        continue
 
                     for s in range(L):
                         for q in range(L):
-                            if phis[q] is None: continue
+                            if phis[q] is None:
+                                continue
                             # Spin conservation check
-                            if ((p%2) + (r%2)) != ((s%2) + (q%2)): continue
+                            if (p % 2) + (r % 2) != (s % 2) + (q % 2):
+                                continue
 
                             ket_mps = apply_annihilation(phis[q], s)
                             val = self._mps_dot(bra_mps, ket_mps)
@@ -27191,428 +28132,63 @@ class MPS:
 
             return val.flatten()[0]
 
-class Site(object):
-    """A general single site
-
-    You use this class to create a single site. The site comes empty (i.e.
-    with no operators included), but for th identity operator. You should
-    add operators you need to make you site up.
-
-    Parameters
-    ----------
-    dim : an int
-    Size of the Hilbert space. The dimension must be at least 1. A site of
-        dim = 1  represents the vaccum (or something strange like that, it's
-        used for demo purposes mostly.)
-    operators : a dictionary of string and numpy array (with ndim = 2).
-    Operators for the site.
-
-    Examples
-    --------
-    >>> from dmrg101.core.sites import Site
-    >>> brand_new_site = Site(2)
-    >>> # the Hilbert space has dimension 2
-    >>> print brand_new_site.dim
-    2
-    >>> # the only operator is the identity
-    >>> print brand_new_site.operators
-    {'id': array([[ 1.,  0.],
-           [ 0.,  1.]])}
-    """
-    def __init__(self, dim):
-        """
-        Creates an empty site of dimension dim.
-
-            Raises
-            ------
-            DMRGException
-                if `dim` < 1.
-
-            Notes
-            -----
-            Postcond : The identity operator (ones in the diagonal, zeros elsewhere)
-            is added to the `self.operators` dictionary.
-        """
-        if dim < 1:
-            raise DMRGException("Site dim must be at least 1")
-        # super(Site, self).__init__()
-        self.dim = dim
-        self.operators = { "id" : scipy.sparse.eye(self.dim, self.dim) }
-
-    def add_operator(self, operator_name):
-        """
-        Adds an operator to the site.
-
-          Parameters
-           ----------
-               operator_name : string
-               The operator name.
-
-           Raises
-           ------
-           DMRGException
-               if `operator_name` is already in the dict.
-
-           Notes
-           -----
-           Postcond:
-
-              - `self.operators` has one item more, and
-              - the newly created operator is a (`self.dim`, `self.dim`)
-                matrix of full of zeros.
-
-           Examples
-           --------
-           >>> new_site = Site(2)
-           >>> print new_site.operators.keys()
-           ['id']
-           >>> new_site.add_operator('s_z')
-           >>> print new_site.operators.keys()
-           ['s_z', 'id']
-           >>> # note that the newly created op has all zeros
-           >>> print new_site.operators['s_z']
-           [[ 0.  0.]
-             [ 0.  0.]]
-        """
-
-        if str(operator_name) in self.operators.keys():
-            raise DMRGException("Operator name exists already")
-        else:
-            self.operators[str(operator_name)] = np.zeros((self.dim, self.dim))
-
-"""Exception class for the DMRG code
-"""
-class DMRGException(Exception):
-    """A base exception for the DMRG code
-
-    Parameters
-    ----------
-    msg : a string
-        A message explaining the error
-    """
-    def __init__(self, msg):
-        super(DMRGException, self).__init__()
-        self.msg = msg
-
-    def __srt__(self, msg):
-            return repr(self.msg)
-
-class Block(Site):
-    """A block.
-
-    That is the representation of the Hilbert space and operators of a
-    direct product of single site's Hilbert space and operators, that have
-    been truncated.
-
-    You use this class to create the two blocks (one for the left, one for
-    the right) needed in the DMRG algorithm. The block comes empty.
-
-    Parameters
-    ----------
-    dim : an int.
-    Size of the Hilbert space. The dimension must be at least 1. A
-    block of dim = 1  represents the vaccum (or something strange like
-    that, it's used for demo purposes mostly.)
-    operators : a dictionary of string and numpy array (with ndim = 2).
-    Operators for the block.
-
-    Examples
-    --------
-    >>> from dmrg101.core.block import Block
-    >>> brand_new_block = Block(2)
-    >>> # the Hilbert space has dimension 2
-    >>> print brand_new_block.dim
-    2
-    >>> # the only operator is the identity
-    >>> print brand_new_block.operators
-    {'id': array([[ 1.,  0.],
-           [ 0.,  1.]])}
-    """
-    def __init__(self, dim):
-        """Creates an empty block of dimension dim.
-
-        Raises
-        ------
-        DMRGException
-                if `dim` < 1.
-
-        Notes
-        -----
-        Postcond : The identity operator (ones in the diagonal, zeros elsewhere)
-        is added to the `self.operators` dictionary. A full of zeros block
-        Hamiltonian operator is added to the list.
-        """
-        super(Block, self).__init__(dim)
-
-class PauliSite(Site):
-    """
-    A site for spin 1/2 models.
-
-    You use this site for models where the single sites are spin
-    one-half sites. The Hilbert space is ordered such as the first state
-    is the spin down, and the second state is the spin up. Therefore e.g.
-    you have the following relation between operator matrix elements:
-
-    .. math::
-
-        \langle \downarrow | A | uparrow \rangle = A_{0,1}
-
-    Notes
-    -----
-    Postcond: The site has already built-in the spin operators for s_z, s_p, s_m.
-
-    Examples
-    --------
-    >>> from dmrg101.core.sites import PauliSite
-    >>> pauli_site = PauliSite()
-    >>> # check all it's what you expected
-    >>> print pauli_site.dim
-    2
-    >>> print pauli_site.operators.keys()
-    ['s_p', 's_z', 's_m', 'id']
-    >>> print pauli_site.operators['s_z']
-    [[-1.  0.]
-      [ 0.  1.]]
-    >>> print pauli_site.operators['s_x']
-    [[ 0.  1.]
-      [ 1.  0.]]
-    """
-    def __init__(self):
-        """
-        Creates the spin one-half site with Pauli matrices.
-
-       Notes
-       -----
-       Postcond : the dimension is set to 2, and the Pauli matrices
-       are added as operators.
-
-        """
-        super(PauliSite, self).__init__(2)
-    # add the operators
-        self.add_operator("s_z")
-        self.add_operator("s_x")
-        self.add_operator("s_m")
-
-    # for clarity
-        s_z = self.operators["s_z"]
-        s_x = self.operators["s_x"]
-        s_m = self.operators["s_m"]
-
-    # set the matrix elements different from zero to the right values
-        s_z[0, 0] = -1.0
-        s_z[1, 1] = 1.0
-        s_x[0, 1] = 1.0
-        s_x[1, 0] = 1.0
-        s_m[0, 1] = 1.0
-
-
-
-
-
-def LeftCanonical(M):
-    '''
-        Function that takes an MPS 'M' as input (order of legs: left-bottom-right) and returns a copy of it that is
-            transformed into left canonical form and normalized.
-
-    Src:
-        https://github.com/GCatarina/DMRG_MPS_didactic/blob/main/DMRG-MPS_implementation.ipynb
-    '''
-    Mcopy = M.copy() #create copy of M
-
-    N = len(Mcopy) #nr of sites
-
-    for l in range(N):
-        # reshape
-        Taux = Mcopy[l]
-        Taux = np.reshape(Taux,(np.shape(Taux)[0]*np.shape(Taux)[1],np.shape(Taux)[2]))
-
-        # SVD
-        U,S,Vdag = np.linalg.svd(Taux,full_matrices=False)
-        '''
-            Note: full_matrices=False leads to a trivial truncation of the matrices (thin SVD).
-        '''
-
-        # update M[l]
-        Mcopy[l] = np.reshape(U,(np.shape(Mcopy[l])[0],np.shape(Mcopy[l])[1],np.shape(U)[1]))
-
-        # update M[l+1]
-        SVdag = np.matmul(np.diag(S),Vdag)
-        if l < N-1:
-            Mcopy[l+1] = np.einsum('ij,jkl',SVdag,Mcopy[l+1])
-        else:
-            '''
-                Note: in the last site (l=N-1), S*Vdag is a number that determines the normalization of the MPS.
-                    We discard this number, which corresponds to normalizing the MPS.
-            '''
-
-    return Mcopy
-
-
-def RightCanonical(M):
-    '''
-        Function that takes an MPS 'M' as input (order of legs: left-bottom-right) and returns a copy of it that is
-            transformed into right canonical form and normalized.
-    '''
-    Mcopy = M.copy() #create copy of M
-
-    N = len(Mcopy) #nr of sites
-
-    for l in range(N-1,-1,-1):
-        # reshape
-        Taux = Mcopy[l]
-        Taux = np.reshape(Taux,(np.shape(Taux)[0],np.shape(Taux)[1]*np.shape(Taux)[2]))
-
-        # SVD
-        U,S,Vdag = np.linalg.svd(Taux,full_matrices=False)
-
-        # update M[l]
-        Mcopy[l] = np.reshape(Vdag,(np.shape(Vdag)[0],np.shape(Mcopy[l])[1],np.shape(Mcopy[l])[2]))
-
-        # update M[l-1]
-        US = np.matmul(U,np.diag(S))
-        if l > 0:
-            Mcopy[l-1] = np.einsum('ijk,kl',Mcopy[l-1],US)
-        else:
-            '''
-                Note: in the first site (l=0), U*S is a number that determines the normalization of the MPS. We
-                    discard this number, which corresponds to normalizing the MPS.
-            '''
-
-    return Mcopy
-
-# class MPS:
-#     def __init__(self, factors, homogenous=False, form=None):
-#         """
-#         class for matrix product states.
-
-#         Parameters
-#         ----------
-#         mps : list
-#             list of 3-tensors. [chi1, d, chi2]
-#         chi_max:
-#             maximum bond order used in compress. Default None.
-
-#         Returns
-#         -------
-#         None.
-
-#         """
-#         self.factors = self.data = factors
-#         self.nsites = self.L = len(factors)
-#         self.nbonds = self.nsites - 1
-#         # self.chi_max = chi_max
-
-#         self.form = form
-
-#         if homogenous:
-#             self.dims = [mps[0].shape[1], ] * self.nsites
-#         else:
-#             self.dims = [t.shape[1] for t in factors] # physical dims of each site
-
-#         # self._mpo = None
-
-#     def bond_orders(self):
-#         return [t.shape[2] for t in self.factors] # bond orders
-
-
-#     def compress(self, chi_max):
-#         return MPS(compress(self.factors, chi_max)[0])
-
-#     def __add__(self, other):
-#         assert len(self.data) == len(other.data)
-#         # for different length, we should choose the maximum one
-#         C = []
-#         for j in range(self.sites):
-#             tmp = block_diag(self.data[j], other.data[j])
-#             C.append(tmp.copy())
-
-#         return MPS(C)
-
-    # def build_mpo_list(self):
-    #     # build MPO representation of the propagator
-    #     pass
-
-    # def copy(self):
-    #     return copy.copy(self)
-
-    # def run(self, dt=0.1, Nt=10):
-    #     pass
-
-    # def obs_single_site(self, e_op, n):
-    #     pass
-
-    # def two_sites(self):
-    #     pass
-
-    # # def to_tensor(self):
-    # #     return mps_to_tensor(self.factors)
-
-    # # def to_vec(self):
-    # #     return mps_to_tensor(self.factors)
-
-    # def left_canonicalize(self):
-    #     pass
-
-    # def right_canonicalize(self):
-    #     pass
-
-    # def left_to_right(self):
-    #     pass
-
-    # def site_canonicalize(self):
-    #     pass
-
-
 class MPO:
-    def __init__(self, factors, target_qn=None, labels=['left', 'right', 'up', 'down'], homogenous=False):
-        """
-        class for matrix product operators.
+    """Finite matrix-product operator in (left, right, out, in) order."""
 
-        TODO: switch leg orders to left, up, down, right
+    STANDARD_LABELS = ("left", "right", "up", "down")
 
-        Parameters
-        ----------
-        factors : list
-            list of 4-tensors of dimension. [chi1, chi2, d_up, d_down]
-            chi1: left virtual bond
-            chi2: right virtual bond
-            d_up: physical output (bra)
-            d_down: physical input (ket)
-        chi_max:
-            maximum bond order used in compress. Default None.
+    def __init__(
+        self,
+        factors,
+        target_qn=None,
+        labels=STANDARD_LABELS,
+        homogenous=False,
+    ):
+        factors = list(factors)
+        if not factors:
+            raise ValueError("An MPO must contain at least one site tensor.")
+        ranks = [
+            getattr(factor, "rank", getattr(factor, "ndim", None))
+            for factor in factors
+        ]
+        if any(rank != 4 for rank in ranks):
+            raise ValueError("Every MPO site tensor must have rank 4.")
+        labels = tuple(labels)
+        if labels != self.STANDARD_LABELS:
+            raise ValueError(
+                "MPO tensors must use ('left', 'right', 'up', 'down') ordering."
+            )
 
-        Returns
-        -------
-        None.
-
-        """
-        self.factors = self.data = self.cores = factors
+        self.factors = factors
+        self.data = self.factors
+        self.cores = self.factors
+        self.target_qn = target_qn
+        self.labels = labels
+        self.homogenous = bool(homogenous)
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
-        # TODO: label treatment
-        #if self.labels :
-            #error (if not four terms, not including correct name type...)
-        #if self.labels not ['left', 'right', 'up', 'down']
-            #swap to not ['left', 'right', 'up', 'down']
-        if homogenous:
-            self.dims = [factors[0].shape[2], ] * self.nsites
-        else:
-            self.dims = [t.shape[2] for t in factors]
+        self.dims = [int(tensor.shape[2]) for tensor in factors]
+        if self.homogenous and len(set(self.dims)) != 1:
+            raise ValueError(
+                "homogenous=True requires the same physical dimension at every site."
+            )
 
     def bond_orders(self):
         """Return right bond dimensions for each site."""
-        return [t.shape[1] for t in self.factors]
-
-    def ground_state(self, algorithm='dmrg'):
-        pass
+        return [int(tensor.shape[1]) for tensor in self.factors]
 
     def dot(self, mps, D=None):
+        """Apply this MPO and compress the resulting MPS."""
+        if not isinstance(mps, MPS):
+            raise TypeError("MPO.dot expects an MPS.")
         if D is None:
-            D = max(self.bond_orders()+mps.bond_orders()) if isinstance(mps, MPO) \
-                else max(mps.bond_orders())*2
+            D = 2 * max(mps.bond_orders())
 
-        # apply MPO to MPS followed by a compression
-        factors = apply_mpo(self.factors, mps.factors, D)
+        factors = apply_mpo(
+            self.factors,
+            [mps._get_std_B(i) for i in range(mps.L)],
+            D,
+        )
         return MPS(factors)
 
 
@@ -27657,7 +28233,7 @@ class MPO:
 
             # 3. Compress (Input is Left, Phys, Right)
             # The output B will also be (Left, Phys, Right)
-            compressed_factors = compress(mps_factors, chi_max, renormalize=False)
+            compressed_factors = compress(mps_factors, chi_max)
 
             # 4. Restore MPO format
             final_factors = []
@@ -27896,10 +28472,10 @@ class MPO:
 
         """
 
-        return expmpo(self, constant, D=D, method=method, order=order, scale=scale)
+        return expmpo(self.H, constant, method='taylor', order=4, scale=0)
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
-    """
+    r"""
     Generate a separable Gaussian wave packet (GWP) in matrix product state (MPS) form.
 
     This routine builds a product MPS where each physical dimension is represented by a rank-3 tensor of shape ``[1, d, 1]``.
@@ -28294,85 +28870,32 @@ def product_MPO(M1, M2):
 
 
 
-'''
-    Function that makes the following contractions (numbers denote leg order):
-
-         /--3--**--1--Mt--3--
-         |             |
-         |             2
-         |             |
-         |             *
-         |             *
-         |             |
-         |             4                 /--3--
-         |             |                 |
-        Tl--2--**--1---O--3--     =     Tf--2--
-         |             |                 |
-         |             2                 \--1--
-         |             |
-         |             *
-         |             *
-         |             |
-         |             2
-         |             |
-         \--1--**--3--Mb--1--
-'''
-def ZipperLeft(Tl,Mb,O,Mt):
-    Taux = np.einsum('ijk,klm',Mb,Tl)
-    Taux = np.einsum('ijkl,kjmn',Taux,O)
-    Tf = np.einsum('ijkl,jlm',Taux,Mt)
-
-    return Tf
-
-# def expect(mpo, mps):
-#     # <GS| O |GS> , closing the zipper from the left
-#     Taux = np.ones((1,1,1))
-#     for l in range(N):
-#         Taux = ZipperLeft(Taux, mps[l].conj().T, mpo[l], mps[l])
-#     print('<GS| H |GS> = ', Taux[0,0,0])
-#     # print('analytical result = ', -2*(N-1)/3)
-#     return Taux[0, 0, 0]
+def ZipperLeft(Tl, Mb, O, Mt):
+    """Advance a left zipper environment by one MPO/MPS site."""
+    aux = np.einsum("ijk,klm", Mb, Tl)
+    aux = np.einsum("ijkl,kjmn", aux, O)
+    return np.einsum("ijkl,jlm", aux, Mt)
 
 
-def ZipperRight(Tr,Mb,O,Mt):
-    '''
-        Function that makes the following contractions (numbers denote leg order):
-
-             --1--Mt--3--**--1--\
-                   |            |
-                   2            |
-                   |            |
-                   *            |
-                   *            |
-                   |            |
-                   4            |            --1--\
-                   |            |                 |
-             --1---O--3--**--2--Tr     =     --2--Tf
-                   |            |                 |
-                   2            |            --3--/
-                   |            |
-                   *            |
-                   *            |
-                   |            |
-                   2            |
-                   |            |
-             --3--Mb--1--**--3--/
-    '''
-    Taux = np.einsum('ijk,klm',Mt,Tr, optimize=True)
-    Taux = np.einsum('ijkl,mnkj',Taux,O, optimize=True)
-    Tf = np.einsum('ijkl,jlm',Taux,Mb, optimize=True)
-
-    return Tf
+def ZipperRight(Tr, Mb, O, Mt):
+    """Advance a right zipper environment by one MPO/MPS site."""
+    aux = np.einsum("ijk,klm", Mt, Tr, optimize=True)
+    aux = np.einsum("ijkl,mnkj", aux, O, optimize=True)
+    return np.einsum("ijkl,jlm", aux, Mb, optimize=True)
 
 def expect_zipper_right(mpo, mps):
-    # <GS| H |GS> for AKLT model, closing the zipper from the right
-    Taux = np.ones((1,1,1))
-    for l in range(N-1,-1,-1):
-        Taux = ZipperRight(Taux, mps[l].conj().T, mpo[l], mps[l])
-    # print('<GS| H |GS> = ', Taux[0,0,0])
-    # print('analytical result = ', -2*(N-1)/3)
-
-    return Taux[0,0,0]
+    """Evaluate ``<mps|mpo|mps>`` by closing from the right."""
+    if len(mpo) != len(mps):
+        raise ValueError("MPO and MPS lengths must match.")
+    environment = np.ones((1, 1, 1))
+    for site in range(len(mpo) - 1, -1, -1):
+        environment = ZipperRight(
+            environment,
+            mps[site].conj().T,
+            mpo[site],
+            mps[site],
+        )
+    return environment[0, 0, 0]
 
 
 # MPS A-matrix is a 3-index tensor, A[s,i,j]
@@ -29113,6 +29636,321 @@ class HamiltonianMultiply(sparse.linalg.LinearOperator):
 
         return np.reshape(R, -1)
 
+
+class DenseLocalProblem(sparse.linalg.LinearOperator):
+    """Dense-tensor two-site effective Hamiltonian owned by MovingEnvironment."""
+
+    def __init__(self, E, W, F, *, bond=None, matvec_options=None):
+        self._dense_cpp_davidson_workspace = None
+        self._dense_cpp_sweep_workspace_key = None
+        self.profile_stats = {}
+        self.reset_local_problem(E, W, F, bond=bond, matvec_options=matvec_options)
+
+    def reset_local_problem(self, E, W, F, *, bond=None, matvec_options=None, **_kwargs):
+        self.E = E
+        self.W = W
+        self.F = F
+        self.bond = None if bond is None else int(bond)
+        self.matvec_options = {} if matvec_options is None else dict(matvec_options)
+        self.dtype = np.result_type(E, W, F, np.complex128)
+        self.chi_L = E.shape[2]
+        self.chi_R = F.shape[2]
+        self.d_out = W.shape[2]
+        self.d_in = W.shape[3]
+        self.req_shape = (self.chi_L, self.d_in, self.chi_R)
+        self.size = self.chi_L * self.d_in * self.chi_R
+        self.shape = (self.size, self.size)
+        self._dense_cpp_matvec = None
+        if bool(self.matvec_options.get("moving_environment_dense_cpp_matvec", False)):
+            if (
+                _cpp_davidson is not None
+                and getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False)
+            ):
+                self._dense_cpp_matvec = getattr(
+                    _cpp_davidson,
+                    "dense_two_site_matvec",
+                    None,
+                )
+        self.profile_stats = {
+            "bond": self.bond,
+            "matvec_calls": 0,
+            "matvec_seconds": 0.0,
+            "paths": {},
+            "local_solver": {},
+        }
+        return True
+
+    def _record_path(self, name, elapsed):
+        paths = self.profile_stats.setdefault("paths", {})
+        entry = paths.setdefault(
+            str(name),
+            {"calls": 0, "seconds": 0.0, "last_seconds": 0.0},
+        )
+        entry["calls"] = int(entry.get("calls", 0)) + 1
+        entry["seconds"] = float(entry.get("seconds", 0.0)) + float(elapsed)
+        entry["last_seconds"] = float(elapsed)
+        self.profile_stats["matvec_calls"] = int(
+            self.profile_stats.get("matvec_calls", 0)
+        ) + 1
+        self.profile_stats["matvec_seconds"] = float(
+            self.profile_stats.get("matvec_seconds", 0.0)
+        ) + float(elapsed)
+
+    def _matvec(self, v):
+        kernel = self._dense_cpp_matvec
+        if kernel is not None:
+            start = time.perf_counter()
+            try:
+                out = kernel(self.E, self.W, self.F, np.asarray(v).reshape(-1))
+            except Exception as exc:
+                self.profile_stats["dense_cpp_matvec_failures"] = int(
+                    self.profile_stats.get("dense_cpp_matvec_failures", 0)
+                ) + 1
+                self.profile_stats["dense_cpp_matvec_last_error"] = str(exc)
+                self._dense_cpp_matvec = None
+            else:
+                self._record_path("dense_cpp_matvec", time.perf_counter() - start)
+                return np.asarray(out).reshape(-1)
+        start = time.perf_counter()
+        try:
+            A = np.asarray(v).reshape(self.req_shape)
+            T1 = np.tensordot(self.E, A, axes=(2, 0))
+            T2 = np.tensordot(T1, self.W, axes=([0, 2], [0, 3]))
+            R = np.tensordot(T2, self.F, axes=([2, 1], [0, 2]))
+            return np.reshape(R, -1)
+        finally:
+            self._record_path("dense_numpy_tensordot", time.perf_counter() - start)
+
+    def _solve_cpp_davidson(self, AA, nstates, *, tol, maxiter):
+        if int(nstates) != 1:
+            return None
+        if not bool(
+            self.matvec_options.get("moving_environment_dense_cpp_davidson", False)
+        ):
+            return None
+        if (
+            _cpp_davidson is None
+            or not getattr(_cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False)
+        ):
+            return None
+        workspace_type = getattr(_cpp_davidson, "DenseDavidsonWorkspace", None)
+        if workspace_type is None:
+            return None
+        restart_dim = int(
+            self.matvec_options.get(
+                "moving_environment_dense_cpp_davidson_restart_dim",
+                min(max(8, int(maxiter)), 64),
+            )
+        )
+        backend = str(
+            self.matvec_options.get(
+                "moving_environment_dense_cpp_davidson_backend",
+                "blas",
+            )
+        )
+        accept_unconverged = bool(
+            self.matvec_options.get(
+                "moving_environment_dense_cpp_davidson_accept_unconverged",
+                False,
+            )
+        )
+        block_davidson = bool(
+            self.matvec_options.get(
+                "moving_environment_dense_cpp_block_davidson",
+                False,
+            )
+        )
+        block_size = max(
+            1,
+            int(
+                self.matvec_options.get(
+                    "moving_environment_dense_cpp_block_davidson_size",
+                    2,
+                )
+            ),
+        )
+        owner = getattr(self, "_moving_environment", None)
+        sweep_key = getattr(self, "_dense_cpp_sweep_workspace_key", None)
+        result = None
+        if owner is not None and sweep_key is not None:
+            solver = getattr(owner, "solve_dense_cpp_workspace", None)
+            if solver is not None:
+                result = solver(
+                    sweep_key,
+                    AA,
+                    tol=float(tol),
+                    max_iter=int(maxiter),
+                    restart_dim=restart_dim,
+                    accept_unconverged=accept_unconverged,
+                    backend=backend,
+                    block_davidson=block_davidson,
+                    block_size=block_size,
+                )
+        if result is None:
+            if self._dense_cpp_davidson_workspace is None:
+                self._dense_cpp_davidson_workspace = workspace_type()
+            if (
+                block_davidson
+                and hasattr(self._dense_cpp_davidson_workspace, "solve_block")
+            ):
+                result = self._dense_cpp_davidson_workspace.solve_block(
+                    np.asarray(self.E, dtype=np.complex128),
+                    np.asarray(self.W, dtype=np.complex128),
+                    np.asarray(self.F, dtype=np.complex128),
+                    np.asarray(AA, dtype=np.complex128).reshape(-1),
+                    float(tol),
+                    int(maxiter),
+                    restart_dim,
+                    accept_unconverged,
+                    backend,
+                    block_size,
+                )
+            else:
+                result = self._dense_cpp_davidson_workspace.solve(
+                    np.asarray(self.E, dtype=np.complex128),
+                    np.asarray(self.W, dtype=np.complex128),
+                    np.asarray(self.F, dtype=np.complex128),
+                    np.asarray(AA, dtype=np.complex128).reshape(-1),
+                    float(tol),
+                    int(maxiter),
+                    restart_dim,
+                    accept_unconverged,
+                    backend,
+                )
+        if not bool(result.get("accepted", False)):
+            self.profile_stats["cpp_dense_davidson_rejections"] = int(
+                self.profile_stats.get("cpp_dense_davidson_rejections", 0)
+            ) + 1
+            rejection = dict(result)
+            rejection.pop("vector", None)
+            self.profile_stats["cpp_dense_davidson_last_result"] = rejection
+            return None
+        vector = np.asarray(result["vector"]).reshape(-1)
+        energy = float(result["energy"])
+        cpp_stats = {}
+        if owner is not None and sweep_key is not None:
+            getter = getattr(owner, "dense_cpp_workspace_record_stats", None)
+            if getter is not None:
+                cpp_stats = getter(sweep_key)
+        if not cpp_stats and self._dense_cpp_davidson_workspace is not None:
+            try:
+                cpp_stats = dict(self._dense_cpp_davidson_workspace.stats())
+            except Exception:
+                cpp_stats = {}
+        result_meta = dict(result)
+        result_meta.pop("vector", None)
+        self.profile_stats["cpp_dense_davidson"] = {
+            **result_meta,
+            "stats": cpp_stats,
+        }
+        return np.array([energy]), vector[:, None], result_meta
+
+    def solve(self, AA, nstates, *, tol=1.0e-9, maxiter=5000):
+        solver_start = time.perf_counter()
+        nstates = int(nstates)
+        nloc = int(np.asarray(AA).size)
+        cpp_solution = self._solve_cpp_davidson(
+            AA,
+            nstates,
+            tol=float(tol),
+            maxiter=int(maxiter),
+        )
+        if cpp_solution is not None:
+            energies, vectors, cpp_result = cpp_solution
+            solver_kind = str(cpp_result.get("kind", "cpp_dense_davidson"))
+            self.profile_stats["local_solver"] = {
+                "kind": solver_kind,
+                "dimension": int(nloc),
+                "roots": int(nstates),
+                "seconds": float(time.perf_counter() - solver_start),
+                "tol": float(tol),
+                "max_iter": int(maxiter),
+                "backend": str(cpp_result.get("backend", "")),
+                "iterations": int(cpp_result.get("iterations", 0)),
+                "residual_norm": float(cpp_result.get("residual_norm", np.nan)),
+                "workspace_reused": bool(cpp_result.get("workspace_reused", False)),
+                "matvec_calls": int(cpp_result.get("matvec_calls", 0)),
+                "block_davidson": bool(cpp_result.get("block_davidson", False)),
+                "block_size": int(cpp_result.get("block_size", 1)),
+            }
+            path_name = (
+                "dense_cpp_block_davidson_"
+                if bool(cpp_result.get("block_davidson", False))
+                else "dense_cpp_davidson_"
+            ) + str(cpp_result.get("backend", ""))
+            path_entry = self.profile_stats.setdefault("paths", {}).setdefault(
+                path_name,
+                {"calls": 0, "seconds": 0.0, "last_seconds": 0.0},
+            )
+            matvec_calls = int(cpp_result.get("matvec_calls", 0))
+            matvec_seconds = float(cpp_result.get("seconds", 0.0))
+            path_entry["calls"] = int(path_entry.get("calls", 0)) + matvec_calls
+            path_entry["seconds"] = float(path_entry.get("seconds", 0.0)) + matvec_seconds
+            path_entry["last_seconds"] = matvec_seconds
+            self.profile_stats["matvec_calls"] = int(
+                self.profile_stats.get("matvec_calls", 0)
+            ) + matvec_calls
+            self.profile_stats["matvec_seconds"] = float(
+                self.profile_stats.get("matvec_seconds", 0.0)
+            ) + matvec_seconds
+            return energies, vectors
+        use_dense_solver = nstates >= nloc
+        try:
+            if use_dense_solver:
+                raise ValueError("dense fallback requested")
+            energies, vectors = sparse.linalg.eigsh(
+                self,
+                nstates,
+                v0=AA,
+                which="SA",
+                tol=float(tol),
+                maxiter=int(maxiter),
+            )
+            solver_kind = "eigsh"
+        except (sparse.linalg.ArpackNoConvergence, ValueError):
+            if nloc > 4096:
+                raise
+            H_dense = np.zeros(
+                (nloc, nloc),
+                dtype=np.result_type(np.asarray(AA).dtype, np.complex128),
+            )
+            for col in range(nloc):
+                e_col = np.zeros(nloc, dtype=np.asarray(AA).dtype)
+                e_col[col] = 1.0
+                H_dense[:, col] = self.matvec(e_col)
+            H_dense = 0.5 * (H_dense + H_dense.T.conj())
+            evals, evecs = np.linalg.eigh(H_dense)
+            energies = evals[:nstates]
+            vectors = evecs[:, :nstates]
+            solver_kind = "dense_fallback"
+        self.profile_stats["local_solver"] = {
+            "kind": solver_kind,
+            "dimension": int(nloc),
+            "roots": int(nstates),
+            "seconds": float(time.perf_counter() - solver_start),
+            "tol": float(tol),
+            "max_iter": int(maxiter),
+        }
+        return energies, vectors
+
+    def profile_summary(self):
+        paths = self.profile_stats.get("paths", {})
+        dominant = None
+        if paths:
+            dominant = max(
+                paths.items(),
+                key=lambda item: float(item[1].get("seconds", 0.0)),
+            )[0]
+        return {
+            "bond": self.bond,
+            "matvec_calls": int(self.profile_stats.get("matvec_calls", 0)),
+            "matvec_seconds": float(self.profile_stats.get("matvec_seconds", 0.0)),
+            "dominant_path": dominant,
+            "paths": dict(paths),
+            "local_solver": dict(self.profile_stats.get("local_solver", {})),
+        }
+
+
 ## optimize a single site given the MPO matrix W, and tensors E,F
 def optimize_site(A, W, E, F, tol=1E-8):
     H = HamiltonianMultiply(E,W,F)
@@ -29397,19 +30235,6 @@ def optimize_two_sites(
         else:
             raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
         use_moving_environment = True
-        if (
-            isinstance(matvec_options, dict)
-            and "moving_environment_cpp_state_owner" not in matvec_options
-            and (
-                bool(matvec_options.get("moving_environment_cpp_davidson", False))
-                or bool(matvec_options.get("moving_environment_cpp_matvec", False))
-            )
-        ):
-            matvec_options["moving_environment_cpp_state_owner"] = True
-            matvec_options.setdefault(
-                "moving_environment_cpp_solve_site_update_owner",
-                True,
-            )
         if isinstance(matvec_options, dict) and "moving_environment" in matvec_options:
             use_moving_environment = bool(matvec_options.get("moving_environment"))
         if moving_environment is False:
@@ -29838,35 +30663,91 @@ def optimize_two_sites(
             )
     else: # Dense branch ( MPS index standardized to Left, Phys, Right)
         optimize_two_sites.last_profile = None
-        W = coarse_grain_MPO(W1,W2)
-        # Returns (Left, Phys_A, Phys_B, Right)
-        AA = coarse_grain_MPS(A,B)
-        # Optimize
-        H = HamiltonianMultiply(E,W,F)
-        nloc = AA.size
-        if nstates >= nloc:
-            use_dense_solver = True
-        else:
-            use_dense_solver = False
-        try:
-            if use_dense_solver:
-                raise ValueError("dense fallback requested")
-            E, V_flat = sparse.linalg.eigsh(
-                H, nstates, v0=AA, which='SA', tol=1e-9, maxiter=5000
+        H_env = None
+        dense_solution = None
+        if isinstance(moving_environment, MovingEnvironment):
+            dense_solution = moving_environment.solve_dense_cpp_two_site_workspace(
+                E,
+                W1,
+                W2,
+                F,
+                A,
+                B,
+                bond=bond,
+                nstates=nstates,
+                tol=1.0e-9,
+                max_iter=5000,
+                matvec_options=matvec_options,
             )
-        except (sparse.linalg.ArpackNoConvergence, ValueError):
-            # Robust fallback for small local spaces when ARPACK stalls.
-            if nloc > 4096:
-                raise
-            H_dense = np.zeros((nloc, nloc), dtype=np.result_type(AA.dtype, np.complex128))
-            for col in range(nloc):
-                e_col = np.zeros(nloc, dtype=AA.dtype)
-                e_col[col] = 1.0
-                H_dense[:, col] = H.matvec(e_col)
-            H_dense = 0.5 * (H_dense + H_dense.T.conj())
-            evals, evecs = np.linalg.eigh(H_dense)
-            E = evals[:nstates]
-            V_flat = evecs[:, :nstates]
+            if dense_solution is not None:
+                H_env = moving_environment
+                E, V_flat = dense_solution
+                optimize_two_sites.last_profile = H_env.profile_summary()
+        if dense_solution is None:
+            if isinstance(moving_environment, MovingEnvironment):
+                W = moving_environment.dense_coarse_grain_mpo(
+                    W1,
+                    W2,
+                    bond=bond,
+                    matvec_options=matvec_options,
+                )
+            else:
+                W = coarse_grain_MPO(W1,W2)
+            # Returns (Left, Phys_A, Phys_B, Right)
+            if isinstance(moving_environment, MovingEnvironment):
+                AA = moving_environment.dense_coarse_grain_mps(
+                    A,
+                    B,
+                    matvec_options=matvec_options,
+                )
+            else:
+                AA = coarse_grain_MPS(A,B)
+            # Optimize
+            if isinstance(moving_environment, MovingEnvironment):
+                H_env = moving_environment.set_dense_bond(
+                    E,
+                    W,
+                    F,
+                    bond=bond,
+                    matvec_options=matvec_options,
+                ).local_operator()
+                dense_solution = H_env.solve_dense_local(
+                    AA,
+                    nstates=nstates,
+                    tol=1.0e-9,
+                    max_iter=5000,
+                )
+                if dense_solution is None:
+                    H_env = None
+                else:
+                    E, V_flat = dense_solution
+                    optimize_two_sites.last_profile = H_env.profile_summary()
+        if H_env is None:
+            H = HamiltonianMultiply(E,W,F)
+            nloc = AA.size
+            if nstates >= nloc:
+                use_dense_solver = True
+            else:
+                use_dense_solver = False
+            try:
+                if use_dense_solver:
+                    raise ValueError("dense fallback requested")
+                E, V_flat = sparse.linalg.eigsh(
+                    H, nstates, v0=AA, which='SA', tol=1e-9, maxiter=5000
+                )
+            except (sparse.linalg.ArpackNoConvergence, ValueError):
+                # Robust fallback for small local spaces when ARPACK stalls.
+                if nloc > 4096:
+                    raise
+                H_dense = np.zeros((nloc, nloc), dtype=np.result_type(AA.dtype, np.complex128))
+                for col in range(nloc):
+                    e_col = np.zeros(nloc, dtype=AA.dtype)
+                    e_col[col] = 1.0
+                    H_dense[:, col] = H.matvec(e_col)
+                H_dense = 0.5 * (H_dense + H_dense.T.conj())
+                evals, evecs = np.linalg.eigh(H_dense)
+                E = evals[:nstates]
+                V_flat = evecs[:, :nstates]
 
         order = np.argsort(E)
         E = np.asarray(E)[order]
@@ -29881,20 +30762,42 @@ def optimize_two_sites(
             V_flat[:, root].reshape(A.shape[0], A.shape[1], B.shape[1], B.shape[2])
             for root in range(nstates)
         ]
-        if nstates == 1:
+        dense_cpp_split = None
+        if (
+            nstates == 1
+            and isinstance(H_env, MovingEnvironment)
+            and H_env._dense_operatorless_local_problem_active
+        ):
+            dense_cpp_split = H_env.split_dense_single_state_cpp(
+                V_flat[:, 0],
+                chi_left=A.shape[0],
+                phys_left=A.shape[1],
+                phys_right=B.shape[1],
+                chi_right=B.shape[2],
+                m_max=m,
+                direction=dir,
+            )
+        if dense_cpp_split is not None:
+            A, B, trunc, m = dense_cpp_split
+        elif nstates == 1:
             A,S,B = fine_grain_MPS(AA_list[0], [A.shape[1], B.shape[1]])
             A,S,B,trunc,m = truncate_SVD(A,S,B,m)
+            if (dir == 'right'):
+                # B = S * B.  S is (m,), B is (m, d, R).
+                # Contract S with B[0] (Left bond of B)
+                B = np.tensordot(np.diag(S), B, axes=(1, 0))
+            else:
+                assert dir == 'left'
+                # A = A * S.  A is (L, d, m), S is (m,)
+                # Contract A[2] (Right bond) with S
+                A = np.tensordot(A, np.diag(S), axes=(2, 0))
         else:
             A,S,B,trunc,m = sa_svd_dense(AA_list, weights, dir, m_max=m)
-        if (dir == 'right'):
-            # B = S * B.  S is (m,), B is (m, d, R).
-            # Contract S with B[0] (Left bond of B)
-            B = np.tensordot(np.diag(S), B, axes=(1, 0))
-        else:
-            assert dir == 'left'
-            # A = A * S.  A is (L, d, m), S is (m,)
-            # Contract A[2] (Right bond) with S
-            A = np.tensordot(A, np.diag(S), axes=(2, 0))
+            if (dir == 'right'):
+                B = np.tensordot(np.diag(S), B, axes=(1, 0))
+            else:
+                assert dir == 'left'
+                A = np.tensordot(A, np.diag(S), axes=(2, 0))
         if nstates == 1:
             return E[0], A, B, trunc, m
         return E, A, B, trunc, m, AA_list
@@ -29953,19 +30856,25 @@ def two_site_dmrg(
         weights = [1.0/nstates] * nstates
     weights = np.array(weights)
     abelian_matvec_options = dict(abelian_matvec_options or {})
-    if (
-        "moving_environment_cpp_state_owner" not in abelian_matvec_options
-        and (
-            bool(abelian_matvec_options.get("moving_environment_cpp_davidson", False))
-            or bool(abelian_matvec_options.get("moving_environment_cpp_matvec", False))
+    if not bool(U1):
+        keep_moving_environment = bool(
+            abelian_matvec_options.get("moving_environment", True)
         )
-    ):
-        abelian_matvec_options["moving_environment_cpp_state_owner"] = True
-        abelian_matvec_options.setdefault(
-            "moving_environment_cpp_solve_site_update_owner",
-            True,
+        keep_dense_cpp_matvec = bool(
+            abelian_matvec_options.get("moving_environment_dense_cpp_matvec", False)
         )
-
+        for key in tuple(abelian_matvec_options):
+            if str(key).startswith("moving_environment_cpp_"):
+                if str(key).endswith("_instance") or str(key).endswith("_key"):
+                    abelian_matvec_options.pop(key, None)
+                else:
+                    abelian_matvec_options[key] = False
+        abelian_matvec_options["native_site_storage"] = False
+        abelian_matvec_options["moving_environment"] = keep_moving_environment
+        abelian_matvec_options["moving_environment_dense_cpp_matvec"] = (
+            keep_dense_cpp_matvec
+        )
+        abelian_matvec_options["moving_environment_operatorless_local_problem"] = False
     native_site_storage = bool(
         abelian_matvec_options.get("native_site_storage", False)
     )
@@ -30251,6 +31160,37 @@ def two_site_dmrg(
             "failed_terms": 0,
         },
     )
+    cpp_contextual_batch_requested = bool(
+        abelian_matvec_options.get(
+            "generator_table_cpp_contextual_batch_construction",
+            True,
+        )
+    )
+    unsafe_disable_cpp_contextual_batch = bool(
+        abelian_matvec_options.get(
+            "generator_table_allow_unsafe_disable_cpp_contextual_batch_construction",
+            False,
+        )
+    )
+    cpp_contextual_batch_construction = bool(
+        cpp_contextual_batch_requested or not unsafe_disable_cpp_contextual_batch
+    )
+    cpp_contextual_batch_override_reason = ""
+    if not cpp_contextual_batch_requested and cpp_contextual_batch_construction:
+        cpp_contextual_batch_override_reason = "python_contextual_batch_is_not_exact"
+    cpp_contextual_batch_stats = direct_family_builder_stats.setdefault(
+        "contextual_cpp_batch_construction",
+        {},
+    )
+    cpp_contextual_batch_stats["requested"] = bool(cpp_contextual_batch_requested)
+    cpp_contextual_batch_stats["effective"] = bool(cpp_contextual_batch_construction)
+    cpp_contextual_batch_stats["unsafe_disable"] = bool(
+        unsafe_disable_cpp_contextual_batch
+    )
+    if cpp_contextual_batch_override_reason:
+        cpp_contextual_batch_stats["override_reason"] = (
+            cpp_contextual_batch_override_reason
+        )
     direct_family_spatial_local_ops_cache = {}
 
     def _spatial_local_ops_cached():
@@ -32312,6 +33252,63 @@ def two_site_dmrg(
             direct_family_contextual_site_operator_cache[key] = op
             return op
 
+        contextual_batch_generic_identity_advance = bool(
+            abelian_matvec_options.get(
+                "generator_table_contextual_batch_generic_identity_advance",
+                False,
+            )
+        )
+
+        def _contextual_identity_advance_stats():
+            stats = direct_family_builder_stats.setdefault(
+                "contextual_identity_advance",
+                {},
+            )
+            stats["generic_enabled"] = bool(contextual_batch_generic_identity_advance)
+            return stats
+
+        def _contextual_identity_boundary_advance(side, site, env, source):
+            if env is None or not is_abelian_packed_boundary_tensor(env):
+                return None
+            side = str(side)
+            site = int(site)
+            stats = _contextual_identity_advance_stats()
+            if not contextual_batch_generic_identity_advance:
+                stats[f"{side}_compact"] = int(
+                    stats.get(f"{side}_compact", 0)
+                ) + 1
+                return _packed_identity_boundary_advance(side, site, env, source)
+            try:
+                qns = abelian_packed_tensor_axis_qns(env, 0)
+                if side == "left":
+                    W = _packed_site_operator_from_left("I", site, qns)
+                    if W is None:
+                        return None
+                    result = _packed_contract_from_left(
+                        W,
+                        _current_site_tensor(site),
+                        env,
+                        _current_site_tensor(site),
+                    )
+                else:
+                    W = _packed_site_operator_from_right("I", site, qns)
+                    if W is None:
+                        return None
+                    result = _packed_contract_from_right(
+                        W,
+                        _current_site_tensor(site),
+                        env,
+                        _current_site_tensor(site),
+                    )
+            except Exception as exc:
+                stats[f"{side}_generic_failures"] = int(
+                    stats.get(f"{side}_generic_failures", 0)
+                ) + 1
+                stats[f"{side}_generic_last_error"] = str(exc)
+                return None
+            stats[f"{side}_generic"] = int(stats.get(f"{side}_generic", 0)) + 1
+            return result
+
         def _shared_left_prefix_key(prefix):
             prefix = tuple(prefix)
             return (
@@ -32563,7 +33560,7 @@ def two_site_dmrg(
                     and env is not None
                     and str(piece) == "I"
                 ):
-                    advanced = _packed_identity_boundary_advance(
+                    advanced = _contextual_identity_boundary_advance(
                         "left",
                         site,
                         env,
@@ -32739,7 +33736,7 @@ def two_site_dmrg(
                     and env is not None
                     and str(piece) == "I"
                 ):
-                    advanced = _packed_identity_boundary_advance(
+                    advanced = _contextual_identity_boundary_advance(
                         "right",
                         site,
                         env,
@@ -33132,6 +34129,8 @@ def two_site_dmrg(
             has_previous_table,
             emit_table_puts,
         ):
+            if not cpp_contextual_batch_construction:
+                return None
             part = (
                 None
                 if _cpp_davidson is None or not pack_boundary_tensors
@@ -33242,6 +34241,8 @@ def two_site_dmrg(
             n_sites,
             suffix_start=0,
         ):
+            if not cpp_contextual_batch_construction:
+                return None
             planner = (
                 None
                 if _cpp_davidson is None or not pack_boundary_tensors
@@ -33366,6 +34367,8 @@ def two_site_dmrg(
             initial_fn,
             contract_fn,
         ):
+            if not cpp_contextual_batch_construction:
+                return None
             executor = (
                 None
                 if _cpp_davidson is None or not pack_boundary_tensors
@@ -33429,6 +34432,23 @@ def two_site_dmrg(
                     _packed_tensor_conj(
                         A,
                         f"contextual_wave_{side}_A_conj",
+                    )
+                )
+                b_views.append(B)
+            return tuple(a_conj), tuple(b_views)
+
+        def _contextual_current_site_views(side):
+            side = str(side)
+            a_conj = []
+            b_views = []
+            for site_idx in range(len(MPS)):
+                tensor = _current_site_tensor(site_idx)
+                A = _packed_tensor_view(tensor, f"contextual_plan_{side}_A")
+                B = _packed_tensor_view(tensor, f"contextual_plan_{side}_B")
+                a_conj.append(
+                    _packed_tensor_conj(
+                        A,
+                        f"contextual_plan_{side}_A_conj",
                     )
                 )
                 b_views.append(B)
@@ -33532,11 +34552,14 @@ def two_site_dmrg(
             *,
             target=None,
         ):
+            if not cpp_contextual_batch_construction:
+                return None
             executor = (
                 None
                 if _cpp_davidson is None
-                or not pack_boundary_tensors
-                or validate_packed_boundary_tensors
+                    or not pack_boundary_tensors
+                    or validate_packed_boundary_tensors
+                    or contextual_batch_generic_identity_advance
                 else getattr(
                     _cpp_davidson,
                     "contextual_execute_boundary_build_wave_packed",
@@ -33581,7 +34604,7 @@ def two_site_dmrg(
                             spatial_local_operator_builder._local_piece_entries_cache,
                             site_a_conj,
                             site_b,
-                            None,
+                            zero_like_sector,
                             None,
                         )
                         result = owner.execute_contextual_wave(
@@ -33706,10 +34729,13 @@ def two_site_dmrg(
             suffix_start=0,
             target=None,
         ):
+            if not cpp_contextual_batch_construction:
+                return None
             if (
                 _cpp_davidson is None
                 or not pack_boundary_tensors
                 or validate_packed_boundary_tensors
+                or contextual_batch_generic_identity_advance
             ):
                 return None
             owner = _contextual_wave_cpp_owner()
@@ -33774,7 +34800,7 @@ def two_site_dmrg(
                     spatial_local_operator_builder._local_piece_entries_cache,
                     site_a_conj,
                     site_b,
-                    None,
+                    zero_like_sector,
                     None,
                 )
                 run_loop = getattr(
@@ -34164,6 +35190,17 @@ def two_site_dmrg(
             )
             if partitioned is not None:
                 env_hits += int(partitioned[0])
+                if table is not None:
+                    queued_table_keys = set(table_put_keys)
+                    for idx, left_pattern, local_piece in pending_rows:
+                        if results[int(idx)] is None:
+                            continue
+                        table_key = (tuple(left_pattern), str(local_piece))
+                        if table_key in queued_table_keys:
+                            continue
+                        table_put_keys.append(table_key)
+                        table_put_values.append(results[int(idx)])
+                        queued_table_keys.add(table_key)
             else:
                 for idx, left_pattern, local_piece in pending_rows:
                     table_key = (left_pattern, local_piece)
@@ -34282,7 +35319,7 @@ def two_site_dmrg(
                         break
 
                     def _left_identity_for_wave(site, env):
-                        return _packed_identity_boundary_advance(
+                        return _contextual_identity_boundary_advance(
                             "left",
                             int(site),
                             env,
@@ -34338,7 +35375,7 @@ def two_site_dmrg(
                                 and str(piece) == "I"
                             ):
                                 try:
-                                    env_next = _packed_identity_boundary_advance(
+                                    env_next = _contextual_identity_boundary_advance(
                                         "left",
                                         site,
                                         env,
@@ -34426,7 +35463,7 @@ def two_site_dmrg(
                             and str(prefix[-1]) == "I"
                         ):
                             try:
-                                env_next = _packed_identity_boundary_advance(
+                                env_next = _contextual_identity_boundary_advance(
                                     "left",
                                     site,
                                     env,
@@ -34501,7 +35538,16 @@ def two_site_dmrg(
             cpp_finalize_prebuilt_owner_nohook_prefetch = 0
             cpp_finalize_prepare = (
                 None
-                if _cpp_davidson is None or not pack_boundary_tensors
+                if (
+                    _cpp_davidson is None
+                    or not pack_boundary_tensors
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_prebuilt_finalizer",
+                            True,
+                        )
+                    )
+                )
                 else getattr(
                     _cpp_davidson,
                     "contextual_left_prepare_local_table_batch",
@@ -34510,7 +35556,16 @@ def two_site_dmrg(
             )
             cpp_finalize_prebuilt = (
                 None
-                if _cpp_davidson is None or not pack_boundary_tensors
+                if (
+                    _cpp_davidson is None
+                    or not pack_boundary_tensors
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_prebuilt_finalizer",
+                            True,
+                        )
+                    )
+                )
                 else getattr(
                     _cpp_davidson,
                     "contextual_left_finalize_prebuilt_batch",
@@ -34907,7 +35962,15 @@ def two_site_dmrg(
                     cpp_finalize_prebuilt_failures += 1
             cpp_finalize = (
                 None
-                if _cpp_davidson is None
+                if (
+                    _cpp_davidson is None
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_finalize_batch",
+                            True,
+                        )
+                    )
+                )
                 else getattr(_cpp_davidson, "contextual_left_finalize_batch", None)
             )
             if pattern_items and cpp_finalize is not None:
@@ -35178,7 +36241,7 @@ def two_site_dmrg(
                         and str(prefix[-1]) == "I"
                     ):
                         try:
-                            env_next = _packed_identity_boundary_advance(
+                            env_next = _contextual_identity_boundary_advance(
                                 "left",
                                 site,
                                 env,
@@ -35379,6 +36442,17 @@ def two_site_dmrg(
             )
             if partitioned is not None:
                 env_hits += int(partitioned[0])
+                if table is not None:
+                    queued_table_keys = set(table_put_keys)
+                    for idx, right_pattern, local_piece in pending_rows:
+                        if results[int(idx)] is None:
+                            continue
+                        table_key = (tuple(right_pattern), str(local_piece))
+                        if table_key in queued_table_keys:
+                            continue
+                        table_put_keys.append(table_key)
+                        table_put_values.append(results[int(idx)])
+                        queued_table_keys.add(table_key)
             else:
                 for idx, right_pattern, local_piece in pending_rows:
                     table_key = (right_pattern, local_piece)
@@ -35501,7 +36575,7 @@ def two_site_dmrg(
                     break
 
                 def _right_identity_for_wave(site, env):
-                    return _packed_identity_boundary_advance(
+                    return _contextual_identity_boundary_advance(
                         "right",
                         int(site),
                         env,
@@ -35561,7 +36635,7 @@ def two_site_dmrg(
                             and str(piece) == "I"
                         ):
                             try:
-                                env_next = _packed_identity_boundary_advance(
+                                env_next = _contextual_identity_boundary_advance(
                                     "right",
                                     site,
                                     env,
@@ -35656,7 +36730,7 @@ def two_site_dmrg(
                         and str(suffix[0]) == "I"
                     ):
                         try:
-                            env_next = _packed_identity_boundary_advance(
+                            env_next = _contextual_identity_boundary_advance(
                                 "right",
                                 site,
                                 env,
@@ -35738,7 +36812,16 @@ def two_site_dmrg(
             cpp_finalize_prebuilt_owner_nohook_prefetch = 0
             cpp_finalize_prepare = (
                 None
-                if _cpp_davidson is None or not pack_boundary_tensors
+                if (
+                    _cpp_davidson is None
+                    or not pack_boundary_tensors
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_prebuilt_finalizer",
+                            True,
+                        )
+                    )
+                )
                 else getattr(
                     _cpp_davidson,
                     "contextual_right_prepare_local_table_batch",
@@ -35747,7 +36830,16 @@ def two_site_dmrg(
             )
             cpp_finalize_prebuilt = (
                 None
-                if _cpp_davidson is None or not pack_boundary_tensors
+                if (
+                    _cpp_davidson is None
+                    or not pack_boundary_tensors
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_prebuilt_finalizer",
+                            True,
+                        )
+                    )
+                )
                 else getattr(
                     _cpp_davidson,
                     "contextual_right_finalize_prebuilt_batch",
@@ -36161,7 +37253,15 @@ def two_site_dmrg(
                     cpp_finalize_prebuilt_failures += 1
             cpp_finalize = (
                 None
-                if _cpp_davidson is None
+                if (
+                    _cpp_davidson is None
+                    or not bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_contextual_finalize_batch",
+                            True,
+                        )
+                    )
+                )
                 else getattr(_cpp_davidson, "contextual_right_finalize_batch", None)
             )
             if pattern_items and cpp_finalize is not None:
@@ -36453,7 +37553,7 @@ def two_site_dmrg(
                     and str(suffix[0]) == "I"
                 ):
                     try:
-                        env_next = _packed_identity_boundary_advance(
+                        env_next = _contextual_identity_boundary_advance(
                             "right",
                             site,
                             env,
@@ -37590,6 +38690,82 @@ def two_site_dmrg(
                     "reason": "native boundary P disabled",
                 }
                 return (), set()
+            p_entries = complementary_operator_generator_entries.get("P", {})
+            native_p_policy = str(
+                abelian_matvec_options.get(
+                    "generator_table_native_boundary_p_policy",
+                    "on",
+                )
+                or "on"
+            ).strip().lower().replace("-", "_")
+            if native_p_policy in {"false", "no", "none", "disabled"}:
+                native_p_policy = "off"
+            if native_p_policy in {"true", "yes", "enabled"}:
+                native_p_policy = "on"
+            if native_p_policy == "off":
+                direct_family_builder_stats["native_boundary_p"] = {
+                    "enabled": False,
+                    "reason": "native boundary P disabled by auto policy",
+                    "policy": native_p_policy,
+                    "generator_terms": int(len(p_entries)),
+                }
+                return (), set()
+            if native_p_policy == "auto":
+                route_backend = str(
+                    abelian_matvec_options.get(
+                        "generator_table_packed_route_table",
+                        "",
+                    )
+                ).strip().lower()
+                packed_route_enabled = route_backend not in {
+                    "",
+                    "0",
+                    "false",
+                    "none",
+                    "off",
+                    "python",
+                    "reference",
+                }
+                table_backed_policy = abelian_matvec_options.get(
+                    "generator_table_allow_table_backed_planned_contextual_entries",
+                    False,
+                )
+                if isinstance(table_backed_policy, str):
+                    table_backed_text = (
+                        table_backed_policy.strip().lower().replace("-", "_")
+                    )
+                    table_backed_requested = table_backed_text == "auto" or (
+                        table_backed_text
+                        not in {"", "0", "false", "none", "off", "no"}
+                    )
+                else:
+                    table_backed_requested = bool(table_backed_policy)
+                auto_max_terms = int(
+                    abelian_matvec_options.get(
+                        "generator_table_native_boundary_p_auto_max_terms",
+                        0,
+                    )
+                    or 0
+                )
+                if (
+                    auto_max_terms > 0
+                    and int(len(p_entries)) > auto_max_terms
+                    and packed_route_enabled
+                    and table_backed_requested
+                    and pack_boundary_tensors
+                ):
+                    direct_family_builder_stats["native_boundary_p"] = {
+                        "enabled": False,
+                        "reason": (
+                            "auto disabled native boundary P because packed "
+                            "table-backed direct P route is cheaper"
+                        ),
+                        "policy": native_p_policy,
+                        "auto_max_terms": int(auto_max_terms),
+                        "generator_terms": int(len(p_entries)),
+                        "packed_route_table": route_backend,
+                    }
+                    return (), set()
             left_table = _native_boundary_table("left")
             right_table = _native_boundary_table("right")
             pair_table = _native_pair_boundary_table()
@@ -37607,7 +38783,6 @@ def two_site_dmrg(
             rejected = 0
             left_identity_pattern = tuple("I" for _ in range(bond))
             right_identity_pattern = tuple("I" for _ in range(max(0, L - bond - 2)))
-            p_entries = complementary_operator_generator_entries.get("P", {})
             p_entries_signature = (id(p_entries), int(len(p_entries)))
             validate = bool(
                 getattr(
@@ -44923,7 +46098,7 @@ def two_site_dmrg(
                 local_table_cache = direct_family_contextual_left_local_table_cache
                 target = None
             try:
-                site_a_conj, site_b = _contextual_wave_site_views(side)
+                site_a_conj, site_b = _contextual_current_site_views(side)
                 local_entries_fn = (
                     None
                     if (
@@ -44932,14 +46107,7 @@ def two_site_dmrg(
                     )
                     else spatial_local_operator_builder.local_piece_entries
                 )
-                zero_like_fn = (
-                    None
-                    if (
-                        cpp_contextual_nohook_entries
-                        and contextual_local_entries_prebuilt
-                    )
-                    else zero_like_sector
-                )
+                zero_like_fn = zero_like_sector
                 args = (
                     side,
                     revision,
@@ -45002,62 +46170,593 @@ def two_site_dmrg(
             "right"
         )
 
+        use_cpp_contextual_batch_plan_requested = bool(
+            abelian_matvec_options.get(
+                "generator_table_use_cpp_contextual_boundary_batch_plan",
+                True,
+            )
+        )
+        use_cpp_contextual_batch_plan = bool(use_cpp_contextual_batch_plan_requested)
+        cpp_contextual_batch_plan_available = bool(
+            use_cpp_contextual_batch_plan
+            and left_contextual_batch_plan_key
+            and right_contextual_batch_plan_key
+        )
+        reference_contextual_boundary_batch_default = bool(
+            abelian_matvec_options.get(
+                "generator_table_packed_direct_family_entries",
+                False,
+            )
+            and abelian_matvec_options.get(
+                "generator_table_allow_planned_packed_contextual_entries",
+                False,
+            )
+            and not use_cpp_contextual_batch_plan_requested
+        )
+        reference_contextual_boundary_batch_user_set = (
+            "generator_table_reference_contextual_boundary_batch"
+            in abelian_matvec_options
+        )
         reference_contextual_boundary_batch = bool(
             abelian_matvec_options.get(
                 "generator_table_reference_contextual_boundary_batch",
-                bool(
-                    abelian_matvec_options.get(
-                        "generator_table_packed_direct_family_entries",
-                        False,
-                    )
-                    and abelian_matvec_options.get(
-                        "generator_table_allow_planned_packed_contextual_entries",
-                        False,
-                    )
+                reference_contextual_boundary_batch_default,
+            )
+        )
+        allow_unvalidated_contextual_boundary_batch = bool(
+            abelian_matvec_options.get(
+                "generator_table_allow_unvalidated_contextual_boundary_batch",
+                False,
+            )
+        )
+        contextual_batch_plan_stats = direct_family_builder_stats.setdefault(
+            "contextual_boundary_batch_plan",
+            {},
+        )
+        contextual_batch_plan_stats["reference_batch_requested"] = bool(
+            reference_contextual_boundary_batch
+        )
+        contextual_batch_plan_stats["reference_batch_default"] = bool(
+            reference_contextual_boundary_batch_default
+        )
+        contextual_batch_plan_stats["allow_unvalidated_batch"] = bool(
+            allow_unvalidated_contextual_boundary_batch
+        )
+        contextual_batch_plan_stats["cpp_contextual_batch_construction_requested"] = (
+            bool(cpp_contextual_batch_requested)
+        )
+        contextual_batch_plan_stats["cpp_contextual_batch_construction_effective"] = (
+            bool(cpp_contextual_batch_construction)
+        )
+        contextual_batch_plan_stats[
+            "cpp_contextual_batch_construction_unsafe_disable"
+        ] = bool(unsafe_disable_cpp_contextual_batch)
+        if cpp_contextual_batch_override_reason:
+            contextual_batch_plan_stats[
+                "cpp_contextual_batch_construction_override_reason"
+            ] = cpp_contextual_batch_override_reason
+        if (
+            reference_contextual_boundary_batch_user_set
+            and not reference_contextual_boundary_batch
+            and not allow_unvalidated_contextual_boundary_batch
+            and not cpp_contextual_batch_plan_available
+        ):
+            reference_contextual_boundary_batch = True
+            contextual_batch_plan_stats[
+                "reference_batch_override_reason"
+            ] = "non_reference_contextual_batch_is_unvalidated"
+        contextual_batch_plan_stats["left_installed"] = bool(
+            left_contextual_batch_plan_key
+        )
+        contextual_batch_plan_stats["right_installed"] = bool(
+            right_contextual_batch_plan_key
+        )
+        contextual_batch_plan_stats["consume_cpp_plan_enabled"] = bool(
+            use_cpp_contextual_batch_plan_requested
+        )
+        contextual_batch_plan_stats["reference_batch"] = bool(
+            reference_contextual_boundary_batch
+        )
+        validate_contextual_boundary_batch = bool(
+            abelian_matvec_options.get(
+                "generator_table_validate_contextual_boundary_batch",
+                not cpp_contextual_batch_plan_available,
+            )
+        )
+        contextual_batch_validation_limit = int(
+            abelian_matvec_options.get(
+                "generator_table_contextual_boundary_batch_validation_limit",
+                -1,
+            )
+        )
+        contextual_batch_validation_tol = float(
+            abelian_matvec_options.get(
+                "generator_table_contextual_boundary_batch_validation_tol",
+                1.0e-10,
+            )
+            or 0.0
+        )
+        contextual_batch_fail_fast = bool(
+            abelian_matvec_options.get(
+                "generator_table_contextual_boundary_batch_fail_fast",
+                False,
+            )
+        )
+        contextual_batch_cold_validate = bool(
+            abelian_matvec_options.get(
+                "generator_table_contextual_boundary_batch_cold_validate",
+                False,
+            )
+        )
+        contextual_batch_refresh_cached_boundaries = bool(
+            abelian_matvec_options.get(
+                "generator_table_contextual_batch_refresh_cached_boundaries",
+                True,
+            )
+        )
+        unsafe_unvalidated_contextual_boundary_batch = bool(
+            abelian_matvec_options.get(
+                "generator_table_allow_unsafe_unvalidated_contextual_boundary_batch",
+                False,
+            )
+        )
+        contextual_batch_full_warm_validation = bool(
+            validate_contextual_boundary_batch
+            and contextual_batch_validation_limit < 0
+            and not contextual_batch_cold_validate
+        )
+        unsafe_cpp_contextual_batch_plan = bool(
+            abelian_matvec_options.get(
+                "generator_table_allow_unsafe_cpp_contextual_boundary_batch_plan",
+                False,
+            )
+        )
+        if (
+            not reference_contextual_boundary_batch
+            and not contextual_batch_full_warm_validation
+            and not unsafe_unvalidated_contextual_boundary_batch
+            and not cpp_contextual_batch_plan_available
+        ):
+            reference_contextual_boundary_batch = True
+            contextual_batch_plan_stats[
+                "reference_batch_override_reason"
+            ] = "non_reference_contextual_batch_requires_full_warm_validation"
+            contextual_batch_plan_stats["reference_batch"] = True
+        prewarm_contextual_boundary_batch = bool(
+            abelian_matvec_options.get(
+                "generator_table_prewarm_contextual_boundary_batch",
+                (
+                    not reference_contextual_boundary_batch
+                    and not contextual_batch_full_warm_validation
                 ),
             )
         )
+        contextual_batch_forced_reference_sides = {"left": False, "right": False}
+        contextual_batch_plan_stats["validation_enabled"] = bool(
+            validate_contextual_boundary_batch
+        )
+        contextual_batch_plan_stats["validation_limit"] = int(
+            contextual_batch_validation_limit
+        )
+        contextual_batch_plan_stats["cold_validation"] = bool(
+            contextual_batch_cold_validate
+        )
+        contextual_batch_plan_stats["generic_identity_advance"] = bool(
+            contextual_batch_generic_identity_advance
+        )
+        contextual_batch_plan_stats["refresh_cached_boundaries"] = bool(
+            contextual_batch_refresh_cached_boundaries
+        )
+        contextual_batch_plan_stats["full_warm_validation"] = bool(
+            contextual_batch_full_warm_validation
+        )
+        contextual_batch_plan_stats["prewarm_batch"] = bool(
+            prewarm_contextual_boundary_batch
+        )
+        contextual_batch_plan_stats["unsafe_unvalidated_batch"] = bool(
+            unsafe_unvalidated_contextual_boundary_batch
+        )
+        contextual_batch_plan_stats["consume_cpp_plan_requested"] = bool(
+            use_cpp_contextual_batch_plan_requested
+        )
+        contextual_batch_plan_stats["consume_cpp_plan_effective"] = bool(
+            use_cpp_contextual_batch_plan
+        )
+        contextual_batch_plan_stats["consume_cpp_plan_available"] = bool(
+            cpp_contextual_batch_plan_available
+        )
+        contextual_batch_plan_stats["consume_cpp_plan_enabled"] = bool(
+            use_cpp_contextual_batch_plan
+        )
+        contextual_batch_plan_stats["unsafe_cpp_plan"] = bool(
+            unsafe_cpp_contextual_batch_plan
+        )
+        contextual_route_lazy_stats = direct_family_builder_stats.setdefault(
+            "contextual_route_lazy_pack",
+            {"calls": 0},
+        )
+        contextual_route_lazy_stats["validate_native_plan_table_ids"] = bool(
+            validate_contextual_boundary_batch and use_cpp_contextual_batch_plan
+        )
+        contextual_route_lazy_stats["native_plan_validation_limit"] = int(
+            contextual_batch_validation_limit
+        )
+        contextual_route_lazy_stats["native_plan_validation_tol"] = float(
+            contextual_batch_validation_tol
+        )
+        contextual_route_lazy_stats["native_plan_validation_fail_fast"] = bool(
+            contextual_batch_fail_fast
+        )
+        contextual_route_lazy_stats["native_plan_validation_cold"] = bool(
+            validate_contextual_boundary_batch and use_cpp_contextual_batch_plan
+        )
+
+        def _contextual_batch_validation_stats(side):
+            stats = direct_family_builder_stats.setdefault(
+                "contextual_boundary_batch_validation",
+                {},
+            )
+            return stats.setdefault(str(side), {"calls": 0})
+
+        def _contextual_payload_difference(candidate, reference):
+            if candidate is None or reference is None:
+                return candidate is reference, float("inf"), float("inf")
+            candidate = tuple(candidate)
+            reference = tuple(reference)
+            if len(candidate) != len(reference):
+                return False, float("inf"), float("inf")
+            max_abs = 0.0
+            max_rel = 0.0
+            for lhs, rhs in zip(candidate, reference):
+                same, diff, ref_norm = compare_abelian_packed_boundary_tensors(
+                    lhs,
+                    rhs,
+                )
+                if not same:
+                    return False, float("inf"), float("inf")
+                diff = float(diff)
+                ref_norm = float(ref_norm)
+                max_abs = max(max_abs, diff)
+                max_rel = max(max_rel, diff / max(ref_norm, 1.0e-30))
+            return True, max_abs, max_rel
+
+        def _evict_contextual_boundary_result(side, pattern, piece):
+            side = str(side)
+            pattern = tuple(pattern)
+            piece = str(piece)
+            token = left_contextual_token if side == "left" else right_contextual_token
+            cache = (
+                direct_family_contextual_left_env_cache
+                if side == "left"
+                else direct_family_contextual_right_env_cache
+            )
+            cache.pop(
+                (
+                    int(direct_family_env_revision[0]),
+                    token,
+                    pattern,
+                    piece,
+                ),
+                None,
+            )
+            table = _contextual_exact_boundary_table(side)
+            entries = getattr(table, "entries", None)
+            if isinstance(entries, dict):
+                table_key = (pattern, piece)
+                normalize = getattr(table, "normalize_key", None)
+                if callable(normalize):
+                    try:
+                        table_key = normalize(table_key)
+                    except Exception:
+                        table_key = (pattern, piece)
+                discard = getattr(table, "discard", None)
+                if callable(discard):
+                    discard(table_key, normalized=True)
+                else:
+                    entries.pop(table_key, None)
+            boundary_bond = bond if side == "left" else bond + 1
+            packed_table = direct_family_packed_contextual_boundary_table_cache.get(
+                (side, int(boundary_bond))
+            )
+            discard = getattr(packed_table, "discard", None)
+            if callable(discard):
+                try:
+                    discard((pattern, piece), normalized=False)
+                except Exception:
+                    pass
+
+        def _clear_contextual_prefix_suffix_cache(side):
+            side = str(side)
+            cache = (
+                direct_family_contextual_left_prefix_cache
+                if side == "left"
+                else direct_family_contextual_right_suffix_cache
+            )
+            cache.clear()
+            stats = _contextual_batch_validation_stats(side)
+            stats["cold_cache_clears"] = int(
+                stats.get("cold_cache_clears", 0)
+            ) + 1
+
+        def _contextual_scalar_batch(side, keys, family_name=None):
+            builder = (
+                _left_env_and_local_operator
+                if str(side) == "left"
+                else _right_env_and_local_operator
+            )
+            return tuple(
+                builder(
+                    tuple(pattern),
+                    str(piece),
+                    family_name=family_name,
+                )
+                for pattern, piece in tuple(keys or ())
+            )
+
+        def _prewarm_contextual_batch(side, keys, family_name=None):
+            if not prewarm_contextual_boundary_batch:
+                return
+            if contextual_batch_full_warm_validation and validate_contextual_boundary_batch:
+                return
+            side = str(side)
+            keys = tuple(keys or ())
+            if not keys:
+                return
+            stats = direct_family_builder_stats.setdefault(
+                "contextual_boundary_batch_prewarm",
+                {},
+            )
+            side_stats = stats.setdefault(side, {"calls": 0})
+            side_stats["calls"] = int(side_stats.get("calls", 0)) + 1
+            side_stats["keys"] = int(side_stats.get("keys", 0)) + int(len(keys))
+            side_stats["last_keys"] = int(len(keys))
+            t_prewarm = time.perf_counter()
+            _contextual_scalar_batch(
+                side,
+                keys,
+                family_name=family_name,
+            )
+            evicted = 0
+            for pattern, piece in keys:
+                _evict_contextual_boundary_result(side, pattern, piece)
+                evicted += 1
+            side_stats["evictions"] = int(side_stats.get("evictions", 0)) + evicted
+            elapsed = time.perf_counter() - t_prewarm
+            side_stats["seconds"] = float(side_stats.get("seconds", 0.0)) + elapsed
+            side_stats["last_seconds"] = float(elapsed)
+
+        def _contextual_batch_validation_sample(side, keys, family_name=None):
+            side_stats = _contextual_batch_validation_stats(side)
+            if (
+                not validate_contextual_boundary_batch
+                or not pack_boundary_tensors
+                or contextual_batch_validation_limit == 0
+            ):
+                side_stats["enabled"] = bool(validate_contextual_boundary_batch)
+                return ()
+            checked = int(side_stats.get("checked", 0))
+            if contextual_batch_validation_limit < 0:
+                remaining = len(tuple(keys or ()))
+            else:
+                remaining = contextual_batch_validation_limit - checked
+            if remaining <= 0:
+                return ()
+            sample = tuple(keys or ())[:remaining]
+            for pattern, piece in sample:
+                _evict_contextual_boundary_result(side, pattern, piece)
+            reference = _contextual_scalar_batch(
+                side,
+                sample,
+                family_name=family_name,
+            )
+            for pattern, piece in sample:
+                _evict_contextual_boundary_result(side, pattern, piece)
+            if contextual_batch_cold_validate:
+                _clear_contextual_prefix_suffix_cache(side)
+            return tuple(zip(sample, reference))
+
+        def _refresh_contextual_boundary_batch_keys(side, keys):
+            if not contextual_batch_refresh_cached_boundaries:
+                return
+            side_stats = _contextual_batch_validation_stats(side)
+            count = 0
+            for pattern, piece in tuple(keys or ()):
+                _evict_contextual_boundary_result(side, pattern, piece)
+                count += 1
+            side_stats["refresh_evictions"] = (
+                int(side_stats.get("refresh_evictions", 0)) + int(count)
+            )
+
+        def _validate_contextual_batch(side, sample, candidate):
+            side = str(side)
+            side_stats = _contextual_batch_validation_stats(side)
+            sample = tuple(sample or ())
+            if not sample:
+                return True
+            side_stats["calls"] = int(side_stats.get("calls", 0)) + 1
+            side_stats["checked"] = int(side_stats.get("checked", 0)) + len(sample)
+            side_stats["last_bond"] = int(bond)
+            side_stats["tol"] = float(contextual_batch_validation_tol)
+            candidate = tuple(candidate or ())
+            if len(candidate) < len(sample):
+                side_stats["mismatches"] = int(
+                    side_stats.get("mismatches", 0)
+                ) + 1
+                side_stats["last_mismatch_reason"] = "short_candidate_batch"
+                side_stats["last_candidate_size"] = int(len(candidate))
+                side_stats["last_sample_size"] = int(len(sample))
+                side_stats["forced_reference"] = True
+                contextual_batch_forced_reference_sides[side] = True
+                contextual_batch_plan_stats[f"{side}_forced_reference"] = True
+                if contextual_batch_fail_fast:
+                    raise RuntimeError(
+                        "contextual boundary batch validation failed "
+                        f"side={side} bond={bond}: short candidate batch"
+                    )
+                return False
+            for idx, ((key, reference), got) in enumerate(zip(sample, candidate)):
+                same, abs_diff, rel_diff = _contextual_payload_difference(got, reference)
+                side_stats["max_abs"] = max(
+                    float(side_stats.get("max_abs", 0.0)),
+                    float(abs_diff),
+                )
+                side_stats["max_rel"] = max(
+                    float(side_stats.get("max_rel", 0.0)),
+                    float(rel_diff),
+                )
+                if (
+                    not same
+                    or float(abs_diff) > contextual_batch_validation_tol
+                    and float(rel_diff) > contextual_batch_validation_tol
+                ):
+                    side_stats["mismatches"] = int(
+                        side_stats.get("mismatches", 0)
+                    ) + 1
+                    side_stats["last_mismatch_index"] = int(idx)
+                    try:
+                        pattern, piece = key
+                        side_stats["last_mismatch_pattern"] = tuple(
+                            str(item) for item in tuple(pattern)
+                        )
+                        side_stats["last_mismatch_piece"] = str(piece)
+                    except Exception:
+                        side_stats["last_mismatch_key"] = repr(key)
+                    side_stats["last_mismatch_abs"] = float(abs_diff)
+                    side_stats["last_mismatch_rel"] = float(rel_diff)
+                    side_stats["forced_reference"] = True
+                    contextual_batch_forced_reference_sides[side] = True
+                    contextual_batch_plan_stats[f"{side}_forced_reference"] = True
+                    if contextual_batch_fail_fast:
+                        raise RuntimeError(
+                            "contextual boundary batch validation failed "
+                            f"side={side} bond={bond} abs={abs_diff:.3e} "
+                            f"rel={rel_diff:.3e}"
+                        )
+                    return False
+            side_stats["matches"] = int(side_stats.get("matches", 0)) + len(sample)
+            return True
 
         def _left_contextual_batch(keys, family_name=None):
-            if reference_contextual_boundary_batch:
-                return tuple(
-                    _left_env_and_local_operator(
-                        tuple(pattern),
-                        str(piece),
-                        family_name=family_name,
-                    )
-                    for pattern, piece in tuple(keys or ())
+            keys = tuple((tuple(pattern), str(piece)) for pattern, piece in tuple(keys or ()))
+            if reference_contextual_boundary_batch or contextual_batch_forced_reference_sides["left"] or bool(
+                abelian_matvec_options.get(
+                    "generator_table_reference_left_contextual_boundary_batch",
+                    False,
                 )
-            return _left_env_and_local_operator_batch(
+            ):
+                return _contextual_scalar_batch(
+                    "left",
+                    keys,
+                    family_name=family_name,
+                )
+            sample = _contextual_batch_validation_sample(
+                "left",
                 keys,
                 family_name=family_name,
-                assume_table_misses=True,
             )
+            _prewarm_contextual_batch(
+                "left",
+                keys,
+                family_name=family_name,
+            )
+            _refresh_contextual_boundary_batch_keys("left", keys)
+            result = _left_env_and_local_operator_batch(
+                keys,
+                family_name=family_name,
+                assume_table_misses=bool(
+                    abelian_matvec_options.get(
+                        "generator_table_contextual_batch_assume_table_misses",
+                        True,
+                    )
+                ),
+            )
+            if not _validate_contextual_batch("left", sample, result[: len(sample)]):
+                for pattern, piece in keys:
+                    _evict_contextual_boundary_result("left", pattern, piece)
+                return _contextual_scalar_batch(
+                    "left",
+                    keys,
+                    family_name=family_name,
+                )
+            return result
 
         def _right_contextual_batch(keys, family_name=None):
-            if reference_contextual_boundary_batch:
-                return tuple(
-                    _right_env_and_local_operator(
-                        tuple(pattern),
-                        str(piece),
-                        family_name=family_name,
-                    )
-                    for pattern, piece in tuple(keys or ())
+            keys = tuple((tuple(pattern), str(piece)) for pattern, piece in tuple(keys or ()))
+            if reference_contextual_boundary_batch or contextual_batch_forced_reference_sides["right"] or bool(
+                abelian_matvec_options.get(
+                    "generator_table_reference_right_contextual_boundary_batch",
+                    False,
                 )
-            return _right_env_and_local_operator_batch(
+            ):
+                return _contextual_scalar_batch(
+                    "right",
+                    keys,
+                    family_name=family_name,
+                )
+            sample = _contextual_batch_validation_sample(
+                "right",
                 keys,
                 family_name=family_name,
-                assume_table_misses=True,
             )
+            _prewarm_contextual_batch(
+                "right",
+                keys,
+                family_name=family_name,
+            )
+            _refresh_contextual_boundary_batch_keys("right", keys)
+            result = _right_env_and_local_operator_batch(
+                keys,
+                family_name=family_name,
+                assume_table_misses=bool(
+                    abelian_matvec_options.get(
+                        "generator_table_contextual_batch_assume_table_misses",
+                        True,
+                    )
+                ),
+            )
+            if not _validate_contextual_batch("right", sample, result[: len(sample)]):
+                for pattern, piece in keys:
+                    _evict_contextual_boundary_result("right", pattern, piece)
+                return _contextual_scalar_batch(
+                    "right",
+                    keys,
+                    family_name=family_name,
+                )
+            return result
 
-        if left_contextual_batch_plan_key and not reference_contextual_boundary_batch:
+        _left_contextual_batch._pyqed_clear_contextual_boundary_cache = (
+            lambda: _clear_contextual_prefix_suffix_cache("left")
+        )
+        _right_contextual_batch._pyqed_clear_contextual_boundary_cache = (
+            lambda: _clear_contextual_prefix_suffix_cache("right")
+        )
+
+        if (
+            left_contextual_batch_plan_key
+            and not reference_contextual_boundary_batch
+            and use_cpp_contextual_batch_plan
+        ):
             _left_contextual_batch._pyqed_cpp_contextual_batch_plan_key = (
                 left_contextual_batch_plan_key
             )
-        if right_contextual_batch_plan_key and not reference_contextual_boundary_batch:
+            contextual_batch_plan_stats["left_attached"] = True
+        else:
+            contextual_batch_plan_stats["left_attached"] = False
+        if (
+            right_contextual_batch_plan_key
+            and not reference_contextual_boundary_batch
+            and use_cpp_contextual_batch_plan
+        ):
             _right_contextual_batch._pyqed_cpp_contextual_batch_plan_key = (
                 right_contextual_batch_plan_key
             )
+            contextual_batch_plan_stats["right_attached"] = True
+        else:
+            contextual_batch_plan_stats["right_attached"] = False
+        if reference_contextual_boundary_batch and use_cpp_contextual_batch_plan:
+            contextual_batch_plan_stats[
+                "attach_disabled_reason"
+            ] = "reference_contextual_boundary_batch"
 
         contextual_builder = AbelianContextualDirectFamilyBuilder(
             stats=direct_family_builder_stats,
@@ -45108,12 +46807,89 @@ def two_site_dmrg(
                 False,
             )
         )
-        allow_table_backed_planned_contextual_entries = bool(
+        table_backed_planned_contextual_policy = abelian_matvec_options.get(
+            "generator_table_allow_table_backed_planned_contextual_entries",
+            False,
+        )
+        if isinstance(table_backed_planned_contextual_policy, str):
+            table_backed_policy_text = (
+                table_backed_planned_contextual_policy.strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if table_backed_policy_text == "auto":
+                route_backend = str(
+                    abelian_matvec_options.get(
+                        "generator_table_packed_route_table",
+                        "",
+                    )
+                ).strip().lower()
+                packed_route_enabled = route_backend not in {
+                    "",
+                    "0",
+                    "false",
+                    "none",
+                    "off",
+                    "python",
+                    "reference",
+                }
+                allow_table_backed_planned_contextual_entries = bool(
+                    allow_planned_packed_contextual_entries
+                    and pack_boundary_tensors
+                    and packed_route_enabled
+                )
+            else:
+                allow_table_backed_planned_contextual_entries = (
+                    table_backed_policy_text
+                    not in {"", "0", "false", "none", "off", "no"}
+                )
+        else:
+            allow_table_backed_planned_contextual_entries = bool(
+                table_backed_planned_contextual_policy
+            )
+        table_backed_planned_contextual_guard_reason = ""
+        unsafe_table_backed_planned_contextual_entries = bool(
             abelian_matvec_options.get(
-                "generator_table_allow_table_backed_planned_contextual_entries",
+                "generator_table_allow_unsafe_table_backed_planned_contextual_entries",
                 False,
             )
         )
+        if (
+            allow_table_backed_planned_contextual_entries
+            and not reference_contextual_boundary_batch
+            and not contextual_batch_full_warm_validation
+            and not unsafe_table_backed_planned_contextual_entries
+            and not cpp_contextual_batch_plan_available
+        ):
+            allow_table_backed_planned_contextual_entries = False
+            table_backed_planned_contextual_guard_reason = (
+                "table_backed_contextual_entries_require_reference_or_full_warm_validation"
+            )
+        cpp_contextual_precompute_disabled_reason = ""
+        if (
+            use_cpp_contextual_batch_plan
+            and allow_table_backed_planned_contextual_entries
+            and bool(build_options.precompute_boundaries)
+        ):
+            build_options = AbelianContextualFamilyBuildOptions(
+                precompute_boundaries=False,
+                precompute_min_records=build_options.precompute_min_records,
+                pack_entries=build_options.pack_entries,
+                packed_buffer=build_options.packed_buffer,
+                planned_without_precompute=build_options.planned_without_precompute,
+                planned_without_precompute_batch=(
+                    build_options.planned_without_precompute_batch
+                ),
+                planned_without_precompute_table_lookup=(
+                    build_options.planned_without_precompute_table_lookup
+                ),
+                planned_without_precompute_table_ids_only=(
+                    build_options.planned_without_precompute_table_ids_only
+                ),
+            )
+            cpp_contextual_precompute_disabled_reason = (
+                "attached_cpp_table_backed_contextual_plan_uses_lazy_table_ids"
+            )
         guarded_planned_packed_contextual_entries = False
         exact_planned_packed_contextual_entries = False
         if build_options.packed_buffer and not bool(
@@ -45189,11 +46965,60 @@ def two_site_dmrg(
             "table_backed_planned_contextual_entries": bool(
                 allow_table_backed_planned_contextual_entries
             ),
+            "table_backed_planned_contextual_entries_policy": (
+                str(table_backed_planned_contextual_policy)
+            ),
+            "unsafe_table_backed_planned_contextual_entries": bool(
+                unsafe_table_backed_planned_contextual_entries
+            ),
+            "table_backed_planned_contextual_guard_reason": (
+                table_backed_planned_contextual_guard_reason
+            ),
+            "cpp_contextual_batch_construction_requested": bool(
+                cpp_contextual_batch_requested
+            ),
+            "cpp_contextual_batch_construction_effective": bool(
+                cpp_contextual_batch_construction
+            ),
+            "cpp_contextual_batch_construction_unsafe_disable": bool(
+                unsafe_disable_cpp_contextual_batch
+            ),
+            "cpp_contextual_batch_construction_override_reason": (
+                cpp_contextual_batch_override_reason
+            ),
+            "cpp_contextual_precompute_disabled": bool(
+                cpp_contextual_precompute_disabled_reason
+            ),
+            "cpp_contextual_precompute_disabled_reason": (
+                cpp_contextual_precompute_disabled_reason
+            ),
         }
         if guarded_planned_packed_contextual_entries:
             direct_family_builder_stats["contextual_build_options"][
                 "planned_packed_contextual_guard_reason"
             ] = "table-backed planned packed contextual entries are not exact"
+        if (
+            allow_table_backed_planned_contextual_entries
+            and bool(build_options.precompute_boundaries)
+            and pack_boundary_tensors
+        ):
+            direct_family_builder_stats[
+                "contextual_boundary_precompute_side_cache_enabled"
+            ] = bool(
+                abelian_matvec_options.get(
+                    "generator_table_contextual_boundary_precompute_side_cache",
+                    True,
+                )
+            )
+            direct_family_builder_stats[
+                "contextual_boundary_side_cache_max_content_keys"
+            ] = int(
+                abelian_matvec_options.get(
+                    "generator_table_contextual_boundary_side_cache_max_content_keys",
+                    8192,
+                )
+                or 8192
+            )
         build_contextual_local_action_plan = bool(
             abelian_matvec_options.get(
                 "generator_table_build_contextual_local_action_plan",
@@ -49225,11 +51050,6 @@ def expect_mps(bra, MPO, ket=None):
 
 
 
-# class TDVP(DMRG):
-#     pass
-
-
-
 def fDMRG_1site_GS_OBC(H,D,Nsweeps):
     '''
     Function that implements finite-system DMRG (one-site update version) to obtain the ground state of an input
@@ -49257,7 +51077,7 @@ def fDMRG_1site_GS_OBC(H,D,Nsweeps):
     M = RightCanonical(M)
 
     # Hzip
-    '''
+    r'''
         Every step of the finite-system DMRG consists in optimizing a local tensor M[l] of an MPS in site
             canonical form. The value of l is sweeped back and forth between 0 and N-1.
 

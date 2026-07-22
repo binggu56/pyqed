@@ -14,6 +14,7 @@ https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/651592
 import numpy as np
 
 from itertools import combinations
+import importlib
 from scipy.sparse.linalg import eigsh
 # from functools import reduce
 
@@ -22,6 +23,25 @@ from opt_einsum import contract
 
 from pyqed.qchem.hf.rhf import RHF
 # from pyqed.qchem.ci.cisd import get_SO_matrix
+
+_CASSCF_CPP_UNINITIALIZED = object()
+_casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+
+
+def _cpp_attr(*names):
+    global _casscf_cpp
+    if _casscf_cpp is _CASSCF_CPP_UNINITIALIZED:
+        try:
+            _casscf_cpp = importlib.import_module("pyqed.qchem._casscf_cpp")
+        except Exception:  # pragma: no cover - optional accelerator
+            _casscf_cpp = None
+    if _casscf_cpp is None:
+        return None
+    for name in names:
+        attr = getattr(_casscf_cpp, name, None)
+        if attr is not None:
+            return attr
+    return None
 
 
 def _transform_spatial_eri_to_mo(eri_ao, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
@@ -213,9 +233,17 @@ def get_fci_combos(mf=None, mo_occ=None):
         list(combinations(np.arange(0, N, 1, dtype=np.int8), N_s[1])),
         dtype=np.int8,
     )
-    ΛA, ΛB = SpinOuterProduct(Λ_α, Λ_β)
-    Binary = givenΛgetB(ΛA, ΛB, N)
-    return Binary
+    alpha = np.zeros((Λ_α.shape[0], N), dtype=np.int8)
+    beta = np.zeros((Λ_β.shape[0], N), dtype=np.int8)
+    if Λ_α.shape[1] > 0:
+        alpha[np.arange(Λ_α.shape[0])[:, None], Λ_α] = 1
+    if Λ_β.shape[1] > 0:
+        beta[np.arange(Λ_β.shape[0])[:, None], Λ_β] = 1
+
+    Binary = np.empty((Λ_α.shape[0], Λ_β.shape[0], 2, N), dtype=np.int8)
+    Binary[:, :, 0, :] = alpha[:, None, :]
+    Binary[:, :, 1, :] = beta[None, :, :]
+    return Binary.reshape(Λ_α.shape[0] * Λ_β.shape[0], 2, N)
 
 
 def determinantsign(Binary):
@@ -524,6 +552,19 @@ def CI_H(Binary, H1, H2, SC1, SC2):
     ======
     HCI: CI Hamiltonian
     """
+    ci_hamiltonian = _cpp_attr("ci_hamiltonian")
+    if ci_hamiltonian is not None and not (np.iscomplexobj(H1) or np.iscomplexobj(H2)):
+        try:
+            return ci_hamiltonian(
+                np.ascontiguousarray(Binary, dtype=np.int8),
+                np.ascontiguousarray(H1, dtype=np.float64),
+                np.ascontiguousarray(H2, dtype=np.float64),
+                SC1,
+                SC2,
+            )
+        except Exception:
+            pass
+
     I_A, J_A, a_t , a, I_B, J_B, b_t , b, ca, cb = SC1
     I_AA, J_AA, aa_t, aa, I_BB, J_BB, bb_t, bb, I_AB, J_AB, ab_t, ab, ba_t, ba = SC2
 

@@ -1,0 +1,218 @@
+{
+  "model": {
+    "nrows": 6,
+    "ncols": 6,
+    "nsites": 36,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open"
+  },
+  "baseline": {
+    "result": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_block_sparse_6x6.json",
+    "state": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_block_sparse_6x6.npz",
+    "energy": -16.848069678166297,
+    "energy_per_site": -0.4680019355046194,
+    "parameters": 3752,
+    "ties": 60
+  },
+  "sampling": {
+    "seed": 29,
+    "nsamples": 256,
+    "burn_in": 100,
+    "sweeps_between": 2,
+    "proposal": "mixed",
+    "exchange_probability": 0.75,
+    "acceptance_rate": 0.034222948438634715,
+    "mean_local_energy": {
+      "real": -16.772667371914203,
+      "imag": -0.014611819223360719
+    },
+    "local_energy_variance": 1.8084480339689448
+  },
+  "ranking": {
+    "candidate_family": "missing J2 diagonal ties",
+    "candidate_count": 50,
+    "cost_weight": 0.2,
+    "correlation_weight": 1.0,
+    "residual_weight": 1.0,
+    "top_signals": [
+      {
+        "edge": [
+          17,
+          19
+        ],
+        "connected_correlation": 0.172607421875,
+        "residual_coupling": 0.10661181079766546,
+        "signal": 0.27921923267266546,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.27921923267266546,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          25,
+          35
+        ],
+        "connected_correlation": 0.2236328125,
+        "residual_coupling": 0.046219898435925555,
+        "signal": 0.26985271093592555,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.26985271093592555,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          28,
+          32
+        ],
+        "connected_correlation": 0.1796875,
+        "residual_coupling": 0.05842421302188034,
+        "signal": 0.23811171302188033,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.23811171302188033,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          2,
+          8
+        ],
+        "connected_correlation": 0.19091796875,
+        "residual_coupling": 0.03951173116893334,
+        "signal": 0.23042969991893333,
+        "delta_log_cost": 0.008918676731841657,
+        "proxy_utility": 0.228645964572565,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          24,
+          34
+        ],
+        "connected_correlation": 0.218414306640625,
+        "residual_coupling": 0.1539499510052874,
+        "signal": 0.3723642576459124,
+        "delta_log_cost": 0.7283543371958743,
+        "proxy_utility": 0.22669339020673754,
+        "peak_width_after": 7
+      },
+      {
+        "edge": [
+          13,
+          23
+        ],
+        "connected_correlation": 0.13739013671875,
+        "residual_coupling": 0.06915296366498823,
+        "signal": 0.20654310038373824,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.20654310038373824,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          3,
+          9
+        ],
+        "connected_correlation": 0.111114501953125,
+        "residual_coupling": 0.06917551909888246,
+        "signal": 0.18029002105200748,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.18029002105200748,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          14,
+          22
+        ],
+        "connected_correlation": 0.088531494140625,
+        "residual_coupling": 0.08405425413432148,
+        "signal": 0.1725857482749465,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.1725857482749465,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          21,
+          27
+        ],
+        "connected_correlation": 0.121368408203125,
+        "residual_coupling": 0.04587384243007803,
+        "signal": 0.16724225063320303,
+        "delta_log_cost": 0.0,
+        "proxy_utility": 0.16724225063320303,
+        "peak_width_after": 6
+      },
+      {
+        "edge": [
+          3,
+          7
+        ],
+        "connected_correlation": 0.11322021484375,
+        "residual_coupling": 0.05484520261143261,
+        "signal": 0.1680654174551826,
+        "delta_log_cost": 0.01775851330098277,
+        "proxy_utility": 0.16451371479498605,
+        "peak_width_after": 6
+      }
+    ]
+  },
+  "selected_proposal": {
+    "edge": [
+      17,
+      19
+    ],
+    "operation": "add",
+    "connected_correlation": 0.172607421875,
+    "residual_coupling": 0.10661181079766546,
+    "signal": 0.27921923267266546,
+    "proxy_utility": 0.27921923267266546,
+    "cost_before": {
+      "peak_width": 6,
+      "peak_physical_states": 64,
+      "peak_norm_elements": 1024,
+      "total_norm_elements": 28576,
+      "log_objective": 17.191794289275677
+    },
+    "cost_after": {
+      "peak_width": 6,
+      "peak_physical_states": 64,
+      "peak_norm_elements": 1024,
+      "total_norm_elements": 28576,
+      "log_objective": 17.191794289275677
+    },
+    "delta_log_cost": 0.0
+  },
+  "relaxation": {
+    "directional_passes": 1,
+    "solver": "whitened",
+    "frontier_canonicalization": "uniform",
+    "migrated_energy": -16.848069678168784,
+    "fresh_energy": -16.848307393418953,
+    "fresh_energy_per_site": -0.468008538706082,
+    "energy_gain": 0.00023771525265559035,
+    "energy_gain_per_site": 6.603201462655288e-06,
+    "fresh_energy_check_passed": true,
+    "accepted": true,
+    "selected": true,
+    "directional_energies": [
+      -16.84830739293032
+    ],
+    "accepted_sites": 32,
+    "solver_failures": 0
+  },
+  "final": {
+    "energy": -16.848307393418953,
+    "energy_per_site": -0.468008538706082,
+    "parameters": 3816,
+    "parameter_increase": 64,
+    "ties": 61,
+    "state_file": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_adaptive_j2_tie_6x6.npz"
+  },
+  "timing_seconds": {
+    "setup": 2.2531588330166414,
+    "sampling_ranking_and_relaxation": 14.716673124989029,
+    "total": 16.96983195800567
+  }
+}

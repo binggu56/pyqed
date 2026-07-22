@@ -7,6 +7,7 @@ Two-site effective block operators for non-Abelian DMRG.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 import numpy as np
 
@@ -21,6 +22,22 @@ from .local_operator import (
 )
 from .mpo import MPO, IrreducibleMPO, RankCoupledMPO
 from .solver import pack_two_site_state, unpack_two_site_state
+
+
+def _su2_qchem_direct_parent_blocks_enabled():
+    """Return whether the direct packed qchem parent-block route is active."""
+
+    try:
+        from .renormalized import get_direct_factorized_orthonormal_kernel_policy
+
+        return bool(
+            get_direct_factorized_orthonormal_kernel_policy().get(
+                "su2_qchem_direct_parent_blocks",
+                False,
+            )
+        )
+    except Exception:
+        return False
 
 
 @dataclass
@@ -107,36 +124,65 @@ class RenormalizedLocalOperatorTableBuilder:
             boundary owner is available.
         """
 
+        timing = {}
         owner = self.owner
         if owner is None:
             return None
+        t0 = time.perf_counter()
         representation = self.representation()
+        timing["local_table_representation"] = time.perf_counter() - t0
         require_symbolic_payloads = representation in {
             "transition",
             "factorized",
             "rank_coupled_factorized",
             "rank_coupled_complementary",
         }
+        t0 = time.perf_counter()
+        require_eager_factor_tables = representation == "factorized"
         self.operator.ensure_side_operator_tables(
             representation,
-            require_factor_tables=representation
-            in {"factorized", "rank_coupled_factorized", "rank_coupled_complementary"},
+            require_factor_tables=require_eager_factor_tables,
             require_symbolic_payloads=require_symbolic_payloads,
         )
+        timing["local_table_side_tables"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         cached = owner.get_local_operator_table(self.key())
+        timing["local_table_cache_lookup"] = time.perf_counter() - t0
         if cached is not None:
             self.operator._attach_table_metadata(cached)
+            actions = cached.actions
+            if actions.metadata is not None:
+                build_timing = actions.metadata.setdefault(
+                    "renormalized_operator_build_timing",
+                    {},
+                )
+                for key, value in timing.items():
+                    build_timing[key] = build_timing.get(key, 0.0) + float(value)
             return cached
+        t0 = time.perf_counter()
         actions = self.operator._compile_actions_uncached(
             representation,
             require_symbolic_payloads=require_symbolic_payloads,
         )
+        timing["local_table_compile_actions"] = time.perf_counter() - t0
+        if actions.metadata is not None:
+            build_timing = actions.metadata.setdefault(
+                "renormalized_operator_build_timing",
+                {},
+            )
+            for key, value in timing.items():
+                build_timing[key] = build_timing.get(key, 0.0) + float(value)
+        t0 = time.perf_counter()
         table = owner.put_local_operator_table(
             self.key(),
             actions,
             representation=representation,
             basis_size=self.operator.basis.size,
         )
+        if actions.metadata is not None:
+            actions.metadata["renormalized_operator_build_timing"][
+                "local_table_put"
+            ] = time.perf_counter() - t0
         actions.local_operator_table = table
         self.operator._attach_table_metadata(table)
         return table
@@ -498,8 +544,38 @@ class EffectiveBlockOperator:
                 side,
                 require_payloads=require_symbolic_payloads,
             )
+            packed_table = None
             if symbolic_table is not None:
-                grouped = symbolic_table.group_boundary_blocks(representation=representation)
+                if representation == "rank_coupled_by_ket":
+                    try:
+                        from .su2_qchem_plan import (
+                            pack_rank_coupled_boundary_table_from_block_map,
+                            pack_rank_coupled_boundary_table_from_payloads,
+                        )
+
+                        if getattr(symbolic_table, "numeric_payloads", None):
+                            packed_table = pack_rank_coupled_boundary_table_from_payloads(
+                                symbolic_table.numeric_payloads,
+                                active_channels=getattr(symbolic_table, "channels", None),
+                                side=side,
+                                bond=getattr(entry, "bond", 0),
+                                representation=representation,
+                            )
+                        if packed_table is None:
+                            packed_table = pack_rank_coupled_boundary_table_from_block_map(
+                                block_map,
+                                active_channels=getattr(symbolic_table, "channels", None),
+                                side=side,
+                                bond=getattr(entry, "bond", 0),
+                                representation=representation,
+                            )
+                    except Exception:
+                        packed_table = None
+                grouped = (
+                    None
+                    if packed_table is not None
+                    else symbolic_table.group_boundary_blocks(representation=representation)
+                )
                 source = "symbolic_" + str(source)
             elif require_symbolic_payloads:
                 raise RuntimeError(
@@ -507,12 +583,29 @@ class EffectiveBlockOperator:
                     f"{entry.bond}."
                 )
             else:
-                grouped = self._group_side_blocks(block_map, representation)
+                if representation == "rank_coupled_by_ket":
+                    try:
+                        from .su2_qchem_plan import pack_rank_coupled_boundary_table_from_block_map
+
+                        packed_table = pack_rank_coupled_boundary_table_from_block_map(
+                            block_map,
+                            side=side,
+                            bond=getattr(entry, "bond", 0),
+                            representation=representation,
+                        )
+                    except Exception:
+                        packed_table = None
+                grouped = (
+                    None
+                    if packed_table is not None
+                    else self._group_side_blocks(block_map, representation)
+                )
             table = entry.put_side_operator_table(
                 key,
                 grouped,
                 representation=representation,
                 source=source,
+                packed_table=packed_table,
             )
         self._require_symbolic_side_record(table, side, representation, require_symbolic_payloads)
         return table
@@ -549,6 +642,8 @@ class EffectiveBlockOperator:
             require_symbolic_payloads=require_symbolic_payloads,
             source=source,
         )
+        if hasattr(table, "grouped_payload"):
+            return table.grouped_payload()
         return table.grouped_by_ket
 
     def _factor_side_table(
@@ -570,6 +665,8 @@ class EffectiveBlockOperator:
             require_symbolic_payloads=require_symbolic_payloads,
             source=source,
         )
+        if hasattr(record, "grouped_payload"):
+            return record.grouped_payload()
         return record.grouped_by_ket
 
     def _factor_side_table_record(
@@ -625,6 +722,7 @@ class EffectiveBlockOperator:
             require_payloads=require_symbolic_payloads,
         )
 
+        packed_table = None
         if symbolic_table is not None:
             if representation == "left_factor_by_ket":
                 base_record = self._side_table_record(
@@ -656,12 +754,27 @@ class EffectiveBlockOperator:
                 )
             else:
                 raise ValueError(f"Unknown factor side-table representation {representation!r}.")
-            grouped = self._symbolic_factor_table(
-                symbolic_table,
-                representation,
-                W,
-                phys_slices=phys_slices,
-            )
+            grouped = None
+            if str(representation).startswith("rank_coupled_") and base_record is not None:
+                try:
+                    from .su2_qchem_plan import pack_rank_coupled_factor_table_from_boundary
+
+                    packed_table = pack_rank_coupled_factor_table_from_boundary(
+                        getattr(base_record, "packed_table", None),
+                        W,
+                        side=side,
+                        bond=getattr(entry, "bond", 0),
+                        representation=representation,
+                    )
+                except Exception:
+                    packed_table = None
+            if packed_table is None:
+                grouped = self._symbolic_factor_table(
+                    symbolic_table,
+                    representation,
+                    W,
+                    phys_slices=phys_slices,
+                )
         elif require_symbolic_payloads:
             raise RuntimeError(
                 f"Missing symbolic-owned factor payloads for {side} boundary "
@@ -712,6 +825,7 @@ class EffectiveBlockOperator:
             representation=representation,
             source=table_source,
             parent_table=base_record,
+            packed_table=packed_table,
         )
         self._require_symbolic_side_record(table, side, representation, require_symbolic_payloads)
         return table
@@ -1054,6 +1168,15 @@ class EffectiveBlockOperator:
             name=self.name,
             metadata=self.boundary_metadata(),
         )
+        build_timing = getattr(packed_apply, "renormalized_operator_build_timing", None)
+        if build_timing:
+            actions.metadata["renormalized_operator_build_timing"] = {
+                str(key): float(value)
+                for key, value in build_timing.items()
+            }
+        qchem_plan = getattr(packed_apply, "su2_qchem_sweep_plan", None)
+        if qchem_plan is not None:
+            actions.metadata["su2_qchem_sweep_plan"] = qchem_plan
         actions.metadata["symbolic_boundary_payloads"] = self.symbolic_boundary_metadata()
         if self.complementary_operator_families is not None:
             actions.metadata["complementary_operator_families"] = (
@@ -1271,44 +1394,199 @@ class EffectiveBlockOperator:
         )
 
         out_dtype = self.output_dtype()
-        packed_out_entries, factorized_terms = _precompute_two_site_rank_coupled_factorized_terms(
-            self.left_block,
-            self.mpo_left,
-            self.mpo_right,
-            self.right_block,
-            self.basis,
-            left_blocks_by_ket=self._side_table(
-                "left",
-                "rank_coupled_by_ket",
-                require_existing=require_prepared_tables,
-                require_symbolic_payloads=require_symbolic_payloads,
-            ),
-            right_blocks_by_ket=self._side_table(
-                "right",
-                "rank_coupled_by_ket",
-                require_existing=require_prepared_tables,
-                require_symbolic_payloads=require_symbolic_payloads,
-            ),
-            left_factor_table=self._factor_side_table(
+        timing = {}
+        t0 = time.perf_counter()
+        left_boundary_record = self._side_table_record(
+            "left",
+            "rank_coupled_by_ket",
+            require_existing=require_prepared_tables,
+            require_symbolic_payloads=require_symbolic_payloads,
+        )
+        right_boundary_record = self._side_table_record(
+            "right",
+            "rank_coupled_by_ket",
+            require_existing=require_prepared_tables,
+            require_symbolic_payloads=require_symbolic_payloads,
+        )
+        left_blocks = (
+            self._group_side_blocks(self.left_block, "rank_coupled_by_ket")
+            if left_boundary_record is None
+            else left_boundary_record.grouped_by_ket
+        )
+        right_blocks = (
+            self._group_side_blocks(self.right_block, "rank_coupled_by_ket")
+            if right_boundary_record is None
+            else right_boundary_record.grouped_by_ket
+        )
+        left_factor_record = (
+            self._factor_side_table_record(
                 "left",
                 "rank_coupled_left_factor_by_ket",
                 require_existing=require_prepared_tables,
                 require_symbolic_payloads=require_symbolic_payloads,
-            ),
-            right_factor_table=self._factor_side_table(
+            )
+            if self.left_entry is not None
+            else None
+        )
+        right_factor_record = (
+            self._factor_side_table_record(
                 "right",
                 "rank_coupled_right_factor_by_ket",
                 require_existing=require_prepared_tables,
                 require_symbolic_payloads=require_symbolic_payloads,
-            ),
+            )
+            if self.right_entry is not None
+            else None
         )
-        compiled_factorized_terms = _compile_factorized_terms(factorized_terms, self.basis)
+        left_factors = (
+            None
+            if left_factor_record is None
+            else getattr(left_factor_record, "grouped_by_ket", None)
+        )
+        right_factors = (
+            None
+            if right_factor_record is None
+            else getattr(right_factor_record, "grouped_by_ket", None)
+        )
+        timing["rank_coupled_side_table_fetch"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        qchem_plan_stats = None
+        qchem_schedule = None
+        qchem_compiled_terms = None
+        left_packed = getattr(left_factor_record, "packed_table", None)
+        right_packed = getattr(right_factor_record, "packed_table", None)
+        if left_packed is not None and right_packed is not None:
+            try:
+                from .su2_qchem_plan import SU2QChemSweepPlan
+
+                left_boundary_packed = getattr(
+                    left_boundary_record,
+                    "packed_table",
+                    None,
+                )
+                right_boundary_packed = getattr(
+                    right_boundary_record,
+                    "packed_table",
+                    None,
+                )
+                qchem_plan_key = (
+                    "su2_qchem_sweep_plan",
+                    int(getattr(left_factor_record, "owner_bond", 0)),
+                    id(left_packed),
+                    id(right_packed),
+                    id(left_boundary_packed),
+                    id(right_boundary_packed),
+                )
+                qchem_plan = None
+                qchem_plan_cache_hit = False
+                plan_getter = getattr(left_factor_record, "get_qchem_sweep_plan", None)
+                if plan_getter is not None:
+                    qchem_plan = plan_getter(qchem_plan_key)
+                    qchem_plan_cache_hit = qchem_plan is not None
+                if qchem_plan is None:
+                    qchem_plan = SU2QChemSweepPlan(
+                        bond=getattr(left_factor_record, "owner_bond", 0),
+                        left_factor_table=left_packed,
+                        right_factor_table=right_packed,
+                        left_boundary_table=left_boundary_packed,
+                        right_boundary_table=right_boundary_packed,
+                    )
+                    plan_putter = getattr(left_factor_record, "put_qchem_sweep_plan", None)
+                    if plan_putter is not None:
+                        plan_putter(qchem_plan_key, qchem_plan)
+                qchem_direct_parent_blocks = _su2_qchem_direct_parent_blocks_enabled()
+                qchem_compiled_terms = qchem_plan.compile_factorized_terms(
+                    self.basis,
+                    prefer_packed=qchem_direct_parent_blocks,
+                )
+                qchem_schedule = None if qchem_compiled_terms is None else self.basis.out_entries
+                qchem_plan_stats = qchem_plan.stats
+                qchem_plan_stats["plan_cache_hit"] = bool(qchem_plan_cache_hit)
+                qchem_plan_stats["packed_compiled_terms"] = bool(
+                    getattr(
+                        qchem_compiled_terms,
+                        "qchem_packed_entry_kernel_provider",
+                        False,
+                    )
+                )
+                qchem_plan_stats["plan_cache_owner"] = {
+                    "side": str(getattr(left_factor_record, "owner_side", "")),
+                    "bond": int(getattr(left_factor_record, "owner_bond", 0)),
+                    "cache_size": int(
+                        len(getattr(left_factor_record, "qchem_sweep_plan_cache", {}))
+                    ),
+                    "cache_hits": int(
+                        getattr(
+                            left_factor_record,
+                            "qchem_sweep_plan_cache_stats",
+                            {},
+                        ).get("hits", 0)
+                    ),
+                    "cache_misses": int(
+                        getattr(
+                            left_factor_record,
+                            "qchem_sweep_plan_cache_stats",
+                            {},
+                        ).get("misses", 0)
+                    ),
+                    "cache_puts": int(
+                        getattr(
+                            left_factor_record,
+                            "qchem_sweep_plan_cache_stats",
+                            {},
+                        ).get("puts", 0)
+                    ),
+                }
+                if qchem_compiled_terms is not None:
+                    qchem_compiled_terms.su2_qchem_sweep_plan_object = qchem_plan
+            except Exception as exc:
+                qchem_plan_stats = {
+                    "kind": "su2_qchem_sweep_plan",
+                    "supported": False,
+                    "error": str(exc),
+                }
+                qchem_schedule = None
+                qchem_compiled_terms = None
+        timing["native_factor_schedule"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        if qchem_compiled_terms is None:
+            if left_blocks is None and left_boundary_record is not None:
+                left_blocks = left_boundary_record.grouped_payload()
+            if right_blocks is None and right_boundary_record is not None:
+                right_blocks = right_boundary_record.grouped_payload()
+            if left_factors is None and left_factor_record is not None:
+                left_factors = left_factor_record.grouped_payload()
+            if right_factors is None and right_factor_record is not None:
+                right_factors = right_factor_record.grouped_payload()
+            packed_out_entries, factorized_terms = _precompute_two_site_rank_coupled_factorized_terms(
+                self.left_block,
+                self.mpo_left,
+                self.mpo_right,
+                self.right_block,
+                self.basis,
+                left_blocks_by_ket=left_blocks,
+                right_blocks_by_ket=right_blocks,
+                left_factor_table=left_factors,
+                right_factor_table=right_factors,
+            )
+            timing["rank_coupled_factorized_terms"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            compiled_factorized_terms = _compile_factorized_terms(factorized_terms, self.basis)
+            timing["rank_coupled_compile_factorized_terms"] = time.perf_counter() - t0
+        else:
+            packed_out_entries = qchem_schedule
+            factorized_terms = None
+            compiled_factorized_terms = qchem_compiled_terms
+            timing["rank_coupled_factorized_terms"] = 0.0
+            timing["rank_coupled_compile_factorized_terms"] = 0.0
+        t0 = time.perf_counter()
         packed_apply = compiled_factorized_terms.packed_matvec(
             base_dtype=out_dtype,
             backend="rank-coupled-factorized-batched",
             out_entries=packed_out_entries,
             block_matrices=compiled_factorized_terms,
         )
+        timing["rank_coupled_packed_matvec_factory"] = time.perf_counter() - t0
         self._annotate_symbolic_payload_source(packed_apply, compiled_factorized_terms)
 
         def tensor_apply(two_site):
@@ -1318,10 +1596,23 @@ class EffectiveBlockOperator:
         def reduced_apply(state):
             return state.layout.from_packed(packed_apply(state.to_packed(dtype=out_dtype)))
 
-        diag = self.diagonal(
-            factorized_terms=factorized_terms,
-            require_symbolic_payloads=require_symbolic_payloads,
-        )
+        t0 = time.perf_counter()
+        if factorized_terms is None:
+            diag = np.zeros(self.basis.size, dtype=float)
+            for entry in self.basis:
+                block = compiled_factorized_terms.block_matrix_for(entry)
+                if block is not None:
+                    diag[entry.slice] = np.real(np.diag(block))
+        else:
+            diag = self.diagonal(
+                factorized_terms=factorized_terms,
+                require_symbolic_payloads=require_symbolic_payloads,
+            )
+        timing["rank_coupled_diagonal"] = time.perf_counter() - t0
+        if qchem_plan_stats is not None:
+            packed_apply.su2_qchem_sweep_plan = qchem_plan_stats
+            compiled_factorized_terms.su2_qchem_sweep_plan = qchem_plan_stats
+        packed_apply.renormalized_operator_build_timing = timing
         return tensor_apply, reduced_apply, packed_apply, diag, False
 
     def _rank_coupled_complementary_local_actions(
@@ -1403,6 +1694,31 @@ class EffectiveBlockOperator:
             compiled_terms.direct_orthonormal_projection_source = (
                 "rank_coupled_complementary"
             )
+            qchem_direct_parent_blocks = bool(
+                getattr(compiled_terms, "su2_qchem_sweep_plan_object", None)
+                is not None
+                and _su2_qchem_direct_parent_blocks_enabled()
+            )
+            if qchem_direct_parent_blocks:
+                compiled_terms.prefer_direct_orthonormal_projection = True
+                compiled_terms.direct_orthonormal_projection_source = (
+                    "rank_coupled_qchem_parent_blocks"
+                )
+            if bool(
+                getattr(
+                    compiled_terms,
+                    "qchem_packed_entry_kernel_provider",
+                    False,
+                )
+            ) and not qchem_direct_parent_blocks:
+                compiled_terms.complementary_direct_orthonormal_projection_available = False
+                compiled_terms.prefer_direct_orthonormal_projection = False
+                compiled_terms.prefer_direct_component_transform = False
+                compiled_terms.prefer_recursive_operator_matvec = False
+                compiled_terms.prefer_complementary_payload_tensor_matvec = False
+                compiled_terms.direct_orthonormal_projection_source = (
+                    "rank_coupled_packed_entry_kernels"
+                )
         return out
 
     def to_local_operator(self):

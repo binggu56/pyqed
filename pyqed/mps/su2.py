@@ -19,7 +19,7 @@ spatial-orbital sector structure that a later non-Abelian tensor layer can use.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, order=True)
@@ -32,10 +32,12 @@ class SU2Irrep:
     """
 
     two_j: int
+    _hash: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if int(self.two_j) != self.two_j or self.two_j < 0:
             raise ValueError(f"SU(2) irrep requires non-negative integer two_j, got {self.two_j!r}.")
+        object.__setattr__(self, "_hash", 1000003 + int(self.two_j))
 
     @property
     def j(self) -> float:
@@ -49,6 +51,9 @@ class SU2Irrep:
         if self.two_j % 2 == 0:
             return f"S={self.two_j // 2}"
         return f"S={self.two_j}/2"
+
+    def __hash__(self) -> int:
+        return self._hash
 
 
 def fuse_irreps(left: SU2Irrep, right: SU2Irrep) -> tuple[SU2Irrep, ...]:
@@ -72,6 +77,7 @@ class SpinChargeSector:
 
     charge: int
     irrep: SU2Irrep
+    _hash: int = field(init=False, repr=False, compare=False)
 
     def __init__(self, charge: int, irrep: SU2Irrep, multiplicity: int | None = None):
         if multiplicity not in (None, 1):
@@ -82,6 +88,11 @@ class SpinChargeSector:
         object.__setattr__(self, "charge", charge)
         object.__setattr__(self, "irrep", irrep)
         self.__post_init__()
+        object.__setattr__(
+            self,
+            "_hash",
+            10000019 + 1315423911 * int(self.charge) + int(self.irrep.two_j),
+        )
 
     def __post_init__(self):
         if int(self.charge) != self.charge or self.charge < 0:
@@ -104,6 +115,9 @@ class SpinChargeSector:
     @property
     def dim(self) -> int:
         return self.irrep.dim
+
+    def __hash__(self) -> int:
+        return self._hash
 
 
 def fuse_charge_spin_sectors(

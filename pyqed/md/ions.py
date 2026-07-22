@@ -49,6 +49,8 @@ def monatomic_ions(symbols, positions, start_molecule_id=0):
     ions.set_array("molecule_ids", topology.molecule_ids, int, ())
     ions.set_array("atom_types", topology.atom_types, str, ())
     ions.set_array("atom_names", topology.atom_names, str, ())
+    ions.set_array("residue_names", np.asarray([symbol.upper() for symbol in symbols]), str, ())
+    ions.set_array("residue_ids", np.arange(start_molecule_id + 1, start_molecule_id + 1 + len(symbols)), int, ())
     return ions
 
 

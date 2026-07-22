@@ -1,0 +1,201 @@
+import itertools
+
+import numpy as np
+import pytest
+
+from pyqed.mps import MPS, MPO
+from pyqed.mps.abelian_direct import AbelianRenormalizedActionDataTable
+from pyqed.mps.decompose import decompose, tt_to_tensor
+from pyqed.mps.mps import LeftCanonical, PauliSite, RightCanonical, Site
+
+
+STANDARD_LABELS = ("lv", "p", "rv")
+
+
+def _random_state(shape=(2, 3, 2), seed=17):
+    rng = np.random.default_rng(seed)
+    tensor = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+    return tensor, decompose(tensor, rank=max(shape) ** len(shape))
+
+
+def _dense(state):
+    return tt_to_tensor([state._get_std_B(i) for i in range(state.L)])
+
+
+@pytest.mark.parametrize("labels", itertools.permutations(STANDARD_LABELS))
+def test_mps_accepts_every_declared_tensor_layout(labels):
+    tensor, factors = _random_state()
+    axes = [STANDARD_LABELS.index(label) for label in labels]
+    state = MPS([factor.transpose(axes) for factor in factors], labels=labels)
+
+    assert state.check_sanity()
+    np.testing.assert_allclose(_dense(state), tensor, atol=1.0e-12)
+    assert state.bond_orders() == [factor.shape[2] for factor in factors]
+
+
+def test_mps_uses_left_physical_right_as_its_default_order():
+    _, factors = _random_state()
+    state = MPS(factors)
+
+    assert state.labels == ["lv", "p", "rv"]
+    assert state.lv_idx == 0
+    assert state.p_idx == 1
+    assert state.rv_idx == 2
+
+
+def test_mps_relabeling_transposes_data_without_changing_the_state():
+    tensor, factors = _random_state()
+    state = MPS(factors)
+
+    state.set_labels(["p", "rv", "lv"])
+    assert state.labels == ["p", "rv", "lv"]
+    np.testing.assert_allclose(_dense(state), tensor, atol=1.0e-12)
+
+    reordered = state.to_order(["lv", "p", "rv"])
+    assert reordered.labels == ["lv", "p", "rv"]
+    np.testing.assert_allclose(_dense(reordered), tensor, atol=1.0e-12)
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical", "center"),
+    [
+        ("left", "left_canonical", 2),
+        ("left_canonical", "left_canonical", 2),
+        ("right", "right_canonical", 0),
+        ("right_canonical", "right_canonical", 0),
+    ],
+)
+def test_mps_gauge_aliases_are_canonicalized(alias, canonical, center):
+    _, factors = _random_state()
+    state = MPS(factors, gauge=alias)
+
+    assert state.gauge == canonical
+    assert state.center == center
+    assert state.norm() == pytest.approx(state.norm_squared())
+
+
+def test_mps_mixed_gauge_requires_a_center():
+    _, factors = _random_state()
+
+    with pytest.raises(ValueError, match="requires an explicit center"):
+        MPS(factors, gauge="mixed")
+
+    state = MPS(factors, gauge="mixed", center=1)
+    assert state.center == 1
+    assert state.gauge == "mixed"
+
+
+def test_mps_canonicalization_preserves_state_and_exposes_schmidt_values():
+    tensor, factors = _random_state()
+    tensor = tensor / np.linalg.norm(tensor)
+    state = MPS(decompose(tensor, rank=12))
+
+    state.right_canonicalize()
+    assert state.gauge == "right_canonical"
+    assert state.center == 0
+    assert state.check_sanity()
+    np.testing.assert_allclose(_dense(state), tensor, atol=1.0e-12)
+    assert state.norm() == pytest.approx(1.0)
+    for i, expected_size in enumerate(state.get_bond_dimensions()):
+        assert state.get_singular_values(i).shape == (expected_size,)
+
+    state.left_to_right()
+    assert state.gauge == "right_canonical"
+
+
+def test_mps_vidal_factors_reconstruct_the_state():
+    _, factors = _random_state()
+    state = MPS(factors).normalize()
+    gammas, lambdas = state.left_to_vidal()
+
+    reconstructed = gammas[0]
+    for i, values in enumerate(lambdas):
+        reconstructed = np.tensordot(
+            reconstructed, np.diag(values), axes=([-1], [0])
+        )
+        reconstructed = np.tensordot(
+            reconstructed, gammas[i + 1], axes=([-1], [0])
+        )
+    reconstructed = np.squeeze(reconstructed, axis=(0, -1))
+    np.testing.assert_allclose(reconstructed, _dense(state), atol=1.0e-12)
+
+
+def test_two_site_expectation_does_not_apply_center_schmidt_values_twice():
+    rng = np.random.default_rng(31)
+    tensor, factors = _random_state(shape=(2, 2), seed=29)
+    state = MPS(factors).normalize().right_canonicalize()
+    operator = rng.normal(size=(2, 2, 2, 2))
+
+    dense = _dense(state)
+    applied = np.tensordot(operator, dense, axes=([2, 3], [0, 1]))
+    expected = np.vdot(dense, applied)
+
+    np.testing.assert_allclose(
+        state.bond_expectation_value([operator]), [expected], atol=1.0e-12
+    )
+
+
+def test_mps_sanity_checks_boundaries_bonds_and_zero_normalization():
+    with pytest.raises(ValueError, match="unit left and right boundary bonds"):
+        MPS([np.ones((2, 2, 1))]).check_sanity()
+
+    with pytest.raises(ValueError, match="incompatible dimensions"):
+        MPS([np.ones((1, 2, 3)), np.ones((2, 2, 1))]).check_sanity()
+
+    with pytest.raises(ValueError, match="zero MPS"):
+        MPS([np.zeros((1, 2, 1))]).normalize()
+
+
+def test_get_singular_values_requires_canonicalization():
+    _, factors = _random_state()
+    state = MPS(factors)
+
+    with pytest.raises(ValueError, match="canonicalize"):
+        state.get_singular_values(0)
+    with pytest.raises(IndexError, match="out of range"):
+        state.get_singular_values(state.nbonds)
+
+
+def test_legacy_helpers_remain_reexported_from_mps_module():
+    tensor, factors = _random_state()
+
+    left = LeftCanonical(factors)
+    right = RightCanonical(factors)
+    np.testing.assert_allclose(tt_to_tensor(left), tensor / np.linalg.norm(tensor))
+    np.testing.assert_allclose(tt_to_tensor(right), tensor / np.linalg.norm(tensor))
+
+    site = Site(2)
+    pauli = PauliSite()
+    assert site.operators["id"].shape == (2, 2)
+    np.testing.assert_allclose(pauli.operators["s_z"], np.diag([-1.0, 1.0]))
+
+
+def test_mpo_validates_its_fixed_tensor_order():
+    identity = np.eye(2).reshape(1, 1, 2, 2)
+    mpo = MPO([identity])
+
+    assert mpo.labels == ("left", "right", "up", "down")
+    with pytest.raises(ValueError, match="must use"):
+        MPO([identity], labels=("left", "up", "down", "right"))
+
+
+def test_renormalized_table_python_fallback_applies_raw_entries():
+    collected = {
+        "left": (np.asarray([[[1.0, 2.0], [3.0, 4.0]]]),),
+        "right": (np.asarray([[[2.0]]]),),
+        "dims_array": np.asarray([[2, 1, 1, 1, 2, 1, 1, 1]], dtype=np.int64),
+        "in_starts_array": np.asarray([0], dtype=np.int64),
+        "out_starts_array": np.asarray([0], dtype=np.int64),
+        "scales_array": np.asarray([0.5], dtype=np.complex128),
+        "matvec_groups": None,
+    }
+    table = AbelianRenormalizedActionDataTable(
+        collected,
+        dim=2,
+        layout=(((0, 0, 0, 0), (2, 1, 1, 1)),),
+        qns=((0,), (0,), (0,), (0,)),
+        dirs=(1, 1, -1, -1),
+        kernel_backend=None,
+    )
+
+    np.testing.assert_allclose(table.matvec([5.0, 7.0]), [19.0, 43.0])

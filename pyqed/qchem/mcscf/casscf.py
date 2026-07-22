@@ -218,6 +218,7 @@ class FirstOrderCASSCF:
         self.use_cholesky_integrals = False
         self._casci_binary_cache = None
         self._casci_direct_connectivity_cache = None
+        self._casci_spin_string_connectivity_cache = None
         self._casci_sc1_cache = None
         self._casci_sc2_cache = None
         self._ah_trust_radius = self.max_step
@@ -387,6 +388,8 @@ class FirstOrderCASSCF:
             mc.binary = self._casci_binary_cache
         if self._casci_direct_connectivity_cache is not None:
             mc.direct_connectivity = self._casci_direct_connectivity_cache
+        if self._casci_spin_string_connectivity_cache is not None:
+            mc.spin_string_connectivity = self._casci_spin_string_connectivity_cache
         if self._casci_sc1_cache is not None and self._casci_sc2_cache is not None:
             mc.SC1 = self._casci_sc1_cache
             mc.SC2 = self._casci_sc2_cache
@@ -413,6 +416,8 @@ class FirstOrderCASSCF:
             self._casci_binary_cache = mc.binary
         if getattr(mc, "direct_connectivity", None) is not None:
             self._casci_direct_connectivity_cache = mc.direct_connectivity
+        if getattr(mc, "spin_string_connectivity", None) is not None:
+            self._casci_spin_string_connectivity_cache = mc.spin_string_connectivity
         if getattr(mc, "SC1", None) is not None and getattr(mc, "SC2", None) is not None:
             self._casci_sc1_cache = mc.SC1
             self._casci_sc2_cache = mc.SC2
@@ -423,6 +428,64 @@ class FirstOrderCASSCF:
         if use_cholesky is None:
             use_cholesky = bool(getattr(self.mf, "cholesky_jk", False))
         return _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+
+    def orbital_rotation_pairs(self, ncore=None, ncas=None, nmo=None):
+        if ncore is None:
+            ncore = self.ncore if self.ncore is not None else self._default_ncore()
+        if ncas is None:
+            ncas = self.ncas
+        if nmo is None:
+            nmo = self.nmo
+        return nonredundant_pairs(ncore, ncas, nmo)
+
+    def _pack_orbitals(self, matrix, ncore, ncas, nmo):
+        return pack_nonredundant(matrix, ncore, ncas, nmo)
+
+    def _unpack_orbitals(self, vec, ncore, ncas, nmo, max_step=None):
+        return unpack_nonredundant(vec, ncore, ncas, nmo, max_step=max_step)
+
+    def _gradient_norm(self, gradient, ncore, ncas, nmo):
+        return gradient_norm(gradient, ncore, ncas, nmo)
+
+    def _diagonal_hessian(self, fock, ncore, ncas, level_shift=1.0e-3):
+        return diagonal_hessian(fock, ncore, ncas, level_shift=level_shift)
+
+    def _diagonal_preconditioned_vector(
+        self,
+        gradient,
+        fock,
+        ncore,
+        ncas,
+        level_shift=1.0e-3,
+    ):
+        return diagonal_preconditioned_vector(
+            gradient,
+            fock,
+            ncore,
+            ncas,
+            level_shift=level_shift,
+        )
+
+    def _diagonal_inverse_hessian(self, fock, ncore, ncas, level_shift=1.0e-3):
+        return diagonal_inverse_hessian(fock, ncore, ncas, level_shift=level_shift)
+
+    def _orbital_step(
+        self,
+        fock,
+        ncore,
+        ncas,
+        step_size=1.0,
+        level_shift=1.0e-3,
+        max_step=0.25,
+    ):
+        return orbital_step(
+            fock,
+            ncore,
+            ncas,
+            step_size=step_size,
+            level_shift=level_shift,
+            max_step=max_step,
+        )
 
     def _get_integrals(self, mo_coeff):
         if not hasattr(self.mf, "get_hcore_mo") or not hasattr(self.mf, "get_eri_mo"):
@@ -532,11 +595,14 @@ class FirstOrderCASSCF:
             dm1_occ, dm2_occ = self._effective_rdms_occ(mc, state_id)
             h1_mo = self._get_hcore_mo(mo_coeff)
             occ_mo = mo_coeff[:, :mc.ncore + mc.ncas]
-            pair_factors = transform_eri_factors_to_mo_pair(
-                _get_mf_cholesky_factors(self.mf),
-                mo_coeff,
-                occ_mo,
-            )
+            if hasattr(self.mf, "mo_factors"):
+                pair_factors = self.mf.mo_factors(mo_coeff, occ_mo)
+            else:
+                pair_factors = transform_eri_factors_to_mo_pair(
+                    _get_mf_cholesky_factors(self.mf),
+                    mo_coeff,
+                    occ_mo,
+                )
             fock = generalized_fock_from_factors(h1_mo, pair_factors, dm1_occ, dm2_occ)
         else:
             dm1, dm2 = self._effective_rdms(mc, state_id)
@@ -851,6 +917,7 @@ class FirstOrderCASSCF:
         self._invalidate_ah_reference_cache()
         self._casci_binary_cache = None
         self._casci_direct_connectivity_cache = None
+        self._casci_spin_string_connectivity_cache = None
         self._casci_sc1_cache = None
         self._casci_sc2_cache = None
         self._ah_trust_radius = self.max_step
@@ -1581,6 +1648,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             mc.shift = self.shift
         if self._casci_binary_cache is not None:
             mc.binary = self._casci_binary_cache
+        if self._casci_spin_string_connectivity_cache is not None:
+            mc.spin_string_connectivity = self._casci_spin_string_connectivity_cache
         if self._casci_sc1_cache is not None and self._casci_sc2_cache is not None:
             mc.SC1 = self._casci_sc1_cache
             mc.SC2 = self._casci_sc2_cache
@@ -1620,6 +1689,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             mc.binary = self._casci_binary_cache
         if self._casci_direct_connectivity_cache is not None:
             mc.direct_connectivity = self._casci_direct_connectivity_cache
+        if self._casci_spin_string_connectivity_cache is not None:
+            mc.spin_string_connectivity = self._casci_spin_string_connectivity_cache
         if self._casci_sc1_cache is not None and self._casci_sc2_cache is not None:
             mc.SC1 = self._casci_sc1_cache
             mc.SC2 = self._casci_sc2_cache
@@ -1953,7 +2024,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         if eps <= 0.0:
             raise ValueError("coupled_fd_step must be positive.")
 
-        kappa = unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo)
+        kappa = self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo)
         trial_U = self._apply_orbital_update(U, eps * kappa)
         h1_trial, eri_trial = self._transform_frozen_integrals(h1_ref, eri_ref, trial_U)
         trial_mc = self._make_integral_casci(
@@ -1974,7 +2045,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             dm1_trial, dm2_trial = self._effective_rdms(trial_mc, self.state_id)
             fock_trial = generalized_fock(h1_trial, eri_trial, dm1_trial, dm2_trial)
             grad_trial = orbital_gradient(fock_trial)
-            grad_trial_vec = pack_nonredundant(
+            grad_trial_vec = self._pack_orbitals(
                 grad_trial,
                 trial_mc.ncore,
                 trial_mc.ncas,
@@ -2000,7 +2071,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         if eps <= 0.0:
             raise ValueError("coupled_fd_step must be positive.")
 
-        kappa = unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo)
+        kappa = self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo)
         trial_U = self._apply_orbital_update(U, eps * kappa)
         h1_trial, pair_trial = self._transform_frozen_factor_integrals(
             h1_ref,
@@ -2042,7 +2113,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             )
         fock = generalized_fock(h1_mo, eri_mo, dm1, dm2)
         grad = orbital_gradient(fock)
-        return pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+        return self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
 
     def _factor_frozen_orbital_gradient_vector(
         self,
@@ -2060,7 +2131,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             dm2_occ,
         )
         grad = orbital_gradient(fock)
-        return pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+        return self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
 
     def _pair_factor_response_slices(self, pair_factors, kappa, nocc_like):
         pair_factors = np.asarray(pair_factors)
@@ -2167,7 +2238,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         eps = min(self.ah_fd_step, 0.1 / peak)
         eps = max(eps, 1.0e-5)
 
-        kappa = unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo)
+        kappa = self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo)
         plus_u = self._orbital_unitary(eps * kappa)
         minus_u = self._orbital_unitary(-eps * kappa)
         h1_plus, eri_plus = self._transform_frozen_integrals(h1_mo, eri_mo, plus_u)
@@ -2208,7 +2279,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         eps = min(self.ah_fd_step, 0.1 / peak)
         eps = max(eps, 1.0e-5)
 
-        kappa = unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo)
+        kappa = self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo)
         plus_u = self._orbital_unitary(eps * kappa)
         minus_u = self._orbital_unitary(-eps * kappa)
         h1_plus, pair_plus = self._transform_frozen_factor_integrals(
@@ -2253,13 +2324,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         the same at the current point because both unitary maps have identical
         first and second derivatives at zero: ``U = I + K + 1/2 K^2 + O(K^3)``.
         """
-        return pack_nonredundant(
+        return self._pack_orbitals(
             orbital_hessian_action_from_integrals(
                 h1_mo,
                 eri_mo,
                 dm1,
                 dm2,
-                unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo),
+                self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
             ),
             mc.ncore,
             mc.ncas,
@@ -2302,7 +2373,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         if max_vectors == 0:
             return None
 
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2317,7 +2388,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         columns = []
         eye = np.eye(nvar)
         for ivec in range(nvar):
-            kappa = unpack_nonredundant(
+            kappa = self._unpack_orbitals(
                 eye[:, ivec],
                 mc.ncore,
                 mc.ncas,
@@ -2475,7 +2546,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             eps = self.coupled_response_fd_step
         if eps <= 0.0:
             raise ValueError("coupled_response_fd_step must be positive.")
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2487,7 +2558,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         cols = []
         eye = np.eye(nvar)
         for iorb in range(nvar):
-            kappa = unpack_nonredundant(
+            kappa = self._unpack_orbitals(
                 eye[:, iorb],
                 mc.ncore,
                 mc.ncas,
@@ -2741,7 +2812,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 self._full_derivative_cache["deri"],
             )
 
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2751,7 +2822,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         deri_cols = []
         eye = np.eye(nvar)
         for iorb in range(nvar):
-            kappa = unpack_nonredundant(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
+            kappa = self._unpack_orbitals(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
             dh1, deri = self._active_integral_derivatives_from_orbital_step(
                 h1_mo,
                 eri_mo,
@@ -2789,7 +2860,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 self._full_derivative_cache["deri"],
             )
 
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2799,7 +2870,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         deri_cols = []
         eye = np.eye(nvar)
         for iorb in range(nvar):
-            kappa = unpack_nonredundant(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
+            kappa = self._unpack_orbitals(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
             dh1, dpair = self._full_mo_factor_derivatives(h1_mo, pair_factors, kappa)
             h1_active, eri_active = self._active_integral_derivatives_from_factor_step(
                 dh1,
@@ -2841,7 +2912,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ):
             return self._full_derivative_cache["de_core"]
 
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2850,7 +2921,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         vals = []
         eye = np.eye(nvar)
         for iorb in range(nvar):
-            kappa = unpack_nonredundant(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
+            kappa = self._unpack_orbitals(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
             dh1, deri = self._full_mo_integral_derivatives(h1_mo, eri_mo, kappa)
             vals.append(self._core_energy_derivative(dh1, deri, mc.ncore))
         vals = np.asarray(vals, dtype=float)
@@ -2876,7 +2947,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ):
             return self._full_derivative_cache["de_core"]
 
-        nvar = pack_nonredundant(
+        nvar = self._pack_orbitals(
             np.zeros((self.nmo, self.nmo)),
             mc.ncore,
             mc.ncas,
@@ -2885,7 +2956,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         vals = []
         eye = np.eye(nvar)
         for iorb in range(nvar):
-            kappa = unpack_nonredundant(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
+            kappa = self._unpack_orbitals(eye[:, iorb], mc.ncore, mc.ncas, self.nmo)
             dh1, dpair = self._full_mo_factor_derivatives(h1_mo, pair_factors, kappa)
             vals.append(
                 self._core_energy_derivative_factors(
@@ -2998,7 +3069,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         return np.asarray(grad, dtype=float)
 
     def _gradient_matrix_from_vector(self, grad_vec, ncore, ncas, nmo):
-        return unpack_nonredundant(grad_vec, ncore, ncas, nmo)
+        return self._unpack_orbitals(grad_vec, ncore, ncas, nmo)
 
     def _make_integral_sigma_casci(self, mc, h1_mo, eri_mo):
         """
@@ -3163,7 +3234,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     def _orbital_gradient_from_ci_response(self, mc, h1_mo, eri_mo, c0, dc):
         dc = self._project_ci_response(dc, [c0])
         if np.linalg.norm(dc) <= 1.0e-14:
-            nvar = pack_nonredundant(
+            nvar = self._pack_orbitals(
                 np.zeros((self.nmo, self.nmo)),
                 mc.ncore,
                 mc.ncas,
@@ -3175,7 +3246,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         dm1_delta = tdm1_dc + tdm1_cd
         dm2_delta = tdm2_dc + tdm2_cd
         fock_delta = generalized_fock(h1_mo, eri_mo, dm1_delta, dm2_delta)
-        return pack_nonredundant(
+        return self._pack_orbitals(
             orbital_gradient(fock_delta),
             mc.ncore,
             mc.ncas,
@@ -3208,7 +3279,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     def _orbital_gradient_from_ci_response_adjoint(self, mc, h1_mo, eri_mo, c0, dc):
         dc = self._project_ci_response(dc, [c0])
         if np.linalg.norm(dc) <= 1.0e-14:
-            nvar = pack_nonredundant(
+            nvar = self._pack_orbitals(
                 np.zeros((self.nmo, self.nmo)),
                 mc.ncore,
                 mc.ncas,
@@ -3228,7 +3299,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     ):
         dc = self._project_ci_response(dc, [c0])
         if np.linalg.norm(dc) <= 1.0e-14:
-            nvar = pack_nonredundant(
+            nvar = self._pack_orbitals(
                 np.zeros((self.nmo, self.nmo)),
                 mc.ncore,
                 mc.ncas,
@@ -4556,6 +4627,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self._invalidate_ah_reference_cache()
         self._casci_binary_cache = None
         self._casci_direct_connectivity_cache = None
+        self._casci_spin_string_connectivity_cache = None
         self._casci_sc1_cache = None
         self._casci_sc2_cache = None
         self._ah_trust_radius = self.max_step
@@ -4641,16 +4713,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         dm2_occ,
                     )
                     grad = orbital_gradient(fock)
-                    gnorm = gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
-                    grad_vec = pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+                    gnorm = self._gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
+                    grad_vec = self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
                     dm1 = dm1_occ
                     dm2 = dm2_occ
                 else:
                     dm1, dm2 = self._effective_rdms(mc, self.state_id)
                     fock = generalized_fock(h1_cur, eri_cur, dm1, dm2)
                     grad = orbital_gradient(fock)
-                    gnorm = gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
-                    grad_vec = pack_nonredundant(grad, mc.ncore, mc.ncas, self.nmo)
+                    gnorm = self._gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
+                    grad_vec = self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
                 if (
                     self.nstates == 1
                     and self.exact_state_specific_gradient
@@ -4682,13 +4754,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                 def base_hessian_action(vec):
                     if self.use_cholesky_integrals and not use_parameterized_hessian:
-                        return pack_nonredundant(
+                        return self._pack_orbitals(
                             self._orbital_hessian_action_from_factors(
                                 h1_cur,
                                 pair_cur,
                                 dm1,
                                 dm2,
-                                unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo),
+                                self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
                             ),
                             mc.ncore,
                             mc.ncas,
@@ -4742,13 +4814,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                     def qn_base_hessian_action(vec):
                         if self.use_cholesky_integrals and not use_parameterized_hessian:
-                            return pack_nonredundant(
+                            return self._pack_orbitals(
                                 self._orbital_hessian_action_from_factors(
                                     h1_qn,
                                     pair_qn,
                                     dm1_qn,
                                     dm2_qn,
-                                    unpack_nonredundant(vec, mc.ncore, mc.ncas, self.nmo),
+                                    self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
                                 ),
                                 mc.ncore,
                                 mc.ncas,
@@ -4844,7 +4916,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     micro_step = 0.0
                     break
 
-                hess_diag = diagonal_hessian(
+                hess_diag = self._diagonal_hessian(
                     fock,
                     mc.ncore,
                     mc.ncas,
@@ -4865,7 +4937,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         regularization=self.level_shift,
                     )
                 else:
-                    diag_step = diagonal_preconditioned_vector(
+                    diag_step = self._diagonal_preconditioned_vector(
                         grad,
                         fock,
                         mc.ncore,
@@ -4969,7 +5041,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                 def evaluate_micro_candidate(label, raw_step, ci_guess):
                     candidate_step, candidate_limit = limited_candidate(raw_step)
-                    kappa = unpack_nonredundant(
+                    kappa = self._unpack_orbitals(
                         candidate_step,
                         mc.ncore,
                         mc.ncas,

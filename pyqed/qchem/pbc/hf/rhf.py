@@ -4,6 +4,8 @@
 import numpy as np
 from scipy.linalg import eigh
 
+from pyqed.qchem.pbc.cell import materialize_dense_eri
+
 
 def _normalize_kpts(kpts):
     if kpts is None:
@@ -73,31 +75,29 @@ class RHF:
     def _build_real_space_data(self):
         if not self.cell.built:
             self.cell.build()
-        if self.cell.dimension != 1:
-            raise NotImplementedError("Native periodic RHF currently supports only dimension=1.")
-
         cluster = self.cell.build_image_molecule(self.nimages)
         self._cluster_mol = cluster
 
         nao0 = int(self.cell.nao)
-        rels = list(range(-self.nimages, self.nimages + 1))
-        center = self.nimages
+        rels = list(self.cell.image_keys(self.nimages))
+        center_key = (0,) if self.cell.dimension == 1 else (0, 0, 0)
+        rel_to_idx = {rel: idx for idx, rel in enumerate(rels)}
         ao_slices = {
-            rel: slice((center + rel) * nao0, (center + rel + 1) * nao0)
-            for rel in rels
+            rel: slice(idx * nao0, (idx + 1) * nao0)
+            for rel, idx in rel_to_idx.items()
         }
 
         s_r = {}
         h_r = {}
         eri_rtu = {}
 
-        csl = ao_slices[0]
+        csl = ao_slices[center_key]
         for r in rels:
             rsl = ao_slices[r]
             s_r[r] = np.asarray(cluster.overlap[csl, rsl], dtype=np.complex128)
             h_r[r] = np.asarray(cluster.hcore[csl, rsl], dtype=np.complex128)
 
-        eri = np.asarray(cluster.eri, dtype=float)
+        eri = materialize_dense_eri(cluster)
         for r in rels:
             rsl = ao_slices[r]
             for t in rels:
@@ -109,7 +109,7 @@ class RHF:
                     )
 
         self._rels = rels
-        self._rel_to_idx = {rel: idx for idx, rel in enumerate(rels)}
+        self._rel_to_idx = rel_to_idx
         self._rel_vectors = {
             rel: self.cell.translation_vector(rel)
             for rel in rels
@@ -149,7 +149,7 @@ class RHF:
             vk = np.zeros_like(self._h_r[r], dtype=np.complex128)
             for t in self._rels:
                 for u in self._rels:
-                    diff = u - t
+                    diff = tuple(ui - ti for ui, ti in zip(u, t))
                     dtu = dm_r.get(diff, zero)
                     g_coul = self._eri_rtu[(r, t, u)]
                     g_ex = self._eri_rtu[(t, r, u)]

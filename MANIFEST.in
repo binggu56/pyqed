@@ -10,15 +10,21 @@ include GOVERNANCE.md
 include ROADMAP.md
 include SECURITY.md
 include SUPPORT.md
-include THIRD_PARTY_NOTICES.md
 
 include examples/quickstart.py
 
 recursive-include pyqed/qchem/basis_set *.gbs *.txt
 recursive-include pyqed/qchem/H2 *.in
 
+include pyqed/_dop853.hpp
+include pyqed/heom/_heom_cpp.cpp
+include pyqed/mps/nonabelian/_su2_kernel.c
+include pyqed/mps/nonabelian/_su2_kernel.pyx
 include pyqed/qchem/_basis_cy.c
 include pyqed/qchem/_basis_cy.pyx
+include pyqed/qchem/_casscf_cpp.cpp
+include pyqed/qchem/_gdf_cpp.cpp
+include pyqed/qchem/_integrals.cpp
 include pyqed/qchem/_rys_cy.c
 include pyqed/qchem/_rys_cy.pyx
 
@@ -28,12 +34,4 @@ include tests/test_release_smoke.py
 recursive-exclude pyqed *.dylib *.pyc *.so
 recursive-exclude pyqed *Bing*Mac*
 recursive-exclude pyqed *gugroup*
-exclude pyqed/dvr/sd.py
-exclude pyqed/gw/dmft.py
-exclude pyqed/integral.py
-exclude pyqed/models/ShinMetiuTBE.py
-exclude pyqed/mps/results.py
-exclude pyqed/namd/eckart.py
-exclude pyqed/namd/gmat.py
-exclude pyqed/qchem/dvr/sd.py
 recursive-exclude * __pycache__

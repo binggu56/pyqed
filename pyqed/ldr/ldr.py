@@ -27,7 +27,7 @@ import scipy
 import string
 
 from scipy.linalg import inv
-from scipy.sparse import kron, eye
+from scipy.sparse import kron, eye, csr_matrix
 from scipy.linalg import eigh
 import logging
 
@@ -528,6 +528,206 @@ class LDRN:
 
         return einsum_string
 
+    @staticmethod
+    def lpa_layout(grid_shape):
+        """Return product-grid indices and nearest-neighbor links.
+
+        The links are the local overlap edges used by the linked-product
+        approximation (LPA).  They are independent of the electronic overlap
+        representation and can be reused for scalar determinant overlaps or
+        multi-state overlap blocks.
+        """
+
+        shape = tuple(int(n) for n in grid_shape)
+        if not shape or any(n <= 0 for n in shape):
+            raise ValueError("grid_shape entries must be positive.")
+
+        indices = np.asarray(list(np.ndindex(shape)), dtype=int)
+        flat_index = {tuple(idx): i for i, idx in enumerate(indices)}
+        edges = []
+        for idx in map(tuple, indices):
+            for axis in range(len(shape)):
+                if idx[axis] + 1 >= shape[axis]:
+                    continue
+                nxt = list(idx)
+                nxt[axis] += 1
+                nxt = tuple(nxt)
+                edges.append((axis, idx, flat_index[idx], flat_index[nxt]))
+        return indices, flat_index, tuple(edges)
+
+    @staticmethod
+    def _unit_overlap(overlap, *, thresh=1.0e-14):
+        overlap = np.asarray(overlap, dtype=complex)
+        if overlap.ndim == 0:
+            magnitude = abs(complex(overlap))
+            return 0.0j if magnitude < float(thresh) else complex(overlap) / magnitude
+
+        u, _, vh = np.linalg.svd(overlap, full_matrices=False)
+        return u @ vh
+
+    @staticmethod
+    def lpa_links(grid_shape, overlap_fn, *, unitarize=False):
+        """Compute nearest-neighbor LPA links on a product grid.
+
+        ``overlap_fn(i, j)`` is called with flat grid indices and may return a
+        scalar overlap or an ``(nstates, nstates)`` overlap block.
+        """
+
+        _, _, edges = LDRN.lpa_layout(grid_shape)
+        links = {}
+        for axis, idx, i, j in edges:
+            value = np.asarray(overlap_fn(i, j), dtype=complex)
+            if unitarize:
+                value = LDRN._unit_overlap(value)
+            links[(axis, idx)] = value
+        return links
+
+    @staticmethod
+    def lpa_overlap(bra_idx, ket_idx, links, grid_shape, *, nstates=None):
+        """Assemble one global LPA overlap from nearest-neighbor links."""
+
+        current = list(tuple(int(i) for i in bra_idx))
+        ket_idx = tuple(int(i) for i in ket_idx)
+        if nstates is None:
+            value = 1.0 + 0.0j
+        else:
+            value = np.eye(int(nstates), dtype=complex)
+
+        for axis in range(len(tuple(grid_shape))):
+            while current[axis] < ket_idx[axis]:
+                src = tuple(current)
+                link = links[(axis, src)]
+                value = value @ link if nstates is not None else value * complex(link)
+                current[axis] += 1
+            while current[axis] > ket_idx[axis]:
+                current[axis] -= 1
+                src = tuple(current)
+                link = links[(axis, src)].conj().T if nstates is not None else complex(links[(axis, src)]).conjugate()
+                value = value @ link if nstates is not None else value * link
+
+        return value
+
+    @staticmethod
+    def lpa_matrix(grid_shape, links, *, nstates=None):
+        """Build a dense global LPA overlap from precomputed local links."""
+
+        indices, _, _ = LDRN.lpa_layout(grid_shape)
+        ngrid = len(indices)
+        if nstates is None:
+            overlap = np.empty((ngrid, ngrid), dtype=complex)
+            for i, bra_idx in enumerate(map(tuple, indices)):
+                overlap[i, i] = 1.0
+                for j in range(i + 1, ngrid):
+                    value = LDRN.lpa_overlap(bra_idx, tuple(indices[j]), links, grid_shape)
+                    overlap[i, j] = value
+                    overlap[j, i] = value.conjugate()
+            return overlap
+
+        nstates = int(nstates)
+        overlap = np.zeros((ngrid, nstates, ngrid, nstates), dtype=complex)
+        eye_state = np.eye(nstates, dtype=complex)
+        for i, bra_idx in enumerate(map(tuple, indices)):
+            overlap[i, :, i, :] = eye_state
+            for j in range(i + 1, ngrid):
+                value = LDRN.lpa_overlap(
+                    bra_idx,
+                    tuple(indices[j]),
+                    links,
+                    grid_shape,
+                    nstates=nstates,
+                )
+                overlap[i, :, j, :] = value
+                overlap[j, :, i, :] = value.conj().T
+        return overlap
+
+    @staticmethod
+    def lpa_kinetic(
+        kinetic,
+        grid_shape,
+        overlap_fn,
+        *,
+        nstates=None,
+        kinetic_sparse_tol=0.0,
+        unitarize_links=False,
+        symmetrize=True,
+    ):
+        """Return sparse ``T_ij A_ij^LPA`` on the nonzero support of ``T``."""
+
+        kinetic = np.asarray(kinetic, dtype=complex)
+        ngrid = int(np.prod(tuple(int(n) for n in grid_shape)))
+        if kinetic.shape != (ngrid, ngrid):
+            raise ValueError(f"kinetic shape {kinetic.shape} != {(ngrid, ngrid)}.")
+        if kinetic_sparse_tol < 0.0:
+            raise ValueError("kinetic_sparse_tol must be non-negative.")
+
+        indices, _, _ = LDRN.lpa_layout(grid_shape)
+        links = LDRN.lpa_links(
+            grid_shape,
+            overlap_fn,
+            unitarize=unitarize_links,
+        )
+        keep = np.abs(kinetic) > float(kinetic_sparse_tol)
+        rows, cols = np.nonzero(keep)
+
+        if nstates is None:
+            data = np.empty(rows.size, dtype=complex)
+            for k, (i, j) in enumerate(zip(rows, cols)):
+                if i == j:
+                    overlap_ij = 1.0 + 0.0j
+                elif i < j:
+                    overlap_ij = LDRN.lpa_overlap(
+                        tuple(indices[i]),
+                        tuple(indices[j]),
+                        links,
+                        grid_shape,
+                    )
+                else:
+                    overlap_ij = LDRN.lpa_overlap(
+                        tuple(indices[j]),
+                        tuple(indices[i]),
+                        links,
+                        grid_shape,
+                    ).conjugate()
+                data[k] = kinetic[i, j] * overlap_ij
+            hamiltonian = csr_matrix((data, (rows, cols)), shape=(ngrid, ngrid), dtype=complex)
+        else:
+            nstates = int(nstates)
+            block_rows = []
+            block_cols = []
+            block_data = []
+            for i, j in zip(rows, cols):
+                if i == j:
+                    overlap_ij = np.eye(nstates, dtype=complex)
+                elif i < j:
+                    overlap_ij = LDRN.lpa_overlap(
+                        tuple(indices[i]),
+                        tuple(indices[j]),
+                        links,
+                        grid_shape,
+                        nstates=nstates,
+                    )
+                else:
+                    overlap_ij = LDRN.lpa_overlap(
+                        tuple(indices[j]),
+                        tuple(indices[i]),
+                        links,
+                        grid_shape,
+                        nstates=nstates,
+                    ).conj().T
+                block = kinetic[i, j] * overlap_ij
+                for a in range(nstates):
+                    for b in range(nstates):
+                        if block[a, b] != 0.0:
+                            block_rows.append(i * nstates + a)
+                            block_cols.append(j * nstates + b)
+                            block_data.append(block[a, b])
+            dim = ngrid * nstates
+            hamiltonian = csr_matrix((block_data, (block_rows, block_cols)), shape=(dim, dim), dtype=complex)
+
+        if symmetrize:
+            hamiltonian = 0.5 * (hamiltonian + hamiltonian.getH())
+        return hamiltonian
+
     def short_time_propagator(self, dt):
 
         if self.apes is None:
@@ -804,12 +1004,12 @@ class LDR2_LvN(LDRN):
             DESCRIPTION.
 
         """
-        from pyqed.HEOM.heom import HEOMSolver
+        from pyqed.heom import HighTemperatureHEOM
 
         if self.H is None:
             self.buildH(dt)
 
-        return HEOMSolver(self.H)
+        return HighTemperatureHEOM(self.H)
 
 
 
@@ -1774,12 +1974,12 @@ class LDR2(WPD2):
         return self.expK @ psi
 
     def HEOM(self):
-        from pyqed.HEOM.heom import HEOMSolver
+        from pyqed.heom import HighTemperatureHEOM
 
         if self.H is None:
             self.buildH(dt)
 
-        return HEOMSolver(self.H)
+        return HighTemperatureHEOM(self.H)
 
 
 class LDR2_Jacobi(LDR2):

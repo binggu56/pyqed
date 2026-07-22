@@ -94,6 +94,25 @@ local block are held fixed, producing an effective eigenvalue problem:
 Sweeping repeatedly through the chain relaxes the MPS toward the ground state
 or targeted low-lying states.
 
+Infinite-system DMRG
+--------------------
+
+For translationally invariant infinite chains, ``pyqed.mps`` also exposes
+``iDMRG`` and the convenience wrapper ``idmrg_nearest_neighbor``.  This iDMRG
+path is deliberately separate from the finite
+quantum-chemistry sweep stack: it starts from a dense nearest-neighbor bond
+Hamiltonian, factors it into local channels, grows persistent left/right
+renormalized block Hamiltonians and boundary operators, solves the two-site
+infinite-system superblock, and truncates through the center Schmidt spectrum.
+``iDMRG.run()`` populates the solver object with ``state``, ``history``,
+``energy_density``, ``center_bond_energy``, and block data.  The reported
+``energy_density`` is the growth/incremental iDMRG estimate; the finite
+superblock energy per site and candidate uniform-state energy are kept in
+``metadata`` for diagnostics.  Plain infinite growth does not always produce a
+consistent repeating tensor, so ``state`` is populated only when the candidate
+``UniformMPS`` energy agrees with the growth estimate within the configured
+``state_energy_tol``.
+
 Quantum Chemistry DMRG
 ----------------------
 
@@ -138,13 +157,45 @@ MPS time evolution can be implemented with TEBD, TDVP-like updates, Krylov
 local propagation, or problem-specific MPO exponentials. PyQED includes
 time-dependent MPS examples for model and quantum chemistry workflows.
 
+Uniform MPS
+-----------
+
+For translationally invariant infinite chains, PyQED provides a lightweight
+``UniformMPS`` class in ``pyqed.mps``.  It stores a one-site uMPS tensor
+``A[s, left, right]`` or a finite unit-cell stack
+``A[i, s, left, right]`` and supports transfer fixed points, local density
+matrices, nearest-neighbor expectation values, and correlation-length
+estimates.  One-site tensors additionally support canonical gauges,
+mixed-canonical data, entanglement spectra, and ``vumps_nearest_neighbor`` for
+dense tangent-space VUMPS updates.  ``optimize_nearest_neighbor`` and
+``optimize_nearest_neighbor_unit_cell`` provide compact direct variational
+fallbacks for small model checks.  ``iDMRG`` provides a
+growth-based infinite-system DMRG route that returns ``UniformMPS`` data when
+the retained center layout is compatible.  Optimizers return the optimized
+``UniformMPS`` directly and store metadata such as ``energy``, ``success``, and
+``nfev`` on that state.  The optional
+``examples/mps/uniform_mps_vs_tenpy.py`` script compares the Heisenberg energy
+density against TeNPy infinite VUMPS when TeNPy is installed.
+
+Uniform LETTA
+-------------
+
+``pyqed.letta`` also provides ``UniformLETTA`` for terminal uniform LETTA in
+the thermodynamic limit.  Its tensor convention follows the finite LETTA code:
+``A[left, s, t, right]`` stores a nearest-neighbor pair tensor whose physical
+legs are shared between neighboring factors.  ``UniformLETTA`` contracts its
+own transfer matrix, computes one- and two-site density matrices, and provides
+``optimize_nearest_neighbor`` to vary the LETTA pair tensor entries directly.
+``UniformLETTA.from_uniform_mps`` embeds any same-unit-cell ``UniformMPS`` by
+choosing the LETTA tensor independent of the shared right physical leg.
+
 Package Map
 -----------
 
 The MPS-related code is split across several namespaces:
 
 * ``pyqed.mps`` contains general MPS, MPO, TEBD, DMRG, symmetry, and AutoMPO
-  utilities.
+  utilities, plus ``UniformMPS`` for one-site uniform/infinite MPS work.
 * ``pyqed.mps.autompo`` contains automatic MPO construction helpers.
 * ``pyqed.mps.nonabelian`` contains prototype SU(2)/non-Abelian tensor and DMRG
   components.

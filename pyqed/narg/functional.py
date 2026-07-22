@@ -1003,6 +1003,102 @@ class Phi4PeriodicSincNARG:
 
 
 @dataclass
+class Phi4MomentumSpaceNARGStepResult:
+    """One scalar ``phi^4`` momentum-space NARG coarse-graining step."""
+
+    effective_hamiltonian: Phi4PeriodicSincNARGResult
+    fitted_hamiltonian: np.ndarray
+    active_configs: np.ndarray
+    active_modes: np.ndarray
+    environment_modes: np.ndarray
+    mode_labels: list
+    potential_surface: np.ndarray
+    fitted_potential: np.ndarray
+    fit_residual: np.ndarray
+    coefficients: dict
+    rms_error: float
+    max_abs_error: float
+    nbranches: int
+    branch_index: int
+
+
+class Phi4MomentumSpaceNARG(Phi4PeriodicSincNARG):
+    """Public scalar ``phi^4`` lattice-field NARG in momentum space.
+
+    This supported interface uses real Fourier coordinates ordered as
+    ``zero, cos(1), sin(1), ...`` with a final Nyquist coordinate for even
+    lattices.  The Hamiltonian is the periodic lattice scalar field theory
+
+    ``H = sum_k 1/2 p_k^2 + 1/2 (m^2 + k^2) q_k^2
+    + lambda / (24 dx) sum_x phi(x)^4``.
+
+    ``narg_effective_hamiltonian`` performs the conditional projection of the
+    environment momentum modes and returns the same data-rich result object as
+    ``Phi4PeriodicSincNARG`` for backward-compatible use.
+    """
+
+    def _active_phi4_fit_columns(self):
+        configs = self.active_configs
+        active_k2 = self.mode_wave_numbers[self.active_modes] ** 2
+        fixed_gradient = 0.5 * np.sum(active_k2[None, :] * configs * configs, axis=1)
+        mass_column = 0.5 * np.sum(configs * configs, axis=1)
+
+        full_configs = np.zeros((configs.shape[0], self.spatial_npoints), dtype=float)
+        full_configs[:, self.active_modes] = configs
+        active_fields = full_configs @ self.real_space_transform.T
+        quartic_column = np.sum(active_fields**4, axis=1) / (24.0 * self.dx)
+        design = np.column_stack([np.ones(configs.shape[0]), mass_column, quartic_column])
+        return design, fixed_gradient
+
+    def narg_step(self, nbranches: int = 1, *, branch_index: int = 0):
+        """Integrate environment modes and fit an active ``phi^4`` Hamiltonian.
+
+        The returned step contains the full conditional ``H_eff`` together with
+        a least-squares projection of the selected retained environment branch
+        onto the active-mode scalar-field form
+
+        ``c0 + 1/2 (m_eff^2 + k^2) q^2 + lambda_eff / (24 dx) sum_x phi_A(x)^4``.
+        """
+        effective = self.narg_effective_hamiltonian(nbranches=nbranches)
+        branch_index = int(branch_index)
+        nbranches = int(nbranches)
+        if branch_index < 0 or branch_index >= nbranches:
+            raise ValueError("branch_index must select one retained branch.")
+
+        surface = effective.conditional_blocks[:, branch_index, branch_index].copy()
+        design, fixed_gradient = self._active_phi4_fit_columns()
+        target = surface - fixed_gradient
+        values, *_ = np.linalg.lstsq(design, target, rcond=None)
+        fitted_potential = fixed_gradient + design @ values
+        residual = surface - fitted_potential
+        fitted_hamiltonian = self.active_kinetic + np.diag(fitted_potential)
+        coefficients = {
+            "constant": float(values[0]),
+            "mass2": float(values[1]),
+            "coupling": float(values[2]),
+        }
+        return Phi4MomentumSpaceNARGStepResult(
+            effective_hamiltonian=effective,
+            fitted_hamiltonian=0.5 * (fitted_hamiltonian + fitted_hamiltonian.T),
+            active_configs=self.active_configs.copy(),
+            active_modes=self.active_modes.copy(),
+            environment_modes=self.environment_modes.copy(),
+            mode_labels=list(self.mode_labels),
+            potential_surface=surface,
+            fitted_potential=fitted_potential,
+            fit_residual=residual,
+            coefficients=coefficients,
+            rms_error=float(np.sqrt(np.mean(residual * residual))),
+            max_abs_error=float(np.max(np.abs(residual))),
+            nbranches=nbranches,
+            branch_index=branch_index,
+        )
+
+
+Phi4MomentumSpaceNARGResult = Phi4PeriodicSincNARGResult
+
+
+@dataclass
 class Phi4LogShellNARGResult:
     """Log-discretized momentum-shell NARG ``H_eff`` for ``phi^4``."""
 
@@ -1041,6 +1137,118 @@ class Phi4LogShellIterativeNARGResult:
     direction: str
 
 
+@dataclass
+class Phi4LogShellCoarseGrainResult:
+    """One conditional NARG coarse-graining step for log momentum shells."""
+
+    effective_hamiltonian: Phi4LogShellNARGResult
+    fitted_hamiltonian: np.ndarray
+    active_configs: np.ndarray
+    active_modes: np.ndarray
+    environment_modes: np.ndarray
+    mode_labels: list
+    shell_edges: np.ndarray
+    retained_shells: int
+    integrated_shells: int
+    new_cutoff: float
+    potential_surface: np.ndarray
+    fitted_potential: np.ndarray
+    fit_residual: np.ndarray
+    coefficients: dict
+    rms_error: float
+    max_abs_error: float
+    nbranches: int
+    branch_index: int
+
+
+@dataclass
+class Phi4LogShellCouplingFlowStep:
+    """One sampled NARG coupling-flow shell step."""
+
+    shell: int
+    integrated_modes: np.ndarray
+    retained_modes: np.ndarray
+    new_cutoff: float
+    coefficients: dict
+    sample_count: int
+    rms_error: float
+    max_abs_error: float
+    energy_min: float
+    energy_max: float
+
+
+@dataclass
+class Phi4LogShellCouplingFlowResult:
+    """Sampled many-shell NARG coupling flow."""
+
+    steps: list
+    initial_coefficients: dict
+    final_coefficients: dict
+    cutoff: float
+    final_cutoff: float
+    log_factor: float
+    retained_shells: int
+    amplitude_npoints: int
+    field_range: float
+    branch_index: int
+    spatial_dim: int = 1
+
+    def dimensionless_rows(self, spatial_dim: int | None = None):
+        """Return dimensionless running couplings and finite-difference betas."""
+        if spatial_dim is None:
+            spatial_dim = self.spatial_dim
+        spatial_dim = int(spatial_dim)
+        rows = [
+            {
+                "step": -1,
+                "shell": None,
+                "cutoff": float(self.cutoff),
+                "rg_time": 0.0,
+                "mass2": float(self.initial_coefficients["mass2"]),
+                "coupling": float(self.initial_coefficients["coupling"]),
+                "constant": float(self.initial_coefficients.get("constant", 0.0)),
+                "gradient_z": float(self.initial_coefficients.get("gradient_z", 1.0)),
+                "phi6": float(self.initial_coefficients.get("phi6", 0.0)),
+                "phi8": float(self.initial_coefficients.get("phi8", 0.0)),
+                "r": float(self.initial_coefficients["mass2"]) / (float(self.cutoff) ** 2),
+                "g": float(self.initial_coefficients["coupling"]) / (float(self.cutoff) ** (3 - spatial_dim)),
+                "beta_r": np.nan,
+                "beta_g": np.nan,
+                "rms_error": 0.0,
+                "max_abs_error": 0.0,
+            }
+        ]
+        for index, step in enumerate(self.steps):
+            cutoff = float(step.new_cutoff)
+            coeff = step.coefficients
+            rows.append(
+                {
+                    "step": index,
+                    "shell": int(step.shell),
+                    "cutoff": cutoff,
+                    "rg_time": float(np.log(float(self.cutoff) / cutoff)),
+                    "mass2": float(coeff["mass2"]),
+                    "coupling": float(coeff["coupling"]),
+                    "constant": float(coeff["constant_total"]),
+                    "gradient_z": float(coeff.get("gradient_z", 1.0)),
+                    "phi6": float(coeff.get("phi6", 0.0)),
+                    "phi8": float(coeff.get("phi8", 0.0)),
+                    "r": float(coeff["mass2"]) / (cutoff**2),
+                    "g": float(coeff["coupling"]) / (cutoff ** (3 - spatial_dim)),
+                    "beta_r": np.nan,
+                    "beta_g": np.nan,
+                    "rms_error": float(step.rms_error),
+                    "max_abs_error": float(step.max_abs_error),
+                }
+            )
+        for previous, current in zip(rows[:-1], rows[1:]):
+            dl = current["rg_time"] - previous["rg_time"]
+            if dl != 0:
+                current["beta_r"] = (current["r"] - previous["r"]) / dl
+                current["beta_g"] = (current["g"] - previous["g"]) / dl
+        return rows
+
+
 class Phi4LogShellNARG:
     """Log-discretized ``phi^4`` momentum shells with conditional NARG.
 
@@ -1064,6 +1272,7 @@ class Phi4LogShellNARG:
         mass2: float = 0.5,
         coupling: float = 0.8,
         quadrature_order: int | None = None,
+        build_dense_spaces: bool = True,
     ):
         self.cutoff = float(cutoff)
         self.log_factor = float(log_factor)
@@ -1073,6 +1282,7 @@ class Phi4LogShellNARG:
         self.field_range = float(field_range)
         self.mass2 = float(mass2)
         self.coupling = float(coupling)
+        self.build_dense_spaces = bool(build_dense_spaces)
         if self.cutoff <= 0:
             raise ValueError("cutoff must be positive.")
         if self.log_factor <= 1:
@@ -1133,10 +1343,16 @@ class Phi4LogShellNARG:
         grid, _ = sine_dvr_grid(self.amplitude_npoints, length_q)
         self.amplitude_grid = grid - self.field_range
         self.amplitude_kinetic = sine_dvr_kinetic_matrix(self.amplitude_npoints, length_q)
-        self.active_configs = self._product_configs(self.active_modes.size)
-        self.environment_configs = self._product_configs(self.environment_modes.size)
-        self.active_kinetic = self._product_kinetic(self.active_modes.size)
-        self.environment_kinetic = self._product_kinetic(self.environment_modes.size)
+        if self.build_dense_spaces:
+            self.active_configs = self._product_configs(self.active_modes.size)
+            self.environment_configs = self._product_configs(self.environment_modes.size)
+            self.active_kinetic = self._product_kinetic(self.active_modes.size)
+            self.environment_kinetic = self._product_kinetic(self.environment_modes.size)
+        else:
+            self.active_configs = None
+            self.environment_configs = None
+            self.active_kinetic = None
+            self.environment_kinetic = None
 
         if quadrature_order is None:
             quadrature_order = max(128, 32 * self.nshells)
@@ -1146,6 +1362,10 @@ class Phi4LogShellNARG:
         self.real_space_basis = self._real_space_basis_values(self.x)
         self._full_hamiltonian_cache = None
         self._exact_energies_cache = None
+
+    def _require_dense_spaces(self):
+        if not self.build_dense_spaces:
+            raise ValueError("This operation requires build_dense_spaces=True.")
 
     def _real_space_basis_values(self, x):
         x = np.asarray(x, dtype=float)
@@ -1213,6 +1433,7 @@ class Phi4LogShellNARG:
         return self.potential_from_modes(full)
 
     def conditional_environment_hamiltonian(self, active_config):
+        self._require_dense_spaces()
         combined = self._combine_mode_configs(active_config, self.environment_configs)
         potential = self.potential_from_modes(combined)
         return self.environment_kinetic + np.diag(potential)
@@ -1221,6 +1442,7 @@ class Phi4LogShellNARG:
         return self._product_configs(self.nmodes)
 
     def full_hamiltonian_matrix(self):
+        self._require_dense_spaces()
         if self._full_hamiltonian_cache is None:
             kinetic = self._product_kinetic(self.nmodes)
             potential = self.potential_from_modes(self.full_mode_configs())
@@ -1243,6 +1465,7 @@ class Phi4LogShellNARG:
         return current @ rotation
 
     def conditional_environment_states(self, nbranches: int = 1):
+        self._require_dense_spaces()
         nbranches = int(nbranches)
         env_dim = self.environment_configs.shape[0]
         if nbranches < 1 or nbranches > env_dim:
@@ -1300,6 +1523,605 @@ class Phi4LogShellNARG:
             effective_energies=effective_energies,
             exact_energies=self.exact_energies(min(effective_energies.size, self.amplitude_npoints**self.nmodes)),
             nbranches=nbranches,
+        )
+
+    def _active_phi4_fit_columns(self):
+        configs = self.active_configs
+        active_k2 = self.mode_wave_numbers[self.active_modes] ** 2
+        fixed_gradient = 0.5 * np.sum(active_k2[None, :] * configs * configs, axis=1)
+        mass_column = 0.5 * np.sum(configs * configs, axis=1)
+
+        full_configs = np.zeros((configs.shape[0], self.nmodes), dtype=float)
+        full_configs[:, self.active_modes] = configs
+        active_fields = full_configs @ self.real_space_basis.T
+        quartic_column = (active_fields**4) @ self.x_weights / 24.0
+        design = np.column_stack([np.ones(configs.shape[0]), mass_column, quartic_column])
+        return design, fixed_gradient
+
+    def _potential_from_partial_modes_with_couplings(self, mode_configs, mode_indices, mass2, coupling):
+        mode_configs = np.asarray(mode_configs, dtype=float)
+        mode_indices = np.asarray(mode_indices, dtype=int)
+        mass2 = float(mass2)
+        coupling = float(coupling)
+        if mode_configs.ndim == 1:
+            mode_configs = mode_configs.reshape(1, -1)
+        if mode_configs.shape[1] != mode_indices.size:
+            raise ValueError("mode_configs must match mode_indices.")
+        free = 0.5 * np.sum(
+            (mass2 + self.mode_wave_numbers[mode_indices] ** 2)[None, :] * mode_configs * mode_configs,
+            axis=1,
+        )
+        site_fields = mode_configs @ self.real_space_basis[:, mode_indices].T
+        quartic = coupling * (site_fields**4) @ self.x_weights / 24.0
+        return free + quartic
+
+    def _coupling_flow_samples(
+        self,
+        mode_indices,
+        amplitudes=None,
+        *,
+        sample_rule: str = "amplitudes",
+        sample_order: int = 3,
+    ):
+        mode_indices = np.asarray(mode_indices, dtype=int)
+        nmodes = mode_indices.size
+        if nmodes == 0:
+            return np.zeros((1, 0), dtype=float)
+        sample_rule = str(sample_rule).lower().replace("-", "_")
+        if sample_rule in {"quadrature", "sparse_quadrature", "sparse"}:
+            sample_order = int(sample_order)
+            if sample_order < 2:
+                raise ValueError("sample_order must be at least 2 for quadrature sampling.")
+            nodes, _ = leggauss(sample_order)
+            nodes = self.field_range * nodes
+            samples = [np.zeros(nmodes, dtype=float)]
+
+            for column in range(nmodes):
+                for node in nodes:
+                    sample = np.zeros(nmodes, dtype=float)
+                    sample[column] = node
+                    samples.append(sample)
+
+            shell_to_columns = {}
+            for column, mode in enumerate(mode_indices):
+                shell_to_columns.setdefault(int(self.shell_index_by_mode[mode]), []).append(column)
+            for columns in shell_to_columns.values():
+                if len(columns) >= 2:
+                    for left in nodes:
+                        for right in nodes:
+                            sample = np.zeros(nmodes, dtype=float)
+                            sample[columns[0]] = left
+                            sample[columns[1]] = right
+                            samples.append(sample)
+
+            shells = sorted(shell_to_columns)
+            for left_shell, right_shell in zip(shells[:-1], shells[1:]):
+                left_column = shell_to_columns[left_shell][0]
+                right_column = shell_to_columns[right_shell][0]
+                for node in nodes:
+                    sample = np.zeros(nmodes, dtype=float)
+                    sample[left_column] = node / np.sqrt(2.0)
+                    sample[right_column] = node / np.sqrt(2.0)
+                    samples.append(sample)
+            return np.unique(np.asarray(samples, dtype=float), axis=0)
+
+        if sample_rule not in {"amplitudes", "amplitude", "radial"}:
+            raise ValueError("sample_rule must be 'amplitudes' or 'quadrature'.")
+        if amplitudes is None:
+            amplitudes = (0.25 * self.field_range, 0.5 * self.field_range)
+        amplitudes = tuple(float(value) for value in amplitudes)
+        samples = [np.zeros(nmodes, dtype=float)]
+
+        for amplitude in amplitudes:
+            for column in range(nmodes):
+                sample = np.zeros(nmodes, dtype=float)
+                sample[column] = amplitude
+                samples.append(sample)
+
+            shell_to_columns = {}
+            for column, mode in enumerate(mode_indices):
+                shell_to_columns.setdefault(int(self.shell_index_by_mode[mode]), []).append(column)
+            for columns in shell_to_columns.values():
+                if len(columns) >= 2:
+                    sample = np.zeros(nmodes, dtype=float)
+                    sample[columns[0]] = amplitude / np.sqrt(2.0)
+                    sample[columns[1]] = amplitude / np.sqrt(2.0)
+                    samples.append(sample)
+
+            shells = sorted(shell_to_columns)
+            for left_shell, right_shell in zip(shells[:-1], shells[1:]):
+                sample = np.zeros(nmodes, dtype=float)
+                sample[shell_to_columns[left_shell][0]] = amplitude / np.sqrt(2.0)
+                sample[shell_to_columns[right_shell][0]] = amplitude / np.sqrt(2.0)
+                samples.append(sample)
+
+        return np.unique(np.asarray(samples, dtype=float), axis=0)
+
+    def _coupling_flow_fit_terms(
+        self,
+        samples,
+        retained_modes,
+        *,
+        max_power: int = 4,
+        fit_gradient: bool = False,
+    ):
+        samples = np.asarray(samples, dtype=float)
+        retained_modes = np.asarray(retained_modes, dtype=int)
+        max_power = int(max_power)
+        if max_power not in {4, 6, 8}:
+            raise ValueError("max_power must be 4, 6, or 8.")
+
+        if retained_modes.size:
+            gradient_column = 0.5 * np.sum(
+                self.mode_wave_numbers[retained_modes][None, :] ** 2 * samples * samples,
+                axis=1,
+            )
+            mass_column = 0.5 * np.sum(samples * samples, axis=1)
+            retained_fields = samples @ self.real_space_basis[:, retained_modes].T
+        else:
+            gradient_column = np.zeros(samples.shape[0], dtype=float)
+            mass_column = np.zeros(samples.shape[0], dtype=float)
+            retained_fields = np.zeros((samples.shape[0], self.x.size), dtype=float)
+
+        columns = [np.ones(samples.shape[0], dtype=float)]
+        names = ["constant"]
+        fixed = np.zeros(samples.shape[0], dtype=float)
+        if fit_gradient:
+            columns.append(gradient_column)
+            names.append("gradient_z")
+        else:
+            fixed = fixed + gradient_column
+        columns.append(mass_column)
+        names.append("mass2")
+        columns.append((retained_fields**4) @ self.x_weights / 24.0)
+        names.append("coupling")
+        if max_power >= 6:
+            columns.append((retained_fields**6) @ self.x_weights / 720.0)
+            names.append("phi6")
+        if max_power >= 8:
+            columns.append((retained_fields**8) @ self.x_weights / 40320.0)
+            names.append("phi8")
+        return np.column_stack(columns), names, fixed
+
+    def narg_coupling_flow(
+        self,
+        *,
+        retained_shells: int = 1,
+        branch_index: int = 0,
+        amplitudes=None,
+        spatial_dim: int = 1,
+        sample_rule: str = "amplitudes",
+        sample_order: int = 3,
+        max_power: int = 4,
+        fit_gradient: bool = False,
+    ):
+        """Run a sampled many-shell NARG coarse-graining flow.
+
+        Each step integrates the current UV cos/sin shell by diagonalizing its
+        conditional Hamiltonian over sampled configurations of the remaining
+        lower shells.  The resulting adiabatic surface is projected back onto a
+        scalar ``phi^4`` form, giving running ``mass2`` and ``coupling``.
+        """
+        retained_shells = int(retained_shells)
+        branch_index = int(branch_index)
+        if retained_shells < 1 or retained_shells > self.nshells:
+            raise ValueError("retained_shells must be between 1 and nshells.")
+        if branch_index < 0:
+            raise ValueError("branch_index must be nonnegative.")
+        if fit_gradient and retained_shells < 2:
+            raise ValueError("fit_gradient requires at least two retained shells.")
+
+        mass2 = float(self.mass2)
+        coupling = float(self.coupling)
+        constant = 0.0
+        steps = []
+        stop_shell = self.nshells - retained_shells
+        for shell in range(stop_shell):
+            integrated_modes = np.asarray([2 * shell, 2 * shell + 1], dtype=int)
+            retained_modes = np.arange(2 * (shell + 1), self.nmodes, dtype=int)
+            shell_configs = self._product_configs(integrated_modes.size)
+            shell_kinetic = self._product_kinetic(integrated_modes.size)
+            shell_dim = shell_configs.shape[0]
+            if branch_index >= shell_dim:
+                raise ValueError("branch_index exceeds the one-shell Hilbert dimension.")
+
+            samples = self._coupling_flow_samples(
+                retained_modes,
+                amplitudes=amplitudes,
+                sample_rule=sample_rule,
+                sample_order=sample_order,
+            )
+            energies = np.empty(samples.shape[0], dtype=float)
+            combined_modes = np.concatenate([integrated_modes, retained_modes])
+            for sample_index, retained_config in enumerate(samples):
+                combined = np.hstack(
+                    [
+                        shell_configs,
+                        np.broadcast_to(retained_config, (shell_dim, retained_config.size)),
+                    ]
+                )
+                potential = self._potential_from_partial_modes_with_couplings(
+                    combined,
+                    combined_modes,
+                    mass2,
+                    coupling,
+                )
+                hamiltonian = shell_kinetic + np.diag(potential)
+                values = np.linalg.eigvalsh(0.5 * (hamiltonian + hamiltonian.T))
+                energies[sample_index] = values[branch_index]
+
+            design, names, fixed = self._coupling_flow_fit_terms(
+                samples,
+                retained_modes,
+                max_power=max_power,
+                fit_gradient=fit_gradient,
+            )
+            target = energies - fixed
+            values, *_ = np.linalg.lstsq(design, target, rcond=None)
+            fitted = fixed + design @ values
+            residual = energies - fitted
+
+            step_coefficients = {name: float(value) for name, value in zip(names, values)}
+            constant += float(step_coefficients["constant"])
+            mass2 = float(step_coefficients["mass2"])
+            coupling = float(step_coefficients["coupling"])
+            if not fit_gradient:
+                step_coefficients["gradient_z"] = 1.0
+            step_coefficients["constant_step"] = float(step_coefficients["constant"])
+            step_coefficients["constant_total"] = float(constant)
+            steps.append(
+                Phi4LogShellCouplingFlowStep(
+                    shell=int(shell),
+                    integrated_modes=integrated_modes.copy(),
+                    retained_modes=retained_modes.copy(),
+                    new_cutoff=float(self.shell_edges[shell + 1]),
+                    coefficients=step_coefficients,
+                    sample_count=int(samples.shape[0]),
+                    rms_error=float(np.sqrt(np.mean(residual * residual))),
+                    max_abs_error=float(np.max(np.abs(residual))),
+                    energy_min=float(np.min(energies)),
+                    energy_max=float(np.max(energies)),
+                )
+            )
+
+        final_cutoff = float(self.shell_edges[stop_shell])
+        final_coefficients = {
+            "constant": float(constant),
+            "mass2": float(mass2),
+            "coupling": float(coupling),
+        }
+        if steps:
+            last = steps[-1].coefficients
+            for name in ("gradient_z", "phi6", "phi8"):
+                if name in last:
+                    final_coefficients[name] = float(last[name])
+        return Phi4LogShellCouplingFlowResult(
+            steps=steps,
+            initial_coefficients={
+                "constant": 0.0,
+                "mass2": float(self.mass2),
+                "coupling": float(self.coupling),
+                "gradient_z": 1.0,
+                "phi6": 0.0,
+                "phi8": 0.0,
+            },
+            final_coefficients=final_coefficients,
+            cutoff=float(self.cutoff),
+            final_cutoff=final_cutoff,
+            log_factor=float(self.log_factor),
+            retained_shells=retained_shells,
+            amplitude_npoints=int(self.amplitude_npoints),
+            field_range=float(self.field_range),
+            branch_index=branch_index,
+            spatial_dim=int(spatial_dim),
+        )
+
+    def sampled_vs_dense_coarse_grain(
+        self,
+        *,
+        retained_shells: int | None = None,
+        nbranches: int = 1,
+        branch_index: int = 0,
+        amplitudes=None,
+        sample_rule: str = "amplitudes",
+        sample_order: int = 3,
+        max_power: int = 4,
+        fit_gradient: bool = False,
+    ):
+        """Compare sampled one-shell NARG fitting against dense conditional NARG."""
+        if retained_shells is None:
+            retained_shells = self.nshells - 1
+        retained_shells = int(retained_shells)
+        if self.nshells - retained_shells != 1:
+            raise ValueError("sampled_vs_dense_coarse_grain compares one integrated UV shell.")
+        if not self.build_dense_spaces:
+            dense = Phi4LogShellNARG(
+                cutoff=self.cutoff,
+                log_factor=self.log_factor,
+                nshells=self.nshells,
+                active_shells=retained_shells,
+                length=self.length,
+                amplitude_npoints=self.amplitude_npoints,
+                field_range=self.field_range,
+                mass2=self.mass2,
+                coupling=self.coupling,
+                quadrature_order=self.quadrature_order,
+                build_dense_spaces=True,
+            )
+        else:
+            dense = self
+        exact = dense.narg_coarse_grain_step(
+            nbranches=nbranches,
+            retained_shells=retained_shells,
+            branch_index=branch_index,
+        )
+        sampled_model = Phi4LogShellNARG(
+            cutoff=self.cutoff,
+            log_factor=self.log_factor,
+            nshells=self.nshells,
+            active_shells=0,
+            length=self.length,
+            amplitude_npoints=self.amplitude_npoints,
+            field_range=self.field_range,
+            mass2=self.mass2,
+            coupling=self.coupling,
+            quadrature_order=self.quadrature_order,
+            build_dense_spaces=False,
+        )
+        sampled = sampled_model.narg_coupling_flow(
+            retained_shells=retained_shells,
+            branch_index=branch_index,
+            amplitudes=amplitudes,
+            sample_rule=sample_rule,
+            sample_order=sample_order,
+            max_power=max_power,
+            fit_gradient=fit_gradient,
+        )
+        sampled_coeff = sampled.steps[0].coefficients
+        rows = {}
+        for name in ("mass2", "coupling"):
+            rows[name] = {
+                "dense": float(exact.coefficients[name]),
+                "sampled": float(sampled_coeff[name]),
+                "abs_error": float(abs(exact.coefficients[name] - sampled_coeff[name])),
+            }
+        rows["constant"] = {
+            "dense": float(exact.coefficients["constant"]),
+            "sampled": float(sampled_coeff["constant_step"]),
+            "abs_error": float(abs(exact.coefficients["constant"] - sampled_coeff["constant_step"])),
+        }
+        return {
+            "dense": exact,
+            "sampled": sampled,
+            "coefficients": rows,
+            "dense_rms_error": float(exact.rms_error),
+            "sampled_rms_error": float(sampled.steps[0].rms_error),
+        }
+
+    def narg_coupling_flow_scan(
+        self,
+        *,
+        amplitude_npoints_values=None,
+        quadrature_orders=None,
+        amplitude_sets=None,
+        sample_rules=None,
+        sample_orders=None,
+        log_factors=None,
+        max_powers=None,
+        fit_gradient_values=None,
+        retained_shells: int = 1,
+        branch_index: int = 0,
+        spatial_dim: int = 1,
+    ):
+        """Convergence scan for the sampled many-shell coupling flow."""
+        if amplitude_npoints_values is None:
+            amplitude_npoints_values = [self.amplitude_npoints]
+        if quadrature_orders is None:
+            quadrature_orders = [self.quadrature_order]
+        if amplitude_sets is None:
+            amplitude_sets = [None]
+        if sample_rules is None:
+            sample_rules = ["amplitudes"]
+        if sample_orders is None:
+            sample_orders = [3]
+        if log_factors is None:
+            log_factors = [self.log_factor]
+        if max_powers is None:
+            max_powers = [4]
+        if fit_gradient_values is None:
+            fit_gradient_values = [False]
+
+        rows = []
+        for amplitude_npoints in amplitude_npoints_values:
+            for quadrature_order in quadrature_orders:
+                for amplitude_set in amplitude_sets:
+                    for sample_rule in sample_rules:
+                        for sample_order in sample_orders:
+                            for log_factor in log_factors:
+                                for max_power in max_powers:
+                                    for fit_gradient in fit_gradient_values:
+                                        model = Phi4LogShellNARG(
+                                            cutoff=self.cutoff,
+                                            log_factor=float(log_factor),
+                                            nshells=self.nshells,
+                                            active_shells=0,
+                                            amplitude_npoints=int(amplitude_npoints),
+                                            field_range=self.field_range,
+                                            mass2=self.mass2,
+                                            coupling=self.coupling,
+                                            quadrature_order=int(quadrature_order),
+                                            build_dense_spaces=False,
+                                        )
+                                        flow = model.narg_coupling_flow(
+                                            retained_shells=retained_shells,
+                                            branch_index=branch_index,
+                                            amplitudes=amplitude_set,
+                                            spatial_dim=spatial_dim,
+                                            sample_rule=sample_rule,
+                                            sample_order=sample_order,
+                                            max_power=max_power,
+                                            fit_gradient=fit_gradient,
+                                        )
+                                        rows.append(
+                                            {
+                                                "amplitude_npoints": int(amplitude_npoints),
+                                                "quadrature_order": int(quadrature_order),
+                                                "amplitudes": amplitude_set,
+                                                "sample_rule": str(sample_rule),
+                                                "sample_order": int(sample_order),
+                                                "log_factor": float(log_factor),
+                                                "max_power": int(max_power),
+                                                "fit_gradient": bool(fit_gradient),
+                                                "final_cutoff": float(flow.final_cutoff),
+                                                "mass2": float(flow.final_coefficients["mass2"]),
+                                                "coupling": float(flow.final_coefficients["coupling"]),
+                                                "gradient_z": float(flow.final_coefficients.get("gradient_z", 1.0)),
+                                                "phi6": float(flow.final_coefficients.get("phi6", 0.0)),
+                                                "phi8": float(flow.final_coefficients.get("phi8", 0.0)),
+                                                "constant": float(flow.final_coefficients["constant"]),
+                                                "max_rms_error": float(
+                                                    max(step.rms_error for step in flow.steps) if flow.steps else 0.0
+                                                ),
+                                                "max_abs_error": float(
+                                                    max(step.max_abs_error for step in flow.steps) if flow.steps else 0.0
+                                                ),
+                                            }
+                                        )
+        return rows
+
+    def narg_fixed_point_scan(
+        self,
+        mass2_values,
+        coupling_values,
+        *,
+        retained_shells: int = 1,
+        branch_index: int = 0,
+        amplitudes=None,
+        sample_rule: str = "quadrature",
+        sample_order: int = 3,
+        max_power: int = 6,
+        fit_gradient: bool = True,
+        spatial_dim: int = 1,
+    ):
+        """Coarse fixed-point diagnostic from final dimensionless beta norm."""
+        rows = []
+        for mass2 in mass2_values:
+            for coupling in coupling_values:
+                model = Phi4LogShellNARG(
+                    cutoff=self.cutoff,
+                    log_factor=self.log_factor,
+                    nshells=self.nshells,
+                    active_shells=0,
+                    amplitude_npoints=self.amplitude_npoints,
+                    field_range=self.field_range,
+                    mass2=float(mass2),
+                    coupling=float(coupling),
+                    quadrature_order=self.quadrature_order,
+                    build_dense_spaces=False,
+                )
+                flow = model.narg_coupling_flow(
+                    retained_shells=retained_shells,
+                    branch_index=branch_index,
+                    amplitudes=amplitudes,
+                    spatial_dim=spatial_dim,
+                    sample_rule=sample_rule,
+                    sample_order=sample_order,
+                    max_power=max_power,
+                    fit_gradient=fit_gradient,
+                )
+                beta_rows = flow.dimensionless_rows(spatial_dim=spatial_dim)
+                final = beta_rows[-1]
+                beta_norm = float(np.hypot(final["beta_r"], final["beta_g"]))
+                rows.append(
+                    {
+                        "initial_mass2": float(mass2),
+                        "initial_coupling": float(coupling),
+                        "final_mass2": float(flow.final_coefficients["mass2"]),
+                        "final_coupling": float(flow.final_coefficients["coupling"]),
+                        "final_r": float(final["r"]),
+                        "final_g": float(final["g"]),
+                        "beta_r": float(final["beta_r"]),
+                        "beta_g": float(final["beta_g"]),
+                        "beta_norm": beta_norm,
+                        "max_rms_error": float(max(step.rms_error for step in flow.steps) if flow.steps else 0.0),
+                    }
+                )
+        rows.sort(key=lambda item: item["beta_norm"])
+        return rows
+
+    def narg_coarse_grain_step(
+        self,
+        nbranches: int = 1,
+        *,
+        retained_shells: int | None = None,
+        branch_index: int = 0,
+    ):
+        """Integrate UV shells conditionally and fit the retained shell theory.
+
+        Unlike ``iterative_shell_narg``, this is a NARG coarse-graining step:
+        the retained lower-momentum shells remain in a coordinate basis, while
+        UV shell states are solved conditionally for each retained
+        configuration and projected into ``H_eff``.
+        """
+        if retained_shells is None:
+            retained_shells = max(self.nshells - 1, 1)
+        retained_shells = int(retained_shells)
+        if retained_shells < 1 or retained_shells > self.nshells:
+            raise ValueError("retained_shells must be between 1 and nshells.")
+
+        model = self
+        if self.active_shells != retained_shells:
+            model = Phi4LogShellNARG(
+                cutoff=self.cutoff,
+                log_factor=self.log_factor,
+                nshells=self.nshells,
+                active_shells=retained_shells,
+                length=self.length,
+                amplitude_npoints=self.amplitude_npoints,
+                field_range=self.field_range,
+                mass2=self.mass2,
+                coupling=self.coupling,
+                quadrature_order=self.quadrature_order,
+            )
+
+        nbranches = int(nbranches)
+        branch_index = int(branch_index)
+        if branch_index < 0 or branch_index >= nbranches:
+            raise ValueError("branch_index must select one retained branch.")
+
+        effective = model.narg_effective_hamiltonian(nbranches=nbranches)
+        surface = effective.conditional_blocks[:, branch_index, branch_index].copy()
+        design, fixed_gradient = model._active_phi4_fit_columns()
+        target = surface - fixed_gradient
+        values, *_ = np.linalg.lstsq(design, target, rcond=None)
+        fitted_potential = fixed_gradient + design @ values
+        residual = surface - fitted_potential
+        fitted_hamiltonian = model.active_kinetic + np.diag(fitted_potential)
+        first_retained_shell = model.nshells - retained_shells
+        coefficients = {
+            "constant": float(values[0]),
+            "mass2": float(values[1]),
+            "coupling": float(values[2]),
+        }
+        return Phi4LogShellCoarseGrainResult(
+            effective_hamiltonian=effective,
+            fitted_hamiltonian=0.5 * (fitted_hamiltonian + fitted_hamiltonian.T),
+            active_configs=model.active_configs.copy(),
+            active_modes=model.active_modes.copy(),
+            environment_modes=model.environment_modes.copy(),
+            mode_labels=list(model.mode_labels),
+            shell_edges=model.shell_edges.copy(),
+            retained_shells=retained_shells,
+            integrated_shells=model.nshells - retained_shells,
+            new_cutoff=float(model.shell_edges[first_retained_shell]),
+            potential_surface=surface,
+            fitted_potential=fitted_potential,
+            fit_residual=residual,
+            coefficients=coefficients,
+            rms_error=float(np.sqrt(np.mean(residual * residual))),
+            max_abs_error=float(np.max(np.abs(residual))),
+            nbranches=nbranches,
+            branch_index=branch_index,
         )
 
     def shell_flow_summary(self, nbranches: int = 2):
@@ -2504,9 +3326,15 @@ class Yukawa1DWavefunctionalNARG:
 __all__ = [
     "ConditionalGaussianNARGResult",
     "ConditionalGaussianWavefunctionNARG",
+    "Phi4LogShellCouplingFlowResult",
+    "Phi4LogShellCouplingFlowStep",
+    "Phi4LogShellCoarseGrainResult",
     "Phi4LogShellIterativeNARGResult",
     "Phi4LogShellNARG",
     "Phi4LogShellNARGResult",
+    "Phi4MomentumSpaceNARG",
+    "Phi4MomentumSpaceNARGResult",
+    "Phi4MomentumSpaceNARGStepResult",
     "Phi4NARGEffectiveHamiltonianResult",
     "Phi4PeriodicSincNARG",
     "Phi4PeriodicSincNARGResult",

@@ -3,7 +3,6 @@ import time
 import pickle
 import logging
 import datetime
-import collections
 import numpy as np
 
 # ============================================================
@@ -39,14 +38,12 @@ import pyqed.mps.mps as mps_lib
 
 try:
     import pyqed.mps.symmetry as sym_module
-    from pyqed.mps.symmetry import BlockTensor, QN, SymmetryManager as MpsSymmetryManager, tensordot
+    from pyqed.mps.symmetry import BlockTensor, QN
     SYMMETRY_AVAILABLE = True
 except ImportError:
     SYMMETRY_AVAILABLE = False
     BlockTensor = None
     QN = None
-    MpsSymmetryManager = None
-    tensordot = None
 
 # ============================================================
 # Logging, Constants / defaults
@@ -67,7 +64,7 @@ DEFAULT_LZ = 36.0
 DEFAULT_NZ = 511
 DEFAULT_M = 1
 
-DEFAULT_ALT_CYCLES = 5 # HF Transversal orbital optimization 
+DEFAULT_ALT_CYCLES = 20 # HF Transversal orbital optimization 
 DEFAULT_SWEEP_ITERATIONS = 10
 DEFAULT_TRUST_STEP = 1.0
 DEFAULT_NEWTON_RIDGE = 0.5
@@ -258,184 +255,6 @@ def build_mps_from_configs(configs_with_amps, sym_mgr, nsites, noise_scale=1e-5)
     return mps
 
 
-def get_vacuum_mps_symmetric(nsites, sym_mgr):
-    if not SYMMETRY_AVAILABLE:
-        raise RuntimeError("Symmetry module unavailable.")
-
-    vac_qn = sym_mgr.get_vac_qn()
-    mps = []
-    for site in range(nsites):
-        emp_qn = sym_mgr.get_phys_qn(site, "emp")
-        occ_qn = sym_mgr.get_phys_qn(site, "occ")
-        data = {(vac_qn, vac_qn, emp_qn): np.array([[[1.0]]], dtype=complex)}
-        mps.append(BlockTensor(data, [[vac_qn], [vac_qn], [emp_qn, occ_qn]], [-1, 1, 1]))
-    return mps
-
-
-def build_creation_mpo_symmetric(coeff_vector, sym_mgr, spin_sector):
-    if not SYMMETRY_AVAILABLE:
-        raise RuntimeError("Symmetry module unavailable.")
-
-    coeff_vector = np.asarray(coeff_vector)
-    nsites = len(coeff_vector)
-    vac_qn = sym_mgr.get_vac_qn()
-    particle_qn = sym_mgr.get_phys_qn(0 if spin_sector == "up" else 1, "occ")
-
-    tensors = []
-    for site in range(nsites):
-        coeff = coeff_vector[site]
-        emp_qn = sym_mgr.get_phys_qn(site, "emp")
-        occ_qn = sym_mgr.get_phys_qn(site, "occ")
-
-        data = {
-            (vac_qn, vac_qn, emp_qn, emp_qn): np.array([[[[1.0]]]], dtype=complex),
-            (vac_qn, vac_qn, occ_qn, occ_qn): np.array([[[[1.0]]]], dtype=complex),
-            (particle_qn, particle_qn, emp_qn, emp_qn): np.array([[[[1.0]]]], dtype=complex),
-            (particle_qn, particle_qn, occ_qn, occ_qn): np.array([[[[-1.0]]]], dtype=complex),
-        }
-
-        is_up_site = (site % 2 == 0)
-        valid_site = (spin_sector == "up" and is_up_site) or (spin_sector == "down" and not is_up_site)
-        if valid_site and abs(coeff) > 1.0e-12:
-            data[(vac_qn, particle_qn, occ_qn, emp_qn)] = np.array([[[[coeff]]]], dtype=complex)
-
-        if site == 0:
-            data = {k: v for k, v in data.items() if k[0] == vac_qn}
-        if site == nsites - 1:
-            data = {k: v for k, v in data.items() if k[1] == particle_qn}
-
-        used_l = sorted(set(k[0] for k in data))
-        used_r = sorted(set(k[1] for k in data))
-        used_out = sorted(set(k[2] for k in data))
-        used_in = sorted(set(k[3] for k in data))
-        tensors.append(BlockTensor(data, [used_l, used_r, used_out, used_in], [1, -1, 1, -1]))
-
-    return tensors
-
-
-def _get_qn_dims(bt, leg_idx):
-    dims = {}
-    for key, block in bt.data.items():
-        dims[key[leg_idx]] = block.shape[leg_idx]
-    return dims
-
-
-def apply_mpo_symmetric(W_list, M_list, vac_qn):
-    new_mps = []
-    last_right_basis_map = {vac_qn: [((vac_qn, vac_qn), 1)]}
-
-    for site, (W, M) in enumerate(zip(W_list, M_list)):
-        T = tensordot(W, M, axes=([3], [2]))
-
-        current_right_basis_map = collections.defaultdict(list)
-        w_dims_r = _get_qn_dims(W, 1)
-        m_dims_r = _get_qn_dims(M, 1)
-
-        for key_T in T.data:
-            qw_r, qm_r = key_T[1], key_T[4]
-            q_r_new = qw_r + qm_r
-            if qw_r in w_dims_r and qm_r in m_dims_r:
-                pair_info = ((qw_r, qm_r), w_dims_r[qw_r] * m_dims_r[qm_r])
-                if pair_info not in current_right_basis_map[q_r_new]:
-                    current_right_basis_map[q_r_new].append(pair_info)
-
-        for qn in current_right_basis_map:
-            current_right_basis_map[qn].sort(key=lambda x: x[0])
-
-        blocks_by_sector = collections.defaultdict(dict)
-        for key_T, block in T.data.items():
-            qw_l, qw_r, q_p_out, qm_l, qm_r = key_T
-            sector = (qw_l + qm_l, qw_r + qm_r, q_p_out)
-            comp_key = ((qw_l, qm_l), (qw_r, qm_r))
-            blocks_by_sector[sector][comp_key] = block
-
-        new_data = {}
-        for sector, comps in blocks_by_sector.items():
-            q_l_new, q_r_new, q_p_out = sector
-            row_info_list = last_right_basis_map.get(q_l_new, [])
-            col_info_list = current_right_basis_map.get(q_r_new, [])
-            if not row_info_list or not col_info_list:
-                continue
-
-            r_dim = sum(d for _, d in row_info_list)
-            c_dim = sum(d for _, d in col_info_list)
-            if site == len(M_list) - 1 and c_dim > 1:
-                c_dim = 1
-
-            row_offsets = {}
-            row_start = 0
-            for pair, dim in row_info_list:
-                row_offsets[pair] = (row_start, dim)
-                row_start += dim
-
-            col_offsets = {}
-            col_start = 0
-            for pair, dim in col_info_list:
-                col_offsets[pair] = (col_start, dim)
-                col_start += dim
-
-            new_block = np.zeros((r_dim, c_dim, 1), dtype=complex)
-            for ((w_l, m_l), (w_r, m_r)), block in comps.items():
-                if (w_l, m_l) not in row_offsets or (w_r, m_r) not in col_offsets:
-                    continue
-
-                r_start, r_len = row_offsets[(w_l, m_l)]
-                c_start, c_len_full = col_offsets[(w_r, m_r)]
-                block_perm = block.transpose(0, 3, 1, 4, 2)
-                if new_block.shape[2] != block.shape[2]:
-                    new_block = np.zeros((r_dim, c_dim, block.shape[2]), dtype=complex)
-
-                fill = block_perm.reshape(
-                    block.shape[0] * block.shape[3],
-                    block.shape[1] * block.shape[4],
-                    block.shape[2],
-                )
-                actual_r = min(r_len, fill.shape[0])
-                actual_c = min(c_len_full, c_dim - c_start, fill.shape[1])
-                if actual_r > 0 and actual_c > 0:
-                    new_block[r_start:r_start + actual_r, c_start:c_start + actual_c, :] = fill[:actual_r, :actual_c, :]
-
-            if np.sum(np.abs(new_block)) > 1.0e-14:
-                new_data[sector] = new_block
-
-        qns_l = sorted(set(k[0] for k in new_data))
-        qns_r = sorted(set(k[1] for k in new_data))
-        qns_p = list(W.qns[2])
-        new_mps.append(BlockTensor(new_data, [qns_l, qns_r, qns_p], [-1, 1, 1]))
-        last_right_basis_map = current_right_basis_map
-
-    return new_mps
-
-
-def generate_exact_hf_guess_from_orbitals(C_occ_spatial, sym_mgr):
-    C_occ_spatial = np.asarray(C_occ_spatial)
-    ncas, nocc = C_occ_spatial.shape
-    nsites = 2 * ncas
-    vac_qn = sym_mgr.get_vac_qn()
-
-    logger.info("[DMRG] Generating exact HF Slater initial guess in localized active basis.")
-    mps = get_vacuum_mps_symmetric(nsites, sym_mgr)
-    for mo_idx in range(nocc):
-        vec = C_occ_spatial[:, mo_idx]
-
-        coeff_up = np.zeros(nsites, dtype=complex)
-        coeff_up[0::2] = vec
-        mpo_up = build_creation_mpo_symmetric(coeff_up, sym_mgr, spin_sector="up")
-        mps = apply_mpo_symmetric(mpo_up, mps, vac_qn)
-
-        coeff_dn = np.zeros(nsites, dtype=complex)
-        coeff_dn[1::2] = vec
-        mpo_dn = build_creation_mpo_symmetric(coeff_dn, sym_mgr, spin_sector="down")
-        mps = apply_mpo_symmetric(mpo_dn, mps, vac_qn)
-
-    max_block_size = max(
-        sum(np.prod(block.shape[:2]) for block in tensor.data.values())
-        for tensor in mps
-    )
-    logger.info("[DMRG] Exact HF guess max block-state count: %d", max_block_size)
-    return mps
-
-
 def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     d = 2
     mps_guess = []
@@ -453,35 +272,12 @@ def get_noisy_hf_guess(n_elec, n_spin, noise=1e-3):
     return mps_guess
 
 
-def make_initial_guess(init_guess, nelec, ncas, abelian_symmetry, sym_mgr=None):
+def make_initial_guess(init_guess, nelec, ncas, abelian_symmetry):
     init_guess = init_guess.lower()
     nsites = 2 * ncas
 
     if abelian_symmetry and SYMMETRY_AVAILABLE and init_guess in ["hf", "cid", "cisd", "random"]:
-        if sym_mgr is None:
-            q_emp = QN(0, 0)
-            q_up = QN(1, 1)
-            q_dn = QN(1, -1)
-            target_qn = QN(int(nelec), 0)
-            site_qn_maps = [
-                {0: q_emp, 1: q_up if i % 2 == 0 else q_dn}
-                for i in range(nsites)
-            ]
-            sym_mgr = MpsSymmetryManager(
-                phys_qns=[q_emp, q_up],
-                target_qn=target_qn,
-                sym_types=["charge", "sz"],
-            )
-            sym_mgr.site_qn_maps = site_qn_maps
-
-            def _get_phys_qn(site, state):
-                if state in ("emp", "empty", 0):
-                    return site_qn_maps[site][0]
-                if state in ("occ", "occupied", 1):
-                    return site_qn_maps[site][1]
-                raise ValueError(f"Unknown local state {state}")
-
-            sym_mgr.get_phys_qn = _get_phys_qn
+        sym_mgr = SymmetryManager(["charge", "sz"])
         if init_guess == "hf":
             configs = [(tuple(gen_hf_config(nelec, nsites)), 1.0)]
         elif init_guess == "cid":
@@ -868,21 +664,6 @@ def rhf_energy_in_compressed_basis(h, g, C_occ, Enuc):
     E2 = 0.5 * np.einsum("pq,pq->", D, (J - 0.5 * K)).real
     return E1 + E2 + Enuc
 
-
-def expect_block_mps(mps_tensors, mpo_tensors):
-    """Expectation value for the BlockTensor MPS/MPO convention used here."""
-    E = mps_lib.initial_E(mpo_tensors[0])
-    for W, A in zip(mpo_tensors, mps_tensors):
-        E = mps_lib.contract_from_left(W, A, E, A)
-
-    if hasattr(E, "data"):
-        total = 0.0
-        for block in E.data.values():
-            total += np.sum(block)
-        return total
-
-    return E[0][0][0]
-
 def run_dmrg_from_hf_data(
     hf_data,
     outdir,
@@ -983,59 +764,25 @@ def run_dmrg_from_hf_data(
 
     abelian_symmetry = True
     if abelian_symmetry:
-        sym_types = ["charge", "sz"]
-        q_emp = QN(0, 0)
-        q_up = QN(1, 1)
-        q_dn = QN(1, -1)
-        target_qn = QN(int(nelec), 0)
+        sym_mgr = SymmetryManager(["charge", "sz"])
         site_qn_maps = []
         for i in range(2 * nkeep):
-            site_qn_maps.append({0: q_emp, 1: q_up if i % 2 == 0 else q_dn})
-
-        sym_mgr = MpsSymmetryManager(
-            phys_qns=[q_emp, q_up],
-            target_qn=target_qn,
-            sym_types=sym_types,
-        )
-        sym_mgr.site_qn_maps = site_qn_maps
-
-        def _get_phys_qn(site, state):
-            if state in ("emp", "empty", 0):
-                return site_qn_maps[site][0]
-            if state in ("occ", "occupied", 1):
-                return site_qn_maps[site][1]
-            raise ValueError(f"Unknown local state {state}")
-
-        sym_mgr.get_phys_qn = _get_phys_qn
+            q_emp = sym_mgr.get_phys_qn(i, "emp")
+            q_occ = sym_mgr.get_phys_qn(i, "occ")
+            site_qn_maps.append({0: q_emp, 1: q_occ})
         final_H = dense_to_symmetric_mpo(mpo_dmrg, site_qn_maps)
     else:
         final_H = mpo_dmrg
         sym_mgr = None
-        target_qn = None
 
-    if abelian_symmetry:
-        mps0 = generate_exact_hf_guess_from_orbitals(C_occ_loc, sym_mgr)
-        try:
-            e_guess = np.real(expect_block_mps(mps0, final_H)) + Enuc
-            logger.info(
-                "[DMRG] Exact-HF guess energy in MPO = %.12f Ha "
-                "(rebuilt HF = %.12f Ha, diff = %.3e)",
-                e_guess,
-                E_hf_rebuilt,
-                e_guess - E_hf_rebuilt,
-            )
-        except Exception as e:
-            logger.info("[DMRG] Exact-HF guess energy check failed: %s", e)
-    else:
-        mps0, sym_mgr_guess, _ = make_initial_guess(
-            init_guess=init_guess,
-            nelec=nelec,
-            ncas=nkeep,
-            abelian_symmetry=abelian_symmetry,
-            sym_mgr=sym_mgr,
-        )
-        if sym_mgr is None and sym_mgr_guess is not None:
-            sym_mgr = sym_mgr_guess
+    mps0, sym_mgr_guess, _ = make_initial_guess(
+        init_guess=init_guess,
+        nelec=nelec,
+        ncas=nkeep,
+        abelian_symmetry=abelian_symmetry,
+    )
+    if sym_mgr_guess is not None:
+        sym_mgr = sym_mgr_guess
 
     solver = DMRG_SOLVER(
         final_H,
@@ -1043,29 +790,21 @@ def run_dmrg_from_hf_data(
         nsweeps=dmrg_sweeps,
         init_guess=mps0,
         symmetry=abelian_symmetry,
-        target_qn=target_qn,
+        target_qn=sym_mgr.get_target_qn(nelec, 0) if sym_mgr is not None else None,
         sym_mgr=sym_mgr,
+        charge=nelec,
+        spin=0,
         not_conv_err=False,
     )
     solver.run()
 
     try:
         psi_tensors = solver.ground_state.Bs
-        mpo_tensors = solver.H.factors if hasattr(solver.H, "factors") else solver.H
-        e_elec = expect_block_mps(psi_tensors, mpo_tensors)
+        e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
         E_dmrg = np.real(e_elec) + Enuc
     except Exception as e:
-        logger.info(f"[DMRG] Block expectation failed, fallback to solver.e_tot. Error: {e}")
+        logger.info(f"[DMRG] expect_mps failed, fallback to solver.e_tot. Error: {e}")
         E_dmrg = solver.e_tot + Enuc
-
-    if E_dmrg > E_hf_rebuilt + 1.0e-7:
-        logger.warning(
-            "[DMRG] Variational check failed in compressed space: "
-            "E_dmrg=%.12f > E_hf_rebuilt=%.12f. "
-            "Increase sweeps/D or inspect the MPO/MPS symmetry sectors.",
-            E_dmrg,
-            E_hf_rebuilt,
-        )
 
     with open(os.path.join(outdir, "dmrg_ground_state.pkl"), "wb") as f:
         pickle.dump(
@@ -1174,12 +913,12 @@ def main():
     run_single_geometry_pipeline(
         mol=mol,
         run_root=run_root,
-        hf_nkeep=6,
+        hf_nkeep=4,
         hf_D=200,
         dmrg_sweeps=30,
         init_guess="cid",
         Lz=8.0,
-        Nz=63,
+        Nz=255,
         M=1,
         s_exps=DEFAULT_S_EXPS, # default is 6 gaussians in sto-6g
         p_exps=DEFAULT_P_EXPS, # default is None

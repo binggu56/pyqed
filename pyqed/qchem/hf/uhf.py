@@ -125,6 +125,50 @@ class UHF:
             make_rdm1(self.mo_coeff[1], self.mo_occ[1]),
         ))
 
+    def cluster(
+        self,
+        method='spectral',
+        n_clusters=None,
+        max_size=4,
+        weights='integral+rdm',
+        orbitals='canonical',
+        localization='pm',
+        mo_coeff=None,
+        dm=None,
+        active=None,
+        space=None,
+        localize_kwargs=None,
+        return_info=False,
+        return_orbitals=False,
+        **kwargs,
+    ):
+        """Cluster MOs for active-space/NARG workflows."""
+        from pyqed.qchem.orbital_clustering import cluster_mf_orbitals
+
+        return cluster_mf_orbitals(
+            self,
+            method=method,
+            n_clusters=n_clusters,
+            max_size=max_size,
+            weights=weights,
+            orbitals=orbitals,
+            localization=localization,
+            mo_coeff=mo_coeff,
+            dm=dm,
+            active=active,
+            space=space,
+            localize_kwargs=localize_kwargs,
+            return_info=return_info,
+            return_orbitals=return_orbitals,
+            **kwargs,
+        )
+
+    def NARG(self, *args, **kwargs):
+        """Build a qchem NARG solver from this mean-field reference."""
+        from pyqed.narg import NARG
+
+        return NARG(self, *args, **kwargs)
+
     def get_ovlp(self):
         return self.mol.overlap
 

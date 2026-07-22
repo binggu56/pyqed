@@ -1,0 +1,1329 @@
+{
+  "schema": "letta-contraction-backends-v1",
+  "status": "complete",
+  "environment": {
+    "python": "3.13.5",
+    "numpy": "2.1.3",
+    "platform": "macOS-26.2-arm64-arm-64bit-Mach-O"
+  },
+  "settings": {
+    "profile": "custom",
+    "geometries": [
+      "4x4"
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "seed": 2718,
+    "generated_bond_dim": 2,
+    "generated_tie_noise": 0.02,
+    "repeats": 1,
+    "tt_ranks": [
+      2,
+      4,
+      8
+    ],
+    "tt_rtol": 0.0,
+    "tt_atol": 0.0,
+    "tt_transfer_ranks": [
+      4,
+      8,
+      16
+    ],
+    "tt_transfer_rtol": 0.0,
+    "tt_transfer_atol": 0.0,
+    "integrated_tt_norm_backend": "exact",
+    "integrated_tt_hermitize_local_actions": true,
+    "vmc_samples": 1,
+    "vmc_burn_in": 4,
+    "vmc_sweeps_between": 1,
+    "vmc_proposal": "mixed",
+    "vmc_exchange_probability": 0.9,
+    "skip_exact": false,
+    "skip_block": true,
+    "skip_tt": false,
+    "skip_vmc": true,
+    "no_dense_many_body_objects": true
+  },
+  "cases": [
+    {
+      "model": {
+        "geometry": "4x4",
+        "nrows": 4,
+        "ncols": 4,
+        "nsites": 16,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 4,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 24,
+        "j2_diagonal_edges": 18,
+        "parameters": 1448,
+        "tensor_storage_bytes": 23168,
+        "tensor_dtype": "complex128",
+        "tensor_source": {
+          "kind": "saved-optimized-letta",
+          "path": "examples/mps/results/frontier_letta_j2_half_convergence_4x4_seed7.npz",
+          "seed": 7
+        },
+        "full_hilbert_dimension": 65536,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.1585983329860028
+            ],
+            "median_seconds": 0.1585983329860028,
+            "minimum_seconds": 0.1585983329860028,
+            "maximum_seconds": 0.1585983329860028,
+            "maximum_tracemalloc_bytes": 12394182,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.0000000000000049,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.0015291669988073409
+              ],
+              "median_seconds": 0.0015291669988073409,
+              "minimum_seconds": 0.0015291669988073409,
+              "maximum_seconds": 0.0015291669988073409,
+              "maximum_tracemalloc_bytes": 162751,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": -7.449486053605032,
+              "imaginary": 7.771561172376096e-16
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.07165212501422502
+              ],
+              "median_seconds": 0.07165212501422502,
+              "minimum_seconds": 0.07165212501422502,
+              "maximum_seconds": 0.07165212501422502,
+              "maximum_tracemalloc_bytes": 10977250,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": -7.449486053604995,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.07304395901155658
+              ],
+              "median_seconds": 0.07304395901155658,
+              "minimum_seconds": 0.07304395901155658,
+              "maximum_seconds": 0.07304395901155658,
+              "maximum_tracemalloc_bytes": 10984490,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": -7.449486053604995,
+          "contraction_plans": 32,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 35,
+            "compressed_maximum": 14,
+            "contracted_maximum": 14
+          },
+          "memory": {
+            "dtype_itemsize": 16,
+            "peak_frontier_elements": 57344,
+            "peak_frontier_bytes": 917504,
+            "cached_environment_elements": 586916,
+            "cached_environment_bytes": 9390656,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 2978,
+              "dense_message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 2978
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "peak_message_elements": 57344,
+              "total_message_elements": 583938,
+              "dense_message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "dense_peak_message_elements": 57344,
+              "dense_total_message_elements": 583938
+            }
+          }
+        },
+        "tt_frontier": {
+          "absorption": "structured",
+          "rows": [
+            {
+              "maximum_rank": 2,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.002533375023631379
+                ],
+                "median_seconds": 0.002533375023631379,
+                "minimum_seconds": 0.002533375023631379,
+                "maximum_seconds": 0.002533375023631379,
+                "maximum_tracemalloc_bytes": 28060,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": -0.013459768204493239,
+                  "imaginary": 0.07116045557683476
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.08751179199316539
+                  ],
+                  "median_seconds": 0.08751179199316539,
+                  "minimum_seconds": 0.08751179199316539,
+                  "maximum_seconds": 0.08751179199316539,
+                  "maximum_tracemalloc_bytes": 285056,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 1.0159549754821902,
+                "relative_error": 1.0159549754821853,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 1064.8040961696265,
+                  "max_relative_discarded_weight": 0.3766013304359242,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 56,
+                  "peak_message_storage_bytes": 896,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 1172,
+                  "peak_product_storage_bytes": 18752,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 873.693885755101,
+                  "total_message_discarded_weight": 191.1102104145255,
+                  "peak_local_factor_storage_elements": 292,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 1.9551904112608156e-14,
+                  "imaginary": -6.083803504825198e-16
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    4.060888915992109
+                  ],
+                  "median_seconds": 4.060888915992109,
+                  "minimum_seconds": 4.060888915992109,
+                  "maximum_seconds": 4.060888915992109,
+                  "maximum_tracemalloc_bytes": 205847480,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 105807593.6842223,
+                  "max_relative_discarded_weight": 0.9453117456407069,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 140,
+                  "peak_message_storage_bytes": 2240,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 3572,
+                  "peak_product_storage_bytes": 57152,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 52634899.207801476,
+                  "total_message_discarded_weight": 53172694.47642083,
+                  "peak_local_factor_storage_elements": 804,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": -5.842862427165509e-14,
+                "imaginary": -2.6370641139505396e-13
+              },
+              "absolute_energy_error": 7.449486053604937,
+              "absolute_energy_error_per_site": 0.46559287835030855,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 1.955190411260806e-14,
+                "imaginary_residue": -6.083803504825168e-16,
+                "absolute_energy_error": 7.449486053605015,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 256,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 140,
+                "peak_message_storage_bytes": 2240,
+                "peak_transient_product_elements": 3572,
+                "peak_transient_product_bytes": 57152,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 409.6
+              }
+            },
+            {
+              "maximum_rank": 4,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.0024642090138513595
+                ],
+                "median_seconds": 0.0024642090138513595,
+                "minimum_seconds": 0.0024642090138513595,
+                "maximum_seconds": 0.0024642090138513595,
+                "maximum_tracemalloc_bytes": 27574,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": -0.008498823651216384,
+                  "imaginary": -0.01391580855234696
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.09180837500025518
+                  ],
+                  "median_seconds": 0.09180837500025518,
+                  "minimum_seconds": 0.09180837500025518,
+                  "maximum_seconds": 0.09180837500025518,
+                  "maximum_tracemalloc_bytes": 378144,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 1.0085948279827548,
+                "relative_error": 1.00859482798275,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 876.5281463031072,
+                  "max_relative_discarded_weight": 0.3766013304359242,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 180,
+                  "peak_message_storage_bytes": 2880,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 4500,
+                  "peak_product_storage_bytes": 72000,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 873.693885755101,
+                  "total_message_discarded_weight": 2.8342605480062146,
+                  "peak_local_factor_storage_elements": 292,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 6.159028836634917e-13,
+                  "imaginary": -8.926445149562609e-14
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    4.17275550001068
+                  ],
+                  "median_seconds": 4.17275550001068,
+                  "minimum_seconds": 4.17275550001068,
+                  "maximum_seconds": 4.17275550001068,
+                  "maximum_tracemalloc_bytes": 205981484,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 52644250.966778666,
+                  "max_relative_discarded_weight": 0.9453117456407069,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 516,
+                  "peak_message_storage_bytes": 8256,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 13716,
+                  "peak_product_storage_bytes": 219456,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 52634899.207801476,
+                  "total_message_discarded_weight": 9351.758977188269,
+                  "peak_local_factor_storage_elements": 804,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": -1.5015296428089547e-11,
+                "imaginary": 3.508890808705953e-11
+              },
+              "absolute_energy_error": 7.44948605358998,
+              "absolute_energy_error_per_site": 0.46559287834937374,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 6.159028836634886e-13,
+                "imaginary_residue": -8.926445149562565e-14,
+                "absolute_energy_error": 7.449486053605611,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 516,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 516,
+                "peak_message_storage_bytes": 8256,
+                "peak_transient_product_elements": 13716,
+                "peak_transient_product_bytes": 219456,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 111.13178294573643
+              }
+            },
+            {
+              "maximum_rank": 8,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.002403125021373853
+                ],
+                "median_seconds": 0.002403125021373853,
+                "minimum_seconds": 0.002403125021373853,
+                "maximum_seconds": 0.002403125021373853,
+                "maximum_tracemalloc_bytes": 27494,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": -0.010971787298911788,
+                  "imaginary": -0.01655492434333169
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.09646545801660977
+                  ],
+                  "median_seconds": 0.09646545801660977,
+                  "minimum_seconds": 0.09646545801660977,
+                  "maximum_seconds": 0.09646545801660977,
+                  "maximum_tracemalloc_bytes": 935932,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 1.0111073237962325,
+                "relative_error": 1.0111073237962276,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 873.8049952314484,
+                  "max_relative_discarded_weight": 0.3766013304359242,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 420,
+                  "peak_message_storage_bytes": 6720,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 14996,
+                  "peak_product_storage_bytes": 239936,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 873.693885755101,
+                  "total_message_discarded_weight": 0.11110947634734321,
+                  "peak_local_factor_storage_elements": 292,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": -2.076220865527258e-13,
+                  "imaginary": 5.119673446504953e-13
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    4.250825875002192
+                  ],
+                  "median_seconds": 4.250825875002192,
+                  "minimum_seconds": 4.250825875002192,
+                  "maximum_seconds": 4.250825875002192,
+                  "maximum_tracemalloc_bytes": 206232364,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 52634932.288472705,
+                  "max_relative_discarded_weight": 0.9453117456407069,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 1764,
+                  "peak_message_storage_bytes": 28224,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 50580,
+                  "peak_product_storage_bytes": 809280,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 52634899.207801476,
+                  "total_message_discarded_weight": 33.08067122860749,
+                  "peak_local_factor_storage_elements": 804,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": -1.571216591214561e-11,
+                "imaginary": -2.2954658146720463e-11
+              },
+              "absolute_energy_error": 7.4494860535892835,
+              "absolute_energy_error_per_site": 0.4655928783493302,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": -2.076220865527248e-13,
+                "imaginary_residue": 5.119673446504928e-13,
+                "absolute_energy_error": 7.4494860536047875,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 1764,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 1764,
+                "peak_message_storage_bytes": 28224,
+                "peak_transient_product_elements": 50580,
+                "peak_transient_product_bytes": 809280,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 32.507936507936506
+              }
+            },
+            {
+              "maximum_rank": 2,
+              "transfer_maximum_rank": 8,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.0022537079930771142
+                ],
+                "median_seconds": 0.0022537079930771142,
+                "minimum_seconds": 0.0022537079930771142,
+                "maximum_seconds": 0.0022537079930771142,
+                "maximum_tracemalloc_bytes": 26662,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": 0.06599762518379877,
+                  "imaginary": -0.06734546379730041
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.08853454201016575
+                  ],
+                  "median_seconds": 0.08853454201016575,
+                  "minimum_seconds": 0.08853454201016575,
+                  "maximum_seconds": 0.08853454201016575,
+                  "maximum_tracemalloc_bytes": 298080,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.936427171570959,
+                "relative_error": 0.9364271715709545,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 507.0641448486411,
+                  "max_relative_discarded_weight": 0.39865896964010106,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 56,
+                  "peak_message_storage_bytes": 896,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 3028,
+                  "peak_product_storage_bytes": 48448,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 292.66917922463335,
+                  "total_message_discarded_weight": 214.3949656240077,
+                  "peak_local_factor_storage_elements": 756,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 2.95622035163683e-11,
+                  "imaginary": 3.956829003610908e-11
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    6.161139125004411
+                  ],
+                  "median_seconds": 6.161139125004411,
+                  "minimum_seconds": 6.161139125004411,
+                  "maximum_seconds": 6.161139125004411,
+                  "maximum_tracemalloc_bytes": 205877944,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 106649116.89853129,
+                  "max_relative_discarded_weight": 0.8773222130024684,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 140,
+                  "peak_message_storage_bytes": 2240,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 12020,
+                  "peak_product_storage_bytes": 192320,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 16400861.110124404,
+                  "total_message_discarded_weight": 90248255.7884069,
+                  "peak_local_factor_storage_elements": 2916,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "energy": {
+                "real": -8.02723819873437e-11,
+                "imaginary": 5.176293714496197e-10
+              },
+              "absolute_energy_error": 7.449486053524723,
+              "absolute_energy_error_per_site": 0.46559287834529517,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 2.956220351636816e-11,
+                "imaginary_residue": 3.9568290036108883e-11,
+                "absolute_energy_error": 7.4494860536345575,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 256,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 140,
+                "peak_message_storage_bytes": 2240,
+                "peak_transient_product_elements": 12020,
+                "peak_transient_product_bytes": 192320,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 409.6
+              }
+            },
+            {
+              "maximum_rank": 4,
+              "transfer_maximum_rank": 8,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.002285416005179286
+                ],
+                "median_seconds": 0.002285416005179286,
+                "minimum_seconds": 0.002285416005179286,
+                "maximum_seconds": 0.002285416005179286,
+                "maximum_tracemalloc_bytes": 27350,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": 0.08253999581392107,
+                  "imaginary": -0.031019450569866554
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.09345558300265111
+                  ],
+                  "median_seconds": 0.09345558300265111,
+                  "minimum_seconds": 0.09345558300265111,
+                  "maximum_seconds": 0.09345558300265111,
+                  "maximum_tracemalloc_bytes": 742928,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.9179842403847603,
+                "relative_error": 0.9179842403847559,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 301.6584464183233,
+                  "max_relative_discarded_weight": 0.1643987027303298,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 180,
+                  "peak_message_storage_bytes": 2880,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 11924,
+                  "peak_product_storage_bytes": 190784,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 292.66917922463335,
+                  "total_message_discarded_weight": 8.98926719368994,
+                  "peak_local_factor_storage_elements": 756,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 3.9679310026264053e-10,
+                  "imaginary": -3.1969948287897514e-10
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    5.84511249998468
+                  ],
+                  "median_seconds": 5.84511249998468,
+                  "minimum_seconds": 5.84511249998468,
+                  "maximum_seconds": 5.84511249998468,
+                  "maximum_tracemalloc_bytes": 205983508,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 55685203.736047365,
+                  "max_relative_discarded_weight": 0.8773222130024684,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 516,
+                  "peak_message_storage_bytes": 8256,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 47508,
+                  "peak_product_storage_bytes": 760128,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 16400861.110124404,
+                  "total_message_discarded_weight": 39284342.62592296,
+                  "peak_local_factor_storage_elements": 2916,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "energy": {
+                "real": 5.487831397165908e-09,
+                "imaginary": -1.810879279129018e-09
+              },
+              "absolute_energy_error": 7.449486059092827,
+              "absolute_energy_error_per_site": 0.4655928786933017,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 3.967931002626386e-10,
+                "imaginary_residue": -3.196994828789736e-10,
+                "absolute_energy_error": 7.449486054001788,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 516,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 516,
+                "peak_message_storage_bytes": 8256,
+                "peak_transient_product_elements": 47508,
+                "peak_transient_product_bytes": 760128,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 111.13178294573643
+              }
+            },
+            {
+              "maximum_rank": 8,
+              "transfer_maximum_rank": 8,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.0021967500215396285
+                ],
+                "median_seconds": 0.0021967500215396285,
+                "minimum_seconds": 0.0021967500215396285,
+                "maximum_seconds": 0.0021967500215396285,
+                "maximum_tracemalloc_bytes": 26582,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": 0.04128461333886272,
+                  "imaginary": 0.03323313713461678
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.09584504200029187
+                  ],
+                  "median_seconds": 0.09584504200029187,
+                  "minimum_seconds": 0.09584504200029187,
+                  "maximum_seconds": 0.09584504200029187,
+                  "maximum_tracemalloc_bytes": 2272540,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.9592912143997941,
+                "relative_error": 0.9592912143997895,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 293.27985971227383,
+                  "max_relative_discarded_weight": 0.1643987027303298,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 420,
+                  "peak_message_storage_bytes": 6720,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 42644,
+                  "peak_product_storage_bytes": 682304,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 292.66917922463335,
+                  "total_message_discarded_weight": 0.6106804876404479,
+                  "peak_local_factor_storage_elements": 756,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": -3.873722240282671e-12,
+                  "imaginary": 1.0551310178455034e-12
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    5.822676290990785
+                  ],
+                  "median_seconds": 5.822676290990785,
+                  "minimum_seconds": 5.822676290990785,
+                  "maximum_seconds": 5.822676290990785,
+                  "maximum_tracemalloc_bytes": 206238564,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 16443260.51008813,
+                  "max_relative_discarded_weight": 0.8773222130024684,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 1764,
+                  "peak_message_storage_bytes": 28224,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 183700,
+                  "peak_product_storage_bytes": 2939200,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 16400861.110124404,
+                  "total_message_discarded_weight": 42399.39996372678,
+                  "peak_local_factor_storage_elements": 2916,
+                  "maximum_local_factor_rank": 8
+                }
+              },
+              "energy": {
+                "real": -4.445211930830812e-11,
+                "imaginary": 6.134039270167995e-11
+              },
+              "absolute_energy_error": 7.449486053560543,
+              "absolute_energy_error_per_site": 0.46559287834753393,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": -3.873722240282652e-12,
+                "imaginary_residue": 1.0551310178454981e-12,
+                "absolute_energy_error": 7.449486053601122,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 1764,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 1764,
+                "peak_message_storage_bytes": 28224,
+                "peak_transient_product_elements": 183700,
+                "peak_transient_product_bytes": 2939200,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 32.507936507936506
+              }
+            },
+            {
+              "maximum_rank": 2,
+              "transfer_maximum_rank": 16,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.002192625019233674
+                ],
+                "median_seconds": 0.002192625019233674,
+                "minimum_seconds": 0.002192625019233674,
+                "maximum_seconds": 0.002192625019233674,
+                "maximum_tracemalloc_bytes": 27334,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": 0.8552262891535459,
+                  "imaginary": -0.15759438083249147
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.08557416702387854
+                  ],
+                  "median_seconds": 0.08557416702387854,
+                  "minimum_seconds": 0.08557416702387854,
+                  "maximum_seconds": 0.08557416702387854,
+                  "maximum_tracemalloc_bytes": 622056,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.21399863602890198,
+                "relative_error": 0.21399863602890093,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 342.7476889459909,
+                  "max_relative_discarded_weight": 0.2859653559735187,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 56,
+                  "peak_message_storage_bytes": 896,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 9428,
+                  "peak_product_storage_bytes": 150848,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 35.06028440488067,
+                  "total_message_discarded_weight": 307.6874045411102,
+                  "peak_local_factor_storage_elements": 2356,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": -4.094379393057629e-06,
+                  "imaginary": 4.07745878241288e-06
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    11.67135562497424
+                  ],
+                  "median_seconds": 11.67135562497424,
+                  "minimum_seconds": 11.67135562497424,
+                  "maximum_seconds": 11.67135562497424,
+                  "maximum_tracemalloc_bytes": 206556136,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 130868475.253924,
+                  "max_relative_discarded_weight": 0.7749490610666987,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 140,
+                  "peak_message_storage_bytes": 2240,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 43764,
+                  "peak_product_storage_bytes": 700224,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 4368848.3629568955,
+                  "total_message_discarded_weight": 126499626.8909671,
+                  "peak_local_factor_storage_elements": 10852,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "energy": {
+                "real": -5.479955671783416e-06,
+                "imaginary": 3.757892621038996e-06
+              },
+              "absolute_energy_error": 7.449480573650272,
+              "absolute_energy_error_per_site": 0.465592535853142,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": -4.094379393057609e-06,
+                "imaginary_residue": 4.07745878241286e-06,
+                "absolute_energy_error": 7.4494819592256025,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 256,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 140,
+                "peak_message_storage_bytes": 2240,
+                "peak_transient_product_elements": 43764,
+                "peak_transient_product_bytes": 700224,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 409.6
+              }
+            },
+            {
+              "maximum_rank": 4,
+              "transfer_maximum_rank": 16,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.0021945000044070184
+                ],
+                "median_seconds": 0.0021945000044070184,
+                "minimum_seconds": 0.0021945000044070184,
+                "maximum_seconds": 0.0021945000044070184,
+                "maximum_tracemalloc_bytes": 26770,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": true,
+              "norm": {
+                "value": {
+                  "real": 0.6214593297407377,
+                  "imaginary": -9.619948649358719e-14
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.09049299999605864
+                  ],
+                  "median_seconds": 0.09049299999605864,
+                  "minimum_seconds": 0.09049299999605864,
+                  "maximum_seconds": 0.09049299999605864,
+                  "maximum_tracemalloc_bytes": 1999256,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.3785406702592672,
+                "relative_error": 0.37854067025926535,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 57.2511450680104,
+                  "max_relative_discarded_weight": 0.07515367241601253,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 180,
+                  "peak_message_storage_bytes": 2880,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 37524,
+                  "peak_product_storage_bytes": 600384,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 35.06028440488067,
+                  "total_message_discarded_weight": 22.190860663129733,
+                  "peak_local_factor_storage_elements": 2356,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 5.211715144770519e-07,
+                  "imaginary": 2.1701128293462167e-06
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    12.019456458016066
+                  ],
+                  "median_seconds": 12.019456458016066,
+                  "minimum_seconds": 12.019456458016066,
+                  "maximum_seconds": 12.019456458016066,
+                  "maximum_tracemalloc_bytes": 206663748,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 91881196.96470891,
+                  "max_relative_discarded_weight": 0.7749490610666987,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 516,
+                  "peak_message_storage_bytes": 8256,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 174484,
+                  "peak_product_storage_bytes": 2791744,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 4368848.3629568955,
+                  "total_message_discarded_weight": 87512348.60175201,
+                  "peak_local_factor_storage_elements": 10852,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "energy": {
+                "real": 8.386252961945875e-07,
+                "imaginary": 3.4919627487958567e-06
+              },
+              "absolute_energy_error": 7.449486892231111,
+              "absolute_energy_error_per_site": 0.4655929307644444,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 5.211715144770494e-07,
+                "imaginary_residue": 2.170112829346206e-06,
+                "absolute_energy_error": 7.44948657477651,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 516,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 516,
+                "peak_message_storage_bytes": 8256,
+                "peak_transient_product_elements": 174484,
+                "peak_transient_product_bytes": 2791744,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 111.13178294573643
+              }
+            },
+            {
+              "maximum_rank": 8,
+              "transfer_maximum_rank": 16,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.0024593340058345348
+                ],
+                "median_seconds": 0.0024593340058345348,
+                "minimum_seconds": 0.0024593340058345348,
+                "maximum_seconds": 0.0024593340058345348,
+                "maximum_tracemalloc_bytes": 27334,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": true,
+              "norm": {
+                "value": {
+                  "real": 0.6964073161841369,
+                  "imaginary": 1.959268749654244e-14
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.11452162498608232
+                  ],
+                  "median_seconds": 0.11452162498608232,
+                  "minimum_seconds": 0.11452162498608232,
+                  "maximum_seconds": 0.11452162498608232,
+                  "maximum_tracemalloc_bytes": 7021084,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.303592683815868,
+                "relative_error": 0.3035926838158665,
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 36.63281616227633,
+                  "max_relative_discarded_weight": 0.03494023492574715,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 420,
+                  "peak_message_storage_bytes": 6720,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 140948,
+                  "peak_product_storage_bytes": 2255168,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 35.06028440488067,
+                  "total_message_discarded_weight": 1.5725317573956568,
+                  "peak_local_factor_storage_elements": 2356,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 3.560351741261496e-07,
+                  "imaginary": 1.900038207601213e-07
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    12.02694229199551
+                  ],
+                  "median_seconds": 12.02694229199551,
+                  "minimum_seconds": 12.02694229199551,
+                  "maximum_seconds": 12.02694229199551,
+                  "maximum_tracemalloc_bytes": 206922876,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 16,
+                  "total_discarded_weight": 19821088.038091403,
+                  "max_relative_discarded_weight": 0.7749490610666987,
+                  "maximum_observed_rank": 8,
+                  "peak_message_storage_elements": 1764,
+                  "peak_message_storage_bytes": 28224,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 687508,
+                  "peak_product_storage_bytes": 11000128,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 4368848.3629568955,
+                  "total_message_discarded_weight": 15452239.675134506,
+                  "peak_local_factor_storage_elements": 10852,
+                  "maximum_local_factor_rank": 16
+                }
+              },
+              "energy": {
+                "real": 5.112455970121023e-07,
+                "imaginary": 2.7283432603955073e-07
+              },
+              "absolute_energy_error": 7.449486564850598,
+              "absolute_energy_error_per_site": 0.46559291030316236,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 3.5603517412614784e-07,
+                "imaginary_residue": 1.9000382076012037e-07,
+                "absolute_energy_error": 7.449486409640169,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 1764,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 1764,
+                "peak_message_storage_bytes": 28224,
+                "peak_transient_product_elements": 687508,
+                "peak_transient_product_bytes": 11000128,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 32.507936507936506
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

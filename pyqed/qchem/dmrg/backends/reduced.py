@@ -99,8 +99,9 @@ class SpatialComplementaryOperatorFamilies:
         ``False`` because the parent-block transform path is faster on H6.
     :param prefer_recursive_operator_matvec: Prefer the matrix-free recursive
         complementary-operator matvec path.  This avoids building transformed
-        local Hamiltonian kernels entirely.  The compiled parent-block backend
-        is the default for block2-like SU(2) qchem Hamiltonians.
+        local Hamiltonian kernels entirely, but is currently slower than the
+        compiled parent-block backend on the default SU(2) qchem benchmarks,
+        so it remains opt-in.
     :param prefer_complementary_payload_tensor_matvec: Prefer the experimental
         payload/family tensor matvec path.  This mirrors the complementary
         family ownership used by block2, but is currently slower than the
@@ -114,7 +115,7 @@ class SpatialComplementaryOperatorFamilies:
     include_half: bool = True
     prefer_direct_orthonormal_projection: bool = False
     prefer_direct_component_transform: bool = False
-    prefer_recursive_operator_matvec: bool = True
+    prefer_recursive_operator_matvec: bool = False
     prefer_complementary_payload_tensor_matvec: bool = False
     prefer_precontracted_family_environment: bool = True
     boundary_table_max_dim: int = 32
@@ -126,9 +127,11 @@ class SpatialComplementaryOperatorFamilies:
     exact_component_compression_validation_vectors: int = 1
     exact_component_compression_min_reduction: int = 1
     exact_component_compression_max_group_size: int = 64
+    enable_native_boundary_r: bool = False
+    validate_native_boundary_r: bool = True
     enable_native_boundary_p: bool = True
-    validate_native_boundary_p: bool = True
-    native_boundary_p_validation_policy: str = "first_pass"
+    validate_native_boundary_p: bool = False
+    native_boundary_p_validation_policy: str = "off"
     direct_operator_batch_min_entries: int = 2
 
     def __getitem__(self, name):
@@ -213,6 +216,8 @@ class SpatialComplementaryOperatorFamilies:
             "exact_component_compression_max_group_size": int(
                 self.exact_component_compression_max_group_size
             ),
+            "enable_native_boundary_r": bool(self.enable_native_boundary_r),
+            "validate_native_boundary_r": bool(self.validate_native_boundary_r),
             "enable_native_boundary_p": bool(self.enable_native_boundary_p),
             "validate_native_boundary_p": bool(self.validate_native_boundary_p),
             "native_boundary_p_validation_policy": str(
@@ -247,9 +252,11 @@ def build_spatial_complementary_operator_families(
     exact_component_compression_validation_vectors=1,
     exact_component_compression_min_reduction=1,
     exact_component_compression_max_group_size=64,
+    enable_native_boundary_r=False,
+    validate_native_boundary_r=True,
     enable_native_boundary_p=True,
-    validate_native_boundary_p=True,
-    native_boundary_p_validation_policy="first_pass",
+    validate_native_boundary_p=False,
+    native_boundary_p_validation_policy="off",
     direct_operator_batch_min_entries=2,
 ):
     """
@@ -406,6 +413,8 @@ def build_spatial_complementary_operator_families(
         exact_component_compression_max_group_size=int(
             exact_component_compression_max_group_size
         ),
+        enable_native_boundary_r=bool(enable_native_boundary_r),
+        validate_native_boundary_r=bool(validate_native_boundary_r),
         enable_native_boundary_p=bool(enable_native_boundary_p),
         validate_native_boundary_p=bool(validate_native_boundary_p),
         native_boundary_p_validation_policy=str(native_boundary_p_validation_policy),

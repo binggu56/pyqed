@@ -19,7 +19,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from hubbard_2d_ed import square_lattice_bonds
-from hubbard_2d_narg import lattice_site_order
 from pyqed.mps.nonabelian import (
     AutoMPO,
     SweepDriver,
@@ -28,6 +27,20 @@ from pyqed.mps.nonabelian import (
     spatial_double_occupancy,
     spatial_number,
 )
+
+
+def lattice_site_order(lx: int, ly: int, *, ordering: str = "row-major"):
+    """Return lattice-site labels in the requested 1D orbital order."""
+    key = ordering.lower().replace("_", "-")
+    if key in {"row", "row-major", "rowmajor"}:
+        return [x + lx * y for y in range(ly) for x in range(lx)]
+    if key == "snake":
+        order = []
+        for y in range(ly):
+            xs = range(lx) if y % 2 == 0 else range(lx - 1, -1, -1)
+            order.extend(x + lx * y for x in xs)
+        return order
+    raise ValueError("ordering must be 'row-major' or 'snake'.")
 
 
 def build_2d_hubbard_mpo(

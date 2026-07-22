@@ -75,7 +75,6 @@ Optional dependencies
 The base installation does not enable every example or backend.  A method page
 identifies its optional requirements where known.  Common categories include:
 
-* ``pyqed[heom]`` for DEOM and structured-bath helpers;
 * PySCF for independent comparisons and selected external-backend workflows;
 * plotting or visualization packages for figure-generating examples;
 * electronic-structure or molecular-dynamics programs used by comparison

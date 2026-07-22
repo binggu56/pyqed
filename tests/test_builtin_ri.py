@@ -72,6 +72,7 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
     assert mol._builtin_build_info["ri"]["metric_solver"] == "cholesky"
     assert mol._builtin_build_info["ri"]["storage"] == "full"
     assert mol._builtin_build_info["ri"]["tensor_builder"] in {
+        "cpp-kernel-packed",
         "cython-kernel-packed",
         "cython-kernel-packed-parallel",
         "python",
@@ -222,7 +223,7 @@ def test_builtin_native_ri_reconstructs_dense_eri_to_auxbasis_accuracy():
 
     atom = "H 0 0 0; H 0 0 0.74"
     dense = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    dense.build(driver="builtin", eri="dense")
+    dense.build(driver="builtin", eri="dense", aosym="s1")
 
     ri = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
     ri.build(driver="builtin", eri="ri")

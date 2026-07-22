@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from itertools import combinations
-from math import comb
+from math import comb, factorial
 import numpy as np
 from scipy.linalg import eigh, expm
 from scipy.sparse.linalg import ArpackNoConvergence, LinearOperator, eigsh
@@ -33,6 +33,30 @@ def boson_annihilation(n: int, *, dtype=float) -> np.ndarray:
     for level in range(1, int(n)):
         op[level - 1, level] = np.sqrt(level)
     return op
+
+
+def _displacement_overlap(alpha: float, dim: int) -> np.ndarray:
+    """Return ``<m|D(alpha)|n>`` for real displacement in a finite output window."""
+    dim = int(dim)
+    if dim < 1:
+        raise ValueError("dim must be positive.")
+    alpha = float(alpha)
+    overlap = np.empty((dim, dim), dtype=float)
+    prefactor = np.exp(-0.5 * alpha * alpha)
+    factorials = [factorial(level) for level in range(dim)]
+    for m in range(dim):
+        for n in range(dim):
+            total = 0.0
+            start = max(0, n - m)
+            for j in range(start, n + 1):
+                l = m - n + j
+                total += (
+                    ((-alpha) ** j)
+                    * (alpha**l)
+                    / (factorial(j) * factorial(l) * factorial(n - j))
+                )
+                overlap[m, n] = prefactor * np.sqrt(float(factorials[m]) * float(factorials[n])) * total
+    return overlap
 
 
 def _normalized_state(state: np.ndarray) -> np.ndarray:
@@ -324,7 +348,7 @@ class SpinfulHolsteinSequentialAdiabaticResult:
         """Initialize LETTA directly from the exported NARG tensors."""
         if self.narg_tensors is None or self.narg_coefficients is None:
             raise ValueError("this result was not run with store_narg_state=True.")
-        from .letta import LETTA
+        from pyqed.letta import LETTA
 
         return LETTA.from_narg(
             list(self.narg_tensors),
@@ -1428,7 +1452,7 @@ class SpinfulHHCouplingNARGResult:
 
 
 @dataclass(frozen=True)
-class SpinfulHolsteinHubbardNARG:
+class HolsteinHubbard:
     """Sector block calculation for spinful Holstein-Hubbard."""
 
     nsites: int
@@ -1450,18 +1474,19 @@ class SpinfulHolsteinHubbardNARG:
             raise ValueError("nsites must be at least 1.")
         if self.nphonon < 1:
             raise ValueError("nphonon must be at least 1.")
+        phonon_basis = self._phonon_basis_name()
         if self.local_dim is not None:
             if self.local_dim < 1:
                 raise ValueError("local_dim must be at least 1.")
-            if self.local_dim > self.nphonon:
+            if phonon_basis != "polaron" and self.local_dim > self.nphonon:
                 raise ValueError("local_dim cannot exceed nphonon.")
         if self.bond_dim < 1:
             raise ValueError("bond_dim must be at least 1.")
-        if self._phonon_basis_name() not in {"polaron", "fock", "dvr", "sine_dvr"}:
+        if phonon_basis not in {"polaron", "fock", "dvr", "sine_dvr"}:
             raise ValueError("phonon_basis must be polaron, fock, dvr, or sine_dvr.")
         if self.dvr_xmax <= self.dvr_xmin:
             raise ValueError("dvr_xmax must be greater than dvr_xmin.")
-        if self._phonon_basis_name() in {"dvr", "sine_dvr"} and self.local_dim is not None and self.local_dim != self.nphonon:
+        if phonon_basis in {"dvr", "sine_dvr"} and self.local_dim is not None and self.local_dim != self.nphonon:
             raise ValueError("DVR phonon basis is primitive; use local_dim=None or local_dim=nphonon.")
         if (self.nup is None or self.ndown is None) and self.nsites % 2:
             raise ValueError("balanced half filling requires even nsites; pass nup/ndown explicitly.")
@@ -1550,6 +1575,35 @@ class SpinfulHolsteinHubbardNARG:
 
     def dressed_site(self) -> SpinfulHHDressedSite:
         keep = self.nphonon if self.local_dim is None else int(self.local_dim)
+        if self._phonon_basis_name() == "polaron":
+            charges = {
+                (0, 0): (0, False),
+                (1, 0): (1, False),
+                (0, 1): (1, False),
+                (1, 1): (2, True),
+            }
+            levels = np.arange(keep, dtype=float)
+            h = {}
+            displacements = {}
+            for sector, (charge, double) in charges.items():
+                shift = -float(self.g) * float(charge) / float(self.omega)
+                energy = float(self.omega) * levels - (float(self.g) * charge) ** 2 / float(self.omega)
+                if double:
+                    energy = energy + float(self.hubbard_u)
+                h[sector] = np.diag(energy)
+                displacements[sector] = shift
+
+            c = {"up": {}, "down": {}}
+            transitions = {
+                "up": [((1, 0), (0, 0), 1.0), ((1, 1), (0, 1), 1.0)],
+                "down": [((0, 1), (0, 0), 1.0), ((1, 1), (1, 0), -1.0)],
+            }
+            for spin, entries in transitions.items():
+                for source, target, sign in entries:
+                    delta = displacements[source] - displacements[target]
+                    c[spin][source] = sign * _displacement_overlap(delta, keep)
+            return SpinfulHHDressedSite(h=h, c=c)
+
         sectors = {
             (0, 0): self._local_charge_hamiltonian(0),
             (1, 0): self._local_charge_hamiltonian(1),
@@ -1558,16 +1612,10 @@ class SpinfulHolsteinHubbardNARG:
         }
         h = {}
         vectors = {}
-        if self._phonon_basis_name() == "polaron":
-            for charge, h_local in sectors.items():
-                evals, evecs = eigh(h_local, subset_by_index=(0, keep - 1))
-                h[charge] = np.diag(evals)
-                vectors[charge] = evecs
-        else:
-            basis = self._primitive_phonon_basis(keep)
-            for charge, h_local in sectors.items():
-                h[charge] = basis.T.conj() @ h_local @ basis
-                vectors[charge] = basis
+        basis = self._primitive_phonon_basis(keep)
+        for charge, h_local in sectors.items():
+            h[charge] = basis.T.conj() @ h_local @ basis
+            vectors[charge] = basis
 
         c = {"up": {}, "down": {}}
         transitions = {
@@ -1867,7 +1915,7 @@ class SpinfulHolsteinHubbardNARG:
 
 
 @dataclass(frozen=True)
-class SpinfulHolsteinHubbardCouplingNARG(SpinfulHolsteinHubbardNARG):
+class SpinfulHolsteinHubbardCouplingNARG(HolsteinHubbard):
     """Spinful HH NARG conditioned on one local hopping channel.
 
     With ``branch_rule="coupling"``, ``mode`` selects the Hermitian site
@@ -2667,7 +2715,7 @@ class SpinfulHolsteinHubbardCouplingNARG(SpinfulHolsteinHubbardNARG):
 
 
 @dataclass(frozen=True)
-class SpinfulHolsteinHubbardTwoSiteNARG(SpinfulHolsteinHubbardNARG):
+class SpinfulHolsteinHubbardTwoSiteNARG(HolsteinHubbard):
     """Spinful HH block growth that adds two dressed sites before truncating."""
 
     pair_dim: int | None = None
@@ -4600,7 +4648,7 @@ __all__ = [
     "SpinfulHolsteinSequentialAdiabaticStep",
     "SpinfulHHNARGResult",
     "SpinfulHolsteinHubbardCouplingNARG",
-    "SpinfulHolsteinHubbardNARG",
+    "HolsteinHubbard",
     "SpinfulHolsteinHubbardTwoSiteNARG",
     "boson_annihilation",
     "conditional_rank1_factor",

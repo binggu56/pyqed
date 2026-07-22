@@ -406,8 +406,8 @@ class VibronicPolariton(VibronicPolariton2):
     def Lindblad(self):
         # NOT FINISHED. Using grids for the density matrix too expansive.
         # CHECK Markus paper
-        from pyqed.oqs import LindbladSolver
-        me = LindbladSolver(self.H.real, c_ops=[kron(self.mol.idm, self.cav.a)])
+        from pyqed.qme import Lindblad
+        me = Lindblad(self.H.real, c_ops=[kron(self.mol.idm, self.cav.a)])
 
         return me
 

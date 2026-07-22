@@ -5,7 +5,7 @@ cimport numpy as cnp
 
 from libc.math cimport exp, sqrt, fabs, NAN
 from libc.stdlib cimport malloc, free
-from libc.stdint cimport int64_t, uint64_t
+from libc.stdint cimport int64_t, uint64_t, uint8_t
 from libc.string cimport memset
 from scipy.special.cython_special cimport hyp1f1
 
@@ -629,6 +629,281 @@ cdef inline double primitive_three_center_precomputed(
     return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
 
 
+cdef inline double primitive_two_center_coulomb_kernel(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz,
+    double alpha_kernel
+) noexcept nogil:
+    cdef double p = a
+    cdef double q = b
+    cdef double dx = Ax - Bx
+    cdef double dy = Ay - By
+    cdef double dz = Az - Bz
+    cdef double rab = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef int tdim_ax = l1 + 2
+    cdef int tdim_ay = m1 + 2
+    cdef int tdim_az = n1 + 2
+    cdef int tdim_bx = l2 + 2
+    cdef int tdim_by = m2 + 2
+    cdef int tdim_bz = n2 + 2
+    cdef size_t size_ax = <size_t>(l1 + 1) * <size_t>tdim_ax
+    cdef size_t size_ay = <size_t>(m1 + 1) * <size_t>tdim_ay
+    cdef size_t size_az = <size_t>(n1 + 1) * <size_t>tdim_az
+    cdef size_t size_bx = <size_t>(l2 + 1) * <size_t>tdim_bx
+    cdef size_t size_by = <size_t>(m2 + 1) * <size_t>tdim_by
+    cdef size_t size_bz = <size_t>(n2 + 1) * <size_t>tdim_bz
+    cdef int tx_max = l1 + l2
+    cdef int uy_max = m1 + m2
+    cdef int vz_max = n1 + n2
+    cdef int nmax = tx_max + uy_max + vz_max + 2
+    cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
+    cdef double* memo_ax = <double*>malloc(size_ax * sizeof(double))
+    cdef double* memo_ay = <double*>malloc(size_ay * sizeof(double))
+    cdef double* memo_az = <double*>malloc(size_az * sizeof(double))
+    cdef double* memo_bx = <double*>malloc(size_bx * sizeof(double))
+    cdef double* memo_by = <double*>malloc(size_by * sizeof(double))
+    cdef double* memo_bz = <double*>malloc(size_bz * sizeof(double))
+    cdef double* memo_r = <double*>malloc(size_r * sizeof(double))
+    cdef size_t i
+    cdef int t, u, v, tau, nu, phi
+    cdef double ex_a, exy_a, xyz_a, ex_b, exy_b, sign, value = 0.0
+    if memo_ax == NULL or memo_ay == NULL or memo_az == NULL or memo_bx == NULL or memo_by == NULL or memo_bz == NULL or memo_r == NULL:
+        free(memo_ax); free(memo_ay); free(memo_az); free(memo_bx); free(memo_by); free(memo_bz); free(memo_r)
+        return 0.0
+    for i in range(size_ax): memo_ax[i] = NAN
+    for i in range(size_ay): memo_ay[i] = NAN
+    for i in range(size_az): memo_az[i] = NAN
+    for i in range(size_bx): memo_bx[i] = NAN
+    for i in range(size_by): memo_by[i] = NAN
+    for i in range(size_bz): memo_bz[i] = NAN
+    for i in range(size_r): memo_r[i] = NAN
+    for t in range(l1 + 1):
+        ex_a = E_rec(l1, 0, t, 0.0, a, 0.0, memo_ax, 1, tdim_ax)
+        for u in range(m1 + 1):
+            exy_a = ex_a * E_rec(m1, 0, u, 0.0, a, 0.0, memo_ay, 1, tdim_ay)
+            for v in range(n1 + 1):
+                xyz_a = exy_a * E_rec(n1, 0, v, 0.0, a, 0.0, memo_az, 1, tdim_az)
+                for tau in range(l2 + 1):
+                    ex_b = E_rec(l2, 0, tau, 0.0, b, 0.0, memo_bx, 1, tdim_bx)
+                    for nu in range(m2 + 1):
+                        exy_b = ex_b * E_rec(m2, 0, nu, 0.0, b, 0.0, memo_by, 1, tdim_by)
+                        for phi in range(n2 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            value += xyz_a * exy_b * E_rec(n2, 0, phi, 0.0, b, 0.0, memo_bz, 1, tdim_bz) * sign * R_rec(t + tau, u + nu, v + phi, 0, alpha_kernel, dx, dy, dz, rab, memo_r, uy_max + 1, vz_max + 1, nmax)
+    free(memo_ax); free(memo_ay); free(memo_az); free(memo_bx); free(memo_by); free(memo_bz); free(memo_r)
+    return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
+
+
+cdef inline double primitive_short_range_two_center_coulomb(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz,
+    double eta
+) noexcept nogil:
+    cdef double theta, eta2, theta_lr, lr_scale
+    if eta <= 0.0:
+        return primitive_two_center_coulomb(
+            a, l1, m1, n1, Ax, Ay, Az,
+            b, l2, m2, n2, Bx, By, Bz,
+        )
+    theta = a * b / (a + b)
+    eta2 = eta * eta
+    theta_lr = theta * eta2 / (theta + eta2)
+    lr_scale = eta / sqrt(theta + eta2)
+    return (
+        primitive_two_center_coulomb(
+            a, l1, m1, n1, Ax, Ay, Az,
+            b, l2, m2, n2, Bx, By, Bz,
+        )
+        - lr_scale * primitive_two_center_coulomb_kernel(
+            a, l1, m1, n1, Ax, Ay, Az,
+            b, l2, m2, n2, Bx, By, Bz,
+            theta_lr,
+        )
+    )
+
+
+cdef inline double primitive_three_center_coulomb_kernel(
+    double a, double b, double p, double px, double py, double pz, double abx, double aby, double abz,
+    int l1, int m1, int n1, int l2, int m2, int n2,
+    double c, int l3, int m3, int n3, double Cx, double Cy, double Cz,
+    double alpha_kernel
+) noexcept nogil:
+    cdef double q = c
+    cdef double dx = px - Cx
+    cdef double dy = py - Cy
+    cdef double dz = pz - Cz
+    cdef double rpc = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef int tdim_abx = l1 + l2 + 2
+    cdef int tdim_aby = m1 + m2 + 2
+    cdef int tdim_abz = n1 + n2 + 2
+    cdef int tdim_cx = l3 + 2
+    cdef int tdim_cy = m3 + 2
+    cdef int tdim_cz = n3 + 2
+    cdef size_t size_abx = <size_t>(l1 + 1) * <size_t>(l2 + 1) * <size_t>tdim_abx
+    cdef size_t size_aby = <size_t>(m1 + 1) * <size_t>(m2 + 1) * <size_t>tdim_aby
+    cdef size_t size_abz = <size_t>(n1 + 1) * <size_t>(n2 + 1) * <size_t>tdim_abz
+    cdef size_t size_cx = <size_t>(l3 + 1) * <size_t>tdim_cx
+    cdef size_t size_cy = <size_t>(m3 + 1) * <size_t>tdim_cy
+    cdef size_t size_cz = <size_t>(n3 + 1) * <size_t>tdim_cz
+    cdef int tx_max = l1 + l2 + l3
+    cdef int uy_max = m1 + m2 + m3
+    cdef int vz_max = n1 + n2 + n3
+    cdef int nmax = tx_max + uy_max + vz_max + 2
+    cdef size_t size_r = <size_t>(tx_max + 1) * <size_t>(uy_max + 1) * <size_t>(vz_max + 1) * <size_t>nmax
+    cdef double memo_abx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_aby_stack[THREE_CENTER_E_CAP]
+    cdef double memo_abz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cx_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cy_stack[THREE_CENTER_E_CAP]
+    cdef double memo_cz_stack[THREE_CENTER_E_CAP]
+    cdef double memo_r_stack[THREE_CENTER_R_CAP]
+    cdef double* memo_abx = NULL
+    cdef double* memo_aby = NULL
+    cdef double* memo_abz = NULL
+    cdef double* memo_cx = NULL
+    cdef double* memo_cy = NULL
+    cdef double* memo_cz = NULL
+    cdef double* memo_r = NULL
+    cdef bint use_heap = False
+    cdef size_t i
+    cdef int t, u, v, tau, nu, phi
+    cdef double ex_ab, exy_ab, xyz_ab, ex_c, exy_c, sign, value = 0.0
+
+    if (
+        size_abx <= THREE_CENTER_E_CAP
+        and size_aby <= THREE_CENTER_E_CAP
+        and size_abz <= THREE_CENTER_E_CAP
+        and size_cx <= THREE_CENTER_E_CAP
+        and size_cy <= THREE_CENTER_E_CAP
+        and size_cz <= THREE_CENTER_E_CAP
+        and size_r <= THREE_CENTER_R_CAP
+    ):
+        memo_abx = &memo_abx_stack[0]
+        memo_aby = &memo_aby_stack[0]
+        memo_abz = &memo_abz_stack[0]
+        memo_cx = &memo_cx_stack[0]
+        memo_cy = &memo_cy_stack[0]
+        memo_cz = &memo_cz_stack[0]
+        memo_r = &memo_r_stack[0]
+    else:
+        use_heap = True
+        memo_abx = <double*>malloc(size_abx * sizeof(double))
+        memo_aby = <double*>malloc(size_aby * sizeof(double))
+        memo_abz = <double*>malloc(size_abz * sizeof(double))
+        memo_cx = <double*>malloc(size_cx * sizeof(double))
+        memo_cy = <double*>malloc(size_cy * sizeof(double))
+        memo_cz = <double*>malloc(size_cz * sizeof(double))
+        memo_r = <double*>malloc(size_r * sizeof(double))
+
+    if memo_abx == NULL or memo_aby == NULL or memo_abz == NULL or memo_cx == NULL or memo_cy == NULL or memo_cz == NULL or memo_r == NULL:
+        if use_heap:
+            free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+        return 0.0
+    for i in range(size_abx): memo_abx[i] = NAN
+    for i in range(size_aby): memo_aby[i] = NAN
+    for i in range(size_abz): memo_abz[i] = NAN
+    for i in range(size_cx): memo_cx[i] = NAN
+    for i in range(size_cy): memo_cy[i] = NAN
+    for i in range(size_cz): memo_cz[i] = NAN
+    for i in range(size_r): memo_r[i] = NAN
+    for t in range(l1 + l2 + 1):
+        ex_ab = E_rec(l1, l2, t, abx, a, b, memo_abx, l2 + 1, tdim_abx)
+        for u in range(m1 + m2 + 1):
+            exy_ab = ex_ab * E_rec(m1, m2, u, aby, a, b, memo_aby, m2 + 1, tdim_aby)
+            for v in range(n1 + n2 + 1):
+                xyz_ab = exy_ab * E_rec(n1, n2, v, abz, a, b, memo_abz, n2 + 1, tdim_abz)
+                for tau in range(l3 + 1):
+                    ex_c = E_rec(l3, 0, tau, 0.0, c, 0.0, memo_cx, 1, tdim_cx)
+                    for nu in range(m3 + 1):
+                        exy_c = ex_c * E_rec(m3, 0, nu, 0.0, c, 0.0, memo_cy, 1, tdim_cy)
+                        for phi in range(n3 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            value += (
+                                xyz_ab
+                                * exy_c
+                                * E_rec(n3, 0, phi, 0.0, c, 0.0, memo_cz, 1, tdim_cz)
+                                * sign
+                                * R_rec(t + tau, u + nu, v + phi, 0, alpha_kernel, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax)
+                            )
+    if use_heap:
+        free(memo_abx); free(memo_aby); free(memo_abz); free(memo_cx); free(memo_cy); free(memo_cz); free(memo_r)
+    return value * (ERI_PREFAC / (p * q * sqrt(p + q)))
+
+
+cdef inline double primitive_short_range_three_center_coulomb(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz,
+    double c, int l3, int m3, int n3, double Cx, double Cy, double Cz,
+    double eta
+) noexcept nogil:
+    cdef double p, q, theta, eta2, theta_lr, lr_scale, px, py, pz
+    cdef double abx, aby, abz
+    if eta <= 0.0:
+        return primitive_three_center_coulomb(
+            a, l1, m1, n1, Ax, Ay, Az,
+            b, l2, m2, n2, Bx, By, Bz,
+            c, l3, m3, n3, Cx, Cy, Cz,
+        )
+    p = a + b
+    q = c
+    theta = p * q / (p + q)
+    eta2 = eta * eta
+    theta_lr = theta * eta2 / (theta + eta2)
+    lr_scale = eta / sqrt(theta + eta2)
+    px = (a * Ax + b * Bx) / p
+    py = (a * Ay + b * By) / p
+    pz = (a * Az + b * Bz) / p
+    abx = Ax - Bx
+    aby = Ay - By
+    abz = Az - Bz
+    return (
+        primitive_three_center_precomputed(
+            a, b, p, px, py, pz, abx, aby, abz,
+            l1, m1, n1, l2, m2, n2,
+            c, l3, m3, n3, Cx, Cy, Cz,
+        )
+        - lr_scale * primitive_three_center_coulomb_kernel(
+            a, b, p, px, py, pz, abx, aby, abz,
+            l1, m1, n1, l2, m2, n2,
+            c, l3, m3, n3, Cx, Cy, Cz,
+            theta_lr,
+        )
+    )
+
+
+cdef inline double primitive_short_range_three_center_precomputed(
+    double a, double b, double p, double px, double py, double pz, double abx, double aby, double abz,
+    int l1, int m1, int n1, int l2, int m2, int n2,
+    double c, int l3, int m3, int n3, double Cx, double Cy, double Cz,
+    double eta
+) noexcept nogil:
+    cdef double q, theta, eta2, theta_lr, lr_scale
+    if eta <= 0.0:
+        return primitive_three_center_precomputed(
+            a, b, p, px, py, pz, abx, aby, abz,
+            l1, m1, n1, l2, m2, n2,
+            c, l3, m3, n3, Cx, Cy, Cz,
+        )
+    q = c
+    theta = p * q / (p + q)
+    eta2 = eta * eta
+    theta_lr = theta * eta2 / (theta + eta2)
+    lr_scale = eta / sqrt(theta + eta2)
+    return (
+        primitive_three_center_precomputed(
+            a, b, p, px, py, pz, abx, aby, abz,
+            l1, m1, n1, l2, m2, n2,
+            c, l3, m3, n3, Cx, Cy, Cz,
+        )
+        - lr_scale * primitive_three_center_coulomb_kernel(
+            a, b, p, px, py, pz, abx, aby, abz,
+            l1, m1, n1, l2, m2, n2,
+            c, l3, m3, n3, Cx, Cy, Cz,
+            theta_lr,
+        )
+    )
+
+
 cdef inline double primitive_eri_from_memos(
     int l1, int m1, int n1, int l2, int m2, int n2,
     int l3, int m3, int n3, int l4, int m4, int n4,
@@ -1084,6 +1359,123 @@ cdef void os_fill_vrr_table(
                                                 )
                                             if az > 0:
                                                 value += az / (2.0 * z) * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                    os_vrr_set(table, ax, ay, az, cx, cy, cz, m, adim, cdim, mdim, value)
+
+
+cdef void os_fill_vrr_table_kernel(
+    double* table,
+    int max_a,
+    int max_c,
+    int max_m,
+    double p,
+    double q,
+    double alpha_kernel,
+    double T,
+    double base_pref,
+    double* PA,
+    double* QC,
+    double* PQ,
+) noexcept nogil:
+    cdef int adim = max_a + 1
+    cdef int cdim = max_c + 1
+    cdef int mdim = max_m + 1
+    cdef int m, total, ax, ay, az, cx, cy, cz, asum, csum, axis
+    cdef double value
+    cdef double alpha_over_p = alpha_kernel / p
+    cdef double alpha_over_q = alpha_kernel / q
+    cdef double cross = alpha_kernel / (2.0 * p * q)
+
+    for m in range(max_m + 1):
+        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, base_pref * boys_fn(m, T))
+
+    for total in range(1, max_m + 1):
+        for ax in range(max_a + 1):
+            for ay in range(max_a + 1 - ax):
+                for az in range(max_a + 1 - ax - ay):
+                    asum = ax + ay + az
+                    for cx in range(max_c + 1):
+                        for cy in range(max_c + 1 - cx):
+                            for cz in range(max_c + 1 - cx - cy):
+                                csum = cx + cy + cz
+                                if asum + csum != total:
+                                    continue
+                                for m in range(max_m - total + 1):
+                                    if asum > 0:
+                                        axis = os_axis_of_max3(ax, ay, az)
+                                        if axis == 0:
+                                            value = (
+                                                PA[0] * os_vrr_get_raw(table, ax - 1, ay, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                - alpha_over_p * PQ[0] * os_vrr_get_raw(table, ax - 1, ay, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if ax - 1 > 0:
+                                                value += (ax - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax - 2, ay, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - alpha_over_p * os_vrr_get_raw(table, ax - 2, ay, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cx > 0:
+                                                value += cx * cross * os_vrr_get_raw(table, ax - 1, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                        elif axis == 1:
+                                            value = (
+                                                PA[1] * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                - alpha_over_p * PQ[1] * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if ay - 1 > 0:
+                                                value += (ay - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax, ay - 2, az, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - alpha_over_p * os_vrr_get_raw(table, ax, ay - 2, az, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cy > 0:
+                                                value += cy * cross * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                        else:
+                                            value = (
+                                                PA[2] * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz, m, adim, cdim, mdim)
+                                                - alpha_over_p * PQ[2] * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if az - 1 > 0:
+                                                value += (az - 1) / (2.0 * p) * (
+                                                    os_vrr_get_raw(table, ax, ay, az - 2, cx, cy, cz, m, adim, cdim, mdim)
+                                                    - alpha_over_p * os_vrr_get_raw(table, ax, ay, az - 2, cx, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if cz > 0:
+                                                value += cz * cross * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                    else:
+                                        axis = os_axis_of_max3(cx, cy, cz)
+                                        if axis == 0:
+                                            value = (
+                                                QC[0] * os_vrr_get_raw(table, ax, ay, az, cx - 1, cy, cz, m, adim, cdim, mdim)
+                                                + alpha_over_q * PQ[0] * os_vrr_get_raw(table, ax, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cx - 1 > 0:
+                                                value += (cx - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx - 2, cy, cz, m, adim, cdim, mdim)
+                                                    - alpha_over_q * os_vrr_get_raw(table, ax, ay, az, cx - 2, cy, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if ax > 0:
+                                                value += ax * cross * os_vrr_get_raw(table, ax - 1, ay, az, cx - 1, cy, cz, m + 1, adim, cdim, mdim)
+                                        elif axis == 1:
+                                            value = (
+                                                QC[1] * os_vrr_get_raw(table, ax, ay, az, cx, cy - 1, cz, m, adim, cdim, mdim)
+                                                + alpha_over_q * PQ[1] * os_vrr_get_raw(table, ax, ay, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cy - 1 > 0:
+                                                value += (cy - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx, cy - 2, cz, m, adim, cdim, mdim)
+                                                    - alpha_over_q * os_vrr_get_raw(table, ax, ay, az, cx, cy - 2, cz, m + 1, adim, cdim, mdim)
+                                                )
+                                            if ay > 0:
+                                                value += ay * cross * os_vrr_get_raw(table, ax, ay - 1, az, cx, cy - 1, cz, m + 1, adim, cdim, mdim)
+                                        else:
+                                            value = (
+                                                QC[2] * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 1, m, adim, cdim, mdim)
+                                                + alpha_over_q * PQ[2] * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
+                                            )
+                                            if cz - 1 > 0:
+                                                value += (cz - 1) / (2.0 * q) * (
+                                                    os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 2, m, adim, cdim, mdim)
+                                                    - alpha_over_q * os_vrr_get_raw(table, ax, ay, az, cx, cy, cz - 2, m + 1, adim, cdim, mdim)
+                                                )
+                                            if az > 0:
+                                                value += az * cross * os_vrr_get_raw(table, ax, ay, az - 1, cx, cy, cz - 1, m + 1, adim, cdim, mdim)
                                     os_vrr_set(table, ax, ay, az, cx, cy, cz, m, adim, cdim, mdim, value)
 
 
@@ -1776,6 +2168,43 @@ cdef inline int precompute_primitive_pair_geom(
     return idx
 
 
+cdef inline int precompute_primitive_pair_geom_asymmetric(
+    int p, int q,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] exps_v,
+    int64_t[::1] nprim_v,
+    double* a_out,
+    double* b_out,
+    double* p_out,
+    double* px_out,
+    double* py_out,
+    double* pz_out,
+) noexcept nogil:
+    cdef int ip, iq, idx = 0
+    cdef double a, b, pexp
+    cdef double Ax = left_origins_v[p, 0]
+    cdef double Ay = left_origins_v[p, 1]
+    cdef double Az = left_origins_v[p, 2]
+    cdef double Bx = right_origins_v[q, 0]
+    cdef double By = right_origins_v[q, 1]
+    cdef double Bz = right_origins_v[q, 2]
+
+    for ip in range(nprim_v[p]):
+        a = exps_v[p, ip]
+        for iq in range(nprim_v[q]):
+            b = exps_v[q, iq]
+            pexp = a + b
+            a_out[idx] = a
+            b_out[idx] = b
+            p_out[idx] = pexp
+            px_out[idx] = (a * Ax + b * Bx) / pexp
+            py_out[idx] = (a * Ay + b * By) / pexp
+            pz_out[idx] = (a * Az + b * Bz) / pexp
+            idx += 1
+    return idx
+
+
 cdef inline double contracted_eri_indices(
     int p, int q, int r, int s,
     int64_t[:, ::1] shells_v,
@@ -1923,6 +2352,885 @@ cdef inline double contracted_three_center_indices(
                     )
                 )
     return value
+
+
+cdef inline double contracted_short_range_two_center_indices(
+    int p, int q,
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    double eta,
+) noexcept nogil:
+    cdef int ip, iq
+    cdef double value = 0.0
+    for ip in range(nprim_v[p]):
+        for iq in range(nprim_v[q]):
+            value += (
+                weights_v[p, ip] * weights_v[q, iq]
+                * primitive_short_range_two_center_coulomb(
+                    exps_v[p, ip], <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2], left_origins_v[p, 0], left_origins_v[p, 1], left_origins_v[p, 2],
+                    exps_v[q, iq], <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2], right_origins_v[q, 0], right_origins_v[q, 1], right_origins_v[q, 2],
+                    eta,
+                )
+            )
+    return value
+
+
+cdef inline double contracted_short_range_three_center_indices(
+    int p, int q, int a,
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    int64_t[:, ::1] aux_shells_v,
+    double[:, ::1] aux_origins_v,
+    double[:, ::1] aux_exps_v,
+    double[:, ::1] aux_weights_v,
+    int64_t[::1] aux_nprim_v,
+    double eta,
+) noexcept nogil:
+    cdef int ip, iq, ia
+    cdef double value = 0.0
+    for ip in range(nprim_v[p]):
+        for iq in range(nprim_v[q]):
+            for ia in range(aux_nprim_v[a]):
+                value += (
+                    weights_v[p, ip] * weights_v[q, iq] * aux_weights_v[a, ia]
+                    * primitive_short_range_three_center_coulomb(
+                        exps_v[p, ip], <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2], left_origins_v[p, 0], left_origins_v[p, 1], left_origins_v[p, 2],
+                        exps_v[q, iq], <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2], right_origins_v[q, 0], right_origins_v[q, 1], right_origins_v[q, 2],
+                        aux_exps_v[a, ia], <int>aux_shells_v[a, 0], <int>aux_shells_v[a, 1], <int>aux_shells_v[a, 2], aux_origins_v[a, 0], aux_origins_v[a, 1], aux_origins_v[a, 2],
+                        eta,
+                    )
+                )
+    return value
+
+
+cpdef compute_short_range_aux_metric(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    double eta,
+):
+    cdef int naux = shells.shape[0]
+    cdef cnp.ndarray[double, ndim=2] metric
+    cdef int p, q
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] metric_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if right_origins.shape[0] != naux:
+        raise ValueError("right_origins must have one row per auxiliary function.")
+
+    metric = np.zeros((naux, naux), dtype=np.float64)
+    metric_v = metric
+    with nogil:
+        for p in range(naux):
+            for q in range(naux):
+                metric_v[p, q] = contracted_short_range_two_center_indices(
+                    p, q,
+                    shells_v,
+                    left_origins_v,
+                    right_origins_v,
+                    exps_v,
+                    weights_v,
+                    nprim_v,
+                    eta,
+                )
+    return metric
+
+
+cpdef compute_short_range_aux_metric_masked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[uint8_t, ndim=2] pair_mask,
+    double eta,
+):
+    cdef int naux = shells.shape[0]
+    cdef cnp.ndarray[double, ndim=2] metric
+    cdef int p, q
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef uint8_t[:, ::1] pair_mask_v = pair_mask
+    cdef double[:, ::1] metric_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if right_origins.shape[0] != naux:
+        raise ValueError("right_origins must have one row per auxiliary function.")
+    if pair_mask.shape[0] != naux or pair_mask.shape[1] != naux:
+        raise ValueError("pair_mask must have shape (naux, naux).")
+
+    metric = np.zeros((naux, naux), dtype=np.float64)
+    metric_v = metric
+    with nogil:
+        for p in range(naux):
+            for q in range(naux):
+                if pair_mask_v[p, q] == 0:
+                    continue
+                metric_v[p, q] = contracted_short_range_two_center_indices(
+                    p, q,
+                    shells_v,
+                    left_origins_v,
+                    right_origins_v,
+                    exps_v,
+                    weights_v,
+                    nprim_v,
+                    eta,
+                )
+    return metric
+
+
+cpdef compute_short_range_three_center_tensor(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    double eta,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef cnp.ndarray[double, ndim=3] tensor
+    cdef int p, q, a
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef double[:, :, ::1] tensor_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if left_origins.shape[0] != nao or right_origins.shape[0] != nao:
+        raise ValueError("left_origins and right_origins must have one row per AO function.")
+
+    tensor = np.zeros((naux, nao, nao), dtype=np.float64)
+    tensor_v = tensor
+    with nogil:
+        for a in range(naux):
+            for p in range(nao):
+                for q in range(nao):
+                    tensor_v[a, p, q] = contracted_short_range_three_center_indices(
+                        p, q, a,
+                        shells_v,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        eta,
+                    )
+    return tensor
+
+
+cpdef compute_short_range_three_center_tensor_masked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    cnp.ndarray[uint8_t, ndim=2] pair_mask,
+    cnp.ndarray[uint8_t, ndim=3] aux_pair_mask,
+    double eta,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef cnp.ndarray[double, ndim=3] tensor
+    cdef int p, q, a
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef uint8_t[:, ::1] pair_mask_v = pair_mask
+    cdef uint8_t[:, :, ::1] aux_pair_mask_v = aux_pair_mask
+    cdef double[:, :, ::1] tensor_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if left_origins.shape[0] != nao or right_origins.shape[0] != nao:
+        raise ValueError("left_origins and right_origins must have one row per AO function.")
+    if pair_mask.shape[0] != nao or pair_mask.shape[1] != nao:
+        raise ValueError("pair_mask must have shape (nao, nao).")
+    if aux_pair_mask.shape[0] != naux or aux_pair_mask.shape[1] != nao or aux_pair_mask.shape[2] != nao:
+        raise ValueError("aux_pair_mask must have shape (naux, nao, nao).")
+
+    tensor = np.zeros((naux, nao, nao), dtype=np.float64)
+    tensor_v = tensor
+    with nogil:
+        for a in range(naux):
+            for p in range(nao):
+                for q in range(nao):
+                    if pair_mask_v[p, q] == 0 or aux_pair_mask_v[a, p, q] == 0:
+                        continue
+                    tensor_v[a, p, q] = contracted_short_range_three_center_indices(
+                        p, q, a,
+                        shells_v,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        eta,
+                    )
+    return tensor
+
+
+cpdef compute_short_range_three_center_tensor_pair_outer_masked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    cnp.ndarray[uint8_t, ndim=2] pair_mask,
+    cnp.ndarray[uint8_t, ndim=3] aux_pair_mask,
+    double eta,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int max_pair_prims = 0
+    cdef int p, q, ip, iq, ia, iaux, ipair, npair
+    cdef double ao_a, ao_b, ao_p, value
+    cdef double* pair_a = NULL
+    cdef double* pair_b = NULL
+    cdef double* pair_p = NULL
+    cdef double* pair_px = NULL
+    cdef double* pair_py = NULL
+    cdef double* pair_pz = NULL
+    cdef double* pair_abx = NULL
+    cdef double* pair_aby = NULL
+    cdef double* pair_abz = NULL
+    cdef double* pair_weight = NULL
+    cdef cnp.ndarray[double, ndim=3] tensor
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef uint8_t[:, ::1] pair_mask_v = pair_mask
+    cdef uint8_t[:, :, ::1] aux_pair_mask_v = aux_pair_mask
+    cdef double[:, :, ::1] tensor_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if left_origins.shape[0] != nao or right_origins.shape[0] != nao:
+        raise ValueError("left_origins and right_origins must have one row per AO function.")
+    if pair_mask.shape[0] != nao or pair_mask.shape[1] != nao:
+        raise ValueError("pair_mask must have shape (nao, nao).")
+    if aux_pair_mask.shape[0] != naux or aux_pair_mask.shape[1] != nao or aux_pair_mask.shape[2] != nao:
+        raise ValueError("aux_pair_mask must have shape (naux, nao, nao).")
+
+    for p in range(nao):
+        for q in range(nao):
+            max_pair_prims = max(max_pair_prims, <int>(nprim[p] * nprim[q]))
+    max_pair_prims = max(max_pair_prims, 1)
+
+    pair_a = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_b = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_p = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_px = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_py = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_pz = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_abx = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_aby = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_abz = <double*>malloc(max_pair_prims * sizeof(double))
+    pair_weight = <double*>malloc(max_pair_prims * sizeof(double))
+    if (
+        pair_a == NULL or pair_b == NULL or pair_p == NULL
+        or pair_px == NULL or pair_py == NULL or pair_pz == NULL
+        or pair_abx == NULL or pair_aby == NULL or pair_abz == NULL
+        or pair_weight == NULL
+    ):
+        free(pair_a); free(pair_b); free(pair_p); free(pair_px); free(pair_py)
+        free(pair_pz); free(pair_abx); free(pair_aby); free(pair_abz); free(pair_weight)
+        raise MemoryError("could not allocate AO-pair primitive buffers")
+
+    tensor = np.zeros((naux, nao, nao), dtype=np.float64)
+    tensor_v = tensor
+    try:
+        with nogil:
+            for p in range(nao):
+                for q in range(nao):
+                    if pair_mask_v[p, q] == 0:
+                        continue
+                    npair = 0
+                    for ip in range(nprim_v[p]):
+                        for iq in range(nprim_v[q]):
+                            ao_a = exps_v[p, ip]
+                            ao_b = exps_v[q, iq]
+                            ao_p = ao_a + ao_b
+                            pair_a[npair] = ao_a
+                            pair_b[npair] = ao_b
+                            pair_p[npair] = ao_p
+                            pair_px[npair] = (
+                                ao_a * left_origins_v[p, 0]
+                                + ao_b * right_origins_v[q, 0]
+                            ) / ao_p
+                            pair_py[npair] = (
+                                ao_a * left_origins_v[p, 1]
+                                + ao_b * right_origins_v[q, 1]
+                            ) / ao_p
+                            pair_pz[npair] = (
+                                ao_a * left_origins_v[p, 2]
+                                + ao_b * right_origins_v[q, 2]
+                            ) / ao_p
+                            pair_abx[npair] = left_origins_v[p, 0] - right_origins_v[q, 0]
+                            pair_aby[npair] = left_origins_v[p, 1] - right_origins_v[q, 1]
+                            pair_abz[npair] = left_origins_v[p, 2] - right_origins_v[q, 2]
+                            pair_weight[npair] = weights_v[p, ip] * weights_v[q, iq]
+                            npair += 1
+
+                    for iaux in range(naux):
+                        if aux_pair_mask_v[iaux, p, q] == 0:
+                            continue
+                        value = 0.0
+                        for ipair in range(npair):
+                            for ia in range(aux_nprim_v[iaux]):
+                                value += (
+                                    pair_weight[ipair]
+                                    * aux_weights_v[iaux, ia]
+                                    * primitive_short_range_three_center_precomputed(
+                                        pair_a[ipair],
+                                        pair_b[ipair],
+                                        pair_p[ipair],
+                                        pair_px[ipair],
+                                        pair_py[ipair],
+                                        pair_pz[ipair],
+                                        pair_abx[ipair],
+                                        pair_aby[ipair],
+                                        pair_abz[ipair],
+                                        <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2],
+                                        <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2],
+                                        aux_exps_v[iaux, ia],
+                                        <int>aux_shells_v[iaux, 0], <int>aux_shells_v[iaux, 1], <int>aux_shells_v[iaux, 2],
+                                        aux_origins_v[iaux, 0], aux_origins_v[iaux, 1], aux_origins_v[iaux, 2],
+                                        eta,
+                                    )
+                                )
+                        tensor_v[iaux, p, q] = value
+    finally:
+        free(pair_a); free(pair_b); free(pair_p); free(pair_px); free(pair_py)
+        free(pair_pz); free(pair_abx); free(pair_aby); free(pair_abz); free(pair_weight)
+    return tensor
+
+
+cdef int compute_shell_triplet_short_range_vrr_hrr_into_tensor(
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    int64_t[:, ::1] aux_shells_v,
+    double[:, ::1] aux_origins_v,
+    double[:, ::1] aux_exps_v,
+    double[:, ::1] aux_weights_v,
+    int64_t[::1] aux_nprim_v,
+    uint8_t[:, ::1] pair_mask_v,
+    uint8_t[:, :, ::1] aux_pair_mask_v,
+    double[:, :, ::1] tensor_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int a0,
+    int a1,
+    double* pq_a,
+    double* pq_b,
+    double* pq_p,
+    double* pq_px,
+    double* pq_py,
+    double* pq_pz,
+    int npq,
+    double eta,
+    double* vrr_table,
+    double* lr_vrr_table,
+    size_t vrr_table_cap,
+) noexcept nogil:
+    cdef int np_ = p1 - p0
+    cdef int nq_ = q1 - q0
+    cdef int na_ = a1 - a0
+    cdef int lA, lB, lC, max_a_l, max_c_l, max_m_l
+    cdef int ia, ib, ic, idx_pq, ip, iq, iap
+    cdef int ao_p, ao_q, aux_i
+    cdef int ax[OS_VRR_MAX_CART]
+    cdef int ay[OS_VRR_MAX_CART]
+    cdef int az[OS_VRR_MAX_CART]
+    cdef int bx[OS_VRR_MAX_CART]
+    cdef int by[OS_VRR_MAX_CART]
+    cdef int bz[OS_VRR_MAX_CART]
+    cdef int cx[OS_VRR_MAX_CART]
+    cdef int cy[OS_VRR_MAX_CART]
+    cdef int cz[OS_VRR_MAX_CART]
+    cdef size_t vrr_table_size
+    cdef double abx, aby, abz, ab2
+    cdef double zeta, theta, theta_lr, eta2, lr_scale
+    cdef double dx, dy, dz, pc2, base_pref
+    cdef double cexp, prefac, full_value, lr_value
+    cdef double PA[3]
+    cdef double QC[3]
+    cdef double PQ[3]
+    cdef double AB[3]
+    cdef double CD[3]
+    cdef bint use_lr = eta > 0.0
+
+    lA = <int>shells_v[p0, 0] + <int>shells_v[p0, 1] + <int>shells_v[p0, 2]
+    lB = <int>shells_v[q0, 0] + <int>shells_v[q0, 1] + <int>shells_v[q0, 2]
+    lC = <int>aux_shells_v[a0, 0] + <int>aux_shells_v[a0, 1] + <int>aux_shells_v[a0, 2]
+    max_a_l = lA + lB
+    max_c_l = lC
+    max_m_l = max_a_l + max_c_l
+    if max_a_l > OS_VRR_PAIR_MAX_L or max_c_l > OS_VRR_PAIR_MAX_L:
+        return 0
+    if np_ != ncart_for_l(lA) or nq_ != ncart_for_l(lB) or na_ != ncart_for_l(lC):
+        return 0
+
+    vrr_table_size = (
+        <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1)
+        * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1)
+        * <size_t>(max_m_l + 1)
+    )
+    if vrr_table == NULL or vrr_table_size > vrr_table_cap:
+        return 0
+    if use_lr and lr_vrr_table == NULL:
+        return 0
+
+    fill_cartesian_components(lA, ax, ay, az)
+    fill_cartesian_components(lB, bx, by, bz)
+    fill_cartesian_components(lC, cx, cy, cz)
+
+    abx = left_origins_v[p0, 0] - right_origins_v[q0, 0]
+    aby = left_origins_v[p0, 1] - right_origins_v[q0, 1]
+    abz = left_origins_v[p0, 2] - right_origins_v[q0, 2]
+    ab2 = abx * abx + aby * aby + abz * abz
+    AB[0] = abx; AB[1] = aby; AB[2] = abz
+    CD[0] = 0.0; CD[1] = 0.0; CD[2] = 0.0
+    eta2 = eta * eta
+
+    for idx_pq in range(npq):
+        ip = idx_pq // <int>nprim_v[q0]
+        iq = idx_pq - ip * <int>nprim_v[q0]
+        for iap in range(aux_nprim_v[a0]):
+            cexp = aux_exps_v[a0, iap]
+            zeta = pq_p[idx_pq] + cexp
+            theta = pq_p[idx_pq] * cexp / zeta
+            dx = pq_px[idx_pq] - aux_origins_v[a0, 0]
+            dy = pq_py[idx_pq] - aux_origins_v[a0, 1]
+            dz = pq_pz[idx_pq] - aux_origins_v[a0, 2]
+            pc2 = dx * dx + dy * dy + dz * dz
+            base_pref = (
+                ERI_PREFAC
+                * exp(-(pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]) * ab2)
+                / (pq_p[idx_pq] * cexp * sqrt(zeta))
+            )
+            PA[0] = pq_px[idx_pq] - left_origins_v[p0, 0]
+            PA[1] = pq_py[idx_pq] - left_origins_v[p0, 1]
+            PA[2] = pq_pz[idx_pq] - left_origins_v[p0, 2]
+            QC[0] = 0.0; QC[1] = 0.0; QC[2] = 0.0
+            PQ[0] = dx; PQ[1] = dy; PQ[2] = dz
+            os_fill_vrr_table_kernel(
+                vrr_table,
+                max_a_l,
+                max_c_l,
+                max_m_l,
+                pq_p[idx_pq],
+                cexp,
+                theta,
+                theta * pc2,
+                base_pref,
+                PA,
+                QC,
+                PQ,
+            )
+            if use_lr:
+                theta_lr = theta * eta2 / (theta + eta2)
+                lr_scale = eta / sqrt(theta + eta2)
+                os_fill_vrr_table_kernel(
+                    lr_vrr_table,
+                    max_a_l,
+                    max_c_l,
+                    max_m_l,
+                    pq_p[idx_pq],
+                    cexp,
+                    theta_lr,
+                    theta_lr * pc2,
+                    base_pref,
+                    PA,
+                    QC,
+                    PQ,
+                )
+            else:
+                lr_scale = 0.0
+            for ia in range(np_):
+                ao_p = p0 + ia
+                for ib in range(nq_):
+                    ao_q = q0 + ib
+                    if pair_mask_v[ao_p, ao_q] == 0:
+                        continue
+                    for ic in range(na_):
+                        aux_i = a0 + ic
+                        if aux_pair_mask_v[aux_i, ao_p, ao_q] == 0:
+                            continue
+                        prefac = (
+                            weights_v[ao_p, ip]
+                            * weights_v[ao_q, iq]
+                            * aux_weights_v[aux_i, iap]
+                        )
+                        full_value = os_vrr_hrr_eval_expanded(
+                            vrr_table,
+                            ax[ia], ay[ia], az[ia],
+                            bx[ib], by[ib], bz[ib],
+                            cx[ic], cy[ic], cz[ic],
+                            0, 0, 0,
+                            0,
+                            max_a_l,
+                            max_c_l,
+                            max_m_l,
+                            AB,
+                            CD,
+                        )
+                        if use_lr:
+                            lr_value = os_vrr_hrr_eval_expanded(
+                                lr_vrr_table,
+                                ax[ia], ay[ia], az[ia],
+                                bx[ib], by[ib], bz[ib],
+                                cx[ic], cy[ic], cz[ic],
+                                0, 0, 0,
+                                0,
+                                max_a_l,
+                                max_c_l,
+                                max_m_l,
+                                AB,
+                                CD,
+                            )
+                            tensor_v[aux_i, ao_p, ao_q] += prefac * (
+                                full_value - lr_scale * lr_value
+                            )
+                        else:
+                            tensor_v[aux_i, ao_p, ao_q] += prefac * full_value
+
+    return 1
+
+
+cdef inline bint shell_pair_mask_has_work(
+    uint8_t[:, ::1] pair_mask_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+) noexcept nogil:
+    cdef int p, q
+    for p in range(p0, p1):
+        for q in range(q0, q1):
+            if pair_mask_v[p, q] != 0:
+                return True
+    return False
+
+
+cdef inline bint shell_triplet_mask_has_work(
+    uint8_t[:, ::1] pair_mask_v,
+    uint8_t[:, :, ::1] aux_pair_mask_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int a0,
+    int a1,
+) noexcept nogil:
+    cdef int p, q, a
+    for p in range(p0, p1):
+        for q in range(q0, q1):
+            if pair_mask_v[p, q] == 0:
+                continue
+            for a in range(a0, a1):
+                if aux_pair_mask_v[a, p, q] != 0:
+                    return True
+    return False
+
+
+cpdef compute_short_range_three_center_tensor_shell_blocked_masked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=2] aux_origins,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_starts,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_stops,
+    cnp.ndarray[uint8_t, ndim=2] pair_mask,
+    cnp.ndarray[uint8_t, ndim=3] aux_pair_mask,
+    double eta,
+):
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int nshell = shell_starts.shape[0]
+    cdef int naux_shell = aux_shell_starts.shape[0]
+    cdef int max_prim = exps.shape[1]
+    cdef int pair_cap = max_prim * max_prim
+    cdef cnp.ndarray[double, ndim=3] tensor
+    cdef int ish, jsh, ash, p0, p1, q0, q1, a0, a1
+    cdef int p, q, a, direct_done
+    cdef int* shell_pair_n
+    cdef double* shell_pair_a
+    cdef double* shell_pair_b
+    cdef double* shell_pair_p
+    cdef double* shell_pair_px
+    cdef double* shell_pair_py
+    cdef double* shell_pair_pz
+    cdef double* direct_vrr_table
+    cdef double* direct_lr_vrr_table
+    cdef size_t pair_storage_size
+    cdef size_t pq_offset
+    cdef int pq_pair_idx
+    cdef int npq
+    cdef double value
+    cdef size_t direct_vrr_table_cap = (
+        <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(2 * OS_VRR_PAIR_MAX_L + 1)
+    )
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, ::1] aux_origins_v = aux_origins
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int64_t[::1] aux_shell_starts_v = aux_shell_starts
+    cdef int64_t[::1] aux_shell_stops_v = aux_shell_stops
+    cdef uint8_t[:, ::1] pair_mask_v = pair_mask
+    cdef uint8_t[:, :, ::1] aux_pair_mask_v = aux_pair_mask
+    cdef double[:, :, ::1] tensor_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if left_origins.shape[0] != nao or right_origins.shape[0] != nao:
+        raise ValueError("left_origins and right_origins must have one row per AO function.")
+    if pair_mask.shape[0] != nao or pair_mask.shape[1] != nao:
+        raise ValueError("pair_mask must have shape (nao, nao).")
+    if aux_pair_mask.shape[0] != naux or aux_pair_mask.shape[1] != nao or aux_pair_mask.shape[2] != nao:
+        raise ValueError("aux_pair_mask must have shape (naux, nao, nao).")
+
+    pair_storage_size = <size_t>nshell * <size_t>nshell * <size_t>pair_cap
+    shell_pair_n = <int*>malloc(nshell * nshell * sizeof(int))
+    shell_pair_a = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_b = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_p = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_px = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_py = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_pz = <double*>malloc(pair_storage_size * sizeof(double))
+    direct_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    direct_lr_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    if (
+        shell_pair_n == NULL or shell_pair_a == NULL or shell_pair_b == NULL
+        or shell_pair_p == NULL or shell_pair_px == NULL or shell_pair_py == NULL
+        or shell_pair_pz == NULL or direct_vrr_table == NULL
+        or direct_lr_vrr_table == NULL
+    ):
+        free(shell_pair_n)
+        free(shell_pair_a); free(shell_pair_b); free(shell_pair_p)
+        free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+        free(direct_vrr_table); free(direct_lr_vrr_table)
+        raise MemoryError("Could not allocate short-range shell-block scratch arrays.")
+
+    tensor = np.zeros((naux, nao, nao), dtype=np.float64)
+    tensor_v = tensor
+    with nogil:
+        for ish in range(nshell):
+            p0 = <int>shell_starts_v[ish]
+            p1 = <int>shell_stops_v[ish]
+            for jsh in range(nshell):
+                q0 = <int>shell_starts_v[jsh]
+                q1 = <int>shell_stops_v[jsh]
+                pq_pair_idx = ish * nshell + jsh
+                pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                if shell_pair_mask_has_work(pair_mask_v, p0, p1, q0, q1):
+                    shell_pair_n[pq_pair_idx] = precompute_primitive_pair_geom_asymmetric(
+                        p0,
+                        q0,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        nprim_v,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                    )
+                else:
+                    shell_pair_n[pq_pair_idx] = 0
+
+        for ash in range(naux_shell):
+            a0 = <int>aux_shell_starts_v[ash]
+            a1 = <int>aux_shell_stops_v[ash]
+            for ish in range(nshell):
+                p0 = <int>shell_starts_v[ish]
+                p1 = <int>shell_stops_v[ish]
+                for jsh in range(nshell):
+                    q0 = <int>shell_starts_v[jsh]
+                    q1 = <int>shell_stops_v[jsh]
+                    pq_pair_idx = ish * nshell + jsh
+                    pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                    npq = shell_pair_n[pq_pair_idx]
+                    if npq <= 0:
+                        continue
+                    if not shell_triplet_mask_has_work(
+                        pair_mask_v,
+                        aux_pair_mask_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                    ):
+                        continue
+                    direct_done = compute_shell_triplet_short_range_vrr_hrr_into_tensor(
+                        shells_v,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        pair_mask_v,
+                        aux_pair_mask_v,
+                        tensor_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                        npq,
+                        eta,
+                        direct_vrr_table,
+                        direct_lr_vrr_table,
+                        direct_vrr_table_cap,
+                    )
+                    if direct_done == 0:
+                        for a in range(a0, a1):
+                            for p in range(p0, p1):
+                                for q in range(q0, q1):
+                                    if pair_mask_v[p, q] == 0 or aux_pair_mask_v[a, p, q] == 0:
+                                        continue
+                                    value = contracted_short_range_three_center_indices(
+                                        p, q, a,
+                                        shells_v,
+                                        left_origins_v,
+                                        right_origins_v,
+                                        exps_v,
+                                        weights_v,
+                                        nprim_v,
+                                        aux_shells_v,
+                                        aux_origins_v,
+                                        aux_exps_v,
+                                        aux_weights_v,
+                                        aux_nprim_v,
+                                        eta,
+                                    )
+                                    tensor_v[a, p, q] = value
+
+    free(shell_pair_n)
+    free(shell_pair_a); free(shell_pair_b); free(shell_pair_p)
+    free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+    free(direct_vrr_table); free(direct_lr_vrr_table)
+    return tensor
 
 
 cpdef compute_ri_tensors(

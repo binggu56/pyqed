@@ -18,7 +18,11 @@ from .canonical import (
     mixed_canonicalize_sites,
     right_canonicalize_sites,
 )
-from .environment import BlockSparseEnvironmentChain, contract_chain_expectation
+from .environment import (
+    BlockSparseEnvironmentChain,
+    contract_chain_expectation,
+    rank_coupled_real_term_coalesce_stats,
+)
 from .contraction import merge_mps_sites, normalize_site_tensor_layout
 from .decompose import state_averaged_svd_two_site
 from .linalg import sector_state_weight
@@ -606,6 +610,9 @@ def sweep_once(
     target_env_sweep = None
     timing = {
         "environment_build": 0.0,
+        "environment_build_hamiltonian": 0.0,
+        "environment_build_norm": 0.0,
+        "environment_build_target": 0.0,
         "bond_operator": 0.0,
         "two_site_update": 0.0,
         "environment_advance": 0.0,
@@ -620,8 +627,11 @@ def sweep_once(
         "local_residual": 0.0,
     } if profile else None
     sweep_t0 = time.perf_counter() if profile else None
+    if profile:
+        rank_coupled_real_term_coalesce_stats(reset=True)
     if mpo_factors is not None and not use_root_environment_path:
         t0 = time.perf_counter() if profile else None
+        sub_t0 = time.perf_counter() if profile else None
         env_sweep = BlockSparseEnvironmentChain.build(
             updated_sites,
             mpo_factors,
@@ -630,6 +640,8 @@ def sweep_once(
             sweep_direction=direction,
             reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
         ).start_sweep(direction)
+        if profile:
+            timing["environment_build_hamiltonian"] += time.perf_counter() - sub_t0
         if not force_canonical_local_norm and (
             nlocal_states <= 1
             or state_average_local_norm
@@ -640,6 +652,7 @@ def sweep_once(
                     updated_sites,
                     mpo_factors,
                 )
+            sub_t0 = time.perf_counter() if profile else None
             norm_env_sweep = BlockSparseEnvironmentChain.build(
                 updated_sites,
                 identity_mpo_factors,
@@ -647,7 +660,10 @@ def sweep_once(
                 sweep_direction=direction,
                 reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
             ).start_sweep(direction)
+            if profile:
+                timing["environment_build_norm"] += time.perf_counter() - sub_t0
         if root_target_mpo_factors is not None:
+            sub_t0 = time.perf_counter() if profile else None
             target_env_sweep = BlockSparseEnvironmentChain.build(
                 updated_sites,
                 root_target_mpo_factors,
@@ -655,6 +671,8 @@ def sweep_once(
                 sweep_direction=direction,
                 reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
             ).start_sweep(direction)
+            if profile:
+                timing["environment_build_target"] += time.perf_counter() - sub_t0
         if profile:
             timing["environment_build"] += time.perf_counter() - t0
     for bond in bonds:
@@ -944,6 +962,9 @@ def sweep_once(
         "reused_prebuilt_boundary_side": reuse_prebuilt_boundary_side,
         "renormalized_block_stack_stats": (
             renormalized_block_stack.stats if renormalized_block_stack is not None else None
+        ),
+        "rank_coupled_real_term_coalesce_stats": (
+            rank_coupled_real_term_coalesce_stats(reset=False) if profile else None
         ),
         "norm_renormalized_block_stack_stats": (
             norm_renormalized_block_stack.stats
@@ -1312,6 +1333,8 @@ def _state_average_energy(history_entry):
         return float(np.mean(energies))
     if "state_average_energy" in history_entry:
         return float(history_entry["state_average_energy"])
+    if "energy" in history_entry:
+        return float(history_entry["energy"])
     return None
 
 
@@ -1828,6 +1851,9 @@ def run_sweeps(
                     moving_environment.stats if moving_environment is not None else None
                 ),
                 "renormalized_block_stack_stats": sweep_result.get("renormalized_block_stack_stats"),
+                "rank_coupled_real_term_coalesce_stats": sweep_result.get(
+                    "rank_coupled_real_term_coalesce_stats"
+                ),
                 "norm_renormalized_block_stack_stats": sweep_result.get(
                     "norm_renormalized_block_stack_stats"
                 ),
@@ -1902,11 +1928,22 @@ def run_sweeps(
                 history[-1]["converged"] = True
                 history[-1]["convergence_metric"] = "energy_delta+metric"
                 break
-            if sweep_nlocal_states <= 1 and metric <= conv_tol:
-                converged = True
-                history[-1]["converged"] = True
-                history[-1]["convergence_metric"] = "metric"
-                break
+            if sweep_nlocal_states <= 1:
+                if mpo_factors is not None and "energy" in history[-1]:
+                    if (
+                        energy_delta is not None
+                        and energy_delta <= float(conv_tol)
+                        and metric <= float(conv_tol)
+                    ):
+                        converged = True
+                        history[-1]["converged"] = True
+                        history[-1]["convergence_metric"] = "energy_delta+metric"
+                        break
+                elif metric <= conv_tol:
+                    converged = True
+                    history[-1]["converged"] = True
+                    history[-1]["convergence_metric"] = "metric"
+                    break
         if alternate:
             direction = "rl" if direction == "lr" else "lr"
 

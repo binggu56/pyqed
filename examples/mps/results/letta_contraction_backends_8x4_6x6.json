@@ -1,0 +1,1553 @@
+{
+  "schema": "letta-contraction-backends-v1",
+  "status": "complete",
+  "environment": {
+    "python": "3.13.5",
+    "numpy": "2.1.3",
+    "platform": "macOS-26.2-arm64-arm-64bit-Mach-O"
+  },
+  "settings": {
+    "profile": "custom",
+    "geometries": [
+      "8x4",
+      "6x6"
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "seed": 2718,
+    "generated_bond_dim": 2,
+    "generated_tie_noise": 0.02,
+    "repeats": 1,
+    "tt_ranks": [
+      2,
+      4
+    ],
+    "tt_rtol": 0.0,
+    "tt_atol": 0.0,
+    "tt_transfer_ranks": [
+      4
+    ],
+    "tt_transfer_rtol": 0.0,
+    "tt_transfer_atol": 0.0,
+    "integrated_tt_norm_backend": "exact",
+    "integrated_tt_hermitize_local_actions": true,
+    "vmc_samples": 1,
+    "vmc_burn_in": 0,
+    "vmc_sweeps_between": 1,
+    "vmc_proposal": "mixed",
+    "vmc_exchange_probability": 0.9,
+    "skip_exact": false,
+    "skip_block": false,
+    "skip_tt": false,
+    "skip_vmc": true,
+    "no_dense_many_body_objects": true
+  },
+  "cases": [
+    {
+      "model": {
+        "geometry": "8x4",
+        "nrows": 8,
+        "ncols": 4,
+        "nsites": 32,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 4,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 52,
+        "j2_diagonal_edges": 42,
+        "parameters": 3240,
+        "tensor_storage_bytes": 51840,
+        "tensor_dtype": "complex128",
+        "tensor_source": {
+          "kind": "saved-optimized-letta",
+          "path": "examples/mps/results/frontier_letta_j2_half_convergence_8x4_seed7.npz",
+          "seed": 7
+        },
+        "full_hilbert_dimension": 4294967296,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.4820377499854658
+            ],
+            "median_seconds": 0.4820377499854658,
+            "minimum_seconds": 0.4820377499854658,
+            "maximum_seconds": 0.4820377499854658,
+            "maximum_tracemalloc_bytes": 27216679,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.0000000000021694,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.004499833012232557
+              ],
+              "median_seconds": 0.004499833012232557,
+              "minimum_seconds": 0.004499833012232557,
+              "maximum_seconds": 0.004499833012232557,
+              "maximum_tracemalloc_bytes": 237951,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": -15.0975035029441,
+              "imaginary": -6.48614495446509e-11
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.22732220799662173
+              ],
+              "median_seconds": 0.22732220799662173,
+              "minimum_seconds": 0.22732220799662173,
+              "maximum_seconds": 0.22732220799662173,
+              "maximum_tracemalloc_bytes": 25669410,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": -15.097503502911348,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.21342808299232274
+              ],
+              "median_seconds": 0.21342808299232274,
+              "minimum_seconds": 0.21342808299232274,
+              "maximum_seconds": 0.21342808299232274,
+              "maximum_tracemalloc_bytes": 25672362,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": -15.097503502911348,
+          "contraction_plans": 64,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 35,
+            "compressed_maximum": 14,
+            "contracted_maximum": 14
+          },
+          "memory": {
+            "dtype_itemsize": 16,
+            "peak_frontier_elements": 57344,
+            "peak_frontier_bytes": 917504,
+            "cached_environment_elements": 1508516,
+            "cached_environment_bytes": 24136256,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7074,
+              "dense_message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7074
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "peak_message_elements": 57344,
+              "total_message_elements": 1501442,
+              "dense_message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "dense_peak_message_elements": 57344,
+              "dense_total_message_elements": 1501442
+            }
+          }
+        },
+        "exact_identity_block": {
+          "backend": "identity_block",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              4.350334000017028
+            ],
+            "median_seconds": 4.350334000017028,
+            "minimum_seconds": 4.350334000017028,
+            "maximum_seconds": 4.350334000017028,
+            "maximum_tracemalloc_bytes": 16162264,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.0000000000021694,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.0032618749828543514
+              ],
+              "median_seconds": 0.0032618749828543514,
+              "minimum_seconds": 0.0032618749828543514,
+              "maximum_seconds": 0.0032618749828543514,
+              "maximum_tracemalloc_bytes": 237951,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": -15.09750350301383,
+              "imaginary": -1.5522555343877343e-11
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.7620910840050783
+              ],
+              "median_seconds": 0.7620910840050783,
+              "minimum_seconds": 0.7620910840050783,
+              "maximum_seconds": 0.7620910840050783,
+              "maximum_tracemalloc_bytes": 8344476,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": -15.097503502981077,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.8222475000075065
+              ],
+              "median_seconds": 0.8222475000075065,
+              "minimum_seconds": 0.8222475000075065,
+              "maximum_seconds": 0.8222475000075065,
+              "maximum_tracemalloc_bytes": 8345340,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": -15.097503502981077,
+          "contraction_plans": 1037,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 35,
+            "compressed_maximum": 14,
+            "contracted_maximum": 35
+          },
+          "memory": {
+            "dtype_itemsize": 16,
+            "peak_frontier_elements": 17920,
+            "peak_frontier_bytes": 286720,
+            "cached_environment_elements": 480644,
+            "cached_environment_bytes": 7690304,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7074,
+              "dense_message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7074
+            },
+            "hamiltonian": {
+              "representation": "BlockMPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                1152,
+                4736,
+                15360,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                17920,
+                17920,
+                17920,
+                17152,
+                6912,
+                2240,
+                544,
+                1
+              ],
+              "peak_message_elements": 17920,
+              "total_message_elements": 473570,
+              "dense_message_elements_by_cut": [
+                1,
+                2816,
+                20480,
+                118784,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                143360,
+                143360,
+                143360,
+                131072,
+                29696,
+                5120,
+                704,
+                1
+              ],
+              "dense_peak_message_elements": 143360,
+              "dense_total_message_elements": 3675586
+            }
+          },
+          "absolute_energy_difference_from_compressed": 6.972911137381743e-11,
+          "absolute_norm_difference_from_compressed": 0.0
+        },
+        "tt_frontier": {
+          "absorption": "structured",
+          "rows": [
+            {
+              "maximum_rank": 2,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.004516207991400734
+                ],
+                "median_seconds": 0.004516207991400734,
+                "minimum_seconds": 0.004516207991400734,
+                "maximum_seconds": 0.004516207991400734,
+                "maximum_tracemalloc_bytes": 45264,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": -0.013010819750697377,
+                  "imaginary": -0.006381886827210552
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.22599133299081586
+                  ],
+                  "median_seconds": 0.22599133299081586,
+                  "minimum_seconds": 0.22599133299081586,
+                  "maximum_seconds": 0.22599133299081586,
+                  "maximum_tracemalloc_bytes": 422960,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 1.0130309222407035,
+                "relative_error": 1.0130309222385059,
+                "diagnostics": {
+                  "advances": 32,
+                  "total_discarded_weight": 29530545.065720692,
+                  "max_relative_discarded_weight": 0.32773216650271675,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 56,
+                  "peak_message_storage_bytes": 896,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 1172,
+                  "peak_product_storage_bytes": 18752,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 28660.633283171683,
+                  "total_message_discarded_weight": 29501884.432437524,
+                  "peak_local_factor_storage_elements": 292,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 2.520898245328253e-19,
+                  "imaginary": 2.652116474979597e-18
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    17.694772290997207
+                  ],
+                  "median_seconds": 17.694772290997207,
+                  "minimum_seconds": 17.694772290997207,
+                  "maximum_seconds": 17.694772290997207,
+                  "maximum_tracemalloc_bytes": 206121536,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 32,
+                  "total_discarded_weight": 371647114682688.7,
+                  "max_relative_discarded_weight": 0.9220630449668277,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 140,
+                  "peak_message_storage_bytes": 2240,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 3572,
+                  "peak_product_storage_bytes": 57152,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 147784415269417.8,
+                  "total_message_discarded_weight": 223862699413270.84,
+                  "peak_local_factor_storage_elements": 804,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": -9.621166190712089e-17,
+                "imaginary": -1.5664689668160726e-16
+              },
+              "absolute_energy_error": 15.097503502911348,
+              "absolute_energy_error_per_site": 0.4717969844659796,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 2.5208982453227844e-19,
+                "imaginary_residue": 2.6521164749738434e-18,
+                "absolute_energy_error": 15.097503502911348,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 256,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 140,
+                "peak_message_storage_bytes": 2240,
+                "peak_transient_product_elements": 3572,
+                "peak_transient_product_bytes": 57152,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 409.6
+              }
+            },
+            {
+              "maximum_rank": 4,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.004952041985234246
+                ],
+                "median_seconds": 0.004952041985234246,
+                "minimum_seconds": 0.004952041985234246,
+                "maximum_seconds": 0.004952041985234246,
+                "maximum_tracemalloc_bytes": 44577,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": false,
+              "norm": {
+                "value": {
+                  "real": -0.0004532363450634901,
+                  "imaginary": -0.000705768583929916
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.2532507920113858
+                  ],
+                  "median_seconds": 0.2532507920113858,
+                  "minimum_seconds": 0.2532507920113858,
+                  "maximum_seconds": 0.2532507920113858,
+                  "maximum_tracemalloc_bytes": 554528,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 1.0004534852890195,
+                "relative_error": 1.0004534852868492,
+                "diagnostics": {
+                  "advances": 32,
+                  "total_discarded_weight": 112493801.20600034,
+                  "max_relative_discarded_weight": 0.32773216650271675,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 180,
+                  "peak_message_storage_bytes": 2880,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 4096,
+                  "peak_product_storage_elements": 4500,
+                  "peak_product_storage_bytes": 72000,
+                  "peak_local_factor_elements": 2048,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 28660.633283171683,
+                  "total_message_discarded_weight": 112465140.57271716,
+                  "peak_local_factor_storage_elements": 292,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 1.0702142194994352e-19,
+                  "imaginary": -1.1299769246610636e-20
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    17.3197234160034
+                  ],
+                  "median_seconds": 17.3197234160034,
+                  "minimum_seconds": 17.3197234160034,
+                  "maximum_seconds": 17.3197234160034,
+                  "maximum_tracemalloc_bytes": 206504756,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 32,
+                  "total_discarded_weight": 151504370690945.25,
+                  "max_relative_discarded_weight": 0.9220630449668277,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 516,
+                  "peak_message_storage_bytes": 8256,
+                  "peak_dense_message_elements": 57344,
+                  "peak_dense_message_bytes": 917504,
+                  "peak_product_storage_elements": 13716,
+                  "peak_product_storage_bytes": 219456,
+                  "peak_local_factor_elements": 3211264,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 147784415269417.8,
+                  "total_message_discarded_weight": 3719955421527.4443,
+                  "peak_local_factor_storage_elements": 804,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": -5.761066791368428e-17,
+                "imaginary": 1.1464122267606247e-16
+              },
+              "absolute_energy_error": 15.097503502911348,
+              "absolute_energy_error_per_site": 0.4717969844659796,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 1.0702142194971135e-19,
+                "imaginary_residue": -1.1299769246586122e-20,
+                "absolute_energy_error": 15.097503502911348,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 516,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 16,
+                "peak_message_storage_elements": 516,
+                "peak_message_storage_bytes": 8256,
+                "peak_transient_product_elements": 13716,
+                "peak_transient_product_bytes": 219456,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 57344,
+                "corresponding_dense_peak_bytes": 917504,
+                "dense_to_tt_peak_ratio": 111.13178294573643
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": {
+        "geometry": "6x6",
+        "nrows": 6,
+        "ncols": 6,
+        "nsites": 36,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 2,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 60,
+        "j2_diagonal_edges": 50,
+        "parameters": 948,
+        "tensor_storage_bytes": 7584,
+        "tensor_dtype": "float64",
+        "tensor_source": {
+          "kind": "generated-mps-lift-plus-tie-noise",
+          "seed": 2718,
+          "tie_noise": 0.02,
+          "snapshot_requested": null,
+          "snapshot_missing_or_ignored": false
+        },
+        "full_hilbert_dimension": 68719476736,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              1.0568652920192108
+            ],
+            "median_seconds": 1.0568652920192108,
+            "minimum_seconds": 1.0568652920192108,
+            "maximum_seconds": 1.0568652920192108,
+            "maximum_tracemalloc_bytes": 76858733,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.059173475780615,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.003223834006348625
+              ],
+              "median_seconds": 0.003223834006348625,
+              "minimum_seconds": 0.003223834006348625,
+              "maximum_seconds": 0.003223834006348625,
+              "maximum_tracemalloc_bytes": 106035,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": 0.012855019247740976,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.973637624992989
+              ],
+              "median_seconds": 0.973637624992989,
+              "minimum_seconds": 0.973637624992989,
+              "maximum_seconds": 0.973637624992989,
+              "maximum_tracemalloc_bytes": 73604618,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": 0.01213684022654247,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.914855582988821
+              ],
+              "median_seconds": 0.914855582988821,
+              "minimum_seconds": 0.914855582988821,
+              "maximum_seconds": 0.914855582988821,
+              "maximum_tracemalloc_bytes": 73605938,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": 0.01213684022654247,
+          "contraction_plans": 72,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 53,
+            "compressed_maximum": 20,
+            "contracted_maximum": 20
+          },
+          "memory": {
+            "dtype_itemsize": 8,
+            "peak_frontier_elements": 327680,
+            "peak_frontier_bytes": 2621440,
+            "cached_environment_elements": 8635948,
+            "cached_environment_bytes": 69087584,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7146,
+              "dense_message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7146
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                256,
+                2048,
+                11264,
+                57344,
+                278528,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                69632,
+                14336,
+                2816,
+                512,
+                64,
+                1
+              ],
+              "peak_message_elements": 327680,
+              "total_message_elements": 8628802,
+              "dense_message_elements_by_cut": [
+                1,
+                256,
+                2048,
+                11264,
+                57344,
+                278528,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                69632,
+                14336,
+                2816,
+                512,
+                64,
+                1
+              ],
+              "dense_peak_message_elements": 327680,
+              "dense_total_message_elements": 8628802
+            }
+          }
+        },
+        "exact_identity_block": {
+          "backend": "identity_block",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              11.941332500020508
+            ],
+            "median_seconds": 11.941332500020508,
+            "minimum_seconds": 11.941332500020508,
+            "maximum_seconds": 11.941332500020508,
+            "maximum_tracemalloc_bytes": 26261812,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.059173475780615,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.0038540830137208104
+              ],
+              "median_seconds": 0.0038540830137208104,
+              "minimum_seconds": 0.0038540830137208104,
+              "maximum_seconds": 0.0038540830137208104,
+              "maximum_tracemalloc_bytes": 106035,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": 0.012855019247740462,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                1.7935366659949068
+              ],
+              "median_seconds": 1.7935366659949068,
+              "minimum_seconds": 1.7935366659949068,
+              "maximum_seconds": 1.7935366659949068,
+              "maximum_tracemalloc_bytes": 9026833,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": 0.012136840226541986,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                1.7533013749925885
+              ],
+              "median_seconds": 1.7533013749925885,
+              "minimum_seconds": 1.7533013749925885,
+              "maximum_seconds": 1.7533013749925885,
+              "maximum_tracemalloc_bytes": 9026857,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": 0.012136840226541986,
+          "contraction_plans": 1671,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 53,
+            "compressed_maximum": 20,
+            "contracted_maximum": 53
+          },
+          "memory": {
+            "dtype_itemsize": 8,
+            "peak_frontier_elements": 37888,
+            "peak_frontier_bytes": 303104,
+            "cached_environment_elements": 1023972,
+            "cached_environment_bytes": 8191776,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7146,
+              "dense_message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7146
+            },
+            "hamiltonian": {
+              "representation": "BlockMPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                288,
+                1184,
+                3840,
+                11648,
+                35328,
+                37120,
+                37888,
+                37888,
+                37888,
+                37888,
+                37888,
+                37120,
+                37888,
+                37888,
+                37888,
+                37888,
+                37888,
+                37120,
+                37888,
+                37888,
+                37888,
+                37888,
+                37888,
+                37120,
+                37888,
+                37888,
+                37888,
+                37888,
+                37888,
+                37120,
+                13824,
+                4928,
+                1728,
+                560,
+                136,
+                1
+              ],
+              "peak_message_elements": 37888,
+              "total_message_elements": 1016826,
+              "dense_message_elements_by_cut": [
+                1,
+                704,
+                5120,
+                29696,
+                155648,
+                770048,
+                819200,
+                868352,
+                868352,
+                868352,
+                868352,
+                868352,
+                819200,
+                868352,
+                868352,
+                868352,
+                868352,
+                868352,
+                819200,
+                868352,
+                868352,
+                868352,
+                868352,
+                868352,
+                819200,
+                868352,
+                868352,
+                868352,
+                868352,
+                868352,
+                819200,
+                192512,
+                38912,
+                7424,
+                1280,
+                176,
+                1
+              ],
+              "dense_peak_message_elements": 868352,
+              "dense_total_message_elements": 22664562
+            }
+          },
+          "absolute_energy_difference_from_compressed": 4.839878497975292e-16,
+          "absolute_norm_difference_from_compressed": 0.0
+        },
+        "tt_frontier": {
+          "absorption": "structured",
+          "rows": [
+            {
+              "maximum_rank": 2,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.005418332992121577
+                ],
+                "median_seconds": 0.005418332992121577,
+                "minimum_seconds": 0.005418332992121577,
+                "maximum_seconds": 0.005418332992121577,
+                "maximum_tracemalloc_bytes": 50026,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": true,
+              "norm": {
+                "value": {
+                  "real": 1.0264411727080263,
+                  "imaginary": 0.0
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.33798545799800195
+                  ],
+                  "median_seconds": 0.33798545799800195,
+                  "minimum_seconds": 0.33798545799800195,
+                  "maximum_seconds": 0.33798545799800195,
+                  "maximum_tracemalloc_bytes": 359760,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.032732303072588786,
+                "relative_error": 0.030903627990178803,
+                "diagnostics": {
+                  "advances": 36,
+                  "total_discarded_weight": 0.5819507787922774,
+                  "max_relative_discarded_weight": 0.0004783233974976003,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 60,
+                  "peak_message_storage_bytes": 480,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 2048,
+                  "peak_product_storage_elements": 764,
+                  "peak_product_storage_bytes": 6112,
+                  "peak_local_factor_elements": 128,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 0.06544087275354561,
+                  "total_message_discarded_weight": 0.5165099060387318,
+                  "peak_local_factor_storage_elements": 168,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 5.882058697404925e-05,
+                  "imaginary": 0.0
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    1.9305763750162441
+                  ],
+                  "median_seconds": 1.9305763750162441,
+                  "minimum_seconds": 1.9305763750162441,
+                  "maximum_seconds": 1.9305763750162441,
+                  "maximum_tracemalloc_bytes": 13680800,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 36,
+                  "total_discarded_weight": 325261043618.27606,
+                  "max_relative_discarded_weight": 0.9063818807181333,
+                  "maximum_observed_rank": 2,
+                  "peak_message_storage_elements": 184,
+                  "peak_message_storage_bytes": 1472,
+                  "peak_dense_message_elements": 327680,
+                  "peak_dense_message_bytes": 2621440,
+                  "peak_product_storage_elements": 4380,
+                  "peak_product_storage_bytes": 35040,
+                  "peak_local_factor_elements": 409600,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 7057947457.188093,
+                  "total_message_discarded_weight": 318203096161.08795,
+                  "peak_local_factor_storage_elements": 872,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": 5.730536589726308e-05,
+                "imaginary": 0.0
+              },
+              "absolute_energy_error": 0.012079534860645207,
+              "absolute_energy_error_per_site": 0.00033554263501792245,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 5.553442218773298e-05,
+                "imaginary_residue": 0.0,
+                "absolute_energy_error": 0.012081305804354738,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 256,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 8,
+                "peak_message_storage_elements": 184,
+                "peak_message_storage_bytes": 1472,
+                "peak_transient_product_elements": 4380,
+                "peak_transient_product_bytes": 35040,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 327680,
+                "corresponding_dense_peak_bytes": 2621440,
+                "dense_to_tt_peak_ratio": 1780.8695652173913
+              }
+            },
+            {
+              "maximum_rank": 4,
+              "transfer_maximum_rank": 4,
+              "setup": {
+                "repeats": 1,
+                "seconds": [
+                  0.004934458993375301
+                ],
+                "median_seconds": 0.004934458993375301,
+                "minimum_seconds": 0.004934458993375301,
+                "maximum_seconds": 0.004934458993375301,
+                "maximum_tracemalloc_bytes": 50675,
+                "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+              },
+              "interface": "standalone TTMPOFrontier",
+              "integration_note": "FrontierTiedLETTA(frontier_backend='tensor_train') uses an exact norm frontier and this TT Hamiltonian engine by default. The separately reported all-TT norm is an experimental diagnostic.",
+              "contractor_types": {
+                "norm": "TTMPOFrontier",
+                "hamiltonian": "TTMPOFrontier"
+              },
+              "contraction_is_exact": false,
+              "all_tt_norm_is_positive_real": true,
+              "norm": {
+                "value": {
+                  "real": 1.0423811718013931,
+                  "imaginary": 0.0
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    0.28170487500028685
+                  ],
+                  "median_seconds": 0.28170487500028685,
+                  "minimum_seconds": 0.28170487500028685,
+                  "maximum_seconds": 0.28170487500028685,
+                  "maximum_tracemalloc_bytes": 423964,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "absolute_error": 0.016792303979221934,
+                "relative_error": 0.015854158325524476,
+                "diagnostics": {
+                  "advances": 36,
+                  "total_discarded_weight": 0.06689993131805674,
+                  "max_relative_discarded_weight": 0.0004783233974976003,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 184,
+                  "peak_message_storage_bytes": 1472,
+                  "peak_dense_message_elements": 256,
+                  "peak_dense_message_bytes": 2048,
+                  "peak_product_storage_elements": 2780,
+                  "peak_product_storage_bytes": 22240,
+                  "peak_local_factor_elements": 128,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 0.06544087275354561,
+                  "total_message_discarded_weight": 0.0014590585645111258,
+                  "peak_local_factor_storage_elements": 168,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "hamiltonian_numerator": {
+                "value": {
+                  "real": 9.297950219604407e-05,
+                  "imaginary": 0.0
+                },
+                "timing": {
+                  "repeats": 1,
+                  "seconds": [
+                    1.9412229169975035
+                  ],
+                  "median_seconds": 1.9412229169975035,
+                  "minimum_seconds": 1.9412229169975035,
+                  "maximum_seconds": 1.9412229169975035,
+                  "maximum_tracemalloc_bytes": 13801284,
+                  "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+                },
+                "diagnostics": {
+                  "advances": 36,
+                  "total_discarded_weight": 7060141878.726102,
+                  "max_relative_discarded_weight": 0.9063818807181333,
+                  "maximum_observed_rank": 4,
+                  "peak_message_storage_elements": 680,
+                  "peak_message_storage_bytes": 5440,
+                  "peak_dense_message_elements": 327680,
+                  "peak_dense_message_bytes": 2621440,
+                  "peak_product_storage_elements": 16860,
+                  "peak_product_storage_bytes": 134880,
+                  "peak_local_factor_elements": 409600,
+                  "dense_frontier_absorptions": 0,
+                  "total_local_factor_discarded_weight": 7057947457.188093,
+                  "total_message_discarded_weight": 2194421.5380091434,
+                  "peak_local_factor_storage_elements": 872,
+                  "maximum_local_factor_rank": 4
+                }
+              },
+              "energy": {
+                "real": 8.919913819563851e-05,
+                "imaginary": 0.0
+              },
+              "absolute_energy_error": 0.012047641088346831,
+              "absolute_energy_error_per_site": 0.00033465669689852306,
+              "hybrid_exact_norm_tt_hamiltonian": {
+                "energy": 8.778496093618452e-05,
+                "imaginary_residue": 0.0,
+                "absolute_energy_error": 0.012049055265606285,
+                "exact_norm_peak_elements": 256,
+                "peak_stored_message_elements": 680,
+                "is_default_integrated_architecture": true
+              },
+              "memory": {
+                "dtype_itemsize": 8,
+                "peak_message_storage_elements": 680,
+                "peak_message_storage_bytes": 5440,
+                "peak_transient_product_elements": 16860,
+                "peak_transient_product_bytes": 134880,
+                "storage_note": "message storage is resident boundary-TT storage; the transient product is reported separately and can be larger",
+                "corresponding_dense_peak_elements": 327680,
+                "corresponding_dense_peak_bytes": 2621440,
+                "dense_to_tt_peak_ratio": 481.88235294117646
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

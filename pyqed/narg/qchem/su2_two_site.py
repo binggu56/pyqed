@@ -20,7 +20,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.linalg import eigh
 
 from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
 from .su2_core import (
@@ -41,6 +40,7 @@ from .su2_reduced_tensor import (
     reduced_tensor_from_components,
     validate_reduced_tensor_components,
 )
+from .su2_backend import resolve_su2_narg_backend
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,28 @@ class SectorRoot:
     irrep: Irrep
     local_index: int
     vector: np.ndarray
+
+
+@dataclass(frozen=True)
+class AdaptiveD:
+    """Energy-window rule for choosing how many SU(2) multiplets to retain."""
+
+    D_min: int = 80
+    D_max: int = 1000
+    energy_window: float = 0.25
+    criterion: str = "energy"
+
+    def __post_init__(self):
+        if int(self.D_min) <= 0:
+            raise ValueError("D_min must be positive")
+        if int(self.D_max) <= 0:
+            raise ValueError("D_max must be positive")
+        if int(self.D_min) > int(self.D_max):
+            raise ValueError("D_min cannot exceed D_max")
+        if float(self.energy_window) < 0.0:
+            raise ValueError("energy_window must be non-negative")
+        if str(self.criterion) not in {"energy", "env_energy"}:
+            raise ValueError("criterion must be 'energy' or 'env_energy'")
 
 
 @dataclass
@@ -177,12 +199,19 @@ def build_two_site_su2_narg(h1e, eri, m2: int | None = None) -> TwoSiteSU2NARG:
     return TwoSiteSU2NARG(branch_states, site, bases, provenance, hamiltonian)
 
 
-def diagonalize_sector(narg: TwoSiteSU2NARG, nelec: int, j2: int, nroots: int = 8):
+def diagonalize_sector(
+    narg: TwoSiteSU2NARG,
+    nelec: int,
+    j2: int,
+    nroots: int = 8,
+    *,
+    backend=None,
+):
     """Diagonalize one scalar ``(Ne, j2)`` Hamiltonian block."""
     irrep = Irrep((nelec, j2))
     block = narg.hamiltonian.block(irrep, irrep)
-    evals, evecs = eigh(block)
-    return evals[:nroots], evecs[:, :nroots], block
+    result = resolve_su2_narg_backend(backend).diagonalize_sector(block, nroots=nroots)
+    return result.values, result.vectors, block
 
 
 def diagonalize_all_sectors(
@@ -190,8 +219,11 @@ def diagonalize_all_sectors(
     *,
     allowed_nelec: set[int] | None = None,
     allowed_irreps: set[Irrep] | None = None,
+    nroots: int | None = None,
+    backend=None,
 ) -> list[SectorRoot]:
     """Diagonalize every allowed scalar sector and sort roots by energy."""
+    backend = resolve_su2_narg_backend(backend)
     roots: list[SectorRoot] = []
     for irrep in narg.site.irreps:
         nelec, _ = irrep.charge
@@ -202,7 +234,8 @@ def diagonalize_all_sectors(
         block = narg.hamiltonian.block(irrep, irrep)
         if block.size == 0:
             continue
-        evals, evecs = eigh(block)
+        result = backend.diagonalize_sector(block, nroots=nroots)
+        evals, evecs = result.values, result.vectors
         for local_index, energy in enumerate(evals):
             roots.append(
                 SectorRoot(
@@ -219,15 +252,46 @@ def diagonalize_all_sectors(
 
 def truncate_to_D(
     narg: TwoSiteSU2NARG,
-    D: int,
+    D: int | AdaptiveD,
     *,
     allowed_nelec: set[int] | None = None,
     allowed_irreps: set[Irrep] | None = None,
+    root_scorer=None,
+    backend=None,
 ) -> TruncatedSU2NARG:
-    """Keep the lowest ``D`` SU(2) eigenmultiplets and rebuild block data."""
-    kept = diagonalize_all_sectors(
-        narg, allowed_nelec=allowed_nelec, allowed_irreps=allowed_irreps
-    )[: int(D)]
+    """Keep the selected SU(2) eigenmultiplets and rebuild block data."""
+    nroots = int(D.D_max) if isinstance(D, AdaptiveD) else int(D)
+    roots = diagonalize_all_sectors(
+        narg,
+        allowed_nelec=allowed_nelec,
+        allowed_irreps=allowed_irreps,
+        nroots=nroots,
+        backend=backend,
+    )
+    if isinstance(D, AdaptiveD):
+        scorer = root_scorer if root_scorer is not None else (lambda root: root.energy)
+        scored_roots = [
+            (float(scorer(root)), root)
+            for root in roots
+        ]
+        scored_roots.sort(
+            key=lambda item: (
+                item[0],
+                item[1].energy,
+                item[1].irrep.charge,
+                item[1].local_index,
+            )
+        )
+        if scored_roots:
+            cutoff = scored_roots[0][0] + float(D.energy_window)
+            inside_window = sum(score <= cutoff + 1.0e-12 for score, _ in scored_roots)
+            nkeep = max(int(D.D_min), inside_window)
+            nkeep = min(int(D.D_max), nkeep, len(scored_roots))
+        else:
+            nkeep = 0
+        kept = [root for _, root in scored_roots[:nkeep]]
+    else:
+        kept = roots[: int(D)]
     grouped: dict[Irrep, list[SectorRoot]] = {}
     for root in kept:
         grouped.setdefault(root.irrep, []).append(root)
@@ -337,33 +401,40 @@ def project_primitive_operator_to_truncated(
     return IrrepTensor(truncated.site, truncated.site, op_irrep, blocks)
 
 
-def rotate_operator_to_truncated(truncated: TruncatedSU2NARG, operator: IrrepTensor) -> IrrepTensor:
+def rotate_operator_to_truncated(
+    truncated: TruncatedSU2NARG,
+    operator: IrrepTensor,
+    *,
+    backend=None,
+) -> IrrepTensor:
     """Rotate a source-basis operator with the truncation transform ``U``.
 
     If ``U`` maps retained states into the source branch basis, the rotated
     operator is ``U_bra.conj().T @ O @ U_ket`` block by block.
     """
-    blocks = {}
-    for bra_irrep in truncated.site.irreps:
+    backend = resolve_su2_narg_backend(backend)
+    block_specs = []
+    for (bra_irrep, ket_irrep), old_block in operator.blocks.items():
+        if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+            continue
         source_bra_dim = truncated.source.site.sector_dim(bra_irrep)
-        if source_bra_dim == 0:
+        source_ket_dim = truncated.source.site.sector_dim(ket_irrep)
+        if source_bra_dim == 0 or source_ket_dim == 0:
+            continue
+        if not truncated.site.symmetry.allows(
+            bra_irrep.charge, operator.op.charge, ket_irrep.charge
+        ):
+            continue
+        if old_block.size == 0:
             continue
         u_bra = truncated.transform.block(bra_irrep, bra_irrep)
-        for ket_irrep in truncated.site.irreps:
-            source_ket_dim = truncated.source.site.sector_dim(ket_irrep)
-            if source_ket_dim == 0:
-                continue
-            if not truncated.site.symmetry.allows(
-                bra_irrep.charge, operator.op.charge, ket_irrep.charge
-            ):
-                continue
-            old_block = operator.block(bra_irrep, ket_irrep)
-            if old_block.size == 0:
-                continue
-            u_ket = truncated.transform.block(ket_irrep, ket_irrep)
-            new_block = u_bra.conj().T @ old_block @ u_ket
-            if np.any(np.abs(new_block) > 1e-12):
-                blocks[(bra_irrep, ket_irrep)] = new_block
+        u_ket = truncated.transform.block(ket_irrep, ket_irrep)
+        block_specs.append(((bra_irrep, ket_irrep), u_bra, old_block, u_ket))
+
+    blocks = {}
+    for (bra_irrep, ket_irrep), new_block in backend.rotate_operator_blocks(block_specs):
+        if np.any(np.abs(new_block) > 1e-12):
+            blocks[(bra_irrep, ket_irrep)] = new_block
     return IrrepTensor(truncated.site, truncated.site, operator.op, blocks)
 
 
@@ -391,16 +462,25 @@ def component_operator_specs() -> dict[str, OpIrrep]:
 def build_renormalized_two_site_block(
     h1e,
     eri,
-    D: int = 8,
+    D: int | AdaptiveD = 8,
     *,
     allowed_nelec: set[int] | None = None,
+    allowed_irreps: set[Irrep] | None = None,
+    backend=None,
 ) -> RenormalizedSU2Block:
     """Build a truncated two-site block with rotated coupling operators."""
     if allowed_nelec is None:
         allowed_nelec = {0, 1, 2, 3, 4}
+    backend = resolve_su2_narg_backend(backend)
 
     narg = build_two_site_su2_narg(h1e, eri)
-    truncated = truncate_to_D(narg, D=D, allowed_nelec=allowed_nelec)
+    truncated = truncate_to_D(
+        narg,
+        D=D,
+        allowed_nelec=allowed_nelec,
+        allowed_irreps=allowed_irreps,
+        backend=backend,
+    )
     model = full_jw_model(h1e, eri, nelec=2)
     primitive_ops = {
         "Cdu": model.Cdu,
@@ -413,7 +493,11 @@ def build_renormalized_two_site_block(
     for name, op_irrep in component_operator_specs().items():
         for site_index, primitive_op in enumerate(primitive_ops[name]):
             source = project_primitive_operator(narg, primitive_op, op_irrep)
-            operators[(name, site_index)] = rotate_operator_to_truncated(truncated, source)
+            operators[(name, site_index)] = rotate_operator_to_truncated(
+                truncated,
+                source,
+                backend=backend,
+            )
 
     multiplets = retained_multiplets(truncated)
     reduced_operators = {}
@@ -431,8 +515,12 @@ def build_renormalized_two_site_block(
             OpIrrep((-1, 1)),
         )
 
-    parity_source = project_primitive_operator(narg, primitive_parity_operator(2), OpIrrep((0, 0)))
-    parity = rotate_operator_to_truncated(truncated, parity_source)
+    parity_source = project_primitive_operator(
+        narg,
+        primitive_parity_operator(2),
+        OpIrrep((0, 0)),
+    )
+    parity = rotate_operator_to_truncated(truncated, parity_source, backend=backend)
     block = RenormalizedSU2Block(
         truncated=truncated,
         hamiltonian=truncated.hamiltonian,

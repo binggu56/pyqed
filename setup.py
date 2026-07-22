@@ -3,8 +3,10 @@
 
 """The setup script."""
 
+import glob
 import os
 from pathlib import Path
+import sys
 
 from setuptools import Extension, setup
 from setuptools.command.build_py import build_py as _build_py
@@ -16,23 +18,6 @@ def _is_sync_conflict_copy(module_path):
     return "gugroup" in filename or "bing" in filename and "mac" in filename
 
 
-_EXCLUDED_LEGACY_MODULES = {
-    "pyqed/dvr/sd.py",
-    "pyqed/gw/dmft.py",
-    "pyqed/integral.py",
-    "pyqed/models/ShinMetiuTBE.py",
-    "pyqed/mps/results.py",
-    "pyqed/namd/eckart.py",
-    "pyqed/namd/gmat.py",
-    "pyqed/qchem/dvr/sd.py",
-}
-
-
-def _is_excluded_legacy_module(module_path):
-    normalized = Path(module_path).as_posix()
-    return any(normalized.endswith(path) for path in _EXCLUDED_LEGACY_MODULES)
-
-
 class _CleanBuildPy(_build_py):
     def find_package_modules(self, package, package_dir):
         modules = super().find_package_modules(package, package_dir)
@@ -40,8 +25,39 @@ class _CleanBuildPy(_build_py):
             module
             for module in modules
             if not _is_sync_conflict_copy(module[2])
-            and not _is_excluded_legacy_module(module[2])
         ]
+
+
+def _cpp_include_dirs(np):
+    include_dirs = [np.get_include()]
+    if sys.platform == "darwin":
+        candidates = []
+        sdkroot = os.environ.get("SDKROOT")
+        if sdkroot:
+            candidates.append(f"{sdkroot}/usr/include/c++/v1")
+        candidates.extend(
+            sorted(
+                glob.glob("/Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk/usr/include/c++/v1"),
+                reverse=True,
+            )
+        )
+        candidates.extend(
+            sorted(glob.glob(f"{sys.prefix}/pkgs/libcxx-*/include/c++/v1"), reverse=True)
+        )
+        for path in candidates:
+            if os.path.isdir(path) and path not in include_dirs:
+                include_dirs.append(path)
+                break
+        return include_dirs
+    for pattern in (
+        f"{sys.prefix}/pkgs/libcxx-*/include/c++/v1",
+        f"{sys.prefix}/include/c++/v1",
+    ):
+        for path in sorted(glob.glob(pattern), reverse=True):
+            if path not in include_dirs:
+                include_dirs.append(path)
+                return include_dirs
+    return include_dirs
 
 
 def _optional_extensions():
@@ -49,25 +65,91 @@ def _optional_extensions():
     if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
         return []
 
+    extensions = []
     try:
         import numpy as np
     except Exception:
-        return []
+        np = None
 
-    return [
-        Extension(
-            "pyqed.qchem._basis_cy",
-            ["pyqed/qchem/_basis_cy.c"],
-            include_dirs=[np.get_include()],
-            optional=True,
-        ),
-        Extension(
-            "pyqed.qchem._rys_cy",
-            ["pyqed/qchem/_rys_cy.c"],
-            include_dirs=[np.get_include()],
-            optional=True,
-        ),
-    ]
+    if np is not None:
+        cpp_include_dirs = _cpp_include_dirs(np)
+        cpp_compile_args = (
+            ["/std:c++17", "/O2"]
+            if sys.platform == "win32"
+            else ["-std=c++17", "-O3"]
+        )
+        accelerate_link_args = (
+            ["-framework", "Accelerate"] if sys.platform == "darwin" else []
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._integrals_cpp",
+                ["pyqed/qchem/_integrals.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._casscf_cpp",
+                ["pyqed/qchem/_casscf_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                extra_link_args=accelerate_link_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._gdf_cpp",
+                ["pyqed/qchem/_gdf_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.heom._heom_cpp",
+                ["pyqed/heom/_heom_cpp.cpp"],
+                depends=["pyqed/_dop853.hpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+
+    if np is not None:
+        extensions.append(
+            Extension(
+                "pyqed.qchem._basis_cy",
+                ["pyqed/qchem/_basis_cy.c"],
+                include_dirs=[np.get_include()],
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._rys_cy",
+                ["pyqed/qchem/_rys_cy.c"],
+                include_dirs=[np.get_include()],
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.mps.nonabelian._su2_kernel",
+                ["pyqed/mps/nonabelian/_su2_kernel.c"],
+                include_dirs=[np.get_include()],
+                optional=True,
+            )
+        )
+    return extensions
 
 
 # Project metadata lives in pyproject.toml.  This small compatibility hook is

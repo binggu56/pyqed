@@ -14,6 +14,10 @@ import numpy as np
 
 CYTHON_AVAILABLE = False
 accumulate_bilinear = None
+product_tensor_estimate_entries = None
+product_tensor_pair_entries = None
+product_tensor_group_indices = None
+scalar_product_pair_entries = None
 
 
 if (
@@ -31,9 +35,29 @@ if (
             setup_args={"include_dirs": np.get_include()},
         )
         from .su2_cython_kernels import accumulate_bilinear as _accumulate_bilinear
+        from .su2_cython_kernels import (
+            product_tensor_estimate_entries as _product_tensor_estimate_entries,
+        )
+        from .su2_cython_kernels import (
+            product_tensor_pair_entries as _product_tensor_pair_entries,
+        )
+        from .su2_cython_kernels import (
+            product_tensor_group_indices as _product_tensor_group_indices,
+        )
+        from .su2_cython_kernels import (
+            scalar_product_pair_entries as _scalar_product_pair_entries,
+        )
 
         accumulate_bilinear = _accumulate_bilinear
+        product_tensor_estimate_entries = _product_tensor_estimate_entries
+        product_tensor_pair_entries = _product_tensor_pair_entries
+        product_tensor_group_indices = _product_tensor_group_indices
+        scalar_product_pair_entries = _scalar_product_pair_entries
         CYTHON_AVAILABLE = True
     except Exception:
         CYTHON_AVAILABLE = False
         accumulate_bilinear = None
+        product_tensor_estimate_entries = None
+        product_tensor_pair_entries = None
+        product_tensor_group_indices = None
+        scalar_product_pair_entries = None

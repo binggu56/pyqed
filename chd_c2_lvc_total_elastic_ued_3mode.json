@@ -1,0 +1,27 @@
+{
+  "method": "elastic first-Born charge-density UED, arbitrary common scale",
+  "excitation_fraction": 0.06,
+  "states": [
+    "ground",
+    "paper-frame 3px",
+    "paper-frame 3py"
+  ],
+  "vibrational_modes": [
+    5,
+    8,
+    26
+  ],
+  "included": [
+    "point-nuclear charge amplitude",
+    "SA-CASSCF diagonal and 3px/3py transition densities",
+    "three-mode LVC populations, coherence, and conditional nuclear motion",
+    "ground/excited ensemble mixture",
+    "s^-4 electron-diffraction envelope"
+  ],
+  "not_included": [
+    "electronic or vibrational inelastic scattering",
+    "rotational averaging and pump photoselection",
+    "detector response, lifetime, and temporal convolution",
+    "absolute instrument normalization"
+  ]
+}

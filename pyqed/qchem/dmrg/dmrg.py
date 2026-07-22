@@ -3824,6 +3824,12 @@ class DMRG(CASCI):
                 self.H = carrier.factors
                 self._hamiltonian_mpo_cache_key = cache_key
                 self._symmetric_mpo_cache = {}
+                if self.spatial_family_environment_backend == "generator_table":
+                    family_pipeline_stage = "native_generator_tables"
+                elif family_tensor_mpos:
+                    family_pipeline_stage = "block2_table_family_mpos"
+                else:
+                    family_pipeline_stage = "carrier_only"
                 self._active_integral_build_info.update(
                     {
                         **carrier.info,
@@ -3834,7 +3840,7 @@ class DMRG(CASCI):
                         "spatial_native_p_grouping": self.spatial_native_p_grouping,
                         "pipeline": (
                             "qchem_integrals->spatial_d4_carrier_scaffold"
-                            "->block2_table_family_mpos"
+                            f"->{family_pipeline_stage}"
                         ),
                         "build_timings": dict(build_timings),
                         **self._spatial_family_build_metadata(

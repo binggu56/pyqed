@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.linalg import null_space
+from scipy.optimize import minimize_scalar
 
 
 @dataclass
@@ -20,6 +22,11 @@ class ConditionalTwoSiteResult:
     basis: np.ndarray
     conditional_vectors: np.ndarray
     mode: str
+    dressing: str = "none"
+    undressed_energies: np.ndarray | None = None
+    discarded_residual_norm: float = 0.0
+    dressing_scale: float = 0.0
+    dressing_mixing: float = 0.0
 
 
 @dataclass
@@ -119,7 +126,261 @@ def _rebranched_basis_matrix(conditional_vectors, dims):
     return basis
 
 
-def conditional_two_site_narg(h01, h012, dims, keep, *, mode="rebranched", nroots=1):
+def _conditional_direct_sum_basis(conditional_vectors):
+    vectors = np.asarray(conditional_vectors, dtype=complex)
+    if vectors.ndim < 3:
+        raise ValueError(
+            "conditional_vectors must have shape (*branches, active_dim, states)."
+        )
+    branch_shape = vectors.shape[:-2]
+    active_dim, states = vectors.shape[-2:]
+    nbranches = int(np.prod(branch_shape))
+    flat = vectors.reshape(nbranches, active_dim, states)
+    basis = np.zeros((active_dim * nbranches, nbranches * states), dtype=complex)
+    active = np.arange(active_dim, dtype=int)
+    state = np.arange(states, dtype=int)
+    for branch in range(nbranches):
+        rows = active * nbranches + branch
+        columns = branch * states + state
+        basis[np.ix_(rows, columns)] = flat[branch]
+    return basis
+
+
+def conditional_cc_dress_basis(
+    hamiltonian,
+    conditional_vectors,
+    keep,
+    *,
+    level_shift=0.0,
+    max_scale=4.0,
+):
+    """Dress a conditional direct-sum basis with one state-specific CC response.
+
+    The complete conditional eigenvectors define branchwise retained and
+    discarded spaces.  A linear discarded-space response is computed for the
+    projected ground state, then one retained direction per branch is rotated
+    toward its discarded response.  A scalar line search keeps the update
+    variational and preserves the number and direct-sum structure of the
+    conditional basis.
+    """
+    vectors = np.asarray(conditional_vectors, dtype=complex)
+    if vectors.ndim < 3 or vectors.shape[-2] != vectors.shape[-1]:
+        raise ValueError(
+            "conditional_vectors must contain complete branch bases with shape "
+            "(*branches, active_dim, active_dim)."
+        )
+    branch_shape = vectors.shape[:-2]
+    active_dim = int(vectors.shape[-2])
+    nbranches = int(np.prod(branch_shape))
+    expected_dim = active_dim * nbranches
+    hamiltonian = _as_hermitian(hamiltonian)
+    if hamiltonian.shape != (expected_dim, expected_dim):
+        raise ValueError(
+            f"hamiltonian must have shape {(expected_dim, expected_dim)}, "
+            f"got {hamiltonian.shape}."
+        )
+    keep = min(int(keep), active_dim)
+    if keep < 1:
+        raise ValueError("keep must be positive.")
+    if float(max_scale) <= 0.0:
+        raise ValueError("max_scale must be positive.")
+
+    retained = vectors[..., :keep]
+    discarded = vectors[..., keep:]
+    basis = _conditional_direct_sum_basis(retained)
+    projected = _as_hermitian(basis.conj().T @ (hamiltonian @ basis))
+    values, coefficients = np.linalg.eigh(projected)
+    undressed_energy = float(values[0])
+
+    if keep == active_dim:
+        return retained, {
+            "undressed_energy": undressed_energy,
+            "discarded_residual_norm": 0.0,
+            "scale": 0.0,
+        }
+
+    complement = _conditional_direct_sum_basis(discarded)
+    hpq = basis.conj().T @ (hamiltonian @ complement)
+    hqq = _as_hermitian(complement.conj().T @ (hamiltonian @ complement))
+    ground = coefficients[:, 0]
+    residual = hpq.conj().T @ ground
+    residual_norm = float(np.linalg.norm(residual))
+    if residual_norm <= 1.0e-14:
+        return retained, {
+            "undressed_energy": undressed_energy,
+            "discarded_residual_norm": residual_norm,
+            "scale": 0.0,
+        }
+
+    shifted = hqq + (float(level_shift) - undressed_energy) * np.eye(hqq.shape[0])
+    response = np.linalg.lstsq(shifted, -residual, rcond=1.0e-12)[0]
+
+    retained_flat = retained.reshape(nbranches, active_dim, keep)
+    discarded_flat = discarded.reshape(nbranches, active_dim, active_dim - keep)
+    ground_flat = ground.reshape(nbranches, keep)
+    response_flat = response.reshape(nbranches, active_dim - keep)
+    branch_data = []
+    for branch in range(nbranches):
+        retained_norm = float(np.linalg.norm(ground_flat[branch]))
+        response_norm = float(np.linalg.norm(response_flat[branch]))
+        if retained_norm <= 1.0e-14 or response_norm <= 1.0e-14:
+            branch_data.append(None)
+            continue
+        retained_direction = ground_flat[branch] / retained_norm
+        retained_complement = null_space(retained_direction.conj()[None, :])
+        rotation = np.column_stack((retained_direction, retained_complement))
+        rotated = retained_flat[branch] @ rotation
+        discarded_direction = discarded_flat[branch] @ (
+            response_flat[branch] / response_norm
+        )
+        branch_data.append(
+            (rotated, discarded_direction, response_norm / retained_norm)
+        )
+
+    def dressed_vectors(scale):
+        out = retained_flat.copy()
+        for branch, data in enumerate(branch_data):
+            if data is None:
+                continue
+            rotated, discarded_direction, amplitude_ratio = data
+            angle = np.arctan(float(scale) * amplitude_ratio)
+            out[branch, :, 0] = (
+                np.cos(angle) * rotated[:, 0]
+                + np.sin(angle) * discarded_direction
+            )
+            out[branch, :, 1:] = rotated[:, 1:]
+        return out.reshape(*branch_shape, active_dim, keep)
+
+    def ground_energy(scale):
+        trial_basis = _conditional_direct_sum_basis(dressed_vectors(scale))
+        trial_hamiltonian = _as_hermitian(
+            trial_basis.conj().T @ (hamiltonian @ trial_basis)
+        )
+        return float(np.linalg.eigvalsh(trial_hamiltonian)[0])
+
+    optimum = minimize_scalar(
+        ground_energy,
+        bounds=(0.0, float(max_scale)),
+        method="bounded",
+        options={"xatol": 1.0e-10},
+    )
+    if not optimum.success or float(optimum.fun) >= undressed_energy - 1.0e-13:
+        scale = 0.0
+        dressed = retained
+    else:
+        scale = float(optimum.x)
+        dressed = dressed_vectors(scale)
+    return dressed, {
+        "undressed_energy": undressed_energy,
+        "discarded_residual_norm": residual_norm,
+        "scale": scale,
+    }
+
+
+def conditional_cc_transition_basis(
+    hamiltonian,
+    conditional_vectors,
+    keep,
+    *,
+    level_shift=0.0,
+):
+    """Add one cross-branch conditional-CC response at fixed model dimension.
+
+    Unlike ``conditional_cc_dress_basis``, this response may map a retained
+    state on branch ``t`` into a discarded state on another branch ``s``.  The
+    returned isometry is therefore a conditional basis followed by one
+    transition layer, rather than a strict branch-direct-sum basis.
+    """
+    vectors = np.asarray(conditional_vectors, dtype=complex)
+    if vectors.ndim < 3 or vectors.shape[-2] != vectors.shape[-1]:
+        raise ValueError(
+            "conditional_vectors must contain complete branch bases with shape "
+            "(*branches, active_dim, active_dim)."
+        )
+    active_dim = int(vectors.shape[-2])
+    keep = min(int(keep), active_dim)
+    if keep < 1:
+        raise ValueError("keep must be positive.")
+
+    retained = vectors[..., :keep]
+    basis = _conditional_direct_sum_basis(retained)
+    hamiltonian = _as_hermitian(hamiltonian)
+    if (
+        hamiltonian.shape[0] != basis.shape[0]
+        or hamiltonian.shape[1] != basis.shape[0]
+    ):
+        raise ValueError("hamiltonian shape is inconsistent with conditional_vectors.")
+    projected = _as_hermitian(basis.conj().T @ (hamiltonian @ basis))
+    values, coefficients = np.linalg.eigh(projected)
+    undressed_energy = float(values[0])
+    if keep == active_dim:
+        return basis, {
+            "undressed_energy": undressed_energy,
+            "discarded_residual_norm": 0.0,
+            "mixing": 0.0,
+        }
+
+    discarded = vectors[..., keep:]
+    complement = _conditional_direct_sum_basis(discarded)
+    hpq = basis.conj().T @ (hamiltonian @ complement)
+    hqq = _as_hermitian(complement.conj().T @ (hamiltonian @ complement))
+    ground = coefficients[:, 0]
+    residual = hpq.conj().T @ ground
+    residual_norm = float(np.linalg.norm(residual))
+    if residual_norm <= 1.0e-14:
+        return basis, {
+            "undressed_energy": undressed_energy,
+            "discarded_residual_norm": residual_norm,
+            "mixing": 0.0,
+        }
+
+    shifted = hqq + (float(level_shift) - undressed_energy) * np.eye(hqq.shape[0])
+    response = np.linalg.lstsq(shifted, -residual, rcond=1.0e-12)[0]
+    response_norm = float(np.linalg.norm(response))
+    if response_norm <= 1.0e-14:
+        return basis, {
+            "undressed_energy": undressed_energy,
+            "discarded_residual_norm": residual_norm,
+            "mixing": 0.0,
+        }
+    response_direction = response / response_norm
+    coupling = np.vdot(ground, hpq @ response_direction)
+    response_energy = float(
+        np.real(np.vdot(response_direction, hqq @ response_direction))
+    )
+    pair_hamiltonian = np.array(
+        [
+            [undressed_energy, coupling],
+            [coupling.conjugate(), response_energy],
+        ],
+        dtype=complex,
+    )
+    _pair_values, pair_vectors = np.linalg.eigh(pair_hamiltonian)
+    retained_weight, discarded_weight = pair_vectors[:, 0]
+    dressed_ground = (
+        retained_weight * (basis @ ground)
+        + discarded_weight * (complement @ response_direction)
+    )
+    dressed_basis = np.column_stack((dressed_ground, basis @ coefficients[:, 1:]))
+    return dressed_basis, {
+        "undressed_energy": undressed_energy,
+        "discarded_residual_norm": residual_norm,
+        "mixing": float(abs(discarded_weight) ** 2),
+    }
+
+
+def conditional_two_site_narg(
+    h01,
+    h012,
+    dims,
+    keep,
+    *,
+    mode="rebranched",
+    nroots=1,
+    dressing=None,
+    cc_level_shift=0.0,
+    cc_max_scale=4.0,
+):
     """Project a three-mode Hamiltonian into a conditional NARG basis.
 
     Parameters
@@ -137,6 +398,11 @@ def conditional_two_site_narg(h01, h012, dims, keep, *, mode="rebranched", nroot
         ``"sequential"`` keeps the old site-0 basis conditioned only on site 1.
         ``"rebranched"`` recomputes that site-0 basis for each ``(site 1,
         site 2)`` branch.
+    dressing
+        ``"conditional_cc"`` applies an experimental cross-branch,
+        state-specific rank-one CC response to a rebranched basis.
+        ``"conditional_cc_branch"`` restricts the response to rotations
+        within each branch.
     """
     dims = tuple(int(d) for d in dims)
     if len(dims) != 3 or any(d < 1 for d in dims):
@@ -144,20 +410,86 @@ def conditional_two_site_narg(h01, h012, dims, keep, *, mode="rebranched", nroot
     keep = int(keep)
     if keep < 1:
         raise ValueError("keep must be positive.")
+    keep = min(keep, dims[0])
     mode = str(mode).lower().replace("-", "_")
+    dressing_key = (
+        "none" if dressing is None else str(dressing).lower().replace("-", "_")
+    )
+    if dressing_key in {"none", "off", "false"}:
+        dressing_key = "none"
+    elif dressing_key in {
+        "conditional_cc",
+        "conditional_cc_transition",
+        "transition_cc",
+        "cc",
+        "rank1_cc",
+    }:
+        dressing_key = "conditional_cc"
+    elif dressing_key in {"conditional_cc_branch", "branch_cc"}:
+        dressing_key = "conditional_cc_branch"
+    else:
+        raise ValueError(
+            "dressing must be None, 'conditional_cc', or "
+            "'conditional_cc_branch'."
+        )
+
+    h012 = _as_hermitian(h012)
+    undressed_values = None
+    discarded_residual_norm = 0.0
+    dressing_scale = 0.0
+    dressing_mixing = 0.0
 
     if mode in {"sequential", "one_site", "old"}:
+        if dressing_key != "none":
+            raise ValueError(
+                "conditional_cc dressing currently requires mode='rebranched'."
+            )
         _energies, conditional_vectors = sequential_conditional_basis(h01, dims, keep)
         basis = _sequential_basis_matrix(conditional_vectors, dims)
         canonical_mode = "sequential"
     elif mode in {"rebranched", "two_site", "true_two_site"}:
-        _energies, conditional_vectors = rebranched_conditional_basis(h012, dims, keep)
-        basis = _rebranched_basis_matrix(conditional_vectors, dims)
+        if dressing_key == "none":
+            _energies, conditional_vectors = rebranched_conditional_basis(h012, dims, keep)
+        else:
+            _energies, complete_vectors = rebranched_conditional_basis(
+                h012,
+                dims,
+                dims[0],
+            )
+            undressed_vectors = complete_vectors[..., :keep]
+            undressed_basis = _rebranched_basis_matrix(undressed_vectors, dims)
+            undressed_projected = _as_hermitian(
+                undressed_basis.conj().T @ (h012 @ undressed_basis)
+            )
+            undressed_values, _ = _lowest_eigenvectors(undressed_projected, nroots)
+            if dressing_key == "conditional_cc_branch":
+                conditional_vectors, diagnostics = conditional_cc_dress_basis(
+                    h012,
+                    complete_vectors,
+                    keep,
+                    level_shift=cc_level_shift,
+                    max_scale=cc_max_scale,
+                )
+                basis = _rebranched_basis_matrix(conditional_vectors, dims)
+                dressing_scale = diagnostics["scale"]
+            else:
+                basis, diagnostics = conditional_cc_transition_basis(
+                    h012,
+                    complete_vectors,
+                    keep,
+                    level_shift=cc_level_shift,
+                )
+                # Cross-branch T^{st} cannot be encoded by branch-local
+                # conditional vectors alone; ``basis`` carries that layer.
+                conditional_vectors = undressed_vectors
+                dressing_mixing = diagnostics["mixing"]
+            discarded_residual_norm = diagnostics["discarded_residual_norm"]
+        if dressing_key == "none":
+            basis = _rebranched_basis_matrix(conditional_vectors, dims)
         canonical_mode = "rebranched"
     else:
         raise ValueError("mode must be 'sequential' or 'rebranched'.")
 
-    h012 = _as_hermitian(h012)
     projected = basis.conj().T @ (h012 @ basis)
     projected = _as_hermitian(projected)
     values, vectors = _lowest_eigenvectors(projected, nroots)
@@ -168,6 +500,11 @@ def conditional_two_site_narg(h01, h012, dims, keep, *, mode="rebranched", nroot
         basis=basis,
         conditional_vectors=conditional_vectors,
         mode=canonical_mode,
+        dressing=dressing_key,
+        undressed_energies=undressed_values,
+        discarded_residual_norm=discarded_residual_norm,
+        dressing_scale=dressing_scale,
+        dressing_mixing=dressing_mixing,
     )
 
 
@@ -303,6 +640,8 @@ def rolling_conditional_narg(
 __all__ = [
     "ConditionalTwoSiteResult",
     "RollingConditionalNARGResult",
+    "conditional_cc_dress_basis",
+    "conditional_cc_transition_basis",
     "conditional_two_site_narg",
     "rebranched_conditional_basis",
     "rolling_conditional_basis_matrix",

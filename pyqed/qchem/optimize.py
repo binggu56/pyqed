@@ -12,7 +12,8 @@ import numpy as np
 from opt_einsum import contract
 
 def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
-             rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='SD'):
+             rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='SD',
+             gradient_fn=None, max_iter=1000, return_info=False):
     """
     Implicit Steepest Descent Method for Optimization
     with Orthogonality Constraints (Implicit–SD)
@@ -47,10 +48,12 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
     """
 
     n, p = X0.shape
+    grad_fn = gradient if gradient_fn is None else gradient_fn
 
     Q0 = 1
     k = 0
     C = f(X0, *args)
+    v = C
     Id = np.identity(n)
 
     X = X0
@@ -59,10 +62,11 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
     # tauM = 2
 
     Q = Q0
-    G = gradient(X0, *args)
+    G = grad_fn(X0, *args)
     # print('gradient', G)
 
     df = grad(X, G)
+    initial_grad_norm = norm(df)
     
     if algorithm == 'CN':
         theta = 0.5
@@ -77,7 +81,7 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
     def update(A, X, theta, tau):
         return np.linalg.solve(Id + tau * theta * A, X - tau * (1-theta) * A @ X)
 
-    while norm(df) > epsilon:
+    while norm(df) > epsilon and k < max_iter:
 
         A = G @ X.T - X @ G.T
         
@@ -86,7 +90,7 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
 
         while f(Y, *args) > C + rho1 * tau * (-1/2 * norm(A)**2):
             tau = tau * delta
-            Y = project(np.linalg.inv(Id + tau * A) @ X)
+            Y = project(update(A, X, theta, tau))
 
         Xnew = Y
         Qnew = eta * Q + 1
@@ -95,7 +99,7 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
         # print('energy = ', v)
 
         Cnew = (eta * Q * C + v)/Qnew
-        Gnew = gradient(Xnew, *args)
+        Gnew = grad_fn(Xnew, *args)
 
         df_new = grad(Xnew, Gnew)
 
@@ -111,6 +115,17 @@ def minimize(f, X0, args=(), tau=1, taum=1e-15, tauM=2, eta=0.85,
         G = Gnew
         df = df_new
 
+    if return_info:
+        grad_norm = norm(df)
+        return X, v, {
+            "objective": v,
+            "grad_norm": grad_norm,
+            "initial_grad_norm": initial_grad_norm,
+            "iterations": k,
+            "converged": grad_norm <= epsilon,
+            "tau": tau,
+            "algorithm": algorithm,
+        }
     return X, v
 
 
@@ -222,17 +237,24 @@ def stepsize(k, dU, dG):
         DESCRIPTION.
 
     """
+    dgdg = inner(dG, dG)
+    dudg = inner(dU, dG)
+    dudu = inner(dU, dU)
+    eps = 1.0e-30
+    if abs(dgdg) < eps or abs(dudg) < eps:
+        return 1.0
+
     if k % 2 == 0:
         # even
         # dU = U - Uprev
         # dG = G - Gprev
-        tau = abs(inner(dU, dG))/inner(dG, dG)
+        tau = abs(dudg)/dgdg
 
     else:
         # odd
         # dU = U - Uprev
         # dG = G - Gprev
-        tau = inner(dU, dU)/abs(inner(dU, dG))
+        tau = dudu/abs(dudg)
 
     return tau
 

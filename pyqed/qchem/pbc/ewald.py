@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -185,6 +186,263 @@ def short_range_point_charge_s(a, b, center, eta):
     return short_range_point_charge(a, b, center, eta)
 
 
+def _basis_fn_signature(fn):
+    return (
+        tuple(int(x) for x in fn.shell),
+        tuple(float(x) for x in fn.origin),
+        tuple(float(x) for x in fn.exps),
+        tuple(float(x) for x in fn.prim_weights),
+    )
+
+
+def _canonical_pair_signatures(sig_a, sig_b):
+    return (sig_a, sig_b) if sig_a <= sig_b else (sig_b, sig_a)
+
+
+@lru_cache(maxsize=262144)
+def _short_range_single_gaussian_coulomb_cached(
+    a, l1, m1, n1, Ax, Ay, Az,
+    b, l2, m2, n2, Bx, By, Bz,
+    eta,
+):
+    p = a
+    q = b
+    theta = p * q / (p + q)
+    theta_lr = None if eta == 0.0 else theta * eta * eta / (theta + eta * eta)
+    lr_scale = 0.0 if eta == 0.0 else eta / math.sqrt(theta + eta * eta)
+    dx = Ax - Bx
+    dy = Ay - By
+    dz = Az - Bz
+    rab = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    primitive_full = 0.0
+    primitive_lr = 0.0
+    for t in range(l1 + 1):
+        ex_a = E(l1, 0, t, 0.0, a, 0.0)
+        for u in range(m1 + 1):
+            exy_a = ex_a * E(m1, 0, u, 0.0, a, 0.0)
+            for v in range(n1 + 1):
+                xyz_a = exy_a * E(n1, 0, v, 0.0, a, 0.0)
+                for tau in range(l2 + 1):
+                    ex_b = E(l2, 0, tau, 0.0, b, 0.0)
+                    for nu in range(m2 + 1):
+                        exy_b = ex_b * E(m2, 0, nu, 0.0, b, 0.0)
+                        for phi in range(n2 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            coeff = (
+                                xyz_a
+                                * exy_b
+                                * E(n2, 0, phi, 0.0, b, 0.0)
+                                * sign
+                            )
+                            primitive_full += coeff * R(
+                                t + tau,
+                                u + nu,
+                                v + phi,
+                                0,
+                                theta,
+                                dx,
+                                dy,
+                                dz,
+                                rab,
+                            )
+                            if theta_lr is not None:
+                                primitive_lr += coeff * R(
+                                    t + tau,
+                                    u + nu,
+                                    v + phi,
+                                    0,
+                                    theta_lr,
+                                    dx,
+                                    dy,
+                                    dz,
+                                    rab,
+                                )
+
+    prefactor = 2.0 * math.pi ** 2.5 / (p * q * math.sqrt(p + q))
+    return prefactor * (primitive_full - lr_scale * primitive_lr)
+
+
+@lru_cache(maxsize=262144)
+def _short_range_three_center_coulomb_cached(
+    a, l1, m1, n1, Ax, Ay, Az,
+    b, l2, m2, n2, Bx, By, Bz,
+    c, l3, m3, n3, Cx, Cy, Cz,
+    eta,
+):
+    p = a + b
+    q = c
+    theta = p * q / (p + q)
+    theta_lr = None if eta == 0.0 else theta * eta * eta / (theta + eta * eta)
+    lr_scale = 0.0 if eta == 0.0 else eta / math.sqrt(theta + eta * eta)
+    px = (a * Ax + b * Bx) / p
+    py = (a * Ay + b * By) / p
+    pz = (a * Az + b * Bz) / p
+    dx = px - Cx
+    dy = py - Cy
+    dz = pz - Cz
+    rpc = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    abx = Ax - Bx
+    aby = Ay - By
+    abz = Az - Bz
+
+    primitive_full = 0.0
+    primitive_lr = 0.0
+    for t in range(l1 + l2 + 1):
+        ex_ab = E(l1, l2, t, abx, a, b)
+        for u in range(m1 + m2 + 1):
+            exy_ab = ex_ab * E(m1, m2, u, aby, a, b)
+            for v in range(n1 + n2 + 1):
+                xyz_ab = exy_ab * E(n1, n2, v, abz, a, b)
+                for tau in range(l3 + 1):
+                    ex_c = E(l3, 0, tau, 0.0, c, 0.0)
+                    for nu in range(m3 + 1):
+                        exy_c = ex_c * E(m3, 0, nu, 0.0, c, 0.0)
+                        for phi in range(n3 + 1):
+                            sign = -1.0 if ((tau + nu + phi) & 1) else 1.0
+                            coeff = (
+                                xyz_ab
+                                * exy_c
+                                * E(n3, 0, phi, 0.0, c, 0.0)
+                                * sign
+                            )
+                            primitive_full += coeff * R(
+                                t + tau,
+                                u + nu,
+                                v + phi,
+                                0,
+                                theta,
+                                dx,
+                                dy,
+                                dz,
+                                rpc,
+                            )
+                            if theta_lr is not None:
+                                primitive_lr += coeff * R(
+                                    t + tau,
+                                    u + nu,
+                                    v + phi,
+                                    0,
+                                    theta_lr,
+                                    dx,
+                                    dy,
+                                    dz,
+                                    rpc,
+                                )
+
+    prefactor = 2.0 * math.pi ** 2.5 / (p * q * math.sqrt(p + q))
+    return prefactor * (primitive_full - lr_scale * primitive_lr)
+
+
+@lru_cache(maxsize=262144)
+def _short_range_two_center_from_signatures_cached(sig_a, sig_b, eta):
+    shell_a, origin_a, exps_a, weights_a = sig_a
+    shell_b, origin_b, exps_b, weights_b = sig_b
+
+    value = 0.0
+    for ia, wa in enumerate(weights_a):
+        for ib, wb in enumerate(weights_b):
+            value += wa * wb * _short_range_single_gaussian_coulomb_cached(
+                exps_a[ia],
+                shell_a[0],
+                shell_a[1],
+                shell_a[2],
+                origin_a[0],
+                origin_a[1],
+                origin_a[2],
+                exps_b[ib],
+                shell_b[0],
+                shell_b[1],
+                shell_b[2],
+                origin_b[0],
+                origin_b[1],
+                origin_b[2],
+                eta,
+            )
+    return value
+
+
+@lru_cache(maxsize=524288)
+def _short_range_three_center_from_signatures_cached(sig_a, sig_b, sig_c, eta):
+    shell_a, origin_a, exps_a, weights_a = sig_a
+    shell_b, origin_b, exps_b, weights_b = sig_b
+    shell_c, origin_c, exps_c, weights_c = sig_c
+
+    value = 0.0
+    for ia, wa in enumerate(weights_a):
+        for ib, wb in enumerate(weights_b):
+            for ic, wc in enumerate(weights_c):
+                value += wa * wb * wc * _short_range_three_center_coulomb_cached(
+                    exps_a[ia],
+                    shell_a[0],
+                    shell_a[1],
+                    shell_a[2],
+                    origin_a[0],
+                    origin_a[1],
+                    origin_a[2],
+                    exps_b[ib],
+                    shell_b[0],
+                    shell_b[1],
+                    shell_b[2],
+                    origin_b[0],
+                    origin_b[1],
+                    origin_b[2],
+                    exps_c[ic],
+                    shell_c[0],
+                    shell_c[1],
+                    shell_c[2],
+                    origin_c[0],
+                    origin_c[1],
+                    origin_c[2],
+                    eta,
+                )
+    return value
+
+
+def short_range_two_center_coulomb(a, b, eta):
+    """
+    Contracted auxiliary metric element with erfc(eta*r12)/r12.
+
+    Returns ``(a|b)_SR``. ``eta=0`` recovers the full Coulomb metric.
+    """
+    eta = float(eta)
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    sig_a, sig_b = _canonical_pair_signatures(
+        _basis_fn_signature(a),
+        _basis_fn_signature(b),
+    )
+    return float(
+        _short_range_two_center_from_signatures_cached(sig_a, sig_b, round(eta, 14))
+    )
+
+
+def short_range_three_center_eri(a, b, c, eta):
+    """
+    Contracted three-center integral with erfc(eta*r12)/r12.
+
+    Returns ``(ab|c)_SR``. ``eta=0`` recovers the full three-center Coulomb
+    integral.
+    """
+    eta = float(eta)
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    sig_a, sig_b = _canonical_pair_signatures(
+        _basis_fn_signature(a),
+        _basis_fn_signature(b),
+    )
+    sig_c = _basis_fn_signature(c)
+    return float(
+        _short_range_three_center_from_signatures_cached(
+            sig_a,
+            sig_b,
+            sig_c,
+            round(eta, 14),
+        )
+    )
+
+
 def short_range_nuclear_attraction_matrix_s(
     charges,
     coords,
@@ -327,8 +585,56 @@ def short_range_eri(a, b, c, d, eta):
     return float(value)
 
 
+def _short_range_eri_ssss(a, b, c, d, eta):
+    eta = float(eta)
+    a_origin = np.asarray(a.origin, dtype=float)
+    b_origin = np.asarray(b.origin, dtype=float)
+    c_origin = np.asarray(c.origin, dtype=float)
+    d_origin = np.asarray(d.origin, dtype=float)
+    ab2 = float(np.dot(a_origin - b_origin, a_origin - b_origin))
+    cd2 = float(np.dot(c_origin - d_origin, c_origin - d_origin))
+
+    value = 0.0
+    for ia, wa in enumerate(a.prim_weights):
+        alpha = float(a.exps[ia])
+        for ib, wb in enumerate(b.prim_weights):
+            beta = float(b.exps[ib])
+            p = alpha + beta
+            p_center = (alpha * a_origin + beta * b_origin) / p
+            kab = math.exp(-alpha * beta / p * ab2)
+            for ic, wc in enumerate(c.prim_weights):
+                gamma = float(c.exps[ic])
+                for id_, wd in enumerate(d.prim_weights):
+                    delta = float(d.exps[id_])
+                    q = gamma + delta
+                    q_center = (gamma * c_origin + delta * d_origin) / q
+                    kcd = math.exp(-gamma * delta / q * cd2)
+                    diff = p_center - q_center
+                    rpq2 = float(np.dot(diff, diff))
+                    theta = p * q / (p + q)
+                    prefactor = (
+                        2.0 * math.pi ** 2.5 * kab * kcd / (p * q * math.sqrt(p + q))
+                    )
+
+                    primitive = _boys0(theta * rpq2)
+                    if eta != 0.0:
+                        theta_lr = theta * eta * eta / (theta + eta * eta)
+                        lr_scale = eta / math.sqrt(theta + eta * eta)
+                        primitive -= lr_scale * _boys0(theta_lr * rpq2)
+
+                    value += wa * wb * wc * wd * prefactor * primitive
+    return float(value)
+
+
 def short_range_eri_s(a, b, c, d, eta):
     """Backward-compatible alias for range-separated ERIs."""
+    if (
+        tuple(int(x) for x in a.shell) == (0, 0, 0)
+        and tuple(int(x) for x in b.shell) == (0, 0, 0)
+        and tuple(int(x) for x in c.shell) == (0, 0, 0)
+        and tuple(int(x) for x in d.shell) == (0, 0, 0)
+    ):
+        return _short_range_eri_ssss(a, b, c, d, eta)
     return short_range_eri(a, b, c, d, eta)
 
 

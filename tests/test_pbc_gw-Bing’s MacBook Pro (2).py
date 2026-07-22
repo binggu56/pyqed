@@ -1,0 +1,4639 @@
+import numpy as np
+import pytest
+
+import pyqed.pbc.gw.integrals as gw_integrals
+from pyqed.pbc.gw import (
+    FULL_EWALD,
+    DiagonalSelfEnergyCache,
+    GammaPBCSCFAdapter,
+    GDF,
+    gdf_orbital_pair_coupling,
+    gdf_transition_factors,
+    gdf_transition_metric,
+    KBSE,
+    KGW,
+    KPointSCFAdapter,
+    KPointTransitionSpace,
+    KTDA,
+    PYSCF_GDF,
+    RECIPROCAL_EWALD_LR,
+    SHORT_RANGE_EWALD,
+    build_transition_space,
+    dense_gamma_orbital_pair_coupling,
+    dense_gamma_orbital_pair_metric,
+    dense_gamma_transition_metric,
+    diagonal_correlation_self_energy,
+    diagonal_evgw,
+    diagonal_finite_size_correction,
+    diagonal_g0w0,
+    direct_rpa,
+    direct_tdh_matrices,
+    full_ewald_orbital_pair_coupling,
+    full_ewald_orbital_pair_metric,
+    full_ewald_transition_metric,
+    normalize_coulomb_component,
+    periodic_bse,
+    periodic_bse_matrices,
+    periodic_bse_spectrum,
+    periodic_tda,
+    periodic_tda_spectrum,
+    prebuild_gdf_q_ao_stores,
+    pyscf_gdf_orbital_pair_coupling,
+    pyscf_gdf_transition_factors,
+    pyscf_gdf_transition_metric,
+    reciprocal_orbital_pair_factors,
+    reciprocal_transition_factors,
+    screened_interaction_poles,
+)
+from pyqed.pbc.gw.self_energy import _scaled_legendre_roots
+from pyqed.pbc.gw.integrals import _gdf_image_keys
+from pyqed.qchem.basis import (
+    ContractedGaussian,
+    _basis_cy,
+    _basis_path,
+    _cart_shell_blocks,
+    _pack_signatures_for_numba,
+    make_contractions,
+    parse_gbs,
+    three_center_eri,
+    two_center_coulomb,
+)
+from pyqed.qchem.pbc import Cell
+from pyqed.qchem.pbc.ewald import (
+    _basis_fn_signature,
+    short_range_three_center_eri,
+    short_range_two_center_coulomb,
+)
+from pyqed.qchem.pbc.hf.ewald_rhf import _shifted_gaussian
+
+
+@pytest.fixture(scope="module")
+def gamma_h2_mf():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    return cell.KRHF(
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="ewald",
+    ).run(max_cycle=80, conv_tol=1e-10, conv_tol_dm=1e-8)
+
+
+@pytest.fixture()
+def two_k_h2_reference():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="ewald",
+    )
+    mf.mo_energy = [
+        np.asarray([-1.0, 0.5]),
+        np.asarray([-0.8, 0.7]),
+    ]
+    mf.mo_coeff = [np.eye(cell.nao), np.eye(cell.nao)]
+    mf.mo_occ = [
+        np.asarray([2.0, 0.0]),
+        np.asarray([2.0, 0.0]),
+    ]
+    mf.dm = [
+        np.diag([2.0, 0.0]),
+        np.diag([2.0, 0.0]),
+    ]
+    return mf
+
+
+@pytest.fixture()
+def four_band_two_k_reference(two_k_h2_reference):
+    mf = two_k_h2_reference
+    coeff = np.asarray(
+        [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=np.complex128,
+    )
+    mf.mo_energy = [
+        np.asarray([-1.2, -0.9, 0.4, 0.8]),
+        np.asarray([-1.1, -0.7, 0.5, 0.9]),
+    ]
+    mf.mo_coeff = [coeff.copy(), coeff.copy()]
+    mf.mo_occ = [
+        np.asarray([2.0, 2.0, 0.0, 0.0]),
+        np.asarray([2.0, 2.0, 0.0, 0.0]),
+    ]
+    mf.dm = [
+        np.diag([4.0, 0.0]).astype(np.complex128),
+        np.diag([4.0, 0.0]).astype(np.complex128),
+    ]
+    return mf
+
+
+@pytest.fixture(scope="module")
+def real_two_k_h2_mf():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    return cell.KRHF(
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=1,
+        jk_builder="ewald",
+    ).run(max_cycle=60, conv_tol=1e-9, conv_tol_dm=1e-7)
+
+
+def test_pbc_gw_exports_public_gamma_classes():
+    assert KGW.__name__ == "KGW"
+    assert KBSE.__name__ == "KBSE"
+    assert KTDA.__name__ == "KTDA"
+
+
+def test_gdf_grouped_auxiliary_ft_matches_scalar_batches():
+    basis = [
+        ContractedGaussian(
+            origin=[0.1, -0.2, 0.3],
+            shell=shell,
+            exps=[0.7, 1.8],
+            norm=[1.0, 1.0],
+            prim_weights=[0.4, -0.2],
+            normalize=False,
+        )
+        for shell in ((0, 0, 0), (1, 0, 0), (0, 1, 1), (2, 0, 0))
+    ]
+    gvecs = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.3, -0.4, 0.2],
+            [-1.1, 0.5, 0.7],
+        ],
+        dtype=float,
+    )
+
+    grouped = gw_integrals._gdf_gaussian_ft_cart_grouped(basis, gvecs)
+    scalar = np.vstack(
+        [gw_integrals._gdf_gaussian_ft_batch(fn, gvecs) for fn in basis]
+    ).T
+
+    np.testing.assert_allclose(grouped, scalar, atol=1.0e-13)
+
+
+def test_coulomb_component_normalization_aliases():
+    assert normalize_coulomb_component("full") == FULL_EWALD
+    assert normalize_coulomb_component("full_ewald") == FULL_EWALD
+    assert normalize_coulomb_component("reciprocal") == RECIPROCAL_EWALD_LR
+    assert normalize_coulomb_component("lr") == RECIPROCAL_EWALD_LR
+    assert normalize_coulomb_component("gdf") == GDF
+    assert normalize_coulomb_component("density_fit") == GDF
+    assert normalize_coulomb_component("pyscf_gdf") == PYSCF_GDF
+    assert normalize_coulomb_component("sr", dense_gamma=True) == SHORT_RANGE_EWALD
+
+    with pytest.raises(ValueError, match="coulomb_component"):
+        normalize_coulomb_component("short_range_ewald")
+    with pytest.raises(ValueError, match="coulomb_component"):
+        normalize_coulomb_component("gdf", dense_gamma=True)
+
+
+def test_coulomb_component_aliases_record_canonical_metadata(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+
+    response = direct_tdh_matrices(space, q_index=0, coulomb_component="full")
+    sigma = diagonal_g0w0(space, coulomb_component="full")
+    tda = periodic_tda(
+        space,
+        q_index=0,
+        coulomb_component="full",
+        screened_exchange_scale=0.0,
+        nroots=1,
+    )
+
+    assert response.coulomb_component == FULL_EWALD
+    assert sigma.info["coulomb_component"] == FULL_EWALD
+    assert tda.block.coulomb_component == FULL_EWALD
+    assert tda.info["coulomb_component"] == FULL_EWALD
+
+
+def test_pbc_gw_legacy_import_path_reexports_public_classes():
+    from setuptools import find_packages
+
+    from pyqed.gw import BSE as PackageBSE
+    from pyqed.gw import GW as PackageGW
+    from pyqed.gw import TDA as PackageTDA
+    from pyqed.gw.bse import BSE as MolecularBSE
+    from pyqed.gw.bse import TDA as MolecularTDA
+    from pyqed.gw.gw import GW as MolecularGW
+    from pyqed.gw.pbc import KBSE as LegacyKBSE
+    from pyqed.gw.pbc import KGW as LegacyKGW
+    from pyqed.gw.pbc import KTDA as LegacyKTDA
+    from pyqed.gw.pbc.coulomb import FULL_EWALD as LegacyFullEwald
+    from pyqed.gw.pbc.response import KPointTransitionSpace as LegacyTransitionSpace
+
+    assert PackageGW is MolecularGW
+    assert PackageBSE is MolecularBSE
+    assert PackageTDA is MolecularTDA
+    assert LegacyKGW is KGW
+    assert LegacyKBSE is KBSE
+    assert LegacyKTDA is KTDA
+    assert LegacyTransitionSpace is KPointTransitionSpace
+    assert LegacyFullEwald == FULL_EWALD
+    packages = set(find_packages())
+    assert "pyqed.gw" in packages
+    assert "pyqed.pbc.gw" in packages
+    assert "pyqed.gw.pbc" in packages
+
+
+def test_gamma_pbc_scf_adapter_exposes_molecular_rhf_hooks(gamma_h2_mf):
+    adapter = GammaPBCSCFAdapter(gamma_h2_mf)
+
+    assert adapter.mol.nelectron == gamma_h2_mf.cell.nelectron
+    assert adapter.mo_energy.shape == (gamma_h2_mf.cell.nao,)
+    assert adapter.mo_coeff.shape == (gamma_h2_mf.cell.nao, gamma_h2_mf.cell.nao)
+    assert adapter.eri.shape == (gamma_h2_mf.cell.nao,) * 4
+
+    vj, vk = adapter.get_jk()
+    np.testing.assert_allclose(adapter.get_k(), vk, atol=1e-12)
+    np.testing.assert_allclose(adapter.get_j(), vj, atol=1e-12)
+    np.testing.assert_allclose(adapter.get_veff(), vj - 0.5 * vk, atol=1e-12)
+    assert adapter.get_eri_mo().shape == (gamma_h2_mf.cell.nao,) * 4
+
+
+def test_gamma_pbc_adapter_rejects_true_kpoint_reference():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="ewald",
+    )
+    mf.mo_energy = [np.zeros(cell.nao), np.zeros(cell.nao)]
+    mf.mo_coeff = [np.eye(cell.nao), np.eye(cell.nao)]
+    mf.mo_occ = [np.asarray([2.0, 0.0]), np.asarray([0.0, 0.0])]
+    mf.dm = [np.eye(cell.nao), np.zeros((cell.nao, cell.nao))]
+
+    with pytest.raises(NotImplementedError, match="Gamma-only"):
+        GammaPBCSCFAdapter(mf)
+
+
+def test_kpoint_scf_adapter_normalizes_multi_k_reference(two_k_h2_reference):
+    ref = KPointSCFAdapter(two_k_h2_reference)
+
+    assert ref.nkpts == 2
+    assert ref.nband == 2
+    assert ref.mo_energy.shape == (2, 2)
+    assert ref.mo_coeff.shape == (2, 2, 2)
+    assert ref.mo_occ.shape == (2, 2)
+    np.testing.assert_array_equal(ref.occupied_bands(0), [0])
+    np.testing.assert_array_equal(ref.virtual_bands(1), [1])
+
+    qpts = ref.qpoint_mesh()
+    assert qpts.shape == (2, 3)
+    np.testing.assert_allclose(qpts[0], np.zeros(3), atol=1e-12)
+    assert ref.find_kpoint_index(ref.kpts[0] + qpts[0]) == 0
+    assert ref.find_kpoint_index(ref.kpts[0] + qpts[1]) == 1
+    assert ref.normalize_k_index(1) == 1
+
+    with pytest.raises(TypeError, match="k_index"):
+        ref.occupied_bands(0.5)
+    with pytest.raises(IndexError, match="k_index"):
+        ref.occupied_bands(-1)
+    with pytest.raises(IndexError, match="k_index"):
+        ref.virtual_bands(ref.nkpts)
+    with pytest.raises(ValueError, match="occupation_tol"):
+        KPointSCFAdapter(two_k_h2_reference, occupation_tol=-1.0e-3)
+    with pytest.raises(ValueError, match="occupation_tol"):
+        KPointSCFAdapter(two_k_h2_reference, occupation_tol=1.0)
+
+
+def test_kpoint_transition_space_builds_momentum_conserving_transitions(two_k_h2_reference):
+    ref = KPointSCFAdapter(two_k_h2_reference)
+    space = KPointTransitionSpace(ref, qpts="mesh")
+
+    assert space.nqpts == 2
+    np.testing.assert_array_equal(space.ntransitions_by_q, [2, 2])
+    assert space.ntransitions == 4
+
+    q0 = space.as_table(0)
+    np.testing.assert_array_equal(q0["k"], [0, 1])
+    np.testing.assert_array_equal(q0["kq"], [0, 1])
+    np.testing.assert_allclose(q0["energy"], [1.5, 1.5])
+
+    q1 = build_transition_space(ref, qpts=[space.qpts[1]]).as_table(0)
+    np.testing.assert_array_equal(q1["k"], [0, 1])
+    np.testing.assert_array_equal(q1["kq"], [1, 0])
+    np.testing.assert_allclose(q1["energy"], [1.7, 1.3])
+
+
+def test_periodic_q_index_requests_are_validated(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    with pytest.raises(IndexError, match="q_index"):
+        space.transitions(-1)
+    with pytest.raises(IndexError, match="q_index"):
+        space.energies(space.nqpts)
+    with pytest.raises(TypeError, match="q_index"):
+        space.as_table(0.0)
+    with pytest.raises(IndexError, match="q_index"):
+        direct_tdh_matrices(space, q_index=-1)
+    with pytest.raises(IndexError, match="q_index"):
+        reciprocal_transition_factors(space, q_index=-1)
+    with pytest.raises(IndexError, match="q_index"):
+        full_ewald_transition_metric(space, q_index=-1)
+    with pytest.raises(IndexError, match="q_index"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1,
+            omega=0.5,
+            q_indices=[-1],
+        )
+    with pytest.raises(IndexError, match="q_index"):
+        periodic_tda(space, q_index=-1, direct_scale=1.0, nroots=1)
+    with pytest.raises(IndexError, match="q_index"):
+        periodic_tda_spectrum(
+            space,
+            q_indices=[0, -1],
+            direct_scale=1.0,
+            nroots=1,
+            return_vectors=False,
+        )
+
+
+def test_periodic_orbital_pair_indices_are_validated(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    with pytest.raises(TypeError, match="k_index"):
+        reciprocal_orbital_pair_factors(
+            space,
+            q_index=0,
+            k_index=0.5,
+            left_band=0,
+            right_band=1,
+        )
+    with pytest.raises(TypeError, match="left_band"):
+        reciprocal_orbital_pair_factors(
+            space,
+            q_index=0,
+            k_index=0,
+            left_band=0.5,
+            right_band=1,
+        )
+    with pytest.raises(IndexError, match="right_band"):
+        reciprocal_orbital_pair_factors(
+            space,
+            q_index=0,
+            k_index=0,
+            left_band=0,
+            right_band=99,
+        )
+    with pytest.raises(TypeError, match="left_pair"):
+        full_ewald_orbital_pair_metric(
+            space,
+            q_index=0,
+            left_pair=(0, 0, 0.5, 1),
+            right_pair=(0, 0, 0, 1),
+        )
+    with pytest.raises(ValueError, match="left_pair"):
+        full_ewald_orbital_pair_metric(
+            space,
+            q_index=0,
+            left_pair=(0, 0, 0),
+            right_pair=(0, 0, 0, 1),
+        )
+    with pytest.raises(TypeError, match="k_index"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0.5,
+            band_index=1,
+            omega=0.5,
+        )
+    with pytest.raises(TypeError, match="band_index"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1.5,
+            omega=0.5,
+        )
+
+
+def test_transition_space_can_limit_occ_and_virtual_band_windows(four_band_two_k_reference):
+    ref = KPointSCFAdapter(four_band_two_k_reference)
+
+    full = KPointTransitionSpace(ref, qpts="mesh")
+    np.testing.assert_array_equal(full.ntransitions_by_q, [8, 8])
+
+    limited = KPointTransitionSpace(
+        ref,
+        qpts="mesh",
+        occ_bands=[1],
+        vir_bands=[2],
+    )
+    np.testing.assert_array_equal(limited.ntransitions_by_q, [2, 2])
+    q0 = limited.as_table(0)
+    np.testing.assert_array_equal(q0["k"], [0, 1])
+    np.testing.assert_array_equal(q0["kq"], [0, 1])
+    np.testing.assert_array_equal(q0["occ"], [1, 1])
+    np.testing.assert_array_equal(q0["vir"], [2, 2])
+    assert limited.with_mo_energy(ref.mo_energy).occ_bands == (1,)
+
+    per_k = KPointTransitionSpace(
+        ref,
+        qpts="mesh",
+        occ_bands={0: [1], 1: [0]},
+        vir_bands={0: [3], 1: [2]},
+    )
+    q1 = per_k.as_table(1)
+    np.testing.assert_array_equal(q1["k"], [0, 1])
+    np.testing.assert_array_equal(q1["kq"], [1, 0])
+    np.testing.assert_array_equal(q1["occ"], [1, 0])
+    np.testing.assert_array_equal(q1["vir"], [2, 3])
+
+    with pytest.raises(ValueError, match="not occupied"):
+        KPointTransitionSpace(ref, qpts="mesh", occ_bands=[2])
+    with pytest.raises(ValueError, match="not virtual"):
+        KPointTransitionSpace(ref, qpts="mesh", vir_bands=[1])
+    with pytest.raises(TypeError, match="occ_bands"):
+        KPointTransitionSpace(ref, qpts="mesh", occ_bands=[1.5])
+    with pytest.raises(TypeError, match="vir_bands"):
+        KPointTransitionSpace(ref, qpts="mesh", vir_bands=[2.5])
+    with pytest.raises(TypeError, match="occ_bands"):
+        KPointTransitionSpace(ref, qpts="mesh", occ_bands={0.5: [1]})
+    with pytest.raises(IndexError, match="out-of-range band"):
+        KPointTransitionSpace(ref, qpts="mesh", occ_bands=[99])
+
+
+def test_transition_space_with_mo_energy_updates_gaps(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    updated_energy = np.asarray(two_k_h2_reference.mo_energy, dtype=float).copy()
+    updated_energy[:, 1] += [0.2, 0.4]
+
+    updated = space.with_mo_energy(updated_energy)
+
+    np.testing.assert_allclose(space.energies(0), [1.5, 1.5])
+    np.testing.assert_allclose(updated.energies(0), [1.7, 1.9])
+    np.testing.assert_allclose(updated.energies(1), [2.1, 1.5])
+    assert updated.reference is space.reference
+    np.testing.assert_allclose(space.energies(0), [1.5, 1.5])
+
+
+def test_multi_k_kgw_runs_diagonal_direct_rpa_g0w0(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference)
+    space = gw.transition_space(qpts="mesh")
+
+    assert gw.info["nkpts"] == 2
+    assert space.nqpts == 2
+    gw.run(direct_scale=1.0)
+
+    assert gw.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert gw.info["converged"]
+    assert gw.info["eta"] == gw.eta
+    assert gw.info["direct_scale"] == 1.0
+    assert gw.info["g2_tol"] == 1.0e-16
+    assert gw.info["thresh"] == 1.0e-10
+    assert gw.info["finite_size_correction"] is False
+    np.testing.assert_array_equal(gw.info["q_indices"], [0, 1])
+    assert gw.e_qp.shape == (2, 2)
+    assert np.all(np.isfinite(gw.e_qp))
+
+
+def test_gamma_periodic_kgw_does_not_require_dense_molecular_eri():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(1, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="reciprocal",
+    )
+    mf._validate()
+    mf._periodic_setup()
+    mf.mo_energy = np.asarray([-1.0, 0.5])
+    mf.mo_coeff = np.eye(cell.nao, dtype=np.complex128)
+    mf.mo_occ = np.asarray([2.0, 0.0])
+    mf.dm = np.diag([2.0, 0.0]).astype(np.complex128)
+
+    assert mf.eri is None
+    gw = KGW(mf)
+    gw.run(direct_scale=1.0, qp_bands=[1])
+
+    assert gw.periodic_backend
+    assert gw.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert gw.e_qp.shape == (1, 2)
+    assert np.isfinite(gw.e_qp[0, 1])
+
+
+def test_multi_k_kgw_can_target_qp_bands(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference)
+    gw.run(direct_scale=1.0, qp_bands=[1])
+
+    assert gw.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert gw.info["qp_bands"] == (1,)
+    assert gw.info["nqp"] == 2
+    assert gw.info["converged"]
+    np.testing.assert_allclose(gw.e_qp[:, 0], np.asarray(two_k_h2_reference.mo_energy)[:, 0])
+    assert np.all(np.isfinite(gw.e_qp[:, 1]))
+    assert not np.allclose(gw.e_qp[:, 1], np.asarray(two_k_h2_reference.mo_energy)[:, 1])
+
+
+def test_gamma_transition_reciprocal_factors_are_finite(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf)
+    space = gw.transition_space(qpts="gamma")
+    factors = space.reciprocal_factors(0)
+
+    assert factors.q_index == 0
+    assert factors.coulomb_component == "reciprocal_ewald_lr"
+    assert factors.g2_tol == 1.0e-16
+    assert factors.ntransitions == 1
+    assert factors.ngvectors > 0
+    assert factors.gvecs.shape == factors.gqvecs.shape
+    assert factors.pair_density.shape == (1, factors.ngvectors)
+    assert factors.weighted_pair_density.shape == factors.pair_density.shape
+    assert np.all(np.isfinite(factors.coulomb_weights))
+    assert np.all(factors.coulomb_weights > 0.0)
+    assert np.all(np.isfinite(factors.pair_density))
+
+    metric = factors.coulomb_metric()
+    assert metric.shape == (1, 1)
+    np.testing.assert_allclose(metric, metric.conj().T, atol=1e-12)
+    assert metric[0, 0].real >= 0.0
+    with pytest.raises(ValueError, match="g2_tol"):
+        space.reciprocal_factors(0, g2_tol=-1.0)
+
+
+def test_gamma_reciprocal_factor_metric_matches_dense_reciprocal_eri(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    reciprocal_metric = space.reciprocal_factors(0).coulomb_metric()
+
+    dense_reciprocal = dense_gamma_transition_metric(
+        space,
+        q_index=0,
+        component="reciprocal_ewald_lr",
+    )
+    dense_short = dense_gamma_transition_metric(
+        space,
+        q_index=0,
+        component="short_range_ewald",
+    )
+    dense_background = dense_gamma_transition_metric(
+        space,
+        q_index=0,
+        component="background",
+    )
+    dense_full = dense_gamma_transition_metric(
+        space,
+        q_index=0,
+        component="full_ewald",
+    )
+
+    np.testing.assert_allclose(reciprocal_metric, dense_reciprocal, atol=1e-12)
+    np.testing.assert_allclose(
+        dense_full,
+        dense_reciprocal + dense_short + dense_background,
+        atol=1e-10,
+    )
+    assert dense_short[0, 0].real > 0.0
+    assert dense_full[0, 0].real > reciprocal_metric[0, 0].real
+
+
+def test_kgw_transition_factors_matches_standalone_helper(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf)
+    space = gw.transition_space(qpts="gamma")
+    from_space = reciprocal_transition_factors(space, 0)
+    from_gw = gw.transition_factors(q_index=0, qpts="gamma")
+
+    np.testing.assert_allclose(
+        from_gw.weighted_pair_density,
+        from_space.weighted_pair_density,
+        atol=1e-12,
+    )
+
+
+def test_gamma_dense_orbital_pair_helpers_match_reciprocal_factors(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    transition = space.transitions(0)[0]
+    transition_factors = space.reciprocal_factors(0)
+    pair_factors = reciprocal_orbital_pair_factors(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+    )
+    mismatched_pair_factors = reciprocal_orbital_pair_factors(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+        g2_tol=1.0e9,
+    )
+
+    assert transition_factors.g2_tol == 1.0e-16
+    assert pair_factors.g2_tol == 1.0e-16
+    dense_coupling = dense_gamma_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+        component="reciprocal_ewald_lr",
+    )
+    dense_metric = dense_gamma_orbital_pair_metric(
+        space,
+        q_index=0,
+        left_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+        right_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+        component="reciprocal_ewald_lr",
+    )
+
+    np.testing.assert_allclose(
+        dense_coupling,
+        pair_factors.coulomb_coupling(transition_factors),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        dense_metric,
+        pair_factors.weighted_pair_density @ pair_factors.weighted_pair_density.conj(),
+        atol=1e-12,
+    )
+    with pytest.raises(ValueError, match="G bases"):
+        mismatched_pair_factors.coulomb_coupling(transition_factors)
+    with pytest.raises(ValueError, match="g2_tol"):
+        reciprocal_orbital_pair_factors(
+            space,
+            q_index=0,
+            k_index=transition.k_index,
+            kq_index=transition.kq_index,
+            left_band=transition.occ_band,
+            right_band=transition.vir_band,
+            g2_tol=-1.0,
+        )
+
+
+def test_full_ewald_pair_helpers_match_dense_gamma_reference(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    transition = space.transitions(0)[0]
+    dense_metric = dense_gamma_transition_metric(space, q_index=0, component="full_ewald")
+    full_metric = full_ewald_transition_metric(space, q_index=0)
+    dense_pair_metric = dense_gamma_orbital_pair_metric(
+        space,
+        q_index=0,
+        left_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+        right_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+        component="full_ewald",
+    )
+    full_pair_metric = full_ewald_orbital_pair_metric(
+        space,
+        q_index=0,
+        left_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+        right_pair=(
+            transition.k_index,
+            transition.kq_index,
+            transition.occ_band,
+            transition.vir_band,
+        ),
+    )
+    full_pair_coupling = full_ewald_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+    )
+
+    np.testing.assert_allclose(full_metric, dense_metric, atol=1e-12)
+    np.testing.assert_allclose(full_pair_metric, dense_pair_metric, atol=1e-12)
+    np.testing.assert_allclose(full_pair_coupling, dense_metric[:, 0], atol=1e-12)
+
+
+def test_gamma_direct_tdh_response_matrices_are_hermitian(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    response = direct_tdh_matrices(space, q_index=0)
+
+    assert response.coulomb_component == "reciprocal_ewald_lr"
+    assert response.direct_scale == 2.0
+    assert response.g2_tol == 1.0e-16
+    assert response.thresh is None
+    assert response.A.shape == (1, 1)
+    assert response.B.shape == (1, 1)
+    np.testing.assert_allclose(response.A, response.A.conj().T, atol=1e-12)
+    np.testing.assert_allclose(response.B, response.B.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        response.A - response.B,
+        np.diag(response.transition_energy),
+        atol=1e-12,
+    )
+    assert response.A[0, 0].real >= response.transition_energy[0]
+
+
+def test_gamma_direct_tdh_can_use_dense_full_ewald_metric(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    reciprocal = direct_tdh_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="reciprocal_ewald_lr",
+    )
+    full = direct_tdh_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+    dense_full = dense_gamma_transition_metric(space, q_index=0, component="full_ewald")
+
+    assert full.coulomb_component == "full_ewald"
+    np.testing.assert_allclose(full.B, dense_full, atol=1e-12)
+    np.testing.assert_allclose(
+        full.A - full.B,
+        np.diag(full.transition_energy),
+        atol=1e-12,
+    )
+    assert full.B[0, 0].real > reciprocal.B[0, 0].real
+
+    full_rpa = direct_rpa(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+    full_poles = space.screened_interaction(
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+    assert full_rpa.coulomb_component == "full_ewald"
+    assert full_poles.coulomb_component == "full_ewald"
+    np.testing.assert_allclose(full_poles.bare_coulomb, dense_full, atol=1e-12)
+    assert full_rpa.omega[0] > reciprocal.transition_energy[0]
+
+
+def test_full_ewald_direct_tdh_supports_multi_k_reference(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    metric = full_ewald_transition_metric(space, q_index=0)
+
+    response = direct_tdh_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    assert response.coulomb_component == "full_ewald"
+    assert metric.shape == response.B.shape == (2, 2)
+    np.testing.assert_allclose(
+        response.B,
+        metric / two_k_h2_reference.nkpts,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(response.B, response.B.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        response.A - response.B,
+        np.diag(response.transition_energy),
+        atol=1e-12,
+    )
+
+
+def test_gdf_direct_tdh_uses_auxiliary_basis_factors(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    factors = gdf_transition_factors(space, q_index=0)
+    metric = gdf_transition_metric(space, q_index=0)
+    response = direct_tdh_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="gdf",
+    )
+    coupling = gdf_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=0,
+        kq_index=0,
+        left_band=1,
+        right_band=1,
+    )
+    transition = space.transitions(0)[0]
+    transition_coupling = gdf_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+    )
+
+    assert factors.coulomb_component == GDF
+    assert factors.factor_method == "periodic_auxiliary_gdf"
+    assert factors.auxbasis
+    assert factors.aux_coord_type == "spherical"
+    assert factors.naux_cart >= len(factors.metric_eigenvalues)
+    assert factors.metric_rank == factors.naux
+    assert response.coulomb_component == GDF
+    assert factors.naux <= len(factors.metric_eigenvalues)
+    assert metric.shape == response.B.shape == (2, 2)
+    assert coupling.shape == (2,)
+    np.testing.assert_allclose(
+        response.B,
+        metric / two_k_h2_reference.nkpts,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(transition_coupling, metric[:, 0], atol=1e-12)
+    np.testing.assert_allclose(response.B, response.B.conj().T, atol=1e-12)
+    assert np.all(np.linalg.eigvalsh(metric).real >= -1e-10)
+
+
+def test_gdf_mo_pair_block_applies_complex_metric_invsqrt_hermitianly():
+    from pyqed.pbc.gw.integrals import _gdf_metric_invsqrt, _gdf_mo_pair_block
+
+    metric = np.asarray(
+        [
+            [2.0, 0.4 + 0.3j],
+            [0.4 - 0.3j, 1.5],
+        ],
+        dtype=np.complex128,
+    )
+    pair = np.asarray([0.7 + 0.2j, -0.1 + 0.5j], dtype=np.complex128)
+    metric_invsqrt, _evals = _gdf_metric_invsqrt(metric, 1.0e-14, "test-aux")
+    block = _gdf_mo_pair_block(
+        pair[:, None, None],
+        metric_invsqrt,
+        np.ones((1, 1), dtype=np.complex128),
+        np.ones((1, 1), dtype=np.complex128),
+    )
+
+    actual = np.vdot(block[:, 0, 0], block[:, 0, 0])
+    expected = pair.conj() @ np.linalg.solve(metric, pair)
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+
+def test_gdf_q_ao_store_reuses_blocks_when_mo_cache_is_cleared(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    first = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    assert first.build_timings["q_ao_store_cache_misses"] == 1
+    assert first.build_timings["q_ao_store_missing_pair_blocks"] == len(
+        list(_pair_keys_for_q(space, 0))
+    )
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 1
+
+    space._gdf_factor_cache = {}
+    _gdf_mf_cache(mf, "mo_pair_block").clear()
+    second = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert second.build_timings["q_ao_store_cache_hits"] == 1
+    assert second.build_timings["q_ao_store_missing_pair_blocks"] == 0
+    assert second.build_timings.get("three_center_ao_cache_misses", 0) == 0
+    assert second.build_timings["mo_pair_block_cache_misses"] == len(
+        list(_pair_keys_for_q(space, 0))
+    )
+    np.testing.assert_allclose(
+        second.coulomb_metric(),
+        first.coulomb_metric(),
+        atol=1.0e-12,
+    )
+
+
+def test_gdf_q_ao_store_loads_cderi_slices(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    factors = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    store = next(iter(_gdf_mf_cache(mf, "q_ao_store").values()))
+    k_index, kq_index = list(_pair_keys_for_q(space, 0))[0]
+
+    ao_block = store.load_ao_block(k_index, kq_index)
+    np.testing.assert_allclose(ao_block, store.ao_blocks[(k_index, kq_index)])
+    cderi = store.load_cderi_block(k_index, kq_index)
+    expected = np.einsum(
+        "Pa,Ppq->apq",
+        store.metric_invsqrt.conj(),
+        ao_block,
+        optimize=True,
+    )
+    np.testing.assert_allclose(cderi, expected, atol=1.0e-12)
+    cderi_array = store.cderi_array()
+    assert cderi_array.label == "j3c"
+    assert cderi_array.aosym == "s1"
+    assert cderi_array.naux == store.metric_rank
+    assert (k_index, kq_index) in cderi_array.kpair_keys
+    np.testing.assert_allclose(
+        cderi_array.load(k_index, kq_index),
+        cderi,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        cderi_array[k_index, kq_index, slice(0, 2)],
+        cderi[:2],
+        atol=1.0e-12,
+    )
+    one = store.load_cderi_block(k_index, kq_index, 0)
+    assert one.shape == cderi[:1].shape
+    np.testing.assert_allclose(one, cderi[:1], atol=1.0e-12)
+
+    store.cache_cderi = True
+    store.cderi_blocks.clear()
+    cache_timings = {}
+    cached = store.load_cderi_block(k_index, kq_index, timings=cache_timings)
+    cached_slice = store.load_cderi_block(
+        k_index,
+        kq_index,
+        slice(0, 2),
+        timings=cache_timings,
+    )
+    np.testing.assert_allclose(cached, cderi, atol=1.0e-12)
+    np.testing.assert_allclose(cached_slice, cderi[:2], atol=1.0e-12)
+    assert cache_timings["cderi_block_cache_misses"] == 1
+    assert cache_timings["cderi_block_cache_hits"] == 1
+    assert len(store.cderi_blocks) == 1
+
+    pieces = list(store.iter_cderi_blocks(k_index, kq_index, blockdim=2))
+    assert pieces[0][0].start == 0
+    assert pieces[-1][0].stop == store.metric_rank
+    reconstructed = np.concatenate([block for _slc, block in pieces], axis=0)
+    np.testing.assert_allclose(reconstructed, cderi, atol=1.0e-12)
+    cderi_pieces = list(cderi_array.sr_loop(k_index, kq_index, blockdim=2))
+    np.testing.assert_allclose(
+        np.concatenate([block for _slc, block in cderi_pieces], axis=0),
+        cderi,
+        atol=1.0e-12,
+    )
+
+    mo_pieces = list(
+        cderi_array.iter_mo_pair_blocks(
+            k_index,
+            kq_index,
+            mf.mo_coeff[k_index],
+            mf.mo_coeff[kq_index],
+            blockdim=2,
+        )
+    )
+    mo_block = np.concatenate([block for _slc, block in mo_pieces], axis=0)
+    np.testing.assert_allclose(
+        mo_block,
+        factors.pair_blocks[(k_index, kq_index)],
+        atol=1.0e-12,
+    )
+
+
+def test_prebuild_gdf_q_ao_stores_warms_factor_build(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    summaries = prebuild_gdf_q_ao_stores(space, q_indices=[0], g2_tol=1.0e-14)
+    assert len(summaries) == 1
+    assert summaries[0]["q_index"] == 0
+    assert summaries[0]["pair_blocks"] == len(list(_pair_keys_for_q(space, 0)))
+    assert summaries[0]["timings"]["q_ao_store_cache_misses"] == 1
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 1
+
+    space._gdf_factor_cache = {}
+    _gdf_mf_cache(mf, "mo_pair_block").clear()
+    factors = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert factors.build_timings["q_ao_store_cache_hits"] == 1
+    assert factors.build_timings["q_ao_store_missing_pair_blocks"] == 0
+    assert factors.build_timings.get("three_center_ao_cache_misses", 0) == 0
+    assert factors.ntransitions > 0
+
+
+def test_prebuild_gdf_can_materialize_cderi_store(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KPointTransitionSpace(mf, qpts="mesh")
+    pair_keys = list(_pair_keys_for_q(space, 0))
+
+    summaries = prebuild_gdf_q_ao_stores(
+        space,
+        q_indices=[0],
+        g2_tol=1.0e-14,
+        materialize_cderi=True,
+    )
+    timings = summaries[0]["timings"]
+    store = next(iter(_gdf_mf_cache(mf, "q_ao_store").values()))
+
+    assert timings["cderi_array_materialized_blocks"] == len(pair_keys)
+    assert timings["cderi_array_loads"] == len(pair_keys)
+    assert timings["cderi_array_materialize_seconds"] >= 0.0
+    assert store.cache_cderi is True
+    assert len(store.cderi_blocks) == len(pair_keys)
+
+    space._gdf_factor_cache = {}
+    _gdf_mf_cache(mf, "mo_pair_block").clear()
+    factors = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert factors.build_timings["q_ao_store_cache_hits"] == 1
+    assert factors.build_timings["cderi_array_mo_pair_loops"] == len(pair_keys)
+    assert factors.build_timings["cderi_block_cache_hits"] >= len(pair_keys)
+    assert factors.ntransitions > 0
+
+
+def test_prebuild_gdf_q_ao_stores_reuses_opposite_q_blocks():
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache
+
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(3, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=1,
+        jk_builder="ewald",
+    )
+    mf.mo_energy = [
+        np.asarray([-1.0, 0.5]),
+        np.asarray([-0.9, 0.6]),
+        np.asarray([-0.8, 0.7]),
+    ]
+    mf.mo_coeff = [np.eye(cell.nao, dtype=np.complex128) for _ in range(3)]
+    mf.mo_occ = [np.asarray([2.0, 0.0]) for _ in range(3)]
+    mf.dm = [np.diag([2.0, 0.0]).astype(np.complex128) for _ in range(3)]
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 1
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+
+    space = KPointTransitionSpace(mf, qpts="mesh")
+    summaries = prebuild_gdf_q_ao_stores(space, g2_tol=1.0e-14)
+    derived = [
+        row for row in summaries
+        if row["timings"].get("q_ao_store_opposite_q_reuses", 0)
+    ]
+
+    assert len(summaries) == len(space.qpts)
+    assert len(derived) == 1
+    target_q = derived[0]["q_index"]
+    source_q = derived[0]["timings"]["q_ao_store_opposite_source_q_index"]
+    stores = list(_gdf_mf_cache(mf, "q_ao_store").values())
+    target_store = next(store for store in stores if store.q_index == target_q)
+    source_store = next(store for store in stores if store.q_index == source_q)
+
+    np.testing.assert_allclose(
+        target_store.metric_invsqrt,
+        source_store.metric_invsqrt.conj(),
+        atol=1.0e-12,
+    )
+    for key, block in target_store.ao_blocks.items():
+        source_key = (key[1], key[0])
+        np.testing.assert_allclose(
+            block,
+            source_store.ao_blocks[source_key].conj().transpose(0, 2, 1),
+            atol=1.0e-12,
+        )
+
+
+def test_gdf_opposite_q_conjugate_reuse_matches_direct_build(monkeypatch):
+    import pyqed.pbc.gw.integrals as integrals
+
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(3, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="ewald",
+    )
+    mf.mo_energy = [
+        np.asarray([-1.0, 0.5]),
+        np.asarray([-0.9, 0.6]),
+        np.asarray([-0.8, 0.7]),
+    ]
+    mf.mo_coeff = [np.eye(cell.nao, dtype=np.complex128) for _ in range(3)]
+    mf.mo_occ = [np.asarray([2.0, 0.0]) for _ in range(3)]
+    mf.dm = [np.diag([2.0, 0.0]).astype(np.complex128) for _ in range(3)]
+
+    space = KPointTransitionSpace(mf, qpts="mesh")
+    q_index = next(
+        index
+        for index in range(len(space.qpts))
+        if integrals._gdf_should_use_opposite_q(space, index) is not None
+    )
+    derived = integrals.gdf_transition_factors(space, q_index=q_index, g2_tol=1.0e-14)
+    assert derived.factor_method.endswith(":opposite_q_conjugate")
+
+    monkeypatch.setattr(integrals, "_gdf_should_use_opposite_q", lambda _space, _q: None)
+    direct_space = KPointTransitionSpace(mf, qpts="mesh")
+    direct = integrals.gdf_transition_factors(
+        direct_space,
+        q_index=q_index,
+        g2_tol=1.0e-14,
+    )
+
+    np.testing.assert_allclose(
+        derived.coulomb_metric(),
+        direct.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    transition = space.transitions(q_index)[0]
+    pair = (
+        transition.k_index,
+        transition.kq_index,
+        transition.occ_band,
+        transition.vir_band,
+    )
+    np.testing.assert_allclose(
+        derived.orbital_pair_metric(pair, pair),
+        direct.orbital_pair_metric(pair, pair),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        derived.orbital_pair_coupling(*pair),
+        direct.orbital_pair_coupling(*pair),
+        atol=1.0e-12,
+    )
+
+
+def test_gdf_accepts_pyscf_auxbasis_alias(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    factors = gdf_transition_factors(
+        space,
+        q_index=0,
+        auxbasis="def2-svp-jkfit",
+    )
+
+    assert factors.auxbasis == "def2-sv(p)-jkfit"
+    assert factors.aux_coord_type == "spherical"
+    assert factors.naux_cart >= factors.naux
+
+
+def test_gdf_cutoffs_can_be_decoupled_from_reference_cutoffs(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.pair_cut = 0
+    mf.recip_cut = 2
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 5
+    mf._periodic_setup()
+    decoupled = gdf_transition_metric(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    del mf.gdf_pair_cut
+    del mf.gdf_recip_cut
+    mf.pair_cut = 2
+    mf.recip_cut = 5
+    mf._periodic_setup()
+    direct = gdf_transition_metric(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    np.testing.assert_allclose(decoupled, direct, atol=1.0e-12)
+
+
+def test_gdf_mesh_can_replace_reciprocal_cutoff(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.pair_cut = 0
+    mf.recip_cut = 2
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    if hasattr(mf, "gdf_mesh"):
+        del mf.gdf_mesh
+    mf._periodic_setup()
+    shell_grid = gdf_transition_metric(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    del mf.gdf_recip_cut
+    mf.gdf_mesh = (5, 5, 5)
+    mf._periodic_setup()
+    mesh_grid = gdf_transition_metric(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    np.testing.assert_allclose(mesh_grid, shell_grid, atol=1.0e-12)
+
+
+def test_gdf_g_vector_streaming_matches_full_grid(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_g_block_size = 0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    full = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    space._gdf_factor_cache = {}
+    for name in list(vars(mf)):
+        if name.startswith("_pbc_gdf_") and name.endswith("_cache"):
+            getattr(mf, name).clear()
+    mf.gdf_g_block_size = 7
+
+    streamed = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert streamed.build_timings["g_block_size"] == 7
+    assert streamed.build_timings["g_blocks"] > 1
+    if (
+        integrals.has_periodic_pair_ft_contract_backend()
+        or integrals.has_periodic_pair_ft_many_backend()
+    ):
+        assert streamed.build_timings["pair_ft_stream_g_blocks"] > 1
+        assert streamed.build_timings["pair_ft_stream_backend"] in {
+            "contract_many",
+            "sum_many",
+        }
+    np.testing.assert_allclose(
+        streamed.coulomb_metric(),
+        full.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        streamed.transition_vectors,
+        full.transition_vectors,
+        atol=1.0e-12,
+    )
+
+
+def test_gdf_auto_pair_cut_builds_shell_pair_image_plan(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = "auto"
+    mf.gdf_pair_image_cut_max = 2
+    mf.gdf_precision = 1.0e-4
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    timings = factors.build_timings
+    assert timings["pair_cut"] == "auto"
+    assert timings["pair_image_plan_auto"] is True
+    assert timings["pair_image_plan_tol"] == pytest.approx(1.0e-5)
+    assert timings["pair_image_plan_max_cut"] <= 2
+    assert timings["pair_image_plan_images"] > 0
+    assert timings["pair_image_plan_kept_image_pairs"] > 0
+    assert np.all(np.isfinite(factors.transition_vectors))
+
+
+def test_gdf_auto_pair_cut_tolerance_factor_override(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = "auto"
+    mf.gdf_pair_image_cut_max = 1
+    mf.gdf_precision = 1.0e-4
+    mf.gdf_pair_image_tol_factor = 0.25
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+
+    plan = integrals._gdf_pair_image_plan(mf, "auto", 0.0)
+
+    assert plan.auto is True
+    assert plan.tolerance == pytest.approx(2.5e-5)
+
+
+def test_gdf_auto_pair_cut_center_image_matches_fixed_zero(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    fixed = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    space._gdf_factor_cache = {}
+    for name in list(vars(mf)):
+        if name.startswith("_pbc_gdf_") and name.endswith("_cache"):
+            getattr(mf, name).clear()
+    mf.gdf_pair_cut = "auto"
+    mf.gdf_pair_image_cut_max = 0
+    mf.gdf_pair_image_tol = 0.0
+
+    auto = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert auto.build_timings["pair_cut"] == "auto"
+    assert auto.build_timings["pair_image_plan_auto"] is True
+    assert auto.build_timings["pair_image_plan_max_cut"] == 0
+    np.testing.assert_allclose(
+        auto.coulomb_metric(),
+        fixed.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        auto.transition_vectors,
+        fixed.transition_vectors,
+        atol=1.0e-12,
+    )
+
+
+def test_range_separated_g_vector_streaming_matches_full_grid(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_g_block_size = 0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    full = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    space._gdf_factor_cache = {}
+    for name in list(vars(mf)):
+        if name.startswith("_pbc_gdf_") and name.endswith("_cache"):
+            getattr(mf, name).clear()
+    mf.gdf_g_block_size = 7
+
+    streamed = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert streamed.build_timings["g_block_size"] == 7
+    assert streamed.build_timings["g_blocks"] > 1
+    np.testing.assert_allclose(
+        streamed.coulomb_metric(),
+        full.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        streamed.transition_vectors,
+        full.transition_vectors,
+        atol=1.0e-12,
+    )
+
+
+def test_range_separated_pair_partition_no_smooth_matches_default(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_g_block_size = 0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    default = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    space._gdf_factor_cache = {}
+    for name in list(vars(mf)):
+        if name.startswith("_pbc_gdf_") and name.endswith("_cache"):
+            getattr(mf, name).clear()
+    mf.gdf_rs_pair_partition = "smooth"
+    mf.gdf_smooth_exponent_cutoff = -1.0
+
+    partitioned = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert partitioned.build_timings["rs_engine"] == "shell_range_separated"
+    assert partitioned.build_timings["rs_pair_partition"] == "smooth"
+    assert partitioned.build_timings["rs_smooth_shells"] == 0
+    assert partitioned.build_timings["rs_reciprocal_only_pairs"] == 0
+    np.testing.assert_allclose(
+        partitioned.coulomb_metric(),
+        default.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        partitioned.transition_vectors,
+        default.transition_vectors,
+        atol=1.0e-12,
+    )
+
+
+def test_range_separated_pair_partition_shell_engine_metadata(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_rs_pair_partition = "smooth"
+    mf.gdf_smooth_exponent_cutoff = 10.0
+    mf.gdf_g_block_size = 0
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    timings = factors.build_timings
+    nao = int(mf.cell.nao)
+    assert timings["rs_engine"] == "shell_range_separated"
+    assert timings["rs_pair_partition"] == "smooth"
+    assert timings["rs_total_shells"] > 0
+    assert timings["rs_smooth_shells"] == timings["rs_total_shells"]
+    assert timings["rs_smooth_aos"] == nao
+    assert timings["rs_reciprocal_only_pairs"] == nao * nao
+    assert timings["rs_compact_pairs"] == 0
+    assert timings["rs_exponent_stat"] == "max"
+    assert np.all(np.isfinite(factors.transition_vectors))
+
+
+def test_range_separated_shell_engine_emits_reciprocal_terms(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+    ref = KGW(mf).transition_space(qpts="mesh").reference
+
+    mf.gdf_rs_pair_partition = "smooth"
+    mf.gdf_smooth_exponent_cutoff = -1.0
+    engine = integrals._gdf_rs_shell_engine(
+        ref,
+        "range_separated",
+        0.4,
+        (5, 5, 5),
+    )
+    assert engine.partition_active is False
+    assert engine.reciprocal_block_kernel("range_separated", 0.4) == (
+        "range_separated",
+        0.4,
+    )
+    gqvecs = np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=float)
+    weights = np.asarray([2.0, 3.0], dtype=float)
+    terms = engine.reciprocal_terms(gqvecs, weights, 0.4)
+    assert len(terms) == 1
+    assert terms[0][0] == "default"
+    np.testing.assert_allclose(terms[0][1], weights)
+    assert terms[0][2] is None
+
+    manual = np.zeros((mf.cell.nao, mf.cell.nao), dtype=bool)
+    manual[0, 0] = True
+    mf.gdf_reciprocal_only_pair_mask = manual
+    engine = integrals._gdf_rs_shell_engine(
+        ref,
+        "range_separated",
+        0.4,
+        (5, 5, 5),
+    )
+    assert engine.partition_active is True
+    assert engine.reciprocal_block_kernel("range_separated", 0.4) == (
+        "full",
+        None,
+    )
+    terms = engine.reciprocal_terms(gqvecs, weights, 0.4)
+    labels = [label for label, _weights, _mask in terms]
+    assert labels == ["compact_lr", "smooth_full"]
+    compact_weights = terms[0][1]
+    expected_lr = weights * np.exp(
+        -np.einsum("gi,gi->g", gqvecs, gqvecs) / (4.0 * 0.4 * 0.4)
+    )
+    np.testing.assert_allclose(compact_weights, expected_lr)
+    np.testing.assert_array_equal(terms[0][2], ~manual)
+    np.testing.assert_allclose(terms[1][1], weights)
+    np.testing.assert_array_equal(terms[1][2], manual)
+
+
+def test_range_separated_pair_partition_streaming_matches_full_grid(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_rs_pair_partition = "all"
+    mf.gdf_g_block_size = 0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    full = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    space._gdf_factor_cache = {}
+    for name in list(vars(mf)):
+        if name.startswith("_pbc_gdf_") and name.endswith("_cache"):
+            getattr(mf, name).clear()
+    mf.gdf_g_block_size = 7
+
+    streamed = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    nao = int(mf.cell.nao)
+    assert streamed.build_timings["rs_pair_partition"] == "all"
+    assert streamed.build_timings["rs_reciprocal_only_pairs"] == nao * nao
+    assert streamed.build_timings["three_center_short_range_pairs"] == 0
+    assert streamed.build_timings["g_block_size"] == 7
+    assert streamed.build_timings["g_blocks"] > 1
+    np.testing.assert_allclose(
+        streamed.coulomb_metric(),
+        full.coulomb_metric(),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        streamed.transition_vectors,
+        full.transition_vectors,
+        atol=1.0e-12,
+    )
+
+
+def test_gdf_precision_can_derive_mesh(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_mesh = "auto"
+    mf.gdf_precision = 1.0e-8
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    assert factors.build_timings["reciprocal_mode"] == "mesh"
+    assert factors.build_timings["gdf_mesh_auto"] is True
+    assert factors.build_timings["gdf_precision"] == 1.0e-8
+    assert factors.build_timings["gdf_ke_cutoff"] > 0.0
+    assert all(n > 0 for n in factors.build_timings["mesh"])
+    assert np.all(np.isfinite(factors.coulomb_metric()))
+
+
+def test_gdf_auto_omega_resolves_from_precision_and_cutoff(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = "auto"
+    mf.gdf_precision = 1.0e-8
+    mf.gdf_recip_cut = 2
+    mf.gdf_short_range_cut = 0
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    assert factors.build_timings["gdf_omega_auto"] is True
+    assert factors.build_timings["gdf_omega"] >= 0.3
+    assert factors.build_timings["gdf_precision"] == 1.0e-8
+    assert factors.factor_method == "periodic_auxiliary_gdf:range_separated"
+    assert np.all(np.isfinite(factors.coulomb_metric()))
+
+
+def test_short_range_auxiliary_integrals_recover_full_coulomb(gamma_h2_mf):
+    basis = tuple(gamma_h2_mf._basis)
+    a, b = basis[0], basis[1]
+
+    np.testing.assert_allclose(
+        short_range_two_center_coulomb(a, b, 0.0),
+        two_center_coulomb(a, b),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        short_range_three_center_eri(a, b, a, 0.0),
+        three_center_eri(a, b, a),
+        atol=1.0e-12,
+    )
+
+
+def test_compiled_short_range_gdf_kernels_match_python(gamma_h2_mf):
+    if (
+        _basis_cy is None
+        or not hasattr(_basis_cy, "compute_short_range_aux_metric")
+        or not hasattr(_basis_cy, "compute_short_range_aux_metric_masked")
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor")
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor_masked")
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_pair_outer_masked",
+        )
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_shell_blocked_masked",
+        )
+    ):
+        pytest.skip("compiled short-range GDF kernels are not available")
+
+    basis = tuple(gamma_h2_mf._basis)
+    signatures = tuple(_basis_fn_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+
+    eta = 0.47
+    left_shift = np.asarray([0.2, -0.1, 0.0])
+    right_shift = np.asarray([-0.3, 0.15, 0.25])
+    left_origins = np.ascontiguousarray(origins + left_shift[None, :])
+    right_origins = np.ascontiguousarray(origins + right_shift[None, :])
+    left_basis = tuple(_shifted_gaussian(fn, left_shift) for fn in basis)
+    right_basis = tuple(_shifted_gaussian(fn, right_shift) for fn in basis)
+
+    metric = _basis_cy.compute_short_range_aux_metric(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        eta,
+    )
+    expected_metric = np.asarray(
+        [
+            [
+                short_range_two_center_coulomb(left_basis[p], right_basis[q], eta)
+                for q in range(len(basis))
+            ]
+            for p in range(len(basis))
+        ],
+        dtype=float,
+    )
+    np.testing.assert_allclose(metric, expected_metric, atol=1.0e-11)
+    pair_mask = np.asarray([[1, 0], [1, 1]], dtype=np.uint8)
+    masked_metric = _basis_cy.compute_short_range_aux_metric_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        pair_mask,
+        eta,
+    )
+    np.testing.assert_allclose(
+        masked_metric,
+        expected_metric * pair_mask,
+        atol=1.0e-11,
+    )
+
+    tensor = _basis_cy.compute_short_range_three_center_tensor(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        eta,
+    )
+    expected_tensor = np.asarray(
+        [
+            [
+                [
+                    short_range_three_center_eri(
+                        left_basis[p],
+                        right_basis[q],
+                        basis[a],
+                        eta,
+                    )
+                    for q in range(len(basis))
+                ]
+                for p in range(len(basis))
+            ]
+            for a in range(len(basis))
+        ],
+        dtype=float,
+    )
+    np.testing.assert_allclose(tensor, expected_tensor, atol=1.0e-11)
+    aux_pair_mask = np.ones((len(basis), len(basis), len(basis)), dtype=np.uint8)
+    aux_pair_mask[0, 0, 1] = 0
+    aux_pair_mask[1, 1, 0] = 0
+    masked_tensor = _basis_cy.compute_short_range_three_center_tensor_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        pair_mask,
+        aux_pair_mask,
+        eta,
+    )
+    np.testing.assert_allclose(
+        masked_tensor,
+        expected_tensor * pair_mask[None, :, :] * aux_pair_mask,
+        atol=1.0e-11,
+    )
+    pair_outer_tensor = _basis_cy.compute_short_range_three_center_tensor_pair_outer_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        pair_mask,
+        aux_pair_mask,
+        eta,
+    )
+    np.testing.assert_allclose(
+        pair_outer_tensor,
+        expected_tensor * pair_mask[None, :, :] * aux_pair_mask,
+        atol=1.0e-11,
+    )
+    blocks = _cart_shell_blocks(basis)
+    shell_starts = np.ascontiguousarray(
+        [start for start, _stop, _l in blocks],
+        dtype=np.int64,
+    )
+    shell_stops = np.ascontiguousarray(
+        [stop for _start, stop, _l in blocks],
+        dtype=np.int64,
+    )
+    shell_blocked_tensor = _basis_cy.compute_short_range_three_center_tensor_shell_blocked_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        shell_starts,
+        shell_stops,
+        shell_starts,
+        shell_stops,
+        pair_mask,
+        aux_pair_mask,
+        eta,
+    )
+    np.testing.assert_allclose(
+        shell_blocked_tensor,
+        expected_tensor * pair_mask[None, :, :] * aux_pair_mask,
+        atol=1.0e-11,
+    )
+
+
+def test_cpp_periodic_pair_ft_primitive_sum_matches_numba(monkeypatch, gamma_h2_mf):
+    import pyqed.qchem.fourier as fourier
+
+    if (
+        fourier._gdf_cpp is None
+        or not hasattr(fourier._gdf_cpp, "periodic_pair_ft_primitive_sum")
+    ):
+        pytest.skip("compiled C++ GDF pair-FT kernel is not available")
+    if fourier._ao_block_pair_ft_primitive_sum_numba is None:
+        pytest.skip("numba AO-pair Fourier reference kernel is not available")
+
+    basis = tuple(gamma_h2_mf._basis)
+    plan = fourier.AOBlockPairFTPlan(basis, basis)
+    origins = np.ascontiguousarray(
+        [np.asarray(fn.origin, dtype=float) for fn in basis],
+        dtype=float,
+    )
+    shifts = np.ascontiguousarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.3, -0.2, 0.1],
+        ],
+        dtype=float,
+    )
+    right_origins_batch = np.ascontiguousarray(origins[None, :, :] + shifts[:, None, :])
+    image_pair_mask = np.ones((len(shifts), len(plan.pair_p)), dtype=np.bool_)
+    image_pair_mask[1, 1::2] = False
+    primitive_terms = plan.periodic_primitive_terms(
+        origins,
+        right_origins_batch,
+        image_pair_mask=image_pair_mask,
+    )
+    gvecs = np.ascontiguousarray(
+        [
+            [0.1, 0.2, -0.3],
+            [0.7, -0.1, 0.4],
+            [1.1, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    kvec = np.asarray([0.2, -0.3, 0.1], dtype=float)
+    phases = np.ascontiguousarray(np.exp(1.0j * (shifts @ kvec)))
+
+    monkeypatch.setenv("PYQED_GDF_CPP", "1")
+    cpp = plan.periodic_sum(
+        gvecs,
+        left_origins=origins,
+        right_origins_batch=right_origins_batch,
+        phases=phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=primitive_terms,
+        compiled=True,
+    )
+    monkeypatch.setattr(fourier, "_gdf_cpp", None)
+    numba = plan.periodic_sum(
+        gvecs,
+        left_origins=origins,
+        right_origins_batch=right_origins_batch,
+        phases=phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=primitive_terms,
+        compiled=True,
+    )
+
+    np.testing.assert_allclose(cpp, numba, atol=1.0e-12)
+
+
+def test_cpp_periodic_pair_ft_primitive_sum_many_matches_stacked_numba(
+    monkeypatch,
+    gamma_h2_mf,
+):
+    import pyqed.qchem.fourier as fourier
+
+    if (
+        fourier._gdf_cpp is None
+        or not hasattr(fourier._gdf_cpp, "periodic_pair_ft_primitive_sum_many")
+    ):
+        pytest.skip("batched compiled C++ GDF pair-FT kernel is not available")
+    if fourier._ao_block_pair_ft_primitive_sum_numba is None:
+        pytest.skip("numba AO-pair Fourier reference kernel is not available")
+
+    basis = tuple(gamma_h2_mf._basis)
+    plan = fourier.AOBlockPairFTPlan(basis, basis)
+    origins = np.ascontiguousarray(
+        [np.asarray(fn.origin, dtype=float) for fn in basis],
+        dtype=float,
+    )
+    shifts = np.ascontiguousarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.3, -0.2, 0.1],
+            [-0.2, 0.4, -0.3],
+        ],
+        dtype=float,
+    )
+    right_origins_batch = np.ascontiguousarray(origins[None, :, :] + shifts[:, None, :])
+    image_pair_mask = np.ones((len(shifts), len(plan.pair_p)), dtype=np.bool_)
+    image_pair_mask[1, 1::2] = False
+    image_pair_mask[2, ::3] = False
+    primitive_terms = plan.periodic_primitive_terms(
+        origins,
+        right_origins_batch,
+        image_pair_mask=image_pair_mask,
+    )
+    gvecs = np.ascontiguousarray(
+        [
+            [0.1, 0.2, -0.3],
+            [0.7, -0.1, 0.4],
+            [1.1, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    kvecs = np.ascontiguousarray(
+        [
+            [0.2, -0.3, 0.1],
+            [-0.4, 0.15, 0.25],
+            [0.35, 0.05, -0.2],
+            [-0.1, 0.45, 0.15],
+            [0.18, -0.22, 0.31],
+            [-0.27, -0.18, 0.08],
+            [0.41, 0.12, -0.33],
+            [-0.36, 0.28, -0.05],
+            [0.06, -0.42, 0.19],
+        ],
+        dtype=float,
+    )
+    weighted_aux = np.ascontiguousarray(
+        [
+            [0.7 + 0.1j, -0.2 + 0.3j],
+            [0.4 - 0.5j, 0.1 + 0.2j],
+            [-0.3 + 0.6j, 0.8 - 0.1j],
+        ],
+        dtype=np.complex128,
+    )
+    phases_all = np.ascontiguousarray(np.exp(1.0j * (kvecs @ shifts.T)))
+    cases = []
+    for nphase in (1, 2, 3, 4, 6, 9):
+        phases = np.ascontiguousarray(phases_all[:nphase])
+        cpp = plan.periodic_sum_many(
+            gvecs,
+            left_origins=origins,
+            right_origins_batch=right_origins_batch,
+            phases=phases,
+            image_pair_mask=image_pair_mask,
+            primitive_terms=primitive_terms,
+            compiled=True,
+            threads=2,
+        )
+        contract_cpp = None
+        if hasattr(fourier._gdf_cpp, "periodic_pair_ft_primitive_contract_many"):
+            contract_cpp = plan.periodic_contract_many(
+                gvecs,
+                weighted_aux,
+                left_origins=origins,
+                right_origins_batch=right_origins_batch,
+                phases=phases,
+                image_pair_mask=image_pair_mask,
+                primitive_terms=primitive_terms,
+                compiled=True,
+                threads=8,
+            )
+        cases.append((phases, cpp, contract_cpp))
+
+    monkeypatch.setattr(fourier, "_gdf_cpp", None)
+    for phases, cpp, contract_cpp in cases:
+        numba = np.stack(
+            [
+                plan.periodic_sum(
+                    gvecs,
+                    left_origins=origins,
+                    right_origins_batch=right_origins_batch,
+                    phases=phase_row,
+                    image_pair_mask=image_pair_mask,
+                    primitive_terms=primitive_terms,
+                    compiled=True,
+                )
+                for phase_row in phases
+            ],
+            axis=0,
+        )
+
+        np.testing.assert_allclose(cpp, numba, atol=1.0e-12)
+        if contract_cpp is not None:
+            contract_ref = np.einsum("ga,xgmn->xamn", weighted_aux, numba, optimize=True)
+            np.testing.assert_allclose(contract_cpp, contract_ref, atol=1.0e-12)
+
+
+def test_cpp_periodic_pair_ft_grouped_p_terms_match_numba(monkeypatch):
+    import pyqed.qchem.fourier as fourier
+
+    if (
+        fourier._gdf_cpp is None
+        or not hasattr(fourier._gdf_cpp, "periodic_pair_ft_primitive_sum_many")
+        or not hasattr(fourier._gdf_cpp, "periodic_pair_ft_primitive_contract_many")
+    ):
+        pytest.skip("batched compiled C++ GDF pair-FT kernels are not available")
+    if fourier._ao_block_pair_ft_primitive_sum_numba is None:
+        pytest.skip("numba AO-pair Fourier reference kernel is not available")
+
+    basis = (
+        ContractedGaussian(
+            origin=[0.0, 0.0, 0.0],
+            shell=(1, 0, 0),
+            exps=[0.7, 0.25],
+            coefs=[0.9, 0.35],
+        ),
+        ContractedGaussian(
+            origin=[0.35, -0.15, 0.25],
+            shell=(0, 1, 0),
+            exps=[0.6, 0.18],
+            coefs=[0.8, 0.25],
+        ),
+        ContractedGaussian(
+            origin=[-0.25, 0.2, -0.1],
+            shell=(0, 0, 0),
+            exps=[0.9, 0.3],
+            coefs=[0.7, 0.45],
+        ),
+    )
+    plan = fourier.AOBlockPairFTPlan(basis, basis)
+    origins = np.ascontiguousarray(
+        [np.asarray(fn.origin, dtype=float) for fn in basis],
+        dtype=float,
+    )
+    shifts = np.ascontiguousarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, -0.2, 0.1],
+            [-0.3, 0.25, -0.35],
+        ],
+        dtype=float,
+    )
+    right_origins_batch = np.ascontiguousarray(origins[None, :, :] + shifts[:, None, :])
+    image_pair_mask = np.ones((len(shifts), len(plan.pair_p)), dtype=np.bool_)
+    image_pair_mask[1, 1::2] = False
+    image_pair_mask[2, ::3] = False
+    primitive_terms = plan.periodic_primitive_terms(
+        origins,
+        right_origins_batch,
+        image_pair_mask=image_pair_mask,
+    )
+    assert np.any(primitive_terms["term_power"] != 0)
+
+    gvecs = np.ascontiguousarray(
+        [
+            [0.1, 0.2, -0.3],
+            [0.7, -0.1, 0.4],
+            [1.1, 0.3, 0.2],
+            [-0.5, 0.8, -0.25],
+        ],
+        dtype=float,
+    )
+    kvecs = np.ascontiguousarray(
+        [
+            [0.2, -0.3, 0.1],
+            [-0.4, 0.15, 0.25],
+        ],
+        dtype=float,
+    )
+    phases = np.ascontiguousarray(np.exp(1.0j * (kvecs @ shifts.T)))
+    weighted_aux = np.ascontiguousarray(
+        [
+            [0.7 + 0.1j, -0.2 + 0.3j],
+            [0.4 - 0.5j, 0.1 + 0.2j],
+            [-0.3 + 0.6j, 0.8 - 0.1j],
+            [0.2 - 0.25j, -0.4 + 0.7j],
+        ],
+        dtype=np.complex128,
+    )
+
+    cpp = plan.periodic_sum_many(
+        gvecs,
+        left_origins=origins,
+        right_origins_batch=right_origins_batch,
+        phases=phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=primitive_terms,
+        compiled=True,
+        threads=2,
+    )
+    contract_cpp = plan.periodic_contract_many(
+        gvecs,
+        weighted_aux,
+        left_origins=origins,
+        right_origins_batch=right_origins_batch,
+        phases=phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=primitive_terms,
+        compiled=True,
+        threads=12,
+    )
+
+    monkeypatch.setattr(fourier, "_gdf_cpp", None)
+    ref = np.stack(
+        [
+            plan.periodic_sum(
+                gvecs,
+                left_origins=origins,
+                right_origins_batch=right_origins_batch,
+                phases=phase_row,
+                image_pair_mask=image_pair_mask,
+                primitive_terms=primitive_terms,
+                compiled=True,
+            )
+            for phase_row in phases
+        ],
+        axis=0,
+    )
+    contract_ref = np.einsum("ga,xgmn->xamn", weighted_aux, ref, optimize=True)
+
+    np.testing.assert_allclose(cpp, ref, atol=1.0e-12)
+    np.testing.assert_allclose(contract_cpp, contract_ref, atol=1.0e-12)
+
+
+def test_compiled_short_range_gdf_kernels_match_python_high_l():
+    if (
+        _basis_cy is None
+        or not hasattr(_basis_cy, "compute_short_range_aux_metric")
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor")
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_pair_outer_masked",
+        )
+    ):
+        pytest.skip("compiled short-range GDF kernels are not available")
+
+    basis_dict = parse_gbs(_basis_path("def2-sv(p)-jkfit"))
+    aux_basis = tuple(
+        make_contractions(
+            basis_dict,
+            ["Li", "H"],
+            np.asarray([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=float),
+            coord_types="c",
+        )
+    )
+    indices = []
+    for shell in ((2, 0, 0), (1, 1, 0), (1, 0, 0), (0, 0, 0)):
+        indices.extend(
+            idx for idx, fn in enumerate(aux_basis) if tuple(fn.shell) == shell
+        )
+    subset = tuple(aux_basis[idx] for idx in dict.fromkeys(indices))
+    subset = subset[:4]
+
+    signatures = tuple(_basis_fn_signature(fn) for fn in subset)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+
+    eta = 0.4770707159433863
+    left_shift = np.asarray([0.3, -0.2, 0.1])
+    right_shift = np.asarray([-0.1, 0.25, 0.4])
+    left_origins = np.ascontiguousarray(origins + left_shift[None, :])
+    right_origins = np.ascontiguousarray(origins + right_shift[None, :])
+    left_basis = tuple(_shifted_gaussian(fn, left_shift) for fn in subset)
+    right_basis = tuple(_shifted_gaussian(fn, right_shift) for fn in subset)
+
+    metric = _basis_cy.compute_short_range_aux_metric(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        eta,
+    )
+    expected_metric = np.asarray(
+        [
+            [
+                short_range_two_center_coulomb(left_basis[p], right_basis[q], eta)
+                for q in range(len(subset))
+            ]
+            for p in range(len(subset))
+        ],
+        dtype=float,
+    )
+    np.testing.assert_allclose(metric, expected_metric, atol=1.0e-11)
+
+    tensor = _basis_cy.compute_short_range_three_center_tensor(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        eta,
+    )
+    expected_tensor = np.asarray(
+        [
+            [
+                [
+                    short_range_three_center_eri(
+                        left_basis[p],
+                        right_basis[q],
+                        subset[a],
+                        eta,
+                    )
+                    for q in range(len(subset))
+                ]
+                for p in range(len(subset))
+            ]
+            for a in range(len(subset))
+        ],
+        dtype=float,
+    )
+    np.testing.assert_allclose(tensor, expected_tensor, atol=1.0e-11)
+    pair_mask = np.ones((len(subset), len(subset)), dtype=np.uint8)
+    aux_pair_mask = np.ones(
+        (len(subset), len(subset), len(subset)),
+        dtype=np.uint8,
+    )
+    pair_outer_tensor = _basis_cy.compute_short_range_three_center_tensor_pair_outer_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        pair_mask,
+        aux_pair_mask,
+        eta,
+    )
+    np.testing.assert_allclose(pair_outer_tensor, expected_tensor, atol=1.0e-11)
+
+
+def test_compiled_short_range_gdf_shell_blocked_matches_dense_high_l():
+    if (
+        _basis_cy is None
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor")
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_shell_blocked_masked",
+        )
+    ):
+        pytest.skip("compiled short-range GDF kernels are not available")
+
+    basis_dict = parse_gbs(_basis_path("def2-sv(p)-jkfit"))
+    aux_basis = tuple(
+        make_contractions(
+            basis_dict,
+            ["Li", "H"],
+            np.asarray([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=float),
+            coord_types="c",
+        )
+    )
+    shell_blocks = _cart_shell_blocks(aux_basis)
+    start, stop, _l = next(block for block in shell_blocks if block[2] == 2)
+    subset = tuple(aux_basis[start:stop])
+    signatures = tuple(_basis_fn_signature(fn) for fn in subset)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+
+    eta = 0.4770707159433863
+    left_shift = np.asarray([0.3, -0.2, 0.1])
+    right_shift = np.asarray([-0.1, 0.25, 0.4])
+    left_origins = np.ascontiguousarray(origins + left_shift[None, :])
+    right_origins = np.ascontiguousarray(origins + right_shift[None, :])
+    dense = _basis_cy.compute_short_range_three_center_tensor(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        eta,
+    )
+    pair_mask = np.ones((len(subset), len(subset)), dtype=np.uint8)
+    aux_pair_mask = np.ones(
+        (len(subset), len(subset), len(subset)),
+        dtype=np.uint8,
+    )
+    shell_starts = np.asarray([0], dtype=np.int64)
+    shell_stops = np.asarray([len(subset)], dtype=np.int64)
+    shell_blocked = _basis_cy.compute_short_range_three_center_tensor_shell_blocked_masked(
+        shells,
+        left_origins,
+        right_origins,
+        exps,
+        weights,
+        nprim,
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        shell_starts,
+        shell_stops,
+        shell_starts,
+        shell_stops,
+        pair_mask,
+        aux_pair_mask,
+        eta,
+    )
+
+    np.testing.assert_allclose(shell_blocked, dense, atol=1.0e-10)
+
+
+@pytest.mark.parametrize("kernel", ["long_range", "range_separated"])
+def test_gdf_range_separated_kernels_require_omega(two_k_h2_reference, kernel):
+    mf = two_k_h2_reference
+    mf.gdf_reciprocal_kernel = kernel
+    if hasattr(mf, "gdf_omega"):
+        del mf.gdf_omega
+
+    with pytest.raises(ValueError, match="gdf_omega"):
+        gdf_transition_metric(
+            KGW(mf).transition_space(qpts="mesh"),
+            q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+
+def test_gdf_short_range_screening_requires_diagnostic_opt_in(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 0
+    mf.gdf_short_range_screen_tol = 1.0e-12
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+
+    with pytest.raises(ValueError, match="heuristic"):
+        gdf_transition_metric(
+            KGW(mf).transition_space(qpts="mesh"),
+            q_index=0,
+            g2_tol=1.0e-14,
+        )
+
+
+def test_gdf_long_range_reciprocal_kernel_is_cache_distinct(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    full_factors = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    full_metric = full_factors.coulomb_metric()
+
+    mf.gdf_reciprocal_kernel = "long_range"
+    mf.gdf_omega = 0.4
+    long_range_factors = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    long_range_metric = long_range_factors.coulomb_metric()
+
+    assert (
+        long_range_factors.factor_method
+        == "periodic_auxiliary_gdf:long_range_reciprocal"
+    )
+    assert long_range_factors.build_timings["reciprocal_kernel"] == "long_range"
+    assert np.linalg.norm(long_range_metric - full_metric) > 1.0e-8
+
+    mf.gdf_omega = 1.0e8
+    large_omega_metric = gdf_transition_metric(
+        space,
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    np.testing.assert_allclose(large_omega_metric, full_metric, atol=1.0e-10)
+
+
+def test_gdf_range_separated_adds_short_range_real_space_terms(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 0
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    mf.gdf_reciprocal_kernel = "long_range"
+    long_range_factors = gdf_transition_factors(space, q_index=1, g2_tol=1.0e-14)
+    long_range_metric = long_range_factors.coulomb_metric()
+
+    mf.gdf_reciprocal_kernel = "range_separated"
+    range_factors = gdf_transition_factors(space, q_index=1, g2_tol=1.0e-14)
+    range_metric = range_factors.coulomb_metric()
+
+    assert range_factors.factor_method == "periodic_auxiliary_gdf:range_separated"
+    assert range_factors.build_timings["reciprocal_kernel"] == "range_separated"
+    assert range_factors.build_timings["short_range_cut"] == 0
+    assert np.linalg.norm(range_metric - long_range_metric) > 1.0e-8
+
+
+def test_gdf_anisotropic_short_range_cut_uses_slab_image_box(two_k_h2_reference):
+    cell = two_k_h2_reference.cell
+
+    assert len(_gdf_image_keys(cell, 1)) == 27
+    assert _gdf_image_keys(cell, (1, 0, 0)) == [(-1, 0, 0), (0, 0, 0), (1, 0, 0)]
+    assert len(_gdf_image_keys(cell, (2, 2, 0))) == 25
+
+
+def test_gdf_pair_ft_default_workers_use_pair_ft_cap(monkeypatch):
+    class DummyMF:
+        pass
+
+    for name in (
+        "PYQED_GDF_WORKERS",
+        "PYQED_GDF_PAIR_FT_WORKERS",
+        "PYQED_GDF_CPP_THREADS",
+        "PYQED_GDF_PAIR_FT_MAX_WORKERS",
+        "PYQED_GDF_SR_WORKERS",
+        "PYQED_GDF_SR_THREADS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(gw_integrals.os, "cpu_count", lambda: 16)
+
+    mf = DummyMF()
+    assert gw_integrals._gdf_short_range_workers(mf) == 8
+    assert gw_integrals._gdf_pair_ft_workers(mf) == 12
+
+    monkeypatch.setenv("PYQED_GDF_PAIR_FT_MAX_WORKERS", "10")
+    assert gw_integrals._gdf_pair_ft_workers(mf) == 10
+
+    monkeypatch.setenv("PYQED_GDF_PAIR_FT_WORKERS", "6")
+    assert gw_integrals._gdf_pair_ft_workers(mf) == 6
+
+    monkeypatch.delenv("PYQED_GDF_PAIR_FT_WORKERS", raising=False)
+    monkeypatch.setenv("PYQED_GDF_WORKERS", "5")
+    assert gw_integrals._gdf_short_range_workers(mf) == 5
+    assert gw_integrals._gdf_pair_ft_workers(mf) == 5
+
+
+def test_gdf_auto_g_block_size_uses_aux_memory_cap(monkeypatch):
+    class DummyMF:
+        pass
+
+    monkeypatch.delenv("PYQED_GDF_G_BLOCK_SIZE", raising=False)
+    monkeypatch.delenv("PYQED_GDF_G_BLOCK_MAX_MB", raising=False)
+    monkeypatch.delenv("PYQED_GDF_G_BLOCK_CAP", raising=False)
+    mf = DummyMF()
+
+    assert gw_integrals._gdf_g_block_size(mf, mesh=(32, 32, 32), naux=80) == 0
+    assert (
+        gw_integrals._gdf_g_block_size(mf, mesh=(65, 65, 65), naux=80)
+        == 131072
+    )
+    assert (
+        gw_integrals._gdf_g_block_size(
+            mf,
+            mesh=(65, 65, 65),
+            naux=80,
+            nao_pair=36,
+            nkpts=2,
+        )
+        == 131072
+    )
+
+    monkeypatch.setenv("PYQED_GDF_G_BLOCK_CAP", "200000")
+    assert (
+        gw_integrals._gdf_g_block_size(
+            mf,
+            mesh=(65, 65, 65),
+            naux=80,
+            nao_pair=36,
+            nkpts=2,
+        )
+        == 200000
+    )
+
+    monkeypatch.setenv("PYQED_GDF_G_BLOCK_MAX_MB", "64")
+    assert (
+        gw_integrals._gdf_g_block_size(mf, mesh=(65, 65, 65), naux=80)
+        == 25000
+    )
+    assert (
+        gw_integrals._gdf_g_block_size(
+            mf,
+            mesh=(65, 65, 65),
+            nao_pair=36,
+            nkpts=2,
+        )
+        == 44440
+    )
+    assert (
+        gw_integrals._gdf_g_block_size(
+            mf,
+            mesh=(65, 65, 65),
+            naux=80,
+            nao_pair=36,
+            nkpts=2,
+        )
+        == 25000
+    )
+
+    mf.gdf_g_block_size = "auto"
+    assert (
+        gw_integrals._gdf_g_block_size(mf, mesh=(65, 65, 65), naux=80)
+        == 25000
+    )
+    mf.gdf_g_block_size = 777
+    assert gw_integrals._gdf_g_block_size(mf, mesh=(65, 65, 65), naux=80) == 777
+
+
+def test_gdf_full_aux_ft_is_explicit_opt_in(monkeypatch):
+    class DummyMF:
+        pass
+
+    monkeypatch.delenv("PYQED_GDF_FULL_AUX_FT", raising=False)
+    monkeypatch.delenv("PYQED_GDF_FULL_AUX_FT_MAX_MB", raising=False)
+    mf = DummyMF()
+
+    assert not gw_integrals._gdf_full_aux_ft_enabled(
+        mf,
+        mesh=(65, 65, 65),
+        naux=80,
+        g_block_size=131072,
+    )
+
+    mf.gdf_full_aux_ft = True
+    assert gw_integrals._gdf_full_aux_ft_enabled(
+        mf,
+        mesh=(65, 65, 65),
+        naux=80,
+        g_block_size=131072,
+    )
+
+    mf.gdf_full_aux_ft_max_mb = 64
+    assert not gw_integrals._gdf_full_aux_ft_enabled(
+        mf,
+        mesh=(65, 65, 65),
+        naux=80,
+        g_block_size=131072,
+    )
+
+    del mf.gdf_full_aux_ft
+    del mf.gdf_full_aux_ft_max_mb
+    monkeypatch.setenv("PYQED_GDF_FULL_AUX_FT", "1")
+    monkeypatch.setenv("PYQED_GDF_FULL_AUX_FT_MAX_MB", "512")
+    assert gw_integrals._gdf_full_aux_ft_enabled(
+        mf,
+        mesh=(65, 65, 65),
+        naux=80,
+        g_block_size=131072,
+    )
+
+
+def test_gdf_range_separated_exact_short_range_uses_compiled_kernel(two_k_h2_reference):
+    if (
+        _basis_cy is None
+        or not hasattr(_basis_cy, "compute_short_range_aux_metric")
+        or not hasattr(_basis_cy, "compute_short_range_aux_metric_masked")
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor")
+        or not hasattr(_basis_cy, "compute_short_range_three_center_tensor_masked")
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_pair_outer_masked",
+        )
+        or not hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_tensor_shell_blocked_masked",
+        )
+    ):
+        pytest.skip("compiled short-range GDF kernels are not available")
+
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_pair_ft_screen_tol = 0.0
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_pair_ft_workers = 2
+    mf.gdf_short_range_workers = 2
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    assert factors.build_timings["aux_metric_short_range_compiled_calls"] > 0
+    assert factors.build_timings["three_center_short_range_compiled_calls"] > 0
+    assert (
+        factors.build_timings["three_center_short_range_shell_blocked_compiled_calls"]
+        > 0
+    )
+    assert (
+        factors.build_timings["three_center_short_range_image_pair_symmetry_reuses"]
+        > 0
+    )
+    assert factors.build_timings["three_center_short_range_workers"] == 2
+    assert factors.build_timings["pair_ft_workers"] == 2
+    assert (
+        factors.build_timings["three_center_short_range_compiled_calls"]
+        < factors.build_timings["three_center_sr_component_terms"]
+    )
+
+
+def test_gdf_range_separated_q0_applies_g0_compensation(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+
+    factors = gdf_transition_factors(
+        KGW(mf).transition_space(qpts="mesh"),
+        q_index=0,
+        g2_tol=1.0e-14,
+    )
+
+    assert factors.factor_method == "periodic_auxiliary_gdf:range_separated"
+    assert factors.metric_rank > 0
+    assert factors.build_timings["aux_metric_short_range_g0_corrections"] == 1
+    assert factors.build_timings["three_center_short_range_g0_corrections"] >= 1
+
+
+def test_gdf_matches_pyscf_gdf_transition_metrics(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    two_k_h2_reference.pair_cut = 2
+    two_k_h2_reference.recip_cut = 5
+    two_k_h2_reference._g_weight_cache = {}
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    for q_index in range(space.nqpts):
+        native = gdf_transition_metric(space, q_index=q_index, g2_tol=1.0e-14)
+        pyscf = pyscf_gdf_transition_metric(space, q_index=q_index)
+        np.testing.assert_allclose(native, pyscf, rtol=1.0e-4, atol=1.0e-6)
+
+
+def test_pyscf_gdf_direct_tdh_uses_pyscf_density_fitting(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    factors = pyscf_gdf_transition_factors(space, q_index=0)
+    metric = pyscf_gdf_transition_metric(space, q_index=0)
+    response = direct_tdh_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="pyscf_gdf",
+    )
+    poles = space.screened_interaction(
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="pyscf_gdf",
+    )
+    coupling = pyscf_gdf_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=0,
+        kq_index=0,
+        left_band=1,
+        right_band=1,
+    )
+
+    assert factors.coulomb_component == PYSCF_GDF
+    assert response.coulomb_component == PYSCF_GDF
+    assert poles.coulomb_component == PYSCF_GDF
+    assert metric.shape == response.B.shape == (2, 2)
+    assert coupling.shape == (2,)
+    np.testing.assert_allclose(metric, metric.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        response.B,
+        metric / two_k_h2_reference.nkpts,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        response.A - response.B,
+        np.diag(response.transition_energy),
+        atol=1e-12,
+    )
+    assert np.all(np.isfinite(response.A))
+
+
+def test_ac_scaled_legendre_roots_match_infinite_interval_jacobian():
+    roots, root_weights = np.polynomial.legendre.leggauss(12)
+    freqs, weights = _scaled_legendre_roots(12)
+    scale = 0.5
+
+    np.testing.assert_allclose(freqs, scale * (1.0 + roots) / (1.0 - roots))
+    np.testing.assert_allclose(weights, root_weights * 2.0 * scale / (1.0 - roots) ** 2)
+    assert np.all(freqs > 0.0)
+    assert np.all(weights > 0.0)
+
+
+def test_periodic_gw_ac_pyscf_gdf_matches_pyscf_kernel_same_reference():
+    pytest.importorskip("pyscf")
+    from pyscf.pbc import gto, gw, scf
+
+    hartree_to_ev = 27.211386245988
+    auxbasis = "def2-svp-jkfit"
+    qcell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    kpts = qcell.make_kpts((2, 1, 1))
+
+    pcell = gto.Cell()
+    pcell.atom = "H 0 0 0; H 1.4 0 0"
+    pcell.a = np.diag([5.0, 5.0, 5.0])
+    pcell.basis = "sto-3g"
+    pcell.unit = "B"
+    pcell.charge = 0
+    pcell.spin = 0
+    pcell.verbose = 0
+    pcell.build()
+
+    pmf = scf.KRHF(pcell, kpts=kpts, exxdiv="ewald").density_fit(auxbasis=auxbasis)
+    pmf.conv_tol = 1.0e-10
+    pmf.max_cycle = 80
+    pmf.verbose = 0
+    pmf.kernel()
+
+    qmf = qcell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=0,
+        pair_cut=3,
+        recip_cut=7,
+        jk_builder="ewald",
+    )
+    qmf.gdf_auxbasis = auxbasis
+    qmf.max_memory = 4000
+    qmf.mo_energy = [np.asarray(block).copy() for block in pmf.mo_energy]
+    qmf.mo_coeff = [np.asarray(block).copy() for block in pmf.mo_coeff]
+    qmf.mo_occ = [np.asarray(block).copy() for block in pmf.mo_occ]
+
+    result = diagonal_g0w0(
+        KPointTransitionSpace(qmf),
+        coulomb_component=PYSCF_GDF,
+        direct_scale=1.0,
+        linearized=True,
+        frequency_integration="ac",
+        ac_nw=24,
+        finite_size_correction=True,
+        finite_size_head_method="pyscf_gradient",
+        qp_bands=[0, 1],
+    )
+
+    kgw = gw.KGW(pmf, freq_int="ac")
+    kgw.linearized = True
+    kgw.ac = "twopole"
+    kgw.fc = True
+    kgw.verbose = 0
+    pyscf_qp = kgw.kernel(orbs=[0, 1], kptlist=[0, 1], nw=24)
+
+    np.testing.assert_allclose(
+        np.asarray(result.e_qp) * hartree_to_ev,
+        np.asarray(pyscf_qp) * hartree_to_ev,
+        atol=1.0e-8,
+    )
+
+
+def test_gamma_direct_rpa_roots_are_finite(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf)
+    from_space = direct_rpa(gw.transition_space(qpts="gamma"), q_index=0)
+    from_gw = gw.rpa(q_index=0, qpts="gamma")
+
+    assert from_space.omega.shape == (1,)
+    assert from_space.vectors.shape == (1, 1)
+    assert np.all(np.isfinite(from_space.omega))
+    assert np.all(from_space.omega >= -1e-12)
+    np.testing.assert_allclose(from_gw.omega, from_space.omega, atol=1e-12)
+
+
+def test_two_k_direct_tdh_response_shapes(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    response = space.tdh_matrices(q_index=1, direct_scale=1.0)
+    rpa = space.rpa(q_index=1, direct_scale=1.0)
+
+    assert response.A.shape == (2, 2)
+    assert response.B.shape == (2, 2)
+    assert response.direct_scale == 1.0
+    assert response.g2_tol == 1.0e-16
+    assert response.thresh is None
+    assert rpa.direct_scale == 1.0
+    assert rpa.g2_tol == 1.0e-16
+    assert rpa.thresh == 1.0e-10
+    np.testing.assert_allclose(response.A, response.A.conj().T, atol=1e-12)
+    np.testing.assert_allclose(response.B, response.B.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        response.A - response.B,
+        np.diag(response.transition_energy),
+        atol=1e-12,
+    )
+    assert rpa.omega.shape == (2,)
+    assert np.all(np.isfinite(rpa.omega))
+
+
+def test_gamma_screened_interaction_poles_match_rpa_block(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf)
+    space = gw.transition_space(qpts="gamma")
+    response = space.rpa(q_index=0)
+    poles = screened_interaction_poles(space, q_index=0)
+    from_gw = gw.screened_interaction(q_index=0, qpts="gamma")
+
+    assert poles.q_index == 0
+    assert poles.coulomb_component == "reciprocal_ewald_lr"
+    assert poles.direct_scale == 2.0
+    assert poles.g2_tol == 1.0e-16
+    assert poles.thresh == 1.0e-10
+    assert poles.ntransitions == 1
+    assert poles.nmodes == 1
+    np.testing.assert_allclose(poles.omega, response.omega, atol=1e-12)
+    np.testing.assert_allclose(from_gw.coupling, poles.coupling, atol=1e-12)
+
+    expected_abs = (
+        abs(poles.kernel_coupling[0, 0])
+        * np.sqrt(poles.transition_energy[0] / poles.omega[0])
+    )
+    np.testing.assert_allclose(abs(poles.coupling[0, 0]), expected_abs, atol=1e-12)
+
+    residue = poles.mode_residue(0)
+    np.testing.assert_allclose(residue, residue.conj().T, atol=1e-12)
+    assert residue[0, 0].real >= 0.0
+    assert poles.normalize_mode_index(0) == 0
+    with pytest.raises(TypeError, match="mode"):
+        poles.mode_residue(0.5)
+    with pytest.raises(IndexError, match="mode"):
+        poles.mode_residue(-1)
+    with pytest.raises(IndexError, match="mode"):
+        poles.mode_residue(poles.nmodes)
+
+
+def test_orbital_pair_coupling_matches_transition_row(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    transition = space.transitions(0)[0]
+    transition_factors = space.reciprocal_factors(0)
+    pair_factors = reciprocal_orbital_pair_factors(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+    )
+    poles = space.screened_interaction(q_index=0)
+
+    bare_coupling = pair_factors.coulomb_coupling(transition_factors)
+    np.testing.assert_allclose(
+        bare_coupling,
+        poles.bare_coulomb[:, 0],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        poles.coupling_for_coulomb_vector(bare_coupling),
+        poles.coupling[0],
+        atol=1e-12,
+    )
+
+
+def test_two_k_screened_interaction_poles_are_hermitian(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    poles = space.screened_interaction(q_index=1, direct_scale=1.0)
+
+    assert poles.coupling.shape == (2, 2)
+    assert poles.kernel_coupling.shape == (2, 2)
+    assert poles.direct_scale == 1.0
+    assert poles.g2_tol == 1.0e-16
+    assert poles.thresh == 1.0e-10
+    assert np.all(np.isfinite(poles.omega))
+    assert np.all(np.isfinite(poles.coupling))
+
+    residue = poles.residue_metric()
+    np.testing.assert_allclose(residue, residue.conj().T, atol=1e-12)
+    assert np.min(np.linalg.eigvalsh(residue).real) >= -1e-10
+
+
+def test_multi_k_direct_tdh_uses_kpoint_transition_weights(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    q_index = 1
+    response = direct_tdh_matrices(space, q_index=q_index, direct_scale=1.0)
+    metric = reciprocal_transition_factors(space, q_index).coulomb_metric()
+    expected = metric / two_k_h2_reference.nkpts
+
+    np.testing.assert_allclose(
+        response.transition_weights,
+        np.full(len(space.transitions(q_index)), 1.0 / two_k_h2_reference.nkpts),
+    )
+    np.testing.assert_allclose(
+        response.A - np.diag(response.transition_energy),
+        expected,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(response.B, expected, atol=1.0e-12)
+
+
+def test_multi_k_mode_coupling_uses_external_pair_kpoint_weight(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    q_index = 1
+    transition = space.transitions(q_index)[0]
+    transition_factors = reciprocal_transition_factors(space, q_index)
+    pair_factors = reciprocal_orbital_pair_factors(
+        space,
+        q_index=q_index,
+        k_index=transition.k_index,
+        kq_index=transition.kq_index,
+        left_band=transition.occ_band,
+        right_band=transition.vir_band,
+    )
+    poles = screened_interaction_poles(space, q_index=q_index, direct_scale=1.0)
+
+    bare_coupling = pair_factors.coulomb_coupling(transition_factors)
+    expected = (
+        np.sqrt(poles.transition_weights) * bare_coupling
+    ).conj() @ poles.mode_projector
+
+    np.testing.assert_allclose(
+        poles.coupling_for_coulomb_vector(bare_coupling),
+        expected,
+        atol=1.0e-12,
+    )
+
+
+def test_gamma_diagonal_correlation_self_energy_is_finite(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, eta=1.0e-3)
+    space = gw.transition_space(qpts="gamma")
+    omega = gamma_h2_mf.mo_energy[0] + np.asarray([-0.1, 0.1])
+
+    sigma = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=0,
+        omega=omega,
+        eta=gw.eta,
+    )
+    from_gw = gw.sigma_c(
+        k_index=0,
+        band_index=0,
+        omega=float(omega[0]),
+        qpts="gamma",
+    )
+
+    assert sigma.sigma_c.shape == (2,)
+    assert sigma.q_contributions.shape == (1, 2)
+    assert np.all(np.isfinite(sigma.sigma_c))
+    np.testing.assert_allclose(
+        np.sum(sigma.q_contributions, axis=0),
+        sigma.sigma_c,
+        atol=1e-12,
+    )
+    assert from_gw.sigma_c.shape == ()
+    assert np.isfinite(from_gw.value())
+
+
+def test_gamma_diagonal_self_energy_can_use_dense_full_ewald_couplings(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    omega = float(space.reference.mo_energy[0, 0])
+    reciprocal = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=0,
+        omega=omega,
+        direct_scale=1.0,
+        coulomb_component="reciprocal_ewald_lr",
+        eta=1.0e-3,
+    )
+    full = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=0,
+        omega=omega,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        eta=1.0e-3,
+    )
+    result = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    assert full.coulomb_component == "full_ewald"
+    assert result.info["coulomb_component"] == "full_ewald"
+    assert result.info["all_converged"]
+    assert full.sigma_c.shape == ()
+    assert np.isfinite(full.sigma_c)
+    assert np.all(np.isfinite(result.e_qp))
+    assert not np.allclose(full.sigma_c, reciprocal.sigma_c)
+
+
+def test_two_k_diagonal_correlation_self_energy_accumulates_q_blocks(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference, eta=1.0e-3)
+    space = gw.transition_space(qpts="mesh")
+    omega = np.asarray([0.4, 0.6])
+
+    sigma = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=omega,
+        eta=gw.eta,
+        direct_scale=1.0,
+    )
+    from_gw = gw.sigma_c(
+        k_index=0,
+        band_index=1,
+        omega=omega,
+        direct_scale=1.0,
+    )
+
+    np.testing.assert_array_equal(sigma.q_indices, [0, 1])
+    assert sigma.eta == gw.eta
+    assert sigma.direct_scale == 1.0
+    assert sigma.g2_tol == 1.0e-16
+    assert sigma.thresh == 1.0e-10
+    assert sigma.average_q is True
+    assert sigma.sigma_c.shape == (2,)
+    assert sigma.q_contributions.shape == (2, 2)
+    assert np.all(np.isfinite(sigma.sigma_c))
+    np.testing.assert_allclose(
+        np.sum(sigma.q_contributions, axis=0),
+        sigma.sigma_c,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(from_gw.sigma_c, sigma.sigma_c, atol=1e-12)
+
+
+def test_diagonal_self_energy_cache_reuses_q_resolved_screening(two_k_h2_reference):
+    space = KGW(two_k_h2_reference, eta=1.0e-3).transition_space(qpts="mesh")
+    cache = DiagonalSelfEnergyCache()
+
+    first = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=np.asarray([0.4, 0.6]),
+        eta=1.0e-3,
+        direct_scale=1.0,
+        cache=cache,
+    )
+    sizes_after_first = cache.sizes()
+    second = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=np.asarray([0.4, 0.6]),
+        eta=1.0e-3,
+        direct_scale=1.0,
+        cache=cache,
+    )
+
+    assert sizes_after_first["screened_interactions"] == space.nqpts
+    assert sizes_after_first["transition_factors"] == space.nqpts
+    assert sizes_after_first["mode_couplings"] > 0
+    assert cache.sizes() == sizes_after_first
+    np.testing.assert_allclose(second.sigma_c, first.sigma_c, atol=1e-12)
+
+
+def test_diagonal_self_energy_can_truncate_intermediate_band_sum(two_k_h2_reference):
+    space = KGW(two_k_h2_reference, eta=1.0e-3).transition_space(qpts="mesh")
+
+    full = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=np.asarray([0.4, 0.6]),
+        eta=1.0e-3,
+        direct_scale=1.0,
+    )
+    truncated = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=np.asarray([0.4, 0.6]),
+        eta=1.0e-3,
+        direct_scale=1.0,
+        intermediate_bands=[0],
+    )
+    k_specific = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        q_indices=[0],
+        eta=1.0e-3,
+        direct_scale=1.0,
+        intermediate_bands={0: [0]},
+    )
+
+    assert truncated.intermediate_bands == (0,)
+    assert k_specific.intermediate_bands == {0: (0,)}
+    assert truncated.sigma_c.shape == full.sigma_c.shape
+    assert not np.allclose(truncated.sigma_c, full.sigma_c)
+    assert np.isfinite(k_specific.sigma_c)
+
+    with pytest.raises(IndexError, match="out-of-range band"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1,
+            omega=0.4,
+            intermediate_bands=[99],
+        )
+    with pytest.raises(TypeError, match="intermediate_bands"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1,
+            omega=0.4,
+            intermediate_bands=[0.5],
+        )
+    with pytest.raises(TypeError, match="intermediate_bands"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1,
+            omega=0.4,
+            intermediate_bands={0.5: [0]},
+        )
+    with pytest.raises(IndexError, match="out-of-range k"):
+        diagonal_correlation_self_energy(
+            space,
+            k_index=0,
+            band_index=1,
+            omega=0.4,
+            intermediate_bands={99: [0]},
+        )
+
+
+def test_two_k_diagonal_self_energy_can_use_full_ewald_couplings(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    sigma = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=np.asarray([0.4, 0.6]),
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        eta=1.0e-3,
+    )
+    result = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    assert sigma.coulomb_component == "full_ewald"
+    assert result.info["coulomb_component"] == "full_ewald"
+    assert sigma.sigma_c.shape == (2,)
+    assert result.e_qp.shape == (2, 2)
+    assert np.all(np.isfinite(sigma.sigma_c))
+    assert np.all(np.isfinite(result.e_qp))
+    assert result.info["all_converged"]
+
+
+def test_two_k_diagonal_g0w0_result_tracks_on_shell_sigma(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    result = diagonal_g0w0(space, eta=1.0e-3, direct_scale=1.0)
+
+    assert result.e_mf.shape == (2, 2)
+    assert result.e_qp.shape == (2, 2)
+    assert result.sigma_c.shape == (2, 2)
+    assert result.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert result.info["eta"] == 1.0e-3
+    assert result.info["direct_scale"] == 1.0
+    assert result.info["g2_tol"] == 1.0e-16
+    assert result.info["thresh"] == 1.0e-10
+    assert result.info["finite_size_correction"] is False
+    np.testing.assert_array_equal(result.info["q_indices"], [0, 1])
+    assert np.all(result.converged)
+    np.testing.assert_allclose(
+        result.e_qp,
+        result.e_mf + result.sigma_c.real,
+        atol=1e-12,
+    )
+
+
+def test_two_k_diagonal_g0w0_linearized_update_matches_manual_z(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    step = 1.0e-5
+    result = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        linearized=True,
+        linearized_step=step,
+        qp_bands={0: [1]},
+    )
+    eps = float(result.e_mf[0, 1])
+    sigma = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=eps,
+        eta=1.0e-3,
+        direct_scale=1.0,
+    ).value()
+    sigma_shifted = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=eps + step,
+        eta=1.0e-3,
+        direct_scale=1.0,
+    ).value()
+    derivative = (sigma_shifted.real - sigma.real) / step
+    expected = eps + sigma.real / (1.0 - derivative)
+
+    assert result.info["linearized"] is True
+    assert result.info["linearized_step"] == step
+    assert result.info["solve_roots"] is False
+    np.testing.assert_allclose(result.e_qp[0, 1], expected, atol=1.0e-12)
+
+
+def test_two_k_diagonal_g0w0_can_target_qp_bands(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    full = diagonal_g0w0(space, eta=1.0e-3, direct_scale=1.0)
+    cache = DiagonalSelfEnergyCache()
+
+    targeted = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        qp_bands=[1],
+        cache=cache,
+    )
+    np.testing.assert_array_equal(
+        targeted.info["target_mask"],
+        np.asarray([[False, True], [False, True]]),
+    )
+    assert targeted.info["qp_bands"] == (1,)
+    assert targeted.info["target_bands"] == ((0, 1), (1, 1))
+    assert targeted.info["nqp"] == 2
+    assert targeted.info["cache_sizes"] == cache.sizes()
+    assert targeted.info["cache_sizes"]["screened_interactions"] == space.nqpts
+    assert targeted.info["all_converged"]
+    np.testing.assert_allclose(targeted.e_qp[:, 1], full.e_qp[:, 1], atol=1e-12)
+    np.testing.assert_allclose(targeted.e_qp[:, 0], targeted.e_mf[:, 0], atol=1e-12)
+    assert np.all(targeted.converged[:, 1])
+    assert not np.any(targeted.converged[:, 0])
+    assert np.all(np.isfinite(targeted.sigma_c[:, 1]))
+    assert np.all(np.isnan(targeted.sigma_c[:, 0].real))
+
+    k_specific = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        qp_bands={1: [0]},
+    )
+    assert k_specific.info["qp_bands"] == {1: (0,)}
+    assert k_specific.info["target_bands"] == ((1, 0),)
+    np.testing.assert_array_equal(
+        k_specific.info["target_mask"],
+        np.asarray([[False, False], [True, False]]),
+    )
+    assert k_specific.converged[1, 0]
+    assert not k_specific.converged[0, 0]
+
+    with pytest.raises(IndexError, match="out-of-range band"):
+        diagonal_g0w0(space, qp_bands=[99])
+    with pytest.raises(TypeError, match="qp_bands"):
+        diagonal_g0w0(space, qp_bands=[1.5])
+    with pytest.raises(TypeError, match="qp_bands"):
+        diagonal_g0w0(space, qp_bands={0.5: [1]})
+    with pytest.raises(IndexError, match="out-of-range k"):
+        diagonal_g0w0(space, qp_bands={99: [0]})
+
+
+def test_two_k_diagonal_g0w0_can_truncate_intermediate_bands(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    full = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        qp_bands=[1],
+    )
+    truncated = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        qp_bands=[1],
+        intermediate_bands=[0],
+    )
+
+    assert truncated.info["intermediate_bands"] == (0,)
+    assert truncated.info["nqp"] == 2
+    assert truncated.info["all_converged"]
+    np.testing.assert_allclose(truncated.e_qp[:, 0], truncated.e_mf[:, 0], atol=1e-12)
+    assert not np.allclose(truncated.e_qp[:, 1], full.e_qp[:, 1])
+
+    gw = KGW(two_k_h2_reference, eta=1.0e-3).run(
+        direct_scale=1.0,
+        qp_bands=[1],
+        intermediate_bands=[0],
+    )
+    assert gw.info["intermediate_bands"] == (0,)
+    np.testing.assert_allclose(gw.e_qp, truncated.e_qp, atol=1e-12)
+
+
+def test_two_k_diagonal_evgw_records_cycles(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    result = diagonal_evgw(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        max_cycle=2,
+        conv_tol=0.0,
+        damping=0.5,
+        update_screening=False,
+        solve_roots=False,
+    )
+
+    assert result.info["backend"] == "kpoint_diagonal_evgw_direct_rpa"
+    assert result.info["method"] == "evgw"
+    assert result.info["update_screening"] is False
+    assert result.info["finite_size_correction"] is False
+    assert result.info["cycles"] == 2
+    assert result.info["all_converged"] is False
+    assert len(result.history) == 2
+    assert result.e_qp.shape == (2, 2)
+    assert result.sigma_c.shape == (2, 2)
+    assert np.all(result.converged)
+    assert np.all(np.isfinite(result.e_qp))
+    np.testing.assert_allclose(result.history[-1]["energy"], result.e_qp, atol=1e-12)
+
+
+def test_periodic_gw_iteration_counts_are_validated(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    with pytest.raises(TypeError, match="maxiter"):
+        diagonal_g0w0(
+            space,
+            direct_scale=1.0,
+            solve_roots=True,
+            maxiter=1.5,
+            qp_bands=[1],
+        )
+    with pytest.raises(ValueError, match="linearized"):
+        diagonal_g0w0(
+            space,
+            direct_scale=1.0,
+            linearized=True,
+            solve_roots=True,
+        )
+    with pytest.raises(ValueError, match="linearized_step"):
+        diagonal_g0w0(
+            space,
+            direct_scale=1.0,
+            linearized=True,
+            linearized_step=0.0,
+        )
+    with pytest.raises(TypeError, match="max_cycle"):
+        diagonal_evgw(
+            space,
+            direct_scale=1.0,
+            max_cycle=1.5,
+            solve_roots=False,
+        )
+    with pytest.raises(ValueError, match="max_cycle"):
+        diagonal_evgw(
+            space,
+            direct_scale=1.0,
+            max_cycle=0,
+            solve_roots=False,
+        )
+    with pytest.raises(TypeError, match="maxiter"):
+        KGW(two_k_h2_reference).evgw(
+            direct_scale=1.0,
+            max_cycle=1,
+            solve_roots=True,
+            maxiter=1.5,
+            qp_bands=[1],
+        )
+
+
+def test_periodic_gw_finite_size_correction_adds_head_and_wing(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    bare = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+    )
+    finite = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        finite_size_correction=True,
+    )
+    direct = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+    )
+
+    assert finite.finite_size_correction is True
+    np.testing.assert_allclose(
+        finite.finite_size_sigma,
+        finite.finite_size_head + finite.finite_size_wing,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(finite.finite_size_sigma, direct.sigma_c, atol=1e-12)
+    np.testing.assert_allclose(finite.value(), bare.value() + direct.sigma_c, atol=1e-12)
+
+    result = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        finite_size_correction=True,
+    )
+    assert result.info["finite_size_correction"] is True
+    assert result.info["finite_size_sigma"].shape == result.e_mf.shape
+    np.testing.assert_allclose(
+        result.info["finite_size_sigma"],
+        result.info["finite_size_head"] + result.info["finite_size_wing"],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.e_qp,
+        result.e_mf + result.sigma_c.real,
+        atol=1e-12,
+    )
+
+    evgw = diagonal_evgw(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        max_cycle=1,
+        solve_roots=False,
+        finite_size_correction=True,
+    )
+    assert evgw.info["finite_size_correction"] is True
+    assert evgw.info["finite_size_sigma"].shape == evgw.e_mf.shape
+
+    gw = KGW(two_k_h2_reference, eta=1.0e-3).run(
+        direct_scale=1.0,
+        finite_size_correction=True,
+    )
+    assert gw.info["finite_size_correction"] is True
+    np.testing.assert_allclose(gw.e_qp, result.e_qp, atol=1e-12)
+
+    with pytest.raises(NotImplementedError, match="reciprocal_ewald_lr"):
+        diagonal_g0w0(
+            space,
+            coulomb_component="full_ewald",
+            finite_size_correction=True,
+        )
+
+
+def test_periodic_gw_pyscf_gdf_finite_size_uses_pyscf_convention(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    bare = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="pyscf_gdf",
+    )
+    finite = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="pyscf_gdf",
+        finite_size_correction=True,
+    )
+    direct = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        coulomb_component="pyscf_gdf",
+    )
+
+    assert finite.coulomb_component == PYSCF_GDF
+    assert finite.finite_size_method.startswith("small_sphere_head_wing:pyscf_gdf")
+    np.testing.assert_allclose(finite.finite_size_sigma, direct.sigma_c, atol=1e-12)
+    np.testing.assert_allclose(finite.value(), bare.value() + direct.sigma_c, atol=1e-12)
+    assert direct.sigma_c.real < 0.0
+
+    result = diagonal_g0w0(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="pyscf_gdf",
+        finite_size_correction=True,
+        qp_bands=[1],
+    )
+    assert result.info["coulomb_component"] == PYSCF_GDF
+    assert result.info["finite_size_correction"] is True
+    assert result.info["finite_size_method"].startswith("small_sphere_head_wing:pyscf_gdf")
+    assert result.info["finite_size_sigma"][0, 1].real < 0.0
+
+
+def test_periodic_gw_builtin_gradient_finite_size_matches_pyscf_gradient(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    two_k_h2_reference.pair_cut = 3
+    two_k_h2_reference._periodic_setup()
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    builtin = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        coulomb_component="pyscf_gdf",
+        head_method="builtin_gradient",
+    )
+    pyscf = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        coulomb_component="pyscf_gdf",
+        head_method="pyscf_gradient",
+    )
+    finite_q = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        coulomb_component="pyscf_gdf",
+        head_method="finite_q",
+    )
+
+    assert builtin.method.endswith("builtin_gradient")
+    np.testing.assert_allclose(builtin.sigma_c, pyscf.sigma_c, rtol=5.0e-4, atol=1.0e-8)
+    assert abs(finite_q.sigma_c - pyscf.sigma_c) > 5.0 * abs(pyscf.sigma_c)
+
+
+def test_periodic_gw_gdf_finite_size_uses_vector_convention(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    bare = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="gdf",
+    )
+    finite = diagonal_correlation_self_energy(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        coulomb_component="gdf",
+        finite_size_correction=True,
+    )
+    direct = diagonal_finite_size_correction(
+        space,
+        k_index=0,
+        band_index=1,
+        omega=0.4,
+        coulomb_component="gdf",
+    )
+
+    assert finite.coulomb_component == GDF
+    assert finite.finite_size_method.startswith("small_sphere_head_wing:gdf")
+    np.testing.assert_allclose(finite.finite_size_sigma, direct.sigma_c, atol=1e-12)
+    np.testing.assert_allclose(finite.value(), bare.value() + direct.sigma_c, atol=1e-12)
+
+
+def test_diagonal_g0w0_gdf_can_prebuild_q_ao_store(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    result = diagonal_g0w0(
+        space,
+        coulomb_component="gdf",
+        prebuild_gdf=True,
+        q_indices=[0],
+        qp_bands=[1],
+        intermediate_bands=[0],
+        direct_scale=1.0,
+        eta=1.0e-3,
+    )
+
+    assert result.info["coulomb_component"] == GDF
+    assert len(result.info["gdf_prebuild"]) == 1
+    assert result.info["gdf_prebuild"][0]["q_index"] == 0
+    assert result.info["gdf_prebuild"][0]["timings"]["q_ao_store_cache_misses"] == 1
+    assert (
+        result.info["gdf_prebuild"][0]["timings"]["cderi_array_materialized_blocks"]
+        > 0
+    )
+    assert result.info["gdf_prebuild_seconds"] >= 0.0
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 1
+
+
+def test_kgw_periodic_gdf_can_prebuild_q_ao_store(two_k_h2_reference):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+
+    gw = KGW(mf, eta=1.0e-3).run(
+        coulomb_component="gdf",
+        prebuild_gdf=True,
+        q_indices=[0],
+        qp_bands=[1],
+        intermediate_bands=[0],
+        direct_scale=1.0,
+    )
+
+    assert gw.periodic_backend
+    assert gw.info["coulomb_component"] == GDF
+    assert len(gw.info["gdf_prebuild"]) == 1
+    assert gw.info["gdf_prebuild"][0]["q_index"] == 0
+    assert gw.info["gdf_prebuild"][0]["timings"]["q_ao_store_cache_misses"] == 1
+    assert (
+        gw.info["gdf_prebuild"][0]["timings"]["cderi_array_materialized_blocks"]
+        > 0
+    )
+    assert gw.info["gdf_prebuild_seconds"] >= 0.0
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 1
+
+
+def test_kgw_periodic_evgw_gdf_can_prebuild_q_ao_store(two_k_h2_reference):
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+
+    gw = KGW(mf, eta=1.0e-3).evgw(
+        coulomb_component="gdf",
+        prebuild_gdf=True,
+        q_indices=[0],
+        qp_bands=[1],
+        intermediate_bands=[0],
+        direct_scale=1.0,
+        max_cycle=1,
+        solve_roots=False,
+    )
+
+    assert gw.periodic_backend
+    assert gw.info["coulomb_component"] == GDF
+    assert len(gw.info["gdf_prebuild"]) == 1
+    assert gw.info["gdf_prebuild"][0]["q_index"] == 0
+
+
+def test_two_k_diagonal_evgw_can_target_qp_bands(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    result = diagonal_evgw(
+        space,
+        eta=1.0e-3,
+        direct_scale=1.0,
+        max_cycle=1,
+        conv_tol=0.0,
+        update_screening=False,
+        solve_roots=False,
+        qp_bands=[1],
+    )
+
+    assert result.info["qp_bands"] == (1,)
+    assert result.info["target_bands"] == ((0, 1), (1, 1))
+    assert result.info["nqp"] == 2
+    assert result.info["eta"] == 1.0e-3
+    assert result.info["direct_scale"] == 1.0
+    assert result.info["g2_tol"] == 1.0e-16
+    assert result.info["thresh"] == 1.0e-10
+    assert result.info["max_cycle"] == 1
+    assert result.info["conv_tol"] == 0.0
+    assert result.info["damping"] == 1.0
+    np.testing.assert_array_equal(result.info["q_indices"], [0, 1])
+    assert result.info["all_converged"] is False
+    assert np.all(result.converged[:, 1])
+    assert not np.any(result.converged[:, 0])
+    np.testing.assert_allclose(result.e_qp[:, 0], result.e_mf[:, 0], atol=1e-12)
+    assert np.all(np.isnan(result.sigma_c[:, 0].real))
+
+
+def test_two_k_kgw_evgw_and_gnw0_drivers(two_k_h2_reference):
+    evgw = KGW(two_k_h2_reference, eta=1.0e-3).evgw(
+        direct_scale=1.0,
+        max_cycle=1,
+        conv_tol=0.0,
+        damping=0.5,
+        solve_roots=False,
+    )
+    gnw0 = KGW(two_k_h2_reference, eta=1.0e-3).gnw0(
+        direct_scale=1.0,
+        max_cycle=1,
+        conv_tol=0.0,
+        damping=0.5,
+        solve_roots=False,
+    )
+
+    assert evgw.info["method"] == "evgw"
+    assert evgw.method == "evgw"
+    assert evgw.info["update_screening"] is True
+    assert evgw.info["cycles"] == 1
+    assert len(evgw.evgw_history) == 1
+    assert gnw0.info["method"] == "gnw0"
+    assert gnw0.method == "gnw0"
+    assert gnw0.info["update_screening"] is False
+    assert gnw0.info["cycles"] == 1
+    assert evgw.e_qp.shape == gnw0.e_qp.shape == (2, 2)
+    assert np.all(np.isfinite(evgw.e_qp))
+    assert np.all(np.isfinite(gnw0.e_qp))
+
+    tda = KTDA(evgw).run(q_index=0, direct_scale=1.0, nroots=1, return_vectors=False)
+    assert tda.e.shape == (1,)
+    assert np.all(np.isfinite(tda.e))
+
+
+def test_kgw_reused_driver_clears_stale_periodic_results(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference, eta=1.0e-3).evgw(
+        direct_scale=1.0,
+        max_cycle=1,
+        conv_tol=0.0,
+        damping=0.5,
+        solve_roots=False,
+    )
+    assert gw.evgw_result is not None
+    assert gw.g0w0_result is None
+    assert len(gw.evgw_history) == 1
+
+    gw.g0w0(direct_scale=1.0)
+
+    assert gw.method == "g0w0"
+    assert gw.g0w0_result is not None
+    assert gw.evgw_result is None
+    assert gw.evgw_history == []
+
+
+def test_two_k_periodic_bse_matrices_are_hermitian(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference).run(direct_scale=1.0)
+    space = gw.transition_space(qpts="mesh")
+    block = periodic_bse_matrices(
+        space,
+        q_index=0,
+        qp_energy=gw.e_qp,
+        direct_scale=1.25,
+        exchange_scale=0.25,
+        screened_exchange_scale=0.75,
+        g2_tol=1.0e-14,
+        thresh=1.0e-9,
+    )
+
+    assert block.A.shape == (2, 2)
+    assert block.B.shape == (2, 2)
+    assert block.coulomb_component == "reciprocal_ewald_lr"
+    assert block.direct_scale == 1.25
+    assert block.exchange_scale == 0.25
+    assert block.screened_exchange_scale == 0.75
+    assert block.g2_tol == 1.0e-14
+    assert block.thresh == 1.0e-9
+    assert block.transition_table.shape == (2,)
+    np.testing.assert_array_equal(block.transition_table["q"], [0, 0])
+    np.testing.assert_allclose(block.transition_table["energy"], block.transition_energy)
+    np.testing.assert_allclose(block.A, block.A.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.B, block.B.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        block.A - block.B,
+        np.diag(block.transition_energy),
+        atol=1e-12,
+    )
+
+
+def test_gamma_periodic_bse_direct_term_can_use_dense_full_ewald_metric(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    reciprocal = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    full = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    dense_full = dense_gamma_transition_metric(space, q_index=0, component="full_ewald")
+
+    assert full.coulomb_component == "full_ewald"
+    np.testing.assert_allclose(full.direct, dense_full, atol=1e-12)
+    assert full.exchange[0, 0].real > 0.0
+    np.testing.assert_allclose(
+        full.screened_exchange,
+        np.zeros_like(full.screened_exchange),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(full.B, full.direct, atol=1e-12)
+    np.testing.assert_allclose(
+        full.A - full.B,
+        np.diag(full.transition_energy),
+        atol=1e-12,
+    )
+    assert full.B[0, 0].real > reciprocal.B[0, 0].real
+
+    tda = periodic_tda(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    bse = periodic_bse(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    spectrum = periodic_tda_spectrum(
+        space,
+        q_indices=[0],
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+        nroots=1,
+        return_vectors=False,
+    )
+
+    assert tda.block.coulomb_component == "full_ewald"
+    assert bse.block.coulomb_component == "full_ewald"
+    assert spectrum.info["coulomb_components"] == ("full_ewald",)
+    assert tda.e.shape == bse.e.shape == (1,)
+    assert np.all(np.isfinite(tda.e))
+    assert np.all(np.isfinite(bse.e))
+
+
+def test_gamma_periodic_bse_full_ewald_uses_dense_pair_couplings(gamma_h2_mf):
+    space = KGW(gamma_h2_mf).transition_space(qpts="gamma")
+    transition = space.transitions(0)[0]
+    reciprocal = periodic_bse_matrices(space, q_index=0, direct_scale=1.0)
+    full = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+    expected_exchange = dense_gamma_orbital_pair_metric(
+        space,
+        q_index=0,
+        left_pair=(
+            transition.kq_index,
+            transition.kq_index,
+            transition.vir_band,
+            transition.vir_band,
+        ),
+        right_pair=(
+            transition.k_index,
+            transition.k_index,
+            transition.occ_band,
+            transition.occ_band,
+        ),
+        component="full_ewald",
+    )
+    poles = space.screened_interaction(
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+    occ_coupling = full_ewald_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=transition.k_index,
+        kq_index=transition.k_index,
+        left_band=transition.occ_band,
+        right_band=transition.occ_band,
+    )
+    vir_coupling = full_ewald_orbital_pair_coupling(
+        space,
+        q_index=0,
+        k_index=transition.kq_index,
+        kq_index=transition.kq_index,
+        left_band=transition.vir_band,
+        right_band=transition.vir_band,
+    )
+    expected_screened_exchange = np.sum(
+        poles.coupling_for_coulomb_vector(vir_coupling)
+        * poles.coupling_for_coulomb_vector(occ_coupling).conj()
+        / poles.omega
+    )
+
+    assert full.coulomb_component == "full_ewald"
+    np.testing.assert_allclose(full.exchange[0, 0], expected_exchange, atol=1e-12)
+    np.testing.assert_allclose(
+        full.screened_exchange[0, 0],
+        expected_screened_exchange.real,
+        atol=1e-40,
+    )
+    assert not np.allclose(full.exchange, reciprocal.exchange)
+    np.testing.assert_allclose(
+        full.A - full.B,
+        np.diag(full.transition_energy),
+        atol=1e-12,
+    )
+
+
+def test_full_ewald_periodic_bse_supports_multi_k_reference(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    block = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    assert block.coulomb_component == "full_ewald"
+    assert block.A.shape == block.B.shape == (2, 2)
+    np.testing.assert_allclose(block.direct, block.direct.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.exchange, block.exchange.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.screened_exchange, block.screened_exchange.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.A, block.A.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.B, block.B.conj().T, atol=1e-12)
+    np.testing.assert_allclose(
+        block.A - block.B,
+        np.diag(block.transition_energy),
+        atol=1e-12,
+    )
+    assert np.all(np.isfinite(block.A))
+
+
+def test_gdf_periodic_bse_supports_multi_k_reference(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    block = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="gdf",
+    )
+    gdf_metric = gdf_transition_metric(space, q_index=0)
+
+    assert block.coulomb_component == GDF
+    assert block.A.shape == block.B.shape == (2, 2)
+    np.testing.assert_allclose(block.direct, gdf_metric, atol=1e-12)
+    np.testing.assert_allclose(block.direct, block.direct.conj().T, atol=1e-12)
+    np.testing.assert_allclose(block.exchange, block.exchange.conj().T, atol=1e-10)
+    np.testing.assert_allclose(block.screened_exchange, block.screened_exchange.conj().T, atol=1e-10)
+    np.testing.assert_allclose(block.A, block.A.conj().T, atol=1e-10)
+    np.testing.assert_allclose(block.B, block.B.conj().T, atol=1e-10)
+    assert np.all(np.isfinite(block.A))
+
+
+def test_periodic_bse_table_tracks_supplied_qp_energy(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    qp_energy = np.asarray(two_k_h2_reference.mo_energy, dtype=float).copy()
+    qp_energy[:, 1] += [0.2, 0.4]
+
+    block = periodic_bse_matrices(
+        space,
+        q_index=1,
+        qp_energy=qp_energy,
+        direct_scale=1.0,
+    )
+
+    np.testing.assert_allclose(block.transition_energy, [2.1, 1.5])
+    np.testing.assert_allclose(block.transition_table["energy"], block.transition_energy)
+    np.testing.assert_allclose(space.as_table(1)["energy"], [1.7, 1.3])
+
+
+def test_periodic_bse_screening_energy_matches_explicit_screening_space(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    screening_energy = np.asarray(two_k_h2_reference.mo_energy, dtype=float).copy()
+    screening_energy[:, 1] += [0.2, 0.4]
+
+    from_energy = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        screening_energy=screening_energy,
+    )
+    from_space = periodic_bse_matrices(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        screening_space=space.with_mo_energy(screening_energy),
+    )
+
+    np.testing.assert_allclose(from_energy.A, from_space.A, atol=1e-12)
+    np.testing.assert_allclose(from_energy.B, from_space.B, atol=1e-12)
+    np.testing.assert_allclose(
+        from_energy.screened_exchange,
+        from_space.screened_exchange,
+        atol=1e-12,
+    )
+
+
+def test_two_k_periodic_tda_and_bse_wrappers(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference).run(direct_scale=1.0)
+
+    tda = KTDA(gw).run(q_index=0, direct_scale=1.0, nroots=2, return_vectors=True)
+    bse = KBSE(gw).run(q_index=0, direct_scale=1.0, nroots=2, return_vectors=True)
+    direct_tda = periodic_tda(
+        gw.transition_space(qpts="mesh"),
+        q_index=0,
+        qp_energy=gw.e_qp,
+        direct_scale=1.0,
+        nroots=2,
+    )
+    direct_bse = periodic_bse(
+        gw.transition_space(qpts="mesh"),
+        q_index=0,
+        qp_energy=gw.e_qp,
+        direct_scale=1.0,
+        nroots=2,
+    )
+
+    assert tda.info["backend"] == "kpoint_dense_bse"
+    assert bse.info["backend"] == "kpoint_dense_bse"
+    assert tda.info["uses_qp_energy"]
+    assert bse.info["uses_qp_energy"]
+    assert tda.info["direct_scale"] == 1.0
+    assert bse.info["direct_scale"] == 1.0
+    assert tda.info["exchange_scale"] == 1.0
+    assert bse.info["exchange_scale"] == 1.0
+    assert tda.info["screened_exchange_scale"] == 1.0
+    assert bse.info["screened_exchange_scale"] == 1.0
+    assert tda.info["g2_tol"] == 1.0e-16
+    assert bse.info["g2_tol"] == 1.0e-16
+    assert tda.info["thresh"] == 1.0e-10
+    assert bse.info["thresh"] == 1.0e-10
+    assert tda.bse_metric == "tda"
+    assert bse.bse_metric == "full"
+    assert tda.e.shape == (2,)
+    assert bse.e.shape == (2,)
+    assert tda.excitation_vectors.shape == (2, 2)
+    assert bse.excitation_vectors.shape == (4, 2)
+    assert bse.x.shape == (2, 2)
+    assert bse.y.shape == (2, 2)
+    assert np.all(np.isfinite(tda.e))
+    assert np.all(np.isfinite(bse.e))
+    np.testing.assert_allclose(tda.e, direct_tda.e, atol=1e-12)
+    np.testing.assert_allclose(bse.e, direct_bse.e, atol=1e-12)
+    np.testing.assert_allclose(bse.xy, direct_bse.vectors, atol=1e-12)
+    metric_norm = np.sum(abs(bse.x) ** 2, axis=0) - np.sum(abs(bse.y) ** 2, axis=0)
+    np.testing.assert_allclose(metric_norm, np.ones(2), atol=1e-8)
+
+
+def test_periodic_bse_root_requests_are_validated(two_k_h2_reference):
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+
+    empty_tda = periodic_tda(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        nroots=0,
+        return_vectors=True,
+    )
+    empty_bse = periodic_bse(
+        space,
+        q_index=0,
+        direct_scale=1.0,
+        nroots=0,
+        return_vectors=True,
+    )
+    assert empty_tda.e.shape == (0,)
+    assert empty_tda.vectors.shape == (2, 0)
+    assert empty_tda.info["nroots_requested"] == 0
+    assert empty_tda.info["nroots_returned"] == 0
+    assert empty_bse.e.shape == (0,)
+    assert empty_bse.vectors.shape == (4, 0)
+    assert empty_bse.info["nroots_requested"] == 0
+    assert empty_bse.info["nroots_returned"] == 0
+
+    with pytest.raises(ValueError, match="nroots"):
+        periodic_tda(space, q_index=0, direct_scale=1.0, nroots=-1)
+    with pytest.raises(ValueError, match="nroots"):
+        periodic_bse(space, q_index=0, direct_scale=1.0, nroots=-1)
+    with pytest.raises(TypeError, match="nroots"):
+        periodic_tda(space, q_index=0, direct_scale=1.0, nroots=1.5)
+    with pytest.raises(TypeError, match="nroots"):
+        periodic_bse(space, q_index=0, direct_scale=1.0, nroots=1.5)
+    with pytest.raises(RuntimeError, match="requested"):
+        periodic_tda(space, q_index=0, direct_scale=1.0, nroots=99)
+    with pytest.raises(RuntimeError, match="requested"):
+        periodic_bse(space, q_index=0, direct_scale=1.0, nroots=99)
+
+    spectrum = periodic_tda_spectrum(
+        space,
+        q_indices=[0],
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    assert spectrum.info["nroots_requested"] == (1,)
+    assert spectrum.info["nroots_returned"] == (1,)
+
+
+def test_periodic_bse_uses_requested_thresh_for_casida_roots(two_k_h2_reference):
+    two_k_h2_reference.mo_energy = [
+        np.asarray([-0.10, 0.10]),
+        np.asarray([-0.10, 0.10]),
+    ]
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="mesh")
+
+    result = periodic_bse(
+        space,
+        q_index=0,
+        direct_scale=0.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+        thresh=0.01,
+        nroots=1,
+        return_vectors=False,
+    )
+    np.testing.assert_allclose(result.e, [0.20], atol=1e-12)
+    assert result.info["thresh"] == 0.01
+
+    with pytest.raises(RuntimeError, match="positive roots"):
+        periodic_bse(
+            space,
+            q_index=0,
+            direct_scale=0.0,
+            exchange_scale=0.0,
+            screened_exchange_scale=0.0,
+            thresh=0.10,
+            nroots=1,
+            return_vectors=False,
+        )
+
+
+def test_periodic_bse_wrappers_can_screen_from_qp_energy(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference, eta=1.0e-3).evgw(
+        direct_scale=1.0,
+        max_cycle=1,
+        conv_tol=0.0,
+        damping=0.5,
+        solve_roots=False,
+    )
+
+    tda = KTDA(gw).run(
+        q_index=0,
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        screening_from_qp=True,
+    )
+    bse = KBSE(gw).run(
+        q_index=0,
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        screening_from_qp=True,
+    )
+
+    assert tda.info["uses_screening_energy"]
+    assert bse.info["uses_screening_energy"]
+    np.testing.assert_allclose(
+        tda._periodic_result.block.transition_table["energy"],
+        tda._periodic_result.block.transition_energy,
+    )
+    np.testing.assert_allclose(
+        bse._periodic_result.block.transition_table["energy"],
+        bse._periodic_result.block.transition_energy,
+    )
+
+
+def test_two_k_periodic_q_spectra(two_k_h2_reference):
+    gw = KGW(two_k_h2_reference).run(direct_scale=1.0)
+    space = gw.transition_space(qpts="mesh")
+
+    direct_tda = periodic_tda_spectrum(
+        space,
+        qp_energy=gw.e_qp,
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    direct_bse = periodic_bse_spectrum(
+        space,
+        qp_energy=gw.e_qp,
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    tda_driver = KTDA(gw)
+    bse_driver = KBSE(gw)
+    wrapper_tda = tda_driver.q_spectrum(direct_scale=1.0, nroots=1, return_vectors=False)
+    wrapper_bse = bse_driver.q_spectrum(direct_scale=1.0, nroots=1, return_vectors=False)
+    qp_screened_subset = KTDA(gw).q_spectrum(
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        q_indices=[1],
+        screening_from_qp=True,
+    )
+    mf_subset = KTDA(gw).q_spectrum(
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        q_indices=[1],
+        use_qp=False,
+    )
+
+    assert direct_tda.nblocks == 2
+    assert direct_bse.nblocks == 2
+    np.testing.assert_array_equal(direct_tda.q_indices, [0, 1])
+    np.testing.assert_array_equal(direct_tda.info["q_indices"], [0, 1])
+    assert direct_tda.qpts.shape == (2, 3)
+    assert direct_tda.info["uses_qp_energy"]
+    assert direct_bse.info["uses_qp_energy"]
+    assert direct_tda.info["coulomb_components"] == ("reciprocal_ewald_lr",)
+    assert direct_tda.info["direct_scales"] == (1.0,)
+    assert direct_bse.info["direct_scales"] == (1.0,)
+    assert direct_tda.info["exchange_scales"] == (1.0,)
+    assert direct_bse.info["exchange_scales"] == (1.0,)
+    assert direct_tda.info["screened_exchange_scales"] == (1.0,)
+    assert direct_bse.info["screened_exchange_scales"] == (1.0,)
+    assert direct_tda.info["g2_tols"] == (1.0e-16,)
+    assert direct_bse.info["g2_tols"] == (1.0e-16,)
+    assert direct_tda.info["thresh_values"] == (1.0e-10,)
+    assert direct_bse.info["thresh_values"] == (1.0e-10,)
+    assert all(roots.shape == (1,) for roots in direct_tda.energies_by_q)
+    assert all(roots.shape == (1,) for roots in direct_bse.energies_by_q)
+    np.testing.assert_allclose(wrapper_tda.lowest_roots(), direct_tda.lowest_roots(), atol=1e-12)
+    np.testing.assert_allclose(wrapper_bse.lowest_roots(), direct_bse.lowest_roots(), atol=1e-12)
+    assert tda_driver.info == wrapper_tda.info
+    assert bse_driver.info == wrapper_bse.info
+    assert tda_driver.bse_metric == "tda"
+    assert bse_driver.bse_metric == "full"
+    assert tda_driver.excitation_energies == wrapper_tda.energies_by_q
+    assert bse_driver.excitation_energies == wrapper_bse.energies_by_q
+    assert tda_driver.excitation_vectors == (None, None)
+    assert bse_driver.excitation_vectors == (None, None)
+    assert qp_screened_subset.nblocks == 1
+    np.testing.assert_array_equal(qp_screened_subset.q_indices, [1])
+    assert qp_screened_subset.info["uses_qp_energy"]
+    assert qp_screened_subset.info["uses_screening_energy"]
+    assert qp_screened_subset.results[0].block.q_index == 1
+    assert mf_subset.info["uses_qp_energy"] is False
+    assert mf_subset.info["uses_screening_energy"] is False
+    np.testing.assert_allclose(
+        mf_subset.results[0].block.transition_energy,
+        space.energies(1),
+        atol=1e-12,
+    )
+
+
+def test_real_two_k_krhf_reference_runs_periodic_gw_bse(real_two_k_h2_mf):
+    assert real_two_k_h2_mf.converged
+
+    ref = KPointSCFAdapter(real_two_k_h2_mf)
+    space = KPointTransitionSpace(ref, qpts="mesh")
+    assert ref.nkpts == 2
+    assert space.nqpts == 2
+    np.testing.assert_array_equal(space.ntransitions_by_q, [2, 2])
+
+    gw = KGW(real_two_k_h2_mf, eta=1e-3).run(direct_scale=1.0, g2_tol=1e-14)
+    assert gw.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert gw.info["converged"]
+    assert gw.e_qp.shape == ref.mo_energy.shape
+    assert np.all(np.isfinite(gw.e_qp))
+
+    tda = KTDA(gw).run(q_index=0, direct_scale=1.0, g2_tol=1e-14, nroots=2)
+    bse = KBSE(gw).run(q_index=0, direct_scale=1.0, g2_tol=1e-14, nroots=2)
+    assert tda.info["backend"] == "kpoint_dense_bse"
+    assert bse.info["backend"] == "kpoint_dense_bse"
+    assert tda.e.shape == (2,)
+    assert bse.e.shape == (2,)
+    assert np.all(np.isfinite(tda.e))
+    assert np.all(np.isfinite(bse.e))
+    assert bse.xy.shape == (4, 2)
+    assert bse._periodic_result.block.transition_table.shape == (2,)
+
+
+def test_gamma_pbc_kgw_smoke(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, screening="TDH", eta=1.0e-3).run()
+
+    assert gw.info["pbc"]
+    assert gw.info["backend"] == "gamma_molecular_bridge"
+    assert gw.e_qp.shape == (gamma_h2_mf.cell.nao,)
+    assert np.all(np.isfinite(gw.e_qp))
+
+
+def test_explicit_molecular_backend_rejects_periodic_options(gamma_h2_mf, two_k_h2_reference):
+    with pytest.raises(ValueError, match="periodic-only"):
+        KGW(gamma_h2_mf).run(
+            backend="molecular",
+            direct_scale=1.0,
+        )
+    with pytest.raises(NotImplementedError, match="Multi-k"):
+        KGW(two_k_h2_reference).run(backend="molecular")
+    with pytest.raises(ValueError, match="periodic-only"):
+        KTDA(gamma_h2_mf).run(
+            backend="molecular",
+            q_index=0,
+            nroots=1,
+        )
+    with pytest.raises(ValueError, match="periodic-only"):
+        KBSE(gamma_h2_mf).run(
+            backend="molecular",
+            screening_from_qp=True,
+            nroots=1,
+        )
+
+
+def test_gamma_kgw_can_use_periodic_full_ewald_driver(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, eta=1.0e-3).g0w0(
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    assert gw.periodic_backend
+    assert gw._gw is None
+    assert gw.g0w0_result is not None
+    assert gw.info["backend"] == "kpoint_diagonal_direct_rpa"
+    assert gw.info["coulomb_component"] == "full_ewald"
+    assert gw.info["converged"]
+    assert gw.e_qp.shape == (1, gamma_h2_mf.cell.nao)
+    assert np.all(np.isfinite(gw.e_qp))
+
+
+def test_gamma_pbc_tda_and_bse_smoke(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, screening="TDH", eta=1.0e-3).run()
+
+    tda = KTDA(gw).run(nroots=1, low_rank=False, return_vectors=True)
+    bse = KBSE(gw).run(nroots=1, low_rank=False, return_vectors=True)
+
+    assert tda.info["pbc"]
+    assert bse.info["pbc"]
+    assert tda.e.shape == (1,)
+    assert bse.e.shape == (1,)
+    assert np.all(np.isfinite(tda.e))
+    assert np.all(np.isfinite(bse.e))
+
+
+def test_bse_wrapper_reused_driver_clears_stale_route_state(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, screening="TDH", eta=1.0e-3).run()
+    tda = KTDA(gw).run(
+        q_index=0,
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+    )
+    assert tda._solver is None
+    assert tda._periodic_result is not None
+    assert tda.excitation_vectors is None
+
+    tda.run(
+        backend="molecular",
+        nroots=1,
+        low_rank=False,
+        return_vectors=True,
+    )
+
+    assert tda.info["backend"] == "gamma_molecular_bridge"
+    assert tda._solver is not None
+    assert tda._periodic_result is None
+    assert tda._periodic_spectrum is None
+    assert tda.excitation_vectors is tda._solver.excitation_vectors
+    assert tda.e.shape == (1,)
+    assert np.all(np.isfinite(tda.e))
+
+
+def test_gamma_periodic_bse_wrapper_q_index_selects_periodic_backend(gamma_h2_mf):
+    tda = KTDA(gamma_h2_mf).run(
+        q_index=0,
+        nroots=1,
+        return_vectors=False,
+        use_qp=False,
+    )
+
+    assert tda.info["backend"] == "kpoint_dense_bse"
+    assert tda._periodic_result.block.q_index == 0
+    assert tda.info["uses_qp_energy"] is False
+    assert tda.e.shape == (1,)
+
+
+def test_gamma_periodic_q_spectrum_defaults_to_periodic_backend(gamma_h2_mf):
+    tda_driver = KTDA(gamma_h2_mf)
+    bse_driver = KBSE(gamma_h2_mf)
+    tda = tda_driver.q_spectrum(
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        use_qp=False,
+    )
+    bse = bse_driver.q_spectrum(
+        direct_scale=1.0,
+        nroots=1,
+        return_vectors=False,
+        use_qp=False,
+    )
+
+    assert tda.info["backend"] == "kpoint_dense_bse"
+    assert bse.info["backend"] == "kpoint_dense_bse"
+    assert tda.nblocks == bse.nblocks == 1
+    np.testing.assert_array_equal(tda.q_indices, [0])
+    np.testing.assert_array_equal(bse.q_indices, [0])
+    assert tda.info["uses_qp_energy"] is False
+    assert bse.info["uses_qp_energy"] is False
+    assert tda_driver.info == tda.info
+    assert bse_driver.info == bse.info
+    assert tda_driver.excitation_energies == tda.energies_by_q
+    assert bse_driver.excitation_energies == bse.energies_by_q
+    assert tda.results[0].block.q_index == 0
+    assert bse.results[0].block.q_index == 0
+    assert np.all(np.isfinite(tda.lowest_roots()))
+    assert np.all(np.isfinite(bse.lowest_roots()))
+
+    with pytest.raises(NotImplementedError, match="q_spectrum"):
+        KTDA(gamma_h2_mf).q_spectrum(
+            backend="molecular",
+            direct_scale=1.0,
+            nroots=1,
+            return_vectors=False,
+            use_qp=False,
+        )
+
+
+def test_gamma_periodic_bse_wrappers_can_use_full_ewald_driver(gamma_h2_mf):
+    gw = KGW(gamma_h2_mf, eta=1.0e-3).g0w0(
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+    )
+
+    tda = KTDA(gw).run(
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        nroots=1,
+        return_vectors=False,
+    )
+    bse = KBSE(gw).run(
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        nroots=1,
+        return_vectors=False,
+    )
+    direct_tda = KTDA(gamma_h2_mf).run(
+        backend="periodic",
+        q_index=0,
+        direct_scale=1.0,
+        coulomb_component="full_ewald",
+        nroots=1,
+        return_vectors=False,
+        use_qp=False,
+    )
+
+    assert tda.info["backend"] == "kpoint_dense_bse"
+    assert bse.info["backend"] == "kpoint_dense_bse"
+    assert tda._periodic_result.block.coulomb_component == "full_ewald"
+    assert bse._periodic_result.block.coulomb_component == "full_ewald"
+    assert direct_tda._periodic_result.block.coulomb_component == "full_ewald"
+    assert tda.info["uses_qp_energy"]
+    assert direct_tda.info["uses_qp_energy"] is False
+    assert tda.e.shape == bse.e.shape == direct_tda.e.shape == (1,)
+    assert np.all(np.isfinite(tda.e))
+    assert np.all(np.isfinite(bse.e))
+    assert np.all(np.isfinite(direct_tda.e))

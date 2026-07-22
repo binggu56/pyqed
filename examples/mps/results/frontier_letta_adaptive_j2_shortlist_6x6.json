@@ -1,0 +1,208 @@
+{
+  "model": {
+    "nrows": 6,
+    "ncols": 6,
+    "nsites": 36,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open"
+  },
+  "source": {
+    "baseline_result": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_block_sparse_6x6.json",
+    "baseline_state": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_block_sparse_6x6.npz",
+    "confirmation": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_adaptive_j2_tie_6x6_confirm.json",
+    "sample_filter": {
+      "chains": 4,
+      "nsamples": 1024,
+      "sector": "half filling (total Sz = 0)",
+      "acceptance_rate": 0.04106404958677686
+    }
+  },
+  "baseline": {
+    "energy": -16.848069678369722,
+    "energy_per_site": -0.46800193551027003,
+    "parameters": 3752,
+    "ties": 60
+  },
+  "selection": {
+    "method": "sample-filtered top five, selected by fresh one-pass energy gain",
+    "shortlist_size": 5,
+    "candidates": [
+      {
+        "sample_rank": 1,
+        "edge": [
+          5,
+          7
+        ],
+        "connected_correlation": 0.1882781982421875,
+        "residual_coupling": 0.026611877873515998,
+        "sample_signal": 0.2148900761157035,
+        "proxy_utility": 0.2148900761157035,
+        "delta_log_cost": 0.0,
+        "cost_before": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "cost_after": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "fresh_energy": -16.848147850247713,
+        "energy_gain": 7.817187799119552e-05,
+        "energy_gain_per_site": 2.1714410553109865e-06,
+        "fresh_energy_check_passed": true,
+        "accepted": true,
+        "seconds": 8.997438124963082
+      },
+      {
+        "sample_rank": 2,
+        "edge": [
+          3,
+          9
+        ],
+        "connected_correlation": 0.1819305419921875,
+        "residual_coupling": 0.016350898895435638,
+        "sample_signal": 0.19828144088762314,
+        "proxy_utility": 0.19828144088762314,
+        "delta_log_cost": 0.0,
+        "cost_before": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "cost_after": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "fresh_energy": -16.848701161550853,
+        "energy_gain": 0.0006314831811309318,
+        "energy_gain_per_site": 1.7541199475859218e-05,
+        "fresh_energy_check_passed": true,
+        "accepted": true,
+        "seconds": 9.330184291990008
+      },
+      {
+        "sample_rank": 3,
+        "edge": [
+          2,
+          8
+        ],
+        "connected_correlation": 0.17462921142578125,
+        "residual_coupling": 0.02090353363371576,
+        "sample_signal": 0.195532745059497,
+        "proxy_utility": 0.19374900971312867,
+        "delta_log_cost": 0.008918676731841657,
+        "cost_before": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "cost_after": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28832,
+          "log_objective": 17.20071296600752
+        },
+        "fresh_energy": -16.84885443505044,
+        "energy_gain": 0.0007847566807193118,
+        "energy_gain_per_site": 2.179879668664755e-05,
+        "fresh_energy_check_passed": true,
+        "accepted": true,
+        "seconds": 9.25558091700077
+      },
+      {
+        "sample_rank": 4,
+        "edge": [
+          29,
+          31
+        ],
+        "connected_correlation": 0.11772918701171875,
+        "residual_coupling": 0.06147094862320629,
+        "sample_signal": 0.17920013563492504,
+        "proxy_utility": 0.17920013563492504,
+        "delta_log_cost": 0.0,
+        "cost_before": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "cost_after": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "fresh_energy": -16.848257321866974,
+        "energy_gain": 0.00018764349725231,
+        "energy_gain_per_site": 5.212319368119722e-06,
+        "fresh_energy_check_passed": true,
+        "accepted": true,
+        "seconds": 9.33641795796575
+      },
+      {
+        "sample_rank": 5,
+        "edge": [
+          27,
+          33
+        ],
+        "connected_correlation": 0.15772247314453125,
+        "residual_coupling": 0.014689350378097831,
+        "sample_signal": 0.17241182352262907,
+        "proxy_utility": 0.17241182352262907,
+        "delta_log_cost": 0.0,
+        "cost_before": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "cost_after": {
+          "peak_width": 6,
+          "peak_physical_states": 64,
+          "peak_norm_elements": 1024,
+          "total_norm_elements": 28576,
+          "log_objective": 17.191794289275677
+        },
+        "fresh_energy": -16.848907893013834,
+        "energy_gain": 0.0008382146441121563,
+        "energy_gain_per_site": 2.3283740114226565e-05,
+        "fresh_energy_check_passed": true,
+        "accepted": true,
+        "seconds": 9.492161792004481
+      }
+    ],
+    "selected_edge": [
+      27,
+      33
+    ]
+  },
+  "final": {
+    "energy": -16.848907893013834,
+    "energy_per_site": -0.46802521925038426,
+    "energy_gain": 0.0008382146441121563,
+    "energy_gain_per_site": 2.3283740114226565e-05,
+    "parameters": 3880,
+    "parameter_increase": 128,
+    "ties": 61,
+    "state_file": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_adaptive_j2_shortlist_6x6.npz"
+  },
+  "total_seconds": 49.40295416599838
+}

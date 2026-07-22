@@ -132,8 +132,15 @@ def _build_side_pipe(entries, q_mid, *, side, coupling="left", source_layouts=No
         selected_shape_fn = lambda block: (block.shape[2], block.shape[3])
         child_dirs = (1, 1)
 
+    coupling = normalize_coupling_scheme(coupling, default="left")
+    packed = {}
+    for key, block in entries:
+        combo = child_sectors_fn(key)
+        selected_shape = selected_shape_fn(block)
+        packed.setdefault((combo, selected_shape), selected_shape)
+
     child_sector_lists = tuple(
-        tuple(sorted({child_sectors_fn(key)[i] for key, _ in entries}))
+        tuple(sorted({combo[i] for combo, _shape in packed}))
         for i in range(2)
     )
 
@@ -141,19 +148,22 @@ def _build_side_pipe(entries, q_mid, *, side, coupling="left", source_layouts=No
         source = source_layouts.get(q_mid)
         if source is not None:
             source_pipe = source["pipe"]
+            source_entries = source_pipe.entries_for_sector(q_mid)
+            source_keys = {
+                (entry.child_sectors, entry.selected_shape, int(entry.local_dim))
+                for entry in source_entries
+            }
+            packed_keys = {
+                (combo, shape, int(np.prod(shape, dtype=int)))
+                for combo, shape in packed
+            }
             if (
                 source_pipe.child_legs == child_legs
                 and source_pipe.child_sector_lists == child_sector_lists
                 and source_pipe.child_dirs == child_dirs
+                and source_keys == packed_keys
             ):
                 return source_pipe, source["basis_map"], source.get("channel_map", {})
-
-    coupling = normalize_coupling_scheme(coupling, default="left")
-    packed = {}
-    for key, block in entries:
-        combo = child_sectors_fn(key)
-        selected_shape = selected_shape_fn(block)
-        packed.setdefault((combo, selected_shape), selected_shape)
 
     offset = 0
     pipe_entries = []
@@ -288,8 +298,15 @@ def _right_reduced_physical_metric(projection):
     return metric
 
 
-def _right_metric_weighted_projected_svd(projection, *, full_matrices=False):
+def _right_metric_weighted_projected_svd(
+    projection,
+    *,
+    full_matrices=False,
+    apply_reduced_metric=True,
+):
     matrix = projection.as_matrix()
+    if not apply_reduced_metric:
+        return projection.svd(full_matrices=full_matrices)
     right_metric = _right_reduced_physical_metric(projection)
     if np.allclose(right_metric, 1.0):
         return projection.svd(full_matrices=full_matrices)
@@ -321,6 +338,13 @@ def svd_two_site(
     if absorb not in {"left", "right"}:
         raise ValueError("absorb must be 'left' or 'right'.")
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
+    left_meta = (two_site.metadata or {}).get("left_metadata", {})
+    right_meta = (two_site.metadata or {}).get("right_metadata", {})
+    use_reduced_right_metric = (
+        left_meta.get("physical_basis") == "fully_reduced_su2"
+        or right_meta.get("physical_basis") == "fully_reduced_su2"
+        or (two_site.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+    )
 
     blocks_by_mid = {}
     bond_entries = _internal_bond_channel_map(two_site)
@@ -328,6 +352,8 @@ def svd_two_site(
         q_mids = bond_entries.get(key)
         if not q_mids:
             raise ValueError(f"Missing contracted bond sector for key {key!r}.")
+        if not use_reduced_right_metric and len(q_mids) > 1:
+            q_mids = (q_mids[0],)
         for q_mid in q_mids:
             blocks_by_mid.setdefault(q_mid, []).append((key, block))
 
@@ -375,6 +401,7 @@ def svd_two_site(
         svd_result = _right_metric_weighted_projected_svd(
             reduced_sector,
             full_matrices=False,
+            apply_reduced_metric=use_reduced_right_metric,
         )
         sector_svds[q_mid] = svd_result
 
@@ -599,6 +626,13 @@ def state_averaged_svd_two_site(
     if absorb not in {"left", "right"}:
         raise ValueError("absorb must be 'left' or 'right'.")
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
+    left_meta = (ref.metadata or {}).get("left_metadata", {})
+    right_meta = (ref.metadata or {}).get("right_metadata", {})
+    use_reduced_right_metric = (
+        left_meta.get("physical_basis") == "fully_reduced_su2"
+        or right_meta.get("physical_basis") == "fully_reduced_su2"
+        or (ref.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+    )
 
     blocks_by_mid = {}
     mid_by_key = {}
@@ -608,6 +642,8 @@ def state_averaged_svd_two_site(
             q_mids = bond_entries.get(key)
             if not q_mids:
                 raise ValueError(f"Missing contracted bond sector for key {key!r}.")
+            if not use_reduced_right_metric and len(q_mids) > 1:
+                q_mids = (q_mids[0],)
             previous_mids = mid_by_key.setdefault(key, q_mids)
             if previous_mids != q_mids:
                 raise ValueError(
@@ -672,7 +708,11 @@ def state_averaged_svd_two_site(
                 projection0 = projection
             matrices.append(projection.as_matrix())
         root_matrices_by_sector[q_mid] = matrices
-        right_metric = _right_reduced_physical_metric(projection0)
+        right_metric = (
+            _right_reduced_physical_metric(projection0)
+            if use_reduced_right_metric
+            else np.ones(projection0.right_dim, dtype=float)
+        )
         sqrt_right_metric = np.sqrt(right_metric)
 
         if absorb == "right":
@@ -892,7 +932,11 @@ def state_averaged_svd_two_site(
                 right_reduced[(q_mid, q_mid)] = left_kept.conj().T @ matrix
             else:
                 right_kept = svd_result.right_matrix(idxs)
-                right_metric = _right_reduced_physical_metric(svd_result.projection)
+                right_metric = (
+                    _right_reduced_physical_metric(svd_result.projection)
+                    if use_reduced_right_metric
+                    else np.ones(svd_result.projection.right_dim, dtype=float)
+                )
                 left_reduced[(q_mid, q_mid)] = (matrix * right_metric[None, :]) @ right_kept.conj().T
                 right_reduced[(q_mid, q_mid)] = right_kept
         root_site_pairs.append(

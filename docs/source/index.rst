@@ -1,6 +1,3 @@
-.. meta::
-   :description: Official PyQED documentation for quantum chemistry, nonadiabatic dynamics, open quantum systems, spectroscopy, and tensor-network methods.
-
 PyQED documentation
 ===================
 
@@ -57,6 +54,7 @@ to its current documentation, examples, and tests.
    hf_analysis
    mp2_comp2
    gw_bse
+   periodic_gw_bse
    tddft_ehrenfest
    mps
    dvr

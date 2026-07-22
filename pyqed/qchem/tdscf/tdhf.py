@@ -1,130 +1,110 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Aug 14 16:29:52 2022
+"""PySCF-backed restricted TDH/TDHF response helpers."""
 
-@author: bing
-"""
-import numpy as np
-from scipy.linalg import eigh, sqrtm
-import scipy
-import pyscf
-from pyscf import ao2mo, scf
-
-from functools import reduce
 import logging
 
-au2ev = 27.211386245988
+import numpy as np
+from pyscf import ao2mo, scf
+from scipy.linalg import eigh, sqrtm
+from scipy.sparse.linalg import eigsh
+
+AU2EV = 27.211386245988
+au2ev = AU2EV
 
 
-def is_positive_def(a):
+def is_positive_def(a, tol=0.0):
     vals = np.linalg.eigvalsh(np.asarray(a))
-    return np.all(vals > 0)
+    return bool(np.all(vals > tol))
 
 
 def eig_asymm(h):
-    '''Diagonalize a real, *asymmetrix* matrix and return sorted results.
-
-    Return the eigenvalues and eigenvectors (column matrix)
-    sorted from lowest to highest eigenvalue.
-    '''
+    """Diagonalize a real non-Hermitian matrix and sort by eigenvalue."""
     e, c = np.linalg.eig(h)
-    if np.allclose(e.imag, 0*e.imag):
-        e = np.real(e)
+    if np.allclose(e.imag, 0.0):
+        e = e.real
+        c = c.real
     else:
-        print("WARNING: Eigenvalues are complex, will be returned as such.")
+        logging.warning("TDHF eigenvalues have non-negligible imaginary parts.")
 
-    idx = e.argsort()
-    e = e[idx]
-    c = c[:,idx]
-
-    return e, c
+    idx = np.argsort(e.real)
+    return e[idx], c[:, idx]
 
 
-def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
-    '''Get the RPA eigenvalues and eigenvectors.
-
-    The RPA computation is required to construct the dielectric function, i.e. screened
-    Coloumb interaction.
-
-    Q^\dagger = \sum_{ia} X_{ia} a^+ i - Y_{ia} i^+ a
-
-    Leads to the RPA eigenvalue equations:
-      [ A  B ][X] = omega [ 1  0 ][X]
-      [ B  A ][Y]         [ 0 -1 ][Y]
-    which is equivalent to
-      [ A  B ][X] = omega [ 1  0 ][X]
-      [-B -A ][Y] =       [ 0  1 ][Y]
-
-    See, e.g. Stratmann, Scuseria, and Frisch,
-              J. Chem. Phys., 109, 8218 (1998)
-    '''
-    A, B = get_ab(gw, method=method)
-
-    if using_tda:
-        ham_rpa = A
-        e, x = eigh(ham_rpa)
-        return e, x
-    else:
-        if not using_casida:
-            ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-            assert is_positive_def(ham_rpa)
-            e, xy = eig_asymm(ham_rpa)
-            return e, xy
+def eig(a, k=None, **kwargs):
+    """Hermitian eigensolver with sparse fallback for small requested roots."""
+    a = np.asarray(a)
+    if isinstance(k, int):
+        if k <= 0:
+            raise ValueError("k must be positive.")
+        if k < a.shape[0] - 1:
+            e, x = eigsh(a, k=k, **kwargs)
         else:
-            assert is_positive_def(A-B)
-            sqrt_A_minus_B = sqrtm(A-B)
-            ham_rpa = np.dot(sqrt_A_minus_B, np.dot((A+B),sqrt_A_minus_B))
-            esq, t = eigh(ham_rpa)
-            return np.sqrt(esq), t
+            e, x = eigh(a)
+            e = e[:k]
+            x = x[:, :k]
+    else:
+        e, x = eigh(a)
+    idx = np.argsort(e)
+    return e[idx], x[:, idx]
 
 
-def _ov_blocks(gw):
-    mo_energy = np.asarray(gw._scf.mo_energy)
-    mo_coeff = np.asarray(gw._scf.mo_coeff)
-    mo_occ = np.asarray(gw._scf.mo_occ)
+def _validate_method(method):
+    key = str(method).upper()
+    if key not in {"TDH", "TDHF"}:
+        raise NotImplementedError("This legacy module supports only TDH and TDHF.")
+    return key
+
+
+def _as_pyscf_rhf(mf):
+    if not isinstance(mf, scf.rhf.RHF):
+        raise NotImplementedError("Only PySCF restricted HF references are supported.")
+    if mf.mo_coeff is None or mf.mo_energy is None or mf.mo_occ is None:
+        raise ValueError("Run the PySCF RHF reference before TDHF.")
+    return mf
+
+
+def _ov_blocks(td):
+    mf = _as_pyscf_rhf(td._scf)
+    mo_energy = np.asarray(mf.mo_energy)
+    mo_coeff = np.asarray(mf.mo_coeff)
+    mo_occ = np.asarray(mf.mo_occ)
 
     occidx = np.where(mo_occ > 0)[0]
     viridx = np.where(mo_occ == 0)[0]
+    if occidx.size == 0 or viridx.size == 0:
+        raise ValueError("TDHF requires at least one occupied and one virtual orbital.")
 
-    orbo = mo_coeff[:, occidx]
-    orbv = mo_coeff[:, viridx]
-    return mo_energy, occidx, viridx, orbo, orbv
+    return mo_energy, occidx, viridx, mo_coeff[:, occidx], mo_coeff[:, viridx]
 
 
-def get_ab(gw, method='TDH', singlet=True):
-    '''Compute restricted RHF A/B matrices in the occupied/virtual response space.'''
-    assert method in ('TDH', 'TDHF', 'TDDFT')
-    if method == 'TDDFT':
-        raise NotImplementedError('TDDFT is not implemented in this legacy TDHF module.')
-
-    mo_energy, occidx, viridx, orbo, orbv = _ov_blocks(gw)
+def get_ab(td, method="TDH", singlet=True):
+    """Compute restricted PySCF RHF A/B matrices in the OV response space."""
+    method = _validate_method(method)
+    mo_energy, occidx, viridx, orbo, orbv = _ov_blocks(td)
     nocc = len(occidx)
     nvir = len(viridx)
-    dim_rpa = nocc * nvir
-    logging.info('dim of AB matrices = {}'.format(dim_rpa))
+    dim = nocc * nvir
+    logging.info("TDHF response dimension = %d", dim)
 
     e_ia = mo_energy[viridx] - mo_energy[occidx, None]
     a = np.diag(e_ia.ravel()).reshape(nocc, nvir, nocc, nvir)
     b = np.zeros_like(a)
 
-    # Coulomb block J_{ia,jb} = (ia|jb)
     eri_iajb = ao2mo.general(
-        gw.mol,
+        td.mol,
         (orbo, orbv, orbo, orbv),
         compact=False,
     ).reshape(nocc, nvir, nocc, nvir)
 
-    # Exchange blocks written in occupied/virtual order.
     eri_ijab = ao2mo.general(
-        gw.mol,
+        td.mol,
         (orbo, orbo, orbv, orbv),
         compact=False,
     ).reshape(nocc, nocc, nvir, nvir)
     k_a = np.transpose(eri_ijab, (0, 2, 1, 3))
 
     eri_jaib = ao2mo.general(
-        gw.mol,
+        td.mol,
         (orbo, orbv, orbo, orbv),
         compact=False,
     ).reshape(nocc, nvir, nocc, nvir)
@@ -134,31 +114,51 @@ def get_ab(gw, method='TDH', singlet=True):
         a += 2.0 * eri_iajb
         b += 2.0 * eri_iajb
 
-    if method == 'TDHF':
+    if method == "TDHF":
         a -= k_a
         b -= k_b
 
-    a = a.reshape(dim_rpa, dim_rpa)
-    b = b.reshape(dim_rpa, dim_rpa)
-    assert np.allclose(a, a.transpose())
-    assert np.allclose(b, b.transpose())
+    a = a.reshape(dim, dim)
+    b = b.reshape(dim, dim)
+    if not np.allclose(a, a.T):
+        raise ValueError("TDHF A matrix is not symmetric.")
+    if not np.allclose(b, b.T):
+        raise ValueError("TDHF B matrix is not symmetric.")
     return a, b
 
-class TDH:
-    '''
-    Time-dependent Hartree 
-    '''
-    def __init__(self):
-        pass
-    
-class TDHF:
-    def __init__(self, mf):
 
+def rpa(td, using_tda=False, using_casida=True, method="TDH", singlet=True):
+    """Solve the restricted TDH/TDHF RPA problem."""
+    a, b = get_ab(td, method=method, singlet=singlet)
+
+    if using_tda:
+        return eig(a)
+
+    if using_casida:
+        a_minus_b = a - b
+        if not is_positive_def(a_minus_b):
+            raise ValueError("Casida TDHF requires A-B to be positive definite.")
+        sqrt_a_minus_b = sqrtm(a_minus_b)
+        ham = sqrt_a_minus_b @ (a + b) @ sqrt_a_minus_b
+        esq, vec = eigh(ham)
+        return np.sqrt(np.clip(esq, 0.0, None)), vec
+
+    ham = np.block([[a, b], [-b, -a]])
+    e, xy = eig_asymm(ham)
+    mask = e.real > 1.0e-8
+    return e[mask], xy[:, mask]
+
+
+class TDHF:
+    """Restricted TDH/TDHF adapter for a converged PySCF RHF object."""
+
+    def __init__(self, mf):
+        mf = _as_pyscf_rhf(mf)
         self.mol = mf.mol
-        self._scf  = mf
-        self.verbose = self.mol.verbose
-        self.stdout = self.mol.stdout
-        self.max_memory = mf.max_memory
+        self._scf = mf
+        self.verbose = getattr(self.mol, "verbose", 0)
+        self.stdout = getattr(self.mol, "stdout", None)
+        self.max_memory = getattr(mf, "max_memory", None)
         self.spin = 0
         self.singlet = True
 
@@ -167,165 +167,47 @@ class TDHF:
         self.e = None
         self.xy = None
 
-        if isinstance(mf, scf.rhf.RHF):
-            self.e_mf = np.asarray(mf.mo_energy)
-            self.nocc = self.mol.nelectron // 2
-            self.nso = len(self.e_mf)
-        else:
-            raise NotImplementedError("\n*** Only supporting restricted calculations right now! ***\n")
-        self._M = None
+        self.e_mf = np.asarray(mf.mo_energy)
+        self.nocc = int(self.mol.nelectron // 2)
+        self.nso = len(self.e_mf)
 
-    # def run(self):
-    #     # if mo_coeff is None:
-    #     #     mo_coeff = self._scf.mo_coeff
-    #     # if mo_energy is None:
-    #     #     mo_energy = self._scf.mo_energy
+    def get_ab(self, method="TDHF", singlet=None):
+        if singlet is None:
+            singlet = self.singlet
+        self._a, self._b = get_ab(self, method=method, singlet=singlet)
+        return self._a, self._b
 
-    #     # self.egw = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
-    #     # logger.log(self, 'GW bandgap = %.15g', self.egw[self.nocc//2]-self.egw[self.nocc//2-1])
-    #     # return self.egw
-    #     return rpa(self, using_tda=True, method='TDHF')
-
-    # def sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
-    #     return sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn)
-
-    # def g0(self, omega):
-    #     return g0(self, omega)
-
-    # def get_m_rpa(self, e_rpa, t_rpa):
-    #     return get_m_rpa(self, e_rpa, t_rpa)
-
-    def run(self, nstates=None, using_tda=False, using_casida=True, method='TDHF', singlet=None):
-        '''Get the RPA eigenvalues and eigenvectors.
-
-        The RPA computation is required to construct the dielectric function, i.e. screened
-        Coloumb interaction.
-
-        Q^\dagger = \sum_{ia} X_{ia} a^+ i - Y_{ia} i^+ a
-
-        Leads to the RPA eigenvalue equations:
-          [ A  B ][X] = omega [ 1  0 ][X]
-          [ B  A ][Y]         [ 0 -1 ][Y]
-        which is equivalent to
-          [ A  B ][X] = omega [ 1  0 ][X]
-          [-B -A ][Y] =       [ 0  1 ][Y]
-
-        See, e.g. Stratmann, Scuseria, and Frisch,
-                  J. Chem. Phys., 109, 8218 (1998)
-        '''
+    def run(self, nstates=None, using_tda=False, using_casida=True, method="TDHF", singlet=None):
         if singlet is None:
             singlet = self.singlet
 
-        A, B = self.get_ab(method=method, singlet=singlet)
-
+        a, b = self.get_ab(method=method, singlet=singlet)
         if using_tda:
-            logging.info('Using TDA approximation')
-            e, x = eig(A, k=nstates, which='SA' if isinstance(nstates, int) else None)
-            self.e = e
-            self.xy = x
-            return e, x
-        
-        else:
-            if using_casida:
-                assert is_positive_def(A-B)
-                sqrt_A_minus_B = sqrtm(A-B)
-                ham_rpa = np.dot(sqrt_A_minus_B, np.dot((A+B),sqrt_A_minus_B))
+            self.e, self.xy = eig(a, k=nstates, which="SA" if isinstance(nstates, int) else None)
+            return self.e, self.xy
 
-                if nstates is not None:
-                    esq, t = eig(ham_rpa, k=nstates, which='SA')
-                else:
-                    esq, t = eigh(ham_rpa)
-                e = np.sqrt(esq)
-                self.e = e
-                self.xy = t
-                return e, t
-
+        if using_casida:
+            a_minus_b = a - b
+            if not is_positive_def(a_minus_b):
+                raise ValueError("Casida TDHF requires A-B to be positive definite.")
+            sqrt_a_minus_b = sqrtm(a_minus_b)
+            ham = sqrt_a_minus_b @ (a + b) @ sqrt_a_minus_b
+            if isinstance(nstates, int):
+                esq, vec = eig(ham, k=nstates, which="SA")
             else:
-                ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-                e, xy = eig_asymm(ham_rpa)
-                e = e[e > 1e-8]
-                if nstates is not None:
-                    e = e[:nstates]
-                    xy = xy[:, :nstates]
-                self.e = e
-                self.xy = xy
-                return e, xy
+                esq, vec = eigh(ham)
+            self.e = np.sqrt(np.clip(esq, 0.0, None))
+            self.xy = vec
+            return self.e, self.xy
 
-
-
-
-    def get_ab(self, method='TDHF', singlet=None):
-        if singlet is None:
-            singlet = self.singlet
-        a, b = get_ab(self, method=method, singlet=singlet)
-        self._a = a
-        self._b = b
-        return a, b
-
-def eig(a, k=None, **kwargs):
-    '''
-    customized eigenvalue function for Hermitian matrix
-
-    Parameters
-    ----------
-    a : TYPE
-        DESCRIPTION.
-    k : TYPE, optional
-        number of required eigenstates. If None, do the full calculation. The default is None.
-    **kwargs : TYPE
-        kwargs for scipy.sparse.linalg.eigsh()
-
-    Returns
-    -------
-    e : TYPE
-        DESCRIPTION.
-    x : TYPE
-        DESCRIPTION.
-
-    '''
-    if isinstance(k, int):
-        e, x = scipy.sparse.linalg.eigsh(a, k=k, **kwargs)
-    else:
-        e, x = eigh(a)
-    return e, x
-
-
-if __name__ == '__main__':
-    from pyscf import gto, scf, tddft
-
-    mol = gto.Mole()
-    mol.atom = [
-        ['H' , (0. , 0. , .917)],
-        ['H' , (0. , 0. , 0.)], ]
-    mol.basis = '631g*'
-    mol.build()
-
-    #
-    # RHF/RKS-TDDFT
-    #
-    def diagonalize(a, b, nroots=5):
-        nocc, nvir = a.shape[:2]
-        a = a.reshape(nocc*nvir,nocc*nvir)
-        b = b.reshape(nocc*nvir,nocc*nvir)
-        e = np.linalg.eig(np.bmat([[a        , b       ],
-                                   [-b.conj(),-a.conj()]]))[0]
-        lowest_e = np.sort(e[e > 0])[:nroots]
-        return lowest_e
-
-    mf = scf.RHF(mol).run()
-
-    print(mf.mo_energy*au2ev)
-
-    # a, b = tddft.TDHF(mf).get_ab()
-    # print('Direct diagoanlization:', diagonalize(a, b))
-    # td = tddft.TDHF(mf)
-    # td.singlet=True
-    # # td.verbose=6
-    # td.kernel(nstates=10)[0]
-    # td.analyze()
-
-
-    tdhf = TDHF(mf)
-    print('occ orbs = ', tdhf.nocc)
-    tdhf.run(nstates=10)
-    print(tdhf._a.shape)
+        ham = np.block([[a, b], [-b, -a]])
+        e, xy = eig_asymm(ham)
+        mask = e.real > 1.0e-8
+        e = e[mask]
+        xy = xy[:, mask]
+        if isinstance(nstates, int):
+            e = e[:nstates]
+            xy = xy[:, :nstates]
+        self.e = e
+        self.xy = xy
+        return self.e, self.xy

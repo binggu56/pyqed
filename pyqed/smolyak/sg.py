@@ -1048,10 +1048,11 @@ class SparseGridLDR(SparseGrid):
             self.build_overlap()
         if self.T is None:
             self.build_kinetic()
+        potential_arg = potential if callable(potential) and quadrature_order is not None else values
 
         if values.ndim == 1:
             self.H = self.T + self.build_potential(
-                values,
+                potential_arg,
                 quadrature_order=quadrature_order,
             )
             return self.H
@@ -1059,7 +1060,7 @@ class SparseGridLDR(SparseGrid):
         nstates = values.shape[1]
         eye_state = sp.eye(nstates, format="csr")
         self.H = sp.kron(self.T, eye_state, format="csr") + self.build_potential(
-            values,
+            potential_arg,
             quadrature_order=quadrature_order,
         )
         return self.H

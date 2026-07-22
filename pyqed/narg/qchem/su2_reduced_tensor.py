@@ -17,11 +17,78 @@ The integer labels use doubled quantum numbers:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import os
 
 import numpy as np
 
 from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep
 from .su2_core import Multiplet, asarray, cg, su2_product_symmetry
+
+
+_CPP_PRODUCT_KERNEL = None
+_CPP_PRODUCT_BATCH_KERNEL = None
+_CPP_PRODUCT_CHECKED = False
+_CPP_PRODUCT_MIN_FLOPS = int(os.environ.get("SU2_NARG_CPP_PRODUCT_MIN_FLOPS", "65536"))
+
+
+def _cpp_product_requested() -> bool:
+    if os.environ.get("SU2_NARG_DISABLE_CPP_PRODUCT", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    if os.environ.get("SU2_NARG_USE_CPP_PRODUCT", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    if os.environ.get("SU2_NARG_USE_CYTHON", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    return os.environ.get("SU2_NARG_BACKEND", "").strip().lower() in {
+        "compiled",
+        "cpp",
+        "native",
+    }
+
+
+def _cpp_product_kernel():
+    global _CPP_PRODUCT_CHECKED
+    global _CPP_PRODUCT_KERNEL
+    global _CPP_PRODUCT_BATCH_KERNEL
+
+    if _CPP_PRODUCT_CHECKED:
+        return _CPP_PRODUCT_KERNEL
+    _CPP_PRODUCT_CHECKED = True
+    if not _cpp_product_requested():
+        return None
+    try:
+        from . import su2_native
+    except Exception:
+        _CPP_PRODUCT_KERNEL = None
+        return None
+    if getattr(su2_native, "CPP_PRODUCT_AVAILABLE", False):
+        _CPP_PRODUCT_KERNEL = getattr(su2_native, "reduced_product_block_sum", None)
+        _CPP_PRODUCT_BATCH_KERNEL = getattr(
+            su2_native,
+            "reduced_product_block_sum_batch",
+            None,
+        )
+    return _CPP_PRODUCT_KERNEL
+
+
+def _cpp_product_batch_kernel():
+    _cpp_product_kernel()
+    return _CPP_PRODUCT_BATCH_KERNEL
 
 
 @dataclass
@@ -176,45 +243,73 @@ def add_reduced_tensors(*tensors: ReducedSU2Tensor, atol: float = 1e-14) -> Redu
     blocks = {}
     keys = set().union(*(tensor.blocks.keys() for tensor in tensors))
     for key in keys:
-        block = sum(tensor.block(*key) for tensor in tensors)
-        if np.any(np.abs(block) > atol):
+        block = None
+        for tensor in tensors:
+            term = tensor.blocks.get(key)
+            if term is None:
+                continue
+            if block is None:
+                block = np.array(term, copy=True)
+            else:
+                block += term
+        if block is not None and np.any(np.abs(block) > atol):
             blocks[key] = block
     return ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
 
 
-def coupled_reduced_product(
-    left: ReducedSU2Tensor,
-    right: ReducedSU2Tensor,
+def _site_charge_signature(site: IrrepSite) -> tuple[tuple[tuple[int, int], int], ...]:
+    return tuple(
+        (tuple(int(x) for x in irrep.charge), int(site.sector_dim(irrep)))
+        for irrep in site.irreps
+    )
+
+
+@lru_cache(maxsize=4096)
+def _coupled_product_angular_terms(
+    site_signature: tuple[tuple[tuple[int, int], int], ...],
+    left_charge: tuple[int, int],
+    right_charge: tuple[int, int],
     rank2: int,
-    *,
-    atol: float = 1e-12,
-) -> ReducedSU2Tensor:
-    """Compose two reduced tensors into ``[left x right]^rank``.
+    atol: float,
+):
+    """Angular recoupling weights for reduced tensor products on one site layout."""
+    charges = tuple(charge for charge, _ in site_signature)
+    left_dnelec, left_rank2 = left_charge
+    right_dnelec, right_rank2 = right_charge
+    op_dnelec = int(left_dnelec) + int(right_dnelec)
+    rank2 = int(rank2)
+    out = []
 
-    The product means ordinary operator composition with ``right`` acting first:
-    ``left @ right``.  The angular part is contracted explicitly with
-    Clebsch-Gordan coefficients, while multiplicity blocks are multiplied in
-    reduced space.
-    """
-    if left.site != right.site:
-        raise ValueError("left and right reduced tensors must use the same site")
-
-    site = left.site
-    left_dnelec, left_rank2 = left.op.charge
-    right_dnelec, right_rank2 = right.op.charge
-    op_irrep = OpIrrep((left_dnelec + right_dnelec, int(rank2)))
-    blocks = {}
-
-    for bra_irrep in site.irreps:
-        bra_nelec, bra_j2 = bra_irrep.charge
-        for ket_irrep in site.irreps:
-            ket_nelec, ket_j2 = ket_irrep.charge
-            if bra_nelec != ket_nelec + op_irrep.charge[0]:
+    for bra_charge in charges:
+        bra_nelec, bra_j2 = bra_charge
+        for ket_charge in charges:
+            ket_nelec, ket_j2 = ket_charge
+            if bra_nelec != ket_nelec + op_dnelec:
                 continue
-            if not site.symmetry.allows(bra_irrep.charge, op_irrep.charge, ket_irrep.charge):
+            if abs(ket_j2 - rank2) > bra_j2 or bra_j2 > ket_j2 + rank2:
+                continue
+            if (ket_j2 + rank2 + bra_j2) % 2:
                 continue
 
-            estimates = []
+            mid_terms = []
+            for mid_charge in charges:
+                mid_nelec, mid_j2 = mid_charge
+                if mid_nelec != ket_nelec + right_dnelec:
+                    continue
+                if abs(ket_j2 - right_rank2) > mid_j2 or mid_j2 > ket_j2 + right_rank2:
+                    continue
+                if (ket_j2 + right_rank2 + mid_j2) % 2:
+                    continue
+                if abs(mid_j2 - left_rank2) > bra_j2 or bra_j2 > mid_j2 + left_rank2:
+                    continue
+                if (mid_j2 + left_rank2 + bra_j2) % 2:
+                    continue
+                mid_terms.append(mid_charge)
+            if not mid_terms:
+                continue
+
+            weight_sums = {mid_charge: 0.0 for mid_charge in mid_terms}
+            estimate_count = 0
             for total_q2 in range(-rank2, rank2 + 1, 2):
                 for ket_m2 in range(-ket_j2, ket_j2 + 1, 2):
                     bra_m2 = ket_m2 + total_q2
@@ -224,28 +319,10 @@ def coupled_reduced_product(
                     if abs(out_coeff) <= atol:
                         continue
 
-                    component_block = np.zeros(
-                        (site.sector_dim(bra_irrep), site.sector_dim(ket_irrep)),
-                        dtype=complex,
-                    )
-                    for mid_irrep in site.irreps:
-                        mid_nelec, mid_j2 = mid_irrep.charge
-                        if mid_nelec != ket_nelec + right_dnelec:
-                            continue
-                        if not site.symmetry.allows(mid_irrep.charge, right.op.charge, ket_irrep.charge):
-                            continue
-                        if not site.symmetry.allows(bra_irrep.charge, left.op.charge, mid_irrep.charge):
-                            continue
-
-                        left_block = left.block(bra_irrep, mid_irrep)
-                        right_block = right.block(mid_irrep, ket_irrep)
-                        if left_block.size == 0 or right_block.size == 0:
-                            continue
-                        block_product = (
-                            left_block
-                            @ right_block
-                            / np.sqrt((bra_j2 + 1.0) * (mid_j2 + 1.0))
-                        )
+                    component_weights = []
+                    for mid_charge in mid_terms:
+                        _, mid_j2 = mid_charge
+                        angular_weight = 0.0
                         for right_q2 in range(-right_rank2, right_rank2 + 1, 2):
                             left_q2 = total_q2 - right_q2
                             if left_q2 < -left_rank2 or left_q2 > left_rank2:
@@ -281,22 +358,239 @@ def coupled_reduced_product(
                             )
                             if abs(left_coeff) <= atol or abs(right_coeff) <= atol:
                                 continue
-                            component_block += (
-                                tensor_coeff
-                                * left_coeff
-                                * right_coeff
-                                * block_product
+                            angular_weight += tensor_coeff * left_coeff * right_coeff
+                        if abs(angular_weight) <= atol:
+                            continue
+                        component_weights.append(
+                            (
+                                mid_charge,
+                                angular_weight
+                                * np.sqrt(bra_j2 + 1.0)
+                                / out_coeff
+                                / np.sqrt((bra_j2 + 1.0) * (mid_j2 + 1.0)),
                             )
+                        )
 
-                    if np.any(np.abs(component_block) > atol):
-                        estimates.append(component_block * np.sqrt(bra_j2 + 1.0) / out_coeff)
+                    if component_weights:
+                        estimate_count += 1
+                        for mid_charge, weight in component_weights:
+                            weight_sums[mid_charge] += weight
 
-            if estimates:
-                block = sum(estimates) / len(estimates)
+            if estimate_count:
+                out.append(
+                    (
+                        bra_charge,
+                        ket_charge,
+                        tuple(
+                            (mid_charge, weight_sums[mid_charge] / estimate_count)
+                            for mid_charge in mid_terms
+                            if abs(weight_sums[mid_charge] / estimate_count) > atol
+                        ),
+                    )
+                )
+    return tuple(item for item in out if item[2])
+
+
+def _fallback_product_block(rows, cols, left_blocks, right_blocks, weights):
+    block = np.zeros((int(rows), int(cols)), dtype=complex)
+    for left_block, right_block, weight in zip(left_blocks, right_blocks, weights):
+        block += weight * (left_block @ right_block)
+    return block
+
+
+def _evaluate_product_jobs(jobs, *, atol: float):
+    """Evaluate delayed reduced-product block jobs, preferably in one C++ batch."""
+    jobs = list(jobs)
+    if not jobs:
+        return []
+
+    batch_kernel = _cpp_product_batch_kernel()
+    if batch_kernel is not None and len(jobs) > 1:
+        specs = [
+            (rows, cols, left_blocks, right_blocks, weights)
+            for _, _, rows, cols, left_blocks, right_blocks, weights in jobs
+        ]
+        try:
+            out = []
+            for job, block in zip(jobs, batch_kernel(specs)):
+                tensor_index, block_key, *_ = job
+                block = np.asarray(block, dtype=complex)
                 if np.any(np.abs(block) > atol):
-                    blocks[(bra_irrep, ket_irrep)] = block
+                    out.append((tensor_index, block_key, block))
+            return out
+        except Exception:
+            pass
 
+    cpp_product = _cpp_product_kernel()
+    out = []
+    for tensor_index, block_key, rows, cols, left_blocks, right_blocks, weights in jobs:
+        block = None
+        if cpp_product is not None:
+            try:
+                block = np.asarray(
+                    cpp_product(
+                        int(rows),
+                        int(cols),
+                        left_blocks,
+                        right_blocks,
+                        np.asarray(weights, dtype=np.complex128),
+                    ),
+                    dtype=complex,
+                )
+            except Exception:
+                block = None
+        if block is None:
+            block = _fallback_product_block(
+                rows,
+                cols,
+                left_blocks,
+                right_blocks,
+                weights,
+            )
+        if np.any(np.abs(block) > atol):
+            out.append((tensor_index, block_key, block))
+    return out
+
+
+def _prepare_coupled_reduced_product(
+    left: ReducedSU2Tensor,
+    right: ReducedSU2Tensor,
+    rank2: int,
+    *,
+    tensor_index: int,
+    atol: float,
+    scale: complex,
+):
+    if left.site != right.site:
+        raise ValueError("left and right reduced tensors must use the same site")
+
+    site = left.site
+    left_dnelec, left_rank2 = left.op.charge
+    right_dnelec, right_rank2 = right.op.charge
+    op_irrep = OpIrrep((left_dnelec + right_dnelec, int(rank2)))
+    blocks = {}
+    jobs = []
+    use_native = _cpp_product_kernel() is not None
+
+    angular_terms = _coupled_product_angular_terms(
+        _site_charge_signature(site),
+        tuple(int(x) for x in left.op.charge),
+        tuple(int(x) for x in right.op.charge),
+        int(rank2),
+        float(atol),
+    )
+    for bra_charge, ket_charge, mid_terms in angular_terms:
+        bra_irrep = Irrep(bra_charge)
+        ket_irrep = Irrep(ket_charge)
+        block = np.zeros(
+            (site.sector_dim(bra_irrep), site.sector_dim(ket_irrep)),
+            dtype=complex,
+        )
+        left_blocks = []
+        right_blocks = []
+        weights = []
+        native_work = 0
+        for mid_charge, weight in mid_terms:
+            mid_irrep = Irrep(mid_charge)
+            left_block = left.block(bra_irrep, mid_irrep)
+            right_block = right.block(mid_irrep, ket_irrep)
+            if left_block.size == 0 or right_block.size == 0:
+                continue
+            scaled_weight = scale * weight
+            if not use_native:
+                block += scaled_weight * (left_block @ right_block)
+            else:
+                left_blocks.append(left_block)
+                right_blocks.append(right_block)
+                weights.append(scaled_weight)
+                native_work += left_block.shape[0] * left_block.shape[1] * right_block.shape[1]
+        if use_native and weights:
+            if native_work >= _CPP_PRODUCT_MIN_FLOPS:
+                jobs.append(
+                    (
+                        int(tensor_index),
+                        (bra_irrep, ket_irrep),
+                        int(block.shape[0]),
+                        int(block.shape[1]),
+                        left_blocks,
+                        right_blocks,
+                        np.asarray(weights, dtype=np.complex128),
+                    )
+                )
+                continue
+            else:
+                for left_block, right_block, weight in zip(left_blocks, right_blocks, weights):
+                    block += weight * (left_block @ right_block)
+        if np.any(np.abs(block) > atol):
+            blocks[(bra_irrep, ket_irrep)] = block
+
+    return site, op_irrep, blocks, jobs
+
+
+def coupled_reduced_product(
+    left: ReducedSU2Tensor,
+    right: ReducedSU2Tensor,
+    rank2: int,
+    *,
+    atol: float = 1e-12,
+    scale: complex = 1.0,
+) -> ReducedSU2Tensor:
+    """Compose two reduced tensors into ``[left x right]^rank``.
+
+    The product means ordinary operator composition with ``right`` acting first:
+    ``left @ right``.  The angular part is contracted explicitly with
+    Clebsch-Gordan coefficients, while multiplicity blocks are multiplied in
+    reduced space.
+    """
+    site, op_irrep, blocks, jobs = _prepare_coupled_reduced_product(
+        left,
+        right,
+        rank2,
+        tensor_index=0,
+        atol=float(atol),
+        scale=scale,
+    )
+    for _, block_key, block in _evaluate_product_jobs(jobs, atol=float(atol)):
+        blocks[block_key] = block
     return ReducedSU2Tensor(IrrepTensor(site, site, op_irrep, blocks))
+
+
+def coupled_reduced_products(requests, *, atol: float = 1e-12):
+    """Evaluate many reduced tensor products with one optional native batch.
+
+    Each request is ``(key, left, right, rank2[, scale])``.  The returned dict
+    maps ``key`` to the corresponding ``ReducedSU2Tensor``.
+    """
+    prepared = []
+    jobs = []
+    for tensor_index, request in enumerate(requests):
+        if len(request) == 4:
+            key, left, right, rank2 = request
+            scale = 1.0
+        elif len(request) == 5:
+            key, left, right, rank2, scale = request
+        else:
+            raise ValueError(
+                "coupled product requests must be (key, left, right, rank2[, scale])"
+            )
+        site, op_irrep, blocks, product_jobs = _prepare_coupled_reduced_product(
+            left,
+            right,
+            rank2,
+            tensor_index=tensor_index,
+            atol=float(atol),
+            scale=scale,
+        )
+        prepared.append([key, site, op_irrep, blocks])
+        jobs.extend(product_jobs)
+
+    for tensor_index, block_key, block in _evaluate_product_jobs(jobs, atol=float(atol)):
+        prepared[int(tensor_index)][3][block_key] = block
+
+    return {
+        key: ReducedSU2Tensor(IrrepTensor(site, site, op_irrep, blocks))
+        for key, site, op_irrep, blocks in prepared
+    }
 
 
 def validate_reduced_tensor_components(

@@ -13,6 +13,7 @@ from pyqed.mps.mps import (
 from pyqed.mps.tdvp import (
     SymmetricTDVP,
     TDVPEngine,
+    _local_sector_phys_dims,
     _block_sparse_site_qn_maps,
     one_site_tdvp_step,
     two_site_tdvp_step,
@@ -325,12 +326,15 @@ class TDMPS:
     def _block_sparse_site_qn_maps_for_state(self, psi):
         if self.local_sectors is None or self.target_sector is None:
             raise ValueError("Block-sparse observables require local_sectors and target_sector.")
-        phys_dims = []
-        for site in range(psi.L):
-            if psi.factors and hasattr(psi.factors[site], "qns"):
-                phys_dims.append(int(psi.factors[site].shape[2]))
-            else:
-                phys_dims.append(int(psi._get_std_B(site).shape[1]))
+        phys_dims = _local_sector_phys_dims(self.local_sectors, psi.L)
+        if phys_dims is None:
+            phys_dims = []
+            for site in range(psi.L):
+                if psi.factors and hasattr(psi.factors[site], "qns"):
+                    phys_dims.append(int(psi.factors[site].shape[2]))
+                else:
+                    phys_dims.append(int(psi._get_std_B(site).shape[1]))
+            phys_dims = tuple(phys_dims)
         cache_key = tuple(phys_dims)
         cached = self._block_sparse_site_qn_maps_cache.get(cache_key)
         if cached is not None:

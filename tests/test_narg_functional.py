@@ -1,7 +1,10 @@
 import numpy as np
 
+from pyqed.narg import Phi4MomentumSpaceNARG, Phi4MomentumSpaceNARGResult, Phi4MomentumSpaceNARGStepResult
 from pyqed.narg.functional import (
     ConditionalGaussianWavefunctionNARG,
+    Phi4LogShellCouplingFlowResult,
+    Phi4LogShellCoarseGrainResult,
     Phi4LogShellNARG,
     Phi4PeriodicSincNARG,
     Phi4TwoSiteNARG,
@@ -188,6 +191,99 @@ def test_phi4_periodic_sinc_narg_improves_with_more_conditional_branches():
     np.testing.assert_allclose(full.effective_energies[0], exact, atol=1e-11)
 
 
+def test_phi4_momentum_space_narg_public_api_matches_full_spectrum():
+    toy = Phi4MomentumSpaceNARG(
+        spatial_npoints=4,
+        amplitude_npoints=3,
+        field_range=4.0,
+        length=6.0,
+        mass2=0.5,
+        coupling=0.8,
+        active_mode_count=3,
+    )
+
+    result = toy.narg_effective_hamiltonian(nbranches=toy.environment_configs.shape[0])
+    exact = toy.exact_energies()
+
+    assert isinstance(result, Phi4MomentumSpaceNARGResult)
+    np.testing.assert_allclose(result.effective_energies, exact, atol=1e-11)
+    assert [result.mode_labels[index] for index in result.active_modes] == [
+        ("zero", 0),
+        ("cos", 1),
+        ("sin", 1),
+    ]
+    assert [result.mode_labels[index] for index in result.environment_modes] == [("nyquist", 2)]
+
+
+def test_phi4_momentum_space_narg_branch_convergence_is_variational():
+    toy = Phi4MomentumSpaceNARG(
+        spatial_npoints=4,
+        amplitude_npoints=3,
+        field_range=4.0,
+        length=6.0,
+        mass2=0.5,
+        coupling=0.8,
+        active_mode_count=3,
+    )
+
+    exact = toy.exact_energies(1)[0]
+    branch1 = toy.narg_effective_hamiltonian(nbranches=1)
+    branch2 = toy.narg_effective_hamiltonian(nbranches=2)
+    full = toy.narg_effective_hamiltonian(nbranches=toy.environment_configs.shape[0])
+
+    assert branch1.effective_energies[0] >= exact - 1e-12
+    assert branch2.effective_energies[0] >= exact - 1e-12
+    assert full.effective_energies[0] >= exact - 1e-12
+    assert branch2.effective_energies[0] <= branch1.effective_energies[0] + 1e-12
+    assert full.effective_energies[0] <= branch2.effective_energies[0] + 1e-12
+    np.testing.assert_allclose(full.effective_energies[0], exact, atol=1e-11)
+
+
+def test_phi4_momentum_space_narg_step_recovers_free_couplings():
+    toy = Phi4MomentumSpaceNARG(
+        spatial_npoints=4,
+        amplitude_npoints=3,
+        field_range=4.0,
+        length=6.0,
+        mass2=0.7,
+        coupling=0.0,
+        active_mode_count=3,
+    )
+
+    step = toy.narg_step(nbranches=1)
+
+    assert isinstance(step, Phi4MomentumSpaceNARGStepResult)
+    np.testing.assert_allclose(step.coefficients["mass2"], toy.mass2, atol=1e-12)
+    np.testing.assert_allclose(step.coefficients["coupling"], 0.0, atol=1e-12)
+    np.testing.assert_allclose(step.rms_error, 0.0, atol=1e-12)
+    np.testing.assert_allclose(step.max_abs_error, 0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        np.linalg.eigvalsh(step.fitted_hamiltonian)[0],
+        step.effective_hamiltonian.effective_energies[0],
+        atol=1e-12,
+    )
+
+
+def test_phi4_momentum_space_narg_step_fits_interacting_active_surface():
+    toy = Phi4MomentumSpaceNARG(
+        spatial_npoints=4,
+        amplitude_npoints=4,
+        field_range=4.5,
+        length=6.0,
+        mass2=0.5,
+        coupling=0.8,
+        active_mode_count=3,
+    )
+
+    step = toy.narg_step(nbranches=2)
+
+    assert step.fitted_hamiltonian.shape == (toy.active_configs.shape[0], toy.active_configs.shape[0])
+    assert set(step.coefficients) == {"constant", "mass2", "coupling"}
+    assert step.coefficients["coupling"] > 0.0
+    assert step.rms_error >= 0.0
+    assert step.max_abs_error >= step.rms_error - 1e-12
+
+
 def test_phi4_log_shell_narg_groups_shell_pairs_and_weights():
     toy = Phi4LogShellNARG(
         cutoff=4.0,
@@ -257,6 +353,246 @@ def test_phi4_log_shell_narg_shell_flow_reports_exact_final_cutoff():
     assert rows[-1]["branches"] == 1
     assert rows[-1]["dimension"] == toy.amplitude_npoints**toy.nmodes
     assert abs(rows[-1]["error"]) <= 1e-11
+
+
+def test_phi4_log_shell_narg_coarse_grain_step_recovers_free_theory():
+    toy = Phi4LogShellNARG(
+        cutoff=8.0,
+        log_factor=2.0,
+        nshells=3,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.7,
+        coupling=0.0,
+        quadrature_order=128,
+    )
+
+    step = toy.narg_coarse_grain_step(nbranches=1, retained_shells=2)
+
+    assert isinstance(step, Phi4LogShellCoarseGrainResult)
+    assert step.integrated_shells == 1
+    assert step.retained_shells == 2
+    np.testing.assert_allclose(step.new_cutoff, toy.shell_edges[1], atol=1e-12)
+    assert [step.mode_labels[index] for index in step.environment_modes] == [("cos", 0), ("sin", 0)]
+    assert [step.mode_labels[index] for index in step.active_modes] == [
+        ("cos", 1),
+        ("sin", 1),
+        ("cos", 2),
+        ("sin", 2),
+    ]
+    np.testing.assert_allclose(step.coefficients["mass2"], toy.mass2, atol=1e-12)
+    np.testing.assert_allclose(step.coefficients["coupling"], 0.0, atol=1e-12)
+    np.testing.assert_allclose(step.rms_error, 0.0, atol=1e-12)
+
+
+def test_phi4_log_shell_narg_coarse_grain_step_fits_interacting_shell():
+    toy = Phi4LogShellNARG(
+        cutoff=4.0,
+        log_factor=2.0,
+        nshells=2,
+        active_shells=0,
+        amplitude_npoints=4,
+        field_range=4.0,
+        mass2=0.5,
+        coupling=0.6,
+        quadrature_order=128,
+    )
+
+    step = toy.narg_coarse_grain_step(nbranches=2, retained_shells=1)
+
+    assert step.effective_hamiltonian.hamiltonian.shape == (toy.amplitude_npoints**2 * 2, toy.amplitude_npoints**2 * 2)
+    assert step.fitted_hamiltonian.shape == (toy.amplitude_npoints**2, toy.amplitude_npoints**2)
+    assert set(step.coefficients) == {"constant", "mass2", "coupling"}
+    assert step.coefficients["coupling"] > 0.0
+    assert step.rms_error >= 0.0
+    assert step.max_abs_error >= step.rms_error - 1e-12
+
+
+def test_phi4_log_shell_narg_sampled_coupling_flow_recovers_free_theory():
+    toy = Phi4LogShellNARG(
+        cutoff=8.0,
+        log_factor=2.0,
+        nshells=4,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.7,
+        coupling=0.0,
+        quadrature_order=160,
+        build_dense_spaces=False,
+    )
+
+    flow = toy.narg_coupling_flow(retained_shells=1)
+
+    assert isinstance(flow, Phi4LogShellCouplingFlowResult)
+    assert len(flow.steps) == 3
+    np.testing.assert_allclose(flow.final_cutoff, toy.shell_edges[3], atol=1e-12)
+    np.testing.assert_allclose(flow.final_coefficients["mass2"], toy.mass2, atol=1e-12)
+    np.testing.assert_allclose(flow.final_coefficients["coupling"], 0.0, atol=1e-12)
+    assert all(step.sample_count > 1 for step in flow.steps)
+
+
+def test_phi4_log_shell_free_pes_energy_prefactor_uses_shell_weighted_coordinate():
+    toy = Phi4LogShellNARG(
+        cutoff=16.0,
+        log_factor=1.5,
+        nshells=8,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.0,
+        coupling=0.0,
+        quadrature_order=160,
+        build_dense_spaces=False,
+    )
+    reference_shell = 1
+    reference_k = toy.shell_representatives[reference_shell]
+    reference_weight = toy.shell_weights[reference_shell]
+    q_rescaled = np.linspace(-0.7, 0.7, 9)
+    qx, qy = np.meshgrid(q_rescaled, q_rescaled, indexing="ij")
+    reference_surface = 0.5 * reference_k * reference_k * (qx * qx + qy * qy)
+
+    for shell in range(reference_shell, toy.nshells):
+        k_value = toy.shell_representatives[shell]
+        b = reference_k / k_value
+        field_scale = toy.shell_weights[shell] / reference_weight
+        q_raw = q_rescaled / field_scale
+        qx_raw, qy_raw = np.meshgrid(q_raw, q_raw, indexing="ij")
+        rescaled_surface = b * 0.5 * k_value * k_value * (qx_raw * qx_raw + qy_raw * qy_raw)
+        np.testing.assert_allclose(rescaled_surface, reference_surface, atol=1e-12)
+
+
+def test_phi4_log_shell_narg_sampled_coupling_flow_runs_many_shells():
+    toy = Phi4LogShellNARG(
+        cutoff=8.0,
+        log_factor=2.0,
+        nshells=5,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.5,
+        coupling=0.5,
+        quadrature_order=192,
+        build_dense_spaces=False,
+    )
+
+    flow = toy.narg_coupling_flow(retained_shells=1)
+
+    assert len(flow.steps) == 4
+    assert flow.steps[0].shell == 0
+    assert flow.steps[-1].shell == 3
+    assert flow.final_cutoff == toy.shell_edges[4]
+    assert np.isfinite(flow.final_coefficients["mass2"])
+    assert np.isfinite(flow.final_coefficients["coupling"])
+    assert max(step.rms_error for step in flow.steps) >= 0.0
+
+
+def test_phi4_log_shell_narg_sampled_flow_compares_to_dense_one_shell():
+    toy = Phi4LogShellNARG(
+        cutoff=4.0,
+        log_factor=2.0,
+        nshells=2,
+        active_shells=1,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.5,
+        coupling=0.4,
+        quadrature_order=96,
+    )
+
+    comparison = toy.sampled_vs_dense_coarse_grain(
+        retained_shells=1,
+        nbranches=1,
+        amplitudes=(1.0, 2.0),
+    )
+
+    assert comparison["coefficients"]["mass2"]["abs_error"] < 0.2
+    assert comparison["coefficients"]["coupling"]["abs_error"] < 0.2
+    assert comparison["sampled_rms_error"] >= 0.0
+    assert comparison["dense_rms_error"] >= 0.0
+
+
+def test_phi4_log_shell_narg_coupling_flow_scan_and_beta_rows():
+    toy = Phi4LogShellNARG(
+        cutoff=6.0,
+        log_factor=1.5,
+        nshells=4,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.5,
+        coupling=0.4,
+        quadrature_order=128,
+        build_dense_spaces=False,
+    )
+
+    flow = toy.narg_coupling_flow(retained_shells=1, amplitudes=(1.0, 2.0))
+    beta_rows = flow.dimensionless_rows()
+    scan = toy.narg_coupling_flow_scan(
+        amplitude_npoints_values=[3],
+        quadrature_orders=[96, 128],
+        amplitude_sets=[(1.0, 2.0)],
+        log_factors=[1.5],
+        retained_shells=1,
+    )
+
+    assert len(beta_rows) == len(flow.steps) + 1
+    assert np.isnan(beta_rows[0]["beta_g"])
+    assert np.isfinite(beta_rows[-1]["g"])
+    assert np.isfinite(beta_rows[-1]["beta_g"])
+    assert len(scan) == 2
+    assert all(np.isfinite(row["mass2"]) for row in scan)
+
+
+def test_phi4_log_shell_narg_quadrature_generated_operators_and_fixed_scan():
+    toy = Phi4LogShellNARG(
+        cutoff=6.0,
+        log_factor=1.5,
+        nshells=4,
+        active_shells=0,
+        amplitude_npoints=3,
+        field_range=4.0,
+        mass2=0.45,
+        coupling=0.4,
+        quadrature_order=128,
+        build_dense_spaces=False,
+    )
+
+    flow = toy.narg_coupling_flow(
+        retained_shells=2,
+        sample_rule="quadrature",
+        sample_order=3,
+        max_power=8,
+        fit_gradient=True,
+    )
+    scan = toy.narg_coupling_flow_scan(
+        amplitude_npoints_values=[3],
+        quadrature_orders=[96],
+        amplitude_sets=[None],
+        sample_rules=["quadrature"],
+        sample_orders=[3],
+        max_powers=[6],
+        fit_gradient_values=[True],
+        retained_shells=2,
+    )
+    fixed = toy.narg_fixed_point_scan(
+        [0.35, 0.45],
+        [0.2, 0.4],
+        retained_shells=2,
+        sample_rule="quadrature",
+        sample_order=3,
+        max_power=6,
+        fit_gradient=True,
+    )
+
+    assert {"gradient_z", "phi6", "phi8"} <= set(flow.final_coefficients)
+    assert np.isfinite(flow.final_coefficients["gradient_z"])
+    assert scan[0]["sample_rule"] == "quadrature"
+    assert scan[0]["max_power"] == 6
+    assert scan[0]["fit_gradient"] is True
+    assert len(fixed) == 4
+    assert fixed[0]["beta_norm"] <= fixed[-1]["beta_norm"]
 
 
 def test_phi4_log_shell_iterative_narg_large_kept_space_matches_exact():

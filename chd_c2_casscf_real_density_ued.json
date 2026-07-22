@@ -1,0 +1,27 @@
+{
+  "method": "SA-CASSCF(4,8)/aug-cc-pVDZ + Kaufmann 3s/3p explicit density",
+  "geometry": "chd_c2_casscf44_augccpvdz.xyz",
+  "state_label_convention": {
+    "source": "Yong/Ruddock CHD 200 nm papers",
+    "x": "normal to the conjugated-carbon plane (out of plane)",
+    "z": "molecular C2 axis",
+    "y": "in-plane axis completing a right-handed x,y,z frame",
+    "warning": "molecular-frame labels, not stored-XYZ Cartesian axes"
+  },
+  "roots": {
+    "ground": 0,
+    "3px": 2,
+    "3py": 3
+  },
+  "population_ratio": "3px:3py = 1:0.8",
+  "orientation_directions": 38,
+  "electron_counts": {
+    "ground": 43.999999999999986,
+    "3px": 43.999999999999986,
+    "3py": 43.99999999999994
+  },
+  "mixture_peak_abs_delta_percent": 378.74067291315254,
+  "mixture_peak_s_angstrom-1": 0.15,
+  "mixture_peak_abs_delta_sM": 4.4410059816521406,
+  "mixture_peak_delta_sM_s_angstrom-1": 0.4127615062761506
+}

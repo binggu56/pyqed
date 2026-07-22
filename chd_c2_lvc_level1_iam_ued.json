@@ -1,0 +1,57 @@
+{
+  "model": "level-1 diagonal two-state/two-mode LVC nuclear IAM UED",
+  "state_labels": [
+    "3px",
+    "3py"
+  ],
+  "state_label_convention": "paper frame: x out of plane, z C2 axis",
+  "state_weights": [
+    0.5555555555555556,
+    0.4444444444444445
+  ],
+  "initial_electronic_state": "sqrt(1/1.8)|3px> + sqrt(0.8/1.8)|3py>, zero relative phase",
+  "coherence_visibility": "IAM nuclear operator is electronic-state diagonal, so level-1 UED is phase blind and equals the incoherent population-weighted signal",
+  "mode_ids": [
+    5,
+    8
+  ],
+  "frequencies_cm-1": [
+    564.5006888172999,
+    730.8402038485546
+  ],
+  "sa_casscf_reference_energies_hartree_relative_ground": [
+    0.20458549164760598,
+    0.20786298045905482
+  ],
+  "diagonal_forces_Eh_per_bohr_sqrtamu": [
+    [
+      -0.0032537923283608708,
+      -0.003343630728662281
+    ],
+    [
+      -0.003465238026891264,
+      -0.004213928074241556
+    ]
+  ],
+  "off_diagonal_vibronic_couplings": "zero by level-1 definition, not calculated",
+  "nuclear_average": "5x5 Gauss-Hermite zero-point wavepacket",
+  "time_range_fs": [
+    0.0,
+    350.0
+  ],
+  "s_range_angstrom-1": [
+    0.25,
+    10.0
+  ],
+  "peak_abs_delta_I_percent": 1.0724884225594822,
+  "peak_time_fs": 206.0,
+  "peak_s_angstrom-1": 6.15,
+  "limitations": [
+    "fixed 3px/3py populations",
+    "coherence prepared but invisible to the diagonal IAM operator",
+    "no interstate population transfer",
+    "IAM nuclear scattering only",
+    "harmonic modes with unchanged ground-state curvature",
+    "no rotational photoselection or instrument-response convolution"
+  ]
+}

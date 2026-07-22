@@ -22,6 +22,8 @@ approximation, which is often the cheapest useful first model.
 import numpy as np
 from opt_einsum import contract
 
+from pyqed.qchem._libcint import CBasis1e
+
 LIGHT_SPEED = 137.03599967994
 
 
@@ -104,8 +106,6 @@ def _get_cbasis(mol):
     """
     Build a libcint-compatible basis wrapper from a pyqed Molecule.
     """
-    from pyqed.qchem._libcint import CBasis1e
-
     if getattr(mol, '_bas', None) is None:
         raise ValueError(
             "mol._bas is not available. Build the molecule with driver='gbasis' "

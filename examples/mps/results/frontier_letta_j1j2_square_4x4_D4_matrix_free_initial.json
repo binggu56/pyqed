@@ -1,0 +1,148 @@
+{
+  "model": {
+    "nrows": 4,
+    "ncols": 4,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "local_terms": 42
+  },
+  "ansatz": {
+    "kind": "frontier-dense-tied-letta",
+    "tie_graph": "all-j1-nearest-neighbor-bonds",
+    "bond_dim": 4,
+    "tie_edges": 24,
+    "parameters": 1448,
+    "hamiltonian_mpo_bond_dim": 14,
+    "compressed_hamiltonian_mpo_bond_dim": 14,
+    "uncompressed_hamiltonian_mpo_bond_dim": 35,
+    "parent_sets": [
+      [
+        1,
+        7
+      ],
+      [
+        2,
+        6
+      ],
+      [
+        3,
+        5
+      ],
+      [
+        4
+      ],
+      [
+        5,
+        11
+      ],
+      [
+        6,
+        10
+      ],
+      [
+        7,
+        9
+      ],
+      [
+        8
+      ],
+      [
+        9,
+        15
+      ],
+      [
+        10,
+        14
+      ],
+      [
+        11,
+        13
+      ],
+      [
+        12
+      ],
+      [
+        13
+      ],
+      [
+        14
+      ],
+      [
+        15
+      ],
+      []
+    ],
+    "site_order_in_original_snake_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "settings": {
+    "sweeps": 0,
+    "solver": "direct",
+    "frontier_backend": "compressed",
+    "optimize_order": false,
+    "path_optimizer": "greedy",
+    "seed": 7
+  },
+  "ordering": {
+    "method": "snake",
+    "objective": "compressed-MPO-elements-without-D-squared",
+    "seconds": 1.2491364032030106e-07,
+    "original_peak_score": 3584.0,
+    "selected_peak_score": 3584.0,
+    "original_total_score": 36496.0,
+    "selected_total_score": 36496.0,
+    "selected_max_frontier_width": 4,
+    "selected_max_operator_rank": 14,
+    "selected_max_uncompressed_mpo_channels": null
+  },
+  "explicit_basis_materialized_in_solver": false,
+  "initial_energy": -0.49650142457211666,
+  "energy": -0.49650142457211666,
+  "setup_seconds": 0.04854420805349946,
+  "sweep_seconds": 0.03771824995055795,
+  "contraction_plans": 32,
+  "peak_frontier_elements": 57344,
+  "norm_peak_frontier_elements": 256,
+  "hamiltonian_peak_frontier_elements": 57344,
+  "cached_environment_elements": 586916,
+  "sweep_energies": [],
+  "validation": {
+    "matrix_free": {
+      "site": 15,
+      "local_dimension": 8,
+      "metric_rank": 8,
+      "metric_rank_is_projected": true,
+      "hamiltonian_matvecs": 9,
+      "metric_matvecs": 9,
+      "iterations": 8,
+      "residual_norm": 8.065848592764485e-16,
+      "solver": "matrix_free",
+      "solver_converged": true,
+      "message": "converged",
+      "direct_energy": -0.9479917385339472,
+      "matrix_free_energy": -0.9479917385339474,
+      "energy_difference": -1.1102230246251565e-16,
+      "direct_environment_seconds": 0.09804216597694904,
+      "matrix_free_environment_seconds": 0.09837924991734326,
+      "direct_seconds": 0.03902579203713685,
+      "matrix_free_seconds": 0.0395256660412997
+    }
+  }
+}

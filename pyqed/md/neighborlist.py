@@ -1,6 +1,10 @@
 """Neighbor-list utilities for short-range MD interactions."""
 
 import numpy as np
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+except Exception:  # pragma: no cover - SciPy is available in the normal test env.
+    _cKDTree = None
 
 
 def minimum_image(vector, cell, pbc):
@@ -195,6 +199,13 @@ def _cutoff_pair_displacements_cell_list(positions, pbc, lengths, cutoff, exclus
 
 def _cutoff_pair_displacements_cell_list_arrays(positions, pbc, lengths, cutoff, exclusions):
     pbc = np.asarray(pbc, dtype=bool)
+    if _cKDTree is not None and np.all(pbc):
+        return _cutoff_pair_displacements_periodic_kdtree_arrays(
+            positions,
+            lengths,
+            cutoff,
+            exclusions,
+        )
     cutoff2 = cutoff * cutoff
     scaled = positions.copy()
     scaled[:, pbc] = np.mod(scaled[:, pbc], lengths[pbc])
@@ -274,6 +285,34 @@ def _cutoff_pair_displacements_cell_list_arrays(positions, pbc, lengths, cutoff,
         np.concatenate(pair_j_chunks),
         np.vstack(displacement_chunks),
     )
+
+
+def _cutoff_pair_displacements_periodic_kdtree_arrays(positions, lengths, cutoff, exclusions):
+    positions = np.asarray(positions, dtype=float)
+    lengths = np.asarray(lengths, dtype=float)
+    wrapped = np.mod(positions, lengths)
+    pairs = _cKDTree(wrapped, boxsize=lengths).query_pairs(float(cutoff), output_type="ndarray")
+    if pairs.size == 0:
+        return (
+            np.asarray([], dtype=int),
+            np.asarray([], dtype=int),
+            np.zeros((0, 3), dtype=float),
+        )
+    pair_i = pairs[:, 0].astype(int, copy=False)
+    pair_j = pairs[:, 1].astype(int, copy=False)
+    if exclusions is not None:
+        active = _nonexcluded_pair_mask(pair_i, pair_j, exclusions, len(positions))
+        if not np.any(active):
+            return (
+                np.asarray([], dtype=int),
+                np.asarray([], dtype=int),
+                np.zeros((0, 3), dtype=float),
+            )
+        pair_i = pair_i[active]
+        pair_j = pair_j[active]
+    displacements = positions[pair_i] - positions[pair_j]
+    displacements -= lengths * np.round(displacements / lengths)
+    return pair_i, pair_j, displacements
 
 
 def _tuple_pairs_to_arrays(pairs):

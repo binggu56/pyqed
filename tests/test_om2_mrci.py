@@ -256,6 +256,58 @@ def test_om2_mrci_builds_selected_configurations_and_overlap():
     np.testing.assert_allclose(np.abs(mrci1.wavefunction_overlap(mrci2)), np.eye(2), atol=1e-10)
 
 
+def _hf_determinant_ci_total_energy(reference, active_orbitals=None):
+    from pyqed.qchem.semiempirical import MRCI
+
+    driver = MRCI(reference, nstates=1, active_orbitals=active_orbitals, full=True)
+    hamiltonian, _ref = driver._dense_hamiltonian()
+    nocc = int(np.count_nonzero(np.asarray(reference.mo_occ) > 1.0e-8))
+    hf_occupation = np.zeros_like(driver.determinants[0])
+    hf_occupation[:, :nocc] = 1
+    matches = np.where(np.all(driver.determinants == hf_occupation[None, :, :], axis=(1, 2)))[0]
+    assert len(matches) == 1
+    return float(hamiltonian[matches[0], matches[0]] + reference.energy_nuc())
+
+
+def test_om2_active_space_mrci_contains_consistent_hf_determinant_energy():
+    from pyqed.qchem.semiempirical import OM2
+
+    om2 = OM2(atom="C 0 0 0; O 1.128 0 0", unit="angstrom").run()
+    ref = om2.reference
+    assert ref.converged
+    nocc = int(np.count_nonzero(ref.mo_occ > 1.0e-8))
+    active_orbitals = tuple(range(nocc - 2, nocc + 2))
+
+    ci_hf_energy = _hf_determinant_ci_total_energy(ref, active_orbitals=active_orbitals)
+
+    np.testing.assert_allclose(ci_hf_energy, ref.e_tot, atol=1.0e-8)
+
+
+def test_om2_mrci_rejects_unconverged_reference():
+    from pyqed.qchem.semiempirical import OM2
+
+    # This distorted azomethane-like geometry converges poorly with the compact
+    # native OM2 SCF damping.  MRCI must not use inconsistent damped-density
+    # energies and final-orbital determinants from such a reference.
+    atom = (
+        "C -1.229657660272 1.296221544263 -0.000000000000; "
+        "N -1.181078827891 0.000000000000 0.000000000000; "
+        "N 1.181078827891 0.000000000000 0.000000000000; "
+        "C 1.229657660272 -0.993012662503 0.833231140149; "
+        "H -0.569040062390 1.453356420929 0.853323450060; "
+        "H -2.240575399824 1.462061036334 0.338265630386; "
+        "H -0.879357518011 1.850114581795 -0.873817438605; "
+        "H 0.597812634428 -1.424037702542 0.067006464063; "
+        "H 2.255226551094 -1.151245963874 0.540934028376; "
+        "H 0.896375414973 -0.949631837023 1.869985151717"
+    )
+    om2 = OM2(atom=atom, unit="bohr").run(max_cycle=20)
+
+    assert not om2.reference.converged
+    with pytest.raises(RuntimeError, match="OM2 reference is not converged"):
+        om2.MECI(nstates=3, ncas=4).run()
+
+
 def test_om2_mrci_scanner_returns_result_object():
     from pyqed.qchem.semiempirical import OM2
 

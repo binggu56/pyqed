@@ -46,6 +46,25 @@ Use active orbital selection when:
 The helper checks that the number of active orbital indices equals ``ncas`` and
 that there are no duplicates.
 
+Atomic Valence Active Space
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+AVAS constructs an active space from chemically meaningful atomic-orbital
+labels using native PyQED overlap and cross-basis integrals. Its interface
+follows PyQED's ``avas.run`` syntax and accepts a converged PyQED
+mean-field object:
+
+.. code-block:: python
+
+   from pyqed.qchem import CASSCF, avas
+
+   ncas, nelecas, mo_avas = avas.run(mf, ["Fe 3d", "N 2p"])
+   mc = CASSCF(mf, ncas=ncas, nelecas=nelecas).run(mo_coeff=mo_avas)
+
+The default ``minao="minao"`` reference uses PyQED's bundled minimal ANO-R0
+basis. The primary molecule can use the builtin/native or gbasis integral
+driver; AVAS does not require PySCF.
+
 First-Order CASSCF
 ------------------
 

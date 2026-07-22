@@ -38,6 +38,7 @@ def test_qchem_letta_wraps_generic_letta_from_factorized_narg():
     letta = LETTA.from_narg([t0, t1], coeff, dims=dims, bond_dim=2, mpo=mpo)
     initial = letta.expect()
     psi = letta.state_vector()
+    assert letta.tensors[-1].shape == (dims[-1], t1.shape[1])
     result = letta.run(nsweeps=1)
 
     expected = []
@@ -52,7 +53,8 @@ def test_qchem_letta_wraps_generic_letta_from_factorized_narg():
 
     assert type(letta).__name__ == "LETTA"
     assert len(letta.tensors) == len(dims)
-    assert letta.tensors[-1].shape == (dims[-1], t1.shape[1])
+    assert letta.tensors[-1].shape == (dims[-1], 1)
+    assert all(update["identity_metric"] for update in letta.history[0]["updates"])
     np.testing.assert_allclose(psi, expected, atol=1e-12)
     assert np.isfinite(initial)
     assert np.isfinite(result.energy)

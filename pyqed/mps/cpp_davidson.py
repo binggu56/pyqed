@@ -1,4 +1,4 @@
-"""Optional C++ Davidson backend for packed Abelian local solves."""
+"""Optional C++ Davidson backends for dense and packed-Abelian local solves."""
 
 from __future__ import annotations
 
@@ -14,6 +14,13 @@ CPP_DAVIDSON_AVAILABLE = False
 CPP_DAVIDSON_BUILD_ERROR = None
 block_table_davidson = None
 block_table_matvec = None
+dense_two_site_matvec = None
+dense_coarse_grain_mpo = None
+dense_coarse_grain_mps = None
+dense_environment_update_left = None
+dense_environment_update_right = None
+DenseDavidsonWorkspace = None
+DenseSweepWorkspace = None
 lapack_svd = None
 lapack_qr = None
 abelian_two_site_svd_from_permuted_data = None
@@ -237,6 +244,13 @@ def _initialize():
     global CPP_DAVIDSON_BUILD_ERROR
     global block_table_davidson
     global block_table_matvec
+    global dense_two_site_matvec
+    global dense_coarse_grain_mpo
+    global dense_coarse_grain_mps
+    global dense_environment_update_left
+    global dense_environment_update_right
+    global DenseDavidsonWorkspace
+    global DenseSweepWorkspace
     global lapack_svd
     global lapack_qr
     global abelian_two_site_svd_from_permuted_data
@@ -319,6 +333,21 @@ def _initialize():
             return
     block_table_davidson = module.block_table_davidson
     block_table_matvec = getattr(module, "block_table_matvec", None)
+    dense_two_site_matvec = getattr(module, "dense_two_site_matvec", None)
+    dense_coarse_grain_mpo = getattr(module, "dense_coarse_grain_mpo", None)
+    dense_coarse_grain_mps = getattr(module, "dense_coarse_grain_mps", None)
+    dense_environment_update_left = getattr(
+        module,
+        "dense_environment_update_left",
+        None,
+    )
+    dense_environment_update_right = getattr(
+        module,
+        "dense_environment_update_right",
+        None,
+    )
+    DenseDavidsonWorkspace = getattr(module, "DenseDavidsonWorkspace", None)
+    DenseSweepWorkspace = getattr(module, "DenseSweepWorkspace", None)
     lapack_svd = getattr(module, "lapack_svd", None)
     lapack_qr = getattr(module, "lapack_qr", None)
     abelian_two_site_svd_from_permuted_data = getattr(

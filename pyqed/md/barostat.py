@@ -142,6 +142,8 @@ class SemiIsotropicPressureController:
         coupling=0.01,
         max_scale=0.01,
         include_kinetic=True,
+        scale_molecule_centers=False,
+        molecule_array="molecule_ids",
     ):
         self.atoms = atoms
         self.target_lateral_pressure = float(target_lateral_pressure)
@@ -154,6 +156,8 @@ class SemiIsotropicPressureController:
         self.coupling = float(coupling)
         self.max_scale = float(max_scale)
         self.include_kinetic = bool(include_kinetic)
+        self.scale_molecule_centers = bool(scale_molecule_centers)
+        self.molecule_array = str(molecule_array)
         if self.compressibility < 0.0:
             raise ValueError("compressibility must be non-negative.")
         if self.coupling < 0.0 or self.coupling > 1.0:
@@ -164,6 +168,7 @@ class SemiIsotropicPressureController:
         self.last_lateral_pressure = None
         self.last_normal_pressure = None
         self.last_scale = np.ones(3)
+        self.calls = 0
 
     @classmethod
     def from_bar(
@@ -210,11 +215,19 @@ class SemiIsotropicPressureController:
         )
         scale = np.array([lateral_scale, lateral_scale, normal_scale], dtype=float)
         self.last_scale = scale
+        self.calls += 1
         if np.allclose(scale, 1.0):
             return scale
 
         lengths, _ = _orthorhombic_lengths_and_volume(self.atoms)
-        positions = self.atoms.get_positions() * scale
+        if self.scale_molecule_centers:
+            positions = _scaled_molecule_center_positions(
+                self.atoms,
+                scale,
+                self.molecule_array,
+            )
+        else:
+            positions = self.atoms.get_positions() * scale
         self.atoms.set_cell(np.diag(lengths * scale), scale_atoms=False)
         self.atoms.set_positions(positions)
         return scale
@@ -399,9 +412,15 @@ def _scaled_molecule_center_positions(atoms, scale, molecule_array):
         )
     positions = atoms.get_positions()
     molecule_ids = atoms.get_array(molecule_array)
-    scaled = positions.copy()
-    for molecule_id in np.unique(molecule_ids):
-        mask = molecule_ids == molecule_id
-        center = np.mean(positions[mask], axis=0)
-        scaled[mask] = center * scale + (positions[mask] - center)
-    return scaled
+    _unique_ids, inverse, counts = np.unique(
+        molecule_ids,
+        return_inverse=True,
+        return_counts=True,
+    )
+    centers = np.column_stack(
+        [
+            np.bincount(inverse, weights=positions[:, axis]) / counts
+            for axis in range(3)
+        ]
+    )
+    return positions + centers[inverse] * (np.asarray(scale, dtype=float) - 1.0)

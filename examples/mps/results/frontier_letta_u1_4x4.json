@@ -1,0 +1,118 @@
+{
+  "model": {
+    "shape": [
+      4,
+      4
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "target_two_sz": 0,
+    "site_order": "row-wise snake",
+    "tie_graph": "all J1 nearest-neighbor bonds"
+  },
+  "settings": {
+    "bond_dim": 4,
+    "mps_directional_pass_limit": 20,
+    "letta_directional_pass_limit": 40,
+    "tie_noise": 0.001,
+    "seed": 7
+  },
+  "exact": {
+    "energy": -7.505556950081064,
+    "seconds": 0.14650899998378009,
+    "used_during_optimization": false
+  },
+  "initial_letta_state_max_difference": 0.0,
+  "results": {
+    "mps_dense_d4": {
+      "symmetry": "none",
+      "optimizer": "two_site_dmrg",
+      "energy": -6.9461316210874635,
+      "seconds": 0.32781762501690537,
+      "parameters": 424,
+      "directional_passes": 20,
+      "converged": false
+    },
+    "mps_u1_d4": {
+      "symmetry": "U1_fixed_Sz",
+      "optimizer": "two_site_dmrg",
+      "energy": -6.946131620941282,
+      "seconds": 4.4485697919735685,
+      "symmetry_parameters": 152,
+      "dense_equivalent_parameters": 424,
+      "directional_passes": 20,
+      "converged": false
+    },
+    "letta_dense_d4": {
+      "symmetry": "none",
+      "optimizer": "one_site_exact_local_S_equals_I",
+      "initial_energy": -6.946183132282197,
+      "energy": -7.378244096666122,
+      "energy_per_site": -0.4611402560416326,
+      "seconds": 16.336918083019555,
+      "symmetry_parameters": 1332,
+      "dense_equivalent_parameters": 1332,
+      "bond_dims": [
+        1,
+        2,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        2,
+        1
+      ],
+      "directional_passes": 40,
+      "accepted_updates": 464,
+      "solver_failures": 0,
+      "sector_leakage": 0.0016877478033828996,
+      "energy_error": 0.12731285341494214,
+      "energy_error_per_site": 0.007957053338433884
+    },
+    "letta_u1_d4": {
+      "symmetry": "U1_fixed_Sz",
+      "optimizer": "one_site_exact_local_S_equals_I",
+      "initial_energy": -6.946183132282197,
+      "energy": -7.21699246096902,
+      "energy_per_site": -0.45106202881056373,
+      "seconds": 11.763537624967285,
+      "symmetry_parameters": 482,
+      "dense_equivalent_parameters": 1332,
+      "bond_dims": [
+        1,
+        2,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        2,
+        1
+      ],
+      "directional_passes": 40,
+      "accepted_updates": 594,
+      "solver_failures": 0,
+      "sector_leakage": 0.0,
+      "energy_error": 0.28856448911204424,
+      "energy_error_per_site": 0.018035280569502765
+    }
+  }
+}

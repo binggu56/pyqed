@@ -30,8 +30,10 @@ from pyqed.qchem.gdvr.tddmrg import (
     build_gdvr_spatial_svd_density_hamiltonian_mpo,
     cap_mpo,
     cap_operator,
+    cap_profile,
     dipole_mpo,
     force_mpo,
+    GDVRSpatialLocalPhase,
     GDVRSpatialHybridDensityPhase,
     GDVRSpatialFactorizedDensityPhase,
     GDVRSpatialTaylorDensityPhase,
@@ -187,6 +189,8 @@ def test_direct_spatial_gdvr_hamiltonian_mpo_matches_spin_orbital_oracle():
 
     np.testing.assert_allclose(spatial, spin_in_spatial_order, atol=1.0e-12)
     assert info["representation"] == "gdvr_direct_spatial_mpo"
+    assert info["native_abelian_mpo"] is True
+    assert hasattr(spatial_mpo.factors[0], "qns")
 
 
 def test_to_gto_feeds_generic_active_space_tddmrg():
@@ -238,6 +242,34 @@ def test_rhf_determinant_mps_can_preserve_abelian_sectors():
     assert all(hasattr(factor, "qns") for factor in sym_factors)
 
 
+def test_rhf_single_occupied_orbital_fast_path_has_closed_shell_amplitudes():
+    orbital = np.array([0.4, -0.2 + 0.3j, 0.7], dtype=complex)
+    orbital = orbital / np.linalg.norm(orbital)
+    mo_coeff = np.eye(3, dtype=complex)
+    mo_coeff[:, 0] = orbital
+    mf = SimpleNamespace(
+        mol=SimpleNamespace(spin=0),
+        mo_coeff=mo_coeff,
+        mo_occ=np.array([2.0, 0.0, 0.0]),
+    )
+
+    psi = rhf_determinant_mps(mf)
+    actual = np.asarray(tt_to_tensor(psi.factors), dtype=complex).reshape((4, 4, 4))
+    expected = np.zeros((4, 4, 4), dtype=complex)
+    for alpha_site, alpha_coeff in enumerate(orbital):
+        for beta_site, beta_coeff in enumerate(orbital):
+            states = [0, 0, 0]
+            if alpha_site == beta_site:
+                states[alpha_site] = 3
+            else:
+                states[alpha_site] = 1
+                states[beta_site] = 2
+            sign = -1.0 if beta_site < alpha_site else 1.0
+            expected[tuple(states)] = sign * alpha_coeff * beta_coeff
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+
 def test_direct_spatial_gdvr_dipole_mpo_is_site_number_operator():
     mol = _ToyGDVRMolecule()
     mu = _mpo_to_dense_matrix(dipole_mpo(mol))
@@ -266,6 +298,34 @@ def test_gdvr_cap_mpo_is_negative_imaginary_number_operator():
     np.testing.assert_allclose(cap, expected, atol=1.0e-12)
     assert np.all(np.real(np.diag(cap)) == pytest.approx(0.0))
     assert np.min(np.imag(np.diag(cap))) < 0.0
+
+
+def test_gdvr_local_phase_matches_dense_diagonal_action():
+    mol = _ThreeSiteToyGDVRMolecule()
+    psi, vec = _random_spatial_mps(3)
+    dt = 0.037
+    field_z = 0.02
+    cap_values = cap_profile(mol, width=0.4, strength=0.2, order=2)
+
+    actual = GDVRSpatialLocalPhase.from_mol(
+        mol,
+        dt,
+        field_z=field_z,
+        cap_values=cap_values,
+    ) @ psi
+
+    occupation = np.array([0.0, 1.0, 1.0, 2.0])
+    phases = []
+    for state in np.ndindex(4, 4, 4):
+        phase = 1.0 + 0.0j
+        for site, local_state in enumerate(state):
+            occ = occupation[int(local_state)]
+            phase *= np.exp(-1j * dt * field_z * mol.z[site] * occ)
+            phase *= np.exp(-dt * cap_values[site] * occ)
+        phases.append(phase)
+    expected = np.asarray(phases) * vec
+
+    np.testing.assert_allclose(tt_to_tensor(actual.factors).reshape(-1), expected, atol=1.0e-12)
 
 
 def test_field_free_dipole_acceleration_mpo_matches_dense_commutator():
@@ -617,7 +677,7 @@ def test_gdvr_tddmrg_cap_is_real_time_only_and_temporary():
     np.testing.assert_allclose(_mpo_to_dense_matrix(td._get_td_hamiltonian()), h0, atol=1.0e-12)
 
 
-def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_public():
+def test_gdvr_tddmrg_omitted_psi0_is_dmrg_ground_state_and_init_guess_is_not_public():
     mf = _ToyGDVRRHF()
     angle = 0.37
     c = np.cos(angle)
@@ -630,17 +690,92 @@ def test_gdvr_tddmrg_omitted_psi0_is_rhf_determinant_and_init_guess_is_not_publi
 
     td = TDDMRG(mf).build()
     actual = td.default_initial_condition(D=8)
-    expected = rhf_determinant_mps(mf, max_bond=8)
+    assert td._has_ground_state()
+    expected = td.export_ground_state(dense=True)
+    rhf = rhf_determinant_mps(mf, max_bond=8)
     product = MPS(td.get_initial_guess_dense(noise=0.0), labels=["lv", "p", "rv"]).normalize()
 
     actual_vec = np.asarray(tt_to_tensor(actual.factors), dtype=complex).reshape(-1)
     expected_vec = np.asarray(tt_to_tensor(expected.factors), dtype=complex).reshape(-1)
+    rhf_vec = np.asarray(tt_to_tensor(rhf.factors), dtype=complex).reshape(-1)
     product_vec = np.asarray(tt_to_tensor(product.factors), dtype=complex).reshape(-1)
 
     overlap = abs(np.vdot(expected_vec, actual_vec))
+    rhf_overlap = abs(np.vdot(rhf_vec, actual_vec))
     product_overlap = abs(np.vdot(product_vec, actual_vec))
     np.testing.assert_allclose(overlap, 1.0, atol=1.0e-12)
+    assert rhf_overlap < 0.99
     assert product_overlap < 0.99
+
+
+def test_gdvr_tddmrg_constructor_does_not_eagerly_build_rhf_mps(monkeypatch):
+    import pyqed.qchem.gdvr.tddmrg as gdvr_tddmrg_module
+
+    def _fail_rhf_mps(*args, **kwargs):
+        raise AssertionError("constructor should keep a lightweight DMRG initial guess")
+
+    monkeypatch.setattr(gdvr_tddmrg_module, "rhf_determinant_mps", _fail_rhf_mps)
+
+    td = TDDMRG(_ToyGDVRRHF()).build()
+
+    assert td.init_guess == "hf"
+    assert not td._has_ground_state()
+
+
+def test_gdvr_tddmrg_optimize_ground_state_uses_fast_defaults(monkeypatch):
+    import pyqed.qchem.gdvr.tddmrg as gdvr_tddmrg_module
+
+    captured = {}
+
+    def _capture_optimize(self, *args, **kwargs):
+        captured.update(kwargs)
+        return self
+
+    monkeypatch.setattr(
+        gdvr_tddmrg_module.BaseTDDMRG,
+        "optimize_ground_state",
+        _capture_optimize,
+    )
+
+    td = TDDMRG(_ToyGDVRRHF()).build()
+
+    assert td.optimize_ground_state(D=6) is td
+    assert captured["D"] == 6
+    assert captured["nsweeps"] == 4
+    assert captured["initial_guess"] == "hf"
+    assert captured["symmetry_list"] == ["charge", "sz"]
+    assert captured["compute_s2"] is False
+    assert captured["abelian_matvec_options"]["native_site_storage"] is True
+
+    captured.clear()
+    assert td.optimize_ground_state(D=6, symmetry=False) is td
+    assert captured["symmetry"] is False
+    assert "symmetry_list" not in captured
+    assert "abelian_matvec_options" not in captured
+
+
+def test_direct_gdvr_tddmrg_build_reuses_native_mpo_for_dmrg():
+    td = TDDMRG(_ToyGDVRRHF()).build()
+
+    assert td._symmetric_mpo_cache[(("charge", "sz"), "native")] is td.H
+    assert td._active_integral_build_info["native_abelian_mpo"] is True
+
+
+def test_direct_gdvr_tddmrg_optimize_ground_state_tiny_native_setup():
+    td = TDDMRG(_ToyGDVRRHF()).build()
+
+    td.optimize_ground_state(
+        D=2,
+        nsweeps=1,
+        symmetry_list=["charge", "sz"],
+        compute_s2=False,
+        davidson_tol=1.0e-4,
+        not_conv_err=False,
+    )
+
+    assert td._has_ground_state()
+    assert np.isfinite(td.e_tot)
+    assert hasattr(td.dmrg.ground_state.factors[0], "qns")
 
 
 def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():
@@ -665,11 +800,16 @@ def test_gdvr_tddmrg_ensure_dense_preserves_spatial_local_order():
 
 def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
     import pyqed.qchem.dmrg.tddmrg as qchem_tddmrg_module
+    import pyqed.mps.tdvp as tdvp_module
 
     def _fail_densify(*args, **kwargs):
         raise AssertionError("block-sparse GDVR-TDDMRG should keep the QN MPS initial state")
 
+    def _fail_dense_mpo_conversion(*args, **kwargs):
+        raise AssertionError("direct GDVR Hamiltonian should already be a native Abelian MPO")
+
     monkeypatch.setattr(qchem_tddmrg_module, "symmetric_to_dense", _fail_densify)
+    monkeypatch.setattr(tdvp_module, "dense_to_symmetric_mpo", _fail_dense_mpo_conversion)
     td = TDDMRG(_ToyGDVRRHF()).build()
     td._use_exact_dense_td = lambda: False
 
@@ -687,3 +827,30 @@ def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
 
     assert hasattr(td.final_state.factors[0], "qns")
     np.testing.assert_allclose(td.pre_normalization_norms, np.ones(1), atol=1.0e-12)
+
+
+def test_direct_gdvr_tddmrg_block_sparse_field_uses_local_phase():
+    mf = _ToyGDVRRHF()
+    td = TDDMRG(mf).build()
+    td._use_exact_dense_td = lambda: False
+    field = lambda t: np.array([0.0, 0.0, 0.02 * np.sin(t)])
+
+    td.run(
+        dt=0.01,
+        steps=1,
+        field=field,
+        e_ops=[],
+        cap={"width": 0.5, "strength": 0.4, "order": 2},
+        cap_mode="local-phase",
+        tdvp_projection_backend="block-sparse",
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+        D=4,
+    )
+
+    assert hasattr(td.final_state.factors[0], "qns")
+    assert td.tdmps.tdvp_split_dynamic_block_sparse is True
+    assert td.cap_settings is None
+    assert td._local_cap_values is None
+    assert td.pre_normalization_norms[0] < 1.0

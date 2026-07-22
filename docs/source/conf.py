@@ -94,13 +94,6 @@ autodoc_mock_imports = [
 #
 html_theme = 'sphinx_rtd_theme'
 
-# Consolidate Read the Docs aliases and historical versions around the public
-# documentation domain. Sphinx emits a per-page canonical link from this base.
-html_baseurl = os.environ.get(
-    'READTHEDOCS_CANONICAL_URL',
-    'https://docs.pyqed.org/en/latest/',
-)
-
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".

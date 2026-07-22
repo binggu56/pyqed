@@ -217,7 +217,7 @@ def test_tddmrg_h4_uses_exact_dense_td_path_and_matches_dense_oracle():
     builder = td.build_interaction_unitary_mpo(dt, time=0.025, field=pulse)
     assert isinstance(builder, _DenseStateTransformOperator)
 
-    td.run(dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"], D=8)
+    td.run(psi0=psi0, dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"], D=8)
     mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
     mu_td = np.concatenate(([mu0], np.real(td.observables[:, 0])))
 

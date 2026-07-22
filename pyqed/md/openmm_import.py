@@ -12,6 +12,7 @@ from pyqed.units import au2nm
 from .atoms import Atoms
 from .calculators import MM
 from .constraints import FixBondLengths
+from .pme import pme_mesh_for_accuracy
 from .topology import Topology
 
 
@@ -98,6 +99,7 @@ def atoms_from_openmm_pdb(
     atoms.set_array("residue_ids", [record.residue_id for record in records], str, ())
     atoms.set_array("chain_ids", [record.chain_id for record in records], str, ())
     atoms.set_array("openmm_indices", [record.index for record in records], int, ())
+    atoms.pdb_bonds = _pdb_bond_pairs(topology)
 
     selected = select_openmm_atoms(
         records,
@@ -131,9 +133,13 @@ def atoms_from_openmm_pdb_system(
     nonbonded_cutoff_nm=1.0,
     ewald_alpha_per_nm=0.0,
     pme_mesh=None,
+    pme_order=5,
+    pme_accuracy="manual",
+    match_openmm_pme_parameters=False,
     reaction_field_dielectric=78.3,
     attach_calculator=True,
-    nonbonded_skin=1.0,
+    nonbonded_skin=0.25,
+    pme_charge_neutrality_tolerance=1.0e-4,
 ):
     """Import an OpenMM PDB+ForceField as a native PyQED MM system.
 
@@ -161,11 +167,43 @@ def atoms_from_openmm_pdb_system(
         ignoreExternalBonds=bool(ignore_external_bonds),
         ewaldErrorTolerance=5.0e-4,
     )
+    openmm_pme_parameters = None
+    method = str(nonbonded_method).lower()
+    pme_accuracy = str(pme_accuracy).lower()
+    if pme_accuracy not in {"manual", "openmm", "balanced", "high"}:
+        raise ValueError("pme_accuracy must be 'manual', 'openmm', 'balanced', or 'high'.")
+    if match_openmm_pme_parameters and pme_accuracy != "manual":
+        raise ValueError("Specify either match_openmm_pme_parameters or pme_accuracy.")
+    if pme_accuracy != "manual" and pme_mesh is not None:
+        raise ValueError("Specify either pme_accuracy or explicit pme_mesh.")
+    if match_openmm_pme_parameters:
+        if method != "pme":
+            raise ValueError("match_openmm_pme_parameters requires nonbonded_method='pme'.")
+        if pme_mesh is not None or float(ewald_alpha_per_nm) != 0.0:
+            raise ValueError("Specify either explicit PME parameters or match_openmm_pme_parameters.")
+        openmm_pme_parameters = _openmm_context_pme_parameters(pdb, system, openmm, unit)
+        ewald_alpha_per_nm = openmm_pme_parameters["ewald_alpha_per_nm"]
+        pme_mesh = tuple(openmm_pme_parameters["pme_mesh"])
+    elif pme_accuracy != "manual":
+        if method != "pme":
+            raise ValueError("pme_accuracy presets require nonbonded_method='pme'.")
+        openmm_pme_parameters = _openmm_context_pme_parameters(pdb, system, openmm, unit)
+        if float(ewald_alpha_per_nm) == 0.0:
+            ewald_alpha_per_nm = openmm_pme_parameters["ewald_alpha_per_nm"]
+        if pme_accuracy == "openmm":
+            pme_mesh = tuple(openmm_pme_parameters["pme_mesh"])
+        else:
+            pme_mesh = pme_mesh_for_accuracy(_topology_periodic_lengths_nm(topology, unit), pme_accuracy)
 
     topology_data, constraint_pairs, constraint_distances = _topology_from_openmm_system(
         system,
         openmm,
         unit,
+    )
+    charge_correction = _neutralize_tiny_pme_charge_roundoff(
+        topology_data,
+        enabled=str(nonbonded_method).lower() == "pme",
+        tolerance=pme_charge_neutrality_tolerance,
     )
     cell = _orthorhombic_cell_bohr(topology, unit)
     pbc = cell is not None
@@ -186,10 +224,12 @@ def atoms_from_openmm_pdb_system(
     atoms.set_array("chain_ids", [record.chain_id for record in records], str, ())
     atoms.set_array("openmm_indices", [record.index for record in records], int, ())
     atoms.set_array("molecule_ids", _molecule_ids_from_residues(topology), int, ())
+    atoms.pdb_bonds = _pdb_bond_pairs(topology)
+    atoms.openmm_pme_parameters = openmm_pme_parameters
+    atoms.openmm_charge_correction = charge_correction
     if constraint_pairs:
         atoms.constraints = [FixBondLengths(constraint_pairs, distances=constraint_distances)]
 
-    method = str(nonbonded_method).lower()
     if attach_calculator:
         cutoff_bohr = None if method in {"none", "nocutoff", "no-cutoff"} else float(nonbonded_cutoff_nm) / au2nm
         calculator_method = "pme" if method == "pme" else "cutoff"
@@ -200,7 +240,8 @@ def atoms_from_openmm_pdb_system(
             )
             if pme_mesh is not None:
                 calc_kwargs["pme_mesh"] = tuple(int(value) for value in pme_mesh)
-        else:
+            calc_kwargs["pme_order"] = int(pme_order)
+        elif cutoff_bohr is not None:
             calc_kwargs["coulomb_reaction_field_dielectric"] = float(reaction_field_dielectric)
         atoms.calc = MM(
             bonds=topology_data.bonds,
@@ -338,6 +379,69 @@ def _atom_records(topology):
     return records
 
 
+def _pdb_bond_pairs(topology):
+    return [(int(bond[0].index), int(bond[1].index)) for bond in topology.bonds()]
+
+
+def _openmm_context_pme_parameters(pdb, system, openmm, unit):
+    integrator = openmm.VerletIntegrator(0.001 * unit.femtosecond)
+    context = openmm.Context(system, integrator, openmm.Platform.getPlatformByName("CPU"))
+    context.setPositions(pdb.positions)
+    for force in system.getForces():
+        if hasattr(force, "getPMEParametersInContext"):
+            alpha, nx, ny, nz = force.getPMEParametersInContext(context)
+            alpha_per_nm = alpha.value_in_unit(1.0 / unit.nanometer) if hasattr(alpha, "value_in_unit") else alpha
+            return {
+                "ewald_alpha_per_nm": float(alpha_per_nm),
+                "pme_mesh": [int(nx), int(ny), int(nz)],
+            }
+    raise ValueError("OpenMM system has no force with context PME parameters.")
+
+
+def _topology_periodic_lengths_nm(topology, unit):
+    vectors = topology.getPeriodicBoxVectors()
+    if vectors is None:
+        raise ValueError("PME accuracy presets require periodic box vectors.")
+    lengths = []
+    for vector in vectors:
+        value = vector.value_in_unit(unit.nanometer) if hasattr(vector, "value_in_unit") else vector
+        lengths.append(float(np.linalg.norm(np.asarray(value, dtype=float))))
+    return np.asarray(lengths, dtype=float)
+
+
+def _neutralize_tiny_pme_charge_roundoff(topology, *, enabled, tolerance):
+    charges = getattr(topology, "charges", None)
+    if not enabled or charges is None or len(charges) == 0:
+        return None
+    charge_sum = float(np.sum(charges))
+    tolerance = float(tolerance)
+    if abs(charge_sum) <= 1.0e-10:
+        return {
+            "applied": False,
+            "initial_charge": charge_sum,
+            "final_charge": charge_sum,
+            "per_atom_delta": 0.0,
+            "tolerance": tolerance,
+        }
+    if tolerance <= 0.0 or abs(charge_sum) > tolerance:
+        return {
+            "applied": False,
+            "initial_charge": charge_sum,
+            "final_charge": charge_sum,
+            "per_atom_delta": 0.0,
+            "tolerance": tolerance,
+        }
+    per_atom_delta = -charge_sum / len(charges)
+    topology.charges = np.asarray(charges, dtype=float) + per_atom_delta
+    return {
+        "applied": True,
+        "initial_charge": charge_sum,
+        "final_charge": float(np.sum(topology.charges)),
+        "per_atom_delta": float(per_atom_delta),
+        "tolerance": tolerance,
+    }
+
+
 def _charges_from_forcefield(
     topology,
     forcefield_files,
@@ -374,6 +478,8 @@ def _topology_from_openmm_system(system, openmm, unit):
     angles = []
     torsions = []
     impropers = []
+    cmaps = []
+    cmap_grids = []
     charges = np.zeros(system.getNumParticles(), dtype=float)
     lj_sigma = np.zeros(system.getNumParticles(), dtype=float)
     lj_epsilon = np.zeros(system.getNumParticles(), dtype=float)
@@ -439,6 +545,20 @@ def _topology_from_openmm_system(system, openmm, unit):
                     i, j, k, l, parameters = force.getTorsionParameters(index)
                     force_constant, phase = _custom_torsion_parameters(force, parameters, unit)
                     impropers.append((int(i), int(j), int(k), int(l), force_constant, phase))
+        elif isinstance(force, openmm.CMAPTorsionForce):
+            cmap_offset = len(cmap_grids)
+            for index in range(force.getNumMaps()):
+                size, values = force.getMapParameters(index)
+                size = int(size)
+                cmap_grids.append(
+                    (
+                        size,
+                        np.asarray([_energy_au(value, unit) for value in values], dtype=float).reshape((size, size)),
+                    )
+                )
+            for index in range(force.getNumTorsions()):
+                parameters = force.getTorsionParameters(index)
+                cmaps.append((int(parameters[0]) + cmap_offset, tuple(int(atom) for atom in parameters[1:])))
         elif isinstance(force, openmm.NonbondedForce):
             for index in range(force.getNumParticles()):
                 charge, sigma, epsilon = force.getParticleParameters(index)
@@ -507,6 +627,8 @@ def _topology_from_openmm_system(system, openmm, unit):
         angles=angles,
         torsions=torsions,
         impropers=impropers,
+        cmaps=cmaps,
+        cmap_grids=cmap_grids,
         charges=charges,
         lj_epsilon=lj_epsilon,
         lj_sigma=lj_sigma,

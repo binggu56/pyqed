@@ -26,7 +26,7 @@ Method citations
 
 The software citation does not replace citations for RHF, CASSCF, HEOM, DVR,
 GW/BSE, LDR, tensor-network, or other scientific methods.  Consult the method
-guide, example header, and linked method documentation for the references relevant
+guide, example header, and ``docs/references.bib`` for the references relevant
 to the exact algorithm and approximation.  When a page does not yet state the
 method reference clearly, open an issue rather than guessing.
 

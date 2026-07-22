@@ -1,18 +1,16 @@
 {
   "schema_version": "1.0",
   "benchmark_id": "h2-sto3g-rhf-pyscf",
-  "generated_at": "2026-07-11T07:01:21Z",
+  "generated_at": "2026-07-11T05:14:36Z",
   "software": {
     "pyqed_version": "0.2.0",
-    "git_commit": "7dbb9bcc6625d9e4030627140dd14738c60a0e67",
-    "git_dirty": false,
+    "git_commit": "0d3b6203f577ca42e6cd3f9f71f734ffc6bff6b2",
+    "git_dirty": true,
     "python_version": "3.13.5",
     "dependencies": {
       "numpy": "2.1.3",
       "scipy": "1.15.3",
-      "pyscf": "2.12.1",
-      "pyqed.qchem._rys_cy": "tracked CPython 3.13 macOS arm64 extension; sha256=690428a9d350ed3947ce97469bb876bfcf3b2d3a5d8baf7831bd4884b448e9e7",
-      "pyqed.qchem._basis_cy": "tracked CPython 3.13 macOS arm64 extension; sha256=96189b7c0a079ca6ff9b64ffb908c48d8bdbc37e9a2fa91f4b2359ec15d71474"
+      "pyscf": "2.12.1"
     }
   },
   "environment": {
@@ -37,7 +35,6 @@
       "pyqed_integral_driver": "builtin",
       "pyqed_eri_representation": "dense",
       "pyqed_eri_backend": "rys",
-      "observed_dense_builder": "rys-cython-blocked",
       "pyqed_ao_symmetry": "s8",
       "pyqed_eri_screen_tolerance": 0.0,
       "pyqed_integral_workers": 1,
@@ -50,8 +47,8 @@
     }
   },
   "execution": {
-    "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=ignore MPLCONFIGDIR=/private/tmp/pyqed-benchmark-mpl-7dbb9bc OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
-    "working_directory": "/private/tmp/pyqed-release-benchmark-7dbb9bc",
+    "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
+    "working_directory": "PyQED repository root",
     "warmups": 0,
     "repeats": 1
   },
@@ -90,17 +87,7 @@
     },
     {
       "path": "benchmarks/h2-sto3g-rhf-pyscf/run.py",
-      "sha256": "bcc44fae0c1c9f8a8a3d83cf07a6dd5077ca9edcc345445e711bc796923e2266",
-      "role": "input"
-    },
-    {
-      "path": "pyqed/qchem/_rys_cy.cpython-313-darwin.so",
-      "sha256": "690428a9d350ed3947ce97469bb876bfcf3b2d3a5d8baf7831bd4884b448e9e7",
-      "role": "input"
-    },
-    {
-      "path": "pyqed/qchem/_basis_cy.cpython-313-darwin.so",
-      "sha256": "96189b7c0a079ca6ff9b64ffb908c48d8bdbc37e9a2fa91f4b2359ec15d71474",
+      "sha256": "2bdd045fc7d9a158694955bb5aafd13b276c2f6c65182f7a91de283336d9944e",
       "role": "input"
     },
     {
@@ -110,9 +97,9 @@
     },
     {
       "path": "benchmarks/h2-sto3g-rhf-pyscf/RESULT.md",
-      "sha256": "114a5d9ced156a225516503d7f3ed5369ebdf513add24894f233f529f647da46",
+      "sha256": "50ba49bb469430f11f19452c26a6a179c6f23c00b3008804158c70505163aa12",
       "role": "processed_output"
     }
   ],
-  "notes": "Correctness validation only; no timing was measured. git status --porcelain was empty immediately before execution at the recorded commit. The exact command generated raw-output.json and used the observed rys-cython-blocked builder with the recorded tracked extension binaries. PYTHONWARNINGS was set to ignore and MPLCONFIGDIR was redirected to writable temporary storage."
+  "notes": "Correctness validation only; no timing was measured. The source tree was dirty, so this is a development-snapshot record and must be re-run on a clean release tree before release-level publication. A provisional exploratory 1e-10-hartree cutoff did not pass; the final 1e-9-hartree tolerance matches the repository's existing external RHF comparison scale, and the full observed difference is preserved."
 }

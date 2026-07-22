@@ -1,0 +1,35 @@
+{
+  "metadata": {
+    "lx": 4,
+    "ly": 4,
+    "nsites": 16,
+    "geometry": "open x, periodic y",
+    "mps_order": "snake",
+    "letta_order": "dimer-first",
+    "mps_max_sweeps": 160,
+    "mps_tol": 1e-06,
+    "require_mps_convergence": true,
+    "letta_max_sweeps": 50,
+    "letta_tol": 1e-09,
+    "require_letta_convergence": true,
+    "seed": 1234
+  },
+  "rows": [
+    {
+      "method": "MPS/DMRG snake",
+      "D": 16,
+      "jprime": 0.5,
+      "energy": -6.5599095029511405,
+      "initial": "",
+      "exact": -6.592203096991229,
+      "error": 0.03229359404008836,
+      "seconds": 100.64770649978891,
+      "sweeps_completed": 18,
+      "converged": true,
+      "final_delta_energy": 6.118681978861673e-07,
+      "convergence_tol": 1e-06,
+      "max_sweeps": 160,
+      "mpo_validation_error": ""
+    }
+  ]
+}

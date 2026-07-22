@@ -1,0 +1,779 @@
+"""Physical-slice block operators for one-site graph-LETTA updates.
+
+For a local tensor with layout ``(D_left, D_right, *physical_dims)``, fixing
+all local physical indices leaves a vector of ``D_left * D_right`` virtual
+entries.  The exact norm operator is diagonal between these physical slices,
+while a local Hamiltonian connects only the slices allowed by its finite-
+support terms.  This module represents that structure without changing the
+native C-order flattening used by :class:`FrontierTiedLETTA`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+
+import numpy as np
+
+from .local_terms import LocalHamiltonian
+from .matrix_free import DavidsonDiagnostics, lowest_generalized_davidson
+
+
+@dataclass(frozen=True)
+class PhysicalBlockSolveDiagnostics:
+    """Convergence and sparsity information for a componentwise solve."""
+
+    converged: bool
+    message: str
+    iterations: int
+    hamiltonian_matvecs: int
+    metric_matvecs: int
+    restarts: int
+    residual_norm: float
+    metric_norm: float
+    projected_rank: int
+    subspace_dimension: int
+    energy_history: tuple[float, ...]
+    residual_history: tuple[float, ...]
+    component_sizes: tuple[int, ...]
+    positive_metric_components: int
+    selected_component: int
+    metric_blocks: int
+    hamiltonian_blocks: int
+    stored_elements: int
+
+
+@dataclass(frozen=True)
+class PhysicalBlockLayout:
+    """Map a flattened LETTA tensor to fixed-physical-index blocks."""
+
+    tensor_shape: tuple[int, ...]
+    virtual_shape: tuple[int, int]
+    physical_shape: tuple[int, ...]
+    block_indices: tuple[np.ndarray, ...]
+    configurations: tuple[tuple[int, ...], ...]
+
+    def __init__(self, tensor_shape):
+        tensor_shape = tuple(int(dim) for dim in tensor_shape)
+        if len(tensor_shape) < 3:
+            raise ValueError(
+                "a graph-LETTA tensor needs two virtual axes and at least "
+                "one physical axis."
+            )
+        if any(dim < 1 for dim in tensor_shape):
+            raise ValueError("tensor_shape must contain only positive dimensions.")
+        virtual_shape = tensor_shape[:2]
+        physical_shape = tensor_shape[2:]
+        virtual_size = int(np.prod(virtual_shape))
+        nblocks = int(np.prod(physical_shape))
+        native_indices = np.arange(virtual_size * nblocks).reshape(
+            virtual_size, nblocks
+        )
+        block_indices = tuple(
+            np.array(native_indices[:, block], copy=True) for block in range(nblocks)
+        )
+        for indices in block_indices:
+            indices.setflags(write=False)
+        configurations = tuple(
+            tuple(int(value) for value in np.unravel_index(block, physical_shape))
+            for block in range(nblocks)
+        )
+        object.__setattr__(self, "tensor_shape", tensor_shape)
+        object.__setattr__(self, "virtual_shape", virtual_shape)
+        object.__setattr__(self, "physical_shape", physical_shape)
+        object.__setattr__(self, "block_indices", block_indices)
+        object.__setattr__(self, "configurations", configurations)
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.tensor_shape))
+
+    @property
+    def virtual_size(self) -> int:
+        return int(np.prod(self.virtual_shape))
+
+    @property
+    def nblocks(self) -> int:
+        return int(np.prod(self.physical_shape))
+
+    def as_blocks(self, vector) -> np.ndarray:
+        """Return ``vector`` as ``(physical_block, virtual_entry)``."""
+        vector = np.asarray(vector)
+        if vector.size != self.size:
+            raise ValueError(f"vector must contain {self.size} entries.")
+        flat = vector.reshape(-1)
+        return np.stack([flat[indices] for indices in self.block_indices])
+
+    def from_blocks(self, blocks) -> np.ndarray:
+        """Restore native C-order flattening from physical-block order."""
+        blocks = np.asarray(blocks)
+        expected = (self.nblocks, self.virtual_size)
+        if blocks.shape != expected:
+            raise ValueError(f"blocks must have shape {expected}.")
+        vector = np.empty(self.size, dtype=blocks.dtype)
+        for block, indices in enumerate(self.block_indices):
+            vector[indices] = blocks[block]
+        return vector
+
+
+def hamiltonian_physical_connectivity(
+    hamiltonian: LocalHamiltonian,
+    physical_sites,
+    *,
+    operator_atol: float = 0.0,
+) -> tuple[tuple[int, int], ...]:
+    r"""Return the structurally allowed local blocks ``(p_bra, p_ket)``.
+
+    A term can change only physical variables in its support.  Variables tied
+    into the optimized tensor but absent from that support must therefore have
+    equal bra and ket values.  Variables in the support but outside the local
+    tensor are left free when testing whether an operator entry exists.  The
+    result is an exact structural over-approximation: environment cancellations
+    may make an allowed block zero, but a forbidden block cannot contribute.
+    """
+    if not isinstance(hamiltonian, LocalHamiltonian):
+        raise TypeError("hamiltonian must be a LocalHamiltonian.")
+    physical_sites = tuple(int(site) for site in physical_sites)
+    if not physical_sites:
+        raise ValueError("physical_sites must contain the optimized site.")
+    if len(physical_sites) != len(set(physical_sites)):
+        raise ValueError("physical_sites must be unique.")
+    if any(site < 0 or site >= len(hamiltonian.dims) for site in physical_sites):
+        raise ValueError("physical_sites contains an invalid site.")
+    operator_atol = float(operator_atol)
+    if not np.isfinite(operator_atol) or operator_atol < 0.0:
+        raise ValueError("operator_atol must be finite and nonnegative.")
+
+    physical_shape = tuple(hamiltonian.dims[site] for site in physical_sites)
+    nblocks = int(np.prod(physical_shape, dtype=np.int64))
+    connected: set[tuple[int, int]] = set()
+    if hamiltonian.constant != 0.0:
+        connected.update((block, block) for block in range(nblocks))
+
+    for term in hamiltonian.terms:
+        term_axis = {site: axis for axis, site in enumerate(term.sites)}
+        changed_axes = tuple(
+            axis for axis, site in enumerate(physical_sites) if site in term_axis
+        )
+        preserved_axes = tuple(
+            axis for axis in range(len(physical_sites)) if axis not in changed_axes
+        )
+        term_dims = tuple(hamiltonian.dims[site] for site in term.sites)
+        rows, columns = np.nonzero(np.abs(term.operator) > operator_atol)
+        if rows.size == 0:
+            continue
+        bra_support = np.stack(np.unravel_index(rows, term_dims), axis=1)
+        ket_support = np.stack(np.unravel_index(columns, term_dims), axis=1)
+        projected_transitions = {
+            (
+                tuple(
+                    int(bra_values[term_axis[physical_sites[axis]]])
+                    for axis in changed_axes
+                ),
+                tuple(
+                    int(ket_values[term_axis[physical_sites[axis]]])
+                    for axis in changed_axes
+                ),
+            )
+            for bra_values, ket_values in zip(bra_support, ket_support)
+        }
+        preserved_shape = tuple(physical_shape[axis] for axis in preserved_axes)
+        for preserved_values in np.ndindex(preserved_shape):
+            for bra_changed, ket_changed in projected_transitions:
+                bra = [0] * len(physical_sites)
+                ket = [0] * len(physical_sites)
+                for axis, value in zip(preserved_axes, preserved_values):
+                    bra[axis] = ket[axis] = value
+                for position, axis in enumerate(changed_axes):
+                    bra[axis] = bra_changed[position]
+                    ket[axis] = ket_changed[position]
+                connected.add(
+                    (
+                        int(np.ravel_multi_index(tuple(bra), physical_shape)),
+                        int(np.ravel_multi_index(tuple(ket), physical_shape)),
+                    )
+                )
+    return tuple(sorted(connected))
+
+
+class PhysicalBlockLinearOperator:
+    """A square operator stored as selected physical-to-physical blocks."""
+
+    def __init__(
+        self,
+        layout: PhysicalBlockLayout,
+        blocks: Mapping[tuple[int, int], np.ndarray],
+        *,
+        dtype=None,
+    ):
+        if not isinstance(layout, PhysicalBlockLayout):
+            raise TypeError("layout must be a PhysicalBlockLayout.")
+        copied = {}
+        inferred_dtypes = []
+        expected_shape = (layout.virtual_size, layout.virtual_size)
+        for pair, block in blocks.items():
+            if len(pair) != 2:
+                raise ValueError("each block key must be a (row, column) pair.")
+            row, column = (int(pair[0]), int(pair[1]))
+            if not (0 <= row < layout.nblocks and 0 <= column < layout.nblocks):
+                raise ValueError("physical block index is out of range.")
+            value = np.asarray(block)
+            if value.shape != expected_shape:
+                raise ValueError(f"operator blocks must have shape {expected_shape}.")
+            if np.any(~np.isfinite(value)):
+                raise ValueError("operator blocks must contain only finite values.")
+            copied[(row, column)] = np.array(value, copy=True)
+            inferred_dtypes.append(value.dtype)
+        if dtype is None:
+            dtype = np.result_type(*inferred_dtypes, np.float64)
+        self.layout = layout
+        self.dtype = np.dtype(dtype)
+        self.blocks = {
+            pair: np.asarray(block, dtype=self.dtype) for pair, block in copied.items()
+        }
+        self.shape = (layout.size, layout.size)
+
+    @property
+    def connected_pairs(self) -> tuple[tuple[int, int], ...]:
+        return tuple(sorted(self.blocks))
+
+    @property
+    def stored_elements(self) -> int:
+        return sum(block.size for block in self.blocks.values())
+
+    def matvec(self, vector) -> np.ndarray:
+        inputs = self.layout.as_blocks(vector)
+        dtype = np.result_type(inputs.dtype, self.dtype)
+        outputs = np.zeros(
+            (self.layout.nblocks, self.layout.virtual_size), dtype=dtype
+        )
+        for (row, column), block in self.blocks.items():
+            outputs[row] += block @ inputs[column]
+        return self.layout.from_blocks(outputs)
+
+    def rmatvec(self, vector) -> np.ndarray:
+        inputs = self.layout.as_blocks(vector)
+        dtype = np.result_type(inputs.dtype, self.dtype)
+        outputs = np.zeros(
+            (self.layout.nblocks, self.layout.virtual_size), dtype=dtype
+        )
+        for (row, column), block in self.blocks.items():
+            outputs[column] += block.T.conj() @ inputs[row]
+        return self.layout.from_blocks(outputs)
+
+    def __matmul__(self, vector):
+        return self.matvec(vector)
+
+    def aslinearoperator(self):
+        """Return a SciPy ``LinearOperator`` sharing these block actions."""
+        from scipy.sparse.linalg import LinearOperator
+
+        return LinearOperator(
+            self.shape,
+            matvec=self.matvec,
+            rmatvec=self.rmatvec,
+            dtype=self.dtype,
+        )
+
+    def to_dense(self) -> np.ndarray:
+        result = np.zeros(self.shape, dtype=self.dtype)
+        for (row, column), block in self.blocks.items():
+            result[
+                np.ix_(
+                    self.layout.block_indices[row],
+                    self.layout.block_indices[column],
+                )
+            ] = block
+        return result
+
+    @classmethod
+    def from_dense(
+        cls,
+        matrix,
+        layout: PhysicalBlockLayout,
+        *,
+        connected_pairs: Iterable[tuple[int, int]] | None = None,
+        zero_atol: float = 0.0,
+        omitted_atol: float | None = None,
+    ):
+        """Extract selected blocks from a dense reference operator.
+
+        If ``connected_pairs`` is omitted, blocks whose maximum absolute entry
+        exceeds ``zero_atol`` are retained.  If it is supplied and
+        ``omitted_atol`` is not ``None``, all structurally forbidden blocks are
+        checked against that floating-point tolerance.
+        """
+        matrix = np.asarray(matrix)
+        if matrix.shape != (layout.size, layout.size):
+            raise ValueError(f"matrix must have shape {(layout.size, layout.size)}.")
+        zero_atol = float(zero_atol)
+        if not np.isfinite(zero_atol) or zero_atol < 0.0:
+            raise ValueError("zero_atol must be finite and nonnegative.")
+        requested = None
+        if connected_pairs is not None:
+            requested = {(int(row), int(column)) for row, column in connected_pairs}
+        blocks = {}
+        largest_omitted = 0.0
+        for row in range(layout.nblocks):
+            for column in range(layout.nblocks):
+                block = matrix[
+                    np.ix_(layout.block_indices[row], layout.block_indices[column])
+                ]
+                include = (
+                    (row, column) in requested
+                    if requested is not None
+                    else bool(np.any(np.abs(block) > zero_atol))
+                )
+                if include:
+                    blocks[(row, column)] = block
+                elif block.size:
+                    largest_omitted = max(
+                        largest_omitted, float(np.max(np.abs(block)))
+                    )
+        if omitted_atol is not None:
+            omitted_atol = float(omitted_atol)
+            if not np.isfinite(omitted_atol) or omitted_atol < 0.0:
+                raise ValueError("omitted_atol must be finite and nonnegative.")
+            if largest_omitted > omitted_atol:
+                raise ValueError(
+                    "a structurally omitted block is numerically nonzero: "
+                    f"maximum magnitude {largest_omitted:.3e} exceeds "
+                    f"omitted_atol={omitted_atol:.3e}."
+                )
+        return cls(layout, blocks, dtype=matrix.dtype)
+
+    @classmethod
+    def from_block_factory(
+        cls,
+        layout: PhysicalBlockLayout,
+        connected_pairs,
+        factory: Callable[[int, int], np.ndarray],
+        *,
+        dtype=None,
+    ):
+        """Build only requested blocks using ``factory(row, column)``."""
+        blocks = {
+            (int(row), int(column)): factory(int(row), int(column))
+            for row, column in connected_pairs
+        }
+        return cls(layout, blocks, dtype=dtype)
+
+
+@dataclass(frozen=True)
+class PhysicalBlockGeneralizedProblem:
+    """Block-sparse representation of ``H x = E N x`` for one LETTA site."""
+
+    layout: PhysicalBlockLayout
+    metric: PhysicalBlockLinearOperator
+    hamiltonian: PhysicalBlockLinearOperator
+
+    @classmethod
+    def from_block_factories(
+        cls,
+        tensor_shape,
+        hamiltonian_pairs,
+        metric_factory: Callable[[int, int], np.ndarray],
+        hamiltonian_factory: Callable[[int, int], np.ndarray],
+        *,
+        dtype=None,
+    ):
+        r"""Construct the pencil directly from fixed-physical contractions.
+
+        Only diagonal metric blocks and structurally allowed Hamiltonian
+        blocks are requested.  Opposite Hamiltonian blocks are contracted and
+        averaged as
+
+        ``(H[p,q] + H[q,p]^dagger) / 2``,
+
+        reproducing the Hermitization used by the dense local solver without
+        ever constructing the full local matrix.
+        """
+        layout = PhysicalBlockLayout(tensor_shape)
+        pairs = {(int(row), int(column)) for row, column in hamiltonian_pairs}
+        if any(
+            row < 0
+            or row >= layout.nblocks
+            or column < 0
+            or column >= layout.nblocks
+            for row, column in pairs
+        ):
+            raise ValueError("hamiltonian_pairs contains an invalid block index.")
+        pairs |= {(column, row) for row, column in pairs}
+
+        metric_blocks = {}
+        for block in range(layout.nblocks):
+            value = np.asarray(metric_factory(block, block))
+            metric_blocks[(block, block)] = 0.5 * (value + value.T.conj())
+
+        hamiltonian_blocks = {}
+        for row, column in sorted(pairs):
+            if row > column:
+                continue
+            forward = np.asarray(hamiltonian_factory(row, column))
+            if row == column:
+                value = 0.5 * (forward + forward.T.conj())
+                hamiltonian_blocks[(row, row)] = value
+                continue
+            reverse = np.asarray(hamiltonian_factory(column, row))
+            value = 0.5 * (forward + reverse.T.conj())
+            hamiltonian_blocks[(row, column)] = value
+            hamiltonian_blocks[(column, row)] = value.T.conj()
+
+        return cls(
+            layout,
+            PhysicalBlockLinearOperator(layout, metric_blocks, dtype=dtype),
+            PhysicalBlockLinearOperator(layout, hamiltonian_blocks, dtype=dtype),
+        )
+
+    @classmethod
+    def from_dense(
+        cls,
+        metric,
+        hamiltonian,
+        tensor_shape,
+        *,
+        hamiltonian_pairs=None,
+        omitted_atol: float | None = 1.0e-12,
+    ):
+        layout = PhysicalBlockLayout(tensor_shape)
+        diagonal_pairs = tuple((block, block) for block in range(layout.nblocks))
+        metric_blocks = PhysicalBlockLinearOperator.from_dense(
+            metric,
+            layout,
+            connected_pairs=diagonal_pairs,
+            omitted_atol=omitted_atol,
+        )
+        hamiltonian_blocks = PhysicalBlockLinearOperator.from_dense(
+            hamiltonian,
+            layout,
+            connected_pairs=hamiltonian_pairs,
+            omitted_atol=omitted_atol if hamiltonian_pairs is not None else None,
+        )
+        return cls(layout, metric_blocks, hamiltonian_blocks)
+
+    @classmethod
+    def from_frontier_state(
+        cls,
+        state,
+        site: int,
+        *,
+        environment=None,
+        omitted_atol: float | None = 1.0e-12,
+    ):
+        """Reference adapter using a state's current dense local operators.
+
+        This helper is intended for validation.  Production frontier updates
+        use fixed-physical block factories and do not form dense local arrays.
+        """
+        site = int(site)
+        metric, hamiltonian = state.local_operators(site, environment=environment)
+        pairs = hamiltonian_physical_connectivity(
+            state.hamiltonian, state.physical_sites[site]
+        )
+        return cls.from_dense(
+            metric,
+            hamiltonian,
+            state.tensors[site].shape,
+            hamiltonian_pairs=pairs,
+            omitted_atol=omitted_atol,
+        )
+
+    @property
+    def hamiltonian_components(self) -> tuple[tuple[int, ...], ...]:
+        """Connected components of the undirected physical-block graph."""
+        neighbors = [set() for _ in range(self.layout.nblocks)]
+        for row, column in self.hamiltonian.connected_pairs:
+            neighbors[row].add(column)
+            neighbors[column].add(row)
+        components = []
+        unseen = set(range(self.layout.nblocks))
+        while unseen:
+            root = min(unseen)
+            stack = [root]
+            unseen.remove(root)
+            component = []
+            while stack:
+                block = stack.pop()
+                component.append(block)
+                new = neighbors[block] & unseen
+                unseen.difference_update(new)
+                stack.extend(sorted(new, reverse=True))
+            components.append(tuple(sorted(component)))
+        return tuple(components)
+
+    @property
+    def stored_elements(self) -> int:
+        return self.metric.stored_elements + self.hamiltonian.stored_elements
+
+    @property
+    def dense_elements(self) -> int:
+        return 2 * self.layout.size**2
+
+    @property
+    def storage_fraction(self) -> float:
+        return self.stored_elements / self.dense_elements
+
+    def metric_rank(self, metric_tol: float = 1.0e-12) -> int:
+        """Return the positive rank of the block-diagonal metric."""
+        metric_tol = float(metric_tol)
+        if not np.isfinite(metric_tol) or metric_tol < 0.0:
+            raise ValueError("metric_tol must be finite and nonnegative.")
+        scale = max(
+            (
+                float(np.linalg.norm(block, ord=np.inf))
+                for block in self.metric.blocks.values()
+            ),
+            default=0.0,
+        )
+        scale = max(scale, np.finfo(float).tiny)
+        return int(
+            sum(
+                np.count_nonzero(np.linalg.eigvalsh(block) > metric_tol * scale)
+                for block in self.metric.blocks.values()
+            )
+        )
+
+    def solve(self, initial_vector, **davidson_options):
+        """Solve every positive-metric component and select its lowest root.
+
+        Solving the connected components independently is required for an
+        exact global result: the current tensor can have zero overlap with the
+        component containing the lowest eigenvalue.
+        """
+        initial_vector = np.asarray(initial_vector)
+        if initial_vector.size != self.layout.size:
+            raise ValueError(
+                f"initial_vector must contain {self.layout.size} entries."
+            )
+        initial_vector = initial_vector.reshape(-1)
+        tolerance = float(davidson_options.get("tol", 1.0e-10))
+        absolute_tolerance = float(davidson_options.get("atol", 0.0))
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError("tol must be finite and nonnegative.")
+        if not np.isfinite(absolute_tolerance) or absolute_tolerance < 0.0:
+            raise ValueError("atol must be finite and nonnegative.")
+        metric_tol = float(davidson_options.get("metric_tol", 1.0e-12))
+        if not np.isfinite(metric_tol) or metric_tol < 0.0:
+            raise ValueError("metric_tol must be finite and nonnegative.")
+        metric_scale = max(
+            (
+                float(np.linalg.norm(block, ord=np.inf))
+                for block in self.metric.blocks.values()
+            ),
+            default=0.0,
+        )
+        metric_scale = max(metric_scale, np.finfo(float).tiny)
+        metric_threshold = metric_tol * metric_scale
+        metric_bases = {}
+        for block, metric_block in (
+            (block, self.metric.blocks[(block, block)])
+            for block in range(self.layout.nblocks)
+        ):
+            eigenvalues, eigenvectors = np.linalg.eigh(metric_block)
+            keep = eigenvalues > metric_threshold
+            if np.any(keep):
+                metric_bases[block] = (
+                    eigenvectors[:, keep] / np.sqrt(eigenvalues[keep])[None, :]
+                )
+        active_neighbors = {block: set() for block in metric_bases}
+        for row, column in self.hamiltonian.connected_pairs:
+            if row in active_neighbors and column in active_neighbors:
+                active_neighbors[row].add(column)
+                active_neighbors[column].add(row)
+        components = []
+        unseen = set(metric_bases)
+        while unseen:
+            root = min(unseen)
+            stack = [root]
+            unseen.remove(root)
+            component = []
+            while stack:
+                block = stack.pop()
+                component.append(block)
+                new = active_neighbors[block] & unseen
+                unseen.difference_update(new)
+                stack.extend(sorted(new, reverse=True))
+            components.append(tuple(sorted(component)))
+        components = tuple(components)
+        candidates = []
+        total_iterations = 0
+        total_hamiltonian_matvecs = 0
+        total_metric_matvecs = 0
+        total_restarts = 0
+        total_subspace = 0
+
+        for component_index, component in enumerate(components):
+            active_blocks = component
+            block_ranges = {}
+            active_layout = []
+            component_size = 0
+            for block in active_blocks:
+                basis = metric_bases[block]
+                start = component_size
+                component_size += basis.shape[1]
+                block_ranges[block] = slice(start, component_size)
+                active_layout.append((block, start, component_size, basis))
+
+            reduced_hamiltonian_blocks = tuple(
+                (
+                    block_ranges[row],
+                    block_ranges[column],
+                    metric_bases[row].T.conj() @ block @ metric_bases[column],
+                )
+                for (row, column), block in self.hamiltonian.blocks.items()
+                if row in block_ranges and column in block_ranges
+            )
+
+            def hamiltonian_action(
+                vector,
+                *,
+                entries=reduced_hamiltonian_blocks,
+                size=component_size,
+            ):
+                vector = np.asarray(vector)
+                output = np.zeros(
+                    size,
+                    dtype=np.result_type(vector.dtype, self.hamiltonian.dtype),
+                )
+                for row_slice, column_slice, block in entries:
+                    output[row_slice] += block @ vector[column_slice]
+                return output
+
+            def metric_action(vector):
+                return np.array(vector, copy=True)
+
+            component_initial = np.concatenate(
+                [
+                    basis.T.conj()
+                    @ (
+                        self.metric.blocks[(block, block)]
+                        @ initial_vector[self.layout.block_indices[block]]
+                    )
+                    for block, _start, _stop, basis in active_layout
+                ]
+            )
+            if float(np.linalg.norm(component_initial)) <= (
+                128.0 * np.finfo(float).eps * np.sqrt(component_size)
+            ):
+                component_initial = np.ones(
+                    component_size,
+                    dtype=np.result_type(initial_vector.dtype, self.metric.dtype),
+                )
+
+            if component_size == 1:
+                unit = np.ones(1, dtype=component_initial.dtype)
+                metric_value = float(np.real(metric_action(unit)[0]))
+                vector = unit / np.sqrt(metric_value)
+                h_vector = hamiltonian_action(vector)
+                n_vector = metric_action(vector)
+                energy = float(np.real(np.vdot(vector, h_vector)))
+                residual = h_vector - energy * n_vector
+                diagnostics = DavidsonDiagnostics(
+                    converged=True,
+                    message="converged",
+                    iterations=1,
+                    hamiltonian_matvecs=1,
+                    metric_matvecs=2,
+                    restarts=0,
+                    residual_norm=float(np.linalg.norm(residual)),
+                    metric_norm=float(np.real(np.vdot(vector, n_vector))),
+                    projected_rank=1,
+                    subspace_dimension=1,
+                    energy_history=(energy,),
+                    residual_history=(float(np.linalg.norm(residual)),),
+                )
+            else:
+                options = dict(davidson_options)
+                if options.get("max_subspace") is not None:
+                    options["max_subspace"] = min(
+                        component_size, int(options["max_subspace"])
+                    )
+                energy, vector, diagnostics = lowest_generalized_davidson(
+                    hamiltonian_action,
+                    metric_action,
+                    component_initial,
+                    **options,
+                )
+            if not diagnostics.converged:
+                raise ValueError(
+                    f"physical-block component {component_index} failed: "
+                    f"{diagnostics.message}"
+                )
+            total_iterations += diagnostics.iterations
+            total_hamiltonian_matvecs += diagnostics.hamiltonian_matvecs
+            total_metric_matvecs += diagnostics.metric_matvecs
+            total_restarts += diagnostics.restarts
+            total_subspace += diagnostics.subspace_dimension
+            candidates.append(
+                (
+                    float(energy),
+                    component_index,
+                    tuple(active_layout),
+                    vector,
+                    diagnostics,
+                )
+            )
+
+        if not candidates:
+            raise ValueError("local overlap metric is numerically singular.")
+        energy, selected_index, selected_layout, selected_vector, selected = min(
+            candidates, key=lambda item: (item[0], item[1])
+        )
+        vector = np.zeros(
+            self.layout.size,
+            dtype=np.result_type(selected_vector.dtype, initial_vector.dtype),
+        )
+        for block, start, stop, basis in selected_layout:
+            vector[self.layout.block_indices[block]] = (
+                basis @ selected_vector[start:stop]
+            )
+        h_vector = self.hamiltonian.matvec(vector)
+        n_vector = self.metric.matvec(vector)
+        metric_norm = float(np.real(np.vdot(vector, n_vector)))
+        residual_norm = float(np.linalg.norm(h_vector - energy * n_vector))
+        residual_scale = max(
+            float(np.linalg.norm(h_vector)),
+            abs(energy) * float(np.linalg.norm(n_vector)),
+            np.finfo(float).tiny,
+        )
+        converged = residual_norm <= (
+            absolute_tolerance + tolerance * residual_scale
+        )
+        diagnostics = PhysicalBlockSolveDiagnostics(
+            converged=bool(converged),
+            message=(
+                (
+                    f"converged in {len(candidates)} positive-metric physical-block "
+                    f"component(s); selected component {selected_index}"
+                )
+                if converged
+                else "fresh full residual exceeds tolerance after metric-range "
+                "reconstruction"
+            ),
+            iterations=total_iterations,
+            hamiltonian_matvecs=total_hamiltonian_matvecs + 1,
+            metric_matvecs=total_metric_matvecs + 1,
+            restarts=total_restarts,
+            residual_norm=residual_norm,
+            metric_norm=metric_norm,
+            projected_rank=self.metric_rank(metric_tol),
+            subspace_dimension=total_subspace,
+            energy_history=selected.energy_history,
+            residual_history=selected.residual_history,
+            component_sizes=tuple(len(component) for component in components),
+            positive_metric_components=len(candidates),
+            selected_component=selected_index,
+            metric_blocks=len(self.metric.blocks),
+            hamiltonian_blocks=len(self.hamiltonian.blocks),
+            stored_elements=self.stored_elements,
+        )
+        return energy, vector, diagnostics
+
+
+__all__ = [
+    "PhysicalBlockGeneralizedProblem",
+    "PhysicalBlockLayout",
+    "PhysicalBlockLinearOperator",
+    "PhysicalBlockSolveDiagnostics",
+    "hamiltonian_physical_connectivity",
+]

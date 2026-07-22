@@ -1,3 +1,5 @@
+import csv
+import hashlib
 import json
 
 import numpy as np
@@ -5,6 +7,7 @@ import pytest
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from pyqed import Molecule
 from pyqed.qchem import embed_point_charges
@@ -13,6 +16,7 @@ from pyqed.md import (
     AU_PRESSURE_TO_BAR,
     autocorrelation,
     BAR_TO_AU_PRESSURE,
+    BerendsenThermostat,
     backend_status,
     Coulomb,
     dipole_moment,
@@ -20,6 +24,7 @@ from pyqed.md import (
     EwaldCoulomb,
     EnergyLogger,
     FixBondLengths,
+    friction_ps_to_atomic_units,
     Langevin,
     LennardJones,
     MDEngine,
@@ -41,10 +46,14 @@ from pyqed.md import (
     membrane_embedding_snapshot,
     MCBarostatLogger,
     MonteCarloSemiIsotropicBarostat,
+    pme_mesh_for_accuracy,
     pme_reciprocal_potential,
     pme_reciprocal_potential_grid,
+    protein_membrane_seed,
     read_restart,
+    read_protein_pdb,
     radial_distribution,
+    residue_composition,
     run_solvent_equilibration,
     SemiIsotropicPressureController,
     solvate_box,
@@ -76,7 +85,64 @@ from pyqed.md import (
 from pyqed.md.measure import MonteCarlo
 from pyqed.md.neighborlist import minimum_image
 from pyqed.md.utility import Utilities
-from pyqed.units import amu2au, au2angstrom, au2k, fs, kcalmol2au
+from pyqed.namd.liquid_ldr import (
+    LiquidAvoidedCrossingLDRModel,
+    SolventEmbeddedLDRSnapshot,
+    SolventEmbeddedLDRTrajectory,
+    XYZFrame,
+    build_embedded_casci_ldr_trajectory,
+    build_embedded_h2_casci_ldr_trajectory,
+    build_solvent_embedded_ldr_trajectory,
+    compare_embedded_ldr_to_static,
+    compare_embedded_geometric_contribution,
+    compare_liquid_geometric_contribution,
+    compare_liquid_to_static_ldr,
+    embedded_casci_ldr_snapshot,
+    embedded_ldr_comparison_metrics,
+    embedded_ldr_frame_overlap_diagnostics,
+    embedded_ldr_geometric_hotspots,
+    embedded_ldr_geometric_population_hotspots,
+    embedded_ldr_geometric_population_quality,
+    embedded_ldr_geometric_population_signal_summary,
+    embedded_ldr_geometric_population_stride_convergence,
+    embedded_ldr_geometric_quality,
+    embedded_ldr_geometric_readiness,
+    embedded_ldr_geometric_signal_summary,
+    embedded_ldr_geometric_state_convergence,
+    embedded_ldr_geometric_step_diagnostics,
+    embedded_ldr_hamiltonian,
+    embedded_ldr_substep_convergence,
+    embedded_ldr_transport_holonomy,
+    embedded_ldr_trajectory_diagnostics,
+    embedded_ldrfg_path_linearized_model,
+    embedded_h2_casci_ldr_snapshot,
+    initial_ldr_packet,
+    h2_bond_geometry,
+    liquid_ldr_diagnostics,
+    liquid_ldr_geometric_driver_correlations,
+    liquid_ldr_geometric_gauge_invariance,
+    liquid_ldr_geometric_gauge_substep_convergence,
+    liquid_ldr_geometric_hotspots,
+    liquid_ldr_geometric_quality,
+    liquid_ldr_geometric_readiness,
+    liquid_ldr_geometric_signal_summary,
+    liquid_ldr_geometric_stride_convergence,
+    liquid_ldr_geometric_step_diagnostics,
+    liquid_ldr_hotspot_driver_summary,
+    liquid_ldr_substep_convergence,
+    methanol_fg_path_force_callback,
+    methanol_fg_path_diagnostics,
+    methanol_full_fg_coordinate_path,
+    propagate_embedded_ldr_snapshots,
+    propagate_liquid_ldrfg_tdvp,
+    propagate_liquid_ldr,
+    second_derivative_kinetic,
+    solvent_electric_field_coordinate,
+    solvent_embedded_ldr_snapshot,
+    solvent_point_charges_from_frame,
+    solute_bond_distance_geometry_builder,
+)
+from pyqed.units import amu2au, au2angstrom, au2fs, au2k, fs, kcalmol2au
 
 
 class HarmonicCalculator:
@@ -697,7 +763,8 @@ def test_native_lipid_template_membrane_openmm_template_summary(tmp_path):
     assert analysis["tail_order"]["count"] == 56
     assert analysis["leaflets"]["upper"]["molecules"] == 1
     assert analysis["leaflets"]["lower"]["molecules"] == 1
-    assert "DPPC" in Path(data["pdb"]).read_text()
+    assert data["template_residue_name"] == "DPPC"
+    assert " DPP " in Path(data["pdb"]).read_text()
     assert "template_atoms: 130" in result.stdout
 
 
@@ -778,6 +845,7 @@ def test_semi_isotropic_pressure_controller_expands_high_lateral_pressure():
     )
     scale = controller.apply(forces=np.zeros((2, 3)))
 
+    assert controller.calls == 1
     assert scale[0] > 1.0
     assert scale[1] == pytest.approx(scale[0])
     assert scale[2] == pytest.approx(1.0)
@@ -792,6 +860,36 @@ def test_semi_isotropic_pressure_controller_expands_high_lateral_pressure():
     ).target_lateral_pressure == pytest.approx(BAR_TO_AU_PRESSURE)
     assert AU_PRESSURE_TO_BAR * BAR_TO_AU_PRESSURE == pytest.approx(1.0)
     assert np.all(masses > 0.0)
+
+
+def test_semi_isotropic_pressure_controller_can_scale_molecule_centers():
+    atoms = Atoms(
+        [["Ar", (2.0, 2.0, 2.0)], ["Ar", (4.0, 2.0, 2.0)]],
+        cell=np.diag([10.0, 10.0, 10.0]),
+        pbc=True,
+    )
+    atoms.set_array("molecule_ids", [0, 0], int, ())
+    atoms.set_velocities(np.array([[100.0, 100.0, 0.0], [-100.0, -100.0, 0.0]]))
+    initial_positions = atoms.get_positions()
+    initial_distance = np.linalg.norm(initial_positions[1] - initial_positions[0])
+    initial_center = initial_positions.mean(axis=0)
+
+    controller = SemiIsotropicPressureController(
+        atoms,
+        target_lateral_pressure=0.0,
+        target_normal_pressure=0.0,
+        compressibility=0.1,
+        coupling=1.0,
+        max_scale=0.05,
+        scale_molecule_centers=True,
+    )
+    scale = controller.apply(forces=np.zeros((2, 3)))
+
+    final_positions = atoms.get_positions()
+    final_center = final_positions.mean(axis=0)
+    final_distance = np.linalg.norm(final_positions[1] - final_positions[0])
+    np.testing.assert_allclose(final_distance, initial_distance)
+    np.testing.assert_allclose(final_center, initial_center * scale)
 
 
 def test_semi_isotropic_pressure_controller_uses_pme_virial_pressure():
@@ -827,6 +925,7 @@ def test_semi_isotropic_pressure_controller_uses_pme_virial_pressure():
 
     scale = controller.apply()
 
+    assert controller.calls == 1
     assert controller.last_lateral_pressure == pytest.approx(lateral)
     assert controller.last_normal_pressure == pytest.approx(normal)
     assert scale[0] > 1.0
@@ -1681,6 +1780,82 @@ def test_qmmm_combines_qm_and_mm_calculators():
     )
 
 
+def test_molecular_mechanics_reuses_identical_snapshot_calculation(monkeypatch):
+    atoms = Atoms([["H", (0.0, 0.0, 0.0)], ["H", (1.2, 0.0, 0.0)]])
+    calc = MM(bonds=[(0, 1, 2.0, 1.0)])
+    calls = {"bonds": 0}
+    original_add_bonds = calc._add_bonds
+
+    def counted_add_bonds(*args, **kwargs):
+        calls["bonds"] += 1
+        return original_add_bonds(*args, **kwargs)
+
+    monkeypatch.setattr(calc, "_add_bonds", counted_add_bonds)
+    atoms.calc = calc
+
+    forces = atoms.get_forces()
+    energy = atoms.get_potential_energy()
+    np.testing.assert_allclose(forces[0], [0.4, 0.0, 0.0])
+    np.testing.assert_allclose(energy, 0.04)
+    assert calls["bonds"] == 1
+
+    atoms.set_positions([[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]])
+    atoms.get_potential_energy()
+    assert calls["bonds"] == 2
+
+
+def test_molecular_mechanics_cache_tracks_atom_charges(monkeypatch):
+    atoms = Atoms([["H", (0.0, 0.0, 0.0)], ["H", (2.0, 0.0, 0.0)]])
+    atoms.set_array("charges", [1.0, -1.0], float, ())
+    calc = MM(coulomb_constant=1.0)
+    calls = {"nonbonded": 0}
+    original_add_nonbonded = calc._add_nonbonded
+
+    def counted_add_nonbonded(*args, **kwargs):
+        calls["nonbonded"] += 1
+        return original_add_nonbonded(*args, **kwargs)
+
+    monkeypatch.setattr(calc, "_add_nonbonded", counted_add_nonbonded)
+    atoms.calc = calc
+
+    energy = atoms.get_potential_energy()
+    np.testing.assert_allclose(atoms.get_potential_energy(), energy)
+    assert calls["nonbonded"] == 1
+
+    atoms.set_array("charges", [1.0, -2.0], float, ())
+    np.testing.assert_allclose(atoms.get_potential_energy(), 2.0 * energy)
+    assert calls["nonbonded"] == 2
+
+
+def test_nonexcluded_pair_mask_accepts_precomputed_keys():
+    from pyqed.md.calculators import _nonexcluded_pair_mask, _pair_key_array
+
+    pair_i = np.array([0, 0, 1, 2, 3])
+    pair_j = np.array([1, 2, 3, 4, 4])
+    exclusions = {(0, 2), (3, 4)}
+    keys = _pair_key_array(exclusions, natoms=5)
+
+    mask = _nonexcluded_pair_mask(pair_i, pair_j, exclusions, natoms=5, excluded_keys=keys)
+
+    np.testing.assert_array_equal(mask, [True, False, True, True, False])
+
+
+def test_pair_displacements_cache_reuses_nonexcluded_mask():
+    from pyqed.md.calculators import _PairDisplacements, _pair_key_array
+
+    pair_i = np.array([0, 0, 1, 2, 3])
+    pair_j = np.array([1, 2, 3, 4, 4])
+    displacements = np.zeros((len(pair_i), 3))
+    pairs = _PairDisplacements(pair_i, pair_j, displacements)
+    keys = _pair_key_array({(0, 2), (3, 4)}, natoms=5)
+
+    first = pairs.nonexcluded_mask(keys, natoms=5)
+    second = pairs.nonexcluded_mask(keys, natoms=5)
+
+    assert second is first
+    np.testing.assert_array_equal(first, [True, False, True, True, False])
+
+
 def test_qmmm_electrostatic_embedding_maps_qm_and_mm_forces():
     qm_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
     qm_mol.build(driver="builtin")
@@ -2091,6 +2266,44 @@ def test_maxwell_boltzmann_velocities_accept_kelvin_and_remove_com():
     assert atoms.get_temperature(remove_center_of_mass=True) > 0.0
 
 
+def test_berendsen_thermostat_cools_toward_target_temperature():
+    atoms = Atoms(
+        [
+            ["O", (0.0, 0.0, 0.0)],
+            ["H", (1.0, 0.0, 0.0)],
+            ["H", (0.0, 1.0, 0.0)],
+        ]
+    )
+    set_maxwell_boltzmann_velocities(atoms, 600.0, seed=3)
+    before = atoms.get_temperature(remove_center_of_mass=True)
+    thermostat = BerendsenThermostat(
+        atoms,
+        target_temperature_K=300.0,
+        tau_fs=10.0,
+        timestep_fs=1.0,
+    )
+
+    scale = thermostat.apply()
+    after = atoms.get_temperature(remove_center_of_mass=True)
+
+    assert thermostat.calls == 1
+    assert thermostat.last_temperature_K == pytest.approx(before)
+    assert thermostat.last_scale == pytest.approx(scale)
+    assert 0.8 <= scale <= 1.0
+    assert 300.0 < after < before
+
+
+def test_berendsen_thermostat_validates_parameters():
+    atoms = Atoms([["He", (0.0, 0.0, 0.0)]])
+
+    with pytest.raises(ValueError, match="target_temperature"):
+        BerendsenThermostat(atoms, target_temperature_K=0.0, tau_fs=1.0, timestep_fs=1.0)
+    with pytest.raises(ValueError, match="tau_fs"):
+        BerendsenThermostat(atoms, target_temperature_K=300.0, tau_fs=0.0, timestep_fs=1.0)
+    with pytest.raises(ValueError, match="interval"):
+        BerendsenThermostat(atoms, target_temperature_K=300.0, tau_fs=1.0, timestep_fs=1.0, interval=0)
+
+
 def test_md_engine_runs_nve_and_writes_artifacts(tmp_path):
     atoms = Atoms(
         [["H", (0.0, 0.0, 0.0)], ["H", (1.1, 0.0, 0.0)]],
@@ -2159,6 +2372,56 @@ def test_md_engine_langevin_requires_temperature_and_runs():
     assert np.isfinite(state.total_energy)
 
 
+def test_md_engine_accepts_langevin_friction_per_ps():
+    atoms = Atoms(
+        [["Ar", (0.0, 0.0, 0.0)], ["Ar", (2.0, 0.0, 0.0)]],
+        calculator=LennardJones(epsilon=0.01, sigma=1.0),
+    )
+    atoms.set_velocities([[0.001, 0.0, 0.0], [-0.001, 0.0, 0.0]])
+
+    engine = MDEngine(
+        atoms,
+        timestep=0.01,
+        ensemble="langevin",
+        temperature_K=50.0,
+        friction_per_ps=1.0,
+    )
+    state = engine.run(2)
+
+    assert state.step == 2
+    assert friction_ps_to_atomic_units(1.0) == pytest.approx(2.41888432651e-5)
+    assert np.all(np.isfinite(atoms.get_positions()))
+
+    with pytest.raises(ValueError, match="only one"):
+        MDEngine(
+            atoms,
+            timestep=0.01,
+            ensemble="langevin",
+            temperature_K=50.0,
+            friction=0.01,
+            friction_per_ps=1.0,
+        )
+
+
+def test_md_engine_accepts_callback_interval_pairs():
+    atoms = Atoms(
+        [["Ar", (0.0, 0.0, 0.0)], ["Ar", (2.0, 0.0, 0.0)]],
+        calculator=LennardJones(epsilon=0.01, sigma=1.0),
+    )
+    atoms.set_velocities([[0.001, 0.0, 0.0], [-0.001, 0.0, 0.0]])
+    calls = []
+
+    engine = MDEngine(
+        atoms,
+        timestep=0.01,
+        ensemble="nve",
+        callbacks=[(lambda: calls.append(engine.step_index), 2)],
+    )
+    engine.run(5)
+
+    assert calls == [2, 4]
+
+
 def test_md_engine_rejects_invalid_cadence_and_steps():
     atoms = Atoms(
         [["H", (0.0, 0.0, 0.0)], ["H", (1.1, 0.0, 0.0)]],
@@ -2199,6 +2462,42 @@ def test_fix_bond_lengths_projects_positions_and_momenta():
     np.testing.assert_allclose(np.dot(relative_velocity, direction), 0.0, atol=1e-12)
     assert constraint.last_momentum_iterations > 0
     assert constraint.last_momentum_error <= constraint.tolerance
+
+
+def test_fix_bond_lengths_projects_connected_constraint_graph():
+    atoms = Atoms(
+        [
+            ["O", (0.0, 0.0, 0.0)],
+            ["H", (0.96, 0.0, 0.0)],
+            ["H", (-0.24, 0.93, 0.0)],
+            ["O", (3.0, 0.0, 0.0)],
+            ["H", (3.96, 0.0, 0.0)],
+            ["H", (2.76, 0.93, 0.0)],
+        ]
+    )
+    constraint = FixBondLengths(
+        [(0, 1), (0, 2), (3, 4), (3, 5)],
+        distances=[0.96, 0.96, 0.96, 0.96],
+    )
+
+    positions = atoms.get_positions()
+    positions[[1, 2, 4, 5]] += np.array(
+        [
+            [0.12, 0.02, 0.0],
+            [-0.03, 0.10, 0.0],
+            [0.08, -0.04, 0.0],
+            [-0.06, 0.07, 0.0],
+        ]
+    )
+    constraint.adjust_positions(atoms, positions)
+
+    distances = np.linalg.norm(
+        positions[constraint._pair_indices[:, 1]] - positions[constraint._pair_indices[:, 0]],
+        axis=1,
+    )
+    np.testing.assert_allclose(distances, [0.96, 0.96, 0.96, 0.96], atol=1e-12)
+    assert constraint.last_position_iterations > 0
+    assert constraint.last_position_error <= constraint.tolerance
 
 
 def test_fix_bond_lengths_validates_inputs_and_reports_nonconvergence():
@@ -2784,6 +3083,57 @@ def test_openmm_adapter_pme_forces_match_native_pme():
     np.testing.assert_allclose(atoms.get_forces(), openmm.get_forces(), rtol=2e-4, atol=6e-6)
 
 
+def test_openmm_adapter_pme_excluded_pair_forces_match_native_pme():
+    pytest.importorskip("openmm")
+    from pyqed.md import OpenMMAdapter
+
+    atoms = Atoms(
+        [
+            ["Na", (1.0, 1.0, 1.0)],
+            ["Cl", (2.0, 1.2, 1.1)],
+            ["Na", (5.1, 1.3, 4.2)],
+            ["Cl", (2.2, 6.0, 5.5)],
+        ],
+        cell=np.diag([8.0, 8.0, 8.0]),
+        pbc=True,
+        calculator=MolecularMechanics(
+            charges=[1.0, -1.0, 1.0, -1.0],
+            coulomb_method="pme",
+            coulomb_cutoff=3.5,
+            ewald_alpha=0.35,
+            pme_mesh=(24, 24, 24),
+            lj_epsilon=np.zeros(4),
+            lj_sigma=np.ones(4),
+            nonbonded_exclusions={(0, 1)},
+            exclude_bonded=False,
+            exclude_angles=False,
+        ),
+    )
+    atoms.topology = Topology(
+        charges=[1.0, -1.0, 1.0, -1.0],
+        lj_epsilon=np.zeros(4),
+        lj_sigma=np.ones(4),
+        masses_amu=[22.99, 35.45, 22.99, 35.45],
+        nonbonded_exclusions={(0, 1)},
+    )
+
+    openmm = OpenMMAdapter(
+        atoms=atoms,
+        nonbonded_method="pme",
+        nonbonded_cutoff=3.5,
+        ewald_alpha=0.35,
+        pme_mesh=(24, 24, 24),
+    )
+
+    np.testing.assert_allclose(
+        atoms.get_potential_energy(),
+        openmm.potential_energy(),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(atoms.get_forces(), openmm.get_forces(), rtol=2e-4, atol=6e-6)
+
+
 def test_ewald_coulomb_energy_and_forces_are_finite():
     atoms = Atoms(
         [["Na", (1.0, 1.0, 1.0)], ["Cl", (4.0, 4.0, 4.0)]],
@@ -2930,11 +3280,339 @@ def test_pme_order_four_improves_reciprocal_accuracy():
             order=4,
         ),
     )
+    pme_order_five = Atoms(
+        atom,
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+        calculator=PMECoulomb(
+            charges=charges,
+            coulomb_constant=1.0,
+            alpha=0.35,
+            real_cutoff=4.0,
+            mesh=(16, 16, 16),
+            order=5,
+        ),
+    )
+    pme_order_eight = Atoms(
+        atom,
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+        calculator=PMECoulomb(
+            charges=charges,
+            coulomb_constant=1.0,
+            alpha=0.35,
+            real_cutoff=4.0,
+            mesh=(16, 16, 16),
+            order=8,
+        ),
+    )
 
     reference = ewald.get_potential_energy()
     error_order_two = abs(pme_order_two.get_potential_energy() - reference)
     error_order_four = abs(pme_order_four.get_potential_energy() - reference)
+    error_order_five = abs(pme_order_five.get_potential_energy() - reference)
+    error_order_eight = abs(pme_order_eight.get_potential_energy() - reference)
     assert error_order_four < 0.01 * error_order_two
+    assert error_order_five < error_order_four
+    assert error_order_eight < error_order_five
+
+
+def test_pme_mesh_for_accuracy_rounds_to_fft_friendly_grid():
+    assert pme_mesh_for_accuracy([6.8239, 6.9484, 9.3611], "high") == (96, 96, 128)
+    assert pme_mesh_for_accuracy([6.8239, 6.9484, 9.3611], "balanced") == (72, 72, 96)
+    with pytest.raises(ValueError, match="PME accuracy"):
+        pme_mesh_for_accuracy([2.0, 2.0, 2.0], "bad")
+
+
+def test_residue_composition_classifies_protein_lipid_water_and_ions():
+    atoms = Atoms(
+        [
+            ["N", (0.0, 0.0, 0.0)],
+            ["C", (1.0, 0.0, 0.0)],
+            ["P", (2.0, 0.0, 0.0)],
+            ["O", (3.0, 0.0, 0.0)],
+            ["Na", (4.0, 0.0, 0.0)],
+        ]
+    )
+    atoms.set_array("residue_names", ["ALA", "ALA", "DPP", "HOH", "NA"], str, ())
+    atoms.set_array("residue_ids", [1, 1, 2, 3, 4], int, ())
+    atoms.set_array("chain_ids", ["A", "A", "L", "W", "I"], str, ())
+
+    summary = residue_composition(atoms)
+
+    assert summary["atoms"] == 5
+    assert summary["protein_atoms"] == 2
+    assert summary["protein_residues"] == 1
+    assert summary["protein_chains"] == 1
+    assert summary["lipid_residues"] == 1
+    assert summary["water_residues"] == 1
+    assert summary["ion_residues"] == 1
+    assert summary["other_atoms"] == 0
+    assert summary["residue_counts"] == {"ALA": 2, "DPP": 1, "HOH": 1, "NA": 1}
+
+
+def _mock_membrane_helix_pdb(path, residues=4):
+    lines = []
+    serial = 1
+    for resid in range(1, residues + 1):
+        z = -4.5 + 3.0 * (resid - 1)
+        atoms = [
+            ("N", "N", -0.6, 0.0, z - 0.4),
+            ("CA", "C", 0.0, 0.6, z),
+            ("C", "C", 0.7, 0.0, z + 0.4),
+            ("O", "O", 1.2, 0.2, z + 0.7),
+        ]
+        for name, element, x, y, atom_z in atoms:
+            lines.append(
+                f"ATOM  {serial:5d} {name:<4s} ALA A{resid:4d}    "
+                f"{x:8.3f}{y:8.3f}{atom_z:8.3f}  1.00 20.00          {element:>2s}"
+            )
+            serial += 1
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_read_protein_pdb_preserves_residue_and_chain_metadata(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb", residues=2)
+
+    protein = read_protein_pdb(pdb)
+
+    assert len(protein) == 8
+    assert tuple(protein.get_array("atom_names")[:4]) == ("N", "CA", "C", "O")
+    assert set(protein.get_array("residue_names")) == {"ALA"}
+    assert set(protein.get_array("chain_ids")) == {"A"}
+    assert residue_composition(protein)["protein_residues"] == 2
+
+
+def test_protein_membrane_seed_builds_centered_composition_and_ions(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+    output_pdb = tmp_path / "seed.pdb"
+
+    seed_atoms = protein_membrane_seed(
+        pdb,
+        lipid="DPPC",
+        nx=2,
+        ny=2,
+        waters_per_side=1,
+        protein_net_charge=1.0,
+        salt_molar=0.0,
+        seed=4,
+        output_pdb=output_pdb,
+    )
+    composition = residue_composition(seed_atoms)
+
+    assert output_pdb.exists()
+    assert composition["protein_residues"] == 4
+    assert composition["lipid_residues"] > 0
+    assert composition["water_residues"] > 0
+    assert composition["ion_residues"] == 1
+    assert seed_atoms.seed_builder["ions"]["placed_ions"] == ["Cl"]
+    assert getattr(seed_atoms, "ions")["region"] == "water"
+    center = 0.5 * np.asarray(seed_atoms.get_cell().lengths())
+    protein_positions = seed_atoms.get_positions()[seed_atoms.get_array("chain_ids") == "A"]
+    np.testing.assert_allclose(
+        0.5 * (np.min(protein_positions, axis=0) + np.max(protein_positions, axis=0)),
+        center,
+        atol=1.0e-12,
+    )
+    lines = output_pdb.read_text().splitlines()
+    assert lines[0].startswith("CRYST1")
+    assert any(line.startswith("ATOM") for line in lines)
+    assert any(line.startswith("HETATM") for line in lines)
+    assert any(line[12:16].strip() == "H1" for line in lines)
+    assert any(line[12:16].strip() == "H2" for line in lines)
+
+
+def test_protein_membrane_seed_places_ions_in_water_slabs(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+
+    seed_atoms = protein_membrane_seed(
+        pdb,
+        lipid="DPPC",
+        nx=2,
+        ny=2,
+        waters_per_side=4,
+        protein_net_charge=2.0,
+        ion_region="water",
+        seed=6,
+    )
+    residue_names = np.asarray(seed_atoms.get_array("residue_names"), dtype=str)
+    positions = seed_atoms.get_positions()
+    water_z = positions[residue_names == "HOH", 2]
+    ion_z = positions[np.isin(residue_names, ["CL", "NA"]), 2]
+
+    assert len(ion_z) == 2
+    assert np.min(water_z) <= np.min(ion_z)
+    assert np.max(ion_z) <= np.max(water_z)
+
+
+def test_protein_membrane_seed_overlap_deletes_lipids_and_avoids_water_overlap(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+
+    seed_atoms = protein_membrane_seed(
+        pdb,
+        lipid="DPPC",
+        nx=2,
+        ny=2,
+        waters_per_side=2,
+        lipid_protein_min_distance=12.0,
+        water_min_distance=2.8,
+        seed=8,
+    )
+    summary = seed_atoms.seed_builder
+    chains = seed_atoms.get_array("chain_ids")
+    positions = seed_atoms.get_positions()
+    protein_positions = positions[chains == "A"]
+    water_positions = positions[chains == "W"]
+
+    assert summary["membrane"]["removed_lipids"] > 0
+    assert len(water_positions) > 0
+    deltas = water_positions[:, None, :] - protein_positions[None, :, :]
+    min_distance_angstrom = np.sqrt(np.min(np.sum(deltas * deltas, axis=-1))) * au2angstrom
+    assert min_distance_angstrom >= 2.8
+
+
+def test_protein_membrane_seed_is_reproducible(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+
+    first = protein_membrane_seed(pdb, lipid="DPPC", nx=2, ny=2, waters_per_side=1, seed=11)
+    second = protein_membrane_seed(pdb, lipid="DPPC", nx=2, ny=2, waters_per_side=1, seed=11)
+    third = protein_membrane_seed(pdb, lipid="DPPC", nx=2, ny=2, waters_per_side=1, seed=12)
+
+    np.testing.assert_allclose(first.get_positions(), second.get_positions())
+    assert not np.allclose(first.get_positions(), third.get_positions())
+
+
+def test_native_protein_membrane_seed_script_writes_artifacts(tmp_path):
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+    script = Path("examples/md/native_protein_membrane_seed.py")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--protein",
+            str(pdb),
+            "--lipid",
+            "DPPC",
+            "--nx",
+            "2",
+            "--ny",
+            "2",
+            "--waters-per-side",
+            "1",
+            "--protein-net-charge",
+            "1",
+            "--output-dir",
+            str(tmp_path / "seed"),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    summary_path = tmp_path / "seed" / "summary.json"
+    pdb_path = tmp_path / "seed" / "protein_membrane_seed.pdb"
+
+    assert summary_path.exists()
+    assert pdb_path.exists()
+    data = json.loads(summary_path.read_text())
+    assert data["workflow"] == "protein_membrane_seed"
+    assert data["composition"]["protein_residues"] == 4
+    assert data["composition"]["lipid_residues"] > 0
+    assert data["composition"]["water_residues"] > 0
+    assert data["composition"]["ion_residues"] == 1
+    assert data["ions"]["placed_ions"] == ["Cl"]
+    assert data["ions"]["region"] == "water"
+    lines = pdb_path.read_text().splitlines()
+    assert lines[0].startswith("CRYST1")
+    assert any(line.startswith("ATOM") for line in lines)
+    assert any(line.startswith("HETATM") for line in lines)
+    assert "protein_residues: 4" in result.stdout
+
+
+def test_native_protein_membrane_seed_openmm_repair_failure_is_reported(tmp_path):
+    pytest.importorskip("openmm")
+    pdb = _mock_membrane_helix_pdb(tmp_path / "helix.pdb")
+    script = Path("examples/md/native_protein_membrane_seed.py")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--protein",
+            str(pdb),
+            "--lipid",
+            "DPPC",
+            "--nx",
+            "2",
+            "--ny",
+            "2",
+            "--waters-per-side",
+            "1",
+            "--repair-openmm",
+            "--output-dir",
+            str(tmp_path / "seed"),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    data = json.loads((tmp_path / "seed" / "summary.json").read_text())
+
+    assert data["openmm_repair"]["success"] is False
+    assert "No template found" in data["openmm_repair"]["error"]
+    assert "openmm_repair_success: False" in result.stdout
+
+
+def test_native_protein_membrane_seed_validation_uses_repaired_pdb(monkeypatch, tmp_path):
+    from examples.md import native_protein_membrane_seed as script
+
+    seed_pdb = tmp_path / "seed.pdb"
+    seed_pdb.write_text("END\n")
+    repaired_pdb = tmp_path / "protein_membrane_seed_openmm_repaired.pdb"
+    args = script.parse_args(["--protein", "input.pdb", "--repair-openmm", "--validate-openmm"])
+    calls = {}
+
+    def fake_repair(path, output_dir, parsed_args):
+        repaired_pdb.write_text("END\n")
+        return {
+            "success": True,
+            "seed_pdb": str(path),
+            "repaired_pdb": str(repaired_pdb),
+        }
+
+    def fake_validate(path, output_dir, parsed_args):
+        calls["pdb"] = str(path)
+        return {"returncode": 0, "summary": str(output_dir / "openmm_validation" / "summary.json")}
+
+    monkeypatch.setattr(script, "_repair_openmm_seed", fake_repair)
+    monkeypatch.setattr(script, "_run_openmm_validation", fake_validate)
+
+    summary = {}
+    validation_pdb = seed_pdb
+    summary["openmm_repair"] = script._repair_openmm_seed(seed_pdb, tmp_path, args)
+    if summary["openmm_repair"]["success"]:
+        validation_pdb = Path(summary["openmm_repair"]["repaired_pdb"])
+    summary["openmm_validation"] = script._run_openmm_validation(validation_pdb, tmp_path, args)
+
+    assert calls["pdb"] == str(repaired_pdb)
+
+
+def test_pme_order_five_bspline_stencils_conserve_charge():
+    from pyqed.md.calculators import _bspline_weights_1d_arrays
+
+    weights, derivatives, offsets = _bspline_weights_1d_arrays(np.array([0.0, 0.2, 0.5, 0.9]), 5)
+
+    assert offsets.tolist() == [-1, 0, 1, 2, 3]
+    np.testing.assert_allclose(weights.sum(axis=1), np.ones(4), atol=1.0e-14)
+    np.testing.assert_allclose(derivatives.sum(axis=1), np.zeros(4), atol=1.0e-14)
+    assert np.all(weights >= -1.0e-14)
+
+    high_weights, high_derivatives, high_offsets = _bspline_weights_1d_arrays(np.array([0.1, 0.7]), 8)
+    assert high_offsets.tolist() == [-1, 0, 1, 2, 3, 4, 5, 6]
+    np.testing.assert_allclose(high_weights.sum(axis=1), np.ones(2), atol=1.0e-14)
+    np.testing.assert_allclose(high_derivatives.sum(axis=1), np.zeros(2), atol=1.0e-14)
 
 
 def test_pme_order_four_force_matches_finite_difference():
@@ -2954,6 +3632,41 @@ def test_pme_order_four_force_matches_finite_difference():
             real_cutoff=4.0,
             mesh=(24, 24, 24),
             order=4,
+        ),
+    )
+    delta = 1e-5
+    forces = atoms.get_forces()
+    positions = atoms.get_positions()
+
+    positions[1, 0] += delta
+    atoms.set_positions(positions)
+    e_plus = atoms.get_potential_energy()
+    positions[1, 0] -= 2.0 * delta
+    atoms.set_positions(positions)
+    e_minus = atoms.get_potential_energy()
+
+    finite_difference_force = -(e_plus - e_minus) / (2.0 * delta)
+    np.testing.assert_allclose(forces[1, 0], finite_difference_force, rtol=3e-5, atol=1e-7)
+    np.testing.assert_allclose(atoms.get_forces().sum(axis=0), np.zeros(3), atol=1e-12)
+
+
+def test_pme_order_five_force_matches_finite_difference():
+    atoms = Atoms(
+        [
+            ["Na", (1.0, 1.0, 1.0)],
+            ["Cl", (3.2, 2.7, 2.9)],
+            ["Na", (5.1, 1.3, 4.2)],
+            ["Cl", (2.2, 6.0, 5.5)],
+        ],
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+        calculator=PMECoulomb(
+            charges=[1.0, -1.0, 1.0, -1.0],
+            coulomb_constant=1.0,
+            alpha=0.35,
+            real_cutoff=4.0,
+            mesh=(24, 24, 24),
+            order=5,
         ),
     )
     delta = 1e-5
@@ -3125,6 +3838,78 @@ def test_molecular_mechanics_nonbonded_skin_preserves_cutoff_results():
     np.testing.assert_allclose(cached.get_forces(), exact.get_forces())
 
 
+def test_molecular_mechanics_small_nonbonded_skin_rebuilds_safely():
+    def make_atoms(skin):
+        return Atoms(
+            [["Na", (0.0, 0.0, 0.0)], ["Cl", (4.20, 0.0, 0.0)]],
+            cell=[12.0, 12.0, 12.0],
+            pbc=True,
+            calculator=MolecularMechanics(
+                charges=[1.0, -1.0],
+                coulomb_constant=1.0,
+                coulomb_cutoff=4.0,
+                lj_epsilon=[0.2, 0.2],
+                lj_sigma=[1.0, 1.0],
+                lj_cutoff=4.0,
+                nonbonded_skin=skin,
+            ),
+        )
+
+    cached = make_atoms(skin=0.25)
+    exact = make_atoms(skin=0.0)
+    assert cached.get_potential_energy() == pytest.approx(0.0)
+    cache = cached.calc._shared_pair_displacement_cache
+    assert cache.rebuild_count == 1
+
+    for distance in (4.08, 3.95, 3.80, 3.65):
+        positions = [[0.0, 0.0, 0.0], [distance, 0.0, 0.0]]
+        cached.set_positions(positions)
+        exact.set_positions(positions)
+        np.testing.assert_allclose(cached.get_potential_energy(), exact.get_potential_energy())
+        np.testing.assert_allclose(cached.get_forces(), exact.get_forces(), rtol=1e-12, atol=1e-12)
+
+    assert cache.rebuild_count >= 2
+    assert cache.reuse_count >= 1
+    assert cache.rebuild_reasons["initial"] == 1
+    assert cache.rebuild_reasons["displacement"] >= 1
+    assert cache.max_reference_displacement > 0.0
+
+
+def test_pair_displacement_cache_reuses_small_cell_changes_and_reports_large_ones():
+    from pyqed.md.calculators import _PairDisplacementCache
+
+    positions = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    cache = _PairDisplacementCache(skin=0.5)
+    cache.pair_displacements(
+        positions,
+        np.diag([8.0, 8.0, 8.0]),
+        np.ones(3, dtype=bool),
+        cutoff=3.0,
+    )
+    assert cache.rebuild_reasons["initial"] == 1
+    assert cache.rebuild_count == 1
+
+    cache.pair_displacements(
+        positions,
+        np.diag([8.1, 8.0, 8.0]),
+        np.ones(3, dtype=bool),
+        cutoff=3.0,
+    )
+    assert cache.rebuild_count == 1
+    assert cache.cell_reuse_count == 1
+    assert cache.last_cell_delta == pytest.approx(0.1)
+
+    cache.pair_displacements(
+        positions,
+        np.diag([8.6, 8.0, 8.0]),
+        np.ones(3, dtype=bool),
+        cutoff=3.0,
+    )
+
+    assert cache.rebuild_reasons["cell"] == 1
+    assert cache.last_rebuild_reason == "cell"
+
+
 def test_molecular_mechanics_nonbonded_skin_preserves_distinct_cutoff_results():
     def make_atoms(distance, skin):
         return Atoms(
@@ -3191,6 +3976,72 @@ def test_molecular_mechanics_nonbonded_skin_preserves_pme_with_lj_exclusions():
     exact.set_positions(positions)
     np.testing.assert_allclose(cached.get_potential_energy(), exact.get_potential_energy())
     np.testing.assert_allclose(cached.get_forces(), exact.get_forces(), rtol=1e-12, atol=1e-12)
+
+
+def test_lj_pme_real_numba_accepts_per_atom_lj_arrays(monkeypatch):
+    pytest.importorskip("numba")
+    from pyqed.md import calculators
+
+    pair_i = np.array([0, 0, 1, 2], dtype=np.int64)
+    pair_j = np.array([1, 2, 3, 3], dtype=np.int64)
+    displacements = np.array(
+        [
+            [-1.2, 0.1, 0.0],
+            [-2.3, -0.4, 0.2],
+            [0.5, -1.4, 0.3],
+            [1.1, 0.6, -0.2],
+        ],
+        dtype=float,
+    )
+    charges = np.array([1.0, -1.0, 0.5, -0.5], dtype=float)
+    epsilon = np.array([0.2, 0.15, 0.0, 0.1], dtype=float)
+    sigma = np.array([1.0, 1.1, 1.2, 0.9], dtype=float)
+    mask = np.array([True, True, False, True], dtype=bool)
+    cutoff = 3.0
+    monkeypatch.setattr(calculators, "_LJ_EWALD_REAL_PAIR_ARRAYS_PARALLEL_MIN_PAIRS", 0)
+
+    fast_forces = np.zeros((4, 3), dtype=float)
+    fast_virial = np.zeros((3, 3), dtype=float)
+    fast_energy = calculators._try_add_lj_ewald_real_pair_arrays_numba(
+        fast_forces,
+        epsilon,
+        sigma,
+        charges,
+        1.0,
+        0.35,
+        cutoff * cutoff,
+        pair_i,
+        pair_j,
+        displacements,
+        lj_cutoff=cutoff,
+        lj_pair_nonexcluded_mask=mask,
+        virial=fast_virial,
+    )
+    assert fast_energy is not None
+
+    monkeypatch.setattr(calculators, "_try_add_lj_ewald_real_pair_arrays_numba", lambda *args, **kwargs: None)
+    reference_forces = np.zeros((4, 3), dtype=float)
+    reference_virial = np.zeros((3, 3), dtype=float)
+    reference_energy = calculators._add_lj_ewald_real_pair_arrays(
+        reference_forces,
+        epsilon,
+        sigma,
+        charges,
+        1.0,
+        0.35,
+        cutoff,
+        cutoff * cutoff,
+        pair_i,
+        pair_j,
+        displacements,
+        lj_cutoff=cutoff,
+        lj_pair_nonexcluded_mask=mask,
+        virial=reference_virial,
+    )
+
+    np.testing.assert_allclose(fast_energy, reference_energy, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(fast_forces, reference_forces, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(fast_virial, reference_virial, rtol=1e-12, atol=1e-12)
 
 
 def test_molecular_mechanics_supports_pair_specific_nonbonded_scaling():
@@ -3267,6 +4118,33 @@ def test_molecular_mechanics_nonbonded_skin_preserves_type_pair_lj_overrides():
 
     np.testing.assert_allclose(cached.get_potential_energy(), exact.get_potential_energy())
     np.testing.assert_allclose(cached.get_forces(), exact.get_forces(), rtol=1e-12, atol=1e-12)
+
+
+def test_molecular_mechanics_reports_nonbonded_energy_components():
+    atoms = Atoms(
+        [["Na", (0.0, 0.0, 0.0)], ["Cl", (3.0, 0.0, 0.0)]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=False,
+        calculator=MolecularMechanics(
+            charges=[1.0, -1.0],
+            coulomb_constant=2.0,
+            lj_epsilon=[0.2, 0.2],
+            lj_sigma=[1.0, 1.0],
+            coulomb_method="cutoff",
+            coulomb_cutoff=6.0,
+            lj_cutoff=6.0,
+            lj_energy_shift=False,
+            coulomb_energy_shift=False,
+        ),
+    )
+
+    components = atoms.calc.nonbonded_energy_components(atoms)
+    nonbonded = atoms.calc.energy_components(atoms)["nonbonded"]
+
+    assert components["total"] == pytest.approx(nonbonded)
+    assert components["residual"] == pytest.approx(0.0, abs=1.0e-12)
+    assert components["coulomb"] == pytest.approx(-2.0 / 3.0)
+    assert components["lj"] != pytest.approx(0.0)
 
 
 def test_topology_preserves_nonbonded_exceptions_when_shifted_and_combined():
@@ -3542,18 +4420,488 @@ def test_openmm_membrane_to_pyqed_benchmark_reports_readiness(tmp_path):
     assert data["pyqed_import"]["atoms"] > 0
     assert data["pyqed_import"]["residue_counts"]["DPP"] == 128
     assert data["pyqed_import"]["residue_counts"]["HOH"] == 3840
+    assert data["pyqed_import"]["composition"]["lipid_residues"] == 128
+    assert data["pyqed_import"]["composition"]["water_residues"] == 3840
+    assert data["pyqed_import"]["composition"]["protein_residues"] == 0
     assert data["readiness"]["import_ready"] is True
     assert data["readiness"]["native_energy_evaluated"] is False
     assert data["readiness"]["force_comparison_evaluated"] is False
     assert data["readiness"]["workflow_ready"] is False
+    assert data["readiness"]["nonbonded_diagnosis"] is None
+    assert data["pyqed_nonbonded_components_kj_mol"] is None
     assert data["pyqed_import"]["topology_terms"]["lj_exclusions"] == 104704
     assert data["pyqed_import"]["topology_terms"]["coulomb_pair_parameters"] == 44672
     assert any(gap["force"] == "CustomNonbondedForce" for gap in data["readiness"]["force_warnings"])
     assert "workflow_ready: False" in result.stdout
 
 
+def test_native_dppc_benchmark_reports_force_timings(tmp_path):
+    pytest.importorskip("openmm")
+
+    script = Path("examples/md/native_dppc_benchmark.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--ensemble",
+            "langevin",
+            "--friction-ps",
+            "2.0",
+            "--steps",
+            "0",
+            "--force-samples",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    summary_path = tmp_path / "native_dppc_benchmark_summary.json"
+    assert summary_path.exists()
+    data = json.loads(summary_path.read_text())
+    assert data["workflow"] == "native_dppc_benchmark"
+    assert data["preset"] == "manual"
+    assert data["atoms"] == 28160
+    assert data["force_first_s"] > 0.0
+    assert data["steps"] == 0
+    assert data["friction_ps"] == pytest.approx(2.0)
+    assert data["friction"] == pytest.approx(friction_ps_to_atomic_units(2.0))
+    assert data["temperature_rescale_interval"] == 0
+    assert data["temperature_rescale_events"] == 0
+    assert data["berendsen_tau_fs"] == 0.0
+    assert data["berendsen_interval"] == 1
+    assert data["berendsen_events"] == 0
+    assert data["berendsen_last_scale"] is None
+    assert data["pressure_control"] == "off"
+    assert data["pressure_interval"] == 10
+    assert data["pressure_scale_molecule_centers"] is True
+    assert data["pressure_events"] == 0
+    assert data["pressure_last_scale"] is None
+    assert data["pressure_lateral_bar"] is None
+    assert data["pressure_normal_bar"] is None
+    assert np.isfinite(data["final_pressure_lateral_bar"])
+    assert np.isfinite(data["final_pressure_normal_bar"])
+    assert data["relaxation"] is None
+    assert data["openmm_pme_parameters"] is None
+    assert data["pme_accuracy"] == "manual"
+    assert data["native_pme_mesh"] == [16, 16, 16]
+    assert data["native_pme_order"] == 5
+    assert data["native_ewald_alpha"] is not None
+    assert data["nonbonded_skin"] == pytest.approx(0.25)
+    assert data["neighbor_cache"]["shared"]["rebuilds"] >= 1
+    assert data["neighbor_cache"]["shared"]["pairs"] > 0
+    assert data["neighbor_cache"]["shared"]["rebuild_reasons"]
+    assert data["neighbor_cache"]["shared"]["max_reference_displacement"] >= 0.0
+    assert data["steps_per_second"] is None
+    assert data["ms_per_step"] is None
+    assert data["membrane"]["lipids"] == 128
+    assert data["composition"]["lipid_residues"] == 128
+    assert data["composition"]["water_residues"] == 3840
+    assert data["composition"]["protein_residues"] == 0
+    assert data["finite_energy"] is True
+    assert data["readiness"]["workflow_ready"] is True
+    assert data["workflow_ready"] is True
+    assert data["status"] == "ready"
+    assert "native_dppc_benchmark" in result.stdout
+
+
+def test_native_dppc_benchmark_applies_membrane_preset_and_gates():
+    from examples.md.native_dppc_benchmark import _apply_preset, _readiness_gates, parse_args
+
+    args = parse_args(["--preset", "native-membrane-smoke"])
+    _apply_preset(args)
+
+    assert args.steps == 100
+    assert args.ensemble == "langevin"
+    assert args.friction_ps_schedule == ["60:100", "40:20"]
+    assert args.match_openmm_pme_parameters is False
+    assert args.pme_accuracy == "high"
+    assert args.pme_mesh is None
+    assert args.nonbonded_skin == pytest.approx(0.5)
+    assert args.relax_steps == 3
+    assert args.berendsen_tau_fs == pytest.approx(1.0)
+    assert args.pressure_control == "weak"
+    assert args.pressure_scale_molecule_centers is True
+    assert args.no_trajectory is True
+    assert args.gate_max_force == pytest.approx(0.2)
+    assert args.gate_max_constraint_error == pytest.approx(1.0e-8)
+    assert args.gate_max_abs_pressure_bar == pytest.approx(20000.0)
+    assert args.gate_max_temperature_k == pytest.approx(120.0)
+    assert args.gate_min_area_per_lipid_a2 == pytest.approx(35.0)
+    assert args.gate_max_area_per_lipid_a2 == pytest.approx(80.0)
+    assert args.gate_min_thickness_a == pytest.approx(30.0)
+    assert args.gate_max_thickness_a == pytest.approx(60.0)
+
+    summary = {
+        "finite_positions": True,
+        "finite_forces": True,
+        "finite_energy": True,
+        "final_max_force": 0.05,
+        "final_constraint_error": 1.0e-12,
+        "final_temperature_K": 60.0,
+        "final_pressure_lateral_bar": 11000.0,
+        "final_pressure_normal_bar": 10000.0,
+        "membrane": {
+            "area_per_lipid_angstrom2": 55.0,
+            "phosphorus_thickness_angstrom": 44.0,
+        },
+    }
+    readiness = _readiness_gates(summary, args)
+    assert readiness["workflow_ready"] is True
+    assert readiness["status"] == "ready"
+
+    summary["final_pressure_lateral_bar"] = 25000.0
+    readiness = _readiness_gates(summary, args)
+    assert readiness["workflow_ready"] is False
+    assert "pressure_bar" in readiness["failed_gates"]
+    summary["final_pressure_lateral_bar"] = 11000.0
+    summary["membrane"]["area_per_lipid_angstrom2"] = 100.0
+    readiness = _readiness_gates(summary, args)
+    assert readiness["workflow_ready"] is False
+    assert "area_per_lipid_max" in readiness["failed_gates"]
+
+    manual = parse_args(["--source-pdb", "snapshot.pdb"])
+    _apply_preset(manual)
+    assert manual.source_pdb == "snapshot.pdb"
+
+
+def test_native_dppc_benchmark_pressure_relax_preset_is_stronger():
+    from examples.md.native_dppc_benchmark import _apply_preset, parse_args
+
+    args = parse_args(["--preset", "native-membrane-pressure-relax"])
+    _apply_preset(args)
+
+    assert args.steps == 1000
+    assert args.friction_ps_schedule == ["200:100", "300:50", "500:20"]
+    assert args.pressure_control == "weak"
+    assert args.pressure_coupling == pytest.approx(1.0e-3)
+    assert args.pressure_max_scale == pytest.approx(5.0e-4)
+    assert args.pressure_scale_molecule_centers is True
+    assert args.gate_max_abs_pressure_bar == pytest.approx(12000.0)
+    assert args.gate_max_force == pytest.approx(0.2)
+
+    strong = parse_args(["--preset", "native-membrane-pressure-relax-strong"])
+    _apply_preset(strong)
+
+    assert strong.steps == 1000
+    assert strong.friction_ps_schedule == ["200:100", "300:50", "500:20"]
+    assert strong.pressure_control == "weak"
+    assert strong.pressure_coupling == pytest.approx(2.0e-3)
+    assert strong.pressure_max_scale == pytest.approx(1.0e-3)
+    assert strong.pressure_scale_molecule_centers is True
+    assert strong.gate_max_abs_pressure_bar == pytest.approx(6000.0)
+
+    aggressive = parse_args(["--preset", "native-membrane-pressure-relax-aggressive"])
+    _apply_preset(aggressive)
+
+    assert aggressive.steps == 1000
+    assert aggressive.friction_ps_schedule == ["200:100", "300:50", "500:20"]
+    assert aggressive.pressure_control == "weak"
+    assert aggressive.pressure_coupling == pytest.approx(4.0e-3)
+    assert aggressive.pressure_max_scale == pytest.approx(2.0e-3)
+    assert aggressive.pressure_scale_molecule_centers is True
+    assert aggressive.gate_max_abs_pressure_bar == pytest.approx(3000.0)
+
+    ramp = parse_args(["--preset", "native-membrane-300k-ramp"])
+    _apply_preset(ramp)
+
+    assert ramp.steps == 1000
+    assert ramp.friction_ps_schedule == ["200:100:50", "300:50:150", "500:20:300"]
+    assert ramp.temperature_k == pytest.approx(50.0)
+    assert ramp.pressure_control == "weak"
+    assert ramp.pressure_coupling == pytest.approx(4.0e-3)
+    assert ramp.pressure_max_scale == pytest.approx(2.0e-3)
+    assert ramp.gate_max_force == pytest.approx(0.3)
+    assert ramp.gate_max_abs_pressure_bar == pytest.approx(6000.0)
+    assert ramp.gate_max_temperature_k == pytest.approx(350.0)
+
+    hold = parse_args(["--preset", "native-membrane-300k-hold", "--source-pdb", "ramp-final.pdb"])
+    _apply_preset(hold)
+
+    assert hold.source_pdb == "ramp-final.pdb"
+    assert hold.steps == 500
+    assert hold.friction_ps_schedule == ["500:50:300"]
+    assert hold.temperature_k == pytest.approx(300.0)
+    assert hold.relax_steps == 0
+    assert hold.berendsen_tau_fs == pytest.approx(0.5)
+    assert hold.pressure_coupling == pytest.approx(1.0e-3)
+    assert hold.pressure_max_scale == pytest.approx(5.0e-4)
+    assert hold.gate_min_temperature_k == pytest.approx(280.0)
+    assert hold.gate_max_temperature_k == pytest.approx(330.0)
+    assert hold.gate_max_force == pytest.approx(0.4)
+
+    one_ps = parse_args(["--preset", "native-membrane-1ps-hold", "--source-pdb", "hold-final.pdb"])
+    _apply_preset(one_ps)
+
+    assert one_ps.source_pdb == "hold-final.pdb"
+    assert one_ps.steps == 1000
+    assert one_ps.timestep_fs == pytest.approx(1.0)
+    assert one_ps.nonbonded_skin == pytest.approx(2.0)
+    assert one_ps.friction_ps_schedule == ["1000:50:300"]
+    assert one_ps.temperature_k == pytest.approx(300.0)
+    assert one_ps.relax_steps == 0
+    assert one_ps.berendsen_tau_fs == pytest.approx(0.5)
+    assert one_ps.pressure_coupling == pytest.approx(1.0e-3)
+    assert one_ps.pressure_max_scale == pytest.approx(5.0e-4)
+    assert one_ps.gate_min_temperature_k == pytest.approx(280.0)
+    assert one_ps.gate_max_temperature_k == pytest.approx(330.0)
+    assert one_ps.gate_max_force == pytest.approx(0.4)
+
+    stable = parse_args(["--preset", "native-membrane-1ps-hold-area-stable"])
+    _apply_preset(stable)
+
+    assert stable.steps == 1000
+    assert stable.timestep_fs == pytest.approx(1.0)
+    assert stable.nonbonded_skin == pytest.approx(2.0)
+    assert stable.pressure_coupling == pytest.approx(4.0e-4)
+    assert stable.pressure_max_scale == pytest.approx(2.0e-4)
+    assert stable.gate_max_area_per_lipid_a2 == pytest.approx(80.0)
+
+
+def test_native_dppc_benchmark_parses_friction_schedule():
+    from examples.md.native_dppc_benchmark import _parse_friction_ps_schedule
+
+    schedule = _parse_friction_ps_schedule(["30:1000", "40:10", "50:5:300"])
+
+    assert schedule == [
+        {"steps": 30, "friction_ps": 1000.0},
+        {"steps": 40, "friction_ps": 10.0},
+        {"steps": 50, "friction_ps": 5.0, "temperature_K": 300.0},
+    ]
+    with pytest.raises(ValueError, match="form"):
+        _parse_friction_ps_schedule(["bad"])
+    with pytest.raises(ValueError, match="positive"):
+        _parse_friction_ps_schedule(["0:10"])
+    with pytest.raises(ValueError, match="temperatures"):
+        _parse_friction_ps_schedule(["10:5:0"])
+
+
+def test_native_dppc_benchmark_friction_schedule_accepts_temperature_targets(tmp_path):
+    from examples.md.native_dppc_benchmark import _run_friction_schedule
+
+    atoms = Atoms(
+        [["Ar", (0.0, 0.0, 0.0)], ["Ar", (2.0, 0.0, 0.0)]],
+        calculator=LennardJones(epsilon=0.01, sigma=1.0),
+    )
+    atoms.set_cell(np.diag([10.0, 10.0, 10.0]))
+    atoms.set_velocities([[0.001, 0.0, 0.0], [-0.001, 0.0, 0.0]])
+
+    records = _run_friction_schedule(
+        atoms,
+        [{"steps": 1, "friction_ps": 10.0, "temperature_K": 75.0}],
+        timestep_fs=0.1,
+        temperature_k=50.0,
+        stage_log_path=tmp_path / "stages.dat",
+        berendsen_tau_fs=1.0,
+    )
+
+    assert records[0]["temperature_target_K"] == pytest.approx(75.0)
+    assert records[0]["temperature_rescale_events"] == 0
+    assert records[0]["berendsen_events"] == 1
+    assert records[0]["steps_per_second"] > 0.0
+    assert records[0]["ms_per_step"] > 0.0
+    header = (tmp_path / "stages.dat").read_text().splitlines()[0]
+    assert "temperature_target_K" in header
+    assert "steps_per_second" in header
+
+
+def test_native_dppc_benchmark_temperature_callbacks():
+    from examples.md.native_dppc_benchmark import _control_callbacks, _temperature_callbacks
+
+    atoms = Atoms(
+        [
+            ["O", (0.0, 0.0, 0.0)],
+            ["H", (1.0, 0.0, 0.0)],
+            ["H", (0.0, 1.0, 0.0)],
+        ]
+    )
+    set_maxwell_boltzmann_velocities(atoms, 500.0, seed=5)
+
+    callbacks, rescaler, berendsen = _temperature_callbacks(
+        atoms,
+        temperature_k=300.0,
+        timestep_fs=0.5,
+        temperature_rescale_interval=4,
+        berendsen_tau_fs=5.0,
+        berendsen_interval=2,
+    )
+
+    assert len(callbacks) == 2
+    assert callbacks[0] == (rescaler, 4)
+    assert callbacks[1] == (berendsen, 2)
+    assert berendsen.tau_fs == pytest.approx(5.0)
+    assert berendsen.interval == 2
+
+    callbacks, rescaler, berendsen, pressure = _control_callbacks(
+        atoms,
+        temperature_k=300.0,
+        timestep_fs=0.5,
+        berendsen_tau_fs=5.0,
+        pressure_control="weak",
+        pressure_interval=3,
+        pressure_coupling=0.002,
+        pressure_max_scale=0.0007,
+        pressure_scale_molecule_centers=True,
+    )
+
+    assert len(callbacks) == 2
+    assert callbacks[0] == (berendsen, 1)
+    assert callbacks[1] == (pressure, 3)
+    assert rescaler.calls == 0
+    assert pressure.coupling == pytest.approx(0.002)
+    assert pressure.max_scale == pytest.approx(0.0007)
+    assert pressure.scale_molecule_centers is True
+
+
+def test_native_dppc_ladder_runs_chunks_and_summarizes(tmp_path, monkeypatch):
+    from examples.md import native_dppc_ladder
+
+    source = tmp_path / "start.pdb"
+    source.write_text("END\n")
+    calls = []
+
+    def fake_run(cmd, check, text, capture_output):
+        calls.append(cmd)
+        chunk_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        chunk = len(calls)
+        final_pdb = chunk_dir / "native_dppc_benchmark_final.pdb"
+        final_pdb.write_text("END\n")
+        summary = {
+            "summary": str(chunk_dir / "native_dppc_benchmark_summary.json"),
+            "final_pdb": str(final_pdb),
+            "status": "ready",
+            "workflow_ready": True,
+            "steps": 1000,
+            "timestep_fs": 1.0,
+            "smoke_wall_time_s": 10.0 + chunk,
+            "steps_per_second": 1000.0 / (10.0 + chunk),
+            "ms_per_step": 10.0 + chunk,
+            "final_temperature_K": 300.0,
+            "final_max_force": 0.1,
+            "final_constraint_error": 1.0e-12,
+            "final_pressure_lateral_bar": 100.0,
+            "final_pressure_normal_bar": 90.0,
+            "membrane": {
+                "area_per_lipid_angstrom2": 65.0,
+                "phosphorus_thickness_angstrom": 45.0,
+            },
+            "neighbor_cache": {
+                "shared": {
+                    "rebuilds": 10,
+                    "reuses": 100,
+                    "cell_reuses": 5,
+                }
+            },
+            "readiness": {
+                "workflow_ready": True,
+                "failed_gates": [],
+                "metrics": {
+                    "final_temperature_K": 300.0,
+                    "final_max_force": 0.1,
+                    "final_constraint_error": 1.0e-12,
+                    "final_pressure_lateral_bar": 100.0,
+                    "final_pressure_normal_bar": 90.0,
+                    "area_per_lipid_A2": 65.0,
+                    "phosphorus_thickness_A": 45.0,
+                },
+            },
+        }
+        Path(summary["summary"]).write_text(json.dumps(summary))
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"chunk {chunk}\n", stderr="")
+
+    monkeypatch.setattr(native_dppc_ladder.subprocess, "run", fake_run)
+
+    rc = native_dppc_ladder.main(
+        [
+            "--source-pdb",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "ladder"),
+            "--chunks",
+            "2",
+            "--force-samples",
+            "1",
+            "--forcefield",
+            "charmm36.xml",
+            "charmm36/water.xml",
+            "--pme-accuracy",
+            "high",
+            "--pme-order",
+            "5",
+        ]
+    )
+
+    assert rc == 0
+    assert len(calls) == 2
+    assert calls[0][calls[0].index("--source-pdb") + 1] == str(source)
+    assert calls[0][calls[0].index("--pme-accuracy") + 1] == "high"
+    assert calls[0][calls[0].index("--pme-order") + 1] == "5"
+    assert calls[0][calls[0].index("--forcefield") + 1 : calls[0].index("--pme-accuracy")] == [
+        "charmm36.xml",
+        "charmm36/water.xml",
+    ]
+    assert calls[1][calls[1].index("--source-pdb") + 1].endswith("chunk_0001/native_dppc_benchmark_final.pdb")
+    data = json.loads((tmp_path / "ladder" / "native_dppc_ladder_summary.json").read_text())
+    assert data["workflow"] == "native_dppc_ladder"
+    assert data["completed_chunks"] == 2
+    assert data["total_steps"] == 2000
+    assert data["total_time_ps"] == pytest.approx(2.0)
+    assert data["chunk_ready"] is True
+    assert data["trend_ready"] is True
+    assert data["workflow_ready"] is True
+    assert data["trend"]["failed_trend_gates"] == []
+    assert data["trend"]["metrics"]["max_abs_pressure_bar"] == pytest.approx(100.0)
+    assert data["chunks"][0]["neighbor_rebuilds"] == 10
+
+    args = native_dppc_ladder.parse_args(
+        [
+            "--source-pdb",
+            str(source),
+            "--trend-max-pressure-growth-bar",
+            "10",
+        ]
+    )
+    failed = native_dppc_ladder._trend_report(
+        args,
+        [
+            {
+                "workflow_ready": True,
+                "final_pressure_lateral_bar": 100.0,
+                "final_pressure_normal_bar": 90.0,
+                "final_temperature_K": 300.0,
+                "final_max_force": 0.1,
+                "final_constraint_error": 1.0e-12,
+                "area_per_lipid_A2": 65.0,
+            },
+            {
+                "workflow_ready": True,
+                "final_pressure_lateral_bar": 250.0,
+                "final_pressure_normal_bar": 90.0,
+                "final_temperature_K": 300.0,
+                "final_max_force": 0.1,
+                "final_constraint_error": 1.0e-12,
+                "area_per_lipid_A2": 65.0,
+            },
+        ],
+    )
+    assert failed["trend_ready"] is False
+    assert "pressure_growth" in failed["failed_trend_gates"]
+
+
 def test_openmm_membrane_to_pyqed_force_comparison_metrics():
-    from examples.md.openmm_membrane_to_pyqed import _force_comparison
+    from examples.md.openmm_membrane_to_pyqed import (
+        HARTREE_TO_KJMOL,
+        _force_comparison,
+        _nonbonded_diagnostic_comparison,
+        _nonbonded_components_to_kj_mol,
+        _pme_parity_recommendation,
+        _nonbonded_readiness_diagnosis,
+        _pme_split_comparison,
+    )
 
     openmm_forces = np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
     pyqed_forces = np.array([[0.5, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -3563,6 +4911,157 @@ def test_openmm_membrane_to_pyqed_force_comparison_metrics():
     np.testing.assert_allclose(report["max_delta_kj_mol_nm"], 1.0)
     np.testing.assert_allclose(report["relative_rms_delta"], np.sqrt(0.625 / 2.5))
     assert report["max_delta_atom"] == 1
+
+    diagnostics = _nonbonded_diagnostic_comparison(
+        {"by_class": {"NonbondedForce": -10.0, "CustomNonbondedForce": -3.0, "CustomBondForce": 1.0}},
+        {
+            "coulomb": -10.5,
+            "lj": -1.75,
+            "total": -12.25,
+            "residual": 0.0,
+            "coulomb_terms": {"atoms": 2, "charge_squared_sum": 4.0},
+        },
+    )
+    assert diagnostics["coulomb"]["delta_openmm_minus_pyqed"] == pytest.approx(0.5)
+    assert diagnostics["coulomb"]["delta_per_atom"] == pytest.approx(0.25)
+    assert diagnostics["coulomb"]["delta_per_charge_squared"] == pytest.approx(0.125)
+    assert diagnostics["lj"]["openmm"] == pytest.approx(-2.0)
+    assert diagnostics["lj"]["delta_openmm_minus_pyqed"] == pytest.approx(-0.25)
+    assert diagnostics["total"]["delta_openmm_minus_pyqed"] == pytest.approx(0.25)
+
+    pme_split = _pme_split_comparison(
+        {"direct": -12.0, "reciprocal": 2.0, "total": -10.0},
+        {
+            "coulomb": -10.5,
+            "coulomb_terms": {
+                "method": "pme",
+                "reciprocal": 1.5,
+            },
+        },
+    )
+    assert pme_split["pyqed_reciprocal_bucket"] == "reciprocal_plus_self"
+    assert pme_split["direct"]["pyqed"] == pytest.approx(-12.0)
+    assert pme_split["direct"]["delta_openmm_minus_pyqed"] == pytest.approx(0.0)
+    assert pme_split["reciprocal"]["delta_openmm_minus_pyqed"] == pytest.approx(0.5)
+    assert pme_split["total"]["delta_openmm_minus_pyqed"] == pytest.approx(0.5)
+    recommendation = _pme_parity_recommendation(
+        "pme",
+        False,
+        pme_split,
+        (55, 56, 76),
+        5,
+        0.1,
+    )
+    assert recommendation["action"] == "increase_pme_mesh"
+    assert recommendation["limiting_bucket"] == "reciprocal"
+    assert recommendation["current_mesh"] == [55, 56, 76]
+    assert recommendation["suggested_order"] == 5
+
+    ready_recommendation = _pme_parity_recommendation("pme", True, pme_split, (96, 96, 128), 5, 0.1)
+    assert ready_recommendation["action"] == "ready"
+
+    ready = _nonbonded_readiness_diagnosis(
+        {"total": {"delta_openmm_minus_pyqed": 0.05}},
+        diagnostics,
+        "cutoff",
+        0.3,
+    )
+    assert ready["status"] == "ready"
+    assert ready["limiting_term"] is None
+
+    pme_offset = _nonbonded_readiness_diagnosis(
+        {"total": {"delta_openmm_minus_pyqed": 0.5}},
+        {
+            "coulomb": {"delta_openmm_minus_pyqed": 0.5},
+            "lj": {"delta_openmm_minus_pyqed": 0.01},
+            "total": {"delta_openmm_minus_pyqed": 0.49},
+        },
+        "pme",
+        0.1,
+    )
+    assert pme_offset["status"] == "pme_coulomb_offset"
+    assert pme_offset["limiting_term"] == "coulomb"
+
+    converted = _nonbonded_components_to_kj_mol(
+        {
+            "coulomb": -1.0,
+            "lj": -0.5,
+            "residual": 0.0,
+            "total": -1.5,
+            "coulomb_terms": {
+                "method": "pme",
+                "atoms": 2,
+                "charge_squared_sum": 4.0,
+                "real": -2.0,
+            },
+        }
+    )
+    assert converted["coulomb"] == pytest.approx(-HARTREE_TO_KJMOL)
+    assert converted["coulomb_terms"]["atoms"] == 2
+    assert converted["coulomb_terms"]["charge_squared_sum"] == pytest.approx(4.0)
+    assert converted["coulomb_terms"]["real"] == pytest.approx(-2.0 * HARTREE_TO_KJMOL)
+
+
+def test_openmm_context_pme_parameter_helper_reports_context_mesh():
+    openmm = pytest.importorskip("openmm")
+    from openmm import app, unit
+    from examples.md.openmm_membrane_to_pyqed import (
+        _openmm_context_pme_parameters,
+        _openmm_pme_nonbonded_split,
+    )
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("ION", chain)
+    sodium = app.Element.getBySymbol("Na")
+    chlorine = app.Element.getBySymbol("Cl")
+    for symbol, element in (("Na", sodium), ("Cl", chlorine), ("Na", sodium), ("Cl", chlorine)):
+        topology.addAtom(symbol, element, residue)
+    topology.setPeriodicBoxVectors(
+        (
+            openmm.Vec3(1.0, 0.0, 0.0),
+            openmm.Vec3(0.0, 1.0, 0.0),
+            openmm.Vec3(0.0, 0.0, 1.0),
+        )
+        * unit.nanometer
+    )
+    system = openmm.System()
+    system.setDefaultPeriodicBoxVectors(
+        openmm.Vec3(1.0, 0.0, 0.0) * unit.nanometer,
+        openmm.Vec3(0.0, 1.0, 0.0) * unit.nanometer,
+        openmm.Vec3(0.0, 0.0, 1.0) * unit.nanometer,
+    )
+    nonbonded = openmm.NonbondedForce()
+    for charge in (1.0, -1.0, 1.0, -1.0):
+        system.addParticle(22.99 * unit.dalton)
+        nonbonded.addParticle(charge, 0.3, 0.0)
+    nonbonded.setNonbondedMethod(openmm.NonbondedForce.PME)
+    nonbonded.setCutoffDistance(0.4 * unit.nanometer)
+    system.addForce(nonbonded)
+    pdb = type(
+        "PDBLike",
+        (),
+        {
+            "positions": [
+                openmm.Vec3(0.1, 0.1, 0.1),
+                openmm.Vec3(0.3, 0.2, 0.2),
+                openmm.Vec3(0.6, 0.3, 0.4),
+                openmm.Vec3(0.2, 0.7, 0.6),
+            ]
+            * unit.nanometer
+        },
+    )()
+
+    params = _openmm_context_pme_parameters(pdb, system, openmm, unit)
+    split = _openmm_pme_nonbonded_split(pdb, system, openmm, unit)
+
+    assert params["ewald_alpha_per_nm"] > 0.0
+    assert len(params["pme_mesh"]) == 3
+    assert all(value > 0 for value in params["pme_mesh"])
+    assert split is not None
+    assert np.isfinite(split["direct"])
+    assert np.isfinite(split["reciprocal"])
+    assert split["total"] == pytest.approx(split["direct"] + split["reciprocal"])
 
 
 def test_molecular_mechanics_cutoff_reaction_field_coulomb_energy():
@@ -4036,6 +5535,8 @@ def test_write_pdb_uses_residue_metadata_and_cell(tmp_path):
     atoms.set_array("residue_names", ["DPPC", "HOH"], str, ())
     atoms.set_array("residue_ids", [7, 8], int, ())
     atoms.set_array("leaflets", [1, -1], int, ())
+    atoms.topology = Topology(bonds=[(0, 1, 1.0, 1.0)])
+    atoms.constraints = [FixBondLengths([(0, 1)], distances=[1.0])]
     path = tmp_path / "snapshot.pdb"
 
     write_pdb(atoms, path)
@@ -4044,9 +5545,15 @@ def test_write_pdb_uses_residue_metadata_and_cell(tmp_path):
     assert lines[0].startswith("CRYST1")
     assert "  5.292" in lines[0]
     assert lines[1].startswith("HETATM")
-    assert " DPPCU   7" in lines[1]
+    assert lines[1][17:20] == "DPP"
+    assert lines[1][21] == "U"
+    assert lines[1][22:26] == "   7"
     assert lines[2].startswith("HETATM")
-    assert "  HOHL   8" in lines[2]
+    assert lines[2][17:20] == "HOH"
+    assert lines[2][21] == "L"
+    assert lines[2][22:26] == "   8"
+    assert "CONECT    1    2" in lines
+    assert "CONECT    2    1" in lines
     assert lines[-1] == "END"
 
 
@@ -4433,3 +5940,3642 @@ def test_qmmm_pyscf_benchmark_runs_longer_pyqed_stability(tmp_path):
     assert "max_constraint_error_bohr:" in result.stdout
     assert (tmp_path / "qmmm_pyscf_benchmark.xyz").exists()
     assert (tmp_path / "qmmm_pyscf_benchmark_energy.dat").exists()
+
+
+def test_solvent_electric_field_coordinate_from_water_frames():
+    frames = [
+        XYZFrame(
+            ("H", "H", "O", "H", "H"),
+            np.array(
+                [
+                    [-0.5, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [2.8, 0.0, 0.0],
+                    [1.7, 0.7, 0.0],
+                ]
+            ),
+            time=0.0,
+        ),
+        XYZFrame(
+            ("H", "H", "O", "H", "H"),
+            np.array(
+                [
+                    [-0.5, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [2.2, 0.0, 0.0],
+                    [3.0, 0.0, 0.0],
+                    [1.9, 0.7, 0.0],
+                ]
+            ),
+            time=1.0,
+        ),
+    ]
+
+    times, q = solvent_electric_field_coordinate(
+        frames,
+        solute_atoms=2,
+        axis_atoms=(0, 1),
+        normalize=False,
+    )
+
+    np.testing.assert_allclose(times, [0.0, 1.0])
+    assert q.shape == (2,)
+    assert np.all(np.isfinite(q))
+    assert not np.isclose(q[0], q[1])
+
+
+def test_liquid_ldr_propagation_conserves_population_norm():
+    x = np.linspace(-3.0, 3.0, 7)
+    kinetic = second_derivative_kinetic(x.size, x[1] - x[0], mass=1.0)
+    model = LiquidAvoidedCrossingLDRModel(x, kinetic, mass_y=1.5)
+    times = np.linspace(0.0, 0.2, 8)
+    q_path = 0.5 * np.sin(np.linspace(0.0, np.pi, times.size))
+
+    result = propagate_liquid_ldr(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+    )
+
+    assert result["populations"].shape == (times.size, 2)
+    assert np.all(np.isfinite(result["populations"]))
+    np.testing.assert_allclose(result["norm"], np.ones(times.size), atol=1.0e-12)
+    np.testing.assert_allclose(result["populations"].sum(axis=1), np.ones(times.size), atol=1.0e-12)
+    assert np.any(np.abs(result["populations"][-1] - result["populations"][0]) > 1.0e-8)
+    refined = propagate_liquid_ldr(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+        substeps=3,
+    )
+    assert refined["populations"].shape == result["populations"].shape
+    np.testing.assert_allclose(refined["norm"], np.ones(times.size), atol=1.0e-12)
+    with pytest.raises(ValueError, match="substeps"):
+        propagate_liquid_ldr(model, q_path, times, initial_state=1, substeps=0)
+    convergence = liquid_ldr_substep_convergence(
+        model,
+        q_path,
+        times,
+        [1, 2, 4, 4],
+        initial_state=1,
+        population_tolerance=1.0e-3,
+        geometric_tolerance=1.0e-3,
+    )
+    assert [record["substeps"] for record in convergence["records"]] == [1, 2, 4]
+    assert convergence["reference_substeps"] == 4
+    assert convergence["recommended_substeps"] in {1, 2, 4}
+    assert convergence["any_ready"] is True
+    assert convergence["records"][-1]["is_reference"] is True
+    assert convergence["records"][-1]["ready"] is True
+    assert convergence["records"][-1]["population_error_max_abs"] == pytest.approx(0.0)
+    assert convergence["records"][-1]["geometric_population_delta_error_max_abs"] == pytest.approx(0.0)
+
+
+def test_liquid_ldr_comparison_reports_geometric_diagnostics():
+    x = np.linspace(-3.0, 3.0, 7)
+    kinetic = second_derivative_kinetic(x.size, x[1] - x[0], mass=1.0)
+    model = LiquidAvoidedCrossingLDRModel(x, kinetic, mass_y=1.5)
+    times = np.linspace(0.0, 0.2, 8)
+    q_path = 0.5 * np.sin(np.linspace(0.0, np.pi, times.size))
+
+    diagnostics = liquid_ldr_diagnostics(model, q_path, times)
+    comparison = compare_liquid_to_static_ldr(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+    )
+
+    assert diagnostics["geometric_speed"].shape == times.shape
+    assert np.all(np.isfinite(diagnostics["gap_min"]))
+    assert np.max(diagnostics["geometric_speed"]) > 0.0
+    assert comparison["liquid"]["populations"].shape == comparison["static"]["populations"].shape
+    np.testing.assert_allclose(
+        comparison["population_delta"],
+        comparison["liquid"]["populations"] - comparison["static"]["populations"],
+    )
+    assert np.any(np.abs(comparison["population_delta"][-1]) > 1.0e-8)
+
+
+def test_liquid_ldr_geometric_contribution_compares_berry_on_off():
+    x = np.linspace(-3.0, 3.0, 7)
+    kinetic = second_derivative_kinetic(x.size, x[1] - x[0], mass=1.0)
+    model = LiquidAvoidedCrossingLDRModel(x, kinetic, mass_y=1.5)
+    times = np.linspace(0.0, 0.3, 10)
+    q_path = 0.8 * np.sin(np.linspace(0.0, np.pi, times.size))
+
+    control = compare_liquid_geometric_contribution(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+    )
+
+    assert control["with_geometry"]["populations"].shape == (times.size, 2)
+    assert control["without_geometry"]["populations"].shape == (times.size, 2)
+    np.testing.assert_allclose(
+        control["population_delta"],
+        control["with_geometry"]["populations"] - control["without_geometry"]["populations"],
+    )
+    assert control["population_delta_max_abs"] > 0.0
+    assert control["population_delta_final_norm"] >= 0.0
+    assert control["with_geometry_norm_max_error"] < 1.0e-12
+    assert control["without_geometry_norm_max_error"] < 1.0e-12
+
+
+def test_liquid_ldr_geometric_gauge_invariance_tracks_phase_choice():
+    x = np.linspace(-3.0, 3.0, 7)
+    kinetic = second_derivative_kinetic(x.size, x[1] - x[0], mass=1.0)
+    model = LiquidAvoidedCrossingLDRModel(x, kinetic, mass_y=1.5)
+    times = np.linspace(0.0, 0.3, 10)
+    q_path = 0.8 * np.sin(np.linspace(0.0, np.pi, times.size))
+
+    gauge = liquid_ldr_geometric_gauge_invariance(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+    )
+
+    assert gauge["gauge_ready"] is True
+    assert "recommendation" in gauge
+    assert gauge["substeps"] == 4
+    assert gauge["with_geometry_population_delta"].shape == (times.size, 2)
+    assert gauge["without_geometry_population_delta"].shape == (times.size, 2)
+    assert gauge["with_geometry_population_delta_max_abs"] < gauge["tolerance"]
+    assert gauge["without_geometry_population_delta_max_abs"] > gauge[
+        "with_geometry_population_delta_max_abs"
+    ]
+    assert gauge["with_geometry_norm_delta_max_abs"] < 1.0e-12
+    assert np.asarray(gauge["phase_offsets"]).shape == (x.size, 2)
+    assert np.asarray(gauge["phase_slopes"]).shape == (x.size, 2)
+    convergence = liquid_ldr_geometric_gauge_substep_convergence(
+        model,
+        q_path,
+        times,
+        [1, 2, 4, 4],
+        initial_state=1,
+    )
+    assert [record["substeps"] for record in convergence["records"]] == [1, 2, 4]
+    assert convergence["recommended_substeps"] in {1, 2, 4}
+    assert convergence["any_ready"] is True
+    assert convergence["records"][0]["with_geometry_error_relative_to_baseline"] == pytest.approx(1.0)
+    assert all(record["with_geometry_population_delta_max_abs"] >= 0.0 for record in convergence["records"])
+    assert all(record["without_geometry_population_delta_max_abs"] >= 0.0 for record in convergence["records"])
+
+
+def test_liquid_ldr_geometric_hotspots_rank_berry_population_steps():
+    x = np.linspace(-3.0, 3.0, 7)
+    kinetic = second_derivative_kinetic(x.size, x[1] - x[0], mass=1.0)
+    model = LiquidAvoidedCrossingLDRModel(x, kinetic, mass_y=1.5)
+    times = np.linspace(0.0, 0.3, 10)
+    q_path = 0.8 * np.sin(np.linspace(0.0, np.pi, times.size))
+    control = compare_liquid_geometric_contribution(
+        model,
+        q_path,
+        times,
+        initial_state=1,
+    )
+    diagnostics = liquid_ldr_diagnostics(model, q_path, times)
+    step_diagnostics = liquid_ldr_geometric_step_diagnostics(
+        control,
+        times=times,
+        q_path=q_path,
+        path_diagnostics=diagnostics,
+    )
+
+    hotspots = liquid_ldr_geometric_hotspots(
+        model,
+        q_path,
+        times,
+        geometric_control=control,
+        diagnostics=diagnostics,
+        top_k=3,
+    )
+
+    assert len(hotspots) == 3
+    assert step_diagnostics["population_delta_step"].shape == (times.size - 1, 2)
+    assert step_diagnostics["step_score"].shape == (times.size - 1,)
+    assert step_diagnostics["cumulative_path_length"].shape == (times.size,)
+    np.testing.assert_allclose(
+        step_diagnostics["population_delta_step"],
+        np.diff(control["population_delta"], axis=0),
+    )
+    np.testing.assert_allclose(
+        step_diagnostics["cumulative_path_length"][1:],
+        np.cumsum(step_diagnostics["step_score"]),
+    )
+    np.testing.assert_allclose(step_diagnostics["q_delta"], np.diff(q_path))
+    np.testing.assert_allclose(step_diagnostics["abs_q_delta"], np.abs(np.diff(q_path)))
+    np.testing.assert_allclose(
+        step_diagnostics["geometric_speed_mean"],
+        0.5 * (diagnostics["geometric_speed"][:-1] + diagnostics["geometric_speed"][1:]),
+    )
+    np.testing.assert_allclose(
+        step_diagnostics["gap_min_mean"],
+        0.5 * (diagnostics["gap_min"][:-1] + diagnostics["gap_min"][1:]),
+    )
+    np.testing.assert_allclose(
+        step_diagnostics["inverse_gap_min_mean"],
+        1.0 / step_diagnostics["gap_min_mean"],
+    )
+    driver_correlations = liquid_ldr_geometric_driver_correlations(step_diagnostics)
+    assert set(driver_correlations) == {
+        "abs_q_delta",
+        "geometric_speed_mean",
+        "gap_min_mean",
+        "inverse_gap_min_mean",
+    }
+    assert all(value is None or -1.0 <= value <= 1.0 for value in driver_correlations.values())
+    assert hotspots[0]["score"] >= hotspots[1]["score"] >= hotspots[2]["score"]
+    top = hotspots[0]
+    step = top["step"]
+    expected_delta = control["population_delta"][step + 1] - control["population_delta"][step]
+    np.testing.assert_allclose(top["population_delta_step"], expected_delta)
+    assert top["dominant_state"] == int(np.argmax(np.abs(expected_delta)))
+    assert top["time_start"] == pytest.approx(times[step])
+    assert top["time_end"] == pytest.approx(times[step + 1])
+    assert top["time_start_fs"] == pytest.approx(times[step] * au2fs)
+    assert top["time_end_fs"] == pytest.approx(times[step + 1] * au2fs)
+    assert top["score"] == pytest.approx(step_diagnostics["step_score"][step])
+    assert top["q_delta"] == pytest.approx(q_path[step + 1] - q_path[step])
+    assert top["abs_q_delta"] == pytest.approx(abs(q_path[step + 1] - q_path[step]))
+    assert top["geometric_speed_mean"] == pytest.approx(
+        0.5 * (diagnostics["geometric_speed"][step] + diagnostics["geometric_speed"][step + 1])
+    )
+    assert top["gap_min_mean"] == pytest.approx(
+        0.5 * (diagnostics["gap_min"][step] + diagnostics["gap_min"][step + 1])
+    )
+    assert top["inverse_gap_min_mean"] == pytest.approx(1.0 / top["gap_min_mean"])
+    assert set(top["driver_scores"]) == {"abs_q_delta", "geometric_speed_mean", "inverse_gap_min_mean"}
+    assert top["dominant_driver"] in top["driver_scores"]
+    assert top["dominant_driver_score"] == pytest.approx(top["driver_scores"][top["dominant_driver"]])
+    assert 0.0 <= top["dominant_driver_score"] <= 1.0
+    driver_summary = liquid_ldr_hotspot_driver_summary(hotspots)
+    assert driver_summary["hotspot_count"] == len(hotspots)
+    assert driver_summary["dominant_driver"] in driver_summary["drivers"]
+    assert driver_summary["dominant_driver_count"] >= 1
+    assert driver_summary["score_sum"] == pytest.approx(sum(record["score"] for record in hotspots))
+    assert sum(driver_summary["count_by_driver"].values()) == len(hotspots)
+    assert sum(driver_summary["score_sum_by_driver"].values()) == pytest.approx(
+        driver_summary["score_sum"]
+    )
+    assert sum(driver_summary["score_fraction_by_driver"].values()) == pytest.approx(1.0)
+    assert driver_summary["top_hotspot_by_driver"][driver_summary["dominant_driver"]][
+        "dominant_driver"
+    ] == driver_summary["dominant_driver"]
+    empty_driver_summary = liquid_ldr_hotspot_driver_summary([])
+    assert empty_driver_summary["hotspot_count"] == 0
+    assert empty_driver_summary["dominant_driver"] is None
+    assert liquid_ldr_geometric_hotspots(model, q_path, times, top_k=0) == []
+
+    signal = liquid_ldr_geometric_signal_summary(control, hotspots=hotspots)
+    assert signal["sample_count"] == times.size
+    assert signal["state_count"] == 2
+    assert signal["step_count"] == times.size - 1
+    assert signal["hotspot_count"] == 3
+    assert signal["top_hotspot"] == hotspots[0]
+    assert signal["top_hotspot_score"] == pytest.approx(hotspots[0]["score"])
+    assert signal["hotspot_driver_summary"] == driver_summary
+    assert signal["step_score_max"] == pytest.approx(hotspots[0]["score"])
+    assert signal["top_step_index"] == int(np.argmax(step_diagnostics["step_score"]))
+    assert signal["step_score_sum"] == pytest.approx(float(np.sum(step_diagnostics["step_score"])))
+    assert 0.0 <= signal["top_step_score_fraction"] <= signal["top3_step_score_fraction"] <= 1.0
+    assert signal["top3_step_score_fraction"] <= signal["top5_step_score_fraction"] <= 1.0
+    assert signal["effective_step_count"] > 0.0
+    assert signal["population_delta_path_length"] >= signal["step_score_max"]
+    assert signal["visible_step_fraction"] > 0.0
+    quality = liquid_ldr_geometric_quality(control, signal_summary=signal)
+    assert quality["verdict"] == "ready"
+    assert quality["norm_stable"] is True
+    assert quality["geometry_visible"] is True
+    assert quality["enough_steps"] is True
+    quiet_quality = liquid_ldr_geometric_quality(
+        control,
+        signal_summary=signal,
+        population_tolerance=10.0,
+    )
+    assert quiet_quality["verdict"] == "geometry_quiet"
+    readiness = liquid_ldr_geometric_readiness(quality)
+    assert readiness["verdict"] == "ready"
+    assert readiness["ready"] is True
+    assert readiness["failed_checks"] == []
+    assert readiness["checks"][0]["name"] == "quality"
+    quiet_readiness = liquid_ldr_geometric_readiness(quiet_quality)
+    assert quiet_readiness["ready"] is False
+    assert quiet_readiness["verdict"] == "quality_limited"
+    stride_convergence = liquid_ldr_geometric_stride_convergence(
+        model,
+        q_path,
+        times,
+        [1, 2, 2, 3],
+        initial_state=1,
+    )
+    assert stride_convergence["baseline_stride"] == 1
+    assert stride_convergence["recommended_stride"] in {1, 2, 3}
+    assert stride_convergence["any_ready"] is True
+    assert [record["stride"] for record in stride_convergence["records"]] == [1, 2, 3]
+    assert stride_convergence["records"][0]["indices"] == list(range(times.size))
+    for record in stride_convergence["records"]:
+        assert record["indices"][0] == 0
+        assert record["indices"][-1] == times.size - 1
+        assert record["sample_count"] == len(record["indices"])
+        assert record["step_count"] == record["sample_count"] - 1
+        assert record["quality_verdict"] in {"ready", "geometry_quiet", "norm_limited", "too_short"}
+        assert record["norm_error_max"] < 1.0e-12
+        assert record["population_delta_max_abs"] >= 0.0
+        assert "top_hotspot_score" in record
+    assert stride_convergence["records"][0]["population_delta_max_abs_relative_to_baseline"] == pytest.approx(1.0)
+    assert stride_convergence["records"][0]["population_delta_path_length_relative_to_baseline"] == pytest.approx(
+        1.0
+    )
+
+
+def test_embedded_h2_ldr_snapshot_builds_apes_and_overlap_with_runner():
+    frame = XYZFrame(
+        ("H", "H", "O", "H", "H"),
+        np.array(
+            [
+                [-0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [1.7, 0.7, 0.0],
+            ]
+        ),
+        time=0.0,
+    )
+
+    class FakeElectronic:
+        def __init__(self, bond):
+            self.bond = float(bond)
+
+        def overlap(self, other):
+            delta = self.bond - other.bond
+            c = np.cos(0.1 * delta)
+            s = np.sin(0.1 * delta)
+            return np.array([[c, -s], [s, c]])
+
+    def runner(geometry, pc_coords, pc_charges):
+        bond = np.linalg.norm(geometry[1] - geometry[0])
+        field_shift = float(np.sum(pc_charges / np.linalg.norm(pc_coords - geometry.mean(axis=0), axis=1)))
+        return np.array([bond + 0.01 * field_shift, bond + 0.5 + 0.01 * field_shift]), FakeElectronic(bond)
+
+    snapshot = embedded_h2_casci_ldr_snapshot(
+        frame,
+        [1.2, 1.4, 1.6],
+        solute_atoms=2,
+        axis_atoms=(0, 1),
+        electronic_runner=runner,
+    )
+    pc_coords, pc_charges = solvent_point_charges_from_frame(frame, solute_atoms=2)
+
+    assert snapshot.apes.shape == (3, 2)
+    assert snapshot.overlap.shape == (3, 2, 3, 2)
+    np.testing.assert_allclose(snapshot.overlap[0, :, 0, :], np.eye(2), atol=1e-12)
+    np.testing.assert_allclose(snapshot.point_charge_coords, pc_coords)
+    np.testing.assert_allclose(snapshot.point_charge_charges, pc_charges)
+    assert snapshot.solvent_coordinate is not None
+
+
+def test_solvent_embedded_ldr_generic_builder_supports_custom_solute_coordinate():
+    frame = XYZFrame(
+        ("C", "O", "H", "O", "H", "H"),
+        np.array(
+            [
+                [-0.4, 0.0, 0.0],
+                [0.4, 0.0, 0.0],
+                [0.0, 0.8, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [1.7, 0.7, 0.0],
+            ]
+        ),
+        time=0.0,
+    )
+
+    class FakeElectronic:
+        def __init__(self, coordinate):
+            self.coordinate = float(coordinate)
+
+        def overlap(self, other):
+            angle = 0.08 * (self.coordinate - other.coordinate)
+            c = np.cos(angle)
+            s = np.sin(angle)
+            return np.array([[c, -s], [s, c]])
+
+    def geometry_builder(coordinate, *, frame, point_charge_coords, point_charge_charges):
+        center = np.mean(frame.positions[:3], axis=0)
+        return np.array(
+            [
+                center + [-0.5 * coordinate, 0.0, 0.0],
+                center + [0.5 * coordinate, 0.0, 0.0],
+                center + [0.0, 0.7, 0.0],
+            ]
+        )
+
+    def runner(geometry, pc_coords, pc_charges):
+        coordinate = np.linalg.norm(geometry[1] - geometry[0])
+        field = float(np.sum(pc_charges / np.linalg.norm(pc_coords - geometry.mean(axis=0), axis=1)))
+        return (
+            np.array(
+                [
+                    0.2 * (coordinate - 1.0) ** 2 + 0.01 * field,
+                    0.4 + 0.1 * (coordinate - 1.4) ** 2 - 0.005 * field,
+                ]
+            ),
+            FakeElectronic(coordinate),
+        )
+
+    snapshot = solvent_embedded_ldr_snapshot(
+        frame,
+        [0.9, 1.1, 1.3],
+        geometry_builder=geometry_builder,
+        electronic_runner=runner,
+        solute_atoms=3,
+        nstates=2,
+        solvent_coordinate_builder=lambda frame, point_charge_coords, point_charge_charges: np.sum(
+            point_charge_charges
+            / np.linalg.norm(point_charge_coords - np.mean(frame.positions[:3], axis=0), axis=1)
+        ),
+        keep_objects=False,
+    )
+    trajectory = build_solvent_embedded_ldr_trajectory(
+        [frame, XYZFrame(frame.symbols, frame.positions + np.array([0.0, 0.02, 0.0]), time=0.2)],
+        [0.9, 1.1, 1.3],
+        geometry_builder=geometry_builder,
+        electronic_runner=runner,
+        solute_atoms=3,
+        nstates=2,
+        keep_objects=False,
+    )
+
+    assert snapshot.apes.shape == (3, 2)
+    assert snapshot.overlap.shape == (3, 2, 3, 2)
+    assert snapshot.electronic_objects is None
+    assert snapshot.solvent_coordinate is not None
+    np.testing.assert_allclose(snapshot.overlap[1, :, 1, :], np.eye(2), atol=1.0e-12)
+    assert trajectory.bond_grid.shape == (3,)
+    assert len(trajectory.snapshots) == 2
+    np.testing.assert_allclose(trajectory.times, [0.0, 0.2])
+
+
+def test_embedded_casci_ldr_snapshot_supports_molecular_bond_coordinate_with_runner():
+    frame = XYZFrame(
+        ("C", "O", "H", "H", "H", "H", "O", "H", "H"),
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.43, 0.0, 0.0],
+                [-0.37, 1.02, 0.0],
+                [-0.37, -0.51, 0.89],
+                [-0.37, -0.51, -0.89],
+                [1.83, 0.89, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.8, 0.0, 0.0],
+                [3.7, 0.7, 0.0],
+            ]
+        ),
+        time=0.0,
+    )
+    geometry_builder = solute_bond_distance_geometry_builder(
+        frame,
+        solute_atoms=6,
+        atom_pair=(0, 1),
+        moving_atoms=(1, 5),
+    )
+
+    class FakeElectronic:
+        def __init__(self, co_distance):
+            self.co_distance = float(co_distance)
+
+        def overlap(self, other):
+            angle = 0.03 * (self.co_distance - other.co_distance)
+            c = np.cos(angle)
+            s = np.sin(angle)
+            return np.array([[c, -s], [s, c]])
+
+    def runner(geometry, pc_coords, pc_charges):
+        co_distance = np.linalg.norm(geometry[1] - geometry[0])
+        solvent_shift = float(np.sum(pc_charges / np.linalg.norm(pc_coords - geometry.mean(axis=0), axis=1)))
+        return (
+            np.array(
+                [
+                    0.5 * (co_distance - 1.43) ** 2 + 0.01 * solvent_shift,
+                    0.2 + 0.3 * (co_distance - 1.60) ** 2 - 0.004 * solvent_shift,
+                ]
+            ),
+            FakeElectronic(co_distance),
+        )
+
+    snapshot = embedded_casci_ldr_snapshot(
+        frame,
+        [1.35, 1.43, 1.55],
+        geometry_builder=geometry_builder,
+        solute_atoms=6,
+        nstates=2,
+        ncas=4,
+        nelecas=4,
+        electronic_runner=runner,
+        keep_objects=False,
+    )
+    moved = geometry_builder(1.55)
+    trajectory = build_embedded_casci_ldr_trajectory(
+        [frame, XYZFrame(frame.symbols, frame.positions + np.array([0.0, 0.0, 0.01]), time=0.3)],
+        [1.35, 1.43, 1.55],
+        geometry_builder=geometry_builder,
+        solute_atoms=6,
+        nstates=2,
+        ncas=4,
+        nelecas=4,
+        electronic_runner=runner,
+        keep_objects=False,
+    )
+
+    np.testing.assert_allclose(np.linalg.norm(moved[1] - moved[0]), 1.55)
+    np.testing.assert_allclose(moved[1] - frame.positions[1], [0.12, 0.0, 0.0])
+    np.testing.assert_allclose(moved[5] - frame.positions[5], [0.12, 0.0, 0.0])
+    assert snapshot.apes.shape == (3, 2)
+    assert snapshot.overlap.shape == (3, 2, 3, 2)
+    assert snapshot.point_charge_coords.shape == (3, 3)
+    assert snapshot.electronic_objects is None
+    assert len(trajectory.snapshots) == 2
+    np.testing.assert_allclose(trajectory.times, [0.0, 0.3])
+
+
+def test_embedded_ldr_frame_overlap_diagnostics_tracks_state_rotation():
+    class FakeElectronic:
+        def __init__(self, angle):
+            self.angle = float(angle)
+
+        def overlap(self, other):
+            theta = other.angle - self.angle
+            c = np.cos(theta)
+            s = np.sin(theta)
+            return np.array([[c, -s], [s, c]], dtype=complex)
+
+    grid = np.array([1.0, 1.2])
+    overlap = np.zeros((2, 2, 2, 2), dtype=complex)
+    for index in range(2):
+        overlap[index, :, index, :] = np.eye(2)
+    snapshots = (
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=grid,
+            apes=np.array([[0.0, 0.3], [0.1, 0.4]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(0.0), FakeElectronic(0.1)),
+        ),
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=grid,
+            apes=np.array([[0.02, 0.32], [0.12, 0.42]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(0.05), FakeElectronic(0.2)),
+        ),
+    )
+
+    diagnostics = embedded_ldr_frame_overlap_diagnostics(snapshots, times=[0.0, 0.5])
+
+    assert diagnostics["overlap_sequence"].shape == (1, 2, 2, 2)
+    assert diagnostics["unitary_transport_sequence"].shape == (1, 2, 2, 2)
+    assert diagnostics["deviation"].shape == (1, 2)
+    assert diagnostics["mixing_norm_max"] > 0.0
+    assert diagnostics["unitarity_error_max"] < 1.0e-12
+    assert diagnostics["unitary_transport_mixing_norm_max"] > 0.0
+    assert diagnostics["unitary_transport_unitarity_error_max"] < 1.0e-12
+    assert diagnostics["phase_invariant_deviation_max"] > 0.0
+    assert diagnostics["phase_invariant_mixing_norm_max"] > 0.0
+    assert diagnostics["phase_aligned_unitary_transport_sequence"].shape == (1, 2, 2, 2)
+    assert diagnostics["polar_residual_max"] < 1.0e-12
+    np.testing.assert_allclose(
+        diagnostics["frame_overlap_speed"],
+        diagnostics["deviation"] / 0.5,
+    )
+
+
+def test_embedded_ldr_frame_overlap_diagnostics_ignores_diagonal_phase_gauge():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    sign_flip = -np.eye(2, dtype=complex)
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = (
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.2]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(np.eye(2)),),
+        ),
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.2]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(sign_flip),),
+        ),
+    )
+
+    diagnostics = embedded_ldr_frame_overlap_diagnostics(snapshots)
+    hotspots = embedded_ldr_geometric_hotspots(
+        diagnostics,
+        coordinate_grid=[1.0],
+        frame_indices=[0, 1],
+    )
+    quality = embedded_ldr_geometric_quality(diagnostics, hotspots)
+
+    assert diagnostics["unitary_transport_deviation_max"] == pytest.approx(np.sqrt(8.0))
+    assert diagnostics["phase_invariant_deviation_max"] < 1.0e-12
+    assert diagnostics["phase_invariant_mixing_norm_max"] < 1.0e-12
+    assert hotspots["geometric_score_max"] < 1.0e-12
+    assert hotspots["records"][0]["unitary_transport_deviation"] == pytest.approx(np.sqrt(8.0))
+    assert hotspots["records"][0]["phase_invariant_deviation"] < 1.0e-12
+    assert quality["verdict"] == "geometry_quiet"
+
+
+def test_embedded_ldr_frame_overlap_diagnostics_polar_transport_handles_nonunitary_blocks():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    block = np.array([[0.8, -0.1], [0.1, 0.6]], dtype=complex)
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = (
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.2]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(np.eye(2)),),
+        ),
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.01, 0.21]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(block),),
+        ),
+    )
+
+    diagnostics = embedded_ldr_frame_overlap_diagnostics(snapshots)
+
+    assert diagnostics["unitarity_error_max"] > 0.0
+    assert diagnostics["polar_residual_max"] > 0.0
+    assert diagnostics["unitary_transport_unitarity_error_max"] < 1.0e-12
+    assert diagnostics["singular_value_min_global"] < 1.0
+    assert diagnostics["singular_value_max_global"] < 1.0
+
+
+def test_embedded_ldr_unitary_frame_transport_changes_populations_for_rotating_basis():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    theta = 0.2
+    c = np.cos(theta)
+    s = np.sin(theta)
+    rotation = np.array([[c, -s], [s, c]], dtype=complex)
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = (
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(np.eye(2)),),
+        ),
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(rotation),),
+        ),
+    )
+    kinetic = np.zeros((1, 1))
+
+    plain = propagate_embedded_ldr_snapshots(snapshots, [0.0, 0.2], kinetic, initial_state=0)
+    transported = propagate_embedded_ldr_snapshots(
+        snapshots,
+        [0.0, 0.2],
+        kinetic,
+        initial_state=0,
+        frame_transport="unitary",
+        substeps=3,
+    )
+
+    np.testing.assert_allclose(plain["populations"][-1], [1.0, 0.0], atol=1.0e-12)
+    np.testing.assert_allclose(
+        transported["populations"][-1],
+        [np.cos(theta) ** 2, np.sin(theta) ** 2],
+        atol=1.0e-12,
+    )
+    assert transported["frame_transport"] == "unitary"
+    assert transported["substeps"] == 3
+    with pytest.raises(ValueError, match="substeps"):
+        propagate_embedded_ldr_snapshots(snapshots, [0.0, 0.2], kinetic, substeps=0)
+
+
+def test_embedded_ldr_geometric_contribution_compares_frame_transport_on_off():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    theta = 0.25
+    c = np.cos(theta)
+    s = np.sin(theta)
+    rotation = np.array([[c, -s], [s, c]], dtype=complex)
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = (
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(np.eye(2)),),
+        ),
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(rotation),),
+        ),
+    )
+    kinetic = np.zeros((1, 1))
+
+    control = compare_embedded_geometric_contribution(
+        snapshots,
+        [0.0, 0.2],
+        kinetic,
+        initial_state=0,
+        frame_transport="unitary",
+    )
+
+    np.testing.assert_allclose(control["without_geometry"]["populations"][-1], [1.0, 0.0], atol=1.0e-12)
+    np.testing.assert_allclose(
+        control["with_geometry"]["populations"][-1],
+        [np.cos(theta) ** 2, np.sin(theta) ** 2],
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        control["population_delta"],
+        control["with_geometry"]["populations"] - control["without_geometry"]["populations"],
+    )
+    assert control["frame_transport"] == "unitary"
+    assert control["population_delta_max_abs"] == pytest.approx(np.sin(theta) ** 2)
+    assert control["population_delta_final_norm"] > 0.0
+    assert control["with_geometry_norm_max_error"] < 1.0e-12
+    assert control["without_geometry_norm_max_error"] < 1.0e-12
+    with pytest.raises(ValueError, match="frame_transport"):
+        compare_embedded_geometric_contribution(snapshots, [0.0, 0.2], kinetic, frame_transport=None)
+
+
+def test_embedded_ldr_substep_convergence_compares_to_finest_reference():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    def rotation(theta):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=complex)
+
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = tuple(
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.01 * index, 0.2 + 0.03 * index]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(rotation(theta)),),
+        )
+        for index, theta in enumerate((0.0, 0.08, 0.22))
+    )
+    kinetic = np.zeros((1, 1))
+
+    convergence = embedded_ldr_substep_convergence(
+        snapshots,
+        [0.0, 0.2, 0.45],
+        kinetic,
+        [1, 2, 4, 4],
+        frame_transport="unitary",
+        initial_state=0,
+        population_tolerance=1.0e-6,
+        geometric_tolerance=1.0e-6,
+    )
+
+    assert [record["substeps"] for record in convergence["records"]] == [1, 2, 4]
+    assert convergence["reference_substeps"] == 4
+    assert convergence["recommended_substeps"] in {1, 2, 4}
+    assert convergence["any_ready"] is True
+    assert convergence["frame_transport"] == "unitary"
+    assert convergence["records"][-1]["is_reference"] is True
+    assert convergence["records"][-1]["ready"] is True
+    assert convergence["records"][-1]["population_error_max_abs"] == pytest.approx(0.0)
+    assert convergence["records"][-1]["geometric_population_delta_error_max_abs"] == pytest.approx(0.0)
+    with pytest.raises(ValueError, match="substep"):
+        embedded_ldr_substep_convergence(snapshots, [0.0, 0.2, 0.45], kinetic, [0])
+
+
+def test_embedded_ldr_geometric_population_hotspots_rank_transport_effect_steps():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    def rotation(theta):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=complex)
+
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = tuple(
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(rotation(theta)),),
+        )
+        for theta in (0.0, 0.05, 0.35)
+    )
+    kinetic = np.zeros((1, 1))
+    times = np.array([0.0, 0.2, 0.5])
+    control = compare_embedded_geometric_contribution(
+        snapshots,
+        times,
+        kinetic,
+        initial_state=0,
+        frame_transport="unitary",
+    )
+
+    steps = embedded_ldr_geometric_step_diagnostics(
+        control,
+        times=times,
+        frame_indices=[0, 1, 2],
+        source_frame_indices=[0, 3, 9],
+    )
+    hotspots = embedded_ldr_geometric_population_hotspots(
+        control,
+        times=times,
+        frame_indices=[0, 1, 2],
+        source_frame_indices=[0, 3, 9],
+        top_k=2,
+    )
+    signal = embedded_ldr_geometric_population_signal_summary(
+        control,
+        hotspots=hotspots,
+        geometric_tolerance=1.0e-8,
+    )
+    quality = embedded_ldr_geometric_population_quality(
+        control,
+        signal_summary=signal,
+        population_tolerance=1.0e-8,
+    )
+    quiet_quality = embedded_ldr_geometric_population_quality(
+        control,
+        signal_summary=signal,
+        population_tolerance=10.0,
+    )
+
+    assert steps["population_delta_step"].shape == (2, 2)
+    assert steps["step_score"].shape == (2,)
+    assert steps["frame_transport"] == "unitary"
+    np.testing.assert_array_equal(steps["frame_start"], [0, 1])
+    np.testing.assert_array_equal(steps["source_frame_end"], [3, 9])
+    np.testing.assert_allclose(steps["cumulative_path_length"][1:], np.cumsum(steps["step_score"]))
+    assert hotspots[0]["score"] >= hotspots[1]["score"]
+    assert hotspots[0]["step"] == 1
+    assert hotspots[0]["frame_start"] == 1
+    assert hotspots[0]["frame_end"] == 2
+    assert hotspots[0]["source_frame_start"] == 3
+    assert hotspots[0]["source_frame_end"] == 9
+    assert hotspots[0]["frame_transport"] == "unitary"
+    np.testing.assert_allclose(
+        hotspots[0]["population_delta_step"],
+        steps["population_delta_step"][1],
+    )
+    assert signal["frame_transport"] == "unitary"
+    assert signal["hotspot_count"] == 2
+    assert signal["top_hotspot"] == hotspots[0]
+    assert signal["visible_step_fraction"] > 0.0
+    assert quality["verdict"] == "ready"
+    assert quality["frame_transport"] == "unitary"
+    assert quality["geometry_visible"] is True
+    assert quality["norm_stable"] is True
+    assert quality["enough_steps"] is True
+    assert "Embedded liquid LDR" in quality["recommendation"]
+    assert quiet_quality["verdict"] == "geometry_quiet"
+    assert embedded_ldr_geometric_population_hotspots(control, times=times, top_k=0) == []
+    with pytest.raises(ValueError, match="frame_indices"):
+        embedded_ldr_geometric_step_diagnostics(control, times=times, frame_indices=[0, 1])
+
+
+def test_embedded_ldr_geometric_population_stride_convergence_tracks_retention():
+    class FakeElectronic:
+        def __init__(self, block):
+            self.block = np.asarray(block, dtype=complex)
+
+        def overlap(self, other):
+            return other.block
+
+    def rotation(theta):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=complex)
+
+    overlap = np.eye(2, dtype=complex).reshape(1, 2, 1, 2)
+    snapshots = tuple(
+        SolventEmbeddedLDRSnapshot(
+            bond_grid=np.array([1.0]),
+            apes=np.array([[0.0, 0.0]]),
+            overlap=overlap,
+            point_charge_coords=np.zeros((0, 3)),
+            point_charge_charges=np.zeros(0),
+            electronic_objects=(FakeElectronic(rotation(theta)),),
+        )
+        for theta in (0.0, 0.05, 0.35)
+    )
+    kinetic = np.zeros((1, 1))
+    times = np.array([0.0, 0.2, 0.5])
+
+    convergence = embedded_ldr_geometric_population_stride_convergence(
+        snapshots,
+        times,
+        kinetic,
+        [1, 2, 2],
+        frame_transport="unitary",
+        initial_state=0,
+        source_frame_indices=[0, 3, 9],
+        substeps=2,
+    )
+
+    assert [record["stride"] for record in convergence["records"]] == [1, 2]
+    assert convergence["baseline_stride"] == 1
+    assert convergence["recommended_stride"] in {1, 2}
+    assert convergence["any_ready"] is True
+    assert convergence["frame_transport"] == "unitary"
+    assert convergence["substeps"] == 2
+    assert convergence["records"][0]["indices"] == [0, 1, 2]
+    assert convergence["records"][0]["source_frame_indices"] == [0, 3, 9]
+    assert convergence["records"][1]["indices"] == [0, 2]
+    assert convergence["records"][1]["source_frame_indices"] == [0, 9]
+    assert convergence["records"][0]["population_delta_max_abs_relative_to_baseline"] == pytest.approx(1.0)
+    assert convergence["records"][0]["population_delta_path_length_relative_to_baseline"] == pytest.approx(1.0)
+    assert convergence["records"][0]["top_hotspot"]["source_frame_end"] == 9
+    assert all(record["norm_error_max"] >= 0.0 for record in convergence["records"])
+    with pytest.raises(ValueError, match="strides"):
+        embedded_ldr_geometric_population_stride_convergence(snapshots, times, kinetic, [0])
+
+
+def test_embedded_ldr_transport_holonomy_accumulates_frame_rotations():
+    theta1 = 0.2
+    theta2 = -0.05
+
+    def rotation(theta):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=complex)
+
+    diagnostics = {
+        "unitary_transport_sequence": np.asarray(
+            [
+                [rotation(theta1)],
+                [rotation(theta2)],
+            ],
+            dtype=complex,
+        )
+    }
+
+    holonomy = embedded_ldr_transport_holonomy(diagnostics)
+
+    np.testing.assert_allclose(holonomy["final_transport"][0], rotation(theta1 + theta2), atol=1.0e-12)
+    assert holonomy["cumulative_transport"].shape == (3, 1, 2, 2)
+    assert holonomy["unitarity_error_max"] < 1.0e-12
+    assert holonomy["final_mixing_norm_max"] > 0.0
+    assert holonomy["final_eigenphase_abs_max"] == pytest.approx(abs(theta1 + theta2))
+
+
+def test_embedded_ldr_phase_aligned_holonomy_removes_diagonal_phase_gauge():
+    diagnostics = {
+        "unitary_transport_sequence": np.asarray([[-np.eye(2, dtype=complex)]]),
+        "phase_aligned_unitary_transport_sequence": np.asarray([[np.eye(2, dtype=complex)]]),
+    }
+
+    unitary = embedded_ldr_transport_holonomy(diagnostics, transport="unitary")
+    phase_aligned = embedded_ldr_transport_holonomy(diagnostics, transport="phase_aligned")
+
+    assert unitary["final_deviation_max"] == pytest.approx(np.sqrt(8.0))
+    assert phase_aligned["transport"] == "phase_aligned"
+    assert phase_aligned["final_deviation_max"] < 1.0e-12
+    assert phase_aligned["final_mixing_norm_max"] < 1.0e-12
+
+
+def test_embedded_ldr_geometric_hotspots_rank_transport_and_leakage():
+    diagnostics = {
+        "unitary_transport_deviation": np.array([[0.1, 0.2], [0.7, 0.1], [0.05, 0.4]]),
+        "unitary_transport_mixing_norm": np.array([[0.01, 0.03], [0.2, 0.01], [0.02, 0.15]]),
+        "deviation": np.array([[0.2, 0.25], [0.8, 0.2], [0.1, 0.5]]),
+        "unitarity_error": np.array([[0.0, 0.01], [0.02, 0.0], [0.0, 0.6]]),
+        "polar_residual": np.array([[0.0, 0.02], [0.03, 0.0], [0.0, 0.2]]),
+        "singular_value_min": np.array([[1.0, 0.99], [0.98, 1.0], [1.0, 0.7]]),
+        "singular_value_max": np.array([[1.0, 1.01], [1.02, 1.0], [1.0, 1.1]]),
+    }
+
+    hotspots = embedded_ldr_geometric_hotspots(
+        diagnostics,
+        times=[0.0, 0.1, 0.4, 0.9],
+        coordinate_grid=[1.2, 1.4],
+        frame_indices=[0, 3, 7, 9],
+        source_frame_indices=[0, 30, 70, 90],
+        top_k=2,
+    )
+
+    np.testing.assert_array_equal(hotspots["top_indices"], [2, 1])
+    assert hotspots["records"][0]["step"] == 2
+    assert hotspots["records"][0]["grid_index"] == 1
+    assert hotspots["records"][0]["coordinate"] == pytest.approx(1.4)
+    assert hotspots["records"][0]["frame_start"] == 7
+    assert hotspots["records"][0]["frame_end"] == 9
+    assert hotspots["records"][0]["source_frame_start"] == 70
+    assert hotspots["records"][0]["source_frame_end"] == 90
+    assert hotspots["records"][0]["time_start"] == pytest.approx(0.4)
+    assert hotspots["records"][0]["time_end"] == pytest.approx(0.9)
+    assert hotspots["records"][0]["leakage_score"] == pytest.approx(0.6)
+    assert hotspots["records"][0]["dominant_source"] == "mixed"
+    assert hotspots["records"][1]["dominant_source"] == "geometric"
+    assert hotspots["geometric_score_max"] == pytest.approx(0.7)
+    assert hotspots["leakage_score_max"] == pytest.approx(0.6)
+
+
+def test_embedded_ldr_geometric_quality_reports_readiness_and_recommendation():
+    diagnostics = {
+        "unitary_transport_deviation": np.array([[0.2], [0.01]]),
+        "unitary_transport_mixing_norm": np.array([[0.1], [0.005]]),
+        "deviation": np.array([[0.2], [0.5]]),
+        "unitarity_error": np.array([[0.0], [0.3]]),
+        "polar_residual": np.array([[0.0], [0.2]]),
+        "singular_value_min": np.array([[1.0], [0.8]]),
+        "singular_value_max": np.array([[1.0], [1.1]]),
+    }
+    leakage_quality = embedded_ldr_geometric_quality(diagnostics, leakage_tolerance=0.05)
+    quiet_diagnostics = dict(diagnostics)
+    quiet_diagnostics.update(
+        {
+            "unitary_transport_deviation": np.array([[1.0e-8]]),
+            "unitary_transport_mixing_norm": np.array([[1.0e-8]]),
+            "deviation": np.array([[1.0e-8]]),
+            "unitarity_error": np.array([[0.0]]),
+            "polar_residual": np.array([[0.0]]),
+            "singular_value_min": np.array([[1.0]]),
+            "singular_value_max": np.array([[1.0]]),
+        }
+    )
+    quiet_quality = embedded_ldr_geometric_quality(quiet_diagnostics)
+    ready_diagnostics = dict(quiet_diagnostics)
+    ready_diagnostics.update(
+        {
+            "unitary_transport_deviation": np.array([[0.05]]),
+            "unitary_transport_mixing_norm": np.array([[0.02]]),
+            "deviation": np.array([[0.05]]),
+        }
+    )
+    ready_quality = embedded_ldr_geometric_quality(ready_diagnostics)
+
+    assert leakage_quality["verdict"] == "leakage_limited"
+    assert leakage_quality["subspace_unitary"] is False
+    assert "increase embedded states" in leakage_quality["recommendation"]
+    assert quiet_quality["verdict"] == "geometry_quiet"
+    assert quiet_quality["subspace_unitary"] is True
+    assert quiet_quality["geometry_visible"] is False
+    assert ready_quality["verdict"] == "ready"
+    assert ready_quality["geometry_visible"] is True
+    readiness = embedded_ldr_geometric_readiness(
+        ready_quality,
+        population_quality={
+            "verdict": "ready",
+            "recommendation": "population signal ready",
+        },
+        state_convergence={"any_ready": True, "recommended_nstates": 2},
+        frame_step_convergence={"any_subspace_unitary": True, "recommended_frame_step": 1},
+    )
+    assert readiness["verdict"] == "ready"
+    assert readiness["ready"] is True
+    assert readiness["failed_checks"] == []
+    assert {check["name"] for check in readiness["checks"]} == {
+        "frame_quality",
+        "population_quality",
+        "state_convergence",
+        "frame_step_convergence",
+    }
+    limited = embedded_ldr_geometric_readiness(
+        ready_quality,
+        population_quality={
+            "verdict": "geometry_quiet",
+            "recommendation": "population too small",
+        },
+    )
+    assert limited["verdict"] == "population_quality_limited"
+    assert limited["ready"] is False
+    assert limited["failed_checks"] == ["population_quality"]
+    assert limited["recommendation"] == "population too small"
+
+
+def test_embedded_ldr_geometric_signal_summary_counts_interpretable_motion():
+    diagnostics = {
+        "unitary_transport_deviation": np.array([[0.2, 0.05], [0.01, 0.3]]),
+        "unitary_transport_mixing_norm": np.array([[0.1, 0.02], [0.005, 0.2]]),
+        "phase_invariant_deviation": np.array([[0.2, 0.0], [0.01, 0.3]]),
+        "phase_invariant_mixing_norm": np.array([[0.1, 0.0], [0.005, 0.2]]),
+        "unitarity_error": np.array([[0.0, 0.0], [0.0, 0.4]]),
+        "polar_residual": np.array([[0.0, 0.0], [0.0, 0.2]]),
+        "singular_value_min": np.array([[1.0, 1.0], [1.0, 0.7]]),
+        "singular_value_max": np.array([[1.0, 1.0], [1.0, 1.1]]),
+    }
+
+    signal = embedded_ldr_geometric_signal_summary(
+        diagnostics,
+        leakage_tolerance=0.05,
+        geometric_tolerance=0.05,
+    )
+
+    assert signal["visible_count"] == 2
+    assert signal["subspace_unitary_count"] == 3
+    assert signal["interpretable_visible_count"] == 1
+    assert signal["visible_step_count"] == 2
+    assert signal["interpretable_visible_step_count"] == 1
+    assert signal["max_geometric_step"] == 1
+    assert signal["max_geometric_grid_index"] == 1
+    assert signal["max_interpretable_geometric_step"] == 0
+    assert signal["max_interpretable_geometric_grid_index"] == 0
+    assert signal["max_interpretable_geometric_deviation"] == pytest.approx(0.2)
+
+
+def test_embedded_ldr_geometric_state_convergence_recommends_ready_subspace():
+    class FrameOverlapObject:
+        def __init__(self, incoming_overlap=None):
+            self.incoming_overlap = incoming_overlap
+
+        def overlap(self, other):
+            return np.asarray(other.incoming_overlap, dtype=complex)
+
+    def trajectory_for(block):
+        block = np.asarray(block, dtype=complex)
+        nstates = block.shape[0]
+        overlap = np.zeros((1, nstates, 1, nstates), dtype=complex)
+        overlap[0, :, 0, :] = np.eye(nstates)
+        snapshots = (
+            SolventEmbeddedLDRSnapshot(
+                bond_grid=np.array([2.7]),
+                apes=np.zeros((1, nstates)),
+                overlap=overlap,
+                point_charge_coords=np.zeros((0, 3)),
+                point_charge_charges=np.zeros(0),
+                electronic_objects=(FrameOverlapObject(),),
+            ),
+            SolventEmbeddedLDRSnapshot(
+                bond_grid=np.array([2.7]),
+                apes=np.zeros((1, nstates)),
+                overlap=overlap,
+                point_charge_coords=np.zeros((0, 3)),
+                point_charge_charges=np.zeros(0),
+                electronic_objects=(FrameOverlapObject(block),),
+            ),
+        )
+        return SolventEmbeddedLDRTrajectory(snapshots, np.array([0.0, 1.0]))
+
+    theta = 0.1
+    c, s = np.cos(theta), np.sin(theta)
+    leaky = np.diag([0.6, 1.0])
+    unitary = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+    convergence = embedded_ldr_geometric_state_convergence(
+        {
+            "two": trajectory_for(leaky),
+            "three": trajectory_for(unitary),
+        },
+        coordinate_grid=[2.7],
+        frame_indices=[0, 1],
+        source_frame_indices=[0, 30],
+        leakage_tolerance=1.0e-3,
+        geometric_tolerance=1.0e-5,
+    )
+
+    assert convergence["recommended_label"] == "three"
+    assert convergence["recommended_nstates"] == 3
+    assert convergence["any_ready"] is True
+    assert convergence["all_ready"] is False
+    assert convergence["leakage_monotonic_nonincreasing"] is True
+    assert convergence["ordered_records"][0]["verdict"] == "leakage_limited"
+    assert convergence["ordered_records"][1]["verdict"] == "ready"
+    assert convergence["ordered_records"][1]["top_record"]["source_frame_end"] == 30
+
+
+def test_methanol_full_fg_coordinate_path_is_body_frame_invariant():
+    symbols = ("C", "O", "H", "H", "H", "H", "O", "H", "H")
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.70, 0.0, 0.0],
+            [-0.70, 1.93, 0.0],
+            [-0.70, -0.96, 1.68],
+            [-0.70, -0.96, -1.68],
+            [3.46, 1.68, 0.0],
+            [7.5, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+            [6.9, 1.3, 0.0],
+        ],
+        dtype=float,
+    )
+    theta = 0.37
+    rotation = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    shifted = positions @ rotation.T + np.array([4.0, -2.0, 1.2])
+    path = methanol_full_fg_coordinate_path(
+        [XYZFrame(symbols, positions, time=0.0), XYZFrame(symbols, shifted, time=0.5)],
+        source_frame_indices=[2, 5],
+    )
+    diagnostics = methanol_fg_path_diagnostics(path)
+
+    assert path[0].labels == path[1].labels
+    assert path[0].groups.count("oh_stretch") == 1
+    assert path[0].groups.count("coh_bend") == 1
+    assert path[0].groups.count("solvent_cartesian") == 9
+    np.testing.assert_allclose(path[0].centers, path[1].centers, atol=1.0e-12)
+    assert path[0].source_frame == 2
+    assert path[1].source_frame == 5
+    assert diagnostics["fg_path_ready"] is True
+    assert diagnostics["group_counts"] == {
+        "oh_stretch": 1,
+        "coh_bend": 1,
+        "solvent_cartesian": 9,
+    }
+    assert diagnostics["min_gaussian_overlap_magnitude"] == pytest.approx(1.0)
+
+
+def test_methanol_full_fg_coordinate_path_reports_internal_values_and_jumps():
+    symbols = ("C", "O", "H", "H", "H", "H", "O", "H", "H")
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [-0.5, 1.0, 0.0],
+            [-0.5, -0.8, 0.8],
+            [-0.5, -0.8, -0.8],
+            [2.0, 1.5, 0.0],
+            [5.0, 0.0, 0.0],
+            [5.8, 0.0, 0.0],
+            [4.7, 0.7, 0.0],
+        ],
+        dtype=float,
+    )
+    moved = positions.copy()
+    moved[6:] += np.array([20.0, 0.0, 0.0])
+    path = methanol_full_fg_coordinate_path(
+        [XYZFrame(symbols, positions, time=0.0), XYZFrame(symbols, moved, time=1.0)]
+    )
+    diagnostics = methanol_fg_path_diagnostics(path, width_scaled_jump_threshold=1.0)
+
+    expected_oh = np.linalg.norm(positions[5] - positions[1])
+    expected_angle = np.arccos(
+        np.dot(positions[0] - positions[1], positions[5] - positions[1])
+        / (
+            np.linalg.norm(positions[0] - positions[1])
+            * np.linalg.norm(positions[5] - positions[1])
+        )
+    )
+    assert path[0].centers[0] == pytest.approx(expected_oh)
+    assert path[0].centers[1] == pytest.approx(expected_angle)
+    assert np.all(path[0].masses > 0.0)
+    assert np.all(path[0].widths > 0.0)
+    assert diagnostics["fg_path_ready"] is False
+    assert diagnostics["verdict"] == "fg_path_limited"
+    assert "frame_jumps" in diagnostics["failed_checks"]
+    assert diagnostics["max_width_scaled_displacement"] > 1.0
+    assert diagnostics["min_gaussian_overlap_magnitude"] < 1.0
+
+
+def test_embedded_ldrfg_path_linearized_tdvp_propagates_full_fg_coordinates():
+    symbols = ("C", "O", "H", "H", "H", "H", "O", "H", "H")
+    base = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.70, 0.0, 0.0],
+            [-0.70, 1.93, 0.0],
+            [-0.70, -0.96, 1.68],
+            [-0.70, -0.96, -1.68],
+            [3.46, 1.68, 0.0],
+            [7.5, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+            [6.9, 1.3, 0.0],
+        ],
+        dtype=float,
+    )
+    frames = [
+        XYZFrame(symbols, base + np.array([0.0, 0.00, 0.0]), time=0.0),
+        XYZFrame(symbols, base + np.array([0.0, 0.03, 0.0]), time=0.2),
+        XYZFrame(symbols, base + np.array([0.0, 0.06, 0.0]), time=0.4),
+    ]
+    frames[1].positions[6:] += np.array([0.08, 0.0, 0.0])
+    frames[2].positions[6:] += np.array([0.16, 0.0, 0.0])
+    fg_path = methanol_full_fg_coordinate_path(frames)
+    grid = np.array([2.6, 2.8])
+    nstates = 2
+    overlap = np.zeros((grid.size, nstates, grid.size, nstates), dtype=complex)
+    for i in range(grid.size):
+        for j in range(grid.size):
+            overlap[i, :, j, :] = np.eye(nstates)
+    snapshots = []
+    for index, frame in enumerate(fg_path):
+        solvent_shift = 0.02 * index
+        apes = np.column_stack(
+            [
+                0.1 * (grid - 2.7) ** 2 + solvent_shift,
+                0.3 + 0.2 * (grid - 2.7) ** 2 + 2.0 * solvent_shift,
+            ]
+        )
+        snapshots.append(
+            SolventEmbeddedLDRSnapshot(
+                bond_grid=grid,
+                apes=apes,
+                overlap=overlap,
+                point_charge_coords=np.zeros((0, 3)),
+                point_charge_charges=np.zeros(0),
+            )
+        )
+    kinetic = second_derivative_kinetic(grid.size, grid[1] - grid[0], mass=1000.0)
+    model = embedded_ldrfg_path_linearized_model(snapshots, fg_path, kinetic, classical_force=True)
+    c0 = initial_ldr_packet(grid, center=2.7, width=0.1, state=1, nstates=nstates)
+    result = propagate_liquid_ldrfg_tdvp(
+        model,
+        c0,
+        fg_path[0].centers,
+        fg_path[0].momenta,
+        np.array([0.0, 0.2, 0.4]),
+        classical_force=methanol_fg_path_force_callback(fg_path),
+    )
+
+    assert model.force_model == "path_linearized_embedded_ldrfg"
+    assert model.electronic_gradient_rank > 0
+    assert result["q"].shape == (3, len(fg_path[0].labels))
+    assert result["coefficients"].shape == (3, grid.size, nstates)
+    assert np.all(np.isfinite(result["electronic_force"]))
+    assert np.all(np.isfinite(result["classical_force"]))
+    assert np.max(np.linalg.norm(result["electronic_force"], axis=1)) > 0.0
+    assert np.max(np.linalg.norm(result["classical_force"], axis=1)) >= 0.0
+    np.testing.assert_allclose(result["norm"], np.ones(3), atol=1.0e-12)
+
+
+def test_liquid_phase_ldr_methanol_casci_helper_writes_diagnostics(tmp_path, monkeypatch):
+    from examples.namd import liquid_phase_ldr
+
+    frames = [
+        XYZFrame(
+            ("C", "O", "H", "H", "H", "H", "O", "H", "H"),
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [2.70, 0.0, 0.0],
+                    [-0.70, 1.93, 0.0],
+                    [-0.70, -0.96, 1.68],
+                    [-0.70, -0.96, -1.68],
+                    [3.46, 1.68, 0.0],
+                    [7.5, 0.0, 0.0],
+                    [9.0, 0.0, 0.0],
+                    [6.9, 1.3, 0.0],
+                ]
+            ),
+            time=0.0,
+        ),
+        XYZFrame(
+            ("C", "O", "H", "H", "H", "H", "O", "H", "H"),
+            np.array(
+                [
+                    [0.0, 0.02, 0.0],
+                    [2.72, 0.02, 0.0],
+                    [-0.70, 1.95, 0.0],
+                    [-0.70, -0.94, 1.68],
+                    [-0.70, -0.94, -1.68],
+                    [3.48, 1.70, 0.0],
+                    [7.5, 0.1, 0.0],
+                    [9.0, 0.1, 0.0],
+                    [6.9, 1.4, 0.0],
+                ]
+            ),
+            time=0.2,
+        ),
+    ]
+
+    class FakeElectronic:
+        def __init__(self, coordinate, frame_shift):
+            self.coordinate = float(coordinate)
+            self.frame_shift = float(frame_shift)
+
+        def overlap(self, other):
+            angle = 0.02 * (self.coordinate - other.coordinate) + 0.5 * (other.frame_shift - self.frame_shift)
+            c = np.cos(angle)
+            s = np.sin(angle)
+            return np.array([[c, -s], [s, c]])
+
+    def fake_build(frames_arg, coordinate_grid, *, frame_indices, geometry_builder, **kwargs):
+        if int(kwargs.get("nstates", 2)) > 2 or int(kwargs.get("ncas", 2)) > 2:
+            raise RuntimeError("mock state space unavailable")
+        snapshots = []
+        times = []
+        for frame_index in frame_indices:
+            frame = frames_arg[frame_index]
+            pc_coords, pc_charges = solvent_point_charges_from_frame(frame, solute_atoms=kwargs["solute_atoms"])
+            apes = []
+            objects = []
+            for coordinate in coordinate_grid:
+                geometry = geometry_builder(coordinate, frame=frame)
+                co_distance = np.linalg.norm(geometry[1] - geometry[0])
+                frame_shift = 0.01 * frame_index
+                apes.append([0.2 * (co_distance - 2.70) ** 2 + frame_shift, 0.3 + frame_shift])
+                objects.append(FakeElectronic(co_distance, frame_shift))
+            overlap = np.zeros((len(coordinate_grid), 2, len(coordinate_grid), 2), dtype=complex)
+            for i, left in enumerate(objects):
+                for j, right in enumerate(objects):
+                    overlap[i, :, j, :] = left.overlap(right)
+            snapshots.append(
+                SolventEmbeddedLDRSnapshot(
+                    bond_grid=np.asarray(coordinate_grid, dtype=float),
+                    apes=np.asarray(apes, dtype=float),
+                    overlap=overlap,
+                    point_charge_coords=pc_coords,
+                    point_charge_charges=pc_charges,
+                    electronic_objects=tuple(objects) if kwargs.get("keep_objects", True) else None,
+                )
+            )
+            times.append(frame.time)
+        return SolventEmbeddedLDRTrajectory(tuple(snapshots), np.asarray(times, dtype=float))
+
+    monkeypatch.setattr(liquid_phase_ldr, "build_embedded_casci_ldr_trajectory", fake_build)
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        methanol_coordinate_grid="2.55,2.70,2.85",
+        embedded_trajectory_frames=2,
+        embedded_trajectory_all_loaded=True,
+        embedded_trajectory_stride=1,
+        embedded_ldr_substeps="auto",
+        embedded_ldr_substep_convergence="1,2",
+        embedded_geometric_stride_convergence="1,2",
+        stride=3,
+        methanol_coordinate_mass=12497.0,
+        methanol_casci_basis="sto-3g",
+        methanol_casci_nstates=2,
+        methanol_casci_ncas=2,
+        methanol_casci_nelecas=2,
+        initial_state=1,
+        embedded_frame_overlaps=True,
+        embedded_transported_propagation=True,
+        embedded_tdvp_fg_propagation=True,
+        embedded_frame_transport="phase_aligned",
+        embedded_hotspots_top_k=1,
+        embedded_leakage_tolerance=1.0e-4,
+        embedded_geometric_tolerance=1.0e-5,
+        embedded_geometric_population_tolerance=1.0e-8,
+        plot=True,
+        embedded_state_convergence="2,3",
+        embedded_active_space_convergence="4:4:2",
+        strict_state_convergence=False,
+        embedded_frame_step_convergence="1,3",
+        strict_frame_step_convergence=False,
+    )
+
+    summary = liquid_phase_ldr._run_methanol_casci_trajectory(frames, args, "mock.xyz")
+    data = np.load(tmp_path / "embedded_methanol_co_casci_ldr_trajectory.npz")
+    report_path = liquid_phase_ldr._write_geometric_quality_report(
+        {
+            "trajectory": "mock.xyz",
+            "frames": len(frames),
+            "embedded_methanol_casci_trajectory": summary,
+        },
+        tmp_path / "geometric_quality_report.md",
+    )
+
+    assert summary["coordinate"] == "methanol_C_O_distance"
+    assert summary["frames"] == [0, 1]
+    assert summary["source_frames"] == [0, 3]
+    assert summary["embedded_ldr_substeps_requested"] == "auto"
+    assert summary["embedded_ldr_substeps_auto"] is True
+    assert summary["diagnostics_finite"] is True
+    assert summary["fg_path_ready"] is True
+    assert summary["fg_path_verdict"] == "ready"
+    assert summary["fg_coordinate_count"] == 11
+    assert summary["fg_group_counts"] == {
+        "oh_stretch": 1,
+        "coh_bend": 1,
+        "solvent_cartesian": 9,
+    }
+    assert summary["fg_min_gaussian_overlap_magnitude"] > 0.0
+    assert summary["fg_max_width_scaled_displacement"] >= 0.0
+    assert summary["tdvp_fg_force_model"] == "path_linearized_embedded_ldrfg"
+    assert summary["tdvp_fg_electronic_force_source"] == "least_squares_apES_gradient_along_fg_path"
+    assert summary["tdvp_fg_classical_force_source"] == "trajectory_finite_difference_momenta"
+    assert summary["tdvp_fg_norm_max_error"] < 1.0e-12
+    assert summary["tdvp_fg_total_force_norm_max"] >= 0.0
+    assert Path(summary["tdvp_fg_propagation_path"]).exists()
+    fg_path = Path(summary["fg_path_diagnostics_path"])
+    assert fg_path.exists()
+    fg_diagnostics = json.loads(fg_path.read_text())
+    assert fg_diagnostics["fg_path_ready"] is True
+    assert fg_diagnostics["coordinate_count"] == 11
+    assert fg_diagnostics["source_frames"] == [0, 3]
+    assert data["fg_coordinate_centers"].shape == (2, 11)
+    assert data["fg_coordinate_momenta"].shape == (2, 11)
+    assert data["fg_coordinate_masses"].shape == (11,)
+    assert data["fg_coordinate_widths"].shape == (11,)
+    assert data["fg_source_frames"].tolist() == [0, 3]
+    assert data["fg_coordinate_labels"][0] == "methanol:O-H"
+    assert data["fg_coordinate_groups"][0] == "oh_stretch"
+    assert data["tdvp_fg_q"].shape == (2, 11)
+    assert data["tdvp_fg_p"].shape == (2, 11)
+    assert data["tdvp_fg_coefficients"].shape == (2, 3, 2)
+    assert data["tdvp_fg_electronic_force"].shape == (2, 11)
+    assert data["tdvp_fg_classical_force"].shape == (2, 11)
+    assert data["tdvp_fg_total_force"].shape == (2, 11)
+    assert data["tdvp_fg_norm"].shape == (2,)
+    assert summary["norm_max_error"] < 1.0e-12
+    assert summary["static_norm_max_error"] < 1.0e-12
+    assert summary["comparison_metrics"]["population_delta_max_abs"] >= 0.0
+    assert summary["gap_min"] > 0.0
+    assert "liquid_minus_static_population_final" in summary
+    assert summary["frame_overlap_mixing_norm_max"] > 0.0
+    assert summary["frame_overlap_unitarity_error_max"] < 1.0e-12
+    assert summary["frame_overlap_unitary_transport_mixing_norm_max"] > 0.0
+    assert summary["frame_overlap_unitary_transport_unitarity_error_max"] < 1.0e-12
+    assert summary["frame_overlap_phase_invariant_deviation_max"] > 0.0
+    assert summary["frame_overlap_phase_invariant_mixing_norm_max"] > 0.0
+    assert summary["frame_overlap_polar_residual_max"] < 1.0e-12
+    assert summary["frame_transport_holonomy"] == "phase_aligned"
+    assert summary["frame_transport_holonomy_mixing_norm_max"] > 0.0
+    assert summary["frame_transport_holonomy_unitarity_error_max"] < 1.0e-12
+    assert summary["geometric_hotspot_score_max"] > 0.0
+    assert summary["geometric_hotspot_count"] == 1
+    assert summary["geometric_hotspots"][0]["step"] == 0
+    assert summary["geometric_hotspots"][0]["frame_start"] == 0
+    assert summary["geometric_hotspots"][0]["frame_end"] == 1
+    assert summary["geometric_hotspots"][0]["source_frame_start"] == 0
+    assert summary["geometric_hotspots"][0]["source_frame_end"] == 3
+    assert summary["geometric_hotspot_top_source"] == "geometric"
+    assert summary["geometric_hotspots"][0]["dominant_source"] == "geometric"
+    assert summary["geometric_quality_verdict"] == "ready"
+    assert summary["geometric_quality_subspace_unitary"] is True
+    assert summary["geometric_quality_geometry_visible"] is True
+    assert summary["geometric_quality_top_source"] == "geometric"
+    assert summary["geometric_quality_leakage_tolerance"] == pytest.approx(1.0e-4)
+    assert summary["geometric_quality_geometric_tolerance"] == pytest.approx(1.0e-5)
+    assert summary["geometric_signal_visible_count"] >= 1
+    assert summary["geometric_signal_visible_fraction"] > 0.0
+    assert summary["geometric_signal_interpretable_visible_count"] >= 1
+    assert summary["geometric_signal_interpretable_visible_fraction"] > 0.0
+    assert summary["geometric_signal_interpretable_visible_step_count"] == 1
+    assert summary["geometric_signal_deviation_max"] == pytest.approx(
+        summary["geometric_quality_geometric_score_max"]
+    )
+    assert summary["geometric_state_convergence"]["recommended_nstates"] == 2
+    assert summary["geometric_state_convergence"]["any_ready"] is True
+    assert summary["geometric_state_convergence"]["failed_count"] == 2
+    assert [record["nstates"] for record in summary["geometric_state_convergence"]["failed_records"]] == [3, 2]
+    assert summary["geometric_state_convergence"]["failed_records"][1]["ncas"] == 4
+    assert summary["geometric_state_convergence"]["failed_records"][1]["nelecas"] == 4
+    assert summary["geometric_state_convergence"]["failed_records"][0]["error_type"] == "RuntimeError"
+    assert Path(summary["geometric_state_convergence_path"]).exists()
+    assert summary["geometric_frame_step_convergence"]["recommended_frame_step"] == 1
+    assert summary["geometric_frame_step_convergence"]["recommended_source_frame_step"] == 3
+    assert summary["geometric_frame_step_convergence"]["any_subspace_unitary"] is True
+    assert summary["geometric_frame_step_convergence"]["failed_count"] == 1
+    assert summary["geometric_frame_step_convergence"]["failed_records"][0]["frame_step"] == 3
+    assert Path(summary["geometric_frame_step_convergence_path"]).exists()
+    assert summary["embedded_ldr_substep_convergence"]["reference_substeps"] == 2
+    assert [record["substeps"] for record in summary["embedded_ldr_substep_convergence"]["records"]] == [1, 2]
+    assert summary["embedded_ldr_substep_convergence"]["records"][-1]["is_reference"] is True
+    assert summary["embedded_ldr_substep_convergence"]["recommended_substeps"] in {1, 2}
+    assert summary["embedded_ldr_substeps"] == summary["embedded_ldr_substep_convergence"]["recommended_substeps"]
+    assert Path(summary["embedded_ldr_substep_convergence_path"]).exists()
+    assert summary["embedded_geometric_stride_convergence"]["baseline_stride"] == 1
+    assert [record["stride"] for record in summary["embedded_geometric_stride_convergence"]["records"]] == [1, 2]
+    assert summary["embedded_geometric_stride_convergence"]["recommended_stride"] in {1, 2}
+    assert Path(summary["embedded_geometric_stride_convergence_path"]).exists()
+    assert "stride" in {check["name"] for check in summary["embedded_geometric_readiness"]["checks"]}
+    assert "geometric_hotspot_xyz" in summary
+    hotspot_xyz = Path(summary["geometric_hotspot_xyz"])
+    assert hotspot_xyz.exists()
+    hotspot_text = hotspot_xyz.read_text()
+    assert hotspot_text.count("\n9\n") == 1
+    assert "section=embedded_methanol_co" in hotspot_text
+    assert "coordinate=" in hotspot_text
+    assert "source_frame_pair=0->3" in hotspot_text
+    assert report_path == tmp_path / "geometric_quality_report.md"
+    report_text = report_path.read_text()
+    assert "Embedded methanol C-O CASCI LDR" in report_text
+    assert "Loaded frames: `[0, 1]`" in report_text
+    assert "Source frames: `[0, 3]`" in report_text
+    assert "Verdict: `ready`" in report_text
+    assert "Top hot spot:" in report_text
+    assert "source_frames=0->3" in report_text
+    assert "Transported population geometry:" in report_text
+    assert "Transported population geometry path length:" in report_text
+    assert "Transported population step CSV:" in report_text
+    assert "Transported population top hot spot:" in report_text
+    assert "Transported population hot spot XYZ:" in report_text
+    assert "Transported population geometry JSON:" in report_text
+    assert "Geometric signal visible fraction:" in report_text
+    assert "Interpretable geometric signal fraction:" in report_text
+    assert "Full-coordinate FG path: `ready`" in report_text
+    assert "FG coordinate count: `11`" in report_text
+    assert "FG diagnostics JSON:" in report_text
+    assert "Coupled LDRFG TDVP: `path_linearized_embedded_ldrfg`" in report_text
+    assert "TDVP diagnostics JSON:" in report_text
+    assert "State convergence:" in report_text
+    assert "State convergence failed record:" in report_text
+    assert "Frame-step convergence:" in report_text
+    assert "Frame-step convergence failed record:" in report_text
+    assert "Embedded population stride convergence:" in report_text
+    assert "Embedded population stride record:" in report_text
+    assert "Embedded population stride convergence JSON:" in report_text
+    assert "Embedded readiness: `ready`" in report_text
+    assert "Embedded readiness check:" in report_text
+    assert "Embedded readiness JSON:" in report_text
+    assert "Hot spot XYZ:" in report_text
+    assert liquid_phase_ldr._geometric_quality_failures(
+        {"embedded_methanol_casci_trajectory": summary}
+    ) == []
+    assert liquid_phase_ldr._embedded_readiness_failures(
+        {"embedded_methanol_casci_trajectory": summary}
+    ) == []
+    limited_summary = dict(summary)
+    limited_summary.update(
+        {
+            "embedded_geometric_readiness_verdict": "population_quality_limited",
+            "embedded_geometric_readiness_recommendation": "population too small",
+            "embedded_geometric_readiness": {
+                "ready": False,
+                "verdict": "population_quality_limited",
+                "recommendation": "population too small",
+                "failed_checks": ["population_quality"],
+            },
+        }
+    )
+    assert liquid_phase_ldr._geometric_quality_failures(
+        {"embedded_methanol_casci_trajectory": limited_summary}
+    ) == [
+        (
+            "embedded_methanol_casci_trajectory.embedded_geometric_readiness",
+            "population_quality_limited",
+            "population too small",
+        )
+    ]
+    assert liquid_phase_ldr._embedded_readiness_failures(
+        {"embedded_methanol_casci_trajectory": limited_summary}
+    ) == [
+        (
+            "embedded_methanol_casci_trajectory",
+            "population_quality_limited",
+            "population too small",
+            ["population_quality"],
+        )
+    ]
+    assert liquid_phase_ldr._embedded_readiness_failures({}) == [
+        (
+            "embedded_geometric_readiness",
+            "missing",
+            "Run an embedded H2 or methanol CASCI LDR trajectory with geometric diagnostics.",
+            ["missing"],
+        )
+    ]
+    assert liquid_phase_ldr._geometric_quality_failures(
+        {
+            "embedded_methanol_casci_trajectory": {
+                "geometric_quality_verdict": "leakage_limited",
+                "geometric_quality_recommendation": "increase embedded states",
+            }
+        }
+    ) == [
+        (
+            "embedded_methanol_casci_trajectory",
+            "leakage_limited",
+            "increase embedded states",
+        )
+    ]
+    hot_grid = summary["geometric_hotspots"][0]["grid_index"]
+    assert summary["geometric_hotspots"][0]["coordinate"] == pytest.approx(
+        float(data["geometric_hotspot_coordinate_grid"][hot_grid])
+    )
+    assert summary["geometric_hotspots"][0]["time_start"] == pytest.approx(0.0)
+    assert summary["geometric_hotspots"][0]["time_end"] == pytest.approx(0.2)
+    assert summary["transported_frame_transport"] == "phase_aligned"
+    assert summary["transported_substeps"] == summary["embedded_ldr_substeps"]
+    assert summary["transported_population_delta_max_abs"] > 0.0
+    assert summary["transported_norm_max_error"] < 1.0e-12
+    assert summary["transported_geometric_step_score_max"] > 0.0
+    assert summary["transported_geometric_population_path_length"] > 0.0
+    assert summary["transported_geometric_dominant_step"] == 0
+    assert summary["transported_geometric_hotspot_count"] == 1
+    assert summary["transported_geometric_top_hotspot"]["step"] == 0
+    assert summary["transported_geometric_top_hotspot"]["source_frame_end"] == 3
+    assert "transported_geometric_hotspot_xyz" in summary
+    transported_hotspot_xyz = Path(summary["transported_geometric_hotspot_xyz"])
+    assert transported_hotspot_xyz.exists()
+    transported_hotspot_text = transported_hotspot_xyz.read_text()
+    assert "section=embedded_methanol_co_transport_population" in transported_hotspot_text
+    assert "source_frame_pair=0->3" in transported_hotspot_text
+    assert "dominant_population_delta_step=" in transported_hotspot_text
+    assert "dominant_state=S" in transported_hotspot_text
+    assert summary["transported_geometric_signal_visible_step_fraction"] > 0.0
+    assert summary["transported_geometric_signal_effective_step_count"] > 0.0
+    assert summary["transported_geometric_signal_population_delta_path_length"] == pytest.approx(
+        summary["transported_geometric_population_path_length"]
+    )
+    assert "transported_geometric_population_path" in summary
+    transported_geometry_path = Path(summary["transported_geometric_population_path"])
+    assert transported_geometry_path.exists()
+    transported_geometry = json.loads(transported_geometry_path.read_text())
+    assert transported_geometry["path"] == summary["path"]
+    assert transported_geometry["frames"] == summary["frames"]
+    assert transported_geometry["source_frames"] == summary["source_frames"]
+    assert transported_geometry["coordinate"] == "methanol_C_O_distance"
+    assert transported_geometry["transported_frame_transport"] == "phase_aligned"
+    assert transported_geometry["transported_substeps"] == summary["embedded_ldr_substeps"]
+    assert transported_geometry["transported_population_final"] == summary["transported_population_final"]
+    assert transported_geometry["transported_geometric_quality_verdict"] == "ready"
+    assert transported_geometry["transported_geometric_top_hotspot"] == summary[
+        "transported_geometric_top_hotspot"
+    ]
+    assert transported_geometry["transported_geometric_step_csv"] == summary["transported_geometric_step_csv"]
+    assert transported_geometry["transported_geometric_hotspot_xyz"] == summary[
+        "transported_geometric_hotspot_xyz"
+    ]
+    assert "transported_geometric_step_csv" in summary
+    transported_step_csv = Path(summary["transported_geometric_step_csv"])
+    assert transported_step_csv.exists()
+    assert summary["transported_geometric_quality_verdict"] == "ready"
+    assert summary["transported_geometric_quality_geometry_visible"] is True
+    assert summary["transported_geometric_quality_norm_stable"] is True
+    assert summary["transported_geometric_quality_enough_steps"] is True
+    assert summary["transported_geometric_quality_population_tolerance"] == pytest.approx(1.0e-8)
+    assert summary["transported_geometric_quality"]["frame_transport"] == "phase_aligned"
+    assert summary["embedded_geometric_readiness_verdict"] == "ready"
+    assert summary["embedded_geometric_readiness_ready"] is True
+    assert summary["embedded_geometric_readiness_failed_checks"] == []
+    assert Path(summary["embedded_geometric_readiness_path"]).exists()
+    assert json.loads(Path(summary["embedded_geometric_readiness_path"]).read_text()) == summary[
+        "embedded_geometric_readiness"
+    ]
+    assert {check["name"] for check in summary["embedded_geometric_readiness"]["checks"]} >= {
+        "frame_quality",
+        "population_quality",
+        "substeps",
+        "fg_path",
+        "state_convergence",
+        "frame_step_convergence",
+    }
+    assert "plot" in summary
+    assert Path(summary["plot"]).exists()
+    assert "gap_min" in data
+    assert "static_populations" in data
+    assert "population_delta" in data
+    assert data["apes_sequence"].shape == (2, 3, 2)
+    assert data["overlap_sequence"].shape == (2, 3, 2, 3, 2)
+    assert data["frame_overlap_sequence"].shape == (1, 3, 2, 2)
+    assert data["frame_overlap_unitary_transport_sequence"].shape == (1, 3, 2, 2)
+    assert data["frame_overlap_phase_aligned_unitary_transport_sequence"].shape == (1, 3, 2, 2)
+    assert data["frame_overlap_mixing_norm"].shape == (1, 3)
+    assert data["frame_overlap_unitary_transport_mixing_norm"].shape == (1, 3)
+    assert data["frame_overlap_phase_invariant_deviation"].shape == (1, 3)
+    assert data["frame_overlap_phase_invariant_mixing_norm"].shape == (1, 3)
+    assert data["frame_transport_cumulative"].shape == (2, 3, 2, 2)
+    assert data["frame_transport_mixing_norm"].shape == (2, 3)
+    assert data["frame_transport_eigenphase"].shape == (2, 3, 2)
+    assert data["frame_transport_final_eigenphase"].shape == (3, 2)
+    assert data["geometric_hotspot_score"].shape == (1,)
+    assert data["geometric_hotspot_top_indices"].shape == (1,)
+    assert data["geometric_hotspot_dominant_source"].shape == (1,)
+    assert data["geometric_hotspot_dominant_source"][0] == "geometric"
+    np.testing.assert_allclose(data["geometric_hotspot_coordinate_grid"], [2.55, 2.70, 2.85])
+    np.testing.assert_array_equal(data["geometric_hotspot_frame_indices"], [0, 1])
+    np.testing.assert_array_equal(data["geometric_hotspot_source_frame_indices"], [0, 3])
+    assert data["transported_populations"].shape == data["populations"].shape
+    assert data["transported_population_delta"].shape == data["populations"].shape
+    assert data["transported_geometric_population_delta_step"].shape == (1, 2)
+    assert data["transported_geometric_step_score"].shape == (1,)
+    assert data["transported_geometric_cumulative_path_length"].shape == (2,)
+    assert data["transported_geometric_frame_indices"].shape == (2,)
+    assert data["transported_geometric_source_frame_indices"].shape == (2,)
+    assert data["transported_geometric_hotspot_step"].shape == (1,)
+    assert data["transported_geometric_hotspot_step"][0] == 0
+    with transported_step_csv.open() as handle:
+        transported_rows = list(csv.DictReader(handle))
+    assert len(transported_rows) == data["transported_geometric_step_score"].shape[0]
+    assert transported_rows[0]["step"] == "0"
+    assert int(transported_rows[0]["source_frame_end"]) == 3
+    assert float(transported_rows[0]["score"]) == pytest.approx(
+        float(data["transported_geometric_step_score"][0])
+    )
+    assert float(transported_rows[0]["population_delta_state_0"]) == pytest.approx(
+        float(data["transported_geometric_population_delta_step"][0, 0])
+    )
+    assert float(transported_rows[0]["population_delta_state_1"]) == pytest.approx(
+        float(data["transported_geometric_population_delta_step"][0, 1])
+    )
+    assert (tmp_path / "embedded_methanol_co_casci_ldr_trajectory.png").stat().st_size > 0
+    np.testing.assert_allclose(data["populations"].sum(axis=1), np.ones(2), atol=1.0e-12)
+    np.testing.assert_allclose(
+        data["population_delta"],
+        data["populations"] - data["static_populations"],
+    )
+
+
+def test_liquid_phase_ldr_methanol_fg_audit_preset_runs_with_mocked_casci(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from examples.namd import liquid_phase_ldr
+
+    symbols = ("C", "O", "H", "H", "H", "H", "O", "H", "H")
+    frames = [
+        XYZFrame(
+            symbols,
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [2.70, 0.0, 0.0],
+                    [-0.70, 1.93, 0.0],
+                    [-0.70, -0.96, 1.68],
+                    [-0.70, -0.96, -1.68],
+                    [3.46, 1.68, 0.0],
+                    [7.5, 0.0, 0.0],
+                    [9.0, 0.0, 0.0],
+                    [6.9, 1.3, 0.0],
+                ]
+            ),
+            time=0.0,
+        ),
+        XYZFrame(
+            symbols,
+            np.array(
+                [
+                    [0.0, 0.02, 0.0],
+                    [2.72, 0.02, 0.0],
+                    [-0.70, 1.95, 0.0],
+                    [-0.70, -0.94, 1.68],
+                    [-0.70, -0.94, -1.68],
+                    [3.48, 1.70, 0.0],
+                    [7.5, 0.1, 0.0],
+                    [9.0, 0.1, 0.0],
+                    [6.9, 1.4, 0.0],
+                ]
+            ),
+            time=0.2,
+        ),
+    ]
+    trajectory = tmp_path / "methanol_water.xyz"
+    with trajectory.open("w") as handle:
+        for frame in frames:
+            handle.write(f"{len(frame.symbols)}\n")
+            handle.write(f"time={frame.time}\n")
+            for symbol, xyz in zip(frame.symbols, frame.positions):
+                handle.write(f"{symbol} {xyz[0]:.12f} {xyz[1]:.12f} {xyz[2]:.12f}\n")
+
+    class FakeElectronic:
+        def __init__(self, coordinate, frame_shift):
+            self.coordinate = float(coordinate)
+            self.frame_shift = float(frame_shift)
+
+        def overlap(self, other):
+            angle = 0.02 * (self.coordinate - other.coordinate) + 0.5 * (
+                other.frame_shift - self.frame_shift
+            )
+            c = np.cos(angle)
+            s = np.sin(angle)
+            return np.array([[c, -s], [s, c]])
+
+    def fake_build(frames_arg, coordinate_grid, *, frame_indices, geometry_builder, **kwargs):
+        snapshots = []
+        times = []
+        for frame_index in frame_indices:
+            frame = frames_arg[frame_index]
+            pc_coords, pc_charges = solvent_point_charges_from_frame(
+                frame,
+                solute_atoms=kwargs["solute_atoms"],
+            )
+            apes = []
+            objects = []
+            for coordinate in coordinate_grid:
+                geometry = geometry_builder(coordinate, frame=frame)
+                co_distance = np.linalg.norm(geometry[1] - geometry[0])
+                frame_shift = 0.01 * frame_index
+                apes.append([0.2 * (co_distance - 2.70) ** 2 + frame_shift, 0.3 + frame_shift])
+                objects.append(FakeElectronic(co_distance, frame_shift))
+            overlap = np.zeros((len(coordinate_grid), 2, len(coordinate_grid), 2), dtype=complex)
+            for i, left in enumerate(objects):
+                for j, right in enumerate(objects):
+                    overlap[i, :, j, :] = left.overlap(right)
+            snapshots.append(
+                SolventEmbeddedLDRSnapshot(
+                    bond_grid=np.asarray(coordinate_grid, dtype=float),
+                    apes=np.asarray(apes, dtype=float),
+                    overlap=overlap,
+                    point_charge_coords=pc_coords,
+                    point_charge_charges=pc_charges,
+                    electronic_objects=tuple(objects) if kwargs.get("keep_objects", True) else None,
+                )
+            )
+            times.append(frame.time)
+        return SolventEmbeddedLDRTrajectory(tuple(snapshots), np.asarray(times, dtype=float))
+
+    monkeypatch.setattr(liquid_phase_ldr, "build_embedded_casci_ldr_trajectory", fake_build)
+    liquid_phase_ldr.main(
+        [
+            "--methanol-fg-audit-preset",
+            "--trajectory",
+            str(trajectory),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--frames",
+            "2",
+            "--x-points",
+            "5",
+            "--geometric-hotspots-top-k",
+            "1",
+            "--embedded-hotspots-top-k",
+            "1",
+        ]
+    )
+
+    stdout = capsys.readouterr().out
+    run_dir = tmp_path / "run"
+    summary = json.loads((run_dir / "summary.json").read_text())
+    methanol = summary["embedded_methanol_casci_trajectory"]
+    readiness = json.loads(Path(methanol["embedded_geometric_readiness_path"]).read_text())
+    manifest = json.loads((run_dir / "artifact_manifest.json").read_text())
+
+    assert "embedded_methanol_casci_trajectory:" in stdout
+    assert "embedded_methanol_fg_path_verdict: ready" in stdout
+    assert "embedded_methanol_tdvp_fg_force_model: path_linearized_embedded_ldrfg" in stdout
+    assert "embedded_geometric_readiness_gate: passed" in stdout
+    assert methanol["embedded_ldr_substeps_requested"] == "auto"
+    assert methanol["fg_path_ready"] is True
+    assert methanol["tdvp_fg_force_model"] == "path_linearized_embedded_ldrfg"
+    assert Path(methanol["tdvp_fg_propagation_path"]).exists()
+    assert "fg_path" in {check["name"] for check in readiness["checks"]}
+    assert any(record["path"] == methanol["fg_path_diagnostics_path"] for record in manifest["artifacts"])
+    assert any(record["path"] == methanol["tdvp_fg_propagation_path"] for record in manifest["artifacts"])
+    with np.load(methanol["path"]) as data:
+        assert "tdvp_fg_q" in data
+        assert data["tdvp_fg_q"].shape[0] == 2
+    inspection = liquid_phase_ldr._inspect_liquid_ldr_bundle(run_dir)
+    assert inspection["artifact_manifest_ok"] is True
+    assert inspection["embedded_methanol_readiness_verdict"] == "ready"
+
+
+def test_embedded_h2_ldr_trajectory_propagates_with_runner():
+    frames = [
+        XYZFrame(
+            ("H", "H", "O", "H", "H"),
+            np.array(
+                [
+                    [-0.5, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [2.0 + 0.1 * index, 0.0, 0.0],
+                    [2.8 + 0.1 * index, 0.0, 0.0],
+                    [1.7 + 0.1 * index, 0.7, 0.0],
+                ]
+            ),
+            time=0.05 * index,
+        )
+        for index in range(3)
+    ]
+
+    class FakeElectronic:
+        def __init__(self, bond, field):
+            self.bond = float(bond)
+            self.field = float(field)
+
+        def overlap(self, other):
+            angle = 0.05 * (self.bond - other.bond) + 0.02 * (self.field - other.field)
+            c = np.cos(angle)
+            s = np.sin(angle)
+            return np.array([[c, -s], [s, c]])
+
+    def runner(geometry, pc_coords, pc_charges):
+        center = geometry.mean(axis=0)
+        bond = np.linalg.norm(geometry[1] - geometry[0])
+        field = float(np.sum(pc_charges / np.linalg.norm(pc_coords - center, axis=1)))
+        return (
+            np.array(
+                [
+                    0.1 * (bond - 1.4) ** 2 + 0.01 * field,
+                    0.3 + 0.2 * (bond - 1.2) ** 2 - 0.005 * field,
+                ]
+            ),
+            FakeElectronic(bond, field),
+        )
+
+    bond_grid = np.array([1.2, 1.4, 1.6])
+    trajectory = build_embedded_h2_casci_ldr_trajectory(
+        frames,
+        bond_grid,
+        solute_atoms=2,
+        axis_atoms=(0, 1),
+        electronic_runner=runner,
+        keep_objects=False,
+    )
+    kinetic = second_derivative_kinetic(bond_grid.size, bond_grid[1] - bond_grid[0], mass=918.0)
+    h0 = embedded_ldr_hamiltonian(trajectory.snapshots[0], kinetic)
+    result = propagate_embedded_ldr_snapshots(
+        trajectory.snapshots,
+        trajectory.times,
+        kinetic,
+        initial_state=0,
+    )
+    comparison = compare_embedded_ldr_to_static(
+        trajectory.snapshots,
+        trajectory.times,
+        kinetic,
+        initial_state=0,
+    )
+    comparison_metrics = embedded_ldr_comparison_metrics(comparison)
+    diagnostics = embedded_ldr_trajectory_diagnostics(
+        trajectory.snapshots,
+        trajectory.times,
+        kinetic,
+    )
+
+    assert trajectory.times.shape == (3,)
+    assert h0.shape == (6, 6)
+    np.testing.assert_allclose(h0, h0.conj().T, atol=1.0e-12)
+    assert result["populations"].shape == (3, 2)
+    assert comparison["static"]["populations"].shape == result["populations"].shape
+    np.testing.assert_allclose(
+        comparison["population_delta"],
+        comparison["liquid"]["populations"] - comparison["static"]["populations"],
+    )
+    assert comparison_metrics["population_delta_max_abs"] >= 0.0
+    assert comparison_metrics["energy_delta_max_abs"] >= 0.0
+    assert comparison_metrics["static_reference_frame"] == 0
+    assert np.all(np.isfinite(result["energy"]))
+    np.testing.assert_allclose(result["norm"], np.ones(3), atol=1.0e-12)
+    np.testing.assert_allclose(result["populations"].sum(axis=1), np.ones(3), atol=1.0e-12)
+    assert trajectory.snapshots[0].electronic_objects is None
+    assert diagnostics["finite"] is True
+    assert diagnostics["gap_min"].shape == (3,)
+    assert diagnostics["apes_frame_rms_delta"].shape == (2,)
+    assert diagnostics["overlap_identity_error"].shape == (3,)
+    assert diagnostics["overlap_hermiticity_error"].shape == (3,)
+    assert diagnostics["hamiltonian_hermiticity_error"].shape == (3,)
+    np.testing.assert_allclose(diagnostics["overlap_identity_error"], np.zeros(3), atol=1.0e-12)
+    np.testing.assert_allclose(diagnostics["overlap_hermiticity_error"], np.zeros(3), atol=1.0e-12)
+    np.testing.assert_allclose(diagnostics["hamiltonian_hermiticity_error"], np.zeros(3), atol=1.0e-12)
+    assert np.all(diagnostics["apes_frame_rms_delta"] > 0.0)
+    assert np.all(diagnostics["gap_min"] > 0.0)
+
+
+def test_h2_bond_geometry_uses_requested_axis_and_center():
+    geometry = h2_bond_geometry(2.0, center=(1.0, 2.0, 3.0), axis=(1.0, 0.0, 0.0))
+    np.testing.assert_allclose(geometry[0], [0.0, 2.0, 3.0])
+    np.testing.assert_allclose(geometry[1], [2.0, 2.0, 3.0])
+
+
+def test_liquid_phase_ldr_example_runs(tmp_path):
+    script = "examples/namd/liquid_phase_ldr.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--md-steps",
+            "4",
+            "--frames",
+            "4",
+            "--waters",
+            "4",
+            "--x-points",
+            "5",
+            "--plot",
+            "--ldr-substeps",
+            "auto",
+            "--ldr-substep-convergence",
+            "1,2,4",
+            "--geometric-stride-convergence",
+            "1,2",
+            "--geometric-gauge-check",
+            "--geometric-gauge-tolerance",
+            "1e-3",
+            "--geometric-gauge-substeps",
+            "auto",
+            "--geometric-gauge-substep-convergence",
+            "1,2,4",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "final_populations:" in result.stdout
+    assert "static_final_populations:" in result.stdout
+    assert "geometric_speed_max:" in result.stdout
+    assert "geometric_population_delta_max_abs:" in result.stdout
+    assert "geometric_hotspot_score_max:" in result.stdout
+    assert "geometric_quality_verdict:" in result.stdout
+    assert "geometric_readiness_verdict:" in result.stdout
+    assert "geometric_readiness:" in result.stdout
+    assert "readiness_summary:" in result.stdout
+    assert "geometric_population:" in result.stdout
+    assert "hotspot_driver_summary:" in result.stdout
+    assert "frame_diagnostics_csv:" in result.stdout
+    assert "run_summary_csv:" in result.stdout
+    assert "run_metadata:" in result.stdout
+    assert "liquid_ldr_geometric_report:" in result.stdout
+    assert "ldr_substeps_auto: True" in result.stdout
+    assert "ldr_substep_convergence:" in result.stdout
+    assert "ldr_recommended_substeps:" in result.stdout
+    assert "geometric_stride_convergence:" in result.stdout
+    assert "geometric_gauge_check:" in result.stdout
+    assert "geometric_gauge_ready: True" in result.stdout
+    assert "geometric_gauge_substeps_auto: True" in result.stdout
+    assert "geometric_gauge_substep_convergence:" in result.stdout
+    assert "geometric_gauge_recommended_substeps:" in result.stdout
+    assert "population_sum_final:" in result.stdout
+    assert "norm_max_error:" in result.stdout
+    assert "artifact_manifest:" in result.stdout
+    data = np.load(tmp_path / "liquid_phase_ldr_result.npz")
+    assert "no_berry_populations" in data
+    assert "geometric_population_delta" in data
+    assert "geometric_population_delta_step" in data
+    assert "geometric_step_score" in data
+    assert "geometric_cumulative_path_length" in data
+    assert "geometric_step_dominant_state" in data
+    assert "geometric_step_time_mid_fs" in data
+    assert "geometric_step_q_mid" in data
+    assert "geometric_step_q_delta" in data
+    assert "geometric_step_abs_q_delta" in data
+    assert "geometric_step_geometric_speed_mean" in data
+    assert "geometric_step_gap_min_mean" in data
+    assert "geometric_step_inverse_gap_min_mean" in data
+    assert data["no_berry_populations"].shape == data["populations"].shape
+    np.testing.assert_allclose(
+        data["geometric_population_delta"],
+        data["populations"] - data["no_berry_populations"],
+    )
+    np.testing.assert_allclose(
+        data["geometric_population_delta_step"],
+        np.diff(data["geometric_population_delta"], axis=0),
+    )
+    np.testing.assert_allclose(
+        data["geometric_step_score"],
+        np.linalg.norm(data["geometric_population_delta_step"], axis=1),
+    )
+    np.testing.assert_allclose(
+        data["geometric_cumulative_path_length"][1:],
+        np.cumsum(data["geometric_step_score"]),
+    )
+    np.testing.assert_allclose(data["geometric_step_q_delta"], np.diff(data["solvent_q"]))
+    np.testing.assert_allclose(data["geometric_step_abs_q_delta"], np.abs(np.diff(data["solvent_q"])))
+    np.testing.assert_allclose(
+        data["geometric_step_geometric_speed_mean"],
+        0.5 * (data["geometric_speed"][:-1] + data["geometric_speed"][1:]),
+    )
+    np.testing.assert_allclose(
+        data["geometric_step_gap_min_mean"],
+        0.5 * (data["gap_min"][:-1] + data["gap_min"][1:]),
+    )
+    np.testing.assert_allclose(
+        data["geometric_step_inverse_gap_min_mean"],
+        1.0 / data["geometric_step_gap_min_mean"],
+    )
+    assert (tmp_path / "summary.json").exists()
+    assert (tmp_path / "liquid_phase_ldr.png").exists()
+    assert (tmp_path / "liquid_ldr_geometric_hotspots.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_report.md").exists()
+    assert (tmp_path / "liquid_ldr_geometric_hotspot.xyz").exists()
+    assert (tmp_path / "liquid_ldr_frame_diagnostics.csv").exists()
+    assert (tmp_path / "liquid_ldr_geometric_steps.csv").exists()
+    assert (tmp_path / "liquid_ldr_substep_convergence.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_stride_convergence.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_gauge_check.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_gauge_substep_convergence.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_readiness.json").exists()
+    assert (tmp_path / "readiness_summary.json").exists()
+    assert (tmp_path / "liquid_ldr_geometric_population.json").exists()
+    assert (tmp_path / "liquid_ldr_hotspot_driver_summary.json").exists()
+    assert (tmp_path / "liquid_ldr_run_summary.csv").exists()
+    assert (tmp_path / "run_metadata.json").exists()
+    assert (tmp_path / "artifact_manifest.json").exists()
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    manifest = json.loads((tmp_path / "artifact_manifest.json").read_text())
+    hotspots = json.loads((tmp_path / "liquid_ldr_geometric_hotspots.json").read_text())
+    readiness = json.loads((tmp_path / "liquid_ldr_geometric_readiness.json").read_text())
+    readiness_summary = json.loads((tmp_path / "readiness_summary.json").read_text())
+    geometric_population = json.loads((tmp_path / "liquid_ldr_geometric_population.json").read_text())
+    hotspot_driver_summary = json.loads((tmp_path / "liquid_ldr_hotspot_driver_summary.json").read_text())
+    run_metadata = json.loads((tmp_path / "run_metadata.json").read_text())
+    ldr_substep_convergence = json.loads((tmp_path / "liquid_ldr_substep_convergence.json").read_text())
+    stride_convergence = json.loads((tmp_path / "liquid_ldr_geometric_stride_convergence.json").read_text())
+    gauge_check = json.loads((tmp_path / "liquid_ldr_geometric_gauge_check.json").read_text())
+    gauge_substep_convergence = json.loads(
+        (tmp_path / "liquid_ldr_geometric_gauge_substep_convergence.json").read_text()
+    )
+    assert summary["plot"] == str(tmp_path / "liquid_phase_ldr.png")
+    assert summary["output_dir"] == str(tmp_path)
+    assert summary["seed"] == 31
+    assert summary["artifact_manifest"] == str(tmp_path / "artifact_manifest.json")
+    assert summary["artifact_count"] == manifest["artifact_count"]
+    assert manifest["schema"] == "pyqed.liquid_ldr.artifact_manifest.v1"
+    assert manifest["hash_algorithm"] == "sha256"
+    assert "created_at_utc" in manifest
+    manifest_paths = {record["path"] for record in manifest["artifacts"]}
+    manifest_by_path = {record["path"]: record for record in manifest["artifacts"]}
+    assert str(tmp_path / "summary.json") in manifest_paths
+    assert str(tmp_path / "liquid_phase_ldr_result.npz") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_geometric_report.md") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_frame_diagnostics.csv") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_geometric_steps.csv") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_geometric_readiness.json") in manifest_paths
+    assert str(tmp_path / "readiness_summary.json") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_geometric_population.json") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_hotspot_driver_summary.json") in manifest_paths
+    assert str(tmp_path / "liquid_ldr_run_summary.csv") in manifest_paths
+    assert str(tmp_path / "run_metadata.json") in manifest_paths
+    assert all(record["exists"] for record in manifest["artifacts"])
+    for record in manifest["artifacts"]:
+        assert Path(record["absolute_path"]).is_absolute()
+        if record["path"] == str(tmp_path / "artifact_manifest.json"):
+            assert record["size_bytes"] is None
+            assert record["sha256"] is None
+        else:
+            assert record["size_bytes"] == Path(record["path"]).stat().st_size
+            assert record["size_bytes"] > 0
+            assert len(record["sha256"]) == 64
+    result_record = manifest_by_path[str(tmp_path / "liquid_phase_ldr_result.npz")]
+    assert result_record["sha256"] == hashlib.sha256(
+        (tmp_path / "liquid_phase_ldr_result.npz").read_bytes()
+    ).hexdigest()
+    verify_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--verify-artifact-manifest",
+            str(tmp_path / "artifact_manifest.json"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "artifact_manifest_verification: passed" in verify_result.stdout
+    assert "artifact_records_failed: 0" in verify_result.stdout
+    assert "artifact_manifest_errors: 0" in verify_result.stdout
+    assert "artifact_manifest_verification_record:" not in verify_result.stdout
+    inspection_path = tmp_path / "bundle_inspection.json"
+    inspect_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-bundle",
+            str(tmp_path),
+            "--inspection-report",
+            str(inspection_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f"bundle_inspection_report: {inspection_path}" in inspect_result.stdout
+    assert "bundle_inspection: ready" in inspect_result.stdout
+    assert "liquid_readiness: ready" in inspect_result.stdout
+    assert "liquid_failed_checks: none" in inspect_result.stdout
+    assert "limited_reasons: none" in inspect_result.stdout
+    assert "geometric_frame_csv:" in inspect_result.stdout
+    assert "run_summary_csv:" in inspect_result.stdout
+    assert "hotspot_driver_summary:" in inspect_result.stdout
+    assert "dominant_hotspot_driver:" in inspect_result.stdout
+    assert "artifact_manifest_ok: True" in inspect_result.stdout
+    inspection = json.loads(inspection_path.read_text())
+    assert inspection["ready"] is True
+    assert inspection["summary_path"] == str(tmp_path / "summary.json")
+    assert inspection["liquid_readiness_verdict"] == summary["geometric_readiness_verdict"]
+    assert inspection["liquid_failed_checks"] == []
+    assert inspection["limited_reasons"] == []
+    assert inspection["geometric_frame_csv"] == str(tmp_path / "liquid_ldr_frame_diagnostics.csv")
+    assert inspection["geometric_step_csv"] == str(tmp_path / "liquid_ldr_geometric_steps.csv")
+    assert inspection["run_summary_csv"] == str(tmp_path / "liquid_ldr_run_summary.csv")
+    assert inspection["geometric_hotspot_path"] == str(tmp_path / "liquid_ldr_geometric_hotspots.json")
+    assert inspection["geometric_hotspot_driver_summary_path"] == str(
+        tmp_path / "liquid_ldr_hotspot_driver_summary.json"
+    )
+    assert inspection["dominant_hotspot_driver"] == summary["geometric_hotspot_driver_summary"][
+        "dominant_driver"
+    ]
+    assert inspection["dominant_hotspot_driver_count"] == summary["geometric_hotspot_driver_summary"][
+        "dominant_driver_count"
+    ]
+    assert inspection["artifact_manifest_ok"] is True
+    assert inspection["artifact_manifest_failed_count"] == 0
+    assert summary["ldr_substeps_auto"] is True
+    assert summary["ldr_substeps_requested"] == "auto"
+    assert summary["geometric_gauge_substeps_auto"] is True
+    assert summary["geometric_gauge_substeps_requested"] == "auto"
+    assert summary["liquid_ldr_geometric_report"] == str(tmp_path / "liquid_ldr_geometric_report.md")
+    assert summary["geometric_hotspot_path"] == str(tmp_path / "liquid_ldr_geometric_hotspots.json")
+    assert summary["geometric_frame_csv"] == str(tmp_path / "liquid_ldr_frame_diagnostics.csv")
+    assert summary["geometric_step_csv"] == str(tmp_path / "liquid_ldr_geometric_steps.csv")
+    assert summary["geometric_readiness_path"] == str(tmp_path / "liquid_ldr_geometric_readiness.json")
+    assert summary["readiness_summary_path"] == str(tmp_path / "readiness_summary.json")
+    assert summary["geometric_population_path"] == str(tmp_path / "liquid_ldr_geometric_population.json")
+    assert summary["geometric_hotspot_driver_summary_path"] == str(
+        tmp_path / "liquid_ldr_hotspot_driver_summary.json"
+    )
+    assert summary["run_summary_csv"] == str(tmp_path / "liquid_ldr_run_summary.csv")
+    assert summary["run_metadata_path"] == str(tmp_path / "run_metadata.json")
+    assert summary["ldr_substep_convergence_path"] == str(tmp_path / "liquid_ldr_substep_convergence.json")
+    assert summary["geometric_stride_convergence_path"] == str(
+        tmp_path / "liquid_ldr_geometric_stride_convergence.json"
+    )
+    assert summary["geometric_gauge_check_path"] == str(tmp_path / "liquid_ldr_geometric_gauge_check.json")
+    assert summary["geometric_gauge_substep_convergence_path"] == str(
+        tmp_path / "liquid_ldr_geometric_gauge_substep_convergence.json"
+    )
+    assert summary["geometric_hotspot_xyz"] == str(tmp_path / "liquid_ldr_geometric_hotspot.xyz")
+    assert summary["geometric_hotspots"] == hotspots
+    assert summary["ldr_substep_convergence"] == ldr_substep_convergence
+    assert [record["substeps"] for record in summary["ldr_substep_convergence"]["records"]] == [1, 2, 4]
+    assert summary["ldr_substep_convergence"]["reference_substeps"] == 4
+    assert summary["ldr_substep_convergence"]["recommended_substeps"] in {1, 2, 4}
+    assert summary["ldr_substeps"] == summary["ldr_substep_convergence"]["recommended_substeps"]
+    assert summary["geometric_stride_convergence"] == stride_convergence
+    assert summary["geometric_gauge_check"] == gauge_check
+    assert summary["geometric_gauge_substep_convergence"] == gauge_substep_convergence
+    assert summary["geometric_gauge_ready"] is True
+    assert [record["substeps"] for record in summary["geometric_gauge_substep_convergence"]["records"]] == [
+        1,
+        2,
+        4,
+    ]
+    assert summary["geometric_gauge_substep_convergence"]["recommended_substeps"] in {1, 2, 4}
+    assert summary["geometric_gauge_substeps"] == summary["geometric_gauge_substep_convergence"][
+        "recommended_substeps"
+    ]
+    assert summary["geometric_gauge_check"]["substeps"] == summary["geometric_gauge_substeps"]
+    assert summary["geometric_gauge_population_delta_max_abs"] < gauge_check["tolerance"]
+    assert summary["geometric_stride_convergence"]["baseline_stride"] == 1
+    assert [record["stride"] for record in summary["geometric_stride_convergence"]["records"]] == [1, 2]
+    assert summary["geometric_stride_convergence"]["records"][0][
+        "population_delta_max_abs_relative_to_baseline"
+    ] == pytest.approx(1.0)
+    assert summary["geometric_hotspot_count"] == len(hotspots)
+    assert summary["geometric_hotspot_plot_marker_count"] == min(len(hotspots), 3)
+    assert summary["geometric_hotspot_score_max"] >= 0.0
+    assert summary["geometric_quality_verdict"] in {"ready", "geometry_quiet", "norm_limited", "too_short"}
+    assert summary["geometric_quality"]["verdict"] == summary["geometric_quality_verdict"]
+    assert "geometric_quality_recommendation" in summary
+    assert summary["geometric_readiness_verdict"] in {
+        "ready",
+        "quality_limited",
+        "substeps_limited",
+        "gauge_limited",
+        "gauge_substeps_limited",
+        "stride_limited",
+    }
+    assert summary["geometric_readiness"]["verdict"] == summary["geometric_readiness_verdict"]
+    assert summary["geometric_readiness"] == readiness
+    assert readiness_summary["records"]["liquid"]["path"] == str(
+        tmp_path / "liquid_ldr_geometric_readiness.json"
+    )
+    assert readiness_summary["records"]["liquid"]["verdict"] == summary["geometric_readiness_verdict"]
+    assert readiness_summary["records"]["liquid"]["ready"] == summary["geometric_readiness"]["ready"]
+    assert readiness_summary["records"]["liquid"]["failed_checks"] == summary["geometric_readiness"][
+        "failed_checks"
+    ]
+    assert readiness_summary["records"]["embedded_h2"]["available"] is False
+    assert readiness_summary["overall_ready"] == summary["geometric_readiness"]["ready"]
+    assert "checks" in summary["geometric_readiness"]
+    assert {check["name"] for check in summary["geometric_readiness"]["checks"]} >= {
+        "quality",
+        "substeps",
+        "gauge",
+        "gauge_substeps",
+        "stride",
+    }
+    assert summary["geometric_signal"]["hotspot_count"] == len(hotspots)
+    assert "top_step_score_fraction" in summary["geometric_signal"]
+    assert "top3_step_score_fraction" in summary["geometric_signal"]
+    assert "effective_step_count" in summary["geometric_signal"]
+    assert summary["geometric_signal"]["top_step_score_fraction"] <= summary["geometric_signal"][
+        "top3_step_score_fraction"
+    ]
+    assert summary["geometric_signal_visible_step_count"] >= 0
+    assert summary["geometric_signal_population_delta_path_length"] >= 0.0
+    assert summary["geometric_signal_population_delta_path_length"] == pytest.approx(
+        float(data["geometric_cumulative_path_length"][-1])
+    )
+    assert geometric_population["geometric_readiness"] == summary["geometric_readiness"]
+    assert geometric_population["geometric_signal"] == summary["geometric_signal"]
+    assert geometric_population["geometric_quality"] == summary["geometric_quality"]
+    assert geometric_population["geometric_hotspots"] == hotspots
+    assert geometric_population["geometric_signal"]["hotspot_driver_summary"] == summary[
+        "geometric_hotspot_driver_summary"
+    ]
+    assert geometric_population["geometric_frame_csv"] == str(tmp_path / "liquid_ldr_frame_diagnostics.csv")
+    assert geometric_population["geometric_step_csv"] == str(tmp_path / "liquid_ldr_geometric_steps.csv")
+    assert geometric_population["run_summary_csv"] == str(tmp_path / "liquid_ldr_run_summary.csv")
+    assert geometric_population["result"] == str(tmp_path / "liquid_phase_ldr_result.npz")
+    assert geometric_population["geometric_population_delta_max_abs"] == pytest.approx(
+        summary["geometric_population_delta_max_abs"]
+    )
+    assert run_metadata["output_dir"] == str(tmp_path)
+    assert run_metadata["trajectory"] == summary["trajectory"]
+    assert run_metadata["args"]["ldr_substeps"] == "auto"
+    assert run_metadata["args"]["geometric_gauge_check"] is True
+    assert run_metadata["readiness"]["liquid"] == summary["geometric_readiness_verdict"]
+    assert run_metadata["artifacts_declared_before_manifest"]["result"] == str(
+        tmp_path / "liquid_phase_ldr_result.npz"
+    )
+    assert "examples/namd/liquid_phase_ldr.py" in run_metadata["command"]
+    assert "--ldr-substeps" in run_metadata["argv"]
+    assert "geometric_driver_correlations" in summary
+    assert set(summary["geometric_driver_correlations"]) == {
+        "abs_q_delta",
+        "geometric_speed_mean",
+        "gap_min_mean",
+        "inverse_gap_min_mean",
+    }
+    assert all(
+        value is None or -1.0 <= value <= 1.0
+        for value in summary["geometric_driver_correlations"].values()
+    )
+    assert "geometric_hotspot_driver_summary" in summary
+    driver_summary = summary["geometric_hotspot_driver_summary"]
+    assert hotspot_driver_summary == driver_summary
+    assert driver_summary == summary["geometric_signal"]["hotspot_driver_summary"]
+    assert driver_summary["hotspot_count"] == len(hotspots)
+    assert driver_summary["dominant_driver"] in driver_summary["drivers"]
+    assert sum(driver_summary["count_by_driver"].values()) == len(hotspots)
+    assert sum(driver_summary["score_sum_by_driver"].values()) == pytest.approx(
+        driver_summary["score_sum"]
+    )
+    assert all("population_delta_step" in record for record in hotspots)
+    assert all(record["dominant_driver"] in record["driver_scores"] for record in hotspots)
+    assert all(
+        record["dominant_driver_score"] == pytest.approx(record["driver_scores"][record["dominant_driver"]])
+        for record in hotspots
+    )
+    assert summary["geometric_population_delta_max_abs"] >= 0.0
+    assert summary["no_berry_norm_max_error"] < 1.0e-12
+    report = (tmp_path / "liquid_ldr_geometric_report.md").read_text()
+    assert "Liquid-Phase LDR Geometric Report" in report
+    assert "Berry Control" in report
+    assert "## Quality" in report
+    assert "Verdict:" in report
+    assert "## Readiness" in report
+    assert "Failed checks:" in report
+    assert "LDR Substep Convergence" in report
+    assert "LDR substep convergence JSON:" in report
+    assert "Top Hot Spot" in report
+    assert "Dominant liquid driver:" in report
+    assert "Dominant hot-spot driver:" in report
+    assert "Driver scores:" in report
+    assert "Driver Correlations" in report
+    assert "Gauge Invariance" in report
+    assert "Gauge check JSON:" in report
+    assert "Gauge Substep Convergence" in report
+    assert "Gauge substep convergence JSON:" in report
+    assert "Stride Convergence" in report
+    assert "Stride convergence JSON:" in report
+    assert "Top 3 Berry step fraction:" in report
+    assert "Effective Berry step count:" in report
+    assert "Frame diagnostics CSV:" in report
+    assert "Step diagnostics CSV:" in report
+    assert "Readiness summary JSON:" in report
+    assert "Hot-spot driver summary JSON:" in report
+    assert "Run summary CSV:" in report
+    assert "Run metadata JSON:" in report
+    assert "Plot hot-spot markers:" in report
+    assert "Top hot spot XYZ:" in report
+    with (tmp_path / "liquid_ldr_frame_diagnostics.csv").open() as handle:
+        frame_rows = list(csv.DictReader(handle))
+    assert len(frame_rows) == data["populations"].shape[0]
+    assert frame_rows[0]["frame"] == "0"
+    assert float(frame_rows[0]["time_fs"]) == pytest.approx(float(data["times_fs"][0]))
+    assert float(frame_rows[0]["solvent_q"]) == pytest.approx(float(data["solvent_q"][0]))
+    assert float(frame_rows[0]["q_dot"]) == pytest.approx(float(data["q_dot"][0]))
+    assert float(frame_rows[0]["gap_min"]) == pytest.approx(float(data["gap_min"][0]))
+    assert float(frame_rows[0]["berry_norm"]) == pytest.approx(float(data["berry_norm"][0]))
+    assert float(frame_rows[0]["geometric_speed"]) == pytest.approx(float(data["geometric_speed"][0]))
+    assert float(frame_rows[0]["pop_S0"]) == pytest.approx(float(data["populations"][0, 0]))
+    assert float(frame_rows[0]["static_pop_S0"]) == pytest.approx(float(data["static_populations"][0, 0]))
+    assert float(frame_rows[0]["no_berry_pop_S0"]) == pytest.approx(
+        float(data["no_berry_populations"][0, 0])
+    )
+    assert float(frame_rows[0]["geometric_delta_S0"]) == pytest.approx(
+        float(data["geometric_population_delta"][0, 0])
+    )
+    with (tmp_path / "liquid_ldr_run_summary.csv").open() as handle:
+        run_summary_rows = list(csv.DictReader(handle))
+    assert len(run_summary_rows) == 1
+    run_summary_row = run_summary_rows[0]
+    assert run_summary_row["output_dir"] == str(tmp_path)
+    assert run_summary_row["seed"] == "31"
+    assert run_summary_row["summary"] == str(tmp_path / "summary.json")
+    assert run_summary_row["result"] == str(tmp_path / "liquid_phase_ldr_result.npz")
+    assert run_summary_row["geometric_frame_csv"] == str(tmp_path / "liquid_ldr_frame_diagnostics.csv")
+    assert run_summary_row["geometric_step_csv"] == str(tmp_path / "liquid_ldr_geometric_steps.csv")
+    assert run_summary_row["artifact_manifest"] == str(tmp_path / "artifact_manifest.json")
+    assert run_summary_row["geometric_readiness_verdict"] == summary["geometric_readiness_verdict"]
+    assert run_summary_row["geometric_quality_verdict"] == summary["geometric_quality_verdict"]
+    assert run_summary_row["dominant_hotspot_driver"] == driver_summary["dominant_driver"]
+    assert int(run_summary_row["artifact_count"]) == summary["artifact_count"]
+    assert float(run_summary_row["geometric_population_delta_max_abs"]) == pytest.approx(
+        summary["geometric_population_delta_max_abs"]
+    )
+    final_delta = np.asarray(summary["geometric_population_delta_final"], dtype=float)
+    dominant_final_state = int(np.argmax(np.abs(final_delta)))
+    dominant_final_value = float(final_delta[dominant_final_state])
+    dominant_final_sign = "positive" if dominant_final_value > 0.0 else "negative" if dominant_final_value < 0.0 else "zero"
+    assert json.loads(run_summary_row["geometric_population_delta_final_json"]) == pytest.approx(
+        summary["geometric_population_delta_final"]
+    )
+    assert int(run_summary_row["geometric_population_delta_final_dominant_state"]) == dominant_final_state
+    assert float(run_summary_row["geometric_population_delta_final_dominant_value"]) == pytest.approx(
+        dominant_final_value
+    )
+    assert run_summary_row["geometric_population_delta_final_dominant_sign"] == dominant_final_sign
+    assert run_summary_row["geometric_population_delta_final_direction"] == f"S{dominant_final_state}:{dominant_final_sign}"
+    with (tmp_path / "liquid_ldr_geometric_steps.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == data["geometric_step_score"].shape[0]
+    assert rows[0]["step"] == "0"
+    assert float(rows[0]["score"]) == pytest.approx(float(data["geometric_step_score"][0]))
+    assert float(rows[0]["q_delta"]) == pytest.approx(float(data["geometric_step_q_delta"][0]))
+    assert float(rows[0]["abs_q_delta"]) == pytest.approx(float(data["geometric_step_abs_q_delta"][0]))
+    assert float(rows[0]["inverse_gap_min_mean"]) == pytest.approx(
+        float(data["geometric_step_inverse_gap_min_mean"][0])
+    )
+    assert float(rows[-1]["cumulative_path_length_end"]) == pytest.approx(
+        float(data["geometric_cumulative_path_length"][-1])
+    )
+    hotspot_xyz = (tmp_path / "liquid_ldr_geometric_hotspot.xyz").read_text()
+    assert "section=analytic_liquid_ldr" in hotspot_xyz
+    assert "role=start" in hotspot_xyz
+    assert "role=end" in hotspot_xyz
+    assert "dominant_population_delta_step=" in hotspot_xyz
+    assert "dominant_driver=" in hotspot_xyz
+    assert "dominant_driver_score=" in hotspot_xyz
+
+    tampered_path = tmp_path / "liquid_ldr_geometric_readiness.json"
+    tampered_path.write_text(tampered_path.read_text() + "\n")
+    tampered_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--verify-artifact-manifest",
+            str(tmp_path / "artifact_manifest.json"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tampered_result.returncode == 6
+    assert "artifact_manifest_verification: failed" in tampered_result.stdout
+    assert "artifact_records_failed: 1" in tampered_result.stdout
+    assert str(tampered_path) in tampered_result.stdout
+    assert "size_mismatch" in tampered_result.stdout or "sha256_mismatch" in tampered_result.stdout
+    tampered_inspect = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-bundle",
+            str(tmp_path / "summary.json"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tampered_inspect.returncode == 7
+    assert "bundle_inspection: limited" in tampered_inspect.stdout
+    assert "artifact_manifest_ok: False" in tampered_inspect.stdout
+    assert "limited_reasons: artifact_records_failed:1" in tampered_inspect.stdout
+    tampered_inspection_path = tmp_path / "tampered_bundle_inspection.json"
+    tampered_inspect_report = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-bundle",
+            str(tmp_path / "summary.json"),
+            "--inspection-report",
+            str(tampered_inspection_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tampered_inspect_report.returncode == 7
+    tampered_inspection = json.loads(tampered_inspection_path.read_text())
+    assert tampered_inspection["limited_reasons"] == ["artifact_records_failed:1"]
+
+
+def test_liquid_phase_ldr_scan_aggregates_run_summaries(tmp_path):
+    script = "examples/namd/liquid_phase_ldr_scan.py"
+    fieldnames = [
+        "output_dir",
+        "trajectory",
+        "seed",
+        "frames",
+        "time_fs",
+        "ldr_substeps",
+        "geometric_gauge_substeps",
+        "geometric_readiness_verdict",
+        "geometric_quality_verdict",
+        "geometric_ready",
+        "geometric_failed_checks",
+        "geometric_population_delta_max_abs",
+        "geometric_population_delta_rms",
+        "geometric_population_delta_final_norm",
+        "geometric_population_delta_final_json",
+        "geometric_population_delta_final_dominant_state",
+        "geometric_population_delta_final_dominant_value",
+        "geometric_population_delta_final_dominant_sign",
+        "geometric_population_delta_final_direction",
+        "geometric_hotspot_count",
+        "geometric_hotspot_score_max",
+        "dominant_hotspot_driver",
+        "dominant_hotspot_driver_count",
+        "dominant_hotspot_driver_score_fraction",
+        "norm_max_error",
+        "no_berry_norm_max_error",
+        "min_gap_min",
+        "geometric_speed_max",
+        "artifact_count",
+        "result",
+        "summary",
+        "geometric_frame_csv",
+        "geometric_step_csv",
+        "geometric_hotspot_path",
+        "geometric_hotspot_driver_summary_path",
+        "geometric_readiness_path",
+        "readiness_summary_path",
+        "geometric_population_path",
+        "artifact_manifest",
+    ]
+    rows = [
+        {
+            "seed": "31",
+            "geometric_readiness_verdict": "ready",
+            "geometric_quality_verdict": "ready",
+            "geometric_ready": "True",
+            "geometric_population_delta_max_abs": "0.2",
+            "geometric_population_delta_final_norm": "0.12",
+            "geometric_population_delta_final_json": "[0.12, -0.12]",
+            "geometric_population_delta_final_dominant_state": "0",
+            "geometric_population_delta_final_dominant_value": "0.12",
+            "geometric_population_delta_final_dominant_sign": "positive",
+            "geometric_population_delta_final_direction": "S0:positive",
+            "geometric_hotspot_score_max": "0.4",
+            "dominant_hotspot_driver": "abs_q_delta",
+            "frames": "4",
+        },
+        {
+            "seed": "32",
+            "geometric_readiness_verdict": "quality_limited",
+            "geometric_quality_verdict": "geometry_quiet",
+            "geometric_ready": "False",
+            "geometric_population_delta_max_abs": "0.05",
+            "geometric_population_delta_final_norm": "0.03",
+            "geometric_population_delta_final_json": "[0.03, -0.03]",
+            "geometric_population_delta_final_dominant_state": "0",
+            "geometric_population_delta_final_dominant_value": "0.03",
+            "geometric_population_delta_final_dominant_sign": "positive",
+            "geometric_population_delta_final_direction": "S0:positive",
+            "geometric_hotspot_score_max": "0.1",
+            "dominant_hotspot_driver": "inverse_gap_min_mean",
+            "frames": "4",
+        },
+    ]
+    summary_paths = []
+    for index, row in enumerate(rows):
+        run_dir = tmp_path / f"run_{index}"
+        run_dir.mkdir()
+        path = run_dir / "liquid_ldr_run_summary.csv"
+        row = {key: row.get(key, "") for key in fieldnames}
+        row["output_dir"] = str(run_dir)
+        row["summary"] = str(run_dir / "summary.json")
+        if index == 0:
+            artifact = run_dir / "artifact.txt"
+            artifact.write_text("scan artifact\n")
+            manifest = {
+                "schema": "pyqed.liquid_ldr.artifact_manifest.v1",
+                "hash_algorithm": "sha256",
+                "artifact_count": 1,
+                "artifacts": [
+                    {
+                        "label": "scan.artifact",
+                        "path": str(artifact),
+                        "absolute_path": str(artifact),
+                        "exists": True,
+                        "size_bytes": artifact.stat().st_size,
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+            manifest_path = run_dir / "artifact_manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            row["artifact_manifest"] = str(manifest_path)
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+        summary_paths.append(path)
+
+    aggregate_dir = tmp_path / "aggregate"
+    result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--scan-plot",
+            "--output-dir",
+            str(aggregate_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "liquid_ldr_scan: aggregated" in result.stdout
+    assert "scan_count: 2" in result.stdout
+    assert "ready_count: 1" in result.stdout
+    assert "signal_detected_count: 2" in result.stdout
+    assert "signal_fraction: 1.000000" in result.stdout
+    assert "driver_consensus_fraction: 0.500000" in result.stdout
+    assert "driver_consensus_tied: True" in result.stdout
+    assert (
+        "driver_consensus_tied_values: abs_q_delta,inverse_gap_min_mean"
+        in result.stdout
+    )
+    assert "manifest_ok_count: 1" in result.stdout
+    assert "manifest_limited_count: 1" in result.stdout
+    assert "scan_readiness_verdict: readiness_limited" in result.stdout
+    assert "scan_readiness_failed_checks: ready_fraction,manifest_ok_fraction" in result.stdout
+    assert "final_direction_consensus_tied: False" in result.stdout
+    assert "final_direction_consensus_tied_values: S0:positive" in result.stdout
+    assert "aggregate_report:" in result.stdout
+    assert "aggregate_evidence:" in result.stdout
+    assert "aggregate_metadata:" in result.stdout
+    assert "aggregate_manifest:" in result.stdout
+    assert "aggregate_plot:" in result.stdout
+    aggregate_csv = aggregate_dir / "liquid_ldr_scan_summary.csv"
+    aggregate_json = aggregate_dir / "liquid_ldr_scan_summary.json"
+    aggregate_report = aggregate_dir / "liquid_ldr_scan_report.md"
+    aggregate_evidence = aggregate_dir / "liquid_ldr_scan_evidence.json"
+    aggregate_metadata = aggregate_dir / "liquid_ldr_scan_metadata.json"
+    aggregate_manifest = aggregate_dir / "liquid_ldr_scan_artifact_manifest.json"
+    aggregate_plot = aggregate_dir / "liquid_ldr_scan_summary.png"
+    assert aggregate_csv.exists()
+    assert aggregate_json.exists()
+    assert aggregate_report.exists()
+    assert aggregate_evidence.exists()
+    assert aggregate_metadata.exists()
+    assert aggregate_manifest.exists()
+    assert aggregate_plot.exists()
+    with aggregate_csv.open() as handle:
+        aggregate_rows = list(csv.DictReader(handle))
+    assert [row["scan_index"] for row in aggregate_rows] == ["0", "1"]
+    assert [row["seed"] for row in aggregate_rows] == ["31", "32"]
+    assert aggregate_rows[0]["run_summary_csv"] == str(summary_paths[0])
+    assert aggregate_rows[0]["artifact_manifest_status"] == "ok"
+    assert aggregate_rows[0]["artifact_manifest_ok"] == "True"
+    assert aggregate_rows[0]["artifact_manifest_records_failed"] == "0"
+    assert aggregate_rows[1]["dominant_hotspot_driver"] == "inverse_gap_min_mean"
+    assert aggregate_rows[1]["artifact_manifest_status"] == "missing"
+    assert aggregate_rows[1]["artifact_manifest_ok"] == "False"
+    summary = json.loads(aggregate_json.read_text())
+    assert summary["workflow"] == "liquid_phase_ldr_scan"
+    assert summary["aggregate_report"] == str(aggregate_report)
+    assert summary["aggregate_evidence"] == str(aggregate_evidence)
+    assert summary["aggregate_metadata"] == str(aggregate_metadata)
+    assert summary["aggregate_manifest"] == str(aggregate_manifest)
+    assert summary["aggregate_plot"] == str(aggregate_plot)
+    assert summary["scan_count"] == 2
+    assert summary["ready_count"] == 1
+    assert summary["limited_count"] == 1
+    assert summary["ready_fraction"] == pytest.approx(0.5)
+    assert summary["manifest_ok_count"] == 1
+    assert summary["manifest_limited_count"] == 1
+    assert summary["manifest_ok_fraction"] == pytest.approx(0.5)
+    assert summary["manifest_records_failed_total"] == 0
+    assert summary["manifest_errors_total"] == 0
+    assert summary["min_geometric_signal"] == pytest.approx(0.0)
+    assert summary["max_signal_relative_stdev"] is None
+    assert summary["signal_relative_stdev"] == pytest.approx(0.6)
+    assert summary["signal_detected_count"] == 2
+    assert summary["signal_limited_count"] == 0
+    assert summary["signal_fraction"] == pytest.approx(1.0)
+    assert summary["scan_ready"] is False
+    assert summary["scan_readiness_verdict"] == "readiness_limited"
+    assert summary["scan_readiness"]["failed_checks"] == [
+        "ready_fraction",
+        "manifest_ok_fraction",
+    ]
+    assert summary["scan_readiness"]["ready_fraction"] == pytest.approx(0.5)
+    assert summary["scan_readiness"]["manifest_ok_fraction"] == pytest.approx(0.5)
+    assert summary["scan_readiness"]["signal_relative_stdev"] == pytest.approx(0.6)
+    assert summary["readiness_counts"] == {"ready": 1, "quality_limited": 1}
+    assert summary["quality_counts"] == {"ready": 1, "geometry_quiet": 1}
+    assert summary["artifact_manifest_status_counts"] == {"ok": 1, "missing": 1}
+    assert summary["dominant_hotspot_driver_counts"] == {
+        "abs_q_delta": 1,
+        "inverse_gap_min_mean": 1,
+    }
+    assert summary["dominant_hotspot_driver_fractions"] == {
+        "abs_q_delta": 0.5,
+        "inverse_gap_min_mean": 0.5,
+    }
+    assert summary["dominant_hotspot_driver_consensus"]["count"] == 1
+    assert summary["dominant_hotspot_driver_consensus"]["fraction"] == pytest.approx(0.5)
+    assert summary["dominant_hotspot_driver_consensus"]["non_missing_count"] == 2
+    assert summary["dominant_hotspot_driver_consensus"]["tied"] is True
+    assert summary["dominant_hotspot_driver_consensus"]["tied_values"] == [
+        "abs_q_delta",
+        "inverse_gap_min_mean",
+    ]
+    assert summary["geometric_final_direction_counts"] == {"S0:positive": 2}
+    assert summary["geometric_final_direction_fractions"] == {"S0:positive": 1.0}
+    assert summary["geometric_final_direction_consensus"]["direction"] == "S0:positive"
+    assert summary["geometric_final_direction_consensus"]["fraction"] == pytest.approx(1.0)
+    assert summary["geometric_final_direction_consensus"]["tied"] is False
+    assert [record["seed"] for record in summary["top_geometric_runs"]] == ["31", "32"]
+    assert summary["top_geometric_runs"][0]["geometric_population_delta_max_abs"] == pytest.approx(
+        0.2
+    )
+    assert summary["top_geometric_runs"][0]["dominant_hotspot_driver"] == "abs_q_delta"
+    assert summary["geometric_population_delta_max_abs"]["max"] == pytest.approx(0.2)
+    assert summary["geometric_population_delta_max_abs"]["mean"] == pytest.approx(0.125)
+    assert summary["geometric_population_delta_max_abs"]["median"] == pytest.approx(0.125)
+    assert summary["geometric_population_delta_max_abs"]["stdev"] == pytest.approx(0.075)
+    report = aggregate_report.read_text()
+    assert "Liquid-Phase LDR Scan Report" in report
+    assert "Verdict: `readiness_limited`" in report
+    assert "Ready fraction: `0.500000`" in report
+    assert "Signal-active runs: `2`" in report
+    assert "Signal relative stdev: `0.6`" in report
+    assert "Dominant hot-spot driver consensus:" in report
+    assert "Dominant hot-spot driver consensus tied: `True`" in report
+    assert "Dominant hot-spot driver tied values: `abs_q_delta,inverse_gap_min_mean`" in report
+    assert "Final geometric direction consensus:" in report
+    assert "Final geometric direction consensus tied: `False`" in report
+    assert "Final geometric direction tied values: `S0:positive`" in report
+    assert "Strongest Geometric Runs" in report
+    assert "rank `1` seed `31`" in report
+    assert "Aggregate plot:" in report
+    assert "Aggregate evidence JSON:" in report
+    assert "Aggregate metadata JSON:" in report
+    assert "Aggregate manifest:" in report
+    evidence = json.loads(aggregate_evidence.read_text())
+    assert evidence["artifact_role"] == "liquid_phase_ldr_scan_evidence"
+    assert evidence["workflow"] == "liquid_phase_ldr_scan"
+    assert evidence["scan_readiness_verdict"] == "readiness_limited"
+    assert evidence["signal_fraction"] == pytest.approx(1.0)
+    assert evidence["signal_relative_stdev"] == pytest.approx(0.6)
+    assert evidence["dominant_hotspot_driver_consensus"]["fraction"] == pytest.approx(0.5)
+    assert evidence["dominant_hotspot_driver_consensus"]["tied"] is True
+    assert evidence["geometric_final_direction_consensus"]["direction"] == "S0:positive"
+    assert evidence["geometric_final_direction_consensus"]["fraction"] == pytest.approx(1.0)
+    assert evidence["aggregate_evidence"] == str(aggregate_evidence)
+    assert evidence["aggregate_metadata"] == str(aggregate_metadata)
+    assert "run_records" not in evidence
+    metadata = json.loads(aggregate_metadata.read_text())
+    assert metadata["workflow"] == "liquid_phase_ldr_scan"
+    assert metadata["aggregate_artifacts"]["metadata"] == str(aggregate_metadata)
+    assert metadata["thresholds"]["min_ready_fraction"] == pytest.approx(1.0)
+    assert metadata["thresholds"]["max_signal_relative_stdev"] is None
+    assert metadata["thresholds"]["min_final_direction_consensus_fraction"] == pytest.approx(0.0)
+    assert metadata["readiness"]["scan"] == "readiness_limited"
+    assert metadata["args"]["scan_plot"] is True
+    assert metadata["args"]["output_dir"] == str(aggregate_dir)
+    assert metadata["run_records"] == []
+    assert metadata["failed_runs"] == []
+    manifest = json.loads(aggregate_manifest.read_text())
+    assert manifest["schema"] == "pyqed.liquid_ldr.scan_artifact_manifest.v1"
+    assert manifest["hash_algorithm"] == "sha256"
+    assert manifest["artifact_count"] == 7
+    manifest_by_label = {record["label"]: record for record in manifest["artifacts"]}
+    for label, path in {
+        "aggregate_csv": aggregate_csv,
+        "aggregate_json": aggregate_json,
+        "aggregate_report": aggregate_report,
+        "aggregate_evidence": aggregate_evidence,
+        "aggregate_metadata": aggregate_metadata,
+        "aggregate_plot": aggregate_plot,
+    }.items():
+        record = manifest_by_label[label]
+        assert record["path"] == str(path)
+        assert record["size_bytes"] == path.stat().st_size
+        assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert manifest_by_label["aggregate_manifest"]["path"] == str(aggregate_manifest)
+    assert manifest_by_label["aggregate_manifest"]["exists"] is True
+    assert manifest_by_label["aggregate_manifest"]["sha256"] is None
+    verification_report = aggregate_dir / "scan_verification_report.json"
+    verify_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--verify-scan-artifact-manifest",
+            str(aggregate_manifest),
+            "--scan-verification-report",
+            str(verification_report),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f"scan_artifact_manifest_verification_report: {verification_report}" in verify_result.stdout
+    assert "scan_artifact_manifest_verification: passed" in verify_result.stdout
+    assert "scan_artifact_records_checked: 6" in verify_result.stdout
+    assert "scan_artifact_records_failed: 0" in verify_result.stdout
+    verification = json.loads(verification_report.read_text())
+    assert verification["ok"] is True
+    assert verification["checked_count"] == 6
+    assert verification["failed_count"] == 0
+    assert any(record["status"] == "unchecked" for record in verification["records"])
+    inspection_report = aggregate_dir / "scan_inspection_report.json"
+    inspect_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-scan-bundle",
+            str(aggregate_dir),
+            "--scan-inspection-report",
+            str(inspection_report),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert inspect_result.returncode == 12
+    assert f"scan_bundle_inspection_report: {inspection_report}" in inspect_result.stdout
+    assert "scan_bundle_inspection: limited" in inspect_result.stdout
+    assert "scan_readiness: readiness_limited" in inspect_result.stdout
+    assert "signal_relative_stdev: 0.6" in inspect_result.stdout
+    assert f"aggregate_evidence: {aggregate_evidence}" in inspect_result.stdout
+    assert f"aggregate_metadata: {aggregate_metadata}" in inspect_result.stdout
+    assert "aggregate_metadata_ok: True" in inspect_result.stdout
+    assert "aggregate_metadata_failed_checks: none" in inspect_result.stdout
+    assert "driver_consensus_tied: True" in inspect_result.stdout
+    assert (
+        "driver_consensus_tied_values: abs_q_delta,inverse_gap_min_mean"
+        in inspect_result.stdout
+    )
+    assert "final_direction_consensus: S0:positive" in inspect_result.stdout
+    assert "final_direction_consensus_fraction: 1.0" in inspect_result.stdout
+    assert "final_direction_consensus_tied: False" in inspect_result.stdout
+    assert "final_direction_consensus_tied_values: S0:positive" in inspect_result.stdout
+    assert "aggregate_manifest_ok: True" in inspect_result.stdout
+    assert "limited_reasons: scan_readiness:readiness_limited:ready_fraction,manifest_ok_fraction" in inspect_result.stdout
+    inspection = json.loads(inspection_report.read_text())
+    assert inspection["ready"] is False
+    assert inspection["scan_ready"] is False
+    assert inspection["summary_path"] == str(aggregate_json)
+    assert inspection["aggregate_evidence"] == str(aggregate_evidence)
+    assert inspection["aggregate_metadata"] == str(aggregate_metadata)
+    assert inspection["aggregate_metadata_ok"] is True
+    assert inspection["aggregate_metadata_failed_checks"] == []
+    assert inspection["scan_readiness_verdict"] == "readiness_limited"
+    assert inspection["scan_readiness_failed_checks"] == [
+        "ready_fraction",
+        "manifest_ok_fraction",
+    ]
+    assert inspection["signal_detected_count"] == 2
+    assert inspection["signal_relative_stdev"] == pytest.approx(0.6)
+    assert inspection["dominant_hotspot_driver_consensus"]["fraction"] == pytest.approx(0.5)
+    assert inspection["dominant_hotspot_driver_consensus"]["tied"] is True
+    assert inspection["geometric_final_direction_consensus"]["direction"] == "S0:positive"
+    assert inspection["geometric_final_direction_consensus"]["fraction"] == pytest.approx(1.0)
+    assert inspection["aggregate_manifest_ok"] is True
+    assert inspection["aggregate_manifest_failed_count"] == 0
+    assert inspection["limited_reasons"] == [
+        "scan_readiness:readiness_limited:ready_fraction,manifest_ok_fraction"
+    ]
+    stale_metadata = json.loads(aggregate_metadata.read_text())
+    stale_metadata["readiness"]["scan"] = "stale"
+    aggregate_metadata.write_text(json.dumps(stale_metadata, indent=2) + "\n")
+    manifest = json.loads(aggregate_manifest.read_text())
+    for record in manifest["artifacts"]:
+        if record["label"] == "aggregate_metadata":
+            record["size_bytes"] = aggregate_metadata.stat().st_size
+            record["sha256"] = hashlib.sha256(aggregate_metadata.read_bytes()).hexdigest()
+    aggregate_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+    stale_inspect = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-scan-bundle",
+            str(aggregate_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert stale_inspect.returncode == 12
+    assert "aggregate_manifest_ok: True" in stale_inspect.stdout
+    assert "aggregate_metadata_ok: False" in stale_inspect.stdout
+    assert "aggregate_metadata_failed_checks: readiness_verdict" in stale_inspect.stdout
+    assert "aggregate_metadata_mismatch:readiness_verdict" in stale_inspect.stdout
+    metadata = json.loads(aggregate_metadata.read_text())
+    metadata["readiness"]["scan"] = "readiness_limited"
+    aggregate_metadata.write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = json.loads(aggregate_manifest.read_text())
+    for record in manifest["artifacts"]:
+        if record["label"] == "aggregate_metadata":
+            record["size_bytes"] = aggregate_metadata.stat().st_size
+            record["sha256"] = hashlib.sha256(aggregate_metadata.read_bytes()).hexdigest()
+    aggregate_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+    aggregate_report.write_text(aggregate_report.read_text() + "\n")
+    tampered_verify = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--verify-scan-artifact-manifest",
+            str(aggregate_manifest),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tampered_verify.returncode == 11
+    assert "scan_artifact_manifest_verification: failed" in tampered_verify.stdout
+    assert "scan_artifact_records_failed: 1" in tampered_verify.stdout
+    assert "label=aggregate_report" in tampered_verify.stdout
+    assert "size_mismatch" in tampered_verify.stdout or "sha256_mismatch" in tampered_verify.stdout
+    strict_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-verified-manifests",
+            "--output-dir",
+            str(tmp_path / "strict"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert strict_result.returncode == 9
+    assert "manifest_limited_count: 1" in strict_result.stdout
+    readiness_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--output-dir",
+            str(tmp_path / "readiness_fail"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert readiness_result.returncode == 10
+    assert "scan_readiness_verdict: readiness_limited" in readiness_result.stdout
+    relaxed_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--output-dir",
+            str(tmp_path / "readiness_pass"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "scan_readiness_verdict: ready" in relaxed_result.stdout
+    relaxed_inspect_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--inspect-scan-bundle",
+            str(tmp_path / "readiness_pass" / "liquid_ldr_scan_summary.json"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "scan_bundle_inspection: ready" in relaxed_inspect_result.stdout
+    assert "limited_reasons: none" in relaxed_inspect_result.stdout
+    assert "aggregate_manifest_ok: True" in relaxed_inspect_result.stdout
+    signal_limited_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--min-geometric-signal",
+            "0.1",
+            "--min-signal-fraction",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "signal_readiness_fail"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert signal_limited_result.returncode == 10
+    assert "scan_readiness_verdict: signal_limited" in signal_limited_result.stdout
+    assert "scan_readiness_failed_checks: signal_fraction" in signal_limited_result.stdout
+    signal_variability_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--max-signal-relative-stdev",
+            "0.5",
+            "--output-dir",
+            str(tmp_path / "signal_variability_fail"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert signal_variability_result.returncode == 10
+    assert "scan_readiness_verdict: signal_reproducibility_limited" in signal_variability_result.stdout
+    assert "scan_readiness_failed_checks: signal_relative_stdev" in signal_variability_result.stdout
+    driver_limited_result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--min-driver-consensus-fraction",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "driver_readiness_fail"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert driver_limited_result.returncode == 10
+    assert "scan_readiness_verdict: driver_consensus_limited" in driver_limited_result.stdout
+    assert "scan_readiness_failed_checks: driver_consensus_fraction" in driver_limited_result.stdout
+    final_direction_pass = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(summary_paths[1]),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--min-final-direction-consensus-fraction",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "final_direction_readiness_pass"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "scan_readiness_verdict: ready" in final_direction_pass.stdout
+    assert "final_direction_consensus_fraction: 1.000000" in final_direction_pass.stdout
+    mixed_direction_path = tmp_path / "mixed_direction_summary.csv"
+    with summary_paths[1].open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames_for_mixed = reader.fieldnames
+        mixed_rows = list(reader)
+    mixed_rows[0]["geometric_population_delta_final_direction"] = "S1:negative"
+    mixed_rows[0]["geometric_population_delta_final_dominant_state"] = "1"
+    mixed_rows[0]["geometric_population_delta_final_dominant_sign"] = "negative"
+    with mixed_direction_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames_for_mixed)
+        writer.writeheader()
+        writer.writerows(mixed_rows)
+    final_direction_fail = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--input-run-summary",
+            str(summary_paths[0]),
+            "--input-run-summary",
+            str(mixed_direction_path),
+            "--require-scan-readiness",
+            "--min-ready-fraction",
+            "0.5",
+            "--min-manifest-ok-fraction",
+            "0.0",
+            "--min-final-direction-consensus-fraction",
+            "1.0",
+            "--output-dir",
+            str(tmp_path / "final_direction_readiness_fail"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert final_direction_fail.returncode == 10
+    assert "scan_readiness_verdict: final_direction_consensus_limited" in final_direction_fail.stdout
+    assert "scan_readiness_failed_checks: final_direction_consensus_fraction" in final_direction_fail.stdout
+
+
+def test_liquid_phase_ldr_auto_extends_gauge_substeps_for_strict_readiness(tmp_path):
+    script = "examples/namd/liquid_phase_ldr.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--md-steps",
+            "4",
+            "--frames",
+            "4",
+            "--waters",
+            "4",
+            "--x-points",
+            "5",
+            "--ldr-substeps",
+            "auto",
+            "--ldr-substep-convergence",
+            "1,2,4",
+            "--geometric-stride-convergence",
+            "1,2",
+            "--geometric-gauge-check",
+            "--geometric-gauge-substeps",
+            "auto",
+            "--geometric-gauge-substep-convergence",
+            "1,2,4",
+            "--require-liquid-ldr-readiness",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "liquid_ldr_readiness_gate: passed" in result.stdout
+    assert "geometric_gauge_substeps: 16" in result.stdout
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    gauge_convergence = json.loads((tmp_path / "liquid_ldr_geometric_gauge_substep_convergence.json").read_text())
+    assert summary["geometric_readiness_verdict"] == "ready"
+    assert summary["geometric_gauge_ready"] is True
+    assert summary["geometric_gauge_substeps"] == 16
+    assert gauge_convergence["auto_extended_substeps"] is True
+    assert gauge_convergence["auto_candidate_substeps"] == [1, 2, 4, 8, 16]
+    assert gauge_convergence["recommended_substeps"] == 16
+    assert gauge_convergence["auto_exhausted"] is False
+    report = (tmp_path / "liquid_ldr_geometric_report.md").read_text()
+    assert "Auto extended: `True`" in report
+    assert "Auto candidates: `[1, 2, 4, 8, 16]`" in report
+
+
+def test_liquid_phase_ldr_quality_gate_can_pass_and_fail(tmp_path):
+    script = "examples/namd/liquid_phase_ldr.py"
+    base_args = [
+        sys.executable,
+        script,
+        "--md-steps",
+        "4",
+        "--frames",
+        "4",
+        "--waters",
+        "4",
+        "--x-points",
+        "5",
+    ]
+    pass_dir = tmp_path / "pass"
+    pass_result = subprocess.run(
+        [
+            *base_args,
+            "--require-liquid-ldr-quality",
+            "--output-dir",
+            str(pass_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "liquid_ldr_quality_gate: passed" in pass_result.stdout
+    assert json.loads((pass_dir / "summary.json").read_text())["geometric_quality_verdict"] == "ready"
+
+    fail_dir = tmp_path / "fail"
+    fail_result = subprocess.run(
+        [
+            *base_args,
+            "--require-liquid-ldr-quality",
+            "--liquid-ldr-quality-population-tolerance",
+            "10.0",
+            "--output-dir",
+            str(fail_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert fail_result.returncode == 3
+    assert "liquid_ldr_quality_gate: failed" in fail_result.stdout
+    assert "verdict=geometry_quiet" in fail_result.stdout
+    assert json.loads((fail_dir / "summary.json").read_text())["geometric_quality_verdict"] == "geometry_quiet"
+
+    readiness_pass_dir = tmp_path / "readiness_pass"
+    readiness_pass_result = subprocess.run(
+        [
+            *base_args,
+            "--require-liquid-ldr-readiness",
+            "--output-dir",
+            str(readiness_pass_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "liquid_ldr_readiness_gate: passed" in readiness_pass_result.stdout
+    readiness_pass_summary = json.loads((readiness_pass_dir / "summary.json").read_text())
+    assert readiness_pass_summary["geometric_readiness_verdict"] == "ready"
+
+    readiness_fail_dir = tmp_path / "readiness_fail"
+    readiness_fail_result = subprocess.run(
+        [
+            *base_args,
+            "--require-liquid-ldr-readiness",
+            "--liquid-ldr-quality-population-tolerance",
+            "10.0",
+            "--output-dir",
+            str(readiness_fail_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert readiness_fail_result.returncode == 4
+    assert "liquid_ldr_readiness_gate: failed" in readiness_fail_result.stdout
+    assert "verdict=quality_limited" in readiness_fail_result.stdout
+    assert "failed_checks=quality" in readiness_fail_result.stdout
+    readiness_fail_summary = json.loads((readiness_fail_dir / "summary.json").read_text())
+    assert readiness_fail_summary["geometric_readiness_verdict"] == "quality_limited"
+
+    embedded_missing_dir = tmp_path / "embedded_missing"
+    embedded_missing_result = subprocess.run(
+        [
+            *base_args,
+            "--require-embedded-geometric-readiness",
+            "--output-dir",
+            str(embedded_missing_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert embedded_missing_result.returncode == 5
+    assert "embedded_geometric_readiness_gate: failed" in embedded_missing_result.stdout
+    assert "verdict=missing" in embedded_missing_result.stdout
+    assert "failed_checks=missing" in embedded_missing_result.stdout
+    assert (embedded_missing_dir / "summary.json").exists()
+
+
+def test_liquid_phase_ldr_manifest_verifier_uses_absolute_fallback(tmp_path):
+    script = Path("examples/namd/liquid_phase_ldr.py").resolve()
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("liquid LDR artifact\n")
+    manifest = {
+        "schema": "pyqed.liquid_ldr.artifact_manifest.v1",
+        "hash_algorithm": "sha256",
+        "artifact_count": 1,
+        "artifacts": [
+            {
+                "label": "synthetic",
+                "path": "artifact.txt",
+                "absolute_path": str(artifact),
+                "exists": True,
+                "size_bytes": artifact.stat().st_size,
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    manifest_path = tmp_path / "artifact_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    report_path = tmp_path / "nested" / "verification_report.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--verify-artifact-manifest",
+            str(manifest_path),
+            "--verification-report",
+            str(report_path),
+        ],
+        cwd=tmp_path.parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert f"artifact_manifest_verification_report: {report_path}" in result.stdout
+    assert "artifact_manifest_verification: passed" in result.stdout
+    assert "artifact_records_checked: 1" in result.stdout
+    assert "artifact_records_failed: 0" in result.stdout
+    report = json.loads(report_path.read_text())
+    assert report["ok"] is True
+    assert report["schema"] == "pyqed.liquid_ldr.artifact_manifest.v1"
+    assert report["hash_algorithm"] == "sha256"
+    assert report["manifest_error_count"] == 0
+    assert report["checked_count"] == 1
+    assert report["failed_count"] == 0
+    assert report["records"][0]["path"] == "artifact.txt"
+    assert report["records"][0]["absolute_path"] == str(artifact)
+    assert report["records"][0]["resolved_path"] == str(artifact)
+
+    manifest["artifact_count"] = 2
+    manifest_path.write_text(json.dumps(manifest))
+    count_result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--verify-artifact-manifest",
+            str(manifest_path),
+        ],
+        cwd=tmp_path.parent,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert count_result.returncode == 6
+    assert "artifact_manifest_verification: failed" in count_result.stdout
+    assert "artifact_manifest_errors: 1" in count_result.stdout
+    assert "artifact_count_mismatch" in count_result.stdout
+
+
+def test_liquid_phase_ldr_embedded_readiness_gate_can_pass(tmp_path):
+    script = "examples/namd/liquid_phase_ldr.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--md-steps",
+            "4",
+            "--frames",
+            "4",
+            "--waters",
+            "4",
+            "--x-points",
+            "5",
+            "--embedded-trajectory",
+            "--embedded-trajectory-frames",
+            "2",
+            "--embedded-frame-overlaps",
+            "--embedded-transported-propagation",
+            "--embedded-ldr-substeps",
+            "auto",
+            "--embedded-ldr-substep-convergence",
+            "1,2",
+            "--embedded-hotspots-top-k",
+            "1",
+            "--embedded-geometric-tolerance",
+            "1e-20",
+            "--embedded-geometric-population-tolerance",
+            "1e-40",
+            "--require-embedded-geometric-readiness",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "embedded_geometric_readiness_gate: passed" in result.stdout
+    assert "embedded_geometric_readiness:" in result.stdout
+    assert "embedded_transport_geometric_population:" in result.stdout
+    assert "readiness_summary:" in result.stdout
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    manifest = json.loads((tmp_path / "artifact_manifest.json").read_text())
+    readiness_summary = json.loads((tmp_path / "readiness_summary.json").read_text())
+    embedded = summary["embedded_trajectory"]
+    readiness_path = tmp_path / "embedded_h2_geometric_readiness.json"
+    transported_path = tmp_path / "embedded_h2_transport_geometric_population.json"
+    readiness_summary_path = tmp_path / "readiness_summary.json"
+    assert readiness_path.exists()
+    assert transported_path.exists()
+    assert readiness_summary_path.exists()
+    assert embedded["embedded_geometric_readiness_path"] == str(readiness_path)
+    assert embedded["transported_geometric_population_path"] == str(transported_path)
+    assert embedded["embedded_geometric_readiness_verdict"] == "ready"
+    assert embedded["embedded_geometric_readiness_ready"] is True
+    assert embedded["transported_geometric_quality_verdict"] == "ready"
+    assert json.loads(readiness_path.read_text()) == embedded["embedded_geometric_readiness"]
+    transported = json.loads(transported_path.read_text())
+    assert transported["transported_frame_transport"] == "phase_aligned"
+    assert transported["transported_substeps"] == embedded["embedded_ldr_substeps"]
+    assert transported["transported_geometric_quality_verdict"] == "ready"
+    assert transported["transported_geometric_top_hotspot"] == embedded[
+        "transported_geometric_top_hotspot"
+    ]
+    manifest_paths = {record["path"] for record in manifest["artifacts"]}
+    manifest_by_path = {record["path"]: record for record in manifest["artifacts"]}
+    assert str(readiness_path) in manifest_paths
+    assert str(transported_path) in manifest_paths
+    assert str(readiness_summary_path) in manifest_paths
+    h2_record = readiness_summary["records"]["embedded_h2"]
+    assert readiness_summary["records"]["liquid"]["ready"] is True
+    assert h2_record["available"] is True
+    assert h2_record["ready"] is True
+    assert h2_record["verdict"] == "ready"
+    assert h2_record["path"] == str(readiness_path)
+    assert h2_record["failed_checks"] == []
+    assert readiness_summary["overall_ready"] is True
+    assert readiness_summary["available_count"] == 2
+    assert readiness_summary["ready_count"] == 2
+    for path in (readiness_path, transported_path, readiness_summary_path):
+        record = manifest_by_path[str(path)]
+        assert record["size_bytes"] == path.stat().st_size
+        assert len(record["sha256"]) == 64
+        assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()

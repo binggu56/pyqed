@@ -48,6 +48,8 @@ Main Components
   paths.
 * ``pyqed.gw`` contains dense molecular GW, eigenvalue-self-consistent GW,
   qsGW, and BSE reference implementations.
+* ``pyqed.pbc.gw`` contains dense small-cell periodic G0W0, evGW/GnW0, TDA,
+  and full BSE development paths.
 
 Integral Backends
 -----------------
@@ -118,6 +120,7 @@ Related Topics
 * :doc:`hf_analysis`
 * :doc:`mp2_comp2`
 * :doc:`gw_bse`
+* :doc:`periodic_gw_bse`
 * :doc:`tddft_ehrenfest`
 * :doc:`qchem_architecture`
 * :doc:`mps`

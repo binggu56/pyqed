@@ -673,11 +673,6 @@ class Mol:
             return driven_dynamics(H, psi0, dt=dt, Nt=nt, \
                                     e_ops=e_ops, nout=nout, t0=t0)
 
-    # def heom(self, env, nado=5, c_ops=None, obs_ops=None, fname=None):
-    #     nt = self.nt
-    #     dt = self.dt
-    #     return _heom(self.oqs, env, c_ops, nado, nt, dt, fname)
-
     # def redfield(self, env, dt, Nt, c_ops, obs_ops, rho0, integrator='SOD'):
     #     nstates = self.nstates
 
@@ -756,10 +751,20 @@ class Mol:
         """
         hierarchical equations of motion
         """
-        from pyqed.HEOM.deom import DEOMSolver
-        
-        solver = DEOMSolver(self.H, self.edip, bath,
-                            coupling, coupling_dipole, pulse_system_func, pulse_coupling_func, mode)
+        from pyqed.heom import HEOM
+
+        if mode is not None:
+            bath.mode = np.asarray(mode, dtype=np.int64)
+
+        solver = HEOM(
+            system=self.H,
+            system_dipole=self.edip,
+            bath=bath,
+            coupling=coupling,
+            coupling_dipole=coupling_dipole,
+            pulse_system_func=pulse_system_func,
+            pulse_coupling_func=pulse_coupling_func,
+        )
         return solver
 
 
@@ -2113,4 +2118,3 @@ if __name__ == '__main__':
     # mol.absorption(omegas)
     # mol.photon_echo(pump=omegas, probe=omegas, plt_signal=True)
     # S = mol.cars(shift=shift, omega1=omegas, plt_signal=True)
-

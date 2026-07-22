@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.sparse.linalg import eigsh
 
-from pyqed.narg.qchem import NARG
+from pyqed.narg.qchem import NARG, NARGSCF
 from pyqed.narg.qchem import abelian as abelian_narg
 from pyqed.narg.qchem.active_space import prepare_active_space
 from pyqed.narg.core import narg_state_vector
@@ -100,6 +100,12 @@ def _hchain_sto3g_mf(nsites, spacing):
     mol = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
     mol.build()
     return mol.RHF().run()
+
+
+def _h2_sto3g_mf():
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build(driver="builtin", eri="dense")
+    return mol.RHF().run(verbose=0)
 
 
 def test_abelian_irrep_tensor_roundtrip_keeps_charge_shift_blocks():
@@ -481,6 +487,40 @@ def test_qchem_narg_prepares_frozen_core_cas_like_casci():
     np.testing.assert_allclose(active_mol.energy_nuc(), mc.e_core, atol=1e-10)
 
 
+def test_h2_public_active_space_api_matches_casci():
+    mf = _h2_sto3g_mf()
+    mc = CASCI(mf, ncas=2, nelecas=(1, 1), verbose=0).run(nstates=1, method="direct_ci")
+
+    number = mf.NARG(
+        symmetry="number",
+        active=[0, 1],
+        nelecas=(1, 1),
+        D=16,
+        nstates=1,
+    )
+    number.run()
+
+    spin = mf.NARG(
+        symmetry="spin",
+        active=[0, 1],
+        nelecas=(1, 1),
+        D=16,
+        nstates=1,
+        target_j2=0,
+        su2_backend="python",
+    )
+    spin.run()
+
+    assert number.workflow["orbital_space"] == (0, 1)
+    assert number.ncore == 0
+    assert number.ncas == 2
+    assert number.local_dims == (4, 4)
+    assert spin.workflow["orbital_space"] == (0, 1)
+    assert spin.target_irrep == (2, 0)
+    np.testing.assert_allclose(number.e_tot[0], mc.e_tot[0], atol=1.0e-10)
+    np.testing.assert_allclose(spin.e_tot[0], mc.e_tot[0], atol=1.0e-10)
+
+
 def test_abelian_narg_accepts_cas_options():
     mf = _lih_sto3g_mf()
     narg = NARG(
@@ -503,6 +543,117 @@ def test_abelian_narg_accepts_cas_options():
     assert len(e) == 2
     assert x.shape[1] == 2
     assert np.all(np.isfinite(e))
+
+
+def test_abelian_narg_exposes_e_tot_and_rdms_directly():
+    mf = _lih_sto3g_mf()
+    narg = NARG(
+        mf,
+        symmetry="abelian",
+        ncas=2,
+        nelecas=2,
+        D=8,
+        nstates=1,
+    )
+
+    narg.run()
+    dm1 = narg.make_rdm1()
+    dm2 = narg.make_rdm2()
+    e_active = (
+        np.einsum("pq,pq", narg.h1e, dm1)
+        + 0.5 * np.einsum("pqrs,pqrs", narg.eri, dm2)
+    )
+
+    assert narg.e_tot.shape == (1,)
+    assert dm1.shape == (2, 2)
+    assert dm2.shape == (2, 2, 2, 2)
+    np.testing.assert_allclose(np.trace(dm1), 2.0, atol=1.0e-10)
+    np.testing.assert_allclose(e_active + narg.e_core, narg.e_tot[0], atol=1.0e-10)
+
+
+def test_abelian_narg_rdm_requires_stored_tensors():
+    mf = _lih_sto3g_mf()
+    narg = NARG(
+        mf,
+        symmetry="abelian",
+        ncas=2,
+        nelecas=2,
+        D=8,
+        nstates=1,
+        store_tensors=False,
+    )
+
+    narg.run()
+    try:
+        narg.make_rdm1()
+    except ValueError as exc:
+        assert "store_tensors=True" in str(exc)
+    else:
+        raise AssertionError("make_rdm1 should require stored NARG tensors")
+
+
+def test_su2_narg_exposes_e_tot_and_rdms_directly():
+    mf = _lih_sto3g_mf()
+    narg = NARG(
+        mf,
+        symmetry="su2",
+        ncas=2,
+        nelecas=2,
+        D=8,
+        nstates=1,
+        su2_backend="python",
+    )
+
+    narg.run()
+    dm1 = narg.make_rdm1()
+    dm2 = narg.make_rdm2()
+
+    assert narg.e_tot.shape == (1,)
+    assert dm1.shape == (2, 2)
+    assert dm2.shape == (2, 2, 2, 2)
+    np.testing.assert_allclose(np.trace(dm1), 2.0, atol=1.0e-10)
+
+
+def test_abelian_nargscf_runs_initial_cas_evaluation():
+    mf = _lih_sto3g_mf()
+    mc = NARGSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        symmetry="abelian",
+        D=8,
+        nstates=1,
+        max_cycle=0,
+        store_tensors=False,
+    ).run()
+
+    assert mc.narg is not None
+    assert mc.e_tot.shape == (1,)
+    np.testing.assert_allclose(mc.e_tot, mc.narg.e_tot)
+
+
+def test_su2_nargscf_runs_initial_cas_evaluation():
+    mf = _lih_sto3g_mf()
+    mc = NARGSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        symmetry="su2",
+        D=8,
+        nstates=1,
+        su2_backend="python",
+        max_cycle=0,
+    ).run()
+
+    assert mc.narg is not None
+    assert mc.e_tot.shape == (1,)
+    np.testing.assert_allclose(mc.e_tot, mc.narg.e_tot)
+
+
+def test_public_qchem_exports_nargscf():
+    from pyqed.qchem import NARGSCF as PublicNARGSCF
+
+    assert PublicNARGSCF is NARGSCF
 
 
 def test_abelian_narg_two_site_growth_emits_two_site_tensor():
@@ -882,6 +1033,76 @@ def test_abelian_narg_rolling_two_site_keeps_one_site_block_size():
     np.testing.assert_allclose(e, exact, atol=1e-10)
 
 
+def test_abelian_recursive_conditional_cc_improves_truncated_hubbard_chain():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    exact = float(_sector_ground_energy(h1e, eri, DummyMol.nelec)[0])
+    abelian_narg.mol = DummyMol()
+
+    common = dict(
+        D=8,
+        n0=1,
+        nstates=1,
+        growth_sites=2,
+        two_site_mode="rolling",
+    )
+    plain = abelian_narg.kernel(h1e, eri, **common)[0][0]
+    solver = abelian_narg.NARG(
+        object(),
+        mol=DummyMol(),
+        **common,
+        dressing="conditional_cc",
+    )
+    dressed, _vectors = solver.run(h1e=h1e, eri=eri)
+    diagnostics = solver.dressing_history
+
+    assert exact <= dressed[0] + 1.0e-10
+    assert plain - exact > 0.3
+    assert dressed[0] - exact < 0.1
+    assert dressed[0] < plain - 0.2
+    assert len(diagnostics) == 2
+    assert all(item["response_rank"] > 0 for item in diagnostics)
+    assert all(item["discarded_residual_norm"] > 0.0 for item in diagnostics)
+    assert solver.tensors is None
+
+
+def test_abelian_one_site_conditional_cc_projects_later_growth_operators():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    exact = float(_sector_ground_energy(h1e, eri, DummyMol.nelec)[0])
+    abelian_narg.mol = DummyMol()
+    common = dict(D=8, n0=1, nstates=1, growth_sites=1)
+    plain = abelian_narg.kernel(h1e, eri, **common)[0][0]
+
+    solver = abelian_narg.NARG(
+        object(),
+        mol=DummyMol(),
+        **common,
+        dressing="conditional_cc",
+    )
+    dressed, _vectors = solver.run(h1e=h1e, eri=eri)
+
+    assert exact <= dressed[0] + 1.0e-10
+    assert plain - exact > 0.5
+    assert dressed[0] - exact < 0.16
+    assert dressed[0] < plain - 0.4
+    assert len(solver.dressing_history) == 4
+    assert all(item["response_rank"] > 0 for item in solver.dressing_history)
+    assert solver.tensors is None
+
+
 def test_abelian_narg_supersite_hubbard_uses_literal_d16_sites():
     class DummyMol:
         nelec = (2, 2)
@@ -1079,6 +1300,38 @@ def test_supersite_kernel_accepts_energy_groups_with_d4_edges():
     assert groups == ((0,), (1, 2), (3,))
     assert [factor["local_dim"] for factor in tensor_qns["factors"]] == [4, 16, 4]
     assert [tensor.shape[-1] for tensor in tensors] == [4, 16, 4]
+
+
+def test_reduced_supersite_kernel_keeps_mixed_energy_groups_exact():
+    class DummyMol:
+        nelec = (2, 2)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h_mom, eri_mom = _real_momentum_hubbard_integrals(4, t=0.7, u=1.0, order="energy")
+    groups = abelian_narg.energy_groups(np.diag(h_mom), tol=1e-10)
+    exact = _sector_ground_energy(h_mom, eri_mom, DummyMol.nelec)
+    abelian_narg.mol = DummyMol()
+
+    e, _, tensors, tensor_qns = abelian_narg.reduced_supersite_kernel(
+        h_mom,
+        eri_mom,
+        groups=groups,
+        D=16,
+        nstates=1,
+        nelec=DummyMol.nelec,
+        return_tensors=True,
+        return_tensor_qns=True,
+    )
+
+    np.testing.assert_allclose(e, exact, atol=1e-10)
+    assert groups == ((0,), (1, 2), (3,))
+    assert tensor_qns["path"] == "reduced"
+    assert [factor["path"] for factor in tensor_qns["factors"]] == ["reduced", "reduced", "reduced"]
+    assert [factor["local_dim"] for factor in tensor_qns["factors"]] == [4, 16, 4]
+    assert [tuple(tensor.shape[2:]) for tensor in tensors[:-1]] == [(1,), (4, 4), (4,)]
 
 
 def test_momentum_space_hubbard_two_site_narg_is_compact_at_weak_coupling():

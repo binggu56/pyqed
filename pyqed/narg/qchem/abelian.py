@@ -23,7 +23,11 @@ from opt_einsum import contract
 
 import numpy as np
 
-from pyqed import TFIM, multispin, transform
+try:
+    from pyqed import TFIM, multispin
+except ImportError:  # optional spin-model helpers are not needed by qchem NARG
+    TFIM = None
+    multispin = None
 from pyqed.qchem import Molecule, build_atom_from_coords
 from pyqed.phys import eigh
 from pyqed.qchem.ci.fci import FCI
@@ -36,6 +40,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from .active_space import CAS_OPTION_DEFAULTS, pop_active_space_options, prepare_active_space
+from .rdm import make_rdm1_from_narg, make_rdm2_from_narg
+from pyqed.narg.hamiltonian import normalize_orbital_blocks
 from ..core import Block, NARGBase, Step
 
 try:
@@ -52,6 +58,11 @@ try:
     from . import abelian_cython as _abelian_cython
 except Exception:  # pragma: no cover - optional accelerator
     _abelian_cython = None
+
+try:
+    from . import compiled as _compiled_qchem
+except Exception:  # pragma: no cover - optional accelerator
+    _compiled_qchem = None
 
 # logging.basicConfig()
 # logger = logging.getLogger()
@@ -81,10 +92,14 @@ def rotate(A, B, U):
         DESCRIPTION.
 
     """
+    B_arr = np.asarray(B)
+    if _compiled_qchem is not None and np.count_nonzero(B_arr) < B_arr.size:
+        return _compiled_qchem.rotate(A, B_arr, U)
+
     n, D, d = U.shape
 
     assert(n == A.shape[0])
-    assert(d == B.shape[1])
+    assert(d == B_arr.shape[1])
 
     # Columns are ordered as (local state, block state), matching the final
     # reshape of the old mbna tensor contraction.
@@ -92,7 +107,7 @@ def rotate(A, B, U):
     rotated = np.asarray(Umat.conj().T @ np.asarray(A @ Umat))
     return (
         rotated.reshape(d, D, d, D)
-        * np.asarray(B)[:, None, :, None]
+        * B_arr[:, None, :, None]
     ).reshape(d * D, d * D)
 
 
@@ -198,10 +213,10 @@ class RotationPlan:
         key = (id(A), self.local_key(B), qn_key(shift))
         cached = self.rotations.get(key)
         if cached is not None and cached[0] is A:
-            return cached[1].copy()
+            return cached[1]
         result = self.rotate(A, B, shift)
         self.rotations[key] = (A, result)
-        return result.copy()
+        return result
 
     def rotate(self, A, B, shift):
         if not self.sector_transitions(shift):
@@ -219,6 +234,28 @@ class RotationPlan:
                 left = self.U[:, bra_states, bra_local]
                 right = self.U[:, ket_states, ket_local]
                 out[bra[:, None], ket[None, :]] += coeff * (left.conj().T @ (A @ right))
+        return out
+
+    def rotate_with_applied_cache(self, A, B, shift, applied):
+        if not self.sector_transitions(shift):
+            return np.zeros((self.out_dim, self.out_dim), dtype=np.result_type(A, B, self.U, complex))
+        out = np.zeros((self.out_dim, self.out_dim), dtype=np.result_type(A, B, self.U, complex))
+        local_transitions = self.nonzero_local_transitions(B)
+        if not local_transitions:
+            return out
+        for bra_parts, ket_parts in self.sector_transitions(shift):
+            for bra_local, ket_local, coeff in local_transitions:
+                bra, bra_states = bra_parts[bra_local]
+                ket, ket_states = ket_parts[ket_local]
+                if bra.size == 0 or ket.size == 0:
+                    continue
+                left = self.U[:, bra_states, bra_local]
+                key = (ket_local, id(ket_states))
+                right = applied.get(key)
+                if right is None:
+                    right = A @ self.U[:, ket_states, ket_local]
+                    applied[key] = right
+                out[bra[:, None], ket[None, :]] += coeff * (left.conj().T @ right)
         return out
 
 
@@ -351,7 +388,11 @@ def blockwise_rotate_sparse(A, B, U, output_qn, shift, plan=None, atol=0.0):
 def rotate_symmetry(
     A, B, U, output_qn=None, shift=None, use_irrep_blocks=False, plan=None, sparse_output=False
 ):
-    if use_irrep_blocks and output_qn is not None and shift is not None:
+    use_blocks = bool(use_irrep_blocks)
+    if output_qn is not None and shift is not None and not use_blocks:
+        B_arr = np.asarray(B)
+        use_blocks = np.count_nonzero(B_arr) < B_arr.size
+    if use_blocks and output_qn is not None and shift is not None:
         if sparse_output:
             return blockwise_rotate_sparse(A, B, U, output_qn, shift, plan=plan)
         return blockwise_rotate(A, B, U, output_qn, shift, plan=plan)
@@ -1035,6 +1076,287 @@ def supersite_kernel(
     if return_tensor_qns:
         results.append({"factors": tensor_qns})
     return tuple(results) if len(results) > 2 else (e, x)
+
+
+def reduced_supersite_kernel(
+    h1e,
+    eri,
+    groups,
+    *,
+    D=20,
+    nstates=1,
+    nelec=None,
+    eri_cutoff=0.0,
+    fast=False,
+    use_numba_terms='auto',
+    use_irrep_tensor=False,
+    use_irrep_blocks=False,
+    sparse_operator_table='auto',
+    use_sparse_operator_projection='auto',
+    return_tensors=False,
+    return_tensor_qns=False,
+):
+    """Reduced recursive NARG for one- and two-orbital supersite schedules.
+
+    Unlike :func:`supersite_kernel`, this path never rebuilds and sandwiches the
+    full primitive prefix Hamiltonian after the initial local block.  It carries
+    the retained Hamiltonian, Abelian charge labels, reduced operator table, and
+    future triple residuals through each cluster append.
+    """
+    h1e = np.asarray(h1e)
+    eri = np.asarray(eri)
+    groups = [tuple(int(i) for i in group) for group in groups]
+    if not groups or any(len(group) < 1 for group in groups):
+        raise ValueError("groups must contain at least one non-empty supersite.")
+    unsupported = [group for group in groups if len(group) > 2]
+    if unsupported:
+        raise NotImplementedError(
+            "Reduced clustered Abelian NARG currently supports one- and two-orbital "
+            "supersites; larger clusters need a reduced multi-site environment merge."
+        )
+    order = tuple(i for group in groups for i in group)
+    norb = h1e.shape[0]
+    if sorted(order) != list(range(norb)):
+        raise ValueError("groups must partition all orbital indices exactly once.")
+    if nelec is None:
+        nelec = getattr(mol, "nelec")
+    nelec = np.asarray(nelec, dtype=int).reshape(-1)
+    target_nelec = int(np.sum(nelec))
+    target_sz2 = int(nelec[0] - nelec[1]) if nelec.size == 2 else int(getattr(mol, "spin", 0))
+    target_qn = (target_nelec, target_sz2)
+    D = int(D)
+    if D < 1:
+        raise ValueError("D must be positive.")
+    nstates = int(nstates)
+    if nstates < 1:
+        raise ValueError("nstates must be positive.")
+
+    if fast:
+        if use_numba_terms == 'auto':
+            use_numba_terms = True
+        if use_irrep_blocks is False:
+            use_irrep_blocks = True
+    if sparse_operator_table == 'auto':
+        sparse_operator_table = bool(fast)
+    else:
+        sparse_operator_table = bool(sparse_operator_table)
+    if use_sparse_operator_projection == 'auto':
+        use_sparse_operator_projection = bool(fast)
+    else:
+        use_sparse_operator_projection = bool(use_sparse_operator_projection)
+
+    h = h1e[np.ix_(order, order)]
+    v = eri[np.ix_(order, order, order, order)]
+    pair_terms, triple_terms = precompute_integral_terms(v, eri_cutoff, use_numba=use_numba_terms)
+
+    first = groups[0]
+    prefix = len(first)
+    model = SpinHalfFermionChain(h[:prefix, :prefix], v[:prefix, :prefix, :prefix, :prefix], nelec=nelec)
+    model.jordan_wigner(forward=False)
+    primitive_qn = primitive_charge_labels(prefix)
+    nroots = min(D, model.H.shape[0])
+    energy, basis, block_qn = diagonalize_by_qn(
+        model.H,
+        primitive_qn,
+        nroots,
+        allowed_qn=feasible_qns(target_qn, prefix, norb),
+        use_irrep_tensor=use_irrep_tensor,
+        allow_empty=True,
+    )
+    if basis.shape[1] == 0:
+        raise ValueError(f"No feasible retained states for initial clustered block {first}.")
+    Hblock = np.diag(energy).astype(np.result_type(model.H, basis, complex))
+
+    required_entries = (
+        required_operator_entries(pair_terms, triple_terms, norb, prefix)
+        if sparse_operator_table
+        else None
+    )
+    primitive_table = make_operator_table(
+        {
+            'Cdu': model.Cdu,
+            'Cdd': model.Cdd,
+            'Cu': model.Cu,
+            'Cd': model.Cd,
+        },
+        OPERATOR_PATTERNS,
+        prefix,
+        required=required_entries,
+    )
+    table = _rotate_operator_table_to_basis(
+        primitive_table,
+        basis,
+        sparse_output=use_sparse_operator_projection,
+    )
+    residuals = build_triple_residuals_from_table(table, prefix, range(prefix, norb), triple_terms)
+
+    collect_tensors = return_tensors or return_tensor_qns
+    tensors = []
+    tensor_qns = []
+    initial_local_qn = supersite_charge_labels(prefix)
+    if collect_tensors:
+        tensors.append(basis.reshape((initial_local_qn.shape[0], basis.shape[1], 1)).copy())
+    if return_tensor_qns:
+        tensor_qns.append(
+            {
+                "row_qn": initial_local_qn.copy(),
+                "right_qn_by_next": block_qn[:, None, :].copy(),
+                "local_qn": initial_local_qn.copy(),
+                "local_dim": initial_local_qn.shape[0],
+                "orbitals": tuple(first),
+                "growth_sites": prefix,
+                "path": "reduced",
+            }
+        )
+
+    for group in groups[1:]:
+        local_norb = len(group)
+        if local_norb == 1:
+            Hblock, tensor, block_qn, branch_qn, local_qn, branch_energy = _append_one_site_reduced(
+                Hblock,
+                block_qn,
+                table,
+                residuals,
+                prefix,
+                D,
+                h,
+                v,
+                pair_terms,
+                target_qn,
+                norb,
+                use_irrep_tensor=use_irrep_tensor,
+                use_irrep_blocks=use_irrep_blocks,
+            )
+            table_tensor = tensor
+            plan = RotationPlan(table_tensor, block_qn)
+            new_residuals = extend_triple_residuals(
+                residuals,
+                table,
+                table_tensor,
+                prefix,
+                norb,
+                triple_terms,
+                block_qn,
+                use_irrep_blocks,
+                plan,
+            )
+            required_entries = (
+                required_operator_entries(pair_terms, triple_terms, norb, prefix + 1)
+                if sparse_operator_table
+                else None
+            )
+            table = extend_operator_table(
+                table,
+                OPERATOR_PATTERNS,
+                table_tensor,
+                prefix,
+                block_qn,
+                use_irrep_blocks,
+                plan,
+                required=required_entries,
+                sparse_output=use_sparse_operator_projection,
+            )
+            residuals = new_residuals
+        else:
+            (
+                Hblock,
+                tensor,
+                table_tensor,
+                block_qn,
+                branch_qn,
+                local_qn,
+                branch_energy,
+            ) = _append_pair_supersite_reduced(
+                Hblock,
+                block_qn,
+                table,
+                residuals,
+                prefix,
+                D,
+                h,
+                v,
+                target_qn,
+                norb,
+                use_irrep_tensor=use_irrep_tensor,
+            )
+            plan = RotationPlan(table_tensor, block_qn)
+            new_residuals = extend_triple_residuals_two_site(
+                residuals,
+                table,
+                table_tensor,
+                prefix,
+                norb,
+                triple_terms,
+                block_qn,
+                use_irrep_blocks,
+                plan,
+            )
+            required_entries = (
+                required_operator_entries(pair_terms, triple_terms, norb, prefix + 2)
+                if sparse_operator_table
+                else None
+            )
+            table = extend_pair_table(
+                table,
+                OPERATOR_PATTERNS,
+                table_tensor,
+                prefix,
+                block_qn,
+                use_irrep_blocks,
+                plan,
+                required=required_entries,
+                sparse_output=use_sparse_operator_projection,
+            )
+            residuals = new_residuals
+
+        prefix += local_norb
+        if collect_tensors:
+            tensors.append(tensor.copy())
+        if return_tensor_qns:
+            tensor_qns.append(
+                {
+                    "right_qn_by_next": branch_qn.copy(),
+                    "local_qn": local_qn.copy(),
+                    "local_dim": int(local_qn.shape[0]),
+                    "orbitals": tuple(group),
+                    "growth_sites": local_norb,
+                    "branch_energy": branch_energy.copy(),
+                    "path": "reduced",
+                }
+            )
+
+    E, X, final_qn = charge_diagonalize(Hblock, block_qn, nstates, allowed_qn={target_qn})
+    E = E[:nstates]
+    X = X[:, :nstates]
+    final_qn = final_qn[:nstates]
+    results = [E, X]
+    if return_tensors or return_tensor_qns:
+        if not tensors:
+            raise ValueError("internal error: clustered NARG did not build any tensors.")
+        terminal_local_shape = tuple(int(dim) for dim in tensors[-1].shape[2:])
+        terminal_local_dim = int(np.prod(terminal_local_shape))
+        final_bond_dim = int(tensors[-1].shape[1])
+        if X.shape[0] != terminal_local_dim * final_bond_dim:
+            raise ValueError("final eigenvector shape is incompatible with clustered NARG tensors.")
+    if return_tensors:
+        coeff = np.asarray(X).reshape(terminal_local_dim, final_bond_dim, X.shape[1])
+        results.append(tensors + [coeff])
+    if return_tensor_qns:
+        terminal_total_qn = qn_array(block_qn).reshape(terminal_local_dim, final_bond_dim, -1)
+        results.append(
+            {
+                "factors": tensor_qns,
+                "terminal_total_qn_by_site": terminal_total_qn.copy(),
+                "local_qn": np.zeros((terminal_local_dim, LOCAL_QN.shape[1]), dtype=int)
+                if terminal_local_dim == 1
+                else qn_array(tensor_qns[-1]["local_qn"]).copy(),
+                "local_shape": terminal_local_shape,
+                "target_qn": np.asarray(target_qn, dtype=int),
+                "final_qn": np.asarray(final_qn, dtype=int),
+                "path": "reduced",
+            }
+        )
+    return tuple(results) if len(results) > 2 else (E, X)
 
 
 @dataclass
@@ -1890,22 +2212,165 @@ def _two_site_operator_factor(table, pattern, indices, first_site, old_dim):
     return block_op, local_op
 
 
-def add_local_kron_blocks(target4, block_op, local_op, coeff=1.0):
+def add_local_kron_blocks(target4, block_op, local_op, coeff=1.0, *, check_zero=True):
     """Add ``coeff * kron(block_op, local_op)`` to a 4D Kronecker view."""
     if abs(coeff) <= 0:
         return
-    block = dense_operator(block_op)
     local = np.asarray(local_op)
-    if not np.any(block) or not np.any(local):
+    if issparse(block_op):
+        if block_op.nnz == 0:
+            return
+        if (
+            _compiled_qchem is not None
+            and target4.dtype == np.dtype(np.complex128)
+            and _compiled_qchem.add_sparse_local_kron_blocks(target4, block_op, local, coeff)
+        ):
+            return
+        block_coo = block_op.tocoo()
+        rows, cols = np.nonzero(local)
+        values = coeff * local[rows, cols]
+        for row, col, value in zip(rows, cols, values):
+            target4[block_coo.row, row, block_coo.col, col] += value * block_coo.data
+        return
+    block = dense_operator(block_op)
+    if check_zero and not np.any(block):
+        return
+    if (
+        _compiled_qchem is not None
+        and target4.dtype == np.dtype(np.complex128)
+        and _compiled_qchem.add_local_kron_blocks(target4, block, local, coeff)
+    ):
         return
     rows, cols = np.nonzero(local)
-    for row, col in zip(rows, cols):
-        scale = coeff * local[row, col]
-        if scale != 0:
-            target4[:, row, :, col] += scale * block
+    if rows.size == 0:
+        return
+    values = coeff * local[rows, cols]
+    target4[:, rows, :, cols] += block[:, None, :] * values[None, :, None]
 
 
-def extend_operator_table_two_site(
+def add_local_kron_blocks_hc(target4, block_op, local_op, coeff=1.0):
+    """Add ``X + X^dagger`` for ``X = coeff * kron(block_op, local_op)``."""
+    if abs(coeff) <= 0:
+        return
+    local = np.asarray(local_op)
+    if issparse(block_op):
+        if block_op.nnz == 0:
+            return
+        if (
+            _compiled_qchem is not None
+            and target4.dtype == np.dtype(np.complex128)
+            and _compiled_qchem.add_sparse_local_kron_blocks_hc(target4, block_op, local, coeff)
+        ):
+            return
+        block_coo = block_op.tocoo()
+        rows, cols = np.nonzero(local)
+        values = coeff * local[rows, cols]
+        for row, col, value in zip(rows, cols, values):
+            target4[block_coo.row, row, block_coo.col, col] += value * block_coo.data
+            target4[block_coo.col, col, block_coo.row, row] += np.conjugate(value * block_coo.data)
+        return
+    block = dense_operator(block_op)
+    if not np.any(block):
+        return
+    if (
+        _compiled_qchem is not None
+        and target4.dtype == np.dtype(np.complex128)
+        and _compiled_qchem.add_local_kron_blocks_hc(target4, block, local, coeff)
+    ):
+        return
+    rows, cols = np.nonzero(local)
+    if rows.size == 0:
+        return
+    block_h = block.T.conj()
+    values = coeff * local[rows, cols]
+    target4[:, rows, :, cols] += block[:, None, :] * values[None, :, None]
+    target4[:, cols, :, rows] += block_h[:, None, :] * np.conjugate(values)[None, :, None]
+
+
+def add_local_kron_blocks_lloo(target4, block_op, local_op, coeff=1.0, *, check_zero=True):
+    """Add ``coeff * kron(block_op, local_op)`` to ``(local, local, old, old)`` blocks."""
+    if abs(coeff) <= 0:
+        return
+    local = np.asarray(local_op)
+    rows, cols = np.nonzero(local)
+    if rows.size == 0:
+        return
+    if issparse(block_op):
+        if block_op.nnz == 0:
+            return
+        block_coo = block_op.tocoo()
+        values = coeff * local[rows, cols]
+        for row, col, value in zip(rows, cols, values):
+            target4[row, col, block_coo.row, block_coo.col] += value * block_coo.data
+        return
+    block = dense_operator(block_op)
+    if check_zero and not np.any(block):
+        return
+    values = coeff * local[rows, cols]
+    for row, col, value in zip(rows, cols, values):
+        target4[row, col] += value * block
+
+
+def add_local_kron_blocks_hc_lloo(target4, block_op, local_op, coeff=1.0):
+    """Add ``X + X^dagger`` to ``(local, local, old, old)`` blocks."""
+    if abs(coeff) <= 0:
+        return
+    local = np.asarray(local_op)
+    rows, cols = np.nonzero(local)
+    if rows.size == 0:
+        return
+    if issparse(block_op):
+        if block_op.nnz == 0:
+            return
+        block_coo = block_op.tocoo()
+        values = coeff * local[rows, cols]
+        for row, col, value in zip(rows, cols, values):
+            target4[row, col, block_coo.row, block_coo.col] += value * block_coo.data
+            target4[col, row, block_coo.col, block_coo.row] += np.conjugate(value * block_coo.data)
+        return
+    block = dense_operator(block_op)
+    if not np.any(block):
+        return
+    block_h = block.T.conj()
+    values = coeff * local[rows, cols]
+    for row, col, value in zip(rows, cols, values):
+        target4[row, col] += value * block
+        target4[col, row] += np.conjugate(value) * block_h
+
+
+def hermitize_pair_blocks(Hpair4):
+    """Hermitize a pair Hamiltonian in local-block form in place."""
+    local_dim = Hpair4.shape[1]
+    for bra_local in range(local_dim):
+        block = Hpair4[:, bra_local, :, bra_local]
+        block[:] = 0.5 * (block + block.T.conj())
+        for ket_local in range(bra_local + 1, local_dim):
+            upper = 0.5 * (
+                Hpair4[:, bra_local, :, ket_local]
+                + Hpair4[:, ket_local, :, bra_local].T.conj()
+            )
+            Hpair4[:, bra_local, :, ket_local] = upper
+            Hpair4[:, ket_local, :, bra_local] = upper.T.conj()
+    return Hpair4
+
+
+def hermitize_pair_blocks_lloo(Hpair4):
+    """Hermitize ``(local, local, old, old)`` pair-Hamiltonian blocks in place."""
+    local_dim = Hpair4.shape[0]
+    for bra_local in range(local_dim):
+        block = Hpair4[bra_local, bra_local]
+        block[:] = 0.5 * (block + block.T.conj())
+        for ket_local in range(bra_local + 1, local_dim):
+            upper = 0.5 * (
+                Hpair4[bra_local, ket_local]
+                + Hpair4[ket_local, bra_local].T.conj()
+            )
+            Hpair4[bra_local, ket_local] = upper
+            Hpair4[ket_local, bra_local] = upper.T.conj()
+    return Hpair4
+
+
+def extend_pair_table(
     table,
     patterns,
     U,
@@ -1916,11 +2381,50 @@ def extend_operator_table_two_site(
     required=None,
     sparse_output=False,
 ):
-    """Project composite operators when adding two spatial orbitals at once."""
+    """Project composite operators when adding a two-orbital supersite."""
     old_dim = U.shape[0]
     out_dim = U.shape[1] * U.shape[2]
     new_nsites = int(first_site) + 2
     new_table = {}
+    if output_qn is not None and plan is None:
+        plan = RotationPlan(U, output_qn)
+    local_cache = {}
+    block_cache = {}
+    applied_caches = {}
+
+    def factor_cached(pattern, indices):
+        old_names, old_indices, local_names, local_roles = _split_two_site_pattern(pattern, indices, first_site)
+        block_key = (old_names, old_indices)
+        block_op = block_cache.get(block_key)
+        if block_op is None:
+            block_op = _old_block_operator(table, old_names, old_indices, old_dim)
+            block_cache[block_key] = block_op
+        local_key = (local_names, local_roles)
+        local_op = local_cache.get(local_key)
+        if local_op is None:
+            local_op = local_pair_product(local_names, local_roles)
+            local_cache[local_key] = local_op
+        return block_op, local_op
+
+    def rotate_entry(block_op, local_op, shift):
+        if plan is not None and output_qn is not None and shift is not None:
+            cache_key = id(block_op)
+            cached = applied_caches.get(cache_key)
+            if cached is None or cached[0] is not block_op:
+                cached = (block_op, {})
+                applied_caches[cache_key] = cached
+            rotated = plan.rotate_with_applied_cache(block_op, local_op, shift, cached[1])
+            return csr_matrix(rotated) if sparse_output else rotated
+        return rotate_symmetry(
+            block_op,
+            local_op,
+            U,
+            output_qn,
+            shift,
+            use_irrep_blocks,
+            plan,
+            sparse_output=sparse_output,
+        )
 
     for pattern in patterns:
         entries = {}
@@ -1935,15 +2439,13 @@ def extend_operator_table_two_site(
                 shape = (out_dim, out_dim)
                 entries[indices] = csr_matrix(shape, dtype=complex) if sparse_output else np.zeros(shape, dtype=complex)
                 continue
-            block_op, local_op = _two_site_operator_factor(table, pattern, indices, first_site, old_dim)
+            block_op, local_op = factor_cached(pattern, indices)
             if is_zero_operator(block_op) or is_zero_operator(local_op):
                 shape = (out_dim, out_dim)
                 dtype = np.result_type(block_op, local_op, U, complex)
                 entries[indices] = csr_matrix(shape, dtype=dtype) if sparse_output else np.zeros(shape, dtype=dtype)
             else:
-                entries[indices] = rotate_symmetry(
-                    block_op, local_op, U, output_qn, shift, use_irrep_blocks, plan, sparse_output=sparse_output
-                )
+                entries[indices] = rotate_entry(block_op, local_op, shift)
         new_table[pattern] = entries
     return new_table
 
@@ -1974,6 +2476,181 @@ def project_two_site_operator(block_op, local_op, projector, *, sparse_output=Fa
         right = projector[:, col, :]
         out += coeff * (left.conj().T @ (block @ right))
     return csr_matrix(out) if sparse_output else out
+
+
+def extend_operator_table_projector(
+    table,
+    patterns,
+    projector,
+    new_site,
+    output_qn=None,
+    required=None,
+    sparse_output=False,
+):
+    """Project one-site composite operators through a general isometry."""
+    old_dim, local_dim, out_dim = projector.shape
+    if local_dim != len(LOCAL_QN):
+        raise ValueError(
+            f"one-site projector local dimension must be {len(LOCAL_QN)}."
+        )
+    identity_block = eye(old_dim)
+    identity_site = np.eye(local_dim)
+    local = {"Cu": cu, "Cd": cd, "Cdu": cdu, "Cdd": cdd}
+    new_table = {}
+
+    for pattern in patterns:
+        entries = {}
+        shift = pattern_qn_shift(pattern)
+        allowed = output_qn is None or has_qn_transition(output_qn, shift)
+        if required is None:
+            index_iter = np.ndindex((int(new_site) + 1,) * len(pattern))
+        else:
+            index_iter = sorted(required.get(pattern, ()))
+        for indices in index_iter:
+            shape = (out_dim, out_dim)
+            dtype = np.result_type(projector, complex)
+            if not allowed:
+                entries[indices] = (
+                    csr_matrix(shape, dtype=dtype)
+                    if sparse_output
+                    else np.zeros(shape, dtype=dtype)
+                )
+                continue
+
+            old_pattern = []
+            old_indices = []
+            local_op = identity_site
+            for name, index in zip(pattern, indices):
+                if int(index) == int(new_site):
+                    local_op = local_op @ local[name]
+                else:
+                    old_pattern.append(name)
+                    old_indices.append(int(index))
+                    local_op = local_op @ JW
+            block_op = (
+                table[tuple(old_pattern)][tuple(old_indices)]
+                if old_pattern
+                else identity_block
+            )
+            if is_zero_operator(block_op) or is_zero_operator(local_op):
+                dtype = np.result_type(block_op, local_op, projector, complex)
+                entries[indices] = (
+                    csr_matrix(shape, dtype=dtype)
+                    if sparse_output
+                    else np.zeros(shape, dtype=dtype)
+                )
+            else:
+                entries[indices] = project_two_site_operator(
+                    block_op,
+                    local_op,
+                    projector,
+                    sparse_output=sparse_output,
+                )
+        new_table[pattern] = entries
+    return new_table
+
+
+def extend_triple_residuals_projector(
+    residuals,
+    table,
+    projector,
+    new_site,
+    total_sites,
+    triple_terms,
+):
+    """Project future weighted triple residuals through a general isometry."""
+    old_dim = projector.shape[0]
+    identity_block = eye(old_dim)
+    identity_site = np.eye(len(LOCAL_QN))
+    local = {"Cu": cu, "Cd": cd, "Cdu": cdu, "Cdd": cdd}
+    projected = {}
+
+    def project_term(pattern, indices):
+        old_pattern = []
+        old_indices = []
+        local_op = identity_site
+        for name, index in zip(pattern, indices):
+            if int(index) == int(new_site):
+                local_op = local_op @ local[name]
+            else:
+                old_pattern.append(name)
+                old_indices.append(int(index))
+                local_op = local_op @ JW
+        block_op = (
+            table[tuple(old_pattern)][tuple(old_indices)]
+            if old_pattern
+            else identity_block
+        )
+        return project_two_site_operator(block_op, local_op, projector)
+
+    for future in range(int(new_site) + 1, int(total_sites)):
+        old_u, old_d = residuals[future]
+        value_u = project_two_site_operator(old_u, JW, projector)
+        value_d = project_two_site_operator(old_d, JW, projector)
+        for i, j, k, coefficient in triple_terms[future]:
+            if i > new_site or j > new_site or k > new_site:
+                continue
+            if i != new_site and j != new_site and k != new_site:
+                continue
+            indices = (k, j, i)
+            value_u += coefficient * project_term(
+                ("Cdu", "Cdu", "Cu"), indices
+            )
+            value_u += coefficient * project_term(
+                ("Cdu", "Cdd", "Cd"), indices
+            )
+            value_d += coefficient * project_term(
+                ("Cdd", "Cdu", "Cu"), indices
+            )
+            value_d += coefficient * project_term(
+                ("Cdd", "Cdd", "Cd"), indices
+            )
+        projected[future] = (value_u, value_d)
+    return projected
+
+
+def extend_triple_residuals_two_site_projector(
+    residuals,
+    table,
+    projector,
+    first_site,
+    total_sites,
+    triple_terms,
+):
+    """Project future triple residuals through a general two-site isometry."""
+    first_site = int(first_site)
+    second_site = first_site + 1
+    old_dim = projector.shape[0]
+    pair_parity = local_pair_product(("JW",), (-1,))
+    projected = {}
+    for future in range(second_site + 1, int(total_sites)):
+        old_u, old_d = residuals[future]
+        value_u = project_two_site_operator(old_u, pair_parity, projector)
+        value_d = project_two_site_operator(old_d, pair_parity, projector)
+        for i, j, k, coefficient in triple_terms[future]:
+            if i > second_site or j > second_site or k > second_site:
+                continue
+            if i < first_site and j < first_site and k < first_site:
+                continue
+            indices = (k, j, i)
+            for pattern, target in (
+                (("Cdu", "Cdu", "Cu"), "u"),
+                (("Cdu", "Cdd", "Cd"), "u"),
+                (("Cdd", "Cdu", "Cu"), "d"),
+                (("Cdd", "Cdd", "Cd"), "d"),
+            ):
+                block_op, local_op = _two_site_operator_factor(
+                    table, pattern, indices, first_site, old_dim
+                )
+                term = coefficient * project_two_site_operator(
+                    block_op, local_op, projector
+                )
+                if target == "u":
+                    value_u += term
+                else:
+                    value_d += term
+        projected[future] = (value_u, value_d)
+    return projected
 
 
 def extend_operator_table_two_site_projector(
@@ -2324,6 +3001,527 @@ def branch_hamiltonian_irrep(H0, pair_sums, nu, nd):
     )
 
 
+def single_site_hamiltonian_from_integrals(h1e, eri, site_id):
+    site_id = int(site_id)
+    return (
+        h1e[site_id, site_id] * (cdu @ cu + cdd @ cd)
+        + eri[site_id, site_id, site_id, site_id] * Nu @ Nd
+    )
+
+
+def _rotate_operator_table_to_basis(table, basis, *, sparse_output=False):
+    """Rotate primitive block operator table into a retained block basis."""
+    basis = np.asarray(basis)
+    basis_h = basis.conj().T
+    rotated = {}
+    for pattern, entries in table.items():
+        new_entries = {}
+        for indices, op in entries.items():
+            projected = basis_h @ (dense_operator(op) @ basis)
+            new_entries[indices] = csr_matrix(projected) if sparse_output else projected
+        rotated[pattern] = new_entries
+    return rotated
+
+
+def _compressed_superblock_one_site_lloo(
+    H0,
+    input_qn,
+    table,
+    residuals,
+    site_id,
+    h1e,
+    eri,
+    pair_terms,
+):
+    """Exact retained-block-plus-orbital Hamiltonian in local-major blocks."""
+    site_id = int(site_id)
+    old_dim = H0.shape[0]
+    local_dim = len(LOCAL_QN)
+    identity_block = np.eye(old_dim)
+    identity_site = np.eye(local_dim)
+    h_site = single_site_hamiltonian_from_integrals(h1e, eri, site_id)
+    pair_sums = build_pair_sums(table, pair_terms, site_id)
+    dtype = np.result_type(H0, h1e, eri, complex)
+    h_full = np.kron(dense_operator(H0), identity_site).astype(dtype, copy=False)
+    h_full += np.kron(identity_block, h_site)
+    h_full += np.kron(dense_operator(pair_sums["density"]), Ntot)
+    h_full -= np.kron(dense_operator(pair_sums["exchange_u"]), Nu)
+    h_full -= np.kron(dense_operator(pair_sums["exchange_d"]), Nd)
+
+    op_lists = operator_lists(table)
+    v1u = zero_like_operator(H0)
+    v1d = zero_like_operator(H0)
+    for index in range(site_id):
+        v1u += h1e[index, site_id] * dense_operator(op_lists["Cdu"][index])
+        v1d += h1e[index, site_id] * dense_operator(op_lists["Cdd"][index])
+    if site_id in residuals:
+        v1u += residuals[site_id][0]
+        v1d += residuals[site_id][1]
+
+    def add_hermitian(block_op, local_op):
+        nonlocal h_full
+        term = np.kron(dense_operator(block_op), np.asarray(local_op))
+        h_full += term + term.T.conj()
+
+    add_hermitian(v1u, JW @ cu)
+    add_hermitian(v1d, JW @ cd)
+    add_hermitian(pair_sums["v2a"], cdu @ cd)
+    add_hermitian(pair_sums["v2b"], cdu @ cdd)
+
+    v3u = zero_like_operator(H0)
+    v3d = zero_like_operator(H0)
+    for index in range(site_id):
+        v3u += eri[index, site_id, site_id, site_id] * dense_operator(
+            op_lists["Cdu"][index]
+        )
+        v3d += eri[index, site_id, site_id, site_id] * dense_operator(
+            op_lists["Cdd"][index]
+        )
+    add_hermitian(v3u, JW @ Nd @ cu)
+    add_hermitian(v3d, JW @ Nu @ cd)
+
+    h_full = 0.5 * (h_full + h_full.T.conj())
+    h_lloo = h_full.reshape(
+        old_dim, local_dim, old_dim, local_dim
+    ).transpose(1, 3, 0, 2)
+    primitive_qn = (
+        qn_array(input_qn)[:, None, :] + LOCAL_QN[None, :, :]
+    ).reshape((-1, LOCAL_QN.shape[1]))
+    return h_lloo, primitive_qn
+
+
+def _compressed_superblock_two_site_lloo(H0, input_qn, table, residuals, first_site, h1e, eri):
+    """Exact compressed Hamiltonian as ``(local, local, old, old)`` blocks."""
+    first_site = int(first_site)
+    old_dim = H0.shape[0]
+    d = len(LOCAL_QN)
+    local_dim = d * d
+    dtype = np.result_type(H0, h1e, eri, complex)
+    Hpair4 = np.zeros((local_dim, local_dim, old_dim, old_dim), dtype=dtype)
+    H0_dense = dense_operator(H0).astype(dtype, copy=False)
+    for local_id in range(local_dim):
+        Hpair4[local_id, local_id] += H0_dense
+    second_site = first_site + 1
+    block_cache = {}
+    block_zero_cache = {}
+    local_cache = {}
+    term_coeffs = {}
+
+    def factor_cached(old_names, old_indices, local_names, local_roles):
+        block_key = (old_names, old_indices)
+        block_op = block_cache.get(block_key)
+        if block_op is None:
+            block_op = _old_block_operator(table, old_names, old_indices, old_dim)
+            block_cache[block_key] = block_op
+        local_key = (local_names, local_roles)
+        local_op = local_cache.get(local_key)
+        if local_op is None:
+            local_op = local_pair_product(local_names, local_roles)
+            local_cache[local_key] = local_op
+        return block_op, local_op
+
+    def accumulate_term(coeff, pattern, indices):
+        if abs(coeff) <= 0:
+            return
+        if all(int(idx) < first_site for idx in indices):
+            return
+        old_names, old_indices, local_names, local_roles = _split_two_site_pattern(pattern, indices, first_site)
+        if len(old_names) > 2:
+            return
+        key = (old_names, old_indices, local_names, local_roles)
+        term_coeffs[key] = term_coeffs.get(key, 0.0) + coeff
+
+    def block_is_zero(block_op):
+        key = id(block_op)
+        cached = block_zero_cache.get(key)
+        if cached is None:
+            cached = is_zero_operator(block_op)
+            block_zero_cache[key] = cached
+        return cached
+
+    for a in range(second_site + 1):
+        for b in range(second_site + 1):
+            coeff = h1e[a, b]
+            accumulate_term(coeff, ('Cdu', 'Cu'), (a, b))
+            accumulate_term(coeff, ('Cdd', 'Cd'), (a, b))
+
+    for p_idx in range(second_site + 1):
+        for q_idx in range(second_site + 1):
+            for r_idx in range(second_site + 1):
+                for s_idx in range(second_site + 1):
+                    coeff = 0.5 * eri[p_idx, q_idx, r_idx, s_idx]
+                    accumulate_term(coeff, ('Cdu', 'Cdu', 'Cu', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
+                    accumulate_term(coeff, ('Cdu', 'Cdd', 'Cd', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
+                    accumulate_term(coeff, ('Cdd', 'Cdu', 'Cu', 'Cd'), (p_idx, r_idx, s_idx, q_idx))
+                    accumulate_term(coeff, ('Cdd', 'Cdd', 'Cd', 'Cd'), (p_idx, r_idx, s_idx, q_idx))
+
+    for (old_names, old_indices, local_names, local_roles), coeff in term_coeffs.items():
+        if abs(coeff) <= 0:
+            continue
+        block_op, local_op = factor_cached(old_names, old_indices, local_names, local_roles)
+        if block_is_zero(block_op):
+            continue
+        add_local_kron_blocks_lloo(Hpair4, block_op, local_op, coeff, check_zero=False)
+
+    for site_id, role in ((first_site, 0), (second_site, 1)):
+        if site_id in residuals:
+            v1u, v1d = residuals[site_id]
+            local_u = local_pair_product(('JW', 'JW', 'JW', 'Cu'), (-1, -1, -1, role))
+            local_d = local_pair_product(('JW', 'JW', 'JW', 'Cd'), (-1, -1, -1, role))
+            add_local_kron_blocks_hc_lloo(Hpair4, v1u, local_u)
+            add_local_kron_blocks_hc_lloo(Hpair4, v1d, local_d)
+
+    hermitize_pair_blocks_lloo(Hpair4)
+    local_qn = pair_charge_labels()
+    output_qn = (qn_array(input_qn)[:, None, :] + local_qn[None, :, :]).reshape((-1, LOCAL_QN.shape[1]))
+    return Hpair4, output_qn, local_qn
+
+
+def _compressed_superblock_two_site(H0, input_qn, table, residuals, first_site, h1e, eri):
+    """Exact compressed Hamiltonian for a retained block plus two new orbitals."""
+    Hpair4_lloo, output_qn, local_qn = _compressed_superblock_two_site_lloo(
+        H0, input_qn, table, residuals, first_site, h1e, eri
+    )
+    local_dim, _, old_dim, _ = Hpair4_lloo.shape
+    Hpair = np.ascontiguousarray(Hpair4_lloo.transpose(2, 0, 3, 1)).reshape(
+        old_dim * local_dim,
+        old_dim * local_dim,
+    )
+    return Hpair, output_qn, local_qn
+
+
+def project_pair_hamiltonian(Hpair4, branch_tensor):
+    """Project a pair superblock Hamiltonian without forming the zero-padded basis."""
+    old_dim, local_dim, old_dim_ket, local_dim_ket = Hpair4.shape
+    if old_dim != old_dim_ket or local_dim != local_dim_ket:
+        raise ValueError("Hpair4 must have shape (old_dim, local_dim, old_dim, local_dim).")
+    if branch_tensor.shape[0] != old_dim or branch_tensor.shape[2] != local_dim:
+        raise ValueError("branch_tensor is incompatible with Hpair4.")
+    keep = branch_tensor.shape[1]
+    dtype = np.result_type(Hpair4, branch_tensor, complex)
+    Hnew = np.zeros((local_dim * keep, local_dim * keep), dtype=dtype)
+    for bra_local in range(local_dim):
+        left = branch_tensor[:, :, bra_local]
+        row = slice(bra_local * keep, (bra_local + 1) * keep)
+        for ket_local in range(bra_local, local_dim):
+            block = Hpair4[:, bra_local, :, ket_local]
+            if not np.any(block):
+                continue
+            right = branch_tensor[:, :, ket_local]
+            col = slice(ket_local * keep, (ket_local + 1) * keep)
+            projected = left.conj().T @ (block @ right)
+            Hnew[row, col] = projected
+            if ket_local != bra_local:
+                Hnew[col, row] = projected.T.conj()
+    return Hnew
+
+
+def project_pair_hamiltonian_lloo(Hpair4, branch_tensor):
+    """Project local-major pair blocks without forming a zero-padded basis."""
+    local_dim, local_dim_ket, old_dim, old_dim_ket = Hpair4.shape
+    if old_dim != old_dim_ket or local_dim != local_dim_ket:
+        raise ValueError("Hpair4 must have shape (local_dim, local_dim, old_dim, old_dim).")
+    if branch_tensor.shape[0] != old_dim or branch_tensor.shape[2] != local_dim:
+        raise ValueError("branch_tensor is incompatible with Hpair4.")
+    keep = branch_tensor.shape[1]
+    dtype = np.result_type(Hpair4, branch_tensor, complex)
+    Hnew = np.zeros((local_dim * keep, local_dim * keep), dtype=dtype)
+    for bra_local in range(local_dim):
+        left = branch_tensor[:, :, bra_local]
+        row = slice(bra_local * keep, (bra_local + 1) * keep)
+        for ket_local in range(bra_local, local_dim):
+            block = Hpair4[bra_local, ket_local]
+            if not np.any(block):
+                continue
+            right = branch_tensor[:, :, ket_local]
+            col = slice(ket_local * keep, (ket_local + 1) * keep)
+            projected = left.conj().T @ (block @ right)
+            Hnew[row, col] = projected
+            if ket_local != bra_local:
+                Hnew[col, row] = projected.T.conj()
+    return Hnew
+
+
+def conditional_cc_transition_projector(
+    Hpair4,
+    primitive_qn,
+    projector,
+    output_qn,
+    *,
+    level_shift=0.0,
+    response_tol=1.0e-10,
+    max_responses=None,
+):
+    r"""Dress a rolling two-site projector with symmetry-preserving responses.
+
+    For every retained Abelian sector, this constructs first-order discarded
+    responses
+
+    .. math::
+
+        (H_{QQ} - E_i + \Delta)t_i = -H_{QP}c_i,
+
+    and Ritz-compresses ``span(P, Q T)`` back to the original number of
+    retained states.  The resulting isometry is general in the two-site branch
+    labels, so it carries the cross-branch amplitudes ``T^{st}`` missing from a
+    branch-local conditional rotation.
+    """
+    Hpair4 = np.asarray(Hpair4)
+    primitive_qn = qn_array(primitive_qn)
+    output_qn = qn_array(output_qn)
+    projector = np.asarray(projector)
+    old_dim, local_dim, out_dim = projector.shape
+    full_dim = old_dim * local_dim
+    if Hpair4.shape != (local_dim, local_dim, old_dim, old_dim):
+        raise ValueError(
+            "Hpair4 must have shape (local_dim, local_dim, old_dim, old_dim)."
+        )
+    if len(primitive_qn) != full_dim or len(output_qn) != out_dim:
+        raise ValueError("quantum-number labels are inconsistent with projector dimensions.")
+    if float(response_tol) < 0.0:
+        raise ValueError("response_tol must be non-negative.")
+    if max_responses is not None and int(max_responses) < 1:
+        raise ValueError("max_responses must be positive when provided.")
+
+    h_full = np.ascontiguousarray(Hpair4.transpose(2, 0, 3, 1)).reshape(
+        full_dim, full_dim
+    )
+    h_full = 0.5 * (h_full + h_full.T.conj())
+    plain = projector.reshape(full_dim, out_dim)
+    dressed = np.array(plain, copy=True)
+    valid = valid_qn_mask(output_qn)
+    diagnostics = {
+        "discarded_residual_norm": 0.0,
+        "response_rank": 0,
+        "transition_mixing": 0.0,
+        "sector_energy_gain": 0.0,
+    }
+    mixing_weight = 0.0
+    mixing_states = 0
+
+    for charge in sorted({qn_key(row) for row in output_qn[valid]}):
+        charge_array = np.asarray(charge, dtype=int)
+        pcols = np.flatnonzero(valid & np.all(output_qn == charge_array, axis=1))
+        rows = np.flatnonzero(np.all(primitive_qn == charge_array, axis=1))
+        if pcols.size == 0 or rows.size <= pcols.size:
+            continue
+
+        p_sector = plain[np.ix_(rows, pcols)]
+        overlap = p_sector.conj().T @ p_sector
+        if not np.allclose(overlap, np.eye(pcols.size), atol=1.0e-9):
+            raise ValueError("retained rolling projector is not sector-orthonormal.")
+        h_sector = h_full[np.ix_(rows, rows)]
+        h_pp = p_sector.conj().T @ (h_sector @ p_sector)
+        h_pp = 0.5 * (h_pp + h_pp.T.conj())
+        p_energy, p_coeff = np.linalg.eigh(h_pp)
+
+        complete, _singular, _adjoint = np.linalg.svd(
+            p_sector, full_matrices=True
+        )
+        q_sector = complete[:, pcols.size :]
+        if q_sector.shape[1] == 0:
+            continue
+        h_qp = q_sector.conj().T @ (h_sector @ p_sector)
+        h_qq = q_sector.conj().T @ (h_sector @ q_sector)
+        h_qq = 0.5 * (h_qq + h_qq.T.conj())
+
+        response = np.zeros(
+            (q_sector.shape[1], pcols.size),
+            dtype=np.result_type(h_sector, projector, complex),
+        )
+        sector_residual_sq = 0.0
+        for state in range(pcols.size):
+            residual = h_qp @ p_coeff[:, state]
+            sector_residual_sq += float(np.vdot(residual, residual).real)
+            if np.linalg.norm(residual) <= float(response_tol):
+                continue
+            shifted = h_qq + (
+                float(level_shift) - float(p_energy[state])
+            ) * np.eye(h_qq.shape[0])
+            response[:, state] = np.linalg.lstsq(
+                shifted, -residual, rcond=1.0e-12
+            )[0]
+        diagnostics["discarded_residual_norm"] = float(
+            np.hypot(diagnostics["discarded_residual_norm"], np.sqrt(sector_residual_sq))
+        )
+
+        left, singular, _right = np.linalg.svd(response, full_matrices=False)
+        if singular.size == 0 or singular[0] <= float(response_tol):
+            continue
+        rank = int(np.count_nonzero(singular > float(response_tol) * singular[0]))
+        if max_responses is not None:
+            rank = min(rank, int(max_responses))
+        if rank == 0:
+            continue
+        response_basis = q_sector @ left[:, :rank]
+        trial = np.column_stack((p_sector, response_basis))
+        h_trial = trial.conj().T @ (h_sector @ trial)
+        h_trial = 0.5 * (h_trial + h_trial.T.conj())
+        trial_energy, trial_coeff = np.linalg.eigh(h_trial)
+        selected = trial_coeff[:, : pcols.size]
+        dressed[np.ix_(rows, pcols)] = trial @ selected
+
+        diagnostics["response_rank"] += rank
+        diagnostics["sector_energy_gain"] += float(
+            np.sum(p_energy) - np.sum(trial_energy[: pcols.size])
+        )
+        mixing_weight += float(np.sum(np.abs(selected[pcols.size :, :]) ** 2))
+        mixing_states += pcols.size
+
+    diagnostics["transition_mixing"] = (
+        mixing_weight / mixing_states if mixing_states else 0.0
+    )
+    dressed_projector = dressed.reshape(old_dim, local_dim, out_dim)
+    h_dressed = dressed.conj().T @ (h_full @ dressed)
+    h_dressed = 0.5 * (h_dressed + h_dressed.T.conj())
+    return h_dressed, dressed_projector, diagnostics
+
+
+def _append_pair_supersite_reduced(
+    H0,
+    input_qn,
+    table,
+    residuals,
+    first_site,
+    keep,
+    h1e,
+    eri,
+    target_qn,
+    total_sites,
+    *,
+    use_irrep_tensor=False,
+):
+    """Append a two-orbital supersite using only retained-space operators."""
+    old_dim = H0.shape[0]
+    keep = min(int(keep), old_dim)
+    d = len(LOCAL_QN)
+    Hpair4, _primitive_pair_qn, local_qn = _compressed_superblock_two_site_lloo(
+        H0, input_qn, table, residuals, first_site, h1e, eri
+    )
+    local_dim = local_qn.shape[0]
+    branch_tensor = np.zeros((old_dim, keep, local_dim), dtype=np.result_type(Hpair4, complex))
+    branch_qn = np.empty((local_dim, keep, LOCAL_QN.shape[1]), dtype=int)
+    branch_energy = np.empty((local_dim, keep), dtype=float)
+
+    for local_id, qn_local in enumerate(local_qn):
+        branch_h = Hpair4[local_id, local_id]
+        allowed_qn = feasible_multi_branch_qns(target_qn, first_site, total_sites, qn_local, 2)
+        E, Ubranch, qn_branch = diagonalize_by_qn(
+            branch_h,
+            input_qn,
+            keep,
+            allowed_qn=allowed_qn,
+            use_irrep_tensor=use_irrep_tensor,
+            allow_empty=True,
+        )
+        E, Ubranch, qn_branch = pad_branch(E, Ubranch, qn_branch, keep)
+        branch_energy[local_id] = E
+        branch_tensor[:, :, local_id] = Ubranch
+        branch_qn[local_id] = qn_branch
+
+    Hnew = project_pair_hamiltonian_lloo(Hpair4, branch_tensor)
+    Hnew = 0.5 * (Hnew + Hnew.T.conj())
+    output_qn = (branch_qn + local_qn[:, None, :]).reshape((-1, LOCAL_QN.shape[1]))
+    tensor = branch_tensor.reshape((old_dim, keep, d, d)).copy()
+    return Hnew, tensor, branch_tensor, output_qn, branch_qn, local_qn, branch_energy
+
+
+def _append_one_site_reduced(
+    H0,
+    input_qn,
+    table,
+    residuals,
+    site_id,
+    keep,
+    h1e,
+    eri,
+    pair_terms,
+    target_qn,
+    total_sites,
+    *,
+    use_irrep_tensor=False,
+    use_irrep_blocks=False,
+):
+    """Append one spatial orbital using retained-space operators."""
+    site_id = int(site_id)
+    keep = min(int(keep), H0.shape[0])
+    d = len(LOCAL_QN)
+    pair_sums = build_pair_sums(table, pair_terms, site_id)
+    branch_allowed = lambda local_state: feasible_branch_qns(
+        target_qn, site_id, total_sites, LOCAL_QN[local_state]
+    )
+    branch_inputs = (
+        (0, 0, H0),
+        (1, 0, branch_hamiltonian(H0, pair_sums, 1, 0)),
+        (0, 1, branch_hamiltonian(H0, pair_sums, 0, 1)),
+        (1, 1, branch_hamiltonian(H0, pair_sums, 1, 1)),
+    )
+    energies = []
+    branches = []
+    branch_qns = []
+    for local_state, (_nu, _nd, branch_h) in enumerate(branch_inputs):
+        E, Ubranch, qn_branch = diagonalize_by_qn(
+            branch_h,
+            input_qn,
+            keep,
+            allowed_qn=branch_allowed(local_state),
+            use_irrep_tensor=use_irrep_tensor,
+            allow_empty=True,
+        )
+        E, Ubranch, qn_branch = pad_branch(E, Ubranch, qn_branch, keep)
+        energies.append(E)
+        branches.append(Ubranch)
+        branch_qns.append(qn_branch)
+
+    branch_energy = np.zeros((d, keep), dtype=float)
+    branch_tensor = np.zeros((H0.shape[0], keep, d), dtype=np.result_type(*branches, complex))
+    h = single_site_hamiltonian_from_integrals(h1e, eri, site_id)
+    for local_state in range(d):
+        branch_energy[local_state] = energies[local_state] + h[local_state, local_state]
+        branch_tensor[:, :, local_state] = branches[local_state]
+    output_qn = np.concatenate(
+        tuple(branch_qns[local_state] + LOCAL_QN[local_state] for local_state in range(d))
+    )
+    plan = RotationPlan(branch_tensor, output_qn)
+    scalar_shift = (0, 0)
+    Hnew = np.diag(branch_energy.reshape((keep * d))).astype(np.result_type(branch_tensor, complex))
+
+    op_lists = operator_lists(table)
+    Cdu = op_lists['Cdu']
+    Cdd = op_lists['Cdd']
+    v1u = zero_like_operator(H0)
+    v1d = zero_like_operator(H0)
+    for i in range(site_id):
+        v1u += h1e[i, site_id] * dense_operator(Cdu[i])
+        v1d += h1e[i, site_id] * dense_operator(Cdd[i])
+    if site_id in residuals:
+        v1u += residuals[site_id][0]
+        v1d += residuals[site_id][1]
+
+    V1 = (
+        rotate_symmetry(v1u, JW @ cu, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+        + rotate_symmetry(v1d, JW @ cd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+    )
+    Hnew += V1 + dag(V1)
+
+    V2a = rotate_symmetry(pair_sums['v2a'], cdu @ cd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+    V2b = rotate_symmetry(pair_sums['v2b'], cdu @ cdd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+    Hnew += V2a + dag(V2a) + V2b + dag(V2b)
+
+    v3u = zero_like_operator(H0)
+    v3d = zero_like_operator(H0)
+    for i in range(site_id):
+        v3u += eri[i, site_id, site_id, site_id] * dense_operator(Cdu[i])
+        v3d += eri[i, site_id, site_id, site_id] * dense_operator(Cdd[i])
+    V3 = (
+        rotate_symmetry(v3u, JW @ Nd @ cu, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+        + rotate_symmetry(v3d, JW @ Nu @ cd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
+    )
+    Hnew += V3 + dag(V3)
+    Hnew = 0.5 * (Hnew + Hnew.T.conj())
+    return Hnew, branch_tensor, output_qn, np.stack(branch_qns, axis=0).copy(), LOCAL_QN.copy(), branch_energy
+
+
 def initial_spin_operators(op_table):
     nsites = len(op_table[('Cu',)])
     old_dim = next(iter(op_table[('Cu',)].values())).shape[0]
@@ -2574,6 +3772,76 @@ def extend_triple_residuals(
     return new_residuals
 
 
+def extend_triple_residuals_two_site(
+    residuals,
+    table,
+    U,
+    first_site,
+    total_sites,
+    triple_terms,
+    output_qn=None,
+    use_irrep_blocks=False,
+    plan=None,
+):
+    """Update future-site triple residuals after a two-orbital reduced append."""
+    first_site = int(first_site)
+    second_site = first_site + 1
+    out_dim = U.shape[1] * U.shape[2]
+    old_dim = U.shape[0]
+    shift_u = pattern_qn_shift(('Cdu', 'Cdu', 'Cu'))
+    shift_d = pattern_qn_shift(('Cdd', 'Cdu', 'Cu'))
+    allow_u = output_qn is None or has_qn_transition(output_qn, shift_u)
+    allow_d = output_qn is None or has_qn_transition(output_qn, shift_d)
+    pair_parity = local_pair_product(('JW',), (-1,))
+    new_residuals = {}
+
+    def projected_terms(terms, shift):
+        out = np.zeros((out_dim, out_dim), dtype=np.result_type(U, complex))
+        for coeff, pattern, indices in terms:
+            block_op, local_op = _two_site_operator_factor(table, pattern, indices, first_site, old_dim)
+            out += coeff * rotate_symmetry(
+                block_op,
+                local_op,
+                U,
+                output_qn,
+                shift,
+                use_irrep_blocks,
+                plan,
+            )
+        return out
+
+    for q in range(second_site + 1, total_sites):
+        old_v1u, old_v1d = residuals[q]
+        v1u = (
+            rotate_symmetry(old_v1u, pair_parity, U, output_qn, shift_u, use_irrep_blocks, plan)
+            if allow_u else np.zeros((out_dim, out_dim), dtype=np.result_type(U, complex))
+        )
+        v1d = (
+            rotate_symmetry(old_v1d, pair_parity, U, output_qn, shift_d, use_irrep_blocks, plan)
+            if allow_d else np.zeros((out_dim, out_dim), dtype=np.result_type(U, complex))
+        )
+
+        terms_u = []
+        terms_d = []
+        for i, j, k, coeff in triple_terms[q]:
+            if i > second_site or j > second_site or k > second_site:
+                continue
+            if i < first_site and j < first_site and k < first_site:
+                continue
+            indices = (k, j, i)
+            terms_u.append((coeff, ('Cdu', 'Cdu', 'Cu'), indices))
+            terms_u.append((coeff, ('Cdu', 'Cdd', 'Cd'), indices))
+            terms_d.append((coeff, ('Cdd', 'Cdu', 'Cu'), indices))
+            terms_d.append((coeff, ('Cdd', 'Cdd', 'Cd'), indices))
+
+        if allow_u:
+            v1u += projected_terms(terms_u, shift_u)
+        if allow_d:
+            v1d += projected_terms(terms_d, shift_d)
+        new_residuals[q] = (v1u, v1d)
+    return new_residuals
+
+
 def extend_triple_residuals_irrep(
     residuals, table, U, block_qn, new_site, total_sites, triple_terms, output_qn
 ):
@@ -2729,6 +3997,10 @@ def kernel(
     use_block_sparse_hamiltonian='auto',
     use_sparse_operator_projection='auto',
     two_site_mode='supersite',
+    dressing=None,
+    cc_level_shift=0.0,
+    cc_response_tol=1.0e-10,
+    cc_max_responses=None,
     target_spin=None,
     spin_tol=1e-3,
     spin_search_factor=4,
@@ -2773,6 +4045,34 @@ def kernel(
         two_site_mode = "rolling"
     if two_site_mode not in {"sequential", "supersite", "rolling"}:
         raise ValueError("two_site_mode must be 'sequential', 'supersite', or 'rolling'.")
+    dressing_key = (
+        "none" if dressing is None else str(dressing).lower().replace("-", "_")
+    )
+    if dressing_key in {"none", "off", "false"}:
+        dressing_key = "none"
+    elif dressing_key in {
+        "cc",
+        "conditional_cc",
+        "conditional_cc_transition",
+        "transition_cc",
+    }:
+        dressing_key = "conditional_cc"
+    else:
+        raise ValueError("dressing must be None or 'conditional_cc'.")
+    if (
+        dressing_key != "none"
+        and growth_sites in {2, "auto"}
+        and two_site_mode == "supersite"
+    ):
+        raise ValueError(
+            "conditional_cc with paired supersite growth is not implemented; "
+            "use growth_sites=1 or two_site_mode='rolling'."
+        )
+    cc_response_tol = float(cc_response_tol)
+    if cc_response_tol < 0.0:
+        raise ValueError("cc_response_tol must be non-negative.")
+    if cc_max_responses is not None and int(cc_max_responses) < 1:
+        raise ValueError("cc_max_responses must be positive when provided.")
     orbital_energy = np.real(np.diag(h1e))
     adjacent_gaps = np.abs(np.diff(orbital_energy))
     if two_site_energy_tol is None:
@@ -2788,10 +4088,21 @@ def kernel(
         target_qn, block_nsites, L, LOCAL_QN[local_state]
     )
     need_spin = target_spin is not None or return_spin or verbose
+    if dressing_key != "none" and need_spin:
+        raise NotImplementedError(
+            "conditional_cc dressing does not yet project spin observables."
+        )
+    if dressing_key != "none" and use_irrep_operator_table:
+        raise NotImplementedError(
+            "conditional_cc dressing requires the dense/sparse Abelian operator table."
+        )
     if two_site_mode == "rolling" and need_spin:
         raise NotImplementedError("rolling two-site qchem NARG does not yet support spin observables.")
-    if two_site_mode == "rolling" and return_tensors:
-        raise NotImplementedError("rolling two-site qchem NARG does not yet return reconstructable NARG tensors.")
+    if (two_site_mode == "rolling" or dressing_key != "none") and return_tensors:
+        raise NotImplementedError(
+            "general-projector qchem NARG does not yet return reconstructable "
+            "branch-local NARG tensors."
+        )
     if sparse_operator_table == 'auto':
         sparse_operator_table = bool(fast)
     else:
@@ -3270,73 +4581,19 @@ def kernel(
         return table, irrep_table, table_qn, residuals, irrep_residuals, spins
 
     def compressed_superblock_two_site(H0, input_qn, table, residuals, first_site):
-        """Exact compressed Hamiltonian for old block plus two new orbitals."""
-        old_dim = H0.shape[0]
-        local_dim = d * d
-        dtype = np.result_type(H0, h1e, eri, complex)
-        Hpair = np.zeros((old_dim * local_dim, old_dim * local_dim), dtype=dtype)
-        Hpair4 = Hpair.reshape(old_dim, local_dim, old_dim, local_dim)
-        H0_dense = dense_operator(H0).astype(dtype, copy=False)
-        for local_id in range(local_dim):
-            Hpair4[:, local_id, :, local_id] += H0_dense
-        second_site = first_site + 1
-
-        def add_term(coeff, pattern, indices):
-            if abs(coeff) <= 0:
-                return
-            if all(int(idx) < first_site for idx in indices):
-                return
-            try:
-                block_op, local_op = _two_site_operator_factor(table, pattern, indices, first_site, old_dim)
-            except NotImplementedError:
-                return
-            add_local_kron_blocks(Hpair4, block_op, local_op, coeff)
-
-        for a in range(second_site + 1):
-            for b in range(second_site + 1):
-                coeff = h1e[a, b]
-                add_term(coeff, ('Cdu', 'Cu'), (a, b))
-                add_term(coeff, ('Cdd', 'Cd'), (a, b))
-
-        for p_idx in range(second_site + 1):
-            for q_idx in range(second_site + 1):
-                for r_idx in range(second_site + 1):
-                    for s_idx in range(second_site + 1):
-                        coeff = 0.5 * eri[p_idx, q_idx, r_idx, s_idx]
-                        add_term(coeff, ('Cdu', 'Cdu', 'Cu', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
-                        add_term(coeff, ('Cdu', 'Cdd', 'Cd', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
-                        add_term(coeff, ('Cdd', 'Cdu', 'Cu', 'Cd'), (p_idx, r_idx, s_idx, q_idx))
-                        add_term(coeff, ('Cdd', 'Cdd', 'Cd', 'Cd'), (p_idx, r_idx, s_idx, q_idx))
-
-        for site_id, role in ((first_site, 0), (second_site, 1)):
-            if site_id in residuals:
-                v1u, v1d = residuals[site_id]
-                local_u = local_pair_product(('JW', 'JW', 'JW', 'Cu'), (-1, -1, -1, role))
-                local_d = local_pair_product(('JW', 'JW', 'JW', 'Cd'), (-1, -1, -1, role))
-                Hres = np.zeros_like(Hpair)
-                Hres4 = Hres.reshape(old_dim, local_dim, old_dim, local_dim)
-                add_local_kron_blocks(Hres4, v1u, local_u)
-                add_local_kron_blocks(Hres4, v1d, local_d)
-                Hpair += Hres + Hres.T.conj()
-
-        Hpair = 0.5 * (Hpair + Hpair.T.conj())
-        local_qn = pair_charge_labels()
-        output_qn = (qn_array(input_qn)[:, None, :] + local_qn[None, :, :]).reshape((-1, LOCAL_QN.shape[1]))
-        return Hpair, output_qn, local_qn
+        return _compressed_superblock_two_site_lloo(H0, input_qn, table, residuals, first_site, h1e, eri)
 
     def append_supersite(H0, input_qn, table, residuals, first_site, keep):
         old_dim = H0.shape[0]
         keep = min(int(keep), old_dim)
-        Hpair, _primitive_pair_qn, local_qn = compressed_superblock_two_site(H0, input_qn, table, residuals, first_site)
+        Hpair4, _primitive_pair_qn, local_qn = compressed_superblock_two_site(H0, input_qn, table, residuals, first_site)
         local_dim = local_qn.shape[0]
-        branch_tensor = np.zeros((old_dim, keep, local_dim), dtype=np.result_type(Hpair, complex))
+        branch_tensor = np.zeros((old_dim, keep, local_dim), dtype=np.result_type(Hpair4, complex))
         branch_qn = np.empty((local_dim, keep, LOCAL_QN.shape[1]), dtype=int)
         branch_energy = np.empty((local_dim, keep), dtype=float)
-        rows0 = np.arange(old_dim)
 
         for local_id, qn_local in enumerate(local_qn):
-            rows = rows0 * local_dim + local_id
-            branch_h = Hpair[np.ix_(rows, rows)]
+            branch_h = Hpair4[local_id, local_id]
             allowed_qn = feasible_multi_branch_qns(target_qn, first_site, L, qn_local, 2)
             E, Ubranch, qn_branch = diagonalize_by_qn(
                 branch_h,
@@ -3351,13 +4608,7 @@ def kernel(
             branch_tensor[:, :, local_id] = Ubranch
             branch_qn[local_id] = qn_branch
 
-        basis = np.zeros((local_dim * old_dim, local_dim * keep), dtype=np.result_type(branch_tensor, complex))
-        for local_id in range(local_dim):
-            basis[
-                rows0 * local_dim + local_id,
-                local_id * keep : (local_id + 1) * keep,
-            ] = branch_tensor[:, :, local_id]
-        Hnew = basis.conj().T @ (Hpair @ basis)
+        Hnew = project_pair_hamiltonian_lloo(Hpair4, branch_tensor)
         Hnew = 0.5 * (Hnew + Hnew.T.conj())
         output_qn = (branch_qn + local_qn[:, None, :]).reshape((-1, LOCAL_QN.shape[1]))
         tensor = branch_tensor.reshape((old_dim, keep, d, d)).copy()
@@ -3367,16 +4618,17 @@ def kernel(
         old_dim = H0.shape[0]
         keep = min(int(keep), old_dim)
         second_site = int(first_site) + 1
-        Hpair, _primitive_pair_qn, local_qn = compressed_superblock_two_site(H0, input_qn, table, residuals, first_site)
+        Hpair4, primitive_pair_qn, local_qn = compressed_superblock_two_site(
+            H0, input_qn, table, residuals, first_site
+        )
         local_dim = local_qn.shape[0]
-        branch_tensor = np.zeros((old_dim, keep, local_dim), dtype=np.result_type(Hpair, complex))
+        branch_tensor = np.zeros((old_dim, keep, local_dim), dtype=np.result_type(Hpair4, complex))
         branch_qn = np.empty((local_dim, keep, LOCAL_QN.shape[1]), dtype=int)
         branch_energy = np.empty((local_dim, keep), dtype=float)
         rows0 = np.arange(old_dim)
 
         for local_id, qn_local in enumerate(local_qn):
-            rows = rows0 * local_dim + local_id
-            branch_h = Hpair[np.ix_(rows, rows)]
+            branch_h = Hpair4[local_id, local_id]
             allowed_qn = feasible_multi_branch_qns(target_qn, first_site, L, qn_local, 2)
             E, Ubranch, qn_branch = diagonalize_by_qn(
                 branch_h,
@@ -3400,7 +4652,7 @@ def kernel(
                 rows0 * local_dim + local_id,
                 local_id * keep : (local_id + 1) * keep,
             ] = branch_tensor[:, :, local_id]
-        Hmid = supersite_basis.conj().T @ (Hpair @ supersite_basis)
+        Hmid = project_pair_hamiltonian_lloo(Hpair4, branch_tensor)
         Hmid = 0.5 * (Hmid + Hmid.T.conj())
         mid_qn = (branch_qn + local_qn[:, None, :]).reshape((-1, LOCAL_QN.shape[1]))
 
@@ -3441,6 +4693,17 @@ def kernel(
         Hnew = 0.5 * (Hnew + Hnew.T.conj())
         output_qn = rolling_qn.reshape((-1, LOCAL_QN.shape[1]))
         projector = projector.reshape((old_dim, local_dim, d * keep))
+        cc_diagnostics = None
+        if dressing_key == "conditional_cc":
+            Hnew, projector, cc_diagnostics = conditional_cc_transition_projector(
+                Hpair4,
+                primitive_pair_qn,
+                projector,
+                output_qn,
+                level_shift=cc_level_shift,
+                response_tol=cc_response_tol,
+                max_responses=cc_max_responses,
+            )
         return (
             Hnew,
             rolling_tensor,
@@ -3450,6 +4713,7 @@ def kernel(
             local_qn,
             branch_energy,
             rolling_energy,
+            cc_diagnostics,
         )
 
     def append_one_site(H0, H0_irrep, input_qn, table, irrep_table, residuals, irrep_residuals, site_id, keep):
@@ -3606,7 +4870,45 @@ def kernel(
             Hnew += V3 + dag(V3)
             Hnew_irrep = labeled_irrep_tensor(Hnew, output_qn, op=(0, 0)) if use_irrep_operator_table else None
         branch_qn = np.stack((qn0, qn1, qn2, qn3), axis=0).copy()
-        return Hnew, Hnew_irrep, branch_tensor, output_qn, branch_qn
+        projector = None
+        cc_diagnostics = None
+        if dressing_key == "conditional_cc":
+            h_grown, primitive_qn = _compressed_superblock_one_site_lloo(
+                H0,
+                input_qn,
+                table,
+                residuals,
+                site_id,
+                h1e,
+                eri,
+                pair_terms,
+            )
+            projector = np.zeros(
+                (H0.shape[0], d, d * keep),
+                dtype=np.result_type(branch_tensor, complex),
+            )
+            for local_state in range(d):
+                columns = slice(local_state * keep, (local_state + 1) * keep)
+                projector[:, local_state, columns] = branch_tensor[:, :, local_state]
+            Hnew, projector, cc_diagnostics = conditional_cc_transition_projector(
+                h_grown,
+                primitive_qn,
+                projector,
+                output_qn,
+                level_shift=cc_level_shift,
+                response_tol=cc_response_tol,
+                max_responses=cc_max_responses,
+            )
+            Hnew_irrep = None
+        return (
+            Hnew,
+            Hnew_irrep,
+            branch_tensor,
+            output_qn,
+            branch_qn,
+            projector,
+            cc_diagnostics,
+        )
 
     class AbelianGrowth(NARGBase):
         def __init__(self, table, irrep_table, table_qn, h_irrep, residuals, irrep_residuals, spins, table_nsites):
@@ -3670,7 +4972,15 @@ def kernel(
         def grow_one(self, block, site, keep):
             maybe_print(verbose, '\n--- adding the {}th orbital ---'.format(site.idx + 1))
             maybe_print(verbose, 'p = ', site.idx)
-            h_new, h_new_irrep, tensor, qn, branch_qn = append_one_site(
+            (
+                h_new,
+                h_new_irrep,
+                tensor,
+                qn,
+                branch_qn,
+                projector,
+                cc_diagnostics,
+            ) = append_one_site(
                 block.h.copy(),
                 self.h_irrep,
                 block.qn,
@@ -3682,11 +4992,47 @@ def kernel(
                 keep,
             )
             self.h_irrep = h_new_irrep
+            if projector is not None:
+                next_residuals = extend_triple_residuals_projector(
+                    self.residuals,
+                    self.table,
+                    projector,
+                    site.idx,
+                    L,
+                    triple_terms,
+                )
+                required_entries = (
+                    required_operator_entries(
+                        pair_terms, triple_terms, L, site.idx + 1
+                    )
+                    if sparse_operator_table
+                    else None
+                )
+                self.table = extend_operator_table_projector(
+                    self.table,
+                    OPERATOR_PATTERNS,
+                    projector,
+                    site.idx,
+                    qn,
+                    required=required_entries,
+                    sparse_output=use_sparse_operator_projection,
+                )
+                self.table_qn = qn
+                self.irrep_table = None
+                self.residuals = next_residuals
+                self.irrep_residuals = None
+                self.table_nsites = site.idx + 1
+            meta = {}
+            if cc_diagnostics is not None:
+                meta["dressing"] = dressing_key
+                meta["cc_diagnostics"] = dict(cc_diagnostics)
+                meta["general_projector"] = True
             return Step(
                 site=site,
                 block=Block(h=h_new, qn=qn, tensor=tensor),
                 tensor=tensor.copy(),
                 qn=branch_qn,
+                meta=meta,
             )
 
         def grow_two(self, block, first, second, keep):
@@ -3703,6 +5049,7 @@ def kernel(
                     local_qn,
                     branch_energy,
                     rolling_energy,
+                    cc_diagnostics,
                 ) = append_rolling_two_sites(
                     block.h.copy(),
                     block.qn,
@@ -3723,7 +5070,8 @@ def kernel(
                 )
                 projector = None
                 rolling_energy = None
-                plan = RotationPlan(tensor3, qn) if use_irrep_blocks else None
+                cc_diagnostics = None
+                plan = RotationPlan(tensor3, qn)
             required_entries = (
                 required_operator_entries(pair_terms, triple_terms, L, second.idx + 1)
                 if sparse_operator_table
@@ -3732,6 +5080,14 @@ def kernel(
             if need_spin:
                 required_entries = add_initial_spin_entries(required_entries, second.idx + 1)
             if self.two_site_mode == "rolling":
+                next_residuals = extend_triple_residuals_two_site_projector(
+                    self.residuals,
+                    self.table,
+                    projector,
+                    first.idx,
+                    L,
+                    triple_terms,
+                )
                 self.table = extend_operator_table_two_site_projector(
                     self.table,
                     OPERATOR_PATTERNS,
@@ -3742,7 +5098,7 @@ def kernel(
                     sparse_output=use_sparse_operator_projection,
                 )
             else:
-                self.table = extend_operator_table_two_site(
+                self.table = extend_pair_table(
                     self.table,
                     OPERATOR_PATTERNS,
                     tensor3,
@@ -3755,12 +5111,15 @@ def kernel(
                 )
             self.table_qn = qn
             self.h_irrep = None
-            self.residuals = build_triple_residuals_from_table(
-                self.table,
-                second.idx + 1,
-                range(second.idx + 1, L),
-                triple_terms,
-            )
+            if self.two_site_mode == "rolling":
+                self.residuals = next_residuals
+            else:
+                self.residuals = build_triple_residuals_from_table(
+                    self.table,
+                    second.idx + 1,
+                    range(second.idx + 1, L),
+                    triple_terms,
+                )
             self.irrep_residuals = None
             if need_spin:
                 if self.two_site_mode == "rolling":
@@ -3777,6 +5136,9 @@ def kernel(
             if rolling_energy is not None:
                 meta["rolling_energy"] = rolling_energy.copy()
                 meta["temporary_local_dim"] = d * d
+            if cc_diagnostics is not None:
+                meta["dressing"] = dressing_key
+                meta["cc_diagnostics"] = dict(cc_diagnostics)
             return Step(
                 site=first,
                 block=Block(h=h_new, qn=qn, tensor=tensor),
@@ -3901,6 +5263,24 @@ def kernel(
     return tuple(result)
 
 
+def _normalize_narg_orbital_blocks(orbital_blocks, nsites, active_space=None):
+    """Normalize orbital blocks into active-space coordinates."""
+    if orbital_blocks is None:
+        return None
+    nsites = int(nsites)
+    try:
+        return normalize_orbital_blocks(orbital_blocks, norb=nsites)
+    except ValueError as direct_error:
+        if active_space is None:
+            raise direct_error
+        ncore = int(active_space.ncore)
+        shifted = tuple(tuple(int(i) - ncore for i in block) for block in orbital_blocks)
+        try:
+            return normalize_orbital_blocks(shifted, norb=nsites)
+        except ValueError:
+            raise direct_error from None
+
+
 class NARG:
     """Small object API for the Abelian quantum-chemistry NARG driver.
 
@@ -3930,11 +5310,16 @@ class NARG:
         "use_block_sparse_hamiltonian": False,
         "use_sparse_operator_projection": "auto",
         "two_site_mode": "supersite",
+        "dressing": None,
+        "cc_level_shift": 0.0,
+        "cc_response_tol": 1.0e-10,
+        "cc_max_responses": None,
         "target_spin": None,
         "spin_tol": 1e-3,
         "spin_search_factor": 4,
         "return_spin": False,
-        "store_tensors": True,
+        "store_tensors": "auto",
+        "orbital_blocks": None,
         **CAS_OPTION_DEFAULTS,
     }
 
@@ -3951,6 +5336,8 @@ class NARG:
         self.tensors = None
         self.tensor_qns = None
         self.local_dims = None
+        self.orbital_blocks = None
+        self.dressing_history = []
         self.site = "spatial"
         self.n0 = None
         self.active_space = None
@@ -4019,15 +5406,88 @@ class NARG:
         self._set_active_space(active_space)
         mol = self.mol
         nsites = int(np.asarray(h1e).shape[-1])
+        orbital_blocks = _normalize_narg_orbital_blocks(
+            opts.pop("orbital_blocks", self.DEFAULT_OPTIONS["orbital_blocks"]),
+            nsites,
+            active_space=active_space,
+        )
         if int(opts.get("n0", self.DEFAULT_OPTIONS["n0"])) >= nsites:
             if nsites < 2:
                 raise ValueError("QChem NARG needs at least two spatial orbitals.")
             opts["n0"] = nsites - 1
 
         return_spin = bool(opts.get("return_spin", False))
-        store_tensors = bool(opts.pop("store_tensors", True))
+        dressing_requested = opts.get("dressing", None) not in {
+            None,
+            False,
+            "none",
+            "off",
+            "false",
+        }
+        store_tensors_option = opts.pop(
+            "store_tensors", self.DEFAULT_OPTIONS["store_tensors"]
+        )
+        if isinstance(store_tensors_option, str):
+            if store_tensors_option != "auto":
+                raise ValueError("store_tensors must be True, False, or 'auto'.")
+            mode = str(opts.get("two_site_mode", "supersite")).lower().replace("-", "_")
+            store_tensors = (
+                not dressing_requested
+                and mode
+                not in {
+                    "rolling",
+                    "two_site",
+                    "true_two_site",
+                    "rolling_two_site",
+                }
+            )
+        else:
+            store_tensors = bool(store_tensors_option)
+        if orbital_blocks is not None:
+            if return_spin or opts.get("target_spin", None) is not None:
+                raise NotImplementedError(
+                    "Clustered Abelian NARG via orbital_blocks does not yet carry spin observables; "
+                    "run without return_spin/target_spin or use unclustered growth."
+                )
+            supersite_result = reduced_supersite_kernel(
+                h1e,
+                eri,
+                orbital_blocks,
+                D=opts.get("D", self.DEFAULT_OPTIONS["D"]),
+                nstates=opts.get("nstates", self.DEFAULT_OPTIONS["nstates"]),
+                nelec=getattr(self.mol, "nelec", None),
+                eri_cutoff=opts.get("eri_cutoff", self.DEFAULT_OPTIONS["eri_cutoff"]),
+                fast=opts.get("fast", self.DEFAULT_OPTIONS["fast"]),
+                use_numba_terms=opts.get("use_numba_terms", self.DEFAULT_OPTIONS["use_numba_terms"]),
+                use_irrep_tensor=opts.get("use_irrep_tensor", self.DEFAULT_OPTIONS["use_irrep_tensor"]),
+                use_irrep_blocks=opts.get("use_irrep_blocks", self.DEFAULT_OPTIONS["use_irrep_blocks"]),
+                sparse_operator_table=opts.get("sparse_operator_table", self.DEFAULT_OPTIONS["sparse_operator_table"]),
+                use_sparse_operator_projection=opts.get(
+                    "use_sparse_operator_projection",
+                    self.DEFAULT_OPTIONS["use_sparse_operator_projection"],
+                ),
+                return_tensors=store_tensors,
+                return_tensor_qns=store_tensors,
+            )
+            enuc = self.mol.energy_nuc() if self.mol is not None else 0.0
+            if store_tensors:
+                e_elec, self.vectors, self.tensors, self.tensor_qns = supersite_result
+            else:
+                e_elec, self.vectors = supersite_result
+                self.tensors = None
+                self.tensor_qns = None
+            self.e_tot = np.asarray(e_elec) + enuc
+            self.spin_info = None
+            self.result = (self.e_tot, self.vectors)
+            self.n0 = None
+            self.local_dims = tuple(4 ** len(block) for block in orbital_blocks)
+            self.orbital_blocks = orbital_blocks
+            self.dressing_history = []
+            return self.result
+
+        return_metadata = store_tensors or dressing_requested
         opts["return_tensors"] = store_tensors
-        opts["return_tensor_qns"] = store_tensors
+        opts["return_tensor_qns"] = return_metadata
 
         kernel_result = kernel(h1e, eri, **opts)
         if return_spin:
@@ -4040,11 +5500,56 @@ class NARG:
         else:
             if store_tensors:
                 self.e_tot, self.vectors, self.tensors, self.tensor_qns = kernel_result
+            elif return_metadata:
+                self.e_tot, self.vectors, self.tensor_qns = kernel_result
+                self.tensors = None
             else:
                 self.e_tot, self.vectors = kernel_result
                 self.tensor_qns = None
+                self.tensors = None
             self.spin_info = None
             self.result = (self.e_tot, self.vectors)
         self.n0 = int(opts.get("n0", self.DEFAULT_OPTIONS["n0"]))
         self.local_dims = (4,) * int(np.asarray(h1e).shape[-1])
+        self.orbital_blocks = None
+        factors = [] if self.tensor_qns is None else self.tensor_qns.get("factors", [])
+        self.dressing_history = [
+            dict(factor["cc_diagnostics"])
+            for factor in factors
+            if "cc_diagnostics" in factor
+        ]
         return self.result
+
+    def make_rdm1(
+        self,
+        state_id=0,
+        spatial=True,
+        with_core=False,
+        with_vir=False,
+        representation="mo",
+        repr=None,
+    ):
+        """Return the spin-traced 1-RDM for the selected NARG root."""
+        return make_rdm1_from_narg(
+            self,
+            state_id=state_id,
+            with_core=with_core,
+            with_vir=with_vir,
+            representation=representation,
+            repr=repr,
+        )
+
+    def make_rdm2(self, state_id=0, spatial=True, with_core=False, with_vir=False):
+        """Return the spin-traced 2-RDM for the selected NARG root."""
+        return make_rdm2_from_narg(
+            self,
+            state_id=state_id,
+            with_core=with_core,
+            with_vir=with_vir,
+        )
+
+    def make_rdm12(self, state_id=0, spatial=True, with_core=False):
+        return (
+            self.make_rdm1(state_id, spatial=spatial, with_core=with_core),
+            self.make_rdm2(state_id, spatial=spatial, with_core=with_core),
+        )

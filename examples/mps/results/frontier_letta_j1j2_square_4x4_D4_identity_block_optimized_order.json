@@ -1,0 +1,162 @@
+{
+  "model": {
+    "nrows": 4,
+    "ncols": 4,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "local_terms": 42
+  },
+  "ansatz": {
+    "kind": "frontier-dense-tied-letta",
+    "tie_graph": "all-j1-nearest-neighbor-bonds",
+    "bond_dim": 4,
+    "tie_edges": 24,
+    "parameters": 1448,
+    "hamiltonian_mpo_bond_dim": 35,
+    "compressed_hamiltonian_mpo_bond_dim": 14,
+    "uncompressed_hamiltonian_mpo_bond_dim": 35,
+    "parent_sets": [
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        3,
+        8
+      ],
+      [
+        6,
+        9
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        7
+      ],
+      [
+        7,
+        12
+      ],
+      [
+        13
+      ],
+      [
+        9,
+        10
+      ],
+      [
+        11,
+        12
+      ],
+      [
+        11
+      ],
+      [
+        14
+      ],
+      [
+        13,
+        14
+      ],
+      [
+        15
+      ],
+      [
+        15
+      ],
+      []
+    ],
+    "site_order_in_original_snake_indices": [
+      3,
+      2,
+      4,
+      5,
+      1,
+      0,
+      6,
+      7,
+      11,
+      10,
+      12,
+      13,
+      9,
+      8,
+      14,
+      15
+    ]
+  },
+  "settings": {
+    "sweeps": 1,
+    "solver": "direct",
+    "frontier_backend": "identity_block",
+    "optimize_order": true,
+    "path_optimizer": "greedy",
+    "seed": 7
+  },
+  "ordering": {
+    "method": "exact-subset-dp",
+    "objective": "identity-aware-block-elements-without-D-squared",
+    "seconds": 0.6935272089904174,
+    "original_peak_score": 1120.0,
+    "selected_peak_score": 1120.0,
+    "original_total_score": 11870.0,
+    "selected_total_score": 9422.0,
+    "selected_max_frontier_width": 4,
+    "selected_max_operator_rank": null,
+    "selected_max_uncompressed_mpo_channels": 35
+  },
+  "explicit_basis_materialized_in_solver": false,
+  "initial_energy": -0.7948040796040409,
+  "energy": -6.344039826298014,
+  "setup_seconds": 0.21937066700775176,
+  "sweep_seconds": 0.6278622909449041,
+  "contraction_plans": 1680,
+  "peak_frontier_elements": 17920,
+  "norm_peak_frontier_elements": 256,
+  "hamiltonian_peak_frontier_elements": 17920,
+  "cached_environment_elements": 153284,
+  "sweep_energies": [
+    -6.344039826298014
+  ],
+  "validation": {
+    "explicit_projector": {
+      "site": 9,
+      "metric_max_error": 5.551115123125783e-14,
+      "metric_relative_error": 6.278575604374956e-15,
+      "hamiltonian_max_error": 1.4210854715202004e-13,
+      "hamiltonian_relative_error": 3.4150115497323225e-15,
+      "metric_action_max_error": 2.6645352591003757e-14,
+      "hamiltonian_action_max_error": 7.105427357601002e-14,
+      "environment_build_seconds": 0.08162208402063698,
+      "cached_hole_seconds": 0.02541841589845717,
+      "explicit_projector_seconds": 0.2702370419865474
+    },
+    "matrix_free": {
+      "site": 15,
+      "local_dimension": 8,
+      "metric_rank": 1,
+      "metric_rank_is_projected": true,
+      "hamiltonian_matvecs": 2,
+      "metric_matvecs": 2,
+      "iterations": 1,
+      "residual_norm": 2.39828892732141e-15,
+      "solver": "matrix_free",
+      "solver_converged": true,
+      "message": "converged",
+      "direct_energy": -6.344039826297992,
+      "matrix_free_energy": -6.344039826297994,
+      "energy_difference": -1.7763568394002505e-15,
+      "direct_environment_seconds": 0.21157487493474036,
+      "matrix_free_environment_seconds": 0.2116041670087725,
+      "direct_seconds": 0.03942629194352776,
+      "matrix_free_seconds": 0.04008291696663946
+    }
+  }
+}

@@ -1,0 +1,1129 @@
+{
+  "schema": "letta-contraction-backends-v1",
+  "status": "complete",
+  "environment": {
+    "python": "3.13.5",
+    "numpy": "2.1.3",
+    "platform": "macOS-26.2-arm64-arm-64bit-Mach-O"
+  },
+  "settings": {
+    "profile": "custom",
+    "geometries": [
+      "4x4",
+      "8x4",
+      "6x6"
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "seed": 2718,
+    "generated_bond_dim": 2,
+    "generated_tie_noise": 0.02,
+    "repeats": 1,
+    "tt_ranks": [
+      2
+    ],
+    "tt_rtol": 0.0,
+    "tt_atol": 0.0,
+    "tt_transfer_ranks": [
+      4
+    ],
+    "tt_transfer_rtol": 0.0,
+    "tt_transfer_atol": 0.0,
+    "integrated_tt_norm_backend": "exact",
+    "integrated_tt_hermitize_local_actions": true,
+    "vmc_samples": 256,
+    "vmc_burn_in": 50,
+    "vmc_sweeps_between": 2,
+    "vmc_proposal": "mixed",
+    "vmc_exchange_probability": 0.9,
+    "skip_exact": false,
+    "skip_block": true,
+    "skip_tt": true,
+    "skip_vmc": false,
+    "no_dense_many_body_objects": true
+  },
+  "cases": [
+    {
+      "model": {
+        "geometry": "4x4",
+        "nrows": 4,
+        "ncols": 4,
+        "nsites": 16,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 4,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 24,
+        "j2_diagonal_edges": 18,
+        "parameters": 1448,
+        "tensor_storage_bytes": 23168,
+        "tensor_dtype": "complex128",
+        "tensor_source": {
+          "kind": "saved-optimized-letta",
+          "path": "examples/mps/results/frontier_letta_j2_half_convergence_4x4_seed7.npz",
+          "seed": 7
+        },
+        "full_hilbert_dimension": 65536,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.16348525002831593
+            ],
+            "median_seconds": 0.16348525002831593,
+            "minimum_seconds": 0.16348525002831593,
+            "maximum_seconds": 0.16348525002831593,
+            "maximum_tracemalloc_bytes": 12394053,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.0000000000000049,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.0015707919956184924
+              ],
+              "median_seconds": 0.0015707919956184924,
+              "minimum_seconds": 0.0015707919956184924,
+              "maximum_seconds": 0.0015707919956184924,
+              "maximum_tracemalloc_bytes": 162751,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": -7.449486053605032,
+              "imaginary": 1.9984014443252818e-15
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.07605945799150504
+              ],
+              "median_seconds": 0.07605945799150504,
+              "minimum_seconds": 0.07605945799150504,
+              "maximum_seconds": 0.07605945799150504,
+              "maximum_tracemalloc_bytes": 10977250,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": -7.449486053604995,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.07614029198884964
+              ],
+              "median_seconds": 0.07614029198884964,
+              "minimum_seconds": 0.07614029198884964,
+              "maximum_seconds": 0.07614029198884964,
+              "maximum_tracemalloc_bytes": 10984490,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": -7.449486053604995,
+          "contraction_plans": 32,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 35,
+            "compressed_maximum": 14,
+            "contracted_maximum": 14
+          },
+          "memory": {
+            "dtype_itemsize": 16,
+            "peak_frontier_elements": 57344,
+            "peak_frontier_bytes": 917504,
+            "cached_environment_elements": 586916,
+            "cached_environment_bytes": 9390656,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 2978,
+              "dense_message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 2978
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "peak_message_elements": 57344,
+              "total_message_elements": 583938,
+              "dense_message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "dense_peak_message_elements": 57344,
+              "dense_total_message_elements": 583938
+            }
+          }
+        },
+        "vmc": {
+          "samples": 256,
+          "proposal": "mixed",
+          "exchange_probability": 0.9,
+          "burn_in_sweeps": 50,
+          "sweeps_between_samples": 2,
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.002068582980427891
+            ],
+            "median_seconds": 0.002068582980427891,
+            "minimum_seconds": 0.002068582980427891,
+            "maximum_seconds": 0.002068582980427891,
+            "maximum_tracemalloc_bytes": 48989,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "timing": {
+            "repeats": 1,
+            "seconds": [
+              6.647597666014917
+            ],
+            "median_seconds": 6.647597666014917,
+            "minimum_seconds": 6.647597666014917,
+            "maximum_seconds": 6.647597666014917,
+            "maximum_tracemalloc_bytes": 581162,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "energy": {
+            "real": -7.448110718530712,
+            "imaginary": -0.0007513013885319584
+          },
+          "variance": 0.07250153305624016,
+          "real_variance": 0.07222580966774676,
+          "naive_standard_error": 0.01679678746113779,
+          "autocorrelation_standard_error": 0.019946435739014116,
+          "integrated_autocorrelation_time": 0.7050958440849564,
+          "effective_sample_size": 181.53560409381365,
+          "standard_error_note": "both errors use the real local-energy variance; the corrected estimate uses Geyer's initial positive sequence",
+          "absolute_energy_error": 0.0013753350742833348,
+          "diagnostics": {
+            "attempts": 8992,
+            "accepted": 747,
+            "acceptance_rate": 0.08307384341637011,
+            "zero_amplitude_rejections": 0,
+            "initialization_attempts": 1,
+            "site_attempts": [
+              1042,
+              1131,
+              1105,
+              1052,
+              1098,
+              1084,
+              1090,
+              1069,
+              1015,
+              1092,
+              1042,
+              1037,
+              1055,
+              1070,
+              1037,
+              1084
+            ],
+            "site_accepts": [
+              71,
+              82,
+              88,
+              99,
+              97,
+              99,
+              102,
+              98,
+              88,
+              131,
+              93,
+              90,
+              83,
+              76,
+              91,
+              104
+            ],
+            "single_site_attempts": 881,
+            "single_site_accepts": 2,
+            "single_site_acceptance_rate": 0.0022701475595913734,
+            "exchange_attempts": 8111,
+            "exchange_accepts": 745,
+            "exchange_acceptance_rate": 0.0918505732955246
+          },
+          "warnings": [
+            "single-site acceptance is below 1%, so mixing between conserved label sectors can remain slow even when exchanges mix within a sector"
+          ]
+        }
+      }
+    },
+    {
+      "model": {
+        "geometry": "8x4",
+        "nrows": 8,
+        "ncols": 4,
+        "nsites": 32,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 4,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 52,
+        "j2_diagonal_edges": 42,
+        "parameters": 3240,
+        "tensor_storage_bytes": 51840,
+        "tensor_dtype": "complex128",
+        "tensor_source": {
+          "kind": "saved-optimized-letta",
+          "path": "examples/mps/results/frontier_letta_j2_half_convergence_8x4_seed7.npz",
+          "seed": 7
+        },
+        "full_hilbert_dimension": 4294967296,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.36828591697849333
+            ],
+            "median_seconds": 0.36828591697849333,
+            "minimum_seconds": 0.36828591697849333,
+            "maximum_seconds": 0.36828591697849333,
+            "maximum_tracemalloc_bytes": 27212105,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.0000000000021694,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.003178332990501076
+              ],
+              "median_seconds": 0.003178332990501076,
+              "minimum_seconds": 0.003178332990501076,
+              "maximum_seconds": 0.003178332990501076,
+              "maximum_tracemalloc_bytes": 237951,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": -15.097503502875913,
+              "imaginary": -9.771605746777823e-11
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.1954829169844743
+              ],
+              "median_seconds": 0.1954829169844743,
+              "minimum_seconds": 0.1954829169844743,
+              "maximum_seconds": 0.1954829169844743,
+              "maximum_tracemalloc_bytes": 25669410,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": -15.09750350284316,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.20064845902379602
+              ],
+              "median_seconds": 0.20064845902379602,
+              "minimum_seconds": 0.20064845902379602,
+              "maximum_seconds": 0.20064845902379602,
+              "maximum_tracemalloc_bytes": 25672362,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": -15.09750350284316,
+          "contraction_plans": 64,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 35,
+            "compressed_maximum": 14,
+            "contracted_maximum": 14
+          },
+          "memory": {
+            "dtype_itemsize": 16,
+            "peak_frontier_elements": 57344,
+            "peak_frontier_bytes": 917504,
+            "cached_environment_elements": 1508516,
+            "cached_environment_bytes": 24136256,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7074,
+              "dense_message_elements_by_cut": [
+                1,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7074
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "peak_message_elements": 57344,
+              "total_message_elements": 1501442,
+              "dense_message_elements_by_cut": [
+                1,
+                1024,
+                8192,
+                45056,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                57344,
+                11264,
+                2048,
+                256,
+                1
+              ],
+              "dense_peak_message_elements": 57344,
+              "dense_total_message_elements": 1501442
+            }
+          }
+        },
+        "vmc": {
+          "samples": 256,
+          "proposal": "mixed",
+          "exchange_probability": 0.9,
+          "burn_in_sweeps": 50,
+          "sweeps_between_samples": 2,
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.003571042005205527
+            ],
+            "median_seconds": 0.003571042005205527,
+            "minimum_seconds": 0.003571042005205527,
+            "maximum_seconds": 0.003571042005205527,
+            "maximum_tracemalloc_bytes": 90803,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "timing": {
+            "repeats": 1,
+            "seconds": [
+              22.195171416999074
+            ],
+            "median_seconds": 22.195171416999074,
+            "minimum_seconds": 22.195171416999074,
+            "maximum_seconds": 22.195171416999074,
+            "maximum_tracemalloc_bytes": 434055,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "energy": {
+            "real": -15.134004605169089,
+            "imaginary": 0.0015782546502032136
+          },
+          "variance": 0.14444779191569374,
+          "real_variance": 0.1407495695046101,
+          "naive_standard_error": 0.023447878494170495,
+          "autocorrelation_standard_error": 0.028815653534809565,
+          "integrated_autocorrelation_time": 0.7551267269929818,
+          "effective_sample_size": 169.50797187342786,
+          "standard_error_note": "both errors use the real local-energy variance; the corrected estimate uses Geyer's initial positive sequence",
+          "absolute_energy_error": 0.036501102325928514,
+          "diagnostics": {
+            "attempts": 17984,
+            "accepted": 774,
+            "acceptance_rate": 0.043038256227758004,
+            "zero_amplitude_rejections": 0,
+            "initialization_attempts": 1,
+            "site_attempts": [
+              1075,
+              1104,
+              1049,
+              1078,
+              1085,
+              1103,
+              1044,
+              1066,
+              1098,
+              1071,
+              1051,
+              1049,
+              1152,
+              1062,
+              988,
+              1092,
+              1072,
+              1105,
+              1031,
+              1120,
+              1041,
+              1071,
+              1076,
+              1101,
+              1026,
+              1073,
+              1059,
+              1051,
+              1023,
+              1086,
+              1034,
+              1057
+            ],
+            "site_accepts": [
+              50,
+              49,
+              39,
+              32,
+              45,
+              45,
+              53,
+              41,
+              64,
+              65,
+              40,
+              35,
+              39,
+              48,
+              44,
+              53,
+              52,
+              56,
+              54,
+              46,
+              39,
+              53,
+              48,
+              50,
+              53,
+              64,
+              46,
+              49,
+              40,
+              50,
+              54,
+              47
+            ],
+            "single_site_attempts": 1775,
+            "single_site_accepts": 5,
+            "single_site_acceptance_rate": 0.0028169014084507044,
+            "exchange_attempts": 16209,
+            "exchange_accepts": 769,
+            "exchange_acceptance_rate": 0.04744277870318959
+          },
+          "warnings": [
+            "single-site acceptance is below 1%, so mixing between conserved label sectors can remain slow even when exchanges mix within a sector"
+          ]
+        }
+      }
+    },
+    {
+      "model": {
+        "geometry": "6x6",
+        "nrows": 6,
+        "ncols": 6,
+        "nsites": 36,
+        "boundary": "open",
+        "site_order": "row-wise snake",
+        "j1": 1.0,
+        "j2": 0.5,
+        "bond_dim": 2,
+        "physical_dim": 2,
+        "tie_graph": "all nearest-neighbor J1 bonds",
+        "tie_edges": 60,
+        "j2_diagonal_edges": 50,
+        "parameters": 948,
+        "tensor_storage_bytes": 7584,
+        "tensor_dtype": "float64",
+        "tensor_source": {
+          "kind": "generated-mps-lift-plus-tie-noise",
+          "seed": 2718,
+          "tie_noise": 0.02,
+          "snapshot_requested": null,
+          "snapshot_missing_or_ignored": false
+        },
+        "full_hilbert_dimension": 68719476736,
+        "full_hilbert_materialized": false
+      },
+      "backends": {
+        "exact_compressed": {
+          "backend": "compressed",
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.8533641250105575
+            ],
+            "median_seconds": 0.8533641250105575,
+            "minimum_seconds": 0.8533641250105575,
+            "maximum_seconds": 0.8533641250105575,
+            "maximum_tracemalloc_bytes": 76859030,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "norm": {
+            "value": {
+              "real": 1.059173475780615,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.0027680420025717467
+              ],
+              "median_seconds": 0.0027680420025717467,
+              "minimum_seconds": 0.0027680420025717467,
+              "maximum_seconds": 0.0027680420025717467,
+              "maximum_tracemalloc_bytes": 106035,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "hamiltonian_numerator": {
+            "value": {
+              "real": 0.012855019247741168,
+              "imaginary": 0.0
+            },
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.6234700840141159
+              ],
+              "median_seconds": 0.6234700840141159,
+              "minimum_seconds": 0.6234700840141159,
+              "maximum_seconds": 0.6234700840141159,
+              "maximum_tracemalloc_bytes": 73604618,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "energy": {
+            "value": 0.012136840226542652,
+            "timing": {
+              "repeats": 1,
+              "seconds": [
+                0.6219436670071445
+              ],
+              "median_seconds": 0.6219436670071445,
+              "minimum_seconds": 0.6219436670071445,
+              "maximum_seconds": 0.6219436670071445,
+              "maximum_tracemalloc_bytes": 73605938,
+              "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+            }
+          },
+          "ratio_energy": 0.012136840226542652,
+          "contraction_plans": 72,
+          "hamiltonian_mpo_bond_dims": {
+            "uncompressed_maximum": 53,
+            "compressed_maximum": 20,
+            "contracted_maximum": 20
+          },
+          "memory": {
+            "dtype_itemsize": 8,
+            "peak_frontier_elements": 327680,
+            "peak_frontier_bytes": 2621440,
+            "cached_environment_elements": 8635948,
+            "cached_environment_bytes": 69087584,
+            "norm": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "peak_message_elements": 256,
+              "total_message_elements": 7146,
+              "dense_message_elements_by_cut": [
+                1,
+                16,
+                32,
+                64,
+                128,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                128,
+                64,
+                32,
+                16,
+                8,
+                1
+              ],
+              "dense_peak_message_elements": 256,
+              "dense_total_message_elements": 7146
+            },
+            "hamiltonian": {
+              "representation": "MPOFrontier",
+              "message_elements_by_cut": [
+                1,
+                256,
+                2048,
+                11264,
+                57344,
+                278528,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                69632,
+                14336,
+                2816,
+                512,
+                64,
+                1
+              ],
+              "peak_message_elements": 327680,
+              "total_message_elements": 8628802,
+              "dense_message_elements_by_cut": [
+                1,
+                256,
+                2048,
+                11264,
+                57344,
+                278528,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                327680,
+                69632,
+                14336,
+                2816,
+                512,
+                64,
+                1
+              ],
+              "dense_peak_message_elements": 327680,
+              "dense_total_message_elements": 8628802
+            }
+          }
+        },
+        "vmc": {
+          "samples": 256,
+          "proposal": "mixed",
+          "exchange_probability": 0.9,
+          "burn_in_sweeps": 50,
+          "sweeps_between_samples": 2,
+          "setup": {
+            "repeats": 1,
+            "seconds": [
+              0.004054624994751066
+            ],
+            "median_seconds": 0.004054624994751066,
+            "minimum_seconds": 0.004054624994751066,
+            "maximum_seconds": 0.004054624994751066,
+            "maximum_tracemalloc_bytes": 44067,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "timing": {
+            "repeats": 1,
+            "seconds": [
+              27.109036375011783
+            ],
+            "median_seconds": 27.109036375011783,
+            "minimum_seconds": 27.109036375011783,
+            "maximum_seconds": 27.109036375011783,
+            "maximum_tracemalloc_bytes": 430096,
+            "memory_note": "tracemalloc measures traced allocations during the call; use the structural element counts for backend-independent memory comparisons"
+          },
+          "energy": {
+            "real": -0.6039280133394779,
+            "imaginary": 0.0
+          },
+          "variance": 8.785731143943352,
+          "real_variance": 8.785731143943352,
+          "naive_standard_error": 0.18525458774623832,
+          "autocorrelation_standard_error": 0.21530750260413736,
+          "integrated_autocorrelation_time": 0.6753834085655215,
+          "effective_sample_size": 189.52197874073514,
+          "standard_error_note": "both errors use the real local-energy variance; the corrected estimate uses Geyer's initial positive sequence",
+          "absolute_energy_error": 0.6160648535660205,
+          "diagnostics": {
+            "attempts": 20232,
+            "accepted": 1975,
+            "acceptance_rate": 0.09761763542902333,
+            "zero_amplitude_rejections": 0,
+            "initialization_attempts": 1,
+            "site_attempts": [
+              1046,
+              1102,
+              1055,
+              1013,
+              1107,
+              1073,
+              1085,
+              1071,
+              1046,
+              1060,
+              1058,
+              1140,
+              1079,
+              1074,
+              1089,
+              1047,
+              1052,
+              1061,
+              1075,
+              1092,
+              1057,
+              1101,
+              1031,
+              1112,
+              1086,
+              1054,
+              1019,
+              1052,
+              1035,
+              1092,
+              1048,
+              1074,
+              1082,
+              1005,
+              1047,
+              1075
+            ],
+            "site_accepts": [
+              16,
+              120,
+              176,
+              12,
+              163,
+              73,
+              48,
+              54,
+              33,
+              191,
+              9,
+              62,
+              80,
+              114,
+              102,
+              41,
+              23,
+              95,
+              132,
+              189,
+              163,
+              72,
+              85,
+              61,
+              55,
+              128,
+              98,
+              127,
+              76,
+              92,
+              83,
+              32,
+              91,
+              135,
+              134,
+              119
+            ],
+            "single_site_attempts": 2069,
+            "single_site_accepts": 666,
+            "single_site_acceptance_rate": 0.3218946350894152,
+            "exchange_attempts": 18163,
+            "exchange_accepts": 1309,
+            "exchange_acceptance_rate": 0.07206959202774872
+          },
+          "warnings": [
+            "single-site moves are viable but rare in this proposal mixture; reduce the exchange probability or compare independent chains to check mixing between physical-label sectors"
+          ]
+        }
+      }
+    }
+  ]
+}

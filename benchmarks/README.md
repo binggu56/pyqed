@@ -42,9 +42,8 @@ benchmark, and record every setting.
 ## Reviewed validation records
 
 - [`h2-sto3g-rhf-pyscf`](h2-sto3g-rhf-pyscf/RESULT.md) compares one native
-  PyQED RHF total energy with PySCF 2.12.1. It was run from clean source commit
-  `7dbb9bcc6625d9e4030627140dd14738c60a0e67` with the observed
-  `rys-cython-blocked` builder. Its
+  PyQED RHF total energy with PySCF 2.12.1.  Its
   [`manifest.json`](h2-sto3g-rhf-pyscf/manifest.json) records the exact input,
-  command, dependencies, environment, tolerance, raw-output and backend hashes,
-  and deliberately narrow claim scope.
+  command, environment, tolerance, raw-output hash, and deliberately narrow
+  claim scope.  The current record comes from a dirty development tree and
+  must be regenerated on a clean release tree before release-level use.

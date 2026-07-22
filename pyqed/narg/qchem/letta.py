@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 
 import numpy as np
 
-from pyqed.narg.letta import LETTA as GenericLETTA
+from pyqed.letta import LETTA as GenericLETTA
 
 _DEFAULT_MPO_CACHE = {}
 _DEFAULT_MPO_CACHE_MAXSIZE = 4
@@ -29,7 +29,7 @@ class LETTA:
 
     This class is intentionally a thin domain adapter: quantum-chemistry code
     is responsible for preparing NARG factors, Hamiltonians, or MPOs, while the
-    tensor optimization is delegated to :class:`pyqed.narg.letta.LETTA`.
+    tensor optimization is delegated to :class:`pyqed.letta.LETTA`.
     """
 
     engine: GenericLETTA
@@ -164,17 +164,13 @@ class LETTA:
             return 0.0
         return float(self.mol.energy_nuc())
 
-    def _with_energy_shift(self, result):
-        shift = self._energy_shift()
-        if shift == 0.0:
-            return result
-        history = []
-        for entry in result.history:
-            entry = dict(entry)
-            if entry.get("energy") is not None:
-                entry["energy"] = entry["energy"] + shift
-            history.append(entry)
-        return replace(result, energy=result.energy + shift, history=history)
+    @property
+    def converged(self):
+        return self.engine.converged
+
+    @property
+    def ncompleted(self):
+        return self.engine.ncompleted
 
     def operator(self, operator=None):
         """Return the supplied operator or the qchem default operator."""
@@ -215,10 +211,8 @@ class LETTA:
     def run(self, operator=None, **kwargs):
         if self.source is not None:
             kwargs.setdefault("start_direction", "rl")
-        result = self.engine.run(self.operator(operator), **kwargs)
-        if operator is None:
-            return self._with_energy_shift(result)
-        return result
+        self.engine.run(self.operator(operator), **kwargs)
+        return self
 
     def state_vector(self):
         return self.engine.state_vector()

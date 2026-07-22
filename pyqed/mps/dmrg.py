@@ -119,6 +119,13 @@ def dmrg_matvec_options(policy="auto"):
         "cpp": "packed-cpp-fast",
         "c++": "packed-cpp-fast",
         "block2-cpp": "packed-cpp-fast",
+        "dense-cpp-fast": "generic-cpp",
+        "dense-cpp": "generic-cpp",
+        "generic-dense-cpp": "generic-cpp",
+        "generic-c++": "generic-cpp",
+        "dense-cpp-block": "generic-cpp-block",
+        "generic-block-cpp": "generic-cpp-block",
+        "generic-block-c++": "generic-cpp-block",
         "projector-fast": "packed-projector-fast",
     }
     policy = aliases.get(policy, policy)
@@ -201,6 +208,7 @@ def dmrg_matvec_options(policy="auto"):
                 "packed_local_flat_preconditioner": True,
                 "moving_environment": True,
                 "moving_environment_flat_preconditioner": True,
+                "moving_environment_cpp_matvec": True,
                 "packed_local_family_flat_direct_matvec": True,
                 "packed_local_family_flat_direct_matvec_backend": "renormalized_table",
                 "generator_table_packed_route_table": "auto",
@@ -250,6 +258,10 @@ def dmrg_matvec_options(policy="auto"):
                 "generator_table_planned_contextual_without_precompute": True,
                 "generator_table_planned_contextual_without_precompute_table_lookup": True,
                 "generator_table_packed_direct_family_entries": True,
+                "generator_table_packed_direct_family_entries_reason": (
+                    "enabled for exact planned packed contextual route"
+                ),
+                "generator_table_allow_planned_packed_contextual_entries": True,
                 "generator_table_prebuild_same_side_native_p": True,
                 "generator_table_incremental_same_side_pair_prebuild": True,
                 "generator_table_use_disjoint_same_side_native_p": False,
@@ -308,6 +320,26 @@ def dmrg_matvec_options(policy="auto"):
             "native_compact_matrix_chain_selector_enabled": False,
             "batched_action_selector_enabled": False,
         }
+    if policy == "generic-cpp":
+        opts = dmrg_matvec_options("generic")
+        opts.update(
+            {
+                "moving_environment_dense_cpp_davidson": True,
+                "moving_environment_dense_cpp_davidson_backend": "blas",
+                "moving_environment_dense_cpp_two_site_solve": True,
+                "moving_environment_dense_cpp_environment_update": False,
+            }
+        )
+        return opts
+    if policy == "generic-cpp-block":
+        opts = dmrg_matvec_options("generic-cpp")
+        opts.update(
+            {
+                "moving_environment_dense_cpp_block_davidson": True,
+                "moving_environment_dense_cpp_block_davidson_size": 2,
+            }
+        )
+        return opts
     if policy == "matrix-chain":
         return {
             "matrix_chain_selector_enabled": True,
@@ -374,13 +406,6 @@ def resolve_abelian_matvec_options(performance="auto", overrides=None):
     options = dmrg_matvec_options(performance)
     if overrides:
         options.update(dict(overrides))
-    if (
-        bool(options.get("moving_environment_cpp_davidson", False))
-        or bool(options.get("moving_environment_cpp_matvec", False))
-    ):
-        options.setdefault("native_site_storage", True)
-        options.setdefault("moving_environment_cpp_state_owner", True)
-        options.setdefault("moving_environment_cpp_solve_site_update_owner", True)
     return options
 
 
@@ -418,7 +443,7 @@ class DMRG:
         """
 
         self.H = H
-        self.L = len(self.H)
+        self.L = len(self._factor_list(H))
         self.D = D
         self.nsweeps = nsweeps
         self.sweep_tol = float(sweep_tol)
@@ -440,8 +465,14 @@ class DMRG:
         self.recenter_final = bool(recenter_final)
         self.final_expectation = bool(final_expectation)
         self.performance = str(performance or "auto")
+        policy_key = self.performance.strip().lower().replace("_", "-")
+        self.resolved_performance = (
+            "generic-cpp"
+            if (not bool(symmetry) and policy_key in {"auto", "default"})
+            else self.performance
+        )
         self.abelian_matvec_options = resolve_abelian_matvec_options(
-            self.performance,
+            self.resolved_performance,
             abelian_matvec_options,
         )
         self.opt = opt
@@ -496,6 +527,12 @@ class DMRG:
         return out
 
     @staticmethod
+    def _factor_list(obj):
+        if hasattr(obj, "factors") and not isinstance(obj, (list, tuple)):
+            return obj.factors
+        return obj
+
+    @staticmethod
     def load_checkpoint(path):
         with Path(path).expanduser().open("rb") as handle:
             return pickle.load(handle)
@@ -523,6 +560,7 @@ class DMRG:
                 "target_qn": self.target_qn,
                 "opt": self.opt,
                 "performance": self.performance,
+                "resolved_performance": self.resolved_performance,
                 "native_site_storage": bool(
                     self.abelian_matvec_options.get("native_site_storage", False)
                 ),
@@ -561,7 +599,13 @@ class DMRG:
             # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
             mps_list = self.init_guess
 
-        mpo_list = self.H.factors if isinstance(self.H, MPO) else self.H
+        mpo_list = self._factor_list(self.H)
+        complementary_operator_mpos = None
+        if self.complementary_operator_mpos is not None:
+            complementary_operator_mpos = {
+                name: self._factor_list(mpo)
+                for name, mpo in self.complementary_operator_mpos.items()
+            }
         use_native_site_storage = bool(
             self.abelian_matvec_options.get("native_site_storage", False)
         )
@@ -618,6 +662,20 @@ class DMRG:
                         row[key] = float(np.real(np.asarray(val).reshape(-1)[0]))
                     except Exception:
                         pass
+                if self.final_expectation and self.nstates == 1 and "mps" in info:
+                    try:
+                        local_energy = row.get("energy")
+                        post_energy = (
+                            _normalized_mps_mpo_expectation(info["mps"], mpo_list)
+                            + getattr(self.H, "constant", 0.0)
+                        )
+                        post_energy = float(np.real(np.asarray(post_energy).reshape(-1)[0]))
+                        if "local_energy" not in row:
+                            row["local_energy"] = local_energy
+                        row["energy"] = post_energy
+                        row["post_truncation_energy"] = post_energy
+                    except Exception as exc:
+                        row["post_truncation_energy_error"] = str(exc)
                 # Keep history metadata light; checkpoints carry tensor data.
                 row.pop("mps", None)
                 row.pop("last_AA_list", None)
@@ -653,7 +711,7 @@ class DMRG:
                 noise_cutoff=self.noise_cutoff,
                 local_dense_max_dim=self.local_dense_max_dim,
                 complementary_operator_families=self.complementary_operator_families,
-                complementary_operator_mpos=self.complementary_operator_mpos,
+                complementary_operator_mpos=complementary_operator_mpos,
                 complementary_operator_term_maps=self.complementary_operator_term_maps,
                 complementary_operator_generator_entries=self.complementary_operator_generator_entries,
                 site_qn_maps=self.site_qn_maps,
@@ -690,7 +748,7 @@ class DMRG:
             shift = getattr(self.H, 'constant', 0.0)
             
             labels = ['lv', 'rv', 'p'] if self.U1 else ['lv', 'p', 'rv']
-            center = (len(self.H) - 1) if self.gauge.lower() == "left" else 0
+            center = (self.L - 1) if self.gauge.lower() == "left" else 0
 
             if self.nstates == 1:
                 self.ground_state = MPS(mps_out, labels=labels, center=center)
@@ -728,6 +786,21 @@ class DMRG:
                 self.e_tot = state_energies[0]
             else:
                 self.e_tot = state_energies
+
+            if self.final_expectation and self.sweep_history:
+                final_row = self.sweep_history[-1]
+                if "energy" in final_row and "local_energy" not in final_row:
+                    final_row["local_energy"] = final_row["energy"]
+                if self.nstates == 1:
+                    final_row["energy"] = float(np.real(self.e_tot))
+                    final_row["post_truncation_energy"] = float(np.real(self.e_tot))
+                else:
+                    energies = [
+                        float(np.real(np.asarray(energy).reshape(-1)[0]))
+                        for energy in np.asarray(self.e_tot).reshape(-1)
+                    ]
+                    final_row["energy"] = energies
+                    final_row["post_truncation_energy"] = energies
 
             self._write_checkpoint(
                 factors=self.ground_state.factors,

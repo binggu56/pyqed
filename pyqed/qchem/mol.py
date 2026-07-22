@@ -102,7 +102,7 @@ _BUILTIN_OPTION_SPECS = (
     ("ri_cache_dir", "builtin_ri_cache_dir", "native_ri_cache_dir", lambda v: None if v is None else str(v), None),
     ("one_electron_cache", "builtin_one_electron_cache", "native_one_electron_cache", bool, True),
     ("auto_ri_min_nao", "builtin_auto_ri_min_nao", "native_auto_ri_min_nao", int, 24),
-    ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-8),
+    ("low_rank_tol", "builtin_low_rank_tol", "native_low_rank_tol", float, 1e-10),
     ("low_rank_max_rank", "builtin_low_rank_max_rank", "native_low_rank_max_rank", lambda v: None if v is None else int(v), None),
     ("build_factors", "builtin_build_factors", "native_build_factors", bool, False),
 )
@@ -246,8 +246,20 @@ def _normalize_builtin_options(options, strict=False):
     if not hasattr(options, "items"):
         raise TypeError("build(options=...) must be a mapping.")
 
-    tmp = {"builtin_options": dict(options)}
+    raw_options = dict(options)
+    raw_keys = set(raw_options)
+    tmp = {"builtin_options": raw_options}
     normalized = _pop_builtin_options(tmp)
+    if (
+        raw_keys & {"eri_representation", "builtin_eri_representation", "native_eri_representation"}
+        and not raw_keys & {"aosym", "builtin_aosym", "native_aosym"}
+    ):
+        normalized_representation = _normalize_eri_representation(normalized["eri_representation"])
+        normalized["aosym"] = (
+            "s8"
+            if normalized_representation in {"dense", "dense+factors", "factors"}
+            else "s1"
+        )
     normalized["eri_representation"], normalized["aosym"] = _split_eri_representation_and_aosym(
         normalized["eri_representation"],
         normalized.get("aosym", "s1"),
@@ -1202,6 +1214,7 @@ class Molecule:
         self.nao = None
         self.nmo = None
         self.unit = unit
+        self.cart = False
         self._bas = None
         self._bas_cart = None
         self._ao_cart2sph = None
@@ -1211,6 +1224,16 @@ class Molecule:
         self._builtin_build_info = None
 
         self._native_build_info = self._builtin_build_info
+
+        self.symmetry = False
+        self.symmetry_info = None
+        self.groupname = None
+        self.irrep_names = None
+        self.symm_orb = None
+        self.ao_irrep_labels = None
+        self.ao_irrep_ids = None
+        self.symmetry_axis = None
+        self.symmetry_tol = None
 
 
     @property
@@ -1233,6 +1256,12 @@ class Molecule:
 
     def atom_symbols(self):
         return [self.atom_symbol(i) for i in range(self.natom)]
+
+    def view(self, **kwargs):
+        """Show this molecule in PyQED's interactive 3D viewer."""
+        from pyqed.visualization import view
+
+        return view(self, **kwargs)
 
     def _set_builtin_options(self, options):
         """
@@ -1310,7 +1339,17 @@ class Molecule:
 
         return np.einsum('z,zx->x', charges, coords) / charges.sum()
 
-    def build(self, driver='builtin', options=None, eri=None, aosym=None, auxbasis=None):
+    def build(
+        self,
+        driver='builtin',
+        options=None,
+        eri=None,
+        aosym=None,
+        auxbasis=None,
+        symmetry=None,
+        symmetry_axis='z',
+        symmetry_tol=1.0e-8,
+    ):
         """
         build molecular integrals
 
@@ -1327,14 +1366,28 @@ class Molecule:
             Backend-specific build options. For ``driver='builtin'``, use short
             keys such as ``eri_representation``, ``aosym``, ``low_rank_tol``,
             ``eri_screen_tol``, ``parallel``, and ``eri_workers``.
-        eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'ri'}, optional
+        eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'cd', 'ri'}, optional
             Short alias for the builtin ``eri_representation`` option.
         aosym : {'s1', 's4', 's8'}, optional
-            AO ERI permutation symmetry for dense-like builtin storage. Defaults
-            to ``'s8'`` for the builtin driver.
+            AO ERI permutation symmetry for dense-like builtin storage. The
+            default builtin build uses ``eri='auto'``: compact exact ``s8``
+            storage for small systems, native RI factors for medium systems
+            when an auxiliary basis is available, and Cholesky/CD factors as a
+            fallback. Explicit dense shortcuts such as ``eri='dense'`` default
+            to ``aosym='s8'`` when no symmetry is supplied.
         auxbasis : str, optional
             Short alias for the builtin ``auxbasis`` option used by
             ``eri='ri'`` and ``eri='dense+ri'``.
+        symmetry : bool or str, optional
+            Build native Abelian point-group metadata after the AO integrals are
+            available. ``True`` currently selects ``C2v``; strings such as
+            ``'C2v'`` and ``'D2h'`` select a supported subgroup explicitly.
+        symmetry_axis : {'z'}, optional
+            Principal-axis convention for native symmetry. Only ``'z'`` is
+            currently implemented.
+        symmetry_tol : float, optional
+            Geometry tolerance, in bohr, used when validating symmetry
+            operations.
 
         Returns
         -------
@@ -1393,6 +1446,15 @@ class Molecule:
         self.native_resolved_aosym = None
         self._builtin_build_info = None
         self._native_build_info = None
+        self.symmetry = False
+        self.symmetry_info = None
+        self.groupname = None
+        self.irrep_names = None
+        self.symm_orb = None
+        self.ao_irrep_labels = None
+        self.ao_irrep_ids = None
+        self.symmetry_axis = None
+        self.symmetry_tol = None
 
         if driver == 'builtin':
             build_builtin(self)
@@ -1438,6 +1500,25 @@ class Molecule:
                 f"Unsupported integral driver '{driver}'. "
                 "Use 'builtin', 'native', 'gbasis', 'gbasis-pyscf', or 'pyscf'."
             )
+
+        if symmetry:
+            from pyqed.qchem.symmetry import build_molecular_symmetry
+
+            info = build_molecular_symmetry(
+                self,
+                symmetry,
+                axis=symmetry_axis,
+                tol=float(symmetry_tol),
+            )
+            self.symmetry = True
+            self.symmetry_info = info
+            self.groupname = info.groupname
+            self.irrep_names = info.irrep_names
+            self.symm_orb = info.symm_orb
+            self.ao_irrep_labels = info.ao_irrep_labels
+            self.ao_irrep_ids = info.ao_irrep_ids
+            self.symmetry_axis = symmetry_axis
+            self.symmetry_tol = float(symmetry_tol)
 
     def geometry_signature(self, digits=12):
         """
@@ -1687,6 +1768,30 @@ class Molecule:
         atom_symbols = self.atom_symbols()
         labels = []
 
+        if basis and hasattr(basis[0], "angmom") and not hasattr(basis[0], "shell"):
+            shell_counts = {}
+            for shell in basis:
+                l = int(shell.angmom)
+                atom_idx = int(shell.icenter) if hasattr(shell, "icenter") else _match_atom_index_from_origin(
+                    atom_coords, np.asarray(shell.coord, dtype=float)
+                )
+                coord_type = str(getattr(shell, "coord_type", "spherical")).lower()
+                if coord_type == "cartesian":
+                    components = [_cartesian_component_label(c) for c in shell.angmom_components_cart]
+                elif coord_type == "spherical":
+                    components = _spherical_component_labels(l)
+                else:
+                    raise ValueError(f"Unsupported gbasis coordinate type {coord_type!r}.")
+                nseg = int(getattr(shell, "num_seg_cont", 1))
+                for _seg in range(nseg):
+                    shell_counts[(atom_idx, l)] = shell_counts.get((atom_idx, l), 0) + 1
+                    shell_name = _angular_shell_name(l, shell_counts[(atom_idx, l)])
+                    for component in components:
+                        labels.append(f"{atom_idx} {atom_symbols[atom_idx]} {shell_name}{component}")
+            if len(labels) != self.nao:
+                raise ValueError("AO label count does not match mol.nao.")
+            return labels
+
         if self.cart or self._ao_cart2sph is None or len(basis) == self.nao:
             shell_counts = {}
             shell_labels = {}
@@ -1831,6 +1936,7 @@ class Molecule:
         self.eri = None
         self.nao = None
         self.nmo = None
+        self.cart = False
         self._bas = None
         self._bas_cart = None
         self._ao_cart2sph = None

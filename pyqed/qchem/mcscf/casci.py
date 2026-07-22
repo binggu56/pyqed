@@ -10,6 +10,7 @@ complete active space configuration interaction
 
 import logging
 from functools import lru_cache, reduce
+import importlib
 import numpy as np
 from scipy.linalg import eigh
 from scipy.sparse.linalg import eigsh
@@ -35,6 +36,26 @@ from pyqed.qchem.soc import (
     get_soc_somf_spin_orbital,
     reorder_spin_orbital_matrix,
 )
+
+_CASSCF_CPP_UNINITIALIZED = object()
+_casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+
+
+def _cpp_attr(*names):
+    global _casscf_cpp
+    if _casscf_cpp is _CASSCF_CPP_UNINITIALIZED:
+        try:
+            _casscf_cpp = importlib.import_module("pyqed.qchem._casscf_cpp")
+        except Exception:  # pragma: no cover - optional accelerator
+            _casscf_cpp = None
+    if _casscf_cpp is None:
+        return None
+    for name in names:
+        attr = getattr(_casscf_cpp, name, None)
+        if attr is not None:
+            return attr
+    return None
+
 
 def cistring(norb, nelec, sz=0):
     """
@@ -284,14 +305,21 @@ def _resolve_use_cholesky_integrals(mf, use_cholesky=None):
     )
 
 
-def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+def mo_pair_factors(eri_factors, mo_left, mo_right=None):
     """
     Transform AO Cholesky factors ``L_P[mu,nu]`` to an MO pair basis.
     """
     if mo_right is None:
         mo_right = mo_left
-    from pyqed.qchem.basis import transform_ri_factors_to_mo_pair
-    return transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+    from pyqed.qchem.basis import mo_pair_factors as _basis_mo_pair_factors
+    return _basis_mo_pair_factors(eri_factors, mo_left, mo_right)
+
+
+def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+    """
+    Compatibility alias for :func:`mo_pair_factors`.
+    """
+    return mo_pair_factors(eri_factors, mo_left, mo_right)
 
 
 def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):
@@ -301,6 +329,21 @@ def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):
     if pair_factors_rs is None:
         pair_factors_rs = pair_factors_pq
     return contract('Ppq,Prs->pqrs', pair_factors_pq, pair_factors_rs)
+
+
+def _get_veff_for_dm(mf, dm):
+    """Return the mean-field potential for ``dm`` across local and PySCF APIs."""
+    try:
+        return mf.get_veff(dm=dm)
+    except TypeError:
+        pass
+    mol = getattr(mf, 'mol', None)
+    if mol is not None:
+        try:
+            return mf.get_veff(mol, dm)
+        except TypeError:
+            pass
+    return mf.get_veff(dm)
 
 
 def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None,
@@ -318,7 +361,7 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
     if use_cholesky:
         if eri_factors is None:
             eri_factors = _get_mf_cholesky_factors(mf)
-        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        pair_factors_pq = mo_pair_factors(eri_factors, mo_left, mo_right)
         if (
             mo_left_2 is mo_left and mo_right_2 is mo_right
         ) or (
@@ -326,7 +369,7 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
         ):
             pair_factors_rs = pair_factors_pq
         else:
-            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+            pair_factors_rs = mo_pair_factors(eri_factors, mo_left_2, mo_right_2)
         return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
 
     eri_source = getattr(mf, 'eri', None)
@@ -363,7 +406,7 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
     if eri_factors is None and eri_source is not None and eri_ndim in (2, 3):
         eri_factors = eri_source
     if eri_factors is not None:
-        pair_factors_pq = transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right)
+        pair_factors_pq = mo_pair_factors(eri_factors, mo_left, mo_right)
         if (
             mo_left_2 is mo_left and mo_right_2 is mo_right
         ) or (
@@ -371,8 +414,28 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
         ):
             pair_factors_rs = pair_factors_pq
         else:
-            pair_factors_rs = transform_eri_factors_to_mo_pair(eri_factors, mo_left_2, mo_right_2)
+            pair_factors_rs = mo_pair_factors(eri_factors, mo_left_2, mo_right_2)
         return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
+
+    if eri_source is None and mol is not None and type(mol).__module__.startswith('pyscf.'):
+        try:
+            from pyscf import ao2mo as pyscf_ao2mo
+        except ImportError:
+            pass
+        else:
+            dims = (
+                mo_left.shape[1],
+                mo_right.shape[1],
+                mo_left_2.shape[1],
+                mo_right_2.shape[1],
+            )
+            return np.asarray(
+                pyscf_ao2mo.kernel(
+                    mol,
+                    (mo_left, mo_right, mo_left_2, mo_right_2),
+                    compact=False,
+                )
+            ).reshape(dims)
 
     raise ValueError(
         "transform_spatial_eri_to_mo requires dense 4-index ERIs or RI/Cholesky "
@@ -570,7 +633,7 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
                 np.dot(mo_core_a, mo_core_a.conj().T),
                 np.dot(mo_core_b, mo_core_b.conj().T),
             ))
-            corevhf = mf.get_veff(core_dm)
+            corevhf = _get_veff_for_dm(mf, core_dm)
             energy_core += np.einsum('ij,ji', core_dm[0], hcore_a).real
             energy_core += np.einsum('ij,ji', core_dm[1], hcore_b).real
             energy_core += 0.5 * np.einsum('ij,ji', core_dm[0], corevhf[0]).real
@@ -589,7 +652,7 @@ def h1e_for_cas(mf, ncas, ncore, mo_coeff=None):
         corevhf = 0
     else:
         core_dm = np.dot(mo_core, mo_core.conj().T) * 2
-        corevhf = mf.get_veff(core_dm)
+        corevhf = _get_veff_for_dm(mf, core_dm)
         energy_core += np.einsum('ij,ji', core_dm, hcore).real
         energy_core += np.einsum('ij,ji', core_dm, corevhf).real * .5
 
@@ -710,11 +773,185 @@ class CASCI:
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
         self.use_cholesky_integrals = False
         self._property_operator_cache = {}
+        self.active_symmetry = None
+        self.active_orb_irrep_labels = None
+        self.active_orb_sym = None
+        self.active_irrep_counts = None
+        self.det_irrep_labels = None
+        self.det_irrep_ids = None
+        self.det_irrep_counts = None
+        self.wfnsym = None
+        self.det_irrep_filter_indices = None
+        self.spin0_symm_transform = None
+        self.spin0_pair_indices = None
 
 
         # effective CAS Hamiltonian
         self.h1e = None
         self.h2e = None
+
+    def _clear_symmetry_metadata(self):
+        self.active_symmetry = None
+        self.active_orb_irrep_labels = None
+        self.active_orb_sym = None
+        self.active_irrep_counts = None
+        self.det_irrep_labels = None
+        self.det_irrep_ids = None
+        self.det_irrep_counts = None
+        self.wfnsym = None
+        self.det_irrep_filter_indices = None
+        self.spin0_symm_transform = None
+        self.spin0_pair_indices = None
+
+    def _update_symmetry_metadata(self, binary=None):
+        if getattr(self.mol, "symmetry_info", None) is None:
+            self._clear_symmetry_metadata()
+            return None
+        try:
+            from pyqed.qchem.symmetry import build_active_space_symmetry
+
+            info = build_active_space_symmetry(
+                self.mf,
+                self.ncore,
+                self.ncas,
+                mo_coeff=self.mo_coeff,
+                binary=self.binary if binary is None else binary,
+            )
+        except NotImplementedError:
+            self._clear_symmetry_metadata()
+            return None
+
+        self.active_symmetry = info
+        self.active_orb_irrep_labels = info.orbital_labels
+        self.active_orb_sym = info.orbital_ids
+        self.active_irrep_counts = info.orbital_counts
+        self.det_irrep_labels = info.determinant_labels
+        self.det_irrep_ids = info.determinant_ids
+        self.det_irrep_counts = info.determinant_counts
+        return info
+
+    def _filter_binary_by_irrep(self, binary, target_irrep=None, wfnsym=None):
+        target = target_irrep if target_irrep is not None else wfnsym
+        if target is None:
+            self.det_irrep_filter_indices = None
+            self.wfnsym = None
+            self._update_symmetry_metadata(binary)
+            return binary
+
+        info = self._update_symmetry_metadata(binary)
+        if info is None or info.determinant_ids is None:
+            raise ValueError("Wavefunction symmetry filtering requires molecular symmetry metadata.")
+        group = info.group
+        target_id = group.irrep_id(target) if isinstance(target, str) else int(target)
+        from pyqed.qchem.symmetry import irrep_id_to_name
+
+        target_label = irrep_id_to_name(group, target_id)
+        indices = np.asarray(
+            [idx for idx, irrep_id in enumerate(info.determinant_ids) if irrep_id == target_id],
+            dtype=int,
+        )
+        if indices.size == 0:
+            raise ValueError(
+                f"No determinants with irrep {target_label} "
+                f"in the CAS({self.nelecas},{self.ncas}) determinant basis."
+            )
+
+        filtered = np.asarray(binary, dtype=np.int8)[indices]
+        self.binary = filtered
+        self.wfnsym = target_label
+        self.det_irrep_filter_indices = indices
+        self._update_symmetry_metadata(filtered)
+        self.det_irrep_filter_indices = indices
+        self.wfnsym = target_label
+        return filtered
+
+    def _spin0_symm_pairs(self, binary):
+        """Build symmetric alpha/beta determinant-index pairs."""
+        if tuple(self.nelecas_spin)[0] != tuple(self.nelecas_spin)[1]:
+            raise ValueError("direct_spin0_symm requires N_alpha == N_beta.")
+
+        dets = np.asarray(binary, dtype=np.int8)
+        if dets.ndim != 3 or dets.shape[1] != 2:
+            raise ValueError("binary must have shape (ndet, 2, ncas).")
+
+        string_order = []
+        string_seen = set()
+        for det in dets:
+            for spin in (0, 1):
+                key = tuple(int(x) for x in det[spin])
+                if key not in string_seen:
+                    string_seen.add(key)
+                    string_order.append(key)
+
+        det_lookup = {}
+        for idx, det in enumerate(dets):
+            alpha = tuple(int(x) for x in det[0])
+            beta = tuple(int(x) for x in det[1])
+            det_lookup[(alpha, beta)] = idx
+
+        pairs = []
+        for ia, alpha in enumerate(string_order):
+            for beta in string_order[ia:]:
+                left = det_lookup.get((alpha, beta))
+                if left is None:
+                    continue
+                right = det_lookup.get((beta, alpha))
+                if right is None:
+                    continue
+                pairs.append((left, right))
+
+        if not pairs:
+            raise ValueError("No singlet spin-adapted configurations were found.")
+        return tuple(pairs)
+
+    def _spin0_symm_basis(self, binary):
+        """Build symmetric alpha/beta string-pair columns in determinant space."""
+        dets = np.asarray(binary, dtype=np.int8)
+        pairs = self._spin0_symm_pairs(dets)
+        transform = np.zeros((dets.shape[0], len(pairs)), dtype=float)
+        for col, (left, right) in enumerate(pairs):
+            if left == right:
+                transform[left, col] = 1.0
+            else:
+                transform[left, col] = 2.0 ** -0.5
+                transform[right, col] = 2.0 ** -0.5
+        return transform, tuple(pairs)
+
+    def _direct_spin0_symm_dense(
+        self,
+        binary,
+        requested_nstates,
+        *,
+        use_cholesky=None,
+    ):
+        """Dense PySCF-like singlet spin-adapted CI with optional spatial symmetry."""
+        transform, pairs = self._spin0_symm_basis(binary)
+        if int(requested_nstates) > transform.shape[1]:
+            raise ValueError(
+                f"Requested {requested_nstates} spin0 roots but only "
+                f"{transform.shape[1]} singlet configurations are available."
+            )
+
+        h1e, h2e = self.get_SO_matrix(use_cholesky=use_cholesky)
+        if self.spin_purification:
+            raise ValueError("direct_spin0_symm already targets singlets; do not combine it with fix_spin().")
+        if h2e is not None:
+            h2e[0, 0] -= h2e[0, 0].swapaxes(1, 3)
+            h2e[1, 1] -= h2e[1, 1].swapaxes(1, 3)
+
+        self.hcore = h1e
+        self.eri_so = h2e
+        self.h2e_cas = None
+        self.spin0_symm_transform = transform
+        self.spin0_pair_indices = pairs
+
+        SC1, SC2 = SlaterCondon(binary)
+        self.SC1 = SC1
+        self.SC2 = SC2
+        H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
+        H_spin0 = transform.T @ np.asarray(H_CI) @ transform
+        energies, vecs_spin0 = self._lowest_dense_eigensystem(H_spin0, requested_nstates)
+        return energies, transform @ vecs_spin0
 
     def as_scanner(
         self,
@@ -1216,6 +1453,8 @@ class CASCI:
         solvent_response_eps=1.78,
         spin_root_cushion=None,
         spin_selection_tol=None,
+        wfnsym=None,
+        target_irrep=None,
     ):
         """
         solve the full CI in the active space, more efficient than the JW solver
@@ -1259,6 +1498,8 @@ class CASCI:
 
         self.nstates = nstates
         self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        method_key = str(method).lower().replace("-", "_")
+        direct_spin0_methods = {"direct_spin0", "direct_spin0_symm", "spin0", "spin0_symm"}
 
         # if method == 'ci':
 
@@ -1284,14 +1525,15 @@ class CASCI:
             self.binary = binary
         else:
             binary = self.binary
+        binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
         solve_nstates = self._spin_selected_nstates(
             nstates,
             binary.shape[0],
             spin_root_cushion=spin_root_cushion,
         )
 
-        if solvent_response_model is None and (method == 'direct_ci' or (
-            method == 'ci' and self.use_cholesky_integrals and not self.spin_purification
+        if solvent_response_model is None and (method_key == 'direct_ci' or method_key in direct_spin0_methods or (
+            method_key == 'ci' and self.use_cholesky_integrals and not self.spin_purification
         )):
             from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
 
@@ -1307,15 +1549,27 @@ class CASCI:
             )
             direct_solver.spin_root_cushion = self.spin_root_cushion
             direct_solver.spin_selection_tol = self.spin_selection_tol
+            if hasattr(self, 'direct_spin0_symm_dense_fallback_nconfigs'):
+                direct_solver.direct_spin0_symm_dense_fallback_nconfigs = (
+                    self.direct_spin0_symm_dense_fallback_nconfigs
+                )
+            if hasattr(self, 'direct_spin0_native_pair'):
+                direct_solver.direct_spin0_native_pair = self.direct_spin0_native_pair
+            if hasattr(self, 'direct_spin0_native_davidson'):
+                direct_solver.direct_spin0_native_davidson = self.direct_spin0_native_davidson
+            if hasattr(self, 'direct_ci_workers'):
+                direct_solver.direct_ci_workers = self.direct_ci_workers
             direct_solver.binary = binary
             direct_solver.run(
                 nstates=nstates,
                 mo_coeff=self.mo_coeff,
-                method='direct_ci',
+                method=method_key,
                 ci0=ci0,
                 use_cholesky=use_cholesky,
                 spin_root_cushion=spin_root_cushion,
                 spin_selection_tol=spin_selection_tol,
+                wfnsym=wfnsym,
+                target_irrep=target_irrep,
             )
 
             self.mo_coeff = direct_solver.mo_coeff
@@ -1330,6 +1584,27 @@ class CASCI:
             self.h2e_cas = getattr(direct_solver, 'h2e_cas', None)
             self.SC1 = getattr(direct_solver, 'SC1', None)
             self.SC2 = getattr(direct_solver, 'SC2', None)
+            self.active_symmetry = getattr(direct_solver, 'active_symmetry', self.active_symmetry)
+            self.active_orb_irrep_labels = getattr(
+                direct_solver, 'active_orb_irrep_labels', self.active_orb_irrep_labels
+            )
+            self.active_orb_sym = getattr(direct_solver, 'active_orb_sym', self.active_orb_sym)
+            self.active_irrep_counts = getattr(
+                direct_solver, 'active_irrep_counts', self.active_irrep_counts
+            )
+            self.det_irrep_labels = getattr(direct_solver, 'det_irrep_labels', self.det_irrep_labels)
+            self.det_irrep_ids = getattr(direct_solver, 'det_irrep_ids', self.det_irrep_ids)
+            self.det_irrep_counts = getattr(direct_solver, 'det_irrep_counts', self.det_irrep_counts)
+            self.wfnsym = getattr(direct_solver, 'wfnsym', self.wfnsym)
+            self.det_irrep_filter_indices = getattr(
+                direct_solver, 'det_irrep_filter_indices', self.det_irrep_filter_indices
+            )
+            self.spin0_symm_transform = getattr(
+                direct_solver, 'spin0_symm_transform', self.spin0_symm_transform
+            )
+            self.spin0_pair_indices = getattr(
+                direct_solver, 'spin0_pair_indices', self.spin0_pair_indices
+            )
             self.solver_backend = getattr(direct_solver, 'solver_backend', 'direct_ci_factor_conn')
             return self
 
@@ -2652,6 +2927,27 @@ def _scatter_opposite_spin_rdm2(dm2, alpha_links, beta_links, cbra, cket):
     rb, sb, bra_b, ket_b, phase_b = beta_links
     if len(pa) == 0 or len(rb) == 0:
         return
+    scatter_cpp = _cpp_attr("scatter_opposite_spin_rdm2")
+    if scatter_cpp is not None and not (np.iscomplexobj(dm2) or np.iscomplexobj(cbra) or np.iscomplexobj(cket)):
+        try:
+            scatter_cpp(
+                dm2,
+                np.ascontiguousarray(pa, dtype=np.intp),
+                np.ascontiguousarray(qa, dtype=np.intp),
+                np.ascontiguousarray(bra_a, dtype=np.intp),
+                np.ascontiguousarray(ket_a, dtype=np.intp),
+                np.ascontiguousarray(phase_a, dtype=np.intp),
+                np.ascontiguousarray(rb, dtype=np.intp),
+                np.ascontiguousarray(sb, dtype=np.intp),
+                np.ascontiguousarray(bra_b, dtype=np.intp),
+                np.ascontiguousarray(ket_b, dtype=np.intp),
+                np.ascontiguousarray(phase_b, dtype=np.intp),
+                np.ascontiguousarray(cbra, dtype=np.float64),
+                np.ascontiguousarray(cket, dtype=np.float64),
+            )
+            return
+        except Exception:
+            pass
     _scatter_opposite_spin_rdm2_numba(
         dm2,
         pa,

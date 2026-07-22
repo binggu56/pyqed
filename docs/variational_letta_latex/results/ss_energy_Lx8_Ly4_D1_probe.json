@@ -1,0 +1,83 @@
+{
+  "metadata": {
+    "lx": 8,
+    "ly": 4,
+    "nsites": 32,
+    "geometry": "open x, periodic y",
+    "mps_order": "snake",
+    "letta_order": "dimer-first",
+    "mps_max_sweeps": 40,
+    "mps_tol": 0.001,
+    "require_mps_convergence": true,
+    "letta_max_sweeps": 50,
+    "letta_tol": 1e-09,
+    "require_letta_convergence": true,
+    "seed": 1234
+  },
+  "rows": [
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -4.000000000000003,
+      "initial": "",
+      "exact": "",
+      "error": "",
+      "seconds": 0.6134950001724064,
+      "sweeps_completed": 2,
+      "converged": true,
+      "final_delta_energy": 4.884981308350689e-15,
+      "convergence_tol": 0.001,
+      "max_sweeps": 40,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -12.000000000000004,
+      "initial": -11.999999999999984,
+      "exact": "",
+      "error": "",
+      "seconds": 0.0390041247010231,
+      "sweeps_completed": 2,
+      "converged": true,
+      "final_delta_energy": 0.0,
+      "convergence_tol": 1e-09,
+      "max_sweeps": 50,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -7.467908337257106,
+      "initial": "",
+      "exact": "",
+      "error": "",
+      "seconds": 247.76279933331534,
+      "sweeps_completed": 8,
+      "converged": true,
+      "final_delta_energy": 0.00026447763834092086,
+      "convergence_tol": 0.001,
+      "max_sweeps": 40,
+      "mpo_validation_error": ""
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -12.123105625617661,
+      "initial": -11.999999999999984,
+      "exact": "",
+      "error": "",
+      "seconds": 0.15026062494143844,
+      "sweeps_completed": 2,
+      "converged": true,
+      "final_delta_energy": 1.2434497875801753e-14,
+      "convergence_tol": 1e-09,
+      "max_sweeps": 50,
+      "mpo_validation_error": ""
+    }
+  ]
+}

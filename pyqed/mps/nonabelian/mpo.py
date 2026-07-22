@@ -743,6 +743,12 @@ class RankCoupledMPO:
         repr=False,
         compare=False,
     )
+    _dtype_cache: np.dtype | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.phys_out_leg, PhysicalLeg):
@@ -819,6 +825,13 @@ class RankCoupledMPO:
         object.__setattr__(self, "right_channel_charges", right_channel_charges)
         object.__setattr__(self, "reduced_terms", reduced_terms)
         object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
+        dtypes = [block.dtype for block in dense_blocks.values()]
+        dtypes.extend(term.dtype for term in reduced_terms)
+        object.__setattr__(self, "_dtype_cache", np.dtype(np.result_type(*dtypes)))
+        # The reduced action list is static MPO metadata.  Build it once with
+        # the MPO core so qchem sweeps do not repeatedly pay this bookkeeping
+        # cost while advancing rank-coupled environments.
+        self._reduced_actions()
 
     @property
     def left_dim(self):
@@ -830,9 +843,7 @@ class RankCoupledMPO:
 
     @property
     def dtype(self):
-        dtypes = [block.dtype for block in self.dense_blocks.values()]
-        dtypes.extend(term.dtype for term in self.reduced_terms)
-        return np.result_type(*dtypes)
+        return self._dtype_cache
 
     def _left_slices(self):
         out = []

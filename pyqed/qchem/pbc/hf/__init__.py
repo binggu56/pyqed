@@ -1,2 +1,2 @@
 from .rhf import RHF
-from .ewald_rhf import EwaldRHF
+from .ewald_rhf import EwaldRHF, KRHF

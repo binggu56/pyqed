@@ -42,17 +42,16 @@ Current development-branch matrix
      - Beta
      - :doc:`mp2_comp2`, :doc:`guide/guide_qchem_mcscf`
      - ``tests/test_mp2.py``, ``tests/test_casci.py``,
-       ``tests/test_casscf.py``; CASSCF currently requires the
-       ``accelerators`` extra
+       ``tests/test_casscf.py``
    * - DVR and small grid-dynamics paths
      - Beta
      - :doc:`dvr`
      - ``tests/test_fedvr.py``, ``tests/test_sddvr.py``,
        ``examples/dvr/fedvr_harmonic_oscillator.py``
    * - Basic superoperators and Lindblad utilities
-     - Experimental
+     - Beta
      - :doc:`guide/guide_open_dynamics`
-     - ``examples/liouville_space.py``, ``examples/redfield.py``
+     - ``tests/test_superoperator_lindblad.py``
    * - Geometric, LDR/LDRFG, and nonadiabatic workflows
      - Experimental
      - :doc:`geometric_quantum_dynamics`, :doc:`pyqed.namd`
@@ -61,11 +60,12 @@ Current development-branch matrix
    * - HEOM and structured-bath workflows
      - Experimental
      - :doc:`heom`
-     - ``examples/heom.py`` and repository examples
-   * - Molecular GW/BSE
+     - ``tests/test_heom_smolyak_truncation.py`` and repository examples
+   * - Molecular and periodic GW/BSE
      - Experimental
-     - :doc:`gw_bse`
-     - ``tests/test_gw_smoke.py`` and comparison scripts
+     - :doc:`gw_bse`, :doc:`periodic_gw_bse`
+     - ``tests/test_gw_smoke.py``, ``tests/test_pbc_gw.py`` and comparison
+       scripts
    * - Real-time TDHF/TDDFT and coupled dynamics
      - Experimental
      - :doc:`tddft_ehrenfest`

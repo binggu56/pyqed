@@ -173,6 +173,106 @@ def test_rebranched_two_site_bose_hubbard_improves_when_new_site_changes_active_
     assert rebranched.energies[0] < sequential.energies[0] - 1.0
 
 
+def test_conditional_cc_dressing_improves_rebranched_bose_hubbard_at_fixed_dimension():
+    nmax = 4
+    dims = (nmax + 1,) * 3
+    h01 = _full_bose_hubbard_hamiltonian(2, nmax, t=0.7, U=1.0, mu=1.4)
+    h012 = _full_bose_hubbard_hamiltonian(
+        3,
+        nmax,
+        t=0.7,
+        U=1.0,
+        mu=1.4,
+        density_couplings={(0, 2): -0.6},
+    )
+    exact = np.linalg.eigvalsh(h012)[0]
+
+    plain = conditional_two_site_narg(h01, h012, dims, keep=2, mode="rebranched")
+    branch_dressed = conditional_two_site_narg(
+        h01,
+        h012,
+        dims,
+        keep=2,
+        mode="rebranched",
+        dressing="conditional_cc_branch",
+    )
+    dressed = conditional_two_site_narg(
+        h01,
+        h012,
+        dims,
+        keep=2,
+        mode="rebranched",
+        dressing="conditional_cc",
+    )
+
+    assert exact <= dressed.energies[0] + 1.0e-10
+    assert branch_dressed.energies[0] < plain.energies[0] - 0.4
+    assert dressed.energies[0] < branch_dressed.energies[0] - 1.0e-3
+    assert dressed.basis.shape == plain.basis.shape
+    np.testing.assert_allclose(
+        dressed.basis.conj().T @ dressed.basis,
+        np.eye(dressed.basis.shape[1]),
+        atol=1.0e-11,
+    )
+    np.testing.assert_allclose(
+        dressed.undressed_energies, plain.energies, atol=1.0e-11
+    )
+    assert dressed.discarded_residual_norm > 1.0
+    assert dressed.dressing_mixing > 0.0
+    assert branch_dressed.dressing_scale > 0.0
+
+
+def test_conditional_cc_dressing_is_inactive_for_an_exact_conditional_subspace():
+    h01 = _qchem_like_hamiltonian(2)
+    h012 = _qchem_like_hamiltonian(3, remote_coulomb=-1.2)
+    exact = np.linalg.eigvalsh(h012)[0]
+
+    dressed = conditional_two_site_narg(
+        h01,
+        h012,
+        (4, 4, 4),
+        keep=2,
+        mode="rebranched",
+        dressing="conditional_cc",
+    )
+
+    np.testing.assert_allclose(dressed.energies[0], exact, atol=1.0e-10)
+    assert dressed.discarded_residual_norm < 1.0e-12
+    assert dressed.dressing_mixing == 0.0
+
+
+def test_cross_branch_conditional_cc_recovers_lih_fixed_electron_component():
+    h1e, eri, _active_mol, _active_space = _lih_sto3g_active_integrals()
+    h01 = SpinHalfFermionChain(
+        h1e[:2, :2], eri[:2, :2, :2, :2]
+    ).jordan_wigner().toarray()
+    chain = SpinHalfFermionChain(h1e[:3, :3], eri[:3, :3, :3, :3])
+    h012 = chain.jordan_wigner().toarray()
+
+    number = (chain.Nu_tot + chain.Nd_tot).toarray()
+    number_error = number - 2.0 * np.eye(number.shape[0])
+    h012 = h012 + 10.0 * (number_error @ number_error)
+    exact = np.linalg.eigvalsh(h012)[0]
+
+    plain = conditional_two_site_narg(
+        h01, h012, (4, 4, 4), keep=1, mode="rebranched"
+    )
+    dressed = conditional_two_site_narg(
+        h01,
+        h012,
+        (4, 4, 4),
+        keep=1,
+        mode="rebranched",
+        dressing="conditional_cc",
+    )
+
+    assert plain.energies[0] - exact > 3.0e-5
+    assert dressed.energies[0] - exact < 2.0e-7
+    assert dressed.energies[0] < plain.energies[0] - 3.0e-5
+    assert dressed.discarded_residual_norm > 1.0e-4
+    assert dressed.dressing_mixing > 1.0e-5
+
+
 def test_rebranched_two_site_quantum_chemistry_window_improves_remote_coulomb_case():
     h01 = _qchem_like_hamiltonian(2)
     h012 = _qchem_like_hamiltonian(3, remote_coulomb=-1.2)

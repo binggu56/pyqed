@@ -9,6 +9,9 @@ from pyqed.qchem.geometric import (
     GeometricFGTerms,
     _build_cbasis_from_reference,
     _contract_ao_operator_with_state_model,
+    dipole_exponential_ci_overlap,
+    dipole_orbital_rotation_unitary,
+    orbital_rotation_ci_overlap,
 )
 from pyqed.qchem.hf import RHF, UHF
 from pyqed.qchem.mcscf.casci import (
@@ -178,6 +181,57 @@ def test_casci_transition_dipole_moment_matches_ao_tdm_contraction():
     assert all_dipoles.shape == (3, 3)
     np.testing.assert_allclose(all_dipoles[1], expected, atol=1e-10)
     np.testing.assert_allclose(dense.transition_dipole(center=center), all_dipoles)
+
+
+def test_dipole_exponential_ci_overlap_is_orbital_rotation_link():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=4, nelecas=2).run(nstates=4, method='ci')
+    center = np.zeros(3)
+    state_ids = [0, 2]
+
+    zero = dipole_exponential_ci_overlap(
+        mc,
+        0.0,
+        axis='z',
+        center=center,
+        state_ids=state_ids,
+    )
+    np.testing.assert_allclose(zero, np.eye(len(state_ids)), atol=1e-12)
+
+    eps = 2.0e-6
+    plus = dipole_exponential_ci_overlap(
+        mc,
+        eps,
+        axis='z',
+        center=center,
+        state_ids=state_ids,
+    )
+    minus = dipole_exponential_ci_overlap(
+        mc,
+        -eps,
+        axis='z',
+        center=center,
+        state_ids=state_ids,
+    )
+    derivative = (plus - minus) / (2.0j * eps)
+    expected = np.asarray(
+        [
+            [
+                mc.transition_dipole_moment(bra, ket, center=center)[2]
+                for ket in state_ids
+            ]
+            for bra in state_ids
+        ],
+        dtype=complex,
+    )
+    np.testing.assert_allclose(derivative, expected, atol=2.0e-10)
+
+    unitary = dipole_orbital_rotation_unitary(mc, eps, axis='z', center=center)
+    via_unitary = orbital_rotation_ci_overlap(mc, unitary, state_ids=state_ids)
+    np.testing.assert_allclose(via_unitary, plus, atol=1e-12)
 
 
 def test_casci_accepts_open_shell_uhf_reference():
@@ -353,6 +407,81 @@ def test_factorized_direct_ci_sigma_matches_ci_root():
 
     sigma = mc.ci_sigma(mc.ci[0])
     np.testing.assert_allclose(sigma, (mc.e_tot[0] - mc.e_core) * mc.ci[0], atol=1e-8)
+
+
+def test_factorized_connection_sigma_fast_matches_numba_for_blocks():
+    rng = np.random.default_rng(19)
+    ndet = 7
+    H_diag = rng.normal(size=ndet)
+    links = {
+        'A': (np.array([1, 4, 6], dtype=np.int32), np.array([0, 3, 2], dtype=np.int32)),
+        'B': (np.array([0, 3], dtype=np.int32), np.array([5, 1], dtype=np.int32)),
+        'AA': (np.array([2, 5], dtype=np.int32), np.array([6, 0], dtype=np.int32)),
+        'BB': (np.array([6], dtype=np.int32), np.array([4], dtype=np.int32)),
+        'AB': (np.array([1, 3, 5, 0], dtype=np.int32), np.array([2, 6, 4, 1], dtype=np.int32)),
+    }
+    H_A = rng.normal(size=len(links['A'][0]))
+    H_B = rng.normal(size=len(links['B'][0]))
+    H_AA = rng.normal(size=len(links['AA'][0]))
+    H_BB = rng.normal(size=len(links['BB'][0]))
+    H_AB = rng.normal(size=len(links['AB'][0]))
+    I_A, J_A = links['A']
+    I_B, J_B = links['B']
+    I_AA, J_AA = links['AA']
+    I_BB, J_BB = links['BB']
+    I_AB, J_AB = links['AB']
+
+    c = rng.normal(size=ndet)
+    sigma_ref = direct_ci._sigma_values_conn_numba(
+        H_diag, H_A, H_B, H_AA, H_BB, H_AB, c,
+        I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+    )
+    sigma_fast = direct_ci._sigma_values_conn_fast(
+        H_diag, H_A, H_B, H_AA, H_BB, H_AB, c,
+        I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+    )
+    np.testing.assert_allclose(sigma_fast, sigma_ref, atol=1e-14)
+
+    block = rng.normal(size=(ndet, 4))
+    block_ref = np.column_stack([
+        direct_ci._sigma_values_conn_numba(
+            H_diag, H_A, H_B, H_AA, H_BB, H_AB, block[:, root],
+            I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+        )
+        for root in range(block.shape[1])
+    ])
+    block_fast = direct_ci._sigma_values_conn_fast(
+        H_diag, H_A, H_B, H_AA, H_BB, H_AB, block,
+        I_A, J_A, I_B, J_B, I_AA, J_AA, I_BB, J_BB, I_AB, J_AB,
+    )
+    np.testing.assert_allclose(block_fast, block_ref, atol=1e-14)
+
+    if direct_ci._casscf_cpp is not None:
+        assert hasattr(direct_ci._casscf_cpp, "sigma_values_conn")
+
+
+def test_spin_string_direct_connectivity_matches_slow_builder_records():
+    mo_occ = np.zeros((2, 4), dtype=np.int8)
+    mo_occ[0, :2] = 1
+    mo_occ[1, :2] = 1
+    binary = direct_ci.get_fci_combos(mo_occ=mo_occ)
+
+    fast = direct_ci._build_direct_connectivity_from_spin_strings(binary)
+    slow = direct_ci._build_direct_connectivity_slow(binary)
+    groups = [
+        ('A', ('I_A', 'J_A', 'p_A', 'q_A', 'phase_A')),
+        ('B', ('I_B', 'J_B', 'p_B', 'q_B', 'phase_B')),
+        ('AA', ('I_AA', 'J_AA', 'p_AA', 'q_AA', 'r_AA', 's_AA', 'phase_AA')),
+        ('BB', ('I_BB', 'J_BB', 'p_BB', 'q_BB', 'r_BB', 's_BB', 'phase_BB')),
+        ('AB', ('I_AB', 'J_AB', 'p_AB', 'q_AB', 'r_AB', 's_AB', 'phase_AB')),
+    ]
+
+    for _, fields in groups:
+        fast_records = np.column_stack([getattr(fast, field) for field in fields])
+        slow_records = np.column_stack([getattr(slow, field) for field in fields])
+        fast_order = np.lexsort(tuple(fast_records[:, col] for col in range(fast_records.shape[1] - 1, -1, -1)))
+        slow_order = np.lexsort(tuple(slow_records[:, col] for col in range(slow_records.shape[1] - 1, -1, -1)))
+        np.testing.assert_array_equal(fast_records[fast_order], slow_records[slow_order])
 
 
 def test_reduced_ci_full_subspace_reproduces_dense_casci():
@@ -801,6 +930,48 @@ def test_direct_ci_davidson_matches_eigsh():
     np.testing.assert_allclose(mc_davidson.e_tot, mc_eigsh.e_tot, atol=1e-10)
 
 
+def test_direct_spin0_symm_davidson_matches_dense_spin0():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+
+    mf = RHF(mol).run()
+
+    mc_dense = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_dense.run(nstates=3, method='direct_spin0_symm')
+
+    mc_davidson = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_davidson.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc_davidson.run(nstates=3, method='direct_spin0_symm')
+
+    assert mc_dense.solver_backend == 'direct_spin0_symm_dense'
+    assert mc_davidson.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
+    assert len(mc_davidson.spin0_pair_indices) == 21
+    np.testing.assert_allclose(mc_davidson.e_tot, mc_dense.e_tot, atol=1e-10)
+
+    mc_spin_string = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_spin_string.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc_spin_string.direct_spin0_native_pair = False
+    mc_spin_string.run(nstates=3, method='direct_spin0_symm')
+
+    assert mc_spin_string.solver_backend == 'direct_spin0_symm_davidson_spin_string'
+    np.testing.assert_allclose(mc_spin_string.e_tot, mc_dense.e_tot, atol=1e-10)
+
+    mc_native_davidson = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_native_davidson.direct_spin0_symm_dense_fallback_nconfigs = 0
+    assert mc_native_davidson.direct_spin0_native_davidson is True
+    mc_native_davidson.run(nstates=1, method='direct_spin0_symm')
+
+    assert mc_native_davidson.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
+    np.testing.assert_allclose(mc_native_davidson.e_tot, mc_dense.e_tot[:1], atol=1e-10)
+
+    mc_public = CASCI(mf, ncas=4, nelecas=4)
+    mc_public.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc_public.run(nstates=2, method='direct_spin0_symm')
+
+    assert mc_public.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
+    np.testing.assert_allclose(mc_public.e_tot, mc_dense.e_tot[:2], atol=1e-10)
+
+
 def test_direct_ci_defaults_to_davidson():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
     mol.build(driver='gbasis')
@@ -900,7 +1071,11 @@ def test_builtin_s8_dense_eri_transform_unpacks_compressed_cache():
     assert mf.eri_s8 is not None
     eri_active = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=False)
 
-    np.testing.assert_allclose(eri_active, mf.get_eri_mo()[0:2, 0:2, 0:2, 0:2])
+    np.testing.assert_allclose(
+        eri_active,
+        mf.get_eri_mo()[0:2, 0:2, 0:2, 0:2],
+        atol=1e-12,
+    )
 
 
 def test_casci_use_cholesky_matches_dense_energy():

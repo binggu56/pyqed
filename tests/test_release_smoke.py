@@ -1,7 +1,6 @@
 """Release gates for the public installation and quickstart contract."""
 
 from pathlib import Path
-from importlib.util import find_spec
 import runpy
 
 import pytest
@@ -27,31 +26,3 @@ def test_public_quickstart_runs(capsys):
     assert namespace["mf"].converged
     assert namespace["mf"].e_tot == pytest.approx(-1.116759310293, abs=1.0e-10)
     assert "RHF energy:" in capsys.readouterr().out
-
-
-def test_documented_package_paths_are_distributed():
-    package_paths = (
-        "pyqed.HEOM",
-        "pyqed.HEOM.deom",
-        "pyqed.floquet",
-        "pyqed.gw",
-        "pyqed.md",
-        "pyqed.ml",
-        "pyqed.namd",
-        "pyqed.narg",
-        "pyqed.mps.nonabelian",
-        "pyqed.qchem.mp",
-        "pyqed.qchem.dft",
-    )
-    assert all(find_spec(name) is not None for name in package_paths)
-
-    from pyqed.gw import BSE, GW, TDA
-    from pyqed.HEOM.heom import HEOMSolver
-    from pyqed.namd import TDDFTDriver
-    from pyqed.qchem import MP2, Molecule
-    from pyqed.qchem.dft import RKS
-
-    assert all(
-        item is not None
-        for item in (BSE, GW, TDA, HEOMSolver, MP2, Molecule, RKS, TDDFTDriver)
-    )

@@ -1,0 +1,67 @@
+{
+  "metadata": {
+    "lx": 2,
+    "ly": 2,
+    "nsites": 4,
+    "geometry": "open x, periodic y",
+    "mps_order": "snake",
+    "letta_order": "dimer-first",
+    "mps_sweeps": 2,
+    "letta_sweeps": 1,
+    "seed": 1234
+  },
+  "rows": [
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -0.5000000000000001,
+      "initial": "",
+      "exact": -1.4999999999999996,
+      "error": 0.9999999999999994,
+      "seconds": 0.007057666778564453,
+      "sweeps_completed": 2,
+      "converged": true,
+      "mpo_validation_error": 0.0
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.0,
+      "energy": -1.5,
+      "initial": -1.5,
+      "exact": -1.4999999999999996,
+      "error": -4.440892098500626e-16,
+      "seconds": 0.0024339999072253704,
+      "sweeps_completed": 1,
+      "converged": "",
+      "mpo_validation_error": 0.0
+    },
+    {
+      "method": "MPS/DMRG snake",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -0.49999999722655913,
+      "initial": "",
+      "exact": -1.5,
+      "error": 1.0000000027734408,
+      "seconds": 0.0020446251146495342,
+      "sweeps_completed": 2,
+      "converged": false,
+      "mpo_validation_error": 0.0
+    },
+    {
+      "method": "LETTA dimer-first",
+      "D": 1,
+      "jprime": 0.5,
+      "energy": -1.5,
+      "initial": -1.5,
+      "exact": -1.5,
+      "error": 0.0,
+      "seconds": 0.0020304168574512005,
+      "sweeps_completed": 1,
+      "converged": "",
+      "mpo_validation_error": 0.0
+    }
+  ]
+}

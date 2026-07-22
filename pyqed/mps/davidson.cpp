@@ -42,6 +42,23 @@ extern "C" void cblas_zgemv(
     const int inc_y
 );
 
+extern "C" void cblas_zgemm(
+    const int order,
+    const int trans_a,
+    const int trans_b,
+    const int m,
+    const int n,
+    const int k,
+    const void* alpha,
+    const void* a,
+    const int lda,
+    const void* b,
+    const int ldb,
+    const void* beta,
+    void* c,
+    const int ldc
+);
+
 extern "C" void zgesvd_(
     char* jobu,
     char* jobvt,
@@ -2147,6 +2164,113 @@ static std::pair<double, std::vector<double>> lowest_eigen_jacobi(
     return {eval, evec};
 }
 
+struct ProjectedHermitianEigenResult {
+    ssize_t n = 0;
+    std::vector<double> values_asc;
+    std::vector<cdouble> vectors_asc;
+
+    cdouble vector(ssize_t row, ssize_t col) const {
+        return vectors_asc[
+            static_cast<size_t>(row * n + col)
+        ];
+    }
+};
+
+static ProjectedHermitianEigenResult projected_hermitian_eigh_ascending(
+    const std::vector<cdouble>& matrix,
+    ssize_t n
+) {
+    if (n < 0 || static_cast<ssize_t>(matrix.size()) != n * n) {
+        throw std::runtime_error("projected Hermitian eigensolver dimension mismatch");
+    }
+    ProjectedHermitianEigenResult result;
+    result.n = n;
+    result.values_asc.assign(static_cast<size_t>(n), 0.0);
+    result.vectors_asc.assign(
+        static_cast<size_t>(n) * static_cast<size_t>(n),
+        cdouble(0.0, 0.0)
+    );
+    if (n == 0) {
+        return result;
+    }
+#ifndef __APPLE__
+    if (n == 1) {
+        result.values_asc[0] = matrix[0].real();
+        result.vectors_asc[0] = cdouble(1.0, 0.0);
+        return result;
+    }
+    throw std::runtime_error("projected Hermitian eigensolver requires zheev");
+#else
+    const int ni = static_cast<int>(n);
+    const int lda = std::max(1, ni);
+    std::vector<cdouble> a(static_cast<size_t>(lda) * static_cast<size_t>(ni));
+    for (int row = 0; row < ni; ++row) {
+        for (int col = 0; col < ni; ++col) {
+            a[static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(lda)] =
+                matrix[static_cast<size_t>(row) * static_cast<size_t>(ni)
+                       + static_cast<size_t>(col)];
+        }
+    }
+    std::vector<double> w(static_cast<size_t>(ni));
+    std::vector<double> rwork(static_cast<size_t>(std::max(1, 3 * ni - 2)));
+    char jobz = 'V';
+    char uplo = 'U';
+    int n_arg = ni;
+    int lda_arg = lda;
+    int info = 0;
+    int lwork = -1;
+    cdouble work_query;
+    zheev_(
+        &jobz,
+        &uplo,
+        &n_arg,
+        a.data(),
+        &lda_arg,
+        w.data(),
+        &work_query,
+        &lwork,
+        rwork.data(),
+        &info
+    );
+    if (info != 0) {
+        throw std::runtime_error("projected zheev workspace query failed");
+    }
+    lwork = std::max(1, static_cast<int>(std::real(work_query)));
+    std::vector<cdouble> work(static_cast<size_t>(lwork));
+    zheev_(
+        &jobz,
+        &uplo,
+        &n_arg,
+        a.data(),
+        &lda_arg,
+        w.data(),
+        work.data(),
+        &lwork,
+        rwork.data(),
+        &info
+    );
+    if (info != 0) {
+        throw std::runtime_error("projected zheev failed to converge");
+    }
+    for (int col = 0; col < ni; ++col) {
+        result.values_asc[static_cast<size_t>(col)] = w[static_cast<size_t>(col)];
+        std::vector<cdouble> vec(static_cast<size_t>(ni));
+        for (int row = 0; row < ni; ++row) {
+            vec[static_cast<size_t>(row)] =
+                a[static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(lda)];
+        }
+        normalize_eigenvector_phase(vec);
+        for (int row = 0; row < ni; ++row) {
+            result.vectors_asc[
+                static_cast<size_t>(row) * static_cast<size_t>(ni)
+                + static_cast<size_t>(col)
+            ] = vec[static_cast<size_t>(row)];
+        }
+    }
+    return result;
+#endif
+}
+
 struct DavidsonWorkspace {
     std::vector<std::vector<cdouble>> V;
     std::vector<std::vector<cdouble>> HV;
@@ -2189,7 +2313,7 @@ struct DavidsonWorkspace {
     }
 };
 
-static py::dict davidson_core_workspace(
+static py::dict davidson(
     ssize_t dim,
     const std::vector<cdouble>& diag,
     std::vector<cdouble> v,
@@ -2390,7 +2514,7 @@ static py::dict davidson_core_workspace(
     return out;
 }
 
-static py::dict davidson_core(
+static py::dict davidson(
     ssize_t dim,
     const std::vector<cdouble>& diag,
     std::vector<cdouble> v,
@@ -2401,7 +2525,7 @@ static py::dict davidson_core(
     const std::function<std::vector<cdouble>(const std::vector<cdouble>&)>& matvec
 ) {
     DavidsonWorkspace workspace;
-    return davidson_core_workspace(
+    return ::davidson(
         dim,
         diag,
         std::move(v),
@@ -2412,6 +2536,397 @@ static py::dict davidson_core(
         workspace,
         matvec
     );
+}
+
+static bool orthonormalize_block_candidate(
+    std::vector<cdouble>& q,
+    const std::vector<std::vector<cdouble>>& basis,
+    ssize_t basis_size,
+    const std::vector<std::vector<cdouble>>& pending,
+    ssize_t dim
+) {
+    for (int pass = 0; pass < 2; ++pass) {
+        for (ssize_t ibasis = 0; ibasis < basis_size; ++ibasis) {
+            const auto& vec = basis[static_cast<size_t>(ibasis)];
+            cdouble overlap = dotc(vec, q);
+            for (ssize_t i = 0; i < dim; ++i) {
+                q[static_cast<size_t>(i)] -= vec[static_cast<size_t>(i)] * overlap;
+            }
+        }
+        for (const auto& vec : pending) {
+            cdouble overlap = dotc(vec, q);
+            for (ssize_t i = 0; i < dim; ++i) {
+                q[static_cast<size_t>(i)] -= vec[static_cast<size_t>(i)] * overlap;
+            }
+        }
+    }
+    double qn = norm2(q);
+    if (qn < 1.0e-10) {
+        return false;
+    }
+    for (auto& x : q) {
+        x /= qn;
+    }
+    return true;
+}
+
+static py::dict block_davidson(
+    ssize_t dim,
+    const std::vector<cdouble>& diag,
+    std::vector<cdouble> v,
+    double tol,
+    int max_iter,
+    int restart_dim,
+    bool accept_unconverged,
+    int block_size,
+    DavidsonWorkspace& workspace,
+    const std::function<
+        std::vector<std::vector<cdouble>>(const std::vector<std::vector<cdouble>>&)
+    >& matvec_many
+) {
+    double vn = norm2(v);
+    if (vn < 1.0e-14) {
+        throw std::runtime_error("initial block Davidson vector has near-zero norm");
+    }
+    for (auto& x : v) {
+        x /= vn;
+    }
+
+    const int requested_block_size = std::max(1, block_size);
+    const ssize_t requested_basis = static_cast<ssize_t>(
+        restart_dim > 0 ? restart_dim : std::max(1, max_iter)
+    );
+    workspace.ensure(dim, std::max<ssize_t>(1, requested_basis));
+    std::fill(workspace.T.begin(), workspace.T.end(), cdouble(0.0, 0.0));
+    std::fill(workspace.best_vec.begin(), workspace.best_vec.end(), cdouble(0.0, 0.0));
+    workspace.V[0] = std::move(v);
+    ssize_t basis_size = 1;
+    ssize_t hv_size = 0;
+    double best_energy = 0.0;
+    double best_resid = std::numeric_limits<double>::infinity();
+    bool converged = false;
+    int restarts = 0;
+    int iterations = 0;
+    long long total_block_vectors_added = 0;
+    long long max_vectors_added_one_iter = 0;
+    long long total_ritz_residuals_used = 0;
+    long long total_shifted_fallback_vectors_added = 0;
+
+    double diag_span = 0.0;
+    if (!diag.empty()) {
+        double diag_min = diag[0].real();
+        double diag_max = diag[0].real();
+        for (const auto& z : diag) {
+            diag_min = std::min(diag_min, z.real());
+            diag_max = std::max(diag_max, z.real());
+        }
+        diag_span = std::max(1.0, std::abs(diag_max - diag_min));
+    } else {
+        diag_span = 1.0;
+    }
+
+    for (int it = 0; it < max_iter; ++it) {
+        iterations = it + 1;
+        if (hv_size < basis_size) {
+            std::vector<std::vector<cdouble>> pending_vectors;
+            pending_vectors.reserve(static_cast<size_t>(basis_size - hv_size));
+            for (ssize_t newest = hv_size; newest < basis_size; ++newest) {
+                pending_vectors.push_back(workspace.V[static_cast<size_t>(newest)]);
+            }
+            std::vector<std::vector<cdouble>> pending_hv = matvec_many(pending_vectors);
+            if (pending_hv.size() != pending_vectors.size()) {
+                throw std::runtime_error("block Davidson batched matvec returned wrong count");
+            }
+            for (ssize_t offset = 0; offset < static_cast<ssize_t>(pending_hv.size()); ++offset) {
+                const ssize_t newest = hv_size + offset;
+                workspace.HV[static_cast<size_t>(newest)] =
+                    std::move(pending_hv[static_cast<size_t>(offset)]);
+                if (static_cast<ssize_t>(workspace.HV[static_cast<size_t>(newest)].size()) != dim) {
+                    throw std::runtime_error("block Davidson batched matvec dimension mismatch");
+                }
+            }
+        }
+        for (ssize_t newest = hv_size; newest < basis_size; ++newest) {
+            for (ssize_t i = 0; i < basis_size; ++i) {
+                cdouble el = dotc(
+                    workspace.V[static_cast<size_t>(i)],
+                    workspace.HV[static_cast<size_t>(newest)]
+                );
+                workspace.T[static_cast<size_t>(i * workspace.max_basis + newest)] = el;
+                workspace.T[static_cast<size_t>(newest * workspace.max_basis + i)] =
+                    std::conj(el);
+            }
+        }
+        hv_size = basis_size;
+
+        const ssize_t m = basis_size;
+        for (ssize_t i = 0; i < m; ++i) {
+            for (ssize_t j = 0; j < m; ++j) {
+                const cdouble z =
+                    workspace.T[static_cast<size_t>(i * workspace.max_basis + j)];
+                workspace.T_dense[static_cast<size_t>(i * m + j)] = z;
+            }
+        }
+        ProjectedHermitianEigenResult projected;
+        try {
+            projected = projected_hermitian_eigh_ascending(workspace.T_dense, m);
+        } catch (const std::exception&) {
+            double imag_max = 0.0;
+            for (ssize_t i = 0; i < m * m; ++i) {
+                imag_max = std::max(
+                    imag_max,
+                    std::abs(workspace.T_dense[static_cast<size_t>(i)].imag())
+                );
+            }
+            projected.n = m;
+            projected.values_asc.assign(
+                static_cast<size_t>(m),
+                std::numeric_limits<double>::infinity()
+            );
+            projected.vectors_asc.assign(
+                static_cast<size_t>(m * m),
+                cdouble(0.0, 0.0)
+            );
+            if (imag_max < 1.0e-12) {
+                std::vector<double> T_real(static_cast<size_t>(m * m), 0.0);
+                for (ssize_t i = 0; i < m * m; ++i) {
+                    T_real[static_cast<size_t>(i)] =
+                        workspace.T_dense[static_cast<size_t>(i)].real();
+                }
+                auto eig = lowest_eigen_jacobi(std::move(T_real), m);
+                projected.values_asc[0] = eig.first;
+                for (ssize_t i = 0; i < m; ++i) {
+                    projected.vectors_asc[static_cast<size_t>(i * m)] = cdouble(
+                        eig.second[static_cast<size_t>(i)],
+                        0.0
+                    );
+                }
+            } else {
+                auto real_T = hermitian_to_real_symmetric(workspace.T_dense, m);
+                auto eig = lowest_eigen_jacobi(std::move(real_T), 2 * m);
+                projected.values_asc[0] = eig.first;
+                for (ssize_t i = 0; i < m; ++i) {
+                    projected.vectors_asc[static_cast<size_t>(i * m)] = cdouble(
+                        eig.second[static_cast<size_t>(i)],
+                        eig.second[static_cast<size_t>(i + m)]
+                    );
+                }
+            }
+        }
+        best_energy = projected.values_asc[0];
+        for (ssize_t i = 0; i < m; ++i) {
+            workspace.coeff[static_cast<size_t>(i)] = projected.vector(i, 0);
+        }
+        double cn = 0.0;
+        for (ssize_t i = 0; i < m; ++i) {
+            cn += std::norm(workspace.coeff[static_cast<size_t>(i)]);
+        }
+        cn = std::sqrt(cn);
+        if (cn < 1.0e-14) {
+            for (ssize_t i = 0; i < m; ++i) {
+                workspace.coeff[static_cast<size_t>(i)] = cdouble(0.0, 0.0);
+            }
+            workspace.coeff[0] = 1.0;
+        } else {
+            for (ssize_t i = 0; i < m; ++i) {
+                workspace.coeff[static_cast<size_t>(i)] /= cn;
+            }
+        }
+        std::fill(workspace.ritz.begin(), workspace.ritz.end(), cdouble(0.0, 0.0));
+        std::fill(workspace.hritz.begin(), workspace.hritz.end(), cdouble(0.0, 0.0));
+        for (ssize_t i = 0; i < m; ++i) {
+            axpy(
+                workspace.ritz,
+                workspace.coeff[static_cast<size_t>(i)],
+                workspace.V[static_cast<size_t>(i)]
+            );
+            axpy(
+                workspace.hritz,
+                workspace.coeff[static_cast<size_t>(i)],
+                workspace.HV[static_cast<size_t>(i)]
+            );
+        }
+        workspace.resid = workspace.hritz;
+        for (ssize_t i = 0; i < dim; ++i) {
+            workspace.resid[static_cast<size_t>(i)] -=
+                best_energy * workspace.ritz[static_cast<size_t>(i)];
+        }
+        best_resid = norm2(workspace.resid);
+        workspace.best_vec = workspace.ritz;
+        if (best_resid < tol) {
+            converged = true;
+            break;
+        }
+        if (
+            (restart_dim > 0 && static_cast<int>(basis_size) >= restart_dim)
+            || basis_size >= workspace.max_basis
+            || basis_size + std::max(1, requested_block_size) > workspace.max_basis
+        ) {
+            double rn = norm2(workspace.ritz);
+            if (rn < 1.0e-14) {
+                break;
+            }
+            for (auto& x : workspace.ritz) {
+                x /= rn;
+            }
+            workspace.V[0] = workspace.ritz;
+            std::fill(workspace.T.begin(), workspace.T.end(), cdouble(0.0, 0.0));
+            basis_size = 1;
+            hv_size = 0;
+            ++restarts;
+            continue;
+        }
+
+        std::vector<std::vector<cdouble>> candidates;
+        candidates.reserve(static_cast<size_t>(requested_block_size));
+        const ssize_t ritz_root_limit = std::min<ssize_t>(
+            m,
+            static_cast<ssize_t>(requested_block_size)
+        );
+        std::vector<cdouble> root_ritz(static_cast<size_t>(dim));
+        std::vector<cdouble> root_hritz(static_cast<size_t>(dim));
+        std::vector<cdouble> root_resid(static_cast<size_t>(dim));
+        for (
+            ssize_t root = 0;
+            root < ritz_root_limit
+                && basis_size + static_cast<ssize_t>(candidates.size()) < workspace.max_basis;
+            ++root
+        ) {
+            const double root_energy = projected.values_asc[static_cast<size_t>(root)];
+            if (!std::isfinite(root_energy)) {
+                continue;
+            }
+            std::fill(root_ritz.begin(), root_ritz.end(), cdouble(0.0, 0.0));
+            std::fill(root_hritz.begin(), root_hritz.end(), cdouble(0.0, 0.0));
+            for (ssize_t ibasis = 0; ibasis < m; ++ibasis) {
+                const cdouble coeff = projected.vector(ibasis, root);
+                axpy(root_ritz, coeff, workspace.V[static_cast<size_t>(ibasis)]);
+                axpy(root_hritz, coeff, workspace.HV[static_cast<size_t>(ibasis)]);
+            }
+            for (ssize_t i = 0; i < dim; ++i) {
+                root_resid[static_cast<size_t>(i)] =
+                    root_hritz[static_cast<size_t>(i)]
+                    - root_energy * root_ritz[static_cast<size_t>(i)];
+            }
+            if (norm2(root_resid) < 1.0e-12) {
+                continue;
+            }
+            ++total_ritz_residuals_used;
+            for (ssize_t i = 0; i < dim; ++i) {
+                cdouble denom = root_energy - diag[static_cast<size_t>(i)];
+                if (std::abs(denom) < 1.0e-8) {
+                    denom = cdouble(
+                        (denom.real() >= 0.0 ? 1.0e-8 : -1.0e-8),
+                        denom.imag()
+                    );
+                }
+                workspace.q[static_cast<size_t>(i)] =
+                    root_resid[static_cast<size_t>(i)] / denom;
+            }
+            if (
+                orthonormalize_block_candidate(
+                    workspace.q,
+                    workspace.V,
+                    basis_size,
+                    candidates,
+                    dim
+                )
+            ) {
+                candidates.push_back(workspace.q);
+            }
+        }
+        const double shift_unit = 1.0e-3 * std::max(1.0, diag_span);
+        const int first_shift_index = candidates.empty() ? 0 : 1;
+        const int max_shift_attempts = std::max(8, 4 * requested_block_size + 4);
+        for (
+            int attempt = first_shift_index;
+            static_cast<int>(candidates.size()) < requested_block_size
+                && attempt < first_shift_index + max_shift_attempts
+                && basis_size + static_cast<ssize_t>(candidates.size()) < workspace.max_basis;
+            ++attempt
+        ) {
+            const int mag = (attempt + 1) / 2;
+            const double sign = (attempt % 2 == 0) ? -1.0 : 1.0;
+            const double shift = (attempt == 0) ? 0.0 : sign * mag * shift_unit;
+            for (ssize_t i = 0; i < dim; ++i) {
+                cdouble denom = best_energy + shift - diag[static_cast<size_t>(i)];
+                if (std::abs(denom) < 1.0e-8) {
+                    denom = cdouble(
+                        (denom.real() >= 0.0 ? 1.0e-8 : -1.0e-8),
+                        denom.imag()
+                    );
+                }
+                workspace.q[static_cast<size_t>(i)] =
+                    workspace.resid[static_cast<size_t>(i)] / denom;
+            }
+            if (
+                orthonormalize_block_candidate(
+                    workspace.q,
+                    workspace.V,
+                    basis_size,
+                    candidates,
+                    dim
+                )
+            ) {
+                candidates.push_back(workspace.q);
+                ++total_shifted_fallback_vectors_added;
+            }
+        }
+        if (candidates.empty()) {
+            break;
+        }
+        max_vectors_added_one_iter = std::max<long long>(
+            max_vectors_added_one_iter,
+            static_cast<long long>(candidates.size())
+        );
+        total_block_vectors_added += static_cast<long long>(candidates.size());
+        for (const auto& candidate : candidates) {
+            workspace.V[static_cast<size_t>(basis_size)] = candidate;
+            ++basis_size;
+        }
+    }
+
+    if (!converged && !accept_unconverged) {
+        py::dict out;
+        out["accepted"] = false;
+        out["energy"] = best_energy;
+        out["residual_norm"] = best_resid;
+        out["iterations"] = iterations;
+        out["basis_size"] = static_cast<int>(basis_size);
+        out["restarts"] = restarts;
+        out["converged"] = false;
+        out["block_davidson"] = py::bool_(true);
+        out["block_size"] = py::int_(requested_block_size);
+        out["block_vectors_added"] = py::int_(total_block_vectors_added);
+        out["block_vectors_added_max"] = py::int_(max_vectors_added_one_iter);
+        out["block_ritz_residuals_used"] = py::int_(total_ritz_residuals_used);
+        out["block_shifted_fallback_vectors_added"] =
+            py::int_(total_shifted_fallback_vectors_added);
+        return out;
+    }
+
+    py::array_t<cdouble> py_vec(dim);
+    auto vec_mut = py_vec.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < dim; ++i) {
+        vec_mut(i) = workspace.best_vec[static_cast<size_t>(i)];
+    }
+    py::dict out;
+    out["accepted"] = true;
+    out["energy"] = best_energy;
+    out["vector"] = py_vec;
+    out["residual_norm"] = best_resid;
+    out["iterations"] = iterations;
+    out["basis_size"] = static_cast<int>(basis_size);
+    out["restarts"] = restarts;
+    out["converged"] = converged;
+    out["block_davidson"] = py::bool_(true);
+    out["block_size"] = py::int_(requested_block_size);
+    out["block_vectors_added"] = py::int_(total_block_vectors_added);
+    out["block_vectors_added_max"] = py::int_(max_vectors_added_one_iter);
+    out["block_ritz_residuals_used"] = py::int_(total_ritz_residuals_used);
+    out["block_shifted_fallback_vectors_added"] =
+        py::int_(total_shifted_fallback_vectors_added);
+    return out;
 }
 
 py::dict block_table_davidson(
@@ -3638,7 +4153,7 @@ public:
             diag[static_cast<size_t>(i)] = diag_arr(i);
             v[static_cast<size_t>(i)] = v0_arr(i);
         }
-        return davidson_core(
+        return ::davidson(
             dim,
             diag,
             std::move(v),
@@ -4326,6 +4841,16 @@ public:
     long long sweep_environment_step_failures = 0;
     long long sweep_environment_step_auto_calls = 0;
     std::string sweep_environment_step_last_error;
+    long long one_site_tdvp_sweep_calls = 0;
+    long long one_site_tdvp_sweep_failures = 0;
+    long long one_site_tdvp_sweep_site_evolutions = 0;
+    long long one_site_tdvp_sweep_bond_evolutions = 0;
+    long long one_site_tdvp_sweep_left_qr_calls = 0;
+    long long one_site_tdvp_sweep_right_rq_calls = 0;
+    long long one_site_tdvp_sweep_environment_advances = 0;
+    double one_site_tdvp_sweep_seconds = 0.0;
+    ssize_t one_site_tdvp_sweep_last_nsites = 0;
+    std::string one_site_tdvp_sweep_last_error;
     long long bond_step_transaction_calls = 0;
     long long bond_step_transaction_accepted = 0;
     long long bond_step_transaction_failures = 0;
@@ -4911,7 +5436,7 @@ public:
             v[static_cast<size_t>(i)] = v0(i);
         }
         const bool reused = record.davidson_workspace.initialized;
-        py::dict out = davidson_core_workspace(
+        py::dict out = ::davidson(
             record.dim,
             record.diagonal_cache,
             std::move(v),
@@ -5436,6 +5961,20 @@ public:
         py::object tensor_cls,
         py::sequence update_rows,
         py::sequence pop_rows
+    );
+
+    py::tuple one_site_tdvp_sweep(
+        py::sequence factors,
+        py::sequence mpo,
+        py::object left_boundary,
+        py::object right_boundary,
+        double dt,
+        py::object environment_tensor_cls,
+        py::dict callbacks,
+        int krylov_dim = 12,
+        double krylov_tol = 1.0e-13,
+        const std::string& krylov_method = "lanczos",
+        const std::string& env_plan_prefix = "tdvp-block"
     );
 
     py::tuple bond_step_update_and_environment_auto(
@@ -13457,6 +13996,23 @@ public:
             sweep_environment_step_auto_calls;
         out["sweep_environment_step_last_error"] =
             sweep_environment_step_last_error;
+        out["one_site_tdvp_sweep_calls"] = one_site_tdvp_sweep_calls;
+        out["one_site_tdvp_sweep_failures"] = one_site_tdvp_sweep_failures;
+        out["one_site_tdvp_sweep_site_evolutions"] =
+            one_site_tdvp_sweep_site_evolutions;
+        out["one_site_tdvp_sweep_bond_evolutions"] =
+            one_site_tdvp_sweep_bond_evolutions;
+        out["one_site_tdvp_sweep_left_qr_calls"] =
+            one_site_tdvp_sweep_left_qr_calls;
+        out["one_site_tdvp_sweep_right_rq_calls"] =
+            one_site_tdvp_sweep_right_rq_calls;
+        out["one_site_tdvp_sweep_environment_advances"] =
+            one_site_tdvp_sweep_environment_advances;
+        out["one_site_tdvp_sweep_seconds"] = one_site_tdvp_sweep_seconds;
+        out["one_site_tdvp_sweep_last_nsites"] =
+            static_cast<long long>(one_site_tdvp_sweep_last_nsites);
+        out["one_site_tdvp_sweep_last_error"] =
+            one_site_tdvp_sweep_last_error;
         out["bond_step_transaction_calls"] = bond_step_transaction_calls;
         out["bond_step_transaction_accepted"] = bond_step_transaction_accepted;
         out["bond_step_transaction_failures"] = bond_step_transaction_failures;
@@ -14588,7 +15144,7 @@ public:
             diag[static_cast<size_t>(i)] = diag_arr(i);
             v[static_cast<size_t>(i)] = v0_arr(i);
         }
-        return davidson_core(
+        return ::davidson(
             dim,
             diag,
             std::move(v),
@@ -27357,7 +27913,11 @@ public:
         for (ssize_t i = 0; i < dim; ++i) {
             vec[static_cast<size_t>(i)] = vec_arr(i);
         }
-        std::vector<cdouble> result = matvec_vector(vec);
+        std::vector<cdouble> result;
+        {
+            py::gil_scoped_release release;
+            result = matvec_vector(vec);
+        }
         py::array_t<cdouble> py_out(dim);
         auto out = py_out.mutable_unchecked<1>();
         for (ssize_t i = 0; i < dim; ++i) {
@@ -27523,7 +28083,7 @@ public:
             davidson_workspace.initialized
             && davidson_workspace.dim == dim
             && davidson_workspace.max_basis >= std::max<ssize_t>(1, requested_basis);
-        py::dict result = davidson_core_workspace(
+        py::dict result = ::davidson(
             dim,
             diag,
             std::move(v),
@@ -28718,7 +29278,7 @@ py::dict CppMovingEnvironment::grouped_davidson(
         v[static_cast<size_t>(i)] = v0(i);
     }
     const bool reused = record.davidson_workspace.initialized;
-    py::dict out = davidson_core_workspace(
+    py::dict out = ::davidson(
         record.dim,
         record.diagonal_cache,
         std::move(v),
@@ -29157,7 +29717,7 @@ public:
             diag[static_cast<size_t>(i)] = diag_arr(i);
             v[static_cast<size_t>(i)] = v0_arr(i);
         }
-        return davidson_core(
+        return ::davidson(
             dim,
             diag,
             std::move(v),
@@ -34640,10 +35200,6 @@ static py::array_t<cdouble> tdvp_site_heff_contract_block(
     if (e.ndim() != 3 || theta.ndim() != 3 || w.ndim() != 4 || f.ndim() != 3) {
         throw std::runtime_error("TDVP site Heff contraction rank mismatch");
     }
-    auto er = e.unchecked<3>();
-    auto tr = theta.unchecked<3>();
-    auto wr = w.unchecked<4>();
-    auto fr = f.unchecked<3>();
     const ssize_t n_mpo_left = e.shape(0);
     const ssize_t n_left_bra = e.shape(1);
     const ssize_t n_left_ket = e.shape(2);
@@ -34658,34 +35214,57 @@ static py::array_t<cdouble> tdvp_site_heff_contract_block(
     const ssize_t n_phys_out = w.shape(2);
     const ssize_t n_right_bra = f.shape(1);
     py::array_t<cdouble> out = zero_array3(n_left_bra, n_right_bra, n_phys_out);
-    auto o = out.mutable_unchecked<3>();
-    for (ssize_t left_bra = 0; left_bra < n_left_bra; ++left_bra) {
-        for (ssize_t right_bra = 0; right_bra < n_right_bra; ++right_bra) {
-            for (ssize_t phys_out = 0; phys_out < n_phys_out; ++phys_out) {
-                cdouble total = cdouble(0.0, 0.0);
-                for (ssize_t mpo_left = 0; mpo_left < n_mpo_left; ++mpo_left) {
-                    for (ssize_t left_ket = 0; left_ket < n_left_ket; ++left_ket) {
-                        const cdouble e_val = er(mpo_left, left_bra, left_ket);
-                        if (e_val == cdouble(0.0, 0.0)) {
+    py::buffer_info ei = e.request();
+    py::buffer_info ti = theta.request();
+    py::buffer_info wi = w.request();
+    py::buffer_info fi = f.request();
+    py::buffer_info oi = out.request();
+    const cdouble* ep = static_cast<const cdouble*>(ei.ptr);
+    const cdouble* tp = static_cast<const cdouble*>(ti.ptr);
+    const cdouble* wp = static_cast<const cdouble*>(wi.ptr);
+    const cdouble* fp = static_cast<const cdouble*>(fi.ptr);
+    cdouble* op = static_cast<cdouble*>(oi.ptr);
+    const cdouble zero = cdouble(0.0, 0.0);
+    for (ssize_t mpo_left = 0; mpo_left < n_mpo_left; ++mpo_left) {
+        for (ssize_t left_ket = 0; left_ket < n_left_ket; ++left_ket) {
+            for (ssize_t left_bra = 0; left_bra < n_left_bra; ++left_bra) {
+                const cdouble e_val =
+                    ep[(mpo_left * n_left_bra + left_bra) * n_left_ket + left_ket];
+                if (e_val == zero) {
+                    continue;
+                }
+                for (ssize_t right_ket = 0; right_ket < n_right_ket; ++right_ket) {
+                    for (ssize_t phys_in = 0; phys_in < n_phys_in; ++phys_in) {
+                        const cdouble theta_val =
+                            tp[(left_ket * n_right_ket + right_ket) * n_phys_in + phys_in];
+                        if (theta_val == zero) {
                             continue;
                         }
-                        for (ssize_t right_ket = 0; right_ket < n_right_ket; ++right_ket) {
-                            for (ssize_t phys_in = 0; phys_in < n_phys_in; ++phys_in) {
-                                const cdouble theta_val = tr(left_ket, right_ket, phys_in);
-                                if (theta_val == cdouble(0.0, 0.0)) {
+                        const cdouble etheta = e_val * theta_val;
+                        for (ssize_t mpo_right = 0; mpo_right < n_mpo_right; ++mpo_right) {
+                            for (ssize_t right_bra = 0; right_bra < n_right_bra; ++right_bra) {
+                                const cdouble f_val =
+                                    fp[(mpo_right * n_right_bra + right_bra) * n_right_ket + right_ket];
+                                if (f_val == zero) {
                                     continue;
                                 }
-                                const cdouble etheta = e_val * theta_val;
-                                for (ssize_t mpo_right = 0; mpo_right < n_mpo_right; ++mpo_right) {
-                                    total += etheta *
-                                        wr(mpo_left, mpo_right, phys_out, phys_in) *
-                                        fr(mpo_right, right_bra, right_ket);
+                                const cdouble ethetaf = etheta * f_val;
+                                cdouble* out_row =
+                                    op + (left_bra * n_right_bra + right_bra) * n_phys_out;
+                                const cdouble* w_base =
+                                    wp + ((mpo_left * n_mpo_right + mpo_right) * n_phys_out)
+                                             * n_phys_in
+                                         + phys_in;
+                                for (ssize_t phys_out = 0; phys_out < n_phys_out; ++phys_out) {
+                                    const cdouble w_val = w_base[phys_out * n_phys_in];
+                                    if (w_val != zero) {
+                                        out_row[phys_out] += ethetaf * w_val;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                o(left_bra, right_bra, phys_out) = total;
             }
         }
     }
@@ -34703,9 +35282,6 @@ static py::array_t<cdouble> tdvp_bond_heff_contract_block(
     if (e.ndim() != 3 || center.ndim() != 2 || f.ndim() != 3) {
         throw std::runtime_error("TDVP bond Heff contraction rank mismatch");
     }
-    auto er = e.unchecked<3>();
-    auto cr = center.unchecked<2>();
-    auto fr = f.unchecked<3>();
     const ssize_t n_mpo = e.shape(0);
     const ssize_t n_left_bra = e.shape(1);
     const ssize_t n_left_ket = e.shape(2);
@@ -34716,22 +35292,40 @@ static py::array_t<cdouble> tdvp_bond_heff_contract_block(
     const ssize_t n_right_ket = center.shape(1);
     const ssize_t n_right_bra = f.shape(1);
     py::array_t<cdouble> out = zero_array2(n_left_bra, n_right_bra);
-    auto o = out.mutable_unchecked<2>();
-    for (ssize_t left_bra = 0; left_bra < n_left_bra; ++left_bra) {
-        for (ssize_t right_bra = 0; right_bra < n_right_bra; ++right_bra) {
-            cdouble total = cdouble(0.0, 0.0);
-            for (ssize_t mpo = 0; mpo < n_mpo; ++mpo) {
-                for (ssize_t left_ket = 0; left_ket < n_left_ket; ++left_ket) {
-                    const cdouble e_val = er(mpo, left_bra, left_ket);
-                    if (e_val == cdouble(0.0, 0.0)) {
+    py::buffer_info ei = e.request();
+    py::buffer_info ci = center.request();
+    py::buffer_info fi = f.request();
+    py::buffer_info oi = out.request();
+    const cdouble* ep = static_cast<const cdouble*>(ei.ptr);
+    const cdouble* cp = static_cast<const cdouble*>(ci.ptr);
+    const cdouble* fp = static_cast<const cdouble*>(fi.ptr);
+    cdouble* op = static_cast<cdouble*>(oi.ptr);
+    const cdouble zero = cdouble(0.0, 0.0);
+    for (ssize_t mpo = 0; mpo < n_mpo; ++mpo) {
+        for (ssize_t left_ket = 0; left_ket < n_left_ket; ++left_ket) {
+            for (ssize_t left_bra = 0; left_bra < n_left_bra; ++left_bra) {
+                const cdouble e_val =
+                    ep[(mpo * n_left_bra + left_bra) * n_left_ket + left_ket];
+                if (e_val == zero) {
+                    continue;
+                }
+                for (ssize_t right_ket = 0; right_ket < n_right_ket; ++right_ket) {
+                    const cdouble center_val = cp[left_ket * n_right_ket + right_ket];
+                    if (center_val == zero) {
                         continue;
                     }
-                    for (ssize_t right_ket = 0; right_ket < n_right_ket; ++right_ket) {
-                        total += e_val * cr(left_ket, right_ket) * fr(mpo, right_bra, right_ket);
+                    const cdouble ec = e_val * center_val;
+                    cdouble* out_row = op + left_bra * n_right_bra;
+                    const cdouble* f_base =
+                        fp + (mpo * n_right_bra) * n_right_ket + right_ket;
+                    for (ssize_t right_bra = 0; right_bra < n_right_bra; ++right_bra) {
+                        const cdouble f_val = f_base[right_bra * n_right_ket];
+                        if (f_val != zero) {
+                            out_row[right_bra] += ec * f_val;
+                        }
                     }
                 }
             }
-            o(left_bra, right_bra) = total;
         }
     }
     return out;
@@ -35233,6 +35827,13 @@ static py::object dict_get_required(py::dict data, const py::object& key) {
     return py::reinterpret_steal<py::object>(value);
 }
 
+static py::object tensor_from_dict_like(
+    py::object tensor_cls,
+    py::dict data,
+    py::object qns,
+    py::object dirs
+);
+
 class CppAbelianTDVPSiteHeffPlan {
 public:
     CppAbelianTDVPSiteHeffPlan() = default;
@@ -35248,7 +35849,7 @@ public:
         return plan;
     }
 
-    py::tuple apply(
+    py::dict apply_dict(
         py::object theta,
         py::object E,
         py::object W,
@@ -35268,8 +35869,33 @@ public:
             );
             add_block_to_output(out, route.out_key, block);
         }
+        return out;
+    }
+
+    py::tuple apply(
+        py::object theta,
+        py::object E,
+        py::object W,
+        py::object F
+    ) const {
+        py::dict out = apply_dict(theta, E, W, F);
         py::tuple key_blocks = dict_items_to_key_block_tuple(out);
         return py::make_tuple(key_blocks[0], key_blocks[1], qns_, dirs_);
+    }
+
+    py::object apply_tensor(
+        py::object tensor_cls,
+        py::object theta,
+        py::object E,
+        py::object W,
+        py::object F
+    ) const {
+        return tensor_from_dict_like(
+            tensor_cls,
+            apply_dict(theta, E, W, F),
+            qns_,
+            dirs_
+        );
     }
 
     ssize_t route_count() const {
@@ -35400,7 +36026,7 @@ public:
         return plan;
     }
 
-    py::tuple apply(py::object center, py::object E, py::object F) const {
+    py::dict apply_dict(py::object center, py::object E, py::object F) const {
         py::dict center_data = py::reinterpret_borrow<py::dict>(center.attr("data"));
         py::dict e_data = py::reinterpret_borrow<py::dict>(E.attr("data"));
         py::dict f_data = py::reinterpret_borrow<py::dict>(F.attr("data"));
@@ -35413,8 +36039,27 @@ public:
             );
             add_block2_to_output(out, route.out_key, block);
         }
+        return out;
+    }
+
+    py::tuple apply(py::object center, py::object E, py::object F) const {
+        py::dict out = apply_dict(center, E, F);
         py::tuple key_blocks = dict_items_to_key_block_tuple(out);
         return py::make_tuple(key_blocks[0], key_blocks[1], qns_, dirs_);
+    }
+
+    py::object apply_tensor(
+        py::object tensor_cls,
+        py::object center,
+        py::object E,
+        py::object F
+    ) const {
+        return tensor_from_dict_like(
+            tensor_cls,
+            apply_dict(center, E, F),
+            qns_,
+            dirs_
+        );
     }
 
     ssize_t route_count() const {
@@ -35881,6 +36526,1151 @@ static py::object environment_tensor_from_payload(
         dirs,
         py::arg("copy") = false
     );
+}
+
+static py::object tensor_from_dict_like(
+    py::object tensor_cls,
+    py::dict data,
+    py::object qns,
+    py::object dirs
+) {
+    return tensor_cls(
+        data,
+        qns,
+        dirs,
+        py::arg("copy") = false
+    );
+}
+
+static py::object tensor_from_payload_like(
+    py::object tensor_cls,
+    py::tuple payload
+) {
+    py::sequence seq = payload.cast<py::sequence>();
+    py::sequence keys = py::reinterpret_borrow<py::object>(seq[0])
+                            .cast<py::sequence>();
+    py::sequence blocks = py::reinterpret_borrow<py::object>(seq[1])
+                              .cast<py::sequence>();
+    py::object qns = py::reinterpret_borrow<py::object>(seq[2]);
+    py::object dirs = py::reinterpret_borrow<py::object>(seq[3]);
+    py::dict data;
+    const ssize_t n = static_cast<ssize_t>(py::len(keys));
+    for (ssize_t idx = 0; idx < n; ++idx) {
+        data[tuple_from_sequence_object(
+            py::reinterpret_borrow<py::object>(keys[idx])
+        )] = py::reinterpret_borrow<py::object>(blocks[idx]);
+    }
+    return tensor_from_dict_like(tensor_cls, data, qns, dirs);
+}
+
+static py::object tensor_class_of(py::object tensor) {
+    return py::reinterpret_borrow<py::object>(tensor.attr("__class__"));
+}
+
+static std::string normalized_method_key(const std::string& method) {
+    std::string key;
+    key.reserve(method.size());
+    for (unsigned char c : method) {
+        key.push_back(c == '_' ? '-' : static_cast<char>(std::tolower(c)));
+    }
+    return key;
+}
+
+static bool py_objects_equal(py::handle lhs, py::handle rhs) {
+    int result = PyObject_RichCompareBool(lhs.ptr(), rhs.ptr(), Py_EQ);
+    if (result < 0) {
+        throw py::error_already_set();
+    }
+    return result == 1;
+}
+
+static cdouble block_tensor_dot_native(py::object bra, py::object ket) {
+    py::dict bra_data = py::reinterpret_borrow<py::dict>(bra.attr("data"));
+    py::dict ket_data = py::reinterpret_borrow<py::dict>(ket.attr("data"));
+    cdouble total = 0.0;
+    for (auto item : bra_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        if (!ket_data.contains(key)) {
+            continue;
+        }
+        auto a = ensure_cdouble_array(py::reinterpret_borrow<py::object>(item.second));
+        auto b = ensure_cdouble_array(py::reinterpret_borrow<py::object>(ket_data[key]));
+        if (a.ndim() != b.ndim()) {
+            throw std::runtime_error("block tensor dot rank mismatch");
+        }
+        ssize_t size = 1;
+        for (ssize_t axis = 0; axis < a.ndim(); ++axis) {
+            if (a.shape(axis) != b.shape(axis)) {
+                throw std::runtime_error("block tensor dot shape mismatch");
+            }
+            size *= a.shape(axis);
+        }
+        py::buffer_info ai = a.request();
+        py::buffer_info bi = b.request();
+        const cdouble* ap = static_cast<const cdouble*>(ai.ptr);
+        const cdouble* bp = static_cast<const cdouble*>(bi.ptr);
+        for (ssize_t idx = 0; idx < size; ++idx) {
+            total += std::conj(ap[idx]) * bp[idx];
+        }
+    }
+    return total;
+}
+
+static double block_tensor_norm_native(py::object tensor) {
+    py::dict data = py::reinterpret_borrow<py::dict>(tensor.attr("data"));
+    double n2 = 0.0;
+    for (auto item : data) {
+        auto block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(item.second));
+        ssize_t size = 1;
+        for (ssize_t axis = 0; axis < block.ndim(); ++axis) {
+            size *= block.shape(axis);
+        }
+        py::buffer_info bi = block.request();
+        const cdouble* bp = static_cast<const cdouble*>(bi.ptr);
+        for (ssize_t idx = 0; idx < size; ++idx) {
+            n2 += std::norm(bp[idx]);
+        }
+    }
+    return std::sqrt(std::max(0.0, n2));
+}
+
+static py::array_t<cdouble> scale_array_like(py::object block_obj, cdouble coeff) {
+    auto block = ensure_cdouble_array(block_obj);
+    std::vector<ssize_t> shape;
+    ssize_t size = 1;
+    for (ssize_t axis = 0; axis < block.ndim(); ++axis) {
+        shape.push_back(block.shape(axis));
+        size *= block.shape(axis);
+    }
+    py::array_t<cdouble> out(shape);
+    py::buffer_info bi = block.request();
+    py::buffer_info oi = out.request();
+    const cdouble* bp = static_cast<const cdouble*>(bi.ptr);
+    cdouble* op = static_cast<cdouble*>(oi.ptr);
+    for (ssize_t idx = 0; idx < size; ++idx) {
+        op[idx] = coeff * bp[idx];
+    }
+    return out;
+}
+
+static void add_scaled_array_inplace(
+    py::object dst_obj,
+    py::object src_obj,
+    cdouble coeff,
+    const char* context
+) {
+    auto dst = ensure_cdouble_array(dst_obj);
+    auto src = ensure_cdouble_array(src_obj);
+    if (dst.ndim() != src.ndim()) {
+        throw std::runtime_error(std::string(context) + " rank mismatch");
+    }
+    ssize_t size = 1;
+    for (ssize_t axis = 0; axis < dst.ndim(); ++axis) {
+        if (dst.shape(axis) != src.shape(axis)) {
+            throw std::runtime_error(std::string(context) + " shape mismatch");
+        }
+        size *= dst.shape(axis);
+    }
+    py::buffer_info di = dst.request();
+    py::buffer_info si = src.request();
+    cdouble* dp = static_cast<cdouble*>(di.ptr);
+    const cdouble* sp = static_cast<const cdouble*>(si.ptr);
+    for (ssize_t idx = 0; idx < size; ++idx) {
+        dp[idx] += coeff * sp[idx];
+    }
+}
+
+static py::object block_tensor_scaled_native(
+    py::object tensor,
+    cdouble coeff,
+    py::object tensor_cls = py::none()
+) {
+    if (tensor_cls.is_none()) {
+        tensor_cls = tensor_class_of(tensor);
+    }
+    py::dict data = py::reinterpret_borrow<py::dict>(tensor.attr("data"));
+    py::dict out;
+    for (auto item : data) {
+        out[py::reinterpret_borrow<py::object>(item.first)] =
+            scale_array_like(py::reinterpret_borrow<py::object>(item.second), coeff);
+    }
+    return tensor_from_dict_like(
+        tensor_cls,
+        out,
+        py::reinterpret_borrow<py::object>(tensor.attr("qns")),
+        py::reinterpret_borrow<py::object>(tensor.attr("dirs"))
+    );
+}
+
+static py::object block_tensor_add_scaled_native(
+    py::object lhs,
+    py::object rhs,
+    cdouble rhs_coeff,
+    py::object tensor_cls = py::none()
+) {
+    if (tensor_cls.is_none()) {
+        tensor_cls = tensor_class_of(lhs);
+    }
+    py::dict lhs_data = py::reinterpret_borrow<py::dict>(lhs.attr("data"));
+    py::dict rhs_data = py::reinterpret_borrow<py::dict>(rhs.attr("data"));
+    py::dict out;
+    for (auto item : lhs_data) {
+        out[py::reinterpret_borrow<py::object>(item.first)] =
+            scale_array_like(py::reinterpret_borrow<py::object>(item.second), 1.0);
+    }
+    for (auto item : rhs_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        if (!out.contains(key)) {
+            out[key] = scale_array_like(
+                py::reinterpret_borrow<py::object>(item.second),
+                rhs_coeff
+            );
+            continue;
+        }
+        add_scaled_array_inplace(
+            py::reinterpret_borrow<py::object>(out[key]),
+            py::reinterpret_borrow<py::object>(item.second),
+            rhs_coeff,
+            "block tensor add"
+        );
+    }
+    return tensor_from_dict_like(
+        tensor_cls,
+        out,
+        py::reinterpret_borrow<py::object>(lhs.attr("qns")),
+        py::reinterpret_borrow<py::object>(lhs.attr("dirs"))
+    );
+}
+
+static py::object block_tensor_add_scaled_inplace(
+    py::object lhs,
+    py::object rhs,
+    cdouble rhs_coeff
+) {
+    if (std::abs(rhs_coeff) <= 0.0) {
+        return lhs;
+    }
+    py::dict lhs_data = py::reinterpret_borrow<py::dict>(lhs.attr("data"));
+    py::dict rhs_data = py::reinterpret_borrow<py::dict>(rhs.attr("data"));
+    for (auto item : rhs_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        if (!lhs_data.contains(key)) {
+            lhs_data[key] = scale_array_like(
+                py::reinterpret_borrow<py::object>(item.second),
+                rhs_coeff
+            );
+            continue;
+        }
+        add_scaled_array_inplace(
+            py::reinterpret_borrow<py::object>(lhs_data[key]),
+            py::reinterpret_borrow<py::object>(item.second),
+            rhs_coeff,
+            "block tensor inplace add"
+        );
+    }
+    return lhs;
+}
+
+static py::object block_tensor_linear_combination_native(
+    const std::vector<cdouble>& coeffs,
+    const std::vector<py::object>& basis,
+    py::object tensor_cls = py::none()
+) {
+    if (basis.empty()) {
+        throw std::runtime_error("block tensor linear combination needs a non-empty basis");
+    }
+    if (tensor_cls.is_none()) {
+        tensor_cls = tensor_class_of(basis.front());
+    }
+    py::dict out;
+    for (size_t bi = 0; bi < basis.size(); ++bi) {
+        const cdouble coeff = coeffs[bi];
+        if (std::abs(coeff) <= 0.0) {
+            continue;
+        }
+        py::dict data = py::reinterpret_borrow<py::dict>(basis[bi].attr("data"));
+        for (auto item : data) {
+            py::object key = py::reinterpret_borrow<py::object>(item.first);
+            if (!out.contains(key)) {
+                out[key] = scale_array_like(
+                    py::reinterpret_borrow<py::object>(item.second),
+                    coeff
+                );
+                continue;
+            }
+            add_scaled_array_inplace(
+                py::reinterpret_borrow<py::object>(out[key]),
+                py::reinterpret_borrow<py::object>(item.second),
+                coeff,
+                "block tensor linear combination"
+            );
+        }
+    }
+    if (py::len(out) == 0) {
+        return block_tensor_scaled_native(basis.front(), 0.0, tensor_cls);
+    }
+    return tensor_from_dict_like(
+        tensor_cls,
+        out,
+        py::reinterpret_borrow<py::object>(basis.front().attr("qns")),
+        py::reinterpret_borrow<py::object>(basis.front().attr("dirs"))
+    );
+}
+
+static py::object block_left_qr_native(py::object theta, py::object tensor_cls) {
+    py::dict theta_data = py::reinterpret_borrow<py::dict>(theta.attr("data"));
+    py::dict by_right;
+    for (auto item : theta_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        py::object q_right = py::reinterpret_borrow<py::object>(seq[1]);
+        if (!by_right.contains(q_right)) {
+            by_right[q_right] = py::list();
+        }
+        by_right[q_right].attr("append")(key);
+    }
+
+    py::dict data_q;
+    py::dict data_center;
+    py::list new_right_qns;
+    for (auto group_item : by_right) {
+        py::object q_right = py::reinterpret_borrow<py::object>(group_item.first);
+        py::sequence keys = py::reinterpret_borrow<py::sequence>(group_item.second);
+        ssize_t cols = -1;
+        ssize_t rows_total = 0;
+        struct Entry { py::object key; py::array_t<cdouble> block; ssize_t left_dim; ssize_t phys_dim; };
+        std::vector<Entry> entries;
+        for (ssize_t idx = 0; idx < static_cast<ssize_t>(py::len(keys)); ++idx) {
+            py::object key = py::reinterpret_borrow<py::object>(keys[idx]);
+            auto block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(theta_data[key]));
+            if (block.ndim() != 3) {
+                throw std::runtime_error("block left QR expects rank-3 site blocks");
+            }
+            const ssize_t left_dim = block.shape(0);
+            const ssize_t right_dim = block.shape(1);
+            const ssize_t phys_dim = block.shape(2);
+            if (cols < 0) {
+                cols = right_dim;
+            } else if (cols != right_dim) {
+                throw std::runtime_error("Inconsistent right-sector degeneracy in block QR");
+            }
+            rows_total += left_dim * phys_dim;
+            entries.push_back(Entry{key, block, left_dim, phys_dim});
+        }
+        if (cols <= 0) {
+            continue;
+        }
+        py::array_t<cdouble> mat({rows_total, cols});
+        auto mv = mat.mutable_unchecked<2>();
+        ssize_t offset = 0;
+        for (const auto& entry : entries) {
+            auto bv = entry.block.unchecked<3>();
+            for (ssize_t l = 0; l < entry.left_dim; ++l) {
+                for (ssize_t p = 0; p < entry.phys_dim; ++p) {
+                    const ssize_t row = offset + l * entry.phys_dim + p;
+                    for (ssize_t r = 0; r < cols; ++r) {
+                        mv(row, r) = bv(l, r, p);
+                    }
+                }
+            }
+            offset += entry.left_dim * entry.phys_dim;
+        }
+        py::tuple qr = lapack_qr(mat);
+        auto q_mat = qr[0].cast<py::array_t<cdouble>>();
+        auto r_mat = qr[1].cast<py::array_t<cdouble>>();
+        const ssize_t chi = q_mat.shape(1);
+        if (chi == 0) {
+            continue;
+        }
+        new_right_qns.append(q_right);
+        data_center[py::make_tuple(q_right, q_right)] = r_mat;
+        auto qv = q_mat.unchecked<2>();
+        offset = 0;
+        for (const auto& entry : entries) {
+            py::sequence key_seq = entry.key.cast<py::sequence>();
+            py::object out_key = py::make_tuple(
+                py::reinterpret_borrow<py::object>(key_seq[0]),
+                q_right,
+                py::reinterpret_borrow<py::object>(key_seq[2])
+            );
+            py::array_t<cdouble> q_block({entry.left_dim, chi, entry.phys_dim});
+            auto qb = q_block.mutable_unchecked<3>();
+            for (ssize_t l = 0; l < entry.left_dim; ++l) {
+                for (ssize_t c = 0; c < chi; ++c) {
+                    for (ssize_t p = 0; p < entry.phys_dim; ++p) {
+                        qb(l, c, p) = qv(offset + l * entry.phys_dim + p, c);
+                    }
+                }
+            }
+            data_q[out_key] = q_block;
+            offset += entry.left_dim * entry.phys_dim;
+        }
+    }
+    py::list q_qns;
+    q_qns.append(get_axis_item(theta.attr("qns"), 0));
+    q_qns.append(tuple_from_sequence_object(new_right_qns));
+    q_qns.append(get_axis_item(theta.attr("qns"), 2));
+    py::list center_qns;
+    center_qns.append(tuple_from_sequence_object(new_right_qns));
+    center_qns.append(get_axis_item(theta.attr("qns"), 1));
+    py::list center_dirs;
+    center_dirs.append(py::int_(-1));
+    center_dirs.append(py::int_(1));
+    return py::make_tuple(
+        tensor_from_dict_like(tensor_cls, data_q, tuple_from_sequence_object(q_qns), theta.attr("dirs")),
+        tensor_from_dict_like(tensor_cls, data_center, tuple_from_sequence_object(center_qns), tuple_from_sequence_object(center_dirs))
+    );
+}
+
+static py::object block_right_rq_native(py::object theta, py::object tensor_cls) {
+    py::dict theta_data = py::reinterpret_borrow<py::dict>(theta.attr("data"));
+    py::dict by_left;
+    for (auto item : theta_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        py::object q_left = py::reinterpret_borrow<py::object>(seq[0]);
+        if (!by_left.contains(q_left)) {
+            by_left[q_left] = py::list();
+        }
+        by_left[q_left].attr("append")(key);
+    }
+
+    py::dict data_q;
+    py::dict data_center;
+    py::list new_left_qns;
+    for (auto group_item : by_left) {
+        py::object q_left = py::reinterpret_borrow<py::object>(group_item.first);
+        py::sequence keys = py::reinterpret_borrow<py::sequence>(group_item.second);
+        ssize_t left_dim = -1;
+        ssize_t cols_total = 0;
+        struct Entry { py::object key; py::array_t<cdouble> block; ssize_t right_dim; ssize_t phys_dim; };
+        std::vector<Entry> entries;
+        for (ssize_t idx = 0; idx < static_cast<ssize_t>(py::len(keys)); ++idx) {
+            py::object key = py::reinterpret_borrow<py::object>(keys[idx]);
+            auto block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(theta_data[key]));
+            if (block.ndim() != 3) {
+                throw std::runtime_error("block right RQ expects rank-3 site blocks");
+            }
+            const ssize_t block_left_dim = block.shape(0);
+            const ssize_t right_dim = block.shape(1);
+            const ssize_t phys_dim = block.shape(2);
+            if (left_dim < 0) {
+                left_dim = block_left_dim;
+            } else if (left_dim != block_left_dim) {
+                throw std::runtime_error("Inconsistent left-sector degeneracy in block RQ");
+            }
+            cols_total += right_dim * phys_dim;
+            entries.push_back(Entry{key, block, right_dim, phys_dim});
+        }
+        if (left_dim <= 0 || cols_total <= 0) {
+            continue;
+        }
+        py::array_t<cdouble> mat_t({cols_total, left_dim});
+        auto mv = mat_t.mutable_unchecked<2>();
+        ssize_t offset = 0;
+        for (const auto& entry : entries) {
+            auto bv = entry.block.unchecked<3>();
+            for (ssize_t r = 0; r < entry.right_dim; ++r) {
+                for (ssize_t p = 0; p < entry.phys_dim; ++p) {
+                    const ssize_t row = offset + r * entry.phys_dim + p;
+                    for (ssize_t l = 0; l < left_dim; ++l) {
+                        mv(row, l) = bv(l, r, p);
+                    }
+                }
+            }
+            offset += entry.right_dim * entry.phys_dim;
+        }
+        py::tuple qr = lapack_qr(mat_t);
+        auto q_t = qr[0].cast<py::array_t<cdouble>>();
+        auto r_t = qr[1].cast<py::array_t<cdouble>>();
+        const ssize_t chi = q_t.shape(1);
+        if (chi == 0) {
+            continue;
+        }
+        new_left_qns.append(q_left);
+        py::array_t<cdouble> center({left_dim, chi});
+        auto cv = center.mutable_unchecked<2>();
+        auto rv = r_t.unchecked<2>();
+        for (ssize_t l = 0; l < left_dim; ++l) {
+            for (ssize_t c = 0; c < chi; ++c) {
+                cv(l, c) = rv(c, l);
+            }
+        }
+        data_center[py::make_tuple(q_left, q_left)] = center;
+        auto qv = q_t.unchecked<2>();
+        offset = 0;
+        for (const auto& entry : entries) {
+            py::sequence key_seq = entry.key.cast<py::sequence>();
+            py::object out_key = py::make_tuple(
+                q_left,
+                py::reinterpret_borrow<py::object>(key_seq[1]),
+                py::reinterpret_borrow<py::object>(key_seq[2])
+            );
+            py::array_t<cdouble> q_block({chi, entry.right_dim, entry.phys_dim});
+            auto qb = q_block.mutable_unchecked<3>();
+            for (ssize_t c = 0; c < chi; ++c) {
+                for (ssize_t r = 0; r < entry.right_dim; ++r) {
+                    for (ssize_t p = 0; p < entry.phys_dim; ++p) {
+                        qb(c, r, p) = qv(offset + r * entry.phys_dim + p, c);
+                    }
+                }
+            }
+            data_q[out_key] = q_block;
+            offset += entry.right_dim * entry.phys_dim;
+        }
+    }
+    py::list center_qns;
+    center_qns.append(get_axis_item(theta.attr("qns"), 0));
+    center_qns.append(tuple_from_sequence_object(new_left_qns));
+    py::list center_dirs;
+    center_dirs.append(py::int_(-1));
+    center_dirs.append(py::int_(1));
+    py::list q_qns;
+    q_qns.append(tuple_from_sequence_object(new_left_qns));
+    q_qns.append(get_axis_item(theta.attr("qns"), 1));
+    q_qns.append(get_axis_item(theta.attr("qns"), 2));
+    return py::make_tuple(
+        tensor_from_dict_like(tensor_cls, data_center, tuple_from_sequence_object(center_qns), tuple_from_sequence_object(center_dirs)),
+        tensor_from_dict_like(tensor_cls, data_q, tuple_from_sequence_object(q_qns), theta.attr("dirs"))
+    );
+}
+
+static py::object block_absorb_center_left_native(
+    py::object center,
+    py::object right_site,
+    py::object tensor_cls
+) {
+    py::dict center_data = py::reinterpret_borrow<py::dict>(center.attr("data"));
+    py::dict right_data = py::reinterpret_borrow<py::dict>(right_site.attr("data"));
+    py::dict out;
+    for (auto c_item : center_data) {
+        py::object c_key = py::reinterpret_borrow<py::object>(c_item.first);
+        py::sequence c_seq = c_key.cast<py::sequence>();
+        py::object c_right = py::reinterpret_borrow<py::object>(c_seq[1]);
+        auto c_block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(c_item.second));
+        auto cv = c_block.unchecked<2>();
+        for (auto r_item : right_data) {
+            py::object r_key = py::reinterpret_borrow<py::object>(r_item.first);
+            py::sequence r_seq = r_key.cast<py::sequence>();
+            if (!py_objects_equal(c_right, py::reinterpret_borrow<py::object>(r_seq[0]))) {
+                continue;
+            }
+            auto r_block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(r_item.second));
+            auto rv = r_block.unchecked<3>();
+            if (c_block.shape(1) != r_block.shape(0)) {
+                throw std::runtime_error("absorb center left shape mismatch");
+            }
+            const ssize_t nl = c_block.shape(0);
+            const ssize_t nk = c_block.shape(1);
+            const ssize_t nr = r_block.shape(1);
+            const ssize_t np = r_block.shape(2);
+            py::array_t<cdouble> block({nl, nr, np});
+            auto bv = block.mutable_unchecked<3>();
+            for (ssize_t l = 0; l < nl; ++l) {
+                for (ssize_t r = 0; r < nr; ++r) {
+                    for (ssize_t p = 0; p < np; ++p) {
+                        cdouble total = 0.0;
+                        for (ssize_t k = 0; k < nk; ++k) {
+                            total += cv(l, k) * rv(k, r, p);
+                        }
+                        bv(l, r, p) = total;
+                    }
+                }
+            }
+            py::object out_key = py::make_tuple(
+                py::reinterpret_borrow<py::object>(c_seq[0]),
+                py::reinterpret_borrow<py::object>(r_seq[1]),
+                py::reinterpret_borrow<py::object>(r_seq[2])
+            );
+            add_block_to_output(out, out_key, block);
+        }
+    }
+    py::list qns;
+    qns.append(get_axis_item(center.attr("qns"), 0));
+    qns.append(get_axis_item(right_site.attr("qns"), 1));
+    qns.append(get_axis_item(right_site.attr("qns"), 2));
+    py::list dirs;
+    dirs.append(get_axis_item(center.attr("dirs"), 0));
+    dirs.append(get_axis_item(right_site.attr("dirs"), 1));
+    dirs.append(get_axis_item(right_site.attr("dirs"), 2));
+    return tensor_from_dict_like(tensor_cls, out, tuple_from_sequence_object(qns), tuple_from_sequence_object(dirs));
+}
+
+static py::object block_absorb_center_right_native(
+    py::object left_site,
+    py::object center,
+    py::object tensor_cls
+) {
+    py::dict left_data = py::reinterpret_borrow<py::dict>(left_site.attr("data"));
+    py::dict center_data = py::reinterpret_borrow<py::dict>(center.attr("data"));
+    py::dict out;
+    for (auto l_item : left_data) {
+        py::object l_key = py::reinterpret_borrow<py::object>(l_item.first);
+        py::sequence l_seq = l_key.cast<py::sequence>();
+        py::object l_right = py::reinterpret_borrow<py::object>(l_seq[1]);
+        auto l_block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(l_item.second));
+        auto lv = l_block.unchecked<3>();
+        for (auto c_item : center_data) {
+            py::object c_key = py::reinterpret_borrow<py::object>(c_item.first);
+            py::sequence c_seq = c_key.cast<py::sequence>();
+            if (!py_objects_equal(l_right, py::reinterpret_borrow<py::object>(c_seq[0]))) {
+                continue;
+            }
+            auto c_block = ensure_cdouble_array(py::reinterpret_borrow<py::object>(c_item.second));
+            auto cv = c_block.unchecked<2>();
+            if (l_block.shape(1) != c_block.shape(0)) {
+                throw std::runtime_error("absorb center right shape mismatch");
+            }
+            const ssize_t nl = l_block.shape(0);
+            const ssize_t nk = l_block.shape(1);
+            const ssize_t np = l_block.shape(2);
+            const ssize_t nr = c_block.shape(1);
+            py::array_t<cdouble> block({nl, nr, np});
+            auto bv = block.mutable_unchecked<3>();
+            for (ssize_t l = 0; l < nl; ++l) {
+                for (ssize_t r = 0; r < nr; ++r) {
+                    for (ssize_t p = 0; p < np; ++p) {
+                        cdouble total = 0.0;
+                        for (ssize_t k = 0; k < nk; ++k) {
+                            total += lv(l, k, p) * cv(k, r);
+                        }
+                        bv(l, r, p) = total;
+                    }
+                }
+            }
+            py::object out_key = py::make_tuple(
+                py::reinterpret_borrow<py::object>(l_seq[0]),
+                py::reinterpret_borrow<py::object>(c_seq[1]),
+                py::reinterpret_borrow<py::object>(l_seq[2])
+            );
+            add_block_to_output(out, out_key, block);
+        }
+    }
+    py::list qns;
+    qns.append(get_axis_item(left_site.attr("qns"), 0));
+    qns.append(get_axis_item(center.attr("qns"), 1));
+    qns.append(get_axis_item(left_site.attr("qns"), 2));
+    py::list dirs;
+    dirs.append(get_axis_item(left_site.attr("dirs"), 0));
+    dirs.append(get_axis_item(center.attr("dirs"), 1));
+    dirs.append(get_axis_item(left_site.attr("dirs"), 2));
+    return tensor_from_dict_like(tensor_cls, out, tuple_from_sequence_object(qns), tuple_from_sequence_object(dirs));
+}
+
+static std::vector<cdouble> lanczos_coefficients_native(
+    const std::vector<double>& alpha,
+    const std::vector<double>& beta,
+    ssize_t actual_dim,
+    double norm,
+    double dt
+) {
+    std::vector<cdouble> coeffs(static_cast<size_t>(actual_dim), 0.0);
+    if (actual_dim == 1) {
+        coeffs[0] = norm * std::exp(cdouble(0.0, -dt * alpha[0]));
+        return coeffs;
+    }
+    py::array_t<cdouble> h({actual_dim, actual_dim});
+    auto hv = h.mutable_unchecked<2>();
+    for (ssize_t i = 0; i < actual_dim; ++i) {
+        for (ssize_t j = 0; j < actual_dim; ++j) {
+            hv(i, j) = 0.0;
+        }
+        hv(i, i) = alpha[static_cast<size_t>(i)];
+    }
+    for (ssize_t i = 0; i < actual_dim - 1; ++i) {
+        hv(i, i + 1) = beta[static_cast<size_t>(i)];
+        hv(i + 1, i) = beta[static_cast<size_t>(i)];
+    }
+    HermitianEigenResult eig = lapack_hermitian_eigh_descending(h);
+    for (ssize_t col = 0; col < actual_dim; ++col) {
+        const cdouble phase = std::exp(cdouble(0.0, -dt * eig.values_desc[static_cast<size_t>(col)]));
+        const cdouble first = std::conj(eig.vector(0, col)) * norm;
+        for (ssize_t row = 0; row < actual_dim; ++row) {
+            coeffs[static_cast<size_t>(row)] += eig.vector(row, col) * phase * first;
+        }
+    }
+    return coeffs;
+}
+
+static py::object block_krylov_lanczos_native(
+    py::object vec,
+    const std::function<py::object(py::object)>& apply_heff,
+    double dt,
+    int krylov_dim,
+    double tol,
+    py::object tensor_cls
+) {
+    const double norm = block_tensor_norm_native(vec);
+    if (norm <= tol) {
+        return block_tensor_scaled_native(vec, 1.0, tensor_cls);
+    }
+    const int mmax = std::max(1, krylov_dim);
+    std::vector<py::object> basis;
+    basis.reserve(static_cast<size_t>(mmax));
+    basis.push_back(block_tensor_scaled_native(vec, 1.0 / norm, tensor_cls));
+    std::vector<double> alpha(static_cast<size_t>(mmax), 0.0);
+    std::vector<double> beta(static_cast<size_t>(std::max(0, mmax - 1)), 0.0);
+    py::object q_prev = py::none();
+    double beta_prev = 0.0;
+    ssize_t actual_dim = 1;
+    for (int j = 0; j < mmax; ++j) {
+        py::object q = basis[static_cast<size_t>(j)];
+        py::object trial = apply_heff(q);
+        if (!q_prev.is_none()) {
+            block_tensor_add_scaled_inplace(trial, q_prev, -beta_prev);
+        }
+        const cdouble alpha_j = block_tensor_dot_native(q, trial);
+        alpha[static_cast<size_t>(j)] = std::real(alpha_j);
+        block_tensor_add_scaled_inplace(trial, q, -alpha_j);
+        const double beta_j = block_tensor_norm_native(trial);
+        actual_dim = static_cast<ssize_t>(j + 1);
+        if (beta_j <= tol || j + 1 == mmax) {
+            break;
+        }
+        beta[static_cast<size_t>(j)] = beta_j;
+        q_prev = q;
+        beta_prev = beta_j;
+        basis.push_back(block_tensor_scaled_native(trial, 1.0 / beta_j, tensor_cls));
+    }
+    std::vector<cdouble> coeffs = lanczos_coefficients_native(
+        alpha,
+        beta,
+        actual_dim,
+        norm,
+        dt
+    );
+    basis.resize(static_cast<size_t>(actual_dim));
+    coeffs.resize(static_cast<size_t>(actual_dim));
+    return block_tensor_linear_combination_native(coeffs, basis, tensor_cls);
+}
+
+static py::object evolve_site_lanczos_native(
+    py::object theta,
+    py::object left,
+    py::object W,
+    py::object right,
+    double dt,
+    int krylov_dim,
+    double tol,
+    py::object tensor_cls
+) {
+    CppAbelianTDVPSiteHeffPlan plan =
+        CppAbelianTDVPSiteHeffPlan::from_tensors(theta, left, W, right);
+    auto apply = [&](py::object local) -> py::object {
+        return plan.apply_tensor(
+            tensor_cls,
+            local,
+            left,
+            W,
+            right
+        );
+    };
+    return block_krylov_lanczos_native(theta, apply, dt, krylov_dim, tol, tensor_cls);
+}
+
+static py::object evolve_bond_lanczos_native(
+    py::object center,
+    py::object left,
+    py::object right,
+    double dt,
+    int krylov_dim,
+    double tol,
+    py::object tensor_cls
+) {
+    CppAbelianTDVPBondHeffPlan plan =
+        CppAbelianTDVPBondHeffPlan::from_tensors(center, left, right);
+    auto apply = [&](py::object local) -> py::object {
+        return plan.apply_tensor(
+            tensor_cls,
+            local,
+            left,
+            right
+        );
+    };
+    return block_krylov_lanczos_native(center, apply, -dt, krylov_dim, tol, tensor_cls);
+}
+
+py::tuple CppMovingEnvironment::one_site_tdvp_sweep(
+    py::sequence factors,
+    py::sequence mpo,
+    py::object left_boundary,
+    py::object right_boundary,
+    double dt,
+    py::object environment_tensor_cls,
+    py::dict callbacks,
+    int krylov_dim,
+    double krylov_tol,
+    const std::string& krylov_method,
+    const std::string& env_plan_prefix
+) {
+    ++one_site_tdvp_sweep_calls;
+    const double sweep_start = wall_seconds();
+    long long site_evolutions = 0;
+    long long bond_evolutions = 0;
+    long long left_qr_calls = 0;
+    long long right_rq_calls = 0;
+    long long env_advances = 0;
+    try {
+        const ssize_t nsites = static_cast<ssize_t>(py::len(factors));
+        if (nsites <= 0) {
+            throw std::runtime_error("MovingEnvironment one-site TDVP sweep requires at least one site");
+        }
+        if (static_cast<ssize_t>(py::len(mpo)) != nsites) {
+            throw std::runtime_error("MovingEnvironment one-site TDVP sweep MPS/MPO length mismatch");
+        }
+        one_site_tdvp_sweep_last_nsites = nsites;
+
+        const std::string krylov_key = normalized_method_key(krylov_method);
+        const bool native_lanczos = (
+            krylov_key == "lanczos"
+            || krylov_key == "hermitian"
+            || krylov_key == "hermitian-lanczos"
+        );
+        auto optional_callback = [&](const char* name) -> py::object {
+            py::str key(name);
+            if (!callbacks.contains(key)) {
+                return py::none();
+            }
+            return py::reinterpret_borrow<py::object>(callbacks[key]);
+        };
+        py::object evolve_site = optional_callback("evolve_site");
+        py::object evolve_bond = optional_callback("evolve_bond");
+        py::object left_qr = optional_callback("left_qr");
+        py::object right_rq = optional_callback("right_rq");
+        py::object absorb_center_left = optional_callback("absorb_center_left");
+        py::object absorb_center_right = optional_callback("absorb_center_right");
+        if (
+            !native_lanczos
+            && (
+                evolve_site.is_none()
+                || evolve_bond.is_none()
+                || left_qr.is_none()
+                || right_rq.is_none()
+                || absorb_center_left.is_none()
+                || absorb_center_right.is_none()
+            )
+        ) {
+            throw std::runtime_error(
+                "MovingEnvironment native one-site TDVP currently supports Lanczos; "
+                "non-Lanczos methods require Python callbacks"
+            );
+        }
+
+        std::vector<py::object> sites;
+        std::vector<py::object> operators;
+        sites.reserve(static_cast<size_t>(nsites));
+        operators.reserve(static_cast<size_t>(nsites));
+        for (ssize_t i = 0; i < nsites; ++i) {
+            sites.push_back(py::reinterpret_borrow<py::object>(factors[i]));
+            operators.push_back(py::reinterpret_borrow<py::object>(mpo[i]));
+        }
+        py::object site_tensor_cls = tensor_class_of(sites.front());
+
+        if (nsites == 1) {
+            if (native_lanczos) {
+                sites[0] = evolve_site_lanczos_native(
+                    sites[0],
+                    left_boundary,
+                    operators[0],
+                    right_boundary,
+                    dt,
+                    krylov_dim,
+                    krylov_tol,
+                    site_tensor_cls
+                );
+            } else {
+                sites[0] = evolve_site(
+                    sites[0],
+                    left_boundary,
+                    operators[0],
+                    right_boundary,
+                    dt
+                );
+            }
+            ++site_evolutions;
+            py::list out_sites;
+            out_sites.append(sites[0]);
+            py::dict info;
+            info["cpp_one_site_engine"] = true;
+            info["cpp_one_site_engine_native_kernels"] = native_lanczos;
+            info["cpp_one_site_engine_sites"] = py::int_(nsites);
+            info["cpp_one_site_engine_site_evolutions"] = py::int_(site_evolutions);
+            info["cpp_one_site_engine_bond_evolutions"] = py::int_(bond_evolutions);
+            info["cpp_one_site_engine_left_qr_calls"] = py::int_(left_qr_calls);
+            info["cpp_one_site_engine_right_rq_calls"] = py::int_(right_rq_calls);
+            info["cpp_one_site_engine_environment_advances"] = py::int_(env_advances);
+            one_site_tdvp_sweep_site_evolutions += site_evolutions;
+            one_site_tdvp_sweep_seconds += wall_seconds() - sweep_start;
+            one_site_tdvp_sweep_last_error.clear();
+            return py::make_tuple(out_sites, info);
+        }
+
+        const double half_dt = 0.5 * dt;
+        std::vector<py::object> right_envs(
+            static_cast<size_t>(nsites + 1),
+            py::none()
+        );
+        std::vector<py::object> left_envs(
+            static_cast<size_t>(nsites),
+            py::none()
+        );
+        right_envs[static_cast<size_t>(nsites)] = right_boundary;
+        left_envs[0] = left_boundary;
+
+        for (ssize_t i = nsites - 1; i >= 0; --i) {
+            const std::string key =
+                env_plan_prefix + ":right-build:" + std::to_string(i);
+            py::tuple payload = environment_advance_auto(
+                key,
+                "right",
+                operators[static_cast<size_t>(i)],
+                sites[static_cast<size_t>(i)],
+                right_envs[static_cast<size_t>(i + 1)],
+                sites[static_cast<size_t>(i)]
+            );
+            right_envs[static_cast<size_t>(i)] =
+                environment_tensor_from_payload(environment_tensor_cls, payload);
+            ++env_advances;
+        }
+
+        py::object left = left_envs[0];
+        for (ssize_t i = 0; i < nsites - 1; ++i) {
+            if (native_lanczos) {
+                sites[static_cast<size_t>(i)] = evolve_site_lanczos_native(
+                    sites[static_cast<size_t>(i)],
+                    left,
+                    operators[static_cast<size_t>(i)],
+                    right_envs[static_cast<size_t>(i + 1)],
+                    half_dt,
+                    krylov_dim,
+                    krylov_tol,
+                    site_tensor_cls
+                );
+            } else {
+                sites[static_cast<size_t>(i)] = evolve_site(
+                    sites[static_cast<size_t>(i)],
+                    left,
+                    operators[static_cast<size_t>(i)],
+                    right_envs[static_cast<size_t>(i + 1)],
+                    half_dt
+                );
+            }
+            ++site_evolutions;
+
+            py::sequence qr_result = (
+                native_lanczos
+                    ? block_left_qr_native(sites[static_cast<size_t>(i)], site_tensor_cls)
+                    : left_qr(sites[static_cast<size_t>(i)])
+            ).cast<py::sequence>();
+            py::object q = py::reinterpret_borrow<py::object>(qr_result[0]);
+            py::object center = py::reinterpret_borrow<py::object>(qr_result[1]);
+            ++left_qr_calls;
+            sites[static_cast<size_t>(i)] = q;
+
+            const std::string env_key =
+                env_plan_prefix + ":left-sweep:" + std::to_string(i);
+            py::tuple env_payload = environment_advance_auto(
+                env_key,
+                "left",
+                operators[static_cast<size_t>(i)],
+                q,
+                left,
+                q
+            );
+            left = environment_tensor_from_payload(environment_tensor_cls, env_payload);
+            left_envs[static_cast<size_t>(i + 1)] = left;
+            ++env_advances;
+
+            if (native_lanczos) {
+                center = evolve_bond_lanczos_native(
+                    center,
+                    left,
+                    right_envs[static_cast<size_t>(i + 1)],
+                    half_dt,
+                    krylov_dim,
+                    krylov_tol,
+                    site_tensor_cls
+                );
+            } else {
+                center = evolve_bond(
+                    center,
+                    left,
+                    right_envs[static_cast<size_t>(i + 1)],
+                    half_dt
+                );
+            }
+            ++bond_evolutions;
+            sites[static_cast<size_t>(i + 1)] = (
+                native_lanczos
+                    ? block_absorb_center_left_native(
+                        center,
+                        sites[static_cast<size_t>(i + 1)],
+                        site_tensor_cls
+                    )
+                    : absorb_center_left(
+                        center,
+                        sites[static_cast<size_t>(i + 1)]
+                    )
+            );
+        }
+
+        if (native_lanczos) {
+            sites[static_cast<size_t>(nsites - 1)] = evolve_site_lanczos_native(
+                sites[static_cast<size_t>(nsites - 1)],
+                left_envs[static_cast<size_t>(nsites - 1)],
+                operators[static_cast<size_t>(nsites - 1)],
+                right_boundary,
+                half_dt,
+                krylov_dim,
+                krylov_tol,
+                site_tensor_cls
+            );
+        } else {
+            sites[static_cast<size_t>(nsites - 1)] = evolve_site(
+                sites[static_cast<size_t>(nsites - 1)],
+                left_envs[static_cast<size_t>(nsites - 1)],
+                operators[static_cast<size_t>(nsites - 1)],
+                right_boundary,
+                half_dt
+            );
+        }
+        ++site_evolutions;
+
+        py::object right = right_boundary;
+        for (ssize_t i = nsites - 1; i > 0; --i) {
+            if (native_lanczos) {
+                sites[static_cast<size_t>(i)] = evolve_site_lanczos_native(
+                    sites[static_cast<size_t>(i)],
+                    left_envs[static_cast<size_t>(i)],
+                    operators[static_cast<size_t>(i)],
+                    right,
+                    half_dt,
+                    krylov_dim,
+                    krylov_tol,
+                    site_tensor_cls
+                );
+            } else {
+                sites[static_cast<size_t>(i)] = evolve_site(
+                    sites[static_cast<size_t>(i)],
+                    left_envs[static_cast<size_t>(i)],
+                    operators[static_cast<size_t>(i)],
+                    right,
+                    half_dt
+                );
+            }
+            ++site_evolutions;
+
+            py::sequence rq_result = (
+                native_lanczos
+                    ? block_right_rq_native(sites[static_cast<size_t>(i)], site_tensor_cls)
+                    : right_rq(sites[static_cast<size_t>(i)])
+            ).cast<py::sequence>();
+            py::object center = py::reinterpret_borrow<py::object>(rq_result[0]);
+            py::object q = py::reinterpret_borrow<py::object>(rq_result[1]);
+            ++right_rq_calls;
+            sites[static_cast<size_t>(i)] = q;
+
+            const std::string env_key =
+                env_plan_prefix + ":right-sweep:" + std::to_string(i);
+            py::tuple env_payload = environment_advance_auto(
+                env_key,
+                "right",
+                operators[static_cast<size_t>(i)],
+                q,
+                right,
+                q
+            );
+            right = environment_tensor_from_payload(environment_tensor_cls, env_payload);
+            ++env_advances;
+
+            if (native_lanczos) {
+                center = evolve_bond_lanczos_native(
+                    center,
+                    left_envs[static_cast<size_t>(i)],
+                    right,
+                    half_dt,
+                    krylov_dim,
+                    krylov_tol,
+                    site_tensor_cls
+                );
+            } else {
+                center = evolve_bond(
+                    center,
+                    left_envs[static_cast<size_t>(i)],
+                    right,
+                    half_dt
+                );
+            }
+            ++bond_evolutions;
+            sites[static_cast<size_t>(i - 1)] = (
+                native_lanczos
+                    ? block_absorb_center_right_native(
+                        sites[static_cast<size_t>(i - 1)],
+                        center,
+                        site_tensor_cls
+                    )
+                    : absorb_center_right(
+                        sites[static_cast<size_t>(i - 1)],
+                        center
+                    )
+            );
+        }
+
+        if (native_lanczos) {
+            sites[0] = evolve_site_lanczos_native(
+                sites[0],
+                left_boundary,
+                operators[0],
+                right,
+                half_dt,
+                krylov_dim,
+                krylov_tol,
+                site_tensor_cls
+            );
+        } else {
+            sites[0] = evolve_site(
+                sites[0],
+                left_boundary,
+                operators[0],
+                right,
+                half_dt
+            );
+        }
+        ++site_evolutions;
+
+        py::list out_sites;
+        for (const auto& site : sites) {
+            out_sites.append(site);
+        }
+        py::dict info;
+        info["cpp_one_site_engine"] = true;
+        info["cpp_one_site_engine_native_kernels"] = native_lanczos;
+        info["cpp_one_site_engine_sites"] = py::int_(nsites);
+        info["cpp_one_site_engine_site_evolutions"] = py::int_(site_evolutions);
+        info["cpp_one_site_engine_bond_evolutions"] = py::int_(bond_evolutions);
+        info["cpp_one_site_engine_left_qr_calls"] = py::int_(left_qr_calls);
+        info["cpp_one_site_engine_right_rq_calls"] = py::int_(right_rq_calls);
+        info["cpp_one_site_engine_environment_advances"] = py::int_(env_advances);
+
+        one_site_tdvp_sweep_site_evolutions += site_evolutions;
+        one_site_tdvp_sweep_bond_evolutions += bond_evolutions;
+        one_site_tdvp_sweep_left_qr_calls += left_qr_calls;
+        one_site_tdvp_sweep_right_rq_calls += right_rq_calls;
+        one_site_tdvp_sweep_environment_advances += env_advances;
+        one_site_tdvp_sweep_seconds += wall_seconds() - sweep_start;
+        one_site_tdvp_sweep_last_error.clear();
+        return py::make_tuple(out_sites, info);
+    } catch (const py::error_already_set& exc) {
+        ++one_site_tdvp_sweep_failures;
+        one_site_tdvp_sweep_seconds += wall_seconds() - sweep_start;
+        one_site_tdvp_sweep_last_error = exc.what();
+        throw;
+    } catch (const std::exception& exc) {
+        ++one_site_tdvp_sweep_failures;
+        one_site_tdvp_sweep_seconds += wall_seconds() - sweep_start;
+        one_site_tdvp_sweep_last_error = exc.what();
+        throw;
+    }
 }
 
 py::tuple CppMovingEnvironment::sweep_environment_step(
@@ -39678,6 +41468,1714 @@ static py::dict build_spatial_qchem_block2_setup(
     return out;
 }
 
+static py::array_t<cdouble> dense_two_site_matvec_cpp(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> v
+) {
+    if (E.ndim() != 3 || W.ndim() != 4 || F.ndim() != 3) {
+        throw std::invalid_argument(
+            "dense_two_site_matvec expects E(rank 3), W(rank 4), F(rank 3)"
+        );
+    }
+    ssize_t v_size = 1;
+    for (ssize_t axis = 0; axis < v.ndim(); ++axis) {
+        v_size *= v.shape(axis);
+    }
+    const ssize_t mpo_l = E.shape(0);
+    const ssize_t bra_l = E.shape(1);
+    const ssize_t ket_l = E.shape(2);
+    const ssize_t mpo_r = W.shape(1);
+    const ssize_t phys_out = W.shape(2);
+    const ssize_t phys_in = W.shape(3);
+    const ssize_t bra_r = F.shape(1);
+    const ssize_t ket_r = F.shape(2);
+    if (W.shape(0) != mpo_l || F.shape(0) != mpo_r) {
+        throw std::invalid_argument("dense_two_site_matvec MPO bond mismatch");
+    }
+    if (v_size != ket_l * phys_in * ket_r) {
+        throw std::invalid_argument("dense_two_site_matvec vector size mismatch");
+    }
+
+    auto e = E.unchecked<3>();
+    auto w = W.unchecked<4>();
+    auto f = F.unchecked<3>();
+    const cdouble* x = static_cast<const cdouble*>(v.request().ptr);
+    py::array_t<cdouble> out({bra_l * phys_out * bra_r});
+    cdouble* y = static_cast<cdouble*>(out.request().ptr);
+
+    for (ssize_t i = 0; i < bra_l; ++i) {
+        for (ssize_t p = 0; p < phys_out; ++p) {
+            for (ssize_t j = 0; j < bra_r; ++j) {
+                cdouble total = 0.0;
+                for (ssize_t a = 0; a < mpo_l; ++a) {
+                    for (ssize_t b = 0; b < mpo_r; ++b) {
+                        for (ssize_t k = 0; k < ket_l; ++k) {
+                            const cdouble e_val = e(a, i, k);
+                            for (ssize_t s = 0; s < phys_in; ++s) {
+                                const cdouble ew_val = e_val * w(a, b, p, s);
+                                const ssize_t base = (k * phys_in + s) * ket_r;
+                                for (ssize_t l = 0; l < ket_r; ++l) {
+                                    total += ew_val * x[base + l] * f(b, j, l);
+                                }
+                            }
+                        }
+                    }
+                }
+                y[(i * phys_out + p) * bra_r + j] = total;
+            }
+        }
+    }
+    return out;
+}
+
+class CppDenseDavidsonWorkspace {
+public:
+    void bind(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+    ) {
+        const double start = wall_seconds();
+        problem.bind(std::move(E), std::move(W), std::move(F));
+        ++bind_calls;
+        bind_seconds += wall_seconds() - start;
+    }
+
+    void bind_boundaries(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+    ) {
+        const double start = wall_seconds();
+        problem.bind_boundaries(std::move(E), std::move(F));
+        ++bind_calls;
+        bind_seconds += wall_seconds() - start;
+    }
+
+    py::array_t<cdouble> matvec(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v,
+        const std::string& backend = "blas"
+    ) {
+        ensure_bound();
+        const ssize_t dim = checked_flat_size(v);
+        if (dim != problem.input_dim()) {
+            throw std::runtime_error("DenseDavidsonWorkspace matvec vector dimension mismatch");
+        }
+        std::vector<cdouble> x(static_cast<size_t>(dim));
+        const cdouble* ptr = static_cast<const cdouble*>(v.request().ptr);
+        std::copy(ptr, ptr + dim, x.begin());
+        std::vector<cdouble> y = matvec_vector(x, backend);
+        return array_from_vector(y);
+    }
+
+    py::array_t<cdouble> diagonal() {
+        ensure_bound();
+        ++diagonal_calls;
+        return array_from_vector(problem.diagonal());
+    }
+
+    py::dict solve_bound(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas"
+    ) {
+        ensure_bound();
+        if (problem.input_dim() != problem.output_dim()) {
+            throw std::runtime_error(
+                "DenseDavidsonWorkspace Davidson solve requires a square local problem"
+            );
+        }
+        const ssize_t dim = checked_flat_size(v0);
+        if (dim != problem.input_dim()) {
+            throw std::runtime_error(
+                "DenseDavidsonWorkspace Davidson vector dimension mismatch"
+            );
+        }
+        std::vector<cdouble> v(static_cast<size_t>(dim));
+        const cdouble* ptr = static_cast<const cdouble*>(v0.request().ptr);
+        std::copy(ptr, ptr + dim, v.begin());
+        std::vector<cdouble> diag = problem.diagonal();
+        ++diagonal_calls;
+        const bool reused = davidson_workspace.initialized;
+        const long long matvec_before = matvec_calls;
+        const double start = wall_seconds();
+        py::dict out = ::davidson(
+            dim,
+            diag,
+            std::move(v),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            davidson_workspace,
+            [this, backend](const std::vector<cdouble>& x) {
+                return this->matvec_vector(x, backend);
+            }
+        );
+        const double elapsed = wall_seconds() - start;
+        ++solve_calls;
+        solve_seconds += elapsed;
+        if (reused) {
+            ++workspace_reuses;
+        }
+        out["kind"] = py::str("cpp_dense_davidson");
+        out["backend"] = py::str(last_matvec_backend);
+        out["workspace_reused"] = py::bool_(reused);
+        out["matvec_calls"] = py::int_(matvec_calls - matvec_before);
+        out["seconds"] = py::float_(elapsed);
+        return out;
+    }
+
+    py::dict solve_bound_block(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        int block_size = 2
+    ) {
+        ensure_bound();
+        if (problem.input_dim() != problem.output_dim()) {
+            throw std::runtime_error(
+                "DenseDavidsonWorkspace block Davidson solve requires a square local problem"
+            );
+        }
+        const ssize_t dim = checked_flat_size(v0);
+        if (dim != problem.input_dim()) {
+            throw std::runtime_error(
+                "DenseDavidsonWorkspace block Davidson vector dimension mismatch"
+            );
+        }
+        std::vector<cdouble> v(static_cast<size_t>(dim));
+        const cdouble* ptr = static_cast<const cdouble*>(v0.request().ptr);
+        std::copy(ptr, ptr + dim, v.begin());
+        std::vector<cdouble> diag = problem.diagonal();
+        ++diagonal_calls;
+        const bool reused = davidson_workspace.initialized;
+        const long long matvec_before = matvec_calls;
+        const double start = wall_seconds();
+        py::dict out = ::block_davidson(
+            dim,
+            diag,
+            std::move(v),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            block_size,
+            davidson_workspace,
+            [this, backend](const std::vector<std::vector<cdouble>>& xs) {
+                return this->matvec_vectors(xs, backend);
+            }
+        );
+        const double elapsed = wall_seconds() - start;
+        ++solve_calls;
+        ++block_solve_calls;
+        solve_seconds += elapsed;
+        block_solve_seconds += elapsed;
+        if (reused) {
+            ++workspace_reuses;
+        }
+        out["kind"] = py::str("cpp_dense_block_davidson");
+        out["backend"] = py::str(last_matvec_backend);
+        out["workspace_reused"] = py::bool_(reused);
+        out["matvec_calls"] = py::int_(matvec_calls - matvec_before);
+        out["seconds"] = py::float_(elapsed);
+        return out;
+    }
+
+    py::dict solve(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas"
+    ) {
+        bind(std::move(E), std::move(W), std::move(F));
+        return solve_bound(std::move(v0), tol, max_iter, restart_dim, accept_unconverged, backend);
+    }
+
+    py::dict solve_block(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        int block_size = 2
+    ) {
+        bind(std::move(E), std::move(W), std::move(F));
+        return solve_bound_block(
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend,
+            block_size
+        );
+    }
+
+    py::dict stats() const {
+        py::dict out;
+        out["bind_calls"] = py::int_(bind_calls);
+        out["bind_seconds"] = py::float_(bind_seconds);
+        out["solve_calls"] = py::int_(solve_calls);
+        out["solve_seconds"] = py::float_(solve_seconds);
+        out["block_solve_calls"] = py::int_(block_solve_calls);
+        out["block_solve_seconds"] = py::float_(block_solve_seconds);
+        out["workspace_reuses"] = py::int_(workspace_reuses);
+        out["matvec_calls"] = py::int_(matvec_calls);
+        out["matvec_seconds"] = py::float_(matvec_seconds);
+        out["batched_matvec_calls"] = py::int_(batched_matvec_calls);
+        out["batched_matvec_vectors"] = py::int_(batched_matvec_vectors);
+        out["blas_matvec_calls"] = py::int_(blas_matvec_calls);
+        out["loop_matvec_calls"] = py::int_(loop_matvec_calls);
+        out["diagonal_calls"] = py::int_(diagonal_calls);
+        out["last_matvec_backend"] = py::str(last_matvec_backend);
+        out["bound"] = py::bool_(problem.bound);
+        out["input_dim"] = py::int_(problem.bound ? problem.input_dim() : 0);
+        out["output_dim"] = py::int_(problem.bound ? problem.output_dim() : 0);
+        return out;
+    }
+
+    void reset_stats() {
+        bind_calls = 0;
+        solve_calls = 0;
+        block_solve_calls = 0;
+        workspace_reuses = 0;
+        matvec_calls = 0;
+        batched_matvec_calls = 0;
+        batched_matvec_vectors = 0;
+        blas_matvec_calls = 0;
+        loop_matvec_calls = 0;
+        diagonal_calls = 0;
+        bind_seconds = 0.0;
+        solve_seconds = 0.0;
+        block_solve_seconds = 0.0;
+        matvec_seconds = 0.0;
+        last_matvec_backend = "unbound";
+    }
+
+private:
+    struct DenseTwoSiteProblem {
+        bool bound = false;
+        ssize_t mpo_l = 0;
+        ssize_t mpo_r = 0;
+        ssize_t bra_l = 0;
+        ssize_t ket_l = 0;
+        ssize_t phys_out = 0;
+        ssize_t phys_in = 0;
+        ssize_t bra_r = 0;
+        ssize_t ket_r = 0;
+        std::vector<cdouble> e_data;
+        std::vector<cdouble> w_data;
+        std::vector<cdouble> f_data;
+        std::vector<cdouble> w_matrix;
+        std::vector<cdouble> f_matrix;
+        mutable std::vector<cdouble> scratch_t1;
+        mutable std::vector<cdouble> scratch_x;
+        mutable std::vector<cdouble> scratch_y;
+        mutable std::vector<cdouble> scratch_xp;
+        mutable std::vector<cdouble> scratch_rp;
+
+        void bind(
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+        ) {
+            if (E.ndim() != 3 || W.ndim() != 4 || F.ndim() != 3) {
+                throw std::invalid_argument(
+                    "DenseDavidsonWorkspace expects E(rank 3), W(rank 4), F(rank 3)"
+                );
+            }
+            mpo_l = E.shape(0);
+            bra_l = E.shape(1);
+            ket_l = E.shape(2);
+            if (W.shape(0) != mpo_l) {
+                throw std::invalid_argument("DenseDavidsonWorkspace left MPO bond mismatch");
+            }
+            mpo_r = W.shape(1);
+            phys_out = W.shape(2);
+            phys_in = W.shape(3);
+            if (F.shape(0) != mpo_r) {
+                throw std::invalid_argument("DenseDavidsonWorkspace right MPO bond mismatch");
+            }
+            bra_r = F.shape(1);
+            ket_r = F.shape(2);
+            copy_flat(E, e_data);
+            copy_flat(W, w_data);
+            copy_flat(F, f_data);
+            build_w_matrix();
+            build_f_matrix();
+            resize_scratch();
+            bound = true;
+        }
+
+        void bind_boundaries(
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+        ) {
+            if (!bound) {
+                throw std::runtime_error(
+                    "DenseDavidsonWorkspace boundary refresh requires a bound MPO tensor"
+                );
+            }
+            if (E.ndim() != 3 || F.ndim() != 3) {
+                throw std::invalid_argument(
+                    "DenseDavidsonWorkspace boundary refresh expects E(rank 3), F(rank 3)"
+                );
+            }
+            if (E.shape(0) != mpo_l || F.shape(0) != mpo_r) {
+                throw std::invalid_argument(
+                    "DenseDavidsonWorkspace boundary refresh MPO bond mismatch"
+                );
+            }
+            bra_l = E.shape(1);
+            ket_l = E.shape(2);
+            bra_r = F.shape(1);
+            ket_r = F.shape(2);
+            copy_flat(E, e_data);
+            copy_flat(F, f_data);
+            build_f_matrix();
+            resize_scratch();
+        }
+
+        ssize_t input_dim() const {
+            return ket_l * phys_in * ket_r;
+        }
+
+        ssize_t output_dim() const {
+            return bra_l * phys_out * bra_r;
+        }
+
+        std::vector<cdouble> diagonal() const {
+            if (bra_l != ket_l || phys_out != phys_in || bra_r != ket_r) {
+                throw std::runtime_error(
+                    "DenseDavidsonWorkspace diagonal requires matching bra/ket dimensions"
+                );
+            }
+            std::vector<cdouble> diag(static_cast<size_t>(input_dim()), cdouble(0.0, 0.0));
+            for (ssize_t k = 0; k < ket_l; ++k) {
+                for (ssize_t s = 0; s < phys_in; ++s) {
+                    for (ssize_t l = 0; l < ket_r; ++l) {
+                        cdouble total = cdouble(0.0, 0.0);
+                        for (ssize_t a = 0; a < mpo_l; ++a) {
+                            const cdouble e_val = e_data[e_index(a, k, k)];
+                            for (ssize_t b = 0; b < mpo_r; ++b) {
+                                total += e_val * w_data[w_index(a, b, s, s)]
+                                    * f_data[f_index(b, l, l)];
+                            }
+                        }
+                        diag[static_cast<size_t>((k * phys_in + s) * ket_r + l)] = total;
+                    }
+                }
+            }
+            return diag;
+        }
+
+        std::vector<cdouble> matvec_loop(const std::vector<cdouble>& x) const {
+            std::vector<cdouble> out(static_cast<size_t>(output_dim()), cdouble(0.0, 0.0));
+            for (ssize_t i = 0; i < bra_l; ++i) {
+                for (ssize_t p = 0; p < phys_out; ++p) {
+                    for (ssize_t j = 0; j < bra_r; ++j) {
+                        cdouble total = cdouble(0.0, 0.0);
+                        for (ssize_t a = 0; a < mpo_l; ++a) {
+                            for (ssize_t b = 0; b < mpo_r; ++b) {
+                                for (ssize_t k = 0; k < ket_l; ++k) {
+                                    const cdouble e_val = e_data[e_index(a, i, k)];
+                                    for (ssize_t s = 0; s < phys_in; ++s) {
+                                        const cdouble ew_val =
+                                            e_val * w_data[w_index(a, b, p, s)];
+                                        const ssize_t base = (k * phys_in + s) * ket_r;
+                                        for (ssize_t l = 0; l < ket_r; ++l) {
+                                            total += ew_val
+                                                * x[static_cast<size_t>(base + l)]
+                                                * f_data[f_index(b, j, l)];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out[static_cast<size_t>((i * phys_out + p) * bra_r + j)] = total;
+                    }
+                }
+            }
+            return out;
+        }
+
+        std::vector<cdouble> matvec_blas_or_loop(const std::vector<cdouble>& x) const {
+#ifdef __APPLE__
+            const ssize_t n_sl = phys_in * ket_r;
+            const ssize_t m1 = bra_l * ket_r;
+            const ssize_t k1 = mpo_l * phys_in;
+            const ssize_t n1 = mpo_r * phys_out;
+            const ssize_t k2 = ket_r * mpo_r;
+            const bool dims_fit =
+                bra_l <= std::numeric_limits<int>::max()
+                && n_sl <= std::numeric_limits<int>::max()
+                && ket_l <= std::numeric_limits<int>::max()
+                && m1 <= std::numeric_limits<int>::max()
+                && k1 <= std::numeric_limits<int>::max()
+                && n1 <= std::numeric_limits<int>::max()
+                && k2 <= std::numeric_limits<int>::max()
+                && bra_r <= std::numeric_limits<int>::max();
+            if (!dims_fit) {
+                return matvec_loop(x);
+            }
+            const cdouble alpha(1.0, 0.0);
+            const cdouble beta0(0.0, 0.0);
+            for (ssize_t a = 0; a < mpo_l; ++a) {
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(bra_l),
+                    static_cast<int>(n_sl),
+                    static_cast<int>(ket_l),
+                    &alpha,
+                    e_data.data() + static_cast<size_t>(a * bra_l * ket_l),
+                    static_cast<int>(ket_l),
+                    x.data(),
+                    static_cast<int>(n_sl),
+                    &beta0,
+                    scratch_t1.data(),
+                    static_cast<int>(n_sl)
+                );
+                for (ssize_t i = 0; i < bra_l; ++i) {
+                    for (ssize_t s = 0; s < phys_in; ++s) {
+                        for (ssize_t l = 0; l < ket_r; ++l) {
+                            scratch_x[
+                                static_cast<size_t>((i * ket_r + l) * k1 + a * phys_in + s)
+                            ] = scratch_t1[
+                                static_cast<size_t>(i * n_sl + s * ket_r + l)
+                            ];
+                        }
+                    }
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(m1),
+                static_cast<int>(n1),
+                static_cast<int>(k1),
+                &alpha,
+                scratch_x.data(),
+                static_cast<int>(k1),
+                w_matrix.data(),
+                static_cast<int>(n1),
+                &beta0,
+                scratch_y.data(),
+                static_cast<int>(n1)
+            );
+            std::vector<cdouble> out(static_cast<size_t>(output_dim()), cdouble(0.0, 0.0));
+            for (ssize_t p = 0; p < phys_out; ++p) {
+                for (ssize_t i = 0; i < bra_l; ++i) {
+                    for (ssize_t l = 0; l < ket_r; ++l) {
+                        for (ssize_t b = 0; b < mpo_r; ++b) {
+                            scratch_xp[static_cast<size_t>(i * k2 + l * mpo_r + b)] =
+                                scratch_y[static_cast<size_t>(
+                                    (i * ket_r + l) * n1 + b * phys_out + p
+                                )];
+                        }
+                    }
+                }
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(bra_l),
+                    static_cast<int>(bra_r),
+                    static_cast<int>(k2),
+                    &alpha,
+                    scratch_xp.data(),
+                    static_cast<int>(k2),
+                    f_matrix.data(),
+                    static_cast<int>(bra_r),
+                    &beta0,
+                    scratch_rp.data(),
+                    static_cast<int>(bra_r)
+                );
+                for (ssize_t i = 0; i < bra_l; ++i) {
+                    for (ssize_t j = 0; j < bra_r; ++j) {
+                        out[static_cast<size_t>((i * phys_out + p) * bra_r + j)] =
+                            scratch_rp[static_cast<size_t>(i * bra_r + j)];
+                    }
+                }
+            }
+            return out;
+#else
+            return matvec_loop(x);
+#endif
+        }
+
+        std::vector<std::vector<cdouble>> matvec_blas_many_or_loop(
+            const std::vector<std::vector<cdouble>>& xs
+        ) const {
+            const ssize_t nvec = static_cast<ssize_t>(xs.size());
+            std::vector<std::vector<cdouble>> outs(
+                static_cast<size_t>(nvec),
+                std::vector<cdouble>(static_cast<size_t>(output_dim()), cdouble(0.0, 0.0))
+            );
+            if (nvec == 0) {
+                return outs;
+            }
+#ifdef __APPLE__
+            const ssize_t in_dim = input_dim();
+            for (const auto& x : xs) {
+                if (static_cast<ssize_t>(x.size()) != in_dim) {
+                    throw std::runtime_error("DenseDavidsonWorkspace batched matvec input dimension mismatch");
+                }
+            }
+            const ssize_t n_sl = phys_in * ket_r;
+            const ssize_t m1 = bra_l * ket_r;
+            const ssize_t k1 = mpo_l * phys_in;
+            const ssize_t n1 = mpo_r * phys_out;
+            const ssize_t k2 = ket_r * mpo_r;
+            const ssize_t n_sl_many = n_sl * nvec;
+            const ssize_t rows_x_many = m1 * nvec;
+            const ssize_t rows_rp_many = bra_l * nvec;
+            const bool dims_fit =
+                bra_l <= std::numeric_limits<int>::max()
+                && n_sl_many <= std::numeric_limits<int>::max()
+                && ket_l <= std::numeric_limits<int>::max()
+                && rows_x_many <= std::numeric_limits<int>::max()
+                && k1 <= std::numeric_limits<int>::max()
+                && n1 <= std::numeric_limits<int>::max()
+                && rows_rp_many <= std::numeric_limits<int>::max()
+                && k2 <= std::numeric_limits<int>::max()
+                && bra_r <= std::numeric_limits<int>::max();
+            if (!dims_fit) {
+                for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                    outs[static_cast<size_t>(ivec)] =
+                        matvec_loop(xs[static_cast<size_t>(ivec)]);
+                }
+                return outs;
+            }
+            const cdouble alpha(1.0, 0.0);
+            const cdouble beta0(0.0, 0.0);
+            std::vector<cdouble> x_many(
+                static_cast<size_t>(ket_l * n_sl_many),
+                cdouble(0.0, 0.0)
+            );
+            std::vector<cdouble> t1_many(
+                static_cast<size_t>(bra_l * n_sl_many),
+                cdouble(0.0, 0.0)
+            );
+            std::vector<cdouble> scratch_x_many(
+                static_cast<size_t>(rows_x_many * k1),
+                cdouble(0.0, 0.0)
+            );
+            std::vector<cdouble> scratch_y_many(
+                static_cast<size_t>(rows_x_many * n1),
+                cdouble(0.0, 0.0)
+            );
+            std::vector<cdouble> scratch_xp_many(
+                static_cast<size_t>(rows_rp_many * k2),
+                cdouble(0.0, 0.0)
+            );
+            std::vector<cdouble> scratch_rp_many(
+                static_cast<size_t>(rows_rp_many * bra_r),
+                cdouble(0.0, 0.0)
+            );
+            for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                const auto& x = xs[static_cast<size_t>(ivec)];
+                for (ssize_t k = 0; k < ket_l; ++k) {
+                    for (ssize_t s = 0; s < phys_in; ++s) {
+                        for (ssize_t l = 0; l < ket_r; ++l) {
+                            x_many[static_cast<size_t>(
+                                k * n_sl_many + ivec * n_sl + s * ket_r + l
+                            )] = x[static_cast<size_t>((k * phys_in + s) * ket_r + l)];
+                        }
+                    }
+                }
+            }
+            for (ssize_t a = 0; a < mpo_l; ++a) {
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(bra_l),
+                    static_cast<int>(n_sl_many),
+                    static_cast<int>(ket_l),
+                    &alpha,
+                    e_data.data() + static_cast<size_t>(a * bra_l * ket_l),
+                    static_cast<int>(ket_l),
+                    x_many.data(),
+                    static_cast<int>(n_sl_many),
+                    &beta0,
+                    t1_many.data(),
+                    static_cast<int>(n_sl_many)
+                );
+                for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                    for (ssize_t i = 0; i < bra_l; ++i) {
+                        for (ssize_t s = 0; s < phys_in; ++s) {
+                            for (ssize_t l = 0; l < ket_r; ++l) {
+                                scratch_x_many[static_cast<size_t>(
+                                    (ivec * m1 + i * ket_r + l) * k1
+                                    + a * phys_in + s
+                                )] = t1_many[static_cast<size_t>(
+                                    i * n_sl_many + ivec * n_sl + s * ket_r + l
+                                )];
+                            }
+                        }
+                    }
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(rows_x_many),
+                static_cast<int>(n1),
+                static_cast<int>(k1),
+                &alpha,
+                scratch_x_many.data(),
+                static_cast<int>(k1),
+                w_matrix.data(),
+                static_cast<int>(n1),
+                &beta0,
+                scratch_y_many.data(),
+                static_cast<int>(n1)
+            );
+            for (ssize_t p = 0; p < phys_out; ++p) {
+                for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                    for (ssize_t i = 0; i < bra_l; ++i) {
+                        for (ssize_t l = 0; l < ket_r; ++l) {
+                            for (ssize_t b = 0; b < mpo_r; ++b) {
+                                scratch_xp_many[static_cast<size_t>(
+                                    (ivec * bra_l + i) * k2 + l * mpo_r + b
+                                )] = scratch_y_many[static_cast<size_t>(
+                                    (ivec * m1 + i * ket_r + l) * n1
+                                    + b * phys_out + p
+                                )];
+                            }
+                        }
+                    }
+                }
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(rows_rp_many),
+                    static_cast<int>(bra_r),
+                    static_cast<int>(k2),
+                    &alpha,
+                    scratch_xp_many.data(),
+                    static_cast<int>(k2),
+                    f_matrix.data(),
+                    static_cast<int>(bra_r),
+                    &beta0,
+                    scratch_rp_many.data(),
+                    static_cast<int>(bra_r)
+                );
+                for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                    auto& out = outs[static_cast<size_t>(ivec)];
+                    for (ssize_t i = 0; i < bra_l; ++i) {
+                        for (ssize_t j = 0; j < bra_r; ++j) {
+                            out[static_cast<size_t>((i * phys_out + p) * bra_r + j)] =
+                                scratch_rp_many[static_cast<size_t>(
+                                    (ivec * bra_l + i) * bra_r + j
+                                )];
+                        }
+                    }
+                }
+            }
+            return outs;
+#else
+            for (ssize_t ivec = 0; ivec < nvec; ++ivec) {
+                outs[static_cast<size_t>(ivec)] =
+                    matvec_loop(xs[static_cast<size_t>(ivec)]);
+            }
+            return outs;
+#endif
+        }
+
+    private:
+        static void copy_flat(const py::array_t<cdouble>& arr, std::vector<cdouble>& out) {
+            ssize_t size = 1;
+            for (ssize_t axis = 0; axis < arr.ndim(); ++axis) {
+                size *= arr.shape(axis);
+            }
+            const cdouble* ptr = static_cast<const cdouble*>(arr.request().ptr);
+            out.assign(ptr, ptr + size);
+        }
+
+        size_t e_index(ssize_t a, ssize_t i, ssize_t k) const {
+            return static_cast<size_t>((a * bra_l + i) * ket_l + k);
+        }
+
+        size_t w_index(ssize_t a, ssize_t b, ssize_t p, ssize_t s) const {
+            return static_cast<size_t>(((a * mpo_r + b) * phys_out + p) * phys_in + s);
+        }
+
+        size_t f_index(ssize_t b, ssize_t j, ssize_t l) const {
+            return static_cast<size_t>((b * bra_r + j) * ket_r + l);
+        }
+
+        void build_w_matrix() {
+            const ssize_t k1 = mpo_l * phys_in;
+            const ssize_t n1 = mpo_r * phys_out;
+            w_matrix.assign(static_cast<size_t>(k1 * n1), cdouble(0.0, 0.0));
+            for (ssize_t a = 0; a < mpo_l; ++a) {
+                for (ssize_t s = 0; s < phys_in; ++s) {
+                    for (ssize_t b = 0; b < mpo_r; ++b) {
+                        for (ssize_t p = 0; p < phys_out; ++p) {
+                            w_matrix[static_cast<size_t>(
+                                (a * phys_in + s) * n1 + b * phys_out + p
+                            )] = w_data[w_index(a, b, p, s)];
+                        }
+                    }
+                }
+            }
+        }
+
+        void build_f_matrix() {
+            const ssize_t k2 = ket_r * mpo_r;
+            f_matrix.assign(static_cast<size_t>(k2 * bra_r), cdouble(0.0, 0.0));
+            for (ssize_t l = 0; l < ket_r; ++l) {
+                for (ssize_t b = 0; b < mpo_r; ++b) {
+                    for (ssize_t j = 0; j < bra_r; ++j) {
+                        f_matrix[static_cast<size_t>((l * mpo_r + b) * bra_r + j)] =
+                            f_data[f_index(b, j, l)];
+                    }
+                }
+            }
+        }
+
+        void resize_scratch() const {
+            const ssize_t n_sl = phys_in * ket_r;
+            const ssize_t m1 = bra_l * ket_r;
+            const ssize_t k1 = mpo_l * phys_in;
+            const ssize_t n1 = mpo_r * phys_out;
+            const ssize_t k2 = ket_r * mpo_r;
+            scratch_t1.resize(static_cast<size_t>(bra_l * n_sl));
+            scratch_x.resize(static_cast<size_t>(m1 * k1));
+            scratch_y.resize(static_cast<size_t>(m1 * n1));
+            scratch_xp.resize(static_cast<size_t>(bra_l * k2));
+            scratch_rp.resize(static_cast<size_t>(bra_l * bra_r));
+        }
+    };
+
+    DenseTwoSiteProblem problem;
+    DavidsonWorkspace davidson_workspace;
+    long long bind_calls = 0;
+    long long solve_calls = 0;
+    long long block_solve_calls = 0;
+    long long workspace_reuses = 0;
+    long long matvec_calls = 0;
+    long long batched_matvec_calls = 0;
+    long long batched_matvec_vectors = 0;
+    long long blas_matvec_calls = 0;
+    long long loop_matvec_calls = 0;
+    long long diagonal_calls = 0;
+    double bind_seconds = 0.0;
+    double solve_seconds = 0.0;
+    double block_solve_seconds = 0.0;
+    double matvec_seconds = 0.0;
+    std::string last_matvec_backend = "unbound";
+
+    void ensure_bound() const {
+        if (!problem.bound) {
+            throw std::runtime_error("DenseDavidsonWorkspace is not bound to a local problem");
+        }
+    }
+
+    static ssize_t checked_flat_size(const py::array_t<cdouble>& arr) {
+        ssize_t size = 1;
+        for (ssize_t axis = 0; axis < arr.ndim(); ++axis) {
+            size *= arr.shape(axis);
+        }
+        return size;
+    }
+
+    static py::array_t<cdouble> array_from_vector(const std::vector<cdouble>& values) {
+        py::array_t<cdouble> out(static_cast<ssize_t>(values.size()));
+        auto mut = out.mutable_unchecked<1>();
+        for (ssize_t i = 0; i < static_cast<ssize_t>(values.size()); ++i) {
+            mut(i) = values[static_cast<size_t>(i)];
+        }
+        return out;
+    }
+
+    std::vector<cdouble> matvec_vector(
+        const std::vector<cdouble>& x,
+        const std::string& backend
+    ) {
+        const double start = wall_seconds();
+        std::vector<cdouble> y;
+        if (backend == "loop" || backend == "scalar") {
+            y = problem.matvec_loop(x);
+            ++loop_matvec_calls;
+            last_matvec_backend = "loop";
+        } else {
+            y = problem.matvec_blas_or_loop(x);
+#ifdef __APPLE__
+            ++blas_matvec_calls;
+            last_matvec_backend = "blas";
+#else
+            ++loop_matvec_calls;
+            last_matvec_backend = "loop";
+#endif
+        }
+        ++matvec_calls;
+        matvec_seconds += wall_seconds() - start;
+        return y;
+    }
+
+    std::vector<std::vector<cdouble>> matvec_vectors(
+        const std::vector<std::vector<cdouble>>& xs,
+        const std::string& backend
+    ) {
+        const double start = wall_seconds();
+        std::vector<std::vector<cdouble>> ys;
+        if (backend == "loop" || backend == "scalar") {
+            ys.reserve(xs.size());
+            for (const auto& x : xs) {
+                ys.push_back(problem.matvec_loop(x));
+            }
+            loop_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = "loop";
+        } else if (xs.size() <= 1) {
+            ys.reserve(xs.size());
+            for (const auto& x : xs) {
+                ys.push_back(problem.matvec_blas_or_loop(x));
+            }
+#ifdef __APPLE__
+            blas_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = "blas";
+#else
+            loop_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = "loop";
+#endif
+        } else {
+            ys = problem.matvec_blas_many_or_loop(xs);
+#ifdef __APPLE__
+            blas_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = "blas";
+#else
+            loop_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = "loop";
+#endif
+        }
+        ++batched_matvec_calls;
+        batched_matvec_vectors += static_cast<long long>(xs.size());
+        matvec_calls += static_cast<long long>(xs.size());
+        matvec_seconds += wall_seconds() - start;
+        return ys;
+    }
+};
+
+static py::array_t<cdouble> dense_coarse_grain_mpo_cpp(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W1,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W2
+) {
+    if (W1.ndim() != 4 || W2.ndim() != 4) {
+        throw std::invalid_argument("dense_coarse_grain_mpo expects rank-4 MPO tensors");
+    }
+    const ssize_t wl = W1.shape(0);
+    const ssize_t wm = W1.shape(1);
+    const ssize_t d1_out = W1.shape(2);
+    const ssize_t d1_in = W1.shape(3);
+    if (W2.shape(0) != wm) {
+        throw std::invalid_argument("dense_coarse_grain_mpo MPO bond mismatch");
+    }
+    const ssize_t wr = W2.shape(1);
+    const ssize_t d2_out = W2.shape(2);
+    const ssize_t d2_in = W2.shape(3);
+    py::array_t<cdouble> out({wl, wr, d1_out * d2_out, d1_in * d2_in});
+    auto w1 = W1.unchecked<4>();
+    auto w2 = W2.unchecked<4>();
+    auto y = out.mutable_unchecked<4>();
+    for (ssize_t a = 0; a < wl; ++a) {
+        for (ssize_t c = 0; c < wr; ++c) {
+            for (ssize_t s = 0; s < d1_out; ++s) {
+                for (ssize_t u = 0; u < d2_out; ++u) {
+                    const ssize_t p = s * d2_out + u;
+                    for (ssize_t t = 0; t < d1_in; ++t) {
+                        for (ssize_t v = 0; v < d2_in; ++v) {
+                            cdouble total = cdouble(0.0, 0.0);
+                            for (ssize_t b = 0; b < wm; ++b) {
+                                total += w1(a, b, s, t) * w2(b, c, u, v);
+                            }
+                            y(a, c, p, t * d2_in + v) = total;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static py::array_t<cdouble> dense_coarse_grain_mps_cpp(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B
+) {
+    if (A.ndim() != 3 || B.ndim() != 3) {
+        throw std::invalid_argument("dense_coarse_grain_mps expects rank-3 site tensors");
+    }
+    const ssize_t chi_l = A.shape(0);
+    const ssize_t d_a = A.shape(1);
+    const ssize_t chi_m = A.shape(2);
+    if (B.shape(0) != chi_m) {
+        throw std::invalid_argument("dense_coarse_grain_mps MPS bond mismatch");
+    }
+    const ssize_t d_b = B.shape(1);
+    const ssize_t chi_r = B.shape(2);
+    py::array_t<cdouble> out({d_a * d_b, chi_l, chi_r});
+    auto a = A.unchecked<3>();
+    auto b = B.unchecked<3>();
+    cdouble* ptr = static_cast<cdouble*>(out.request().ptr);
+    std::fill(ptr, ptr + out.size(), cdouble(0.0, 0.0));
+    // Match the historical Python coarse_grain_MPS flat ordering exactly:
+    // reshape(tensordot(A, B, axes=(2, 0)), (dA*dB, chiL, chiR)).
+    for (ssize_t i = 0; i < chi_l; ++i) {
+        for (ssize_t s = 0; s < d_a; ++s) {
+            for (ssize_t u = 0; u < d_b; ++u) {
+                for (ssize_t j = 0; j < chi_r; ++j) {
+                    cdouble total = cdouble(0.0, 0.0);
+                    for (ssize_t m = 0; m < chi_m; ++m) {
+                        total += a(i, s, m) * b(m, u, j);
+                    }
+                    const ssize_t legacy_flat =
+                        (((i * d_a + s) * d_b + u) * chi_r + j);
+                    ptr[static_cast<size_t>(legacy_flat)] = total;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static py::array_t<cdouble> dense_environment_update_left_cpp(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B
+) {
+    if (W.ndim() != 4 || A.ndim() != 3 || E.ndim() != 3 || B.ndim() != 3) {
+        throw std::invalid_argument("dense_environment_update_left expects W4,A3,E3,B3");
+    }
+    const ssize_t mpo_l = W.shape(0);
+    const ssize_t mpo_r = W.shape(1);
+    const ssize_t d_out = W.shape(2);
+    const ssize_t d_in = W.shape(3);
+    if (E.shape(0) != mpo_l || A.shape(0) != E.shape(1) || B.shape(0) != E.shape(2)) {
+        throw std::invalid_argument("dense_environment_update_left left dimension mismatch");
+    }
+    if (A.shape(1) != d_out || B.shape(1) != d_in) {
+        throw std::invalid_argument("dense_environment_update_left physical dimension mismatch");
+    }
+    const ssize_t bra_l = A.shape(0);
+    const ssize_t ket_l = B.shape(0);
+    const ssize_t bra_r = A.shape(2);
+    const ssize_t ket_r = B.shape(2);
+    py::array_t<cdouble> out({mpo_r, bra_r, ket_r});
+#ifdef __APPLE__
+    const bool dims_fit =
+        bra_l <= std::numeric_limits<int>::max()
+        && ket_l <= std::numeric_limits<int>::max()
+        && bra_r <= std::numeric_limits<int>::max()
+        && ket_r <= std::numeric_limits<int>::max()
+        && d_out <= std::numeric_limits<int>::max()
+        && d_in <= std::numeric_limits<int>::max()
+        && mpo_r <= std::numeric_limits<int>::max()
+        && d_out * d_in <= std::numeric_limits<int>::max()
+        && bra_r * ket_r <= std::numeric_limits<int>::max();
+    if (dims_fit) {
+        const cdouble* w_ptr = static_cast<const cdouble*>(W.request().ptr);
+        const cdouble* a_ptr = static_cast<const cdouble*>(A.request().ptr);
+        const cdouble* e_ptr = static_cast<const cdouble*>(E.request().ptr);
+        const cdouble* b_ptr = static_cast<const cdouble*>(B.request().ptr);
+        cdouble* y_ptr = static_cast<cdouble*>(out.request().ptr);
+        std::fill(
+            y_ptr,
+            y_ptr + static_cast<size_t>(mpo_r * bra_r * ket_r),
+            cdouble(0.0, 0.0)
+        );
+        const ssize_t n_tl = d_in * ket_r;
+        const ssize_t k_st = d_out * d_in;
+        const ssize_t rows_jl = bra_r * ket_r;
+        std::vector<cdouble> t1(static_cast<size_t>(bra_l * n_tl));
+        std::vector<cdouble> a_s(static_cast<size_t>(bra_l * bra_r));
+        std::vector<cdouble> u(static_cast<size_t>(bra_r * n_tl));
+        std::vector<cdouble> q(static_cast<size_t>(rows_jl * k_st));
+        std::vector<cdouble> wmat(static_cast<size_t>(k_st * mpo_r));
+        std::vector<cdouble> r(static_cast<size_t>(rows_jl * mpo_r));
+        const cdouble alpha(1.0, 0.0);
+        const cdouble beta0(0.0, 0.0);
+        for (ssize_t aidx = 0; aidx < mpo_l; ++aidx) {
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(bra_l),
+                static_cast<int>(n_tl),
+                static_cast<int>(ket_l),
+                &alpha,
+                e_ptr + static_cast<size_t>(aidx * bra_l * ket_l),
+                static_cast<int>(ket_l),
+                b_ptr,
+                static_cast<int>(n_tl),
+                &beta0,
+                t1.data(),
+                static_cast<int>(n_tl)
+            );
+            std::fill(q.begin(), q.end(), cdouble(0.0, 0.0));
+            for (ssize_t s = 0; s < d_out; ++s) {
+                for (ssize_t i = 0; i < bra_l; ++i) {
+                    for (ssize_t j = 0; j < bra_r; ++j) {
+                        a_s[static_cast<size_t>(i * bra_r + j)] =
+                            a_ptr[static_cast<size_t>((i * d_out + s) * bra_r + j)];
+                    }
+                }
+                cblas_zgemm(
+                    101,
+                    113,
+                    111,
+                    static_cast<int>(bra_r),
+                    static_cast<int>(n_tl),
+                    static_cast<int>(bra_l),
+                    &alpha,
+                    a_s.data(),
+                    static_cast<int>(bra_r),
+                    t1.data(),
+                    static_cast<int>(n_tl),
+                    &beta0,
+                    u.data(),
+                    static_cast<int>(n_tl)
+                );
+                for (ssize_t j = 0; j < bra_r; ++j) {
+                    for (ssize_t t = 0; t < d_in; ++t) {
+                        for (ssize_t l = 0; l < ket_r; ++l) {
+                            q[static_cast<size_t>(
+                                (j * ket_r + l) * k_st + s * d_in + t
+                            )] = u[static_cast<size_t>(j * n_tl + t * ket_r + l)];
+                        }
+                    }
+                }
+            }
+            for (ssize_t s = 0; s < d_out; ++s) {
+                for (ssize_t t = 0; t < d_in; ++t) {
+                    for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+                        wmat[static_cast<size_t>((s * d_in + t) * mpo_r + beta)] =
+                            w_ptr[static_cast<size_t>(
+                                ((aidx * mpo_r + beta) * d_out + s) * d_in + t
+                            )];
+                    }
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(rows_jl),
+                static_cast<int>(mpo_r),
+                static_cast<int>(k_st),
+                &alpha,
+                q.data(),
+                static_cast<int>(k_st),
+                wmat.data(),
+                static_cast<int>(mpo_r),
+                &beta0,
+                r.data(),
+                static_cast<int>(mpo_r)
+            );
+            for (ssize_t j = 0; j < bra_r; ++j) {
+                for (ssize_t l = 0; l < ket_r; ++l) {
+                    for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+                        y_ptr[static_cast<size_t>((beta * bra_r + j) * ket_r + l)] +=
+                            r[static_cast<size_t>((j * ket_r + l) * mpo_r + beta)];
+                    }
+                }
+            }
+        }
+        return out;
+    }
+#endif
+    auto w = W.unchecked<4>();
+    auto a = A.unchecked<3>();
+    auto e = E.unchecked<3>();
+    auto b = B.unchecked<3>();
+    auto y = out.mutable_unchecked<3>();
+    for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+        for (ssize_t j = 0; j < bra_r; ++j) {
+            for (ssize_t l = 0; l < ket_r; ++l) {
+                cdouble total = cdouble(0.0, 0.0);
+                for (ssize_t alpha = 0; alpha < mpo_l; ++alpha) {
+                    for (ssize_t i = 0; i < E.shape(1); ++i) {
+                        for (ssize_t k = 0; k < E.shape(2); ++k) {
+                            const cdouble e_val = e(alpha, i, k);
+                            for (ssize_t s = 0; s < d_out; ++s) {
+                                const cdouble ea = e_val * std::conj(a(i, s, j));
+                                for (ssize_t t = 0; t < d_in; ++t) {
+                                    total += ea * w(alpha, beta, s, t) * b(k, t, l);
+                                }
+                            }
+                        }
+                    }
+                }
+                y(beta, j, l) = total;
+            }
+        }
+    }
+    return out;
+}
+
+static py::array_t<cdouble> dense_environment_update_right_cpp(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B
+) {
+    if (W.ndim() != 4 || A.ndim() != 3 || F.ndim() != 3 || B.ndim() != 3) {
+        throw std::invalid_argument("dense_environment_update_right expects W4,A3,F3,B3");
+    }
+    const ssize_t mpo_l = W.shape(0);
+    const ssize_t mpo_r = W.shape(1);
+    const ssize_t d_out = W.shape(2);
+    const ssize_t d_in = W.shape(3);
+    if (F.shape(0) != mpo_r || A.shape(2) != F.shape(1) || B.shape(2) != F.shape(2)) {
+        throw std::invalid_argument("dense_environment_update_right right dimension mismatch");
+    }
+    if (A.shape(1) != d_out || B.shape(1) != d_in) {
+        throw std::invalid_argument("dense_environment_update_right physical dimension mismatch");
+    }
+    const ssize_t bra_l = A.shape(0);
+    const ssize_t ket_l = B.shape(0);
+    const ssize_t bra_r = A.shape(2);
+    const ssize_t ket_r = B.shape(2);
+    py::array_t<cdouble> out({mpo_l, bra_l, ket_l});
+#ifdef __APPLE__
+    const bool dims_fit =
+        bra_l <= std::numeric_limits<int>::max()
+        && ket_l <= std::numeric_limits<int>::max()
+        && bra_r <= std::numeric_limits<int>::max()
+        && ket_r <= std::numeric_limits<int>::max()
+        && d_out <= std::numeric_limits<int>::max()
+        && d_in <= std::numeric_limits<int>::max()
+        && mpo_l <= std::numeric_limits<int>::max()
+        && d_out * d_in <= std::numeric_limits<int>::max()
+        && bra_l * ket_l <= std::numeric_limits<int>::max();
+    if (dims_fit) {
+        const cdouble* w_ptr = static_cast<const cdouble*>(W.request().ptr);
+        const cdouble* a_ptr = static_cast<const cdouble*>(A.request().ptr);
+        const cdouble* f_ptr = static_cast<const cdouble*>(F.request().ptr);
+        const cdouble* b_ptr = static_cast<const cdouble*>(B.request().ptr);
+        cdouble* y_ptr = static_cast<cdouble*>(out.request().ptr);
+        std::fill(
+            y_ptr,
+            y_ptr + static_cast<size_t>(mpo_l * bra_l * ket_l),
+            cdouble(0.0, 0.0)
+        );
+        const ssize_t k_st = d_out * d_in;
+        const ssize_t rows_ik = bra_l * ket_l;
+        std::vector<cdouble> a_s(static_cast<size_t>(bra_l * bra_r));
+        std::vector<cdouble> u(static_cast<size_t>(bra_l * ket_r));
+        std::vector<cdouble> b_t(static_cast<size_t>(ket_l * ket_r));
+        std::vector<cdouble> ik(static_cast<size_t>(bra_l * ket_l));
+        std::vector<cdouble> q(static_cast<size_t>(rows_ik * k_st));
+        std::vector<cdouble> wmat(static_cast<size_t>(k_st * mpo_l));
+        std::vector<cdouble> r(static_cast<size_t>(rows_ik * mpo_l));
+        const cdouble alpha(1.0, 0.0);
+        const cdouble beta0(0.0, 0.0);
+        for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+            const cdouble* f_beta =
+                f_ptr + static_cast<size_t>(beta * bra_r * ket_r);
+            std::fill(q.begin(), q.end(), cdouble(0.0, 0.0));
+            for (ssize_t s = 0; s < d_out; ++s) {
+                for (ssize_t i = 0; i < bra_l; ++i) {
+                    for (ssize_t j = 0; j < bra_r; ++j) {
+                        a_s[static_cast<size_t>(i * bra_r + j)] =
+                            std::conj(a_ptr[static_cast<size_t>(
+                                (i * d_out + s) * bra_r + j
+                            )]);
+                    }
+                }
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(bra_l),
+                    static_cast<int>(ket_r),
+                    static_cast<int>(bra_r),
+                    &alpha,
+                    a_s.data(),
+                    static_cast<int>(bra_r),
+                    f_beta,
+                    static_cast<int>(ket_r),
+                    &beta0,
+                    u.data(),
+                    static_cast<int>(ket_r)
+                );
+                for (ssize_t t = 0; t < d_in; ++t) {
+                    for (ssize_t k = 0; k < ket_l; ++k) {
+                        for (ssize_t l = 0; l < ket_r; ++l) {
+                            b_t[static_cast<size_t>(k * ket_r + l)] =
+                                b_ptr[static_cast<size_t>((k * d_in + t) * ket_r + l)];
+                        }
+                    }
+                    cblas_zgemm(
+                        101,
+                        111,
+                        112,
+                        static_cast<int>(bra_l),
+                        static_cast<int>(ket_l),
+                        static_cast<int>(ket_r),
+                        &alpha,
+                        u.data(),
+                        static_cast<int>(ket_r),
+                        b_t.data(),
+                        static_cast<int>(ket_r),
+                        &beta0,
+                        ik.data(),
+                        static_cast<int>(ket_l)
+                    );
+                    for (ssize_t i = 0; i < bra_l; ++i) {
+                        for (ssize_t k = 0; k < ket_l; ++k) {
+                            q[static_cast<size_t>(
+                                (i * ket_l + k) * k_st + s * d_in + t
+                            )] = ik[static_cast<size_t>(i * ket_l + k)];
+                        }
+                    }
+                }
+            }
+            for (ssize_t s = 0; s < d_out; ++s) {
+                for (ssize_t t = 0; t < d_in; ++t) {
+                    for (ssize_t alpha_mpo = 0; alpha_mpo < mpo_l; ++alpha_mpo) {
+                        wmat[static_cast<size_t>((s * d_in + t) * mpo_l + alpha_mpo)] =
+                            w_ptr[static_cast<size_t>(
+                                ((alpha_mpo * mpo_r + beta) * d_out + s) * d_in + t
+                            )];
+                    }
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(rows_ik),
+                static_cast<int>(mpo_l),
+                static_cast<int>(k_st),
+                &alpha,
+                q.data(),
+                static_cast<int>(k_st),
+                wmat.data(),
+                static_cast<int>(mpo_l),
+                &beta0,
+                r.data(),
+                static_cast<int>(mpo_l)
+            );
+            for (ssize_t i = 0; i < bra_l; ++i) {
+                for (ssize_t k = 0; k < ket_l; ++k) {
+                    for (ssize_t alpha_mpo = 0; alpha_mpo < mpo_l; ++alpha_mpo) {
+                        y_ptr[static_cast<size_t>((alpha_mpo * bra_l + i) * ket_l + k)] +=
+                            r[static_cast<size_t>((i * ket_l + k) * mpo_l + alpha_mpo)];
+                    }
+                }
+            }
+        }
+        return out;
+    }
+#endif
+    auto w = W.unchecked<4>();
+    auto a = A.unchecked<3>();
+    auto f = F.unchecked<3>();
+    auto b = B.unchecked<3>();
+    auto y = out.mutable_unchecked<3>();
+    for (ssize_t alpha = 0; alpha < mpo_l; ++alpha) {
+        for (ssize_t i = 0; i < bra_l; ++i) {
+            for (ssize_t k = 0; k < ket_l; ++k) {
+                cdouble total = cdouble(0.0, 0.0);
+                for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+                    for (ssize_t j = 0; j < F.shape(1); ++j) {
+                        for (ssize_t l = 0; l < F.shape(2); ++l) {
+                            const cdouble f_val = f(beta, j, l);
+                            for (ssize_t s = 0; s < d_out; ++s) {
+                                const cdouble af = std::conj(a(i, s, j)) * f_val;
+                                for (ssize_t t = 0; t < d_in; ++t) {
+                                    total += af * w(alpha, beta, s, t) * b(k, t, l);
+                                }
+                            }
+                        }
+                    }
+                }
+                y(alpha, i, k) = total;
+            }
+        }
+    }
+    return out;
+}
+
+class CppDenseSweepWorkspace {
+public:
+    void bind(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+    ) {
+        record_for(key).bind(std::move(E), std::move(W), std::move(F));
+        ++bind_calls;
+        last_key = key;
+    }
+
+    void bind_boundaries(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F
+    ) {
+        record_for_existing(key).bind_boundaries(std::move(E), std::move(F));
+        ++boundary_bind_calls;
+        last_key = key;
+    }
+
+    py::dict solve_bound(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas"
+    ) {
+        ++solve_bound_calls;
+        last_key = key;
+        py::dict out = record_for_existing(key).solve_bound(
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend
+        );
+        out["sweep_workspace_key"] = py::str(key);
+        out["sweep_workspace_records"] = py::int_(records.size());
+        return out;
+    }
+
+    py::dict solve_bound_block(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        int block_size = 2
+    ) {
+        ++solve_bound_calls;
+        ++block_solve_bound_calls;
+        last_key = key;
+        py::dict out = record_for_existing(key).solve_bound_block(
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend,
+            block_size
+        );
+        out["sweep_workspace_key"] = py::str(key);
+        out["sweep_workspace_records"] = py::int_(records.size());
+        return out;
+    }
+
+    py::dict solve(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas"
+    ) {
+        bind(key, std::move(E), std::move(W), std::move(F));
+        return solve_bound(
+            key,
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend
+        );
+    }
+
+    py::dict solve_block(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v0,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        int block_size = 2
+    ) {
+        bind(key, std::move(E), std::move(W), std::move(F));
+        return solve_bound_block(
+            key,
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend,
+            block_size
+        );
+    }
+
+    py::dict solve_two_site(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W1,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W2,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> B,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        bool reuse_static_w = true
+    ) {
+        const double coarse_start = wall_seconds();
+        py::array_t<cdouble> v0 = dense_coarse_grain_mps_cpp(std::move(A), std::move(B));
+        const double mps_seconds = wall_seconds() - coarse_start;
+        bool reused_w = false;
+        double mpo_seconds = 0.0;
+        if (
+            reuse_static_w
+            && records.find(key) != records.end()
+            && records.find(key)->second
+        ) {
+            bind_boundaries(key, std::move(E), std::move(F));
+            reused_w = true;
+        } else {
+            const double mpo_start = wall_seconds();
+            py::array_t<cdouble> W = dense_coarse_grain_mpo_cpp(std::move(W1), std::move(W2));
+            mpo_seconds = wall_seconds() - mpo_start;
+            bind(key, std::move(E), std::move(W), std::move(F));
+        }
+        const double solve_start = wall_seconds();
+        py::dict out = solve_bound(
+            key,
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend
+        );
+        const double solve_total_seconds = wall_seconds() - solve_start;
+        ++two_site_solve_calls;
+        two_site_solve_seconds += mps_seconds + mpo_seconds + solve_total_seconds;
+        ++two_site_mps_builds;
+        if (!reused_w) {
+            ++two_site_mpo_builds;
+        } else {
+            ++two_site_static_w_reuses;
+        }
+        out["two_site_solver"] = py::bool_(true);
+        out["two_site_static_w_reused"] = py::bool_(reused_w);
+        out["two_site_mps_build_seconds"] = py::float_(mps_seconds);
+        out["two_site_mpo_build_seconds"] = py::float_(mpo_seconds);
+        out["two_site_total_seconds"] = py::float_(
+            mps_seconds + mpo_seconds + solve_total_seconds
+        );
+        out["sweep_workspace_records"] = py::int_(records.size());
+        return out;
+    }
+
+    py::dict solve_two_site_block(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W1,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> W2,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> B,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        bool reuse_static_w = true,
+        int block_size = 2
+    ) {
+        const double coarse_start = wall_seconds();
+        py::array_t<cdouble> v0 = dense_coarse_grain_mps_cpp(std::move(A), std::move(B));
+        const double mps_seconds = wall_seconds() - coarse_start;
+        bool reused_w = false;
+        double mpo_seconds = 0.0;
+        if (
+            reuse_static_w
+            && records.find(key) != records.end()
+            && records.find(key)->second
+        ) {
+            bind_boundaries(key, std::move(E), std::move(F));
+            reused_w = true;
+        } else {
+            const double mpo_start = wall_seconds();
+            py::array_t<cdouble> W = dense_coarse_grain_mpo_cpp(std::move(W1), std::move(W2));
+            mpo_seconds = wall_seconds() - mpo_start;
+            bind(key, std::move(E), std::move(W), std::move(F));
+        }
+        const double solve_start = wall_seconds();
+        py::dict out = solve_bound_block(
+            key,
+            std::move(v0),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            backend,
+            block_size
+        );
+        const double solve_total_seconds = wall_seconds() - solve_start;
+        ++two_site_solve_calls;
+        ++two_site_block_solve_calls;
+        two_site_solve_seconds += mps_seconds + mpo_seconds + solve_total_seconds;
+        ++two_site_mps_builds;
+        if (!reused_w) {
+            ++two_site_mpo_builds;
+        } else {
+            ++two_site_static_w_reuses;
+        }
+        out["two_site_solver"] = py::bool_(true);
+        out["two_site_static_w_reused"] = py::bool_(reused_w);
+        out["two_site_mps_build_seconds"] = py::float_(mps_seconds);
+        out["two_site_mpo_build_seconds"] = py::float_(mpo_seconds);
+        out["two_site_total_seconds"] = py::float_(
+            mps_seconds + mpo_seconds + solve_total_seconds
+        );
+        out["sweep_workspace_records"] = py::int_(records.size());
+        return out;
+    }
+
+    py::array_t<cdouble> matvec(
+        const std::string& key,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> v,
+        const std::string& backend = "blas"
+    ) {
+        ++matvec_calls;
+        last_key = key;
+        return record_for_existing(key).matvec(std::move(v), backend);
+    }
+
+    py::array_t<cdouble> diagonal(const std::string& key) {
+        ++diagonal_calls;
+        last_key = key;
+        return record_for_existing(key).diagonal();
+    }
+
+    py::dict record_stats(const std::string& key) const {
+        const auto it = records.find(key);
+        if (it == records.end() || !it->second) {
+            throw std::runtime_error("DenseSweepWorkspace record key is absent");
+        }
+        return it->second->stats();
+    }
+
+    py::dict stats() const {
+        py::dict out;
+        out["records"] = py::int_(records.size());
+        out["bind_calls"] = py::int_(bind_calls);
+        out["boundary_bind_calls"] = py::int_(boundary_bind_calls);
+        out["solve_bound_calls"] = py::int_(solve_bound_calls);
+        out["block_solve_bound_calls"] = py::int_(block_solve_bound_calls);
+        out["two_site_solve_calls"] = py::int_(two_site_solve_calls);
+        out["two_site_block_solve_calls"] = py::int_(two_site_block_solve_calls);
+        out["two_site_solve_seconds"] = py::float_(two_site_solve_seconds);
+        out["two_site_mpo_builds"] = py::int_(two_site_mpo_builds);
+        out["two_site_mps_builds"] = py::int_(two_site_mps_builds);
+        out["two_site_static_w_reuses"] = py::int_(two_site_static_w_reuses);
+        out["matvec_calls"] = py::int_(matvec_calls);
+        out["diagonal_calls"] = py::int_(diagonal_calls);
+        out["last_key"] = py::str(last_key);
+        return out;
+    }
+
+    void clear() {
+        records.clear();
+        last_key.clear();
+    }
+
+    void reset_stats() {
+        bind_calls = 0;
+        boundary_bind_calls = 0;
+        solve_bound_calls = 0;
+        block_solve_bound_calls = 0;
+        two_site_solve_calls = 0;
+        two_site_block_solve_calls = 0;
+        two_site_mpo_builds = 0;
+        two_site_mps_builds = 0;
+        two_site_static_w_reuses = 0;
+        two_site_solve_seconds = 0.0;
+        matvec_calls = 0;
+        diagonal_calls = 0;
+        for (auto& item : records) {
+            if (item.second) {
+                item.second->reset_stats();
+            }
+        }
+    }
+
+private:
+    std::unordered_map<std::string, std::unique_ptr<CppDenseDavidsonWorkspace>> records;
+    long long bind_calls = 0;
+    long long boundary_bind_calls = 0;
+    long long solve_bound_calls = 0;
+    long long block_solve_bound_calls = 0;
+    long long two_site_solve_calls = 0;
+    long long two_site_block_solve_calls = 0;
+    long long two_site_mpo_builds = 0;
+    long long two_site_mps_builds = 0;
+    long long two_site_static_w_reuses = 0;
+    double two_site_solve_seconds = 0.0;
+    long long matvec_calls = 0;
+    long long diagonal_calls = 0;
+    std::string last_key;
+
+    CppDenseDavidsonWorkspace& record_for(const std::string& key) {
+        auto& ptr = records[key];
+        if (!ptr) {
+            ptr = std::make_unique<CppDenseDavidsonWorkspace>();
+        }
+        return *ptr;
+    }
+
+    CppDenseDavidsonWorkspace& record_for_existing(const std::string& key) {
+        auto it = records.find(key);
+        if (it == records.end() || !it->second) {
+            throw std::runtime_error("DenseSweepWorkspace record key is absent");
+        }
+        return *it->second;
+    }
+};
+
 PYBIND11_MODULE(_cpp_davidson, m) {
     m.doc() = "Optional C++ packed Davidson kernels for PyQED MPS.";
     m.def(
@@ -39690,6 +43188,230 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         &lapack_qr,
         py::arg("matrix")
     );
+    m.def(
+        "dense_two_site_matvec",
+        &dense_two_site_matvec_cpp,
+        py::arg("E"),
+        py::arg("W"),
+        py::arg("F"),
+        py::arg("v")
+    );
+    m.def(
+        "dense_coarse_grain_mpo",
+        &dense_coarse_grain_mpo_cpp,
+        py::arg("W1"),
+        py::arg("W2")
+    );
+    m.def(
+        "dense_coarse_grain_mps",
+        &dense_coarse_grain_mps_cpp,
+        py::arg("A"),
+        py::arg("B")
+    );
+    m.def(
+        "dense_environment_update_left",
+        &dense_environment_update_left_cpp,
+        py::arg("W"),
+        py::arg("A"),
+        py::arg("E"),
+        py::arg("B")
+    );
+    m.def(
+        "dense_environment_update_right",
+        &dense_environment_update_right_cpp,
+        py::arg("W"),
+        py::arg("A"),
+        py::arg("F"),
+        py::arg("B")
+    );
+    py::class_<CppDenseDavidsonWorkspace>(m, "DenseDavidsonWorkspace")
+        .def(py::init<>())
+        .def(
+            "bind",
+            &CppDenseDavidsonWorkspace::bind,
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F")
+        )
+        .def(
+            "bind_boundaries",
+            &CppDenseDavidsonWorkspace::bind_boundaries,
+            py::arg("E"),
+            py::arg("F")
+        )
+        .def(
+            "matvec",
+            &CppDenseDavidsonWorkspace::matvec,
+            py::arg("v"),
+            py::arg("backend") = "blas"
+        )
+        .def("diagonal", &CppDenseDavidsonWorkspace::diagonal)
+        .def(
+            "solve_bound",
+            &CppDenseDavidsonWorkspace::solve_bound,
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas"
+        )
+        .def(
+            "solve_bound_block",
+            &CppDenseDavidsonWorkspace::solve_bound_block,
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("block_size") = 2
+        )
+        .def(
+            "solve",
+            &CppDenseDavidsonWorkspace::solve,
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas"
+        )
+        .def(
+            "solve_block",
+            &CppDenseDavidsonWorkspace::solve_block,
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("block_size") = 2
+        )
+        .def("stats", &CppDenseDavidsonWorkspace::stats)
+        .def("reset_stats", &CppDenseDavidsonWorkspace::reset_stats);
+    py::class_<CppDenseSweepWorkspace>(m, "DenseSweepWorkspace")
+        .def(py::init<>())
+        .def(
+            "bind",
+            &CppDenseSweepWorkspace::bind,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F")
+        )
+        .def(
+            "bind_boundaries",
+            &CppDenseSweepWorkspace::bind_boundaries,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("F")
+        )
+        .def(
+            "solve_bound",
+            &CppDenseSweepWorkspace::solve_bound,
+            py::arg("key"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas"
+        )
+        .def(
+            "solve_bound_block",
+            &CppDenseSweepWorkspace::solve_bound_block,
+            py::arg("key"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("block_size") = 2
+        )
+        .def(
+            "solve",
+            &CppDenseSweepWorkspace::solve,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas"
+        )
+        .def(
+            "solve_block",
+            &CppDenseSweepWorkspace::solve_block,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F"),
+            py::arg("v0"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("block_size") = 2
+        )
+        .def(
+            "solve_two_site",
+            &CppDenseSweepWorkspace::solve_two_site,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("W1"),
+            py::arg("W2"),
+            py::arg("F"),
+            py::arg("A"),
+            py::arg("B"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("reuse_static_w") = true
+        )
+        .def(
+            "solve_two_site_block",
+            &CppDenseSweepWorkspace::solve_two_site_block,
+            py::arg("key"),
+            py::arg("E"),
+            py::arg("W1"),
+            py::arg("W2"),
+            py::arg("F"),
+            py::arg("A"),
+            py::arg("B"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("reuse_static_w") = true,
+            py::arg("block_size") = 2
+        )
+        .def(
+            "matvec",
+            &CppDenseSweepWorkspace::matvec,
+            py::arg("key"),
+            py::arg("v"),
+            py::arg("backend") = "blas"
+        )
+        .def("diagonal", &CppDenseSweepWorkspace::diagonal, py::arg("key"))
+        .def("record_stats", &CppDenseSweepWorkspace::record_stats, py::arg("key"))
+        .def("stats", &CppDenseSweepWorkspace::stats)
+        .def("clear", &CppDenseSweepWorkspace::clear)
+        .def("reset_stats", &CppDenseSweepWorkspace::reset_stats);
     m.def(
         "build_spatial_qchem_family_entries",
         &build_spatial_qchem_family_entries,
@@ -40711,6 +44433,16 @@ PYBIND11_MODULE(_cpp_davidson, m) {
              &CppMovingEnvironment::sweep_environment_step_auto,
              py::arg("direction"), py::arg("tensor_cls"),
              py::arg("update_rows"), py::arg("pop_rows"))
+        .def("one_site_tdvp_sweep",
+             &CppMovingEnvironment::one_site_tdvp_sweep,
+             py::arg("factors"), py::arg("mpo"),
+             py::arg("left_boundary"), py::arg("right_boundary"),
+             py::arg("dt"), py::arg("environment_tensor_cls"),
+             py::arg("callbacks"),
+             py::arg("krylov_dim") = 12,
+             py::arg("krylov_tol") = 1.0e-13,
+             py::arg("krylov_method") = "lanczos",
+             py::arg("env_plan_prefix") = "tdvp-block")
         .def("bond_step_update_and_environment_auto",
              &CppMovingEnvironment::bond_step_update_and_environment_auto,
              py::arg("bond_hint"), py::arg("v0"), py::arg("tol"),

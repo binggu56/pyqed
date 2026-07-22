@@ -11,10 +11,10 @@
       "kind": ["external_validation"],
       "status": "reviewed",
       "source": "benchmarks/h2-sto3g-rhf-pyscf/run.py",
-      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=ignore MPLCONFIGDIR=/private/tmp/pyqed-benchmark-mpl-7dbb9bc OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/h2-sto3g-rhf-pyscf/run.py --input benchmarks/h2-sto3g-rhf-pyscf/input.json --output benchmarks/h2-sto3g-rhf-pyscf/raw-output.json",
       "optional_dependencies": ["pyscf"],
       "manifest": "benchmarks/h2-sto3g-rhf-pyscf/manifest.json",
-      "claim_scope": "At source commit 7dbb9bcc6625d9e4030627140dd14738c60a0e67, the total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G using the observed rys-cython-blocked builder agrees with PySCF 2.12.1 within 1e-9 hartree; no performance or broader accuracy claim."
+      "claim_scope": "Total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G compared with PySCF 2.12.1; no performance or broader accuracy claim."
     },
     {
       "id": "native-h4-casscf-representations",
@@ -24,6 +24,15 @@
       "command": "PYTHONPATH=. python examples/qchem/casscf_factor_vs_dense.py",
       "optional_dependencies": [],
       "claim_scope": "Dense versus factorized CASSCF for the H4/STO-3G/CAS(4,4) workload encoded by the script."
+    },
+    {
+      "id": "qchem-path-report",
+      "kind": ["performance", "path_introspection"],
+      "status": "candidate",
+      "source": "benchmarks/qchem_path_report.py",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONPATH=. python benchmarks/qchem_path_report.py",
+      "optional_dependencies": [],
+      "claim_scope": "Reports native qchem ERI, direct-JK, RI/factor, and AO2MO paths plus timings for the encoded RHF workloads."
     },
     {
       "id": "fedvr-harmonic-oscillator",

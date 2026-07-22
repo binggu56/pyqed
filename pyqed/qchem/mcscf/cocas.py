@@ -146,7 +146,7 @@ def _fresh_casci_like(source):
             symmetry=getattr(source, "symmetry", None),
             spatial_site_basis=getattr(source, "spatial_site_basis", "canonical"),
             integral_backend=getattr(source, "integral_backend", "auto"),
-            spatial_abelian_mpo=getattr(source, "spatial_abelian_mpo", "spatial"),
+            spatial_abelian_mpo=getattr(source, "spatial_abelian_mpo", "grouped"),
             spatial_abelian_symbolic_algo=getattr(
                 source,
                 "spatial_abelian_symbolic_algo",
@@ -237,6 +237,8 @@ def _fresh_casci_like(source):
                 "spatial_direct_operator_batch_min_entries",
                 2,
             ),
+            dmrg_performance=getattr(source, "dmrg_performance", "block2-like"),
+            abelian_matvec_options=getattr(source, "abelian_matvec_options", None),
             debug_complementary_action_check=getattr(
                 source,
                 "debug_complementary_action_check",

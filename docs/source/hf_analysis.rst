@@ -6,6 +6,60 @@ PyQED provides analysis helpers for restricted Hartree-Fock results through
 intended for inspecting molecular orbitals, charges, bond orders, and orbital
 similarity across geometries.
 
+Interactive Molecular Fields
+----------------------------
+
+The top-level :func:`pyqed.view` function opens the PyQED molecular viewer.
+The same interface handles molecular geometry, every molecular orbital,
+density fields, electrostatic potential, natural transition orbitals (NTOs),
+and Gaussian cube files:
+
+.. code-block:: python
+
+   from pyqed import view
+
+   view(mol)                              # molecular geometry
+   view(mf, orbital=["homo", "lumo"])    # selected orbitals
+   view(mf, orbital="all")                # every MO in one state selector
+   view(mf, density="electron")           # total electron density
+   view(mf, esp=True)                     # ESP on the density surface
+
+For an unrestricted calculation, ``density="all"`` includes the total,
+alpha, beta, and spin densities. A custom AO density matrix can be supplied
+directly with ``density=dm``. Excited-state calculations expose every NTO
+pair through the same selector:
+
+.. code-block:: python
+
+   from pyqed.qchem.tddft import TDA
+
+   td = TDA(mf).run(nstates=5)
+   view(td, nto="all")
+
+Automatic NTO extraction currently supports restricted references. Arbitrary
+state-resolved AO density matrices can be named explicitly; names containing
+``transition`` are rendered as transition densities and other signed matrices
+as difference densities:
+
+.. code-block:: python
+
+   view(mf, density={
+       "S1 transition density": transition_dm,
+       "S1 - S0 difference density": excited_dm - ground_dm,
+   })
+
+Cube files are accepted without an optional chemistry viewer dependency:
+
+.. code-block:: python
+
+   view("density.cube")
+   view("orbitals.cube", dataset="all")  # every dataset in a multi-orbital cube
+
+The geometry-only view uses a compact link. Volumetric arrays never enter the
+page URL: PyQED writes a local launcher and transfers validated float32 field
+data directly to the viewer. The website renders it locally in the browser
+and offers a field/state menu plus adjustable isovalues.
+
 Basic Usage
 -----------
 

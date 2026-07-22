@@ -1,0 +1,654 @@
+{
+  "status": "complete",
+  "model": {
+    "nrows": 6,
+    "ncols": 6,
+    "nsites": 36,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "site_order": "row-wise snake",
+    "tie_graph": "all nearest-neighbor J1 bonds",
+    "tie_edges": 60,
+    "j2_diagonal_edges": 50,
+    "full_hilbert_dimension": 68719476736
+  },
+  "protocol": {
+    "source_result": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_bond_expansion_6x6.json",
+    "source_state": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_bond_expansion_6x6.npz",
+    "optimizer": "adjacent merge solve, exact-environment metric retraction, and guarded factor Rayleigh sweeps",
+    "svd_role": "initializer and Euclidean truncation diagnostic only",
+    "retraction": "deterministic; no random starts by default",
+    "candidate_selection": "lowest accepted energy after a fresh post-truncation contraction from a common source; no exact-state or reference-energy oracle",
+    "applied_update": "best single strictly improving candidate",
+    "symmetry": "none",
+    "reference_mps_symmetry": "none",
+    "solver": "whitened",
+    "metric_tol": 1e-12,
+    "eig_tol": 1e-10,
+    "maxiter": 1600,
+    "max_subspace": 96,
+    "minimum_selection_gain": 1e-12,
+    "pair_left_sites": [
+      13,
+      14,
+      15,
+      19,
+      20,
+      21
+    ],
+    "one_site_control_pair_left_sites": [
+      14,
+      20
+    ],
+    "bounded_rank_proposals": 1
+  },
+  "source": {
+    "energy": -16.849164652451783,
+    "energy_per_site": -0.46803235145699396,
+    "parameters": 4008,
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ],
+    "physical_frontier_cost": {
+      "peak_width": 6,
+      "peak_physical_states": 64,
+      "peak_norm_elements": 2304,
+      "total_norm_elements": 31136,
+      "log_objective": 18.088522006801515
+    },
+    "network_frontier_cost": {
+      "peak_frontier_elements": 340992,
+      "norm_peak_frontier_elements": 2304,
+      "hamiltonian_peak_frontier_elements": 340992,
+      "cached_environment_elements": 4477316
+    }
+  },
+  "candidates": [
+    {
+      "sites": [
+        13,
+        14
+      ],
+      "spanned_cut": 14,
+      "overlap_sites": [
+        14
+      ],
+      "raw_merged_dimension": 768,
+      "old_bond_dimension": 4,
+      "temporary_bond_dimension": 6,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        4,
+        4
+      ],
+      "maximum_discarded_rank_channels": 12,
+      "relative_truncation_error": 0.02801839506295094,
+      "split_strategy": "variational",
+      "selected_retraction_start": "old",
+      "environment_metric_projection_error": 0.035480462126275515,
+      "factor_sweeps": 8,
+      "factor_accepted_half_updates": 16,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.85550655132894,
+      "attempted_post_retraction_energy": -16.849167251981196,
+      "attempted_post_retraction_gain": 2.5995294130609636e-06,
+      "attempted_post_split_energy": -16.849167251981196,
+      "attempted_post_split_gain": 2.5995294130609636e-06,
+      "accepted_energy": -16.849167251981196,
+      "accepted_energy_gain": 2.5995294130609636e-06,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 528,
+      "local_residual_norm": 5.689337636266026e-06,
+      "local_coordinate_residual_norm": 2.903952820740063e-11,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 3.2906901581302194e-12,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 4608,
+        "total_norm_elements": 34720,
+        "log_objective": 18.890620371150014
+      },
+      "timing_seconds": {
+        "copy_and_replan": 3.437860250007361,
+        "merge_optimize_retract": 22.44897587504238,
+        "total": 27.322781833994668
+      }
+    },
+    {
+      "sites": [
+        14,
+        15
+      ],
+      "spanned_cut": 15,
+      "overlap_sites": [
+        15
+      ],
+      "raw_merged_dimension": 512,
+      "old_bond_dimension": 6,
+      "temporary_bond_dimension": 4,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        6,
+        6
+      ],
+      "maximum_discarded_rank_channels": 10,
+      "relative_truncation_error": 0.0008294372542544596,
+      "split_strategy": "variational",
+      "selected_retraction_start": "metric",
+      "environment_metric_projection_error": 0.013836111279667367,
+      "factor_sweeps": 8,
+      "factor_accepted_half_updates": 16,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.851069540355297,
+      "attempted_post_retraction_energy": -16.851300711126658,
+      "attempted_post_retraction_gain": 0.0021360586748748744,
+      "attempted_post_split_energy": -16.851300711126658,
+      "attempted_post_split_gain": 0.0021360586748748744,
+      "accepted_energy": -16.851300711126658,
+      "accepted_energy_gain": 0.0021360586748748744,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 511,
+      "local_residual_norm": 6.560373406797583e-05,
+      "local_coordinate_residual_norm": 1.4955899499127015e-11,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 9.599205002030792e-08,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 2304,
+        "total_norm_elements": 30880,
+        "log_objective": 18.080266025954494
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.569755124975927,
+        "merge_optimize_retract": 13.930202333023772,
+        "total": 18.20097004197305
+      }
+    },
+    {
+      "sites": [
+        15,
+        16
+      ],
+      "spanned_cut": 16,
+      "overlap_sites": [
+        16
+      ],
+      "raw_merged_dimension": 768,
+      "old_bond_dimension": 4,
+      "temporary_bond_dimension": 4,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        4,
+        4
+      ],
+      "maximum_discarded_rank_channels": 12,
+      "relative_truncation_error": 0.16560141522924063,
+      "split_strategy": "variational",
+      "selected_retraction_start": "old",
+      "environment_metric_projection_error": 0.03324107062114614,
+      "factor_sweeps": 2,
+      "factor_accepted_half_updates": 2,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.85297803685445,
+      "attempted_post_retraction_energy": -16.849181855524268,
+      "attempted_post_retraction_gain": 1.7203072484761606e-05,
+      "attempted_post_split_energy": -16.849181855524268,
+      "attempted_post_split_gain": 1.7203072484761606e-05,
+      "accepted_energy": -16.849181855524268,
+      "accepted_energy_gain": 1.7203072484761606e-05,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 728,
+      "local_residual_norm": 0.0002849128268395142,
+      "local_coordinate_residual_norm": 2.032177042026172e-10,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 3.380628633165912e-08,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 2304,
+        "total_norm_elements": 32160,
+        "log_objective": 18.120880745108686
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.640341125021223,
+        "merge_optimize_retract": 18.793678916990757,
+        "total": 22.921408459020313
+      }
+    },
+    {
+      "sites": [
+        19,
+        20
+      ],
+      "spanned_cut": 20,
+      "overlap_sites": [
+        20
+      ],
+      "raw_merged_dimension": 768,
+      "old_bond_dimension": 4,
+      "temporary_bond_dimension": 6,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        4,
+        4
+      ],
+      "maximum_discarded_rank_channels": 12,
+      "relative_truncation_error": 0.1298122675977416,
+      "split_strategy": "variational",
+      "selected_retraction_start": "old",
+      "environment_metric_projection_error": 0.02482256415131572,
+      "factor_sweeps": 8,
+      "factor_accepted_half_updates": 16,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.85166375001326,
+      "attempted_post_retraction_energy": -16.849186634279842,
+      "attempted_post_retraction_gain": 2.198182805912552e-05,
+      "attempted_post_split_energy": -16.849186634279842,
+      "attempted_post_split_gain": 2.198182805912552e-05,
+      "accepted_energy": -16.849186634279842,
+      "accepted_energy_gain": 2.198182805912552e-05,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 768,
+      "local_residual_norm": 4.549492821227153e-12,
+      "local_coordinate_residual_norm": 8.146321317367928e-12,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 1.8264886601158556e-10,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 4608,
+        "total_norm_elements": 34720,
+        "log_objective": 18.890620371150014
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.2821801250102,
+        "merge_optimize_retract": 19.11011150002014,
+        "total": 22.90300887497142
+      }
+    },
+    {
+      "sites": [
+        20,
+        21
+      ],
+      "spanned_cut": 21,
+      "overlap_sites": [
+        21
+      ],
+      "raw_merged_dimension": 512,
+      "old_bond_dimension": 6,
+      "temporary_bond_dimension": 4,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        6,
+        6
+      ],
+      "maximum_discarded_rank_channels": 10,
+      "relative_truncation_error": 0.0037298732892147015,
+      "split_strategy": "variational",
+      "selected_retraction_start": "metric",
+      "environment_metric_projection_error": 0.009662167936634613,
+      "factor_sweeps": 8,
+      "factor_accepted_half_updates": 16,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.84960779031793,
+      "attempted_post_retraction_energy": -16.849259178712384,
+      "attempted_post_retraction_gain": 9.452626060024727e-05,
+      "attempted_post_split_energy": -16.849259178712384,
+      "attempted_post_split_gain": 9.452626060024727e-05,
+      "accepted_energy": -16.849259178712384,
+      "accepted_energy_gain": 9.452626060024727e-05,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 512,
+      "local_residual_norm": 8.883158257310235e-12,
+      "local_coordinate_residual_norm": 2.614335364372625e-12,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 8.497839391246855e-09,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 2304,
+        "total_norm_elements": 30880,
+        "log_objective": 18.080266025954494
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.3125607909751125,
+        "merge_optimize_retract": 12.818822332948912,
+        "total": 16.637618999986444
+      }
+    },
+    {
+      "sites": [
+        21,
+        22
+      ],
+      "spanned_cut": 22,
+      "overlap_sites": [
+        22
+      ],
+      "raw_merged_dimension": 768,
+      "old_bond_dimension": 4,
+      "temporary_bond_dimension": 4,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        4,
+        4
+      ],
+      "maximum_discarded_rank_channels": 12,
+      "relative_truncation_error": 0.05743155442214649,
+      "split_strategy": "variational",
+      "selected_retraction_start": "old",
+      "environment_metric_projection_error": 0.026125826712421446,
+      "factor_sweeps": 6,
+      "factor_accepted_half_updates": 12,
+      "factor_random_starts": 0,
+      "energy_before": -16.849164652451783,
+      "merged_energy_before_split": -16.851744414767218,
+      "attempted_post_retraction_energy": -16.84921157877852,
+      "attempted_post_retraction_gain": 4.692632673553021e-05,
+      "attempted_post_split_energy": -16.84921157877852,
+      "attempted_post_split_gain": 4.692632673553021e-05,
+      "accepted_energy": -16.84921157877852,
+      "accepted_energy_gain": 4.692632673553021e-05,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 768,
+      "local_residual_norm": 5.773253576152577e-11,
+      "local_coordinate_residual_norm": 1.577314120990925e-10,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 9.156090833086606e-10,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 2304,
+        "total_norm_elements": 32160,
+        "log_objective": 18.120880745108686
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.266035082982853,
+        "merge_optimize_retract": 19.02660033298889,
+        "total": 22.773540000023786
+      }
+    }
+  ],
+  "matched_one_site_pair_controls": [
+    {
+      "sites": [
+        14,
+        15
+      ],
+      "energy": -16.849165737396497,
+      "energy_gain": 1.084944713625191e-06,
+      "accepted_updates": [
+        true,
+        false
+      ],
+      "solver_converged": [
+        true,
+        true
+      ],
+      "raw_local_dimensions": [
+        192,
+        192
+      ],
+      "timing_seconds": {
+        "copy_and_replan": 2.550374415994156,
+        "two_one_site_updates": 5.465492916002404,
+        "total": 9.482731165946461
+      }
+    },
+    {
+      "sites": [
+        20,
+        21
+      ],
+      "energy": -16.849213293130145,
+      "energy_gain": 4.8640678361522305e-05,
+      "accepted_updates": [
+        true,
+        true
+      ],
+      "solver_converged": [
+        true,
+        true
+      ],
+      "raw_local_dimensions": [
+        192,
+        192
+      ],
+      "timing_seconds": {
+        "copy_and_replan": 2.280965375015512,
+        "two_one_site_updates": 5.35867624997627,
+        "total": 9.097824375028722
+      }
+    }
+  ],
+  "rank_proposal": {
+    "trigger_pair": [
+      13,
+      14
+    ],
+    "trigger_cut": 14,
+    "old_dimension": 4,
+    "proposed_dimension": 6,
+    "initialization": "zero, exactly state-preserving",
+    "energy_before_expansion": -16.849164652451783,
+    "energy_after_expansion": -16.84916465244844,
+    "expansion_energy_error": 3.3431035717512714e-12,
+    "expansion_norm_error": 0.0,
+    "expansion_reported_norm_error": 0.0,
+    "pair_update": {
+      "sites": [
+        13,
+        14
+      ],
+      "spanned_cut": 14,
+      "overlap_sites": [
+        14
+      ],
+      "raw_merged_dimension": 768,
+      "old_bond_dimension": 6,
+      "temporary_bond_dimension": 6,
+      "full_conditional_ranks": [
+        16,
+        16
+      ],
+      "full_conditional_rank_min": 16,
+      "full_conditional_rank_max": 16,
+      "retained_conditional_ranks": [
+        6,
+        6
+      ],
+      "maximum_discarded_rank_channels": 10,
+      "relative_truncation_error": 0.008964803365170236,
+      "split_strategy": "variational",
+      "selected_retraction_start": "old",
+      "environment_metric_projection_error": 0.0161347656888524,
+      "factor_sweeps": 2,
+      "factor_accepted_half_updates": 3,
+      "factor_random_starts": 0,
+      "energy_before": -16.84916465244844,
+      "merged_energy_before_split": -16.855506551357724,
+      "attempted_post_retraction_energy": -16.84940660548706,
+      "attempted_post_retraction_gain": 0.0002419530386212898,
+      "attempted_post_split_energy": -16.84940660548706,
+      "attempted_post_split_gain": 0.0002419530386212898,
+      "accepted_energy": -16.84940660548706,
+      "accepted_energy_gain": 0.0002419530386212898,
+      "accepted": true,
+      "local_solver": "whitened",
+      "local_solver_converged": true,
+      "local_solver_message": "converged in the exact local S=I frame",
+      "local_metric_rank": 528,
+      "local_residual_norm": 5.689339751979367e-06,
+      "local_coordinate_residual_norm": 5.987644292024032e-11,
+      "local_metric_is_identity": true,
+      "local_metric_identity_error": 3.2906901581302194e-12,
+      "temporary_frontier_cost": {
+        "peak_width": 7,
+        "peak_physical_states": 128,
+        "peak_norm_elements": 4608,
+        "total_norm_elements": 34720,
+        "log_objective": 18.890620371150014
+      },
+      "timing_seconds": {
+        "copy_and_replan": 2.497085207956843,
+        "merge_optimize_retract": 17.04451404098654,
+        "total": 21.20303191698622
+      }
+    },
+    "attempted_gain_vs_unexpanded_source": 0.00024195303527818623,
+    "accepted_gain_vs_unexpanded_source": 0.00024195303527818623,
+    "timing_seconds": {
+      "expansion": 2.4147551669739187,
+      "pair_total": 21.20303191698622
+    }
+  },
+  "selection": {
+    "selected_sites": [
+      14,
+      15
+    ],
+    "accepted_strict_improvement": true,
+    "energy": -16.851300711126658,
+    "energy_per_site": -0.46809168642018495,
+    "energy_gain": 0.0021360586748748744,
+    "energy_gain_per_site": 5.9334963190968734e-05,
+    "parameters": 4008,
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ],
+    "peak_frontier_elements": 340992,
+    "snapshot": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_two_site_6x6.npz"
+  },
+  "timing_seconds": {
+    "total": 182.2420534999692
+  }
+}

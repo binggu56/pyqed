@@ -1910,7 +1910,7 @@ def _abelian_block_data_result_dtype(data, *extra):
 class AbelianSiteTensorData:
     """Native Abelian site tensor carrier backed by plain block data."""
 
-    __slots__ = ("data", "qns", "dirs")
+    __slots__ = ("data", "qns", "dirs", "_layout_signature")
 
     _pyqed_abelian_site_tensor_data = True
 
@@ -1924,6 +1924,7 @@ class AbelianSiteTensorData:
         )
         self.qns = tuple(tuple(axis_qns) for axis_qns in (qns or ()))
         self.dirs = tuple(int(d) for d in (dirs or ()))
+        self._layout_signature = None
 
     @property
     def rank(self):
@@ -3433,18 +3434,30 @@ class AbelianRenormalizedActionDataTable:
                 collected.get("scales_array"),
             )
         out = np.zeros(int(self.dim), dtype=np.complex128)
-        groups = groups or ()
-        iterator = (
-            (
-                group["left"],
-                group["right"],
-                group["dims"],
-                group["in_start"],
-                group["out_start"],
-                group.get("scales"),
+        if groups:
+            iterator = (
+                (
+                    group["left"],
+                    group["right"],
+                    group["dims"],
+                    group["in_start"],
+                    group["out_start"],
+                    group.get("scales"),
+                )
+                for group in groups
             )
-            for group in groups
-        )
+        else:
+            scales = collected.get("scales_array")
+            if scales is None:
+                scales = (None,) * len(collected.get("left", ()))
+            iterator = zip(
+                collected.get("left", ()),
+                collected.get("right", ()),
+                collected.get("dims_array", ()),
+                collected.get("in_starts_array", ()),
+                collected.get("out_starts_array", ()),
+                scales,
+            )
         for left_stack, right_stack, dims, in_start, out_start, scales in iterator:
             ni, nl, nu, nv, nj, nx, nk, ny = (int(v) for v in dims)
             in_size = nj * nx * nk * ny
@@ -3461,6 +3474,8 @@ class AbelianRenormalizedActionDataTable:
             mat_stack = np.matmul(tmp, right_stack)
             if scales is None:
                 mat = mat_stack.sum(axis=0)
+            elif np.ndim(scales) == 0:
+                mat = mat_stack.sum(axis=0) * scales
             else:
                 mat = (mat_stack * np.asarray(scales).reshape(-1, 1, 1)).sum(axis=0)
             out_block = (
@@ -4895,6 +4910,7 @@ class AbelianNativeExactPatternOperatorTable:
     batch_stores: int = 0
     cpp_resolves: int = 0
     cpp_stores: int = 0
+    evictions: int = 0
 
     def get(self, key):
         return self.entries.get(key)
@@ -4985,6 +5001,14 @@ class AbelianNativeExactPatternOperatorTable:
         self.batch_stores += 1
         return int(stored)
 
+    def discard(self, key, *, normalized=False):
+        key = self.normalize_key(key) if not bool(normalized) else key
+        if key not in self.entries:
+            return False
+        self.entries.pop(key, None)
+        self.evictions += 1
+        return True
+
     @property
     def n_entries(self):
         return int(len(self.entries))
@@ -5021,6 +5045,7 @@ class AbelianNativeExactPatternOperatorTable:
             "batch_stores": int(self.batch_stores),
             "cpp_resolves": int(self.cpp_resolves),
             "cpp_stores": int(self.cpp_stores),
+            "evictions": int(self.evictions),
             "family_counts": {
                 str(name): int(count)
                 for name, count in sorted(self.family_counts.items())
@@ -5108,6 +5133,10 @@ class AbelianNativeExactPatternComponentTable:
             getattr(entries, "_pyqed_packed_direct_family_entries", False)
         )
         entries = entries if entries_is_packed else tuple(entries or ())
+        if bool(getattr(entries, "_pyqed_planned_direct_family_table_ids", False)):
+            snapshot = getattr(entries, "snapshot_table_payloads", None)
+            if callable(snapshot):
+                entries = snapshot()
         if records is None:
             records = self.family_records.get(str(family_name), ())
         records = tuple(records or ())
@@ -6840,6 +6869,7 @@ class AbelianPlannedPackedDirectFamilyEntries:
         "local_sources",
         "_local_columns",
         "_table_backed",
+        "_schedule_key",
         "source",
     )
 
@@ -6864,6 +6894,7 @@ class AbelianPlannedPackedDirectFamilyEntries:
         left_table=None,
         right_table=None,
         table_backed=None,
+        schedule_key=None,
         source="planned_packed_local_generator",
     ):
         coeffs = np.asarray(coeffs if coeffs is not None else (), dtype=np.complex128)
@@ -6904,11 +6935,16 @@ class AbelianPlannedPackedDirectFamilyEntries:
                 and np.all(right_table_ids >= 0)
             )
         self._table_backed = bool(table_backed)
+        self._schedule_key = schedule_key
         self.source = str(source)
 
     @property
     def _pyqed_planned_direct_family_table_ids(self):
         return bool(self._table_backed)
+
+    @property
+    def _pyqed_planned_direct_family_schedule_key(self):
+        return self._schedule_key
 
     @property
     def left_table_payloads(self):
@@ -6926,6 +6962,7 @@ class AbelianPlannedPackedDirectFamilyEntries:
         *,
         left_table=None,
         right_table=None,
+        schedule_key=None,
         source="planned_packed_local_generator",
     ):
         raw_left_table_ids = getattr(boundary_batch, "left_table_ids", ())
@@ -6944,6 +6981,15 @@ class AbelianPlannedPackedDirectFamilyEntries:
             and bool(np.all(left_table_ids >= 0))
             and bool(np.all(right_table_ids >= 0))
         )
+        if schedule_key is None:
+            schedule_key = (
+                "planned_direct_route",
+                getattr(route_plan, "signature", None),
+                str(source),
+                bool(table_backed),
+                tuple(int(value) for value in left_table_ids),
+                tuple(int(value) for value in right_table_ids),
+            )
         return cls(
             route_plan.coeffs,
             route_plan.left_ids,
@@ -6959,6 +7005,7 @@ class AbelianPlannedPackedDirectFamilyEntries:
             left_table=left_table if table_backed else None,
             right_table=right_table if table_backed else None,
             table_backed=table_backed,
+            schedule_key=schedule_key,
             source=source,
         )
 
@@ -6998,6 +7045,39 @@ class AbelianPlannedPackedDirectFamilyEntries:
         )
         self._local_columns = cached
         return cached
+
+    def snapshot_table_payloads(self):
+        """Detach planned entries from mutable boundary-table payload slots."""
+
+        if not self._pyqed_planned_direct_family_table_ids:
+            return self
+        left_payloads = self.left_table_payloads
+        right_payloads = self.right_table_payloads
+        left_values = []
+        for table_id in self.left_table_ids:
+            table_id = int(table_id)
+            if table_id < 0 or table_id >= len(left_payloads):
+                raise ValueError("planned packed direct left table payload is missing")
+            payload = left_payloads[table_id]
+            if payload is None:
+                raise ValueError("planned packed direct left table payload is empty")
+            left_values.append(payload)
+        right_values = []
+        for table_id in self.right_table_ids:
+            table_id = int(table_id)
+            if table_id < 0 or table_id >= len(right_payloads):
+                raise ValueError("planned packed direct right table payload is missing")
+            payload = right_payloads[table_id]
+            if payload is None:
+                raise ValueError("planned packed direct right table payload is empty")
+            right_values.append(payload)
+        self.left_values = tuple(left_values)
+        self.right_values = tuple(right_values)
+        self.left_table = None
+        self.right_table = None
+        self._table_backed = False
+        self._local_columns = None
+        return self
 
     @property
     def local_E(self):
@@ -7045,6 +7125,7 @@ class AbelianPlannedPackedDirectFamilyEntries:
         self.right_table = None
         self.local_sources = ()
         self._table_backed = False
+        self._schedule_key = None
         self._local_columns = (
             tuple(materialized.local_E),
             tuple(materialized.local_W_left),
@@ -7778,6 +7859,7 @@ class AbelianContextualFamilyBuildOptions:
     planned_without_precompute_batch: bool = True
     planned_without_precompute_table_lookup: bool = True
     planned_without_precompute_table_ids_only: bool = True
+    snapshot_table_backed_planned_entries: bool = True
 
     @classmethod
     def from_matvec_options(cls, options):
@@ -7856,6 +7938,12 @@ class AbelianContextualFamilyBuildOptions:
                     True,
                 )
             ),
+            snapshot_table_backed_planned_entries=bool(
+                options.get(
+                    "generator_table_snapshot_table_backed_planned_entries",
+                    True,
+                )
+            ),
         )
 
     def should_precompute(self, records):
@@ -7888,6 +7976,9 @@ class AbelianContextualFamilyBuildOptions:
             ),
             planned_without_precompute_table_ids_only=(
                 self.planned_without_precompute_table_ids_only
+            ),
+            snapshot_table_backed_planned_entries=(
+                self.snapshot_table_backed_planned_entries
             ),
         )
 
@@ -7948,6 +8039,7 @@ class AbelianPackedContextualBoundaryTable:
     last_batch_hits: int = 0
     last_batch_misses: int = 0
     resets: int = 0
+    evictions: int = 0
     source: str = "abelian_packed_contextual_boundary_table"
 
     @staticmethod
@@ -8161,6 +8253,7 @@ class AbelianPackedContextualBoundaryTable:
             return False
         self.revision = revision
         self.entries.clear()
+        self.payloads = [None] * len(self.payloads)
         self.family_counts.clear()
         self.blocks = 0
         self.last_batch_size = 0
@@ -8312,6 +8405,20 @@ class AbelianPackedContextualBoundaryTable:
         self.batch_stores += 1
         return int(stored)
 
+    def discard(self, key, *, normalized=False):
+        key = self.normalize_key(key) if not bool(normalized) else key
+        previous = self.entries.pop(key, None)
+        if previous is None:
+            return False
+        self.blocks -= self.payload_block_count(previous)
+        table_id = self.ids.get(key)
+        if table_id is not None:
+            table_id = int(table_id)
+            if 0 <= table_id < len(self.payloads):
+                self.payloads[table_id] = None
+        self.evictions += 1
+        return True
+
     @property
     def n_entries(self):
         return int(len(self.entries))
@@ -8342,6 +8449,7 @@ class AbelianPackedContextualBoundaryTable:
             "last_batch_hits": int(self.last_batch_hits),
             "last_batch_misses": int(self.last_batch_misses),
             "resets": int(self.resets),
+            "evictions": int(self.evictions),
             "families": dict(self.family_counts),
         }
 
@@ -8368,6 +8476,7 @@ class AbelianSameSidePBoundaryValueTable:
     last_batch_hits: int = 0
     last_batch_misses: int = 0
     resets: int = 0
+    evictions: int = 0
     source: str = "abelian_same_side_p_boundary_value_table"
 
     @staticmethod
@@ -8671,6 +8780,20 @@ class AbelianSameSidePBoundaryValueTable:
         self.batch_stores += 1
         return int(stored)
 
+    def discard(self, key, *, normalized=False):
+        key = self.normalize_key(key) if not bool(normalized) else key
+        previous = self.entries.pop(key, None)
+        if previous is None:
+            return False
+        self.blocks -= self.payload_block_count(previous)
+        table_id = self.ids.get(key)
+        if table_id is not None:
+            table_id = int(table_id)
+            if 0 <= table_id < len(self.payloads):
+                self.payloads[table_id] = None
+        self.evictions += 1
+        return True
+
     @property
     def n_entries(self):
         return int(len(self.entries))
@@ -8701,6 +8824,7 @@ class AbelianSameSidePBoundaryValueTable:
             "last_batch_hits": int(self.last_batch_hits),
             "last_batch_misses": int(self.last_batch_misses),
             "resets": int(self.resets),
+            "evictions": int(self.evictions),
         }
 
 
@@ -10014,6 +10138,77 @@ class AbelianContextualDirectFamilyBuilder:
             None,
         )
         if owner is not None and hasattr(owner, "resolve_contextual_boundary_batch"):
+            native_plan_key = str(
+                getattr(
+                    batch_builder,
+                    "_pyqed_cpp_contextual_batch_plan_key",
+                    "",
+                )
+                or ""
+            )
+            owner_table_id_resolver = getattr(
+                owner,
+                "resolve_contextual_boundary_table_ids_from_plan",
+                None,
+            )
+            if (
+                bool(table_ids_only)
+                and packed_table is not None
+                and native_plan_key
+                and owner_table_id_resolver is not None
+            ):
+                try:
+                    result = owner_table_id_resolver(
+                        native_plan_key,
+                        tuple(raw_keys),
+                        packed_table,
+                        family_name,
+                        debug_stats if debug_stats is not None else None,
+                    )
+                    table_ids = tuple(result[1])
+                    complete = bool(
+                        len(table_ids) == len(raw_keys)
+                        and all(int(table_id) >= 0 for table_id in table_ids)
+                    )
+                    if complete:
+                        values = list(result[0])
+                        if not values:
+                            values = [True]
+                        if debug_stats is not None:
+                            _increment_counter(
+                                debug_stats,
+                                f"{debug_prefix}owner_resolve_calls",
+                            )
+                            _increment_counter(
+                                debug_stats,
+                                f"{debug_prefix}owner_native_plan_table_id_calls",
+                            )
+                            _increment_counter(
+                                debug_stats,
+                                f"{debug_prefix}owner_native_plan_table_id_successes",
+                            )
+                        return (
+                            values,
+                            table_ids,
+                            int(result[2]),
+                            int(result[3]),
+                            float(result[4]),
+                            bool(result[5]),
+                        )
+                    if debug_stats is not None:
+                        _increment_counter(
+                            debug_stats,
+                            f"{debug_prefix}owner_native_plan_table_id_incomplete",
+                        )
+                except Exception as exc:
+                    if debug_stats is not None:
+                        _increment_counter(
+                            debug_stats,
+                            f"{debug_prefix}owner_native_plan_table_id_failures",
+                        )
+                        debug_stats[
+                            f"{debug_prefix}owner_native_plan_table_id_last_error"
+                        ] = repr(exc)
             try:
                 result = owner.resolve_contextual_boundary_batch(
                     tuple(raw_keys),
@@ -10397,7 +10592,7 @@ class AbelianContextualDirectFamilyBuilder:
             left_keys, right_keys = contextual_boundary_keys(records)
             route_cache_token = None
         else:
-            route_cache_token = getattr(route_plan, "signature", None) or id(route_plan)
+            route_cache_token = ("route_plan_object", id(route_plan))
         left_build_keys = tuple(left_keys)
         right_build_keys = tuple(right_keys)
         left_cache = self.left_cache
@@ -10427,6 +10622,11 @@ class AbelianContextualDirectFamilyBuilder:
         )
         owner_resolve_from_builder = (
             getattr(owner, "resolve_contextual_boundary_batch_from_builder", None)
+            if owner is not None
+            else None
+        )
+        owner_resolve_table_ids_from_plan = (
+            getattr(owner, "resolve_contextual_boundary_table_ids_from_plan", None)
             if owner is not None
             else None
         )
@@ -10623,10 +10823,13 @@ class AbelianContextualDirectFamilyBuilder:
                     )
                     if use_side_resolve:
                         max_content_keys = int(
-                            getattr(
-                                self,
+                            self.stats.get(
                                 "contextual_boundary_side_cache_max_content_keys",
-                                512,
+                                getattr(
+                                    self,
+                                    "contextual_boundary_side_cache_max_content_keys",
+                                    512,
+                                ),
                             )
                         )
 
@@ -10634,18 +10837,31 @@ class AbelianContextualDirectFamilyBuilder:
                             keys = tuple(keys or ())
                             if len(keys) <= max_content_keys:
                                 return keys
+                            if route_plan is not None:
+                                return (
+                                    "route_plan_side",
+                                    route_cache_token,
+                                    int(len(keys)),
+                                )
                             return (int(len(keys)), id(keys))
 
-                        def _resolve_side(side, owner_key, keys, packed_table):
+                        def _resolve_side(
+                            side,
+                            owner_key,
+                            keys,
+                            packed_table,
+                            native_plan_key,
+                        ):
                             keys = tuple(keys or ())
+                            side_text = str(side)
                             side_token = (
                                 self.left_boundary_cache_token
-                                if str(side) == "left"
+                                if side_text == "left"
                                 else self.right_boundary_cache_token
                             )
                             side_cache_key = (
                                 "contextual_boundary_side_precompute_result",
-                                str(side),
+                                side_text,
                                 side_token,
                                 str(family_name),
                                 id(packed_table),
@@ -10669,26 +10885,364 @@ class AbelianContextualDirectFamilyBuilder:
                                     False,
                                 )
                             _increment_counter(side_cache_stats, "misses")
-                            resolved = owner_resolve_from_builder(
-                                owner_key,
-                                keys,
-                                bool(owner_table_ids_only),
-                                debug_stats,
-                            )
+                            if bool(owner_table_ids_only):
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_attempts",
+                                )
+                                if owner_resolve_table_ids_from_plan is None:
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_no_method",
+                                    )
+                                if not native_plan_key:
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_no_key",
+                                    )
+                            def _resolve_from_builder(resolve_keys, use_native_plan=True):
+                                resolve_keys = tuple(resolve_keys or ())
+                                try:
+                                    return owner_resolve_from_builder(
+                                        owner_key,
+                                        resolve_keys,
+                                        bool(owner_table_ids_only),
+                                        debug_stats,
+                                        bool(use_native_plan),
+                                    )
+                                except TypeError:
+                                    if bool(use_native_plan):
+                                        return owner_resolve_from_builder(
+                                            owner_key,
+                                            resolve_keys,
+                                            bool(owner_table_ids_only),
+                                            debug_stats,
+                                        )
+                                    raise
+
+                            def _payload_pair_difference(candidate, reference):
+                                if candidate is None or reference is None:
+                                    return candidate is reference, float("inf"), float("inf")
+                                try:
+                                    candidate_pair = tuple(candidate)
+                                    reference_pair = tuple(reference)
+                                except Exception:
+                                    return False, float("inf"), float("inf")
+                                if len(candidate_pair) != len(reference_pair):
+                                    return False, float("inf"), float("inf")
+                                max_abs = 0.0
+                                max_rel = 0.0
+                                for lhs, rhs in zip(candidate_pair, reference_pair):
+                                    same, diff, ref_norm = compare_abelian_packed_boundary_tensors(
+                                        lhs,
+                                        rhs,
+                                    )
+                                    if not same:
+                                        return False, float("inf"), float("inf")
+                                    diff = float(diff)
+                                    ref_norm = float(ref_norm)
+                                    max_abs = max(max_abs, diff)
+                                    max_rel = max(max_rel, diff / max(ref_norm, 1.0e-30))
+                                return True, max_abs, max_rel
+
+                            def _discard_boundary_keys(discard_keys):
+                                if packed_table is None:
+                                    return 0
+                                discard = getattr(packed_table, "discard", None)
+                                if not callable(discard):
+                                    return 0
+                                storage_keys = self._normalized_boundary_keys(
+                                    discard_keys,
+                                    family_name=family_name,
+                                )
+                                count = 0
+                                for storage_key in storage_keys:
+                                    try:
+                                        if discard(storage_key, normalized=True):
+                                            count += 1
+                                    except Exception:
+                                        pass
+                                return int(count)
+
+                            def _debug_value(name, default):
+                                getter = getattr(debug_stats, "get", None)
+                                if not callable(getter):
+                                    return default
+                                return getter(name, default)
+
+                            def _validate_native_table_ids(native_table_ids):
+                                if not bool(_debug_value("validate_native_plan_table_ids", False)):
+                                    return True
+                                if packed_table is None or not hasattr(packed_table, "values_for_ids"):
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_validation_unavailable",
+                                    )
+                                    return True
+                                limit = int(_debug_value("native_plan_validation_limit", -1))
+                                if limit == 0:
+                                    return True
+                                tol = float(
+                                    _debug_value("native_plan_validation_tol", 1.0e-10)
+                                    or 0.0
+                                )
+                                fail_fast = bool(
+                                    _debug_value("native_plan_validation_fail_fast", False)
+                                )
+                                sample_size = len(keys) if limit < 0 else min(int(limit), len(keys))
+                                if sample_size <= 0:
+                                    return True
+                                sample_keys = tuple(keys[:sample_size])
+                                sample_ids = tuple(native_table_ids[:sample_size])
+                                native_values = tuple(packed_table.values_for_ids(sample_ids))
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_validation_calls",
+                                )
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_validation_keys",
+                                    sample_size,
+                                )
+                                side_cache_stats["last_native_plan_validation_keys"] = int(sample_size)
+                                evicted = _discard_boundary_keys(sample_keys)
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_validation_evictions",
+                                    evicted,
+                                )
+                                if bool(_debug_value("native_plan_validation_cold", False)):
+                                    batch_builder = (
+                                        self.left_batch_builder
+                                        if side_text == "left"
+                                        else self.right_batch_builder
+                                    )
+                                    clear_cache = getattr(
+                                        batch_builder,
+                                        "_pyqed_clear_contextual_boundary_cache",
+                                        None,
+                                    )
+                                    if callable(clear_cache):
+                                        clear_cache()
+                                        _increment_counter(
+                                            side_cache_stats,
+                                            "native_plan_validation_cold_clears",
+                                        )
+                                try:
+                                    reference = _resolve_from_builder(
+                                        sample_keys,
+                                        use_native_plan=False,
+                                    )
+                                except Exception as exc:
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_validation_failures",
+                                    )
+                                    side_cache_stats["native_plan_validation_last_error"] = repr(exc)
+                                    if fail_fast:
+                                        raise
+                                    return True
+                                reference_ids = tuple(reference[1])
+                                if len(reference_ids) != sample_size or any(
+                                    int(table_id) < 0 for table_id in reference_ids
+                                ):
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_validation_failures",
+                                    )
+                                    side_cache_stats[
+                                        "native_plan_validation_last_error"
+                                    ] = "reference_table_ids_incomplete"
+                                    if fail_fast:
+                                        raise RuntimeError(
+                                            "contextual native plan validation could not "
+                                            "build reference ids"
+                                        )
+                                    return True
+                                reference_values = tuple(packed_table.values_for_ids(reference_ids))
+                                max_abs = 0.0
+                                max_rel = 0.0
+                                for idx, (got, ref) in enumerate(zip(native_values, reference_values)):
+                                    same, abs_diff, rel_diff = _payload_pair_difference(got, ref)
+                                    max_abs = max(max_abs, float(abs_diff))
+                                    max_rel = max(max_rel, float(rel_diff))
+                                    if (
+                                        not same
+                                        or (
+                                            float(abs_diff) > tol
+                                            and float(rel_diff) > tol
+                                        )
+                                    ):
+                                        _increment_counter(
+                                            side_cache_stats,
+                                            "native_plan_validation_mismatches",
+                                        )
+                                        side_cache_stats[
+                                            "native_plan_validation_last_side"
+                                        ] = side_text
+                                        side_cache_stats[
+                                            "native_plan_validation_last_index"
+                                        ] = int(idx)
+                                        try:
+                                            pattern, piece = sample_keys[idx]
+                                            side_cache_stats[
+                                                "native_plan_validation_last_pattern"
+                                            ] = tuple(str(item) for item in pattern)
+                                            side_cache_stats[
+                                                "native_plan_validation_last_piece"
+                                            ] = str(piece)
+                                        except Exception:
+                                            side_cache_stats[
+                                                "native_plan_validation_last_key"
+                                            ] = repr(sample_keys[idx])
+                                        try:
+                                            got_pair = tuple(got)
+                                            ref_pair = tuple(ref)
+                                            side_cache_stats[
+                                                "native_plan_validation_last_native_key_counts"
+                                            ] = tuple(
+                                                len(abelian_packed_tensor_items(item)[0])
+                                                for item in got_pair
+                                            )
+                                            side_cache_stats[
+                                                "native_plan_validation_last_ref_key_counts"
+                                            ] = tuple(
+                                                len(abelian_packed_tensor_items(item)[0])
+                                                for item in ref_pair
+                                            )
+                                            side_cache_stats[
+                                                "native_plan_validation_last_native_qns"
+                                            ] = tuple(
+                                                tuple(tuple(axis) for axis in getattr(item, "qns", ()))
+                                                for item in got_pair
+                                            )
+                                            side_cache_stats[
+                                                "native_plan_validation_last_ref_qns"
+                                            ] = tuple(
+                                                tuple(tuple(axis) for axis in getattr(item, "qns", ()))
+                                                for item in ref_pair
+                                            )
+                                            side_cache_stats[
+                                                "native_plan_validation_last_native_sources"
+                                            ] = tuple(
+                                                str(getattr(item, "source", ""))
+                                                for item in got_pair
+                                            )
+                                            side_cache_stats[
+                                                "native_plan_validation_last_ref_sources"
+                                            ] = tuple(
+                                                str(getattr(item, "source", ""))
+                                                for item in ref_pair
+                                            )
+                                        except Exception:
+                                            pass
+                                        side_cache_stats[
+                                            "native_plan_validation_max_abs"
+                                        ] = float(max_abs)
+                                        side_cache_stats[
+                                            "native_plan_validation_max_rel"
+                                        ] = float(max_rel)
+                                        _discard_boundary_keys(keys)
+                                        if fail_fast:
+                                            raise RuntimeError(
+                                                "contextual native plan validation failed "
+                                                f"side={side_text} abs={abs_diff:.3e} "
+                                                f"rel={rel_diff:.3e}"
+                                            )
+                                        return False
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_validation_matches",
+                                    sample_size,
+                                )
+                                side_cache_stats["native_plan_validation_max_abs"] = max(
+                                    float(
+                                        side_cache_stats.get(
+                                            "native_plan_validation_max_abs",
+                                            0.0,
+                                        )
+                                    ),
+                                    float(max_abs),
+                                )
+                                side_cache_stats["native_plan_validation_max_rel"] = max(
+                                    float(
+                                        side_cache_stats.get(
+                                            "native_plan_validation_max_rel",
+                                            0.0,
+                                        )
+                                    ),
+                                    float(max_rel),
+                                )
+                                return True
+
+                            used_native_plan = False
+                            if (
+                                bool(owner_table_ids_only)
+                                and owner_resolve_table_ids_from_plan is not None
+                                and native_plan_key
+                            ):
+                                _increment_counter(
+                                    side_cache_stats,
+                                    "native_plan_calls",
+                                )
+                                used_native_plan = True
+                                resolved = owner_resolve_table_ids_from_plan(
+                                    native_plan_key,
+                                    keys,
+                                    packed_table,
+                                    family_name,
+                                    debug_stats,
+                                )
+                            else:
+                                resolved = _resolve_from_builder(keys)
+                            if used_native_plan:
+                                native_table_ids = tuple(resolved[1])
+                                native_complete = bool(
+                                    len(native_table_ids) == len(keys)
+                                    and all(int(table_id) >= 0 for table_id in native_table_ids)
+                                )
+                                if not native_complete:
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_fallbacks",
+                                    )
+                                    resolved = _resolve_from_builder(
+                                        keys,
+                                        use_native_plan=False,
+                                    )
+                                elif not _validate_native_table_ids(native_table_ids):
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_validation_fallbacks",
+                                    )
+                                    _increment_counter(
+                                        side_cache_stats,
+                                        "native_plan_fallbacks",
+                                    )
+                                    resolved = _resolve_from_builder(
+                                        keys,
+                                        use_native_plan=False,
+                                    )
                             values = tuple(resolved[0])
                             table_ids = tuple(resolved[1])
                             hits = int(resolved[2])
                             misses = int(resolved[3])
                             build_seconds = float(resolved[4])
                             batch_used = bool(resolved[5])
-                            complete = bool(
-                                (table_ids and all(int(table_id) >= 0 for table_id in table_ids))
-                                or (
-                                    not bool(owner_table_ids_only)
-                                    and values
+                            if bool(owner_table_ids_only):
+                                table_id_array = np.asarray(
+                                    table_ids,
+                                    dtype=np.int64,
+                                )
+                                complete = bool(
+                                    table_id_array.size == len(keys)
+                                    and bool(np.all(table_id_array >= 0))
+                                )
+                            else:
+                                complete = bool(
+                                    values
                                     and all(value is not None for value in values)
                                 )
-                            )
                             if complete:
                                 self.boundary_batch_cache[side_cache_key] = (
                                     values,
@@ -10716,6 +11270,11 @@ class AbelianContextualDirectFamilyBuilder:
                             left_owner_key,
                             left_build_keys,
                             self.left_packed_boundary_table,
+                            _native_batch_plan_key(
+                                self.left_batch_builder
+                                if route_plan is not None
+                                else None
+                            ),
                         )
                         (
                             right_values,
@@ -10729,6 +11288,11 @@ class AbelianContextualDirectFamilyBuilder:
                             right_owner_key,
                             right_build_keys,
                             self.right_packed_boundary_table,
+                            _native_batch_plan_key(
+                                self.right_batch_builder
+                                if route_plan is not None
+                                else None
+                            ),
                         )
                     else:
                         (
@@ -10993,15 +11557,7 @@ class AbelianContextualDirectFamilyBuilder:
                 )
                 _increment_counter(precompute_cache_stats, "stores")
                 precompute_cache_stats["cache_size"] = int(
-                    sum(
-                        1
-                        for key in self.boundary_batch_cache
-                        if (
-                            isinstance(key, tuple)
-                            and key
-                            and key[0] == "contextual_boundary_precompute_result"
-                        )
-                    )
+                    precompute_cache_stats.get("stores", 0)
                 )
         return boundary_batch
 
@@ -11052,7 +11608,7 @@ class AbelianContextualDirectFamilyBuilder:
         if route_plan is not None:
             family_name = route_plan.family_name
             record_count = route_plan.record_count
-            route_cache_token = getattr(route_plan, "signature", None) or id(route_plan)
+            route_cache_token = ("route_plan_object", id(route_plan))
         else:
             record_count = len(records or ())
             route_cache_token = None
@@ -11072,6 +11628,40 @@ class AbelianContextualDirectFamilyBuilder:
         left_builder = self.left_builder
         right_builder = self.right_builder
         fallback_builder = self.fallback_builder
+
+        def _snapshot_table_backed_planned_entries(planned_entries):
+            if not bool(
+                getattr(
+                    planned_entries,
+                    "_pyqed_planned_direct_family_table_ids",
+                    False,
+                )
+            ):
+                return planned_entries
+            if not bool(options.snapshot_table_backed_planned_entries):
+                snapshot_stats = self.stats.setdefault(
+                    "contextual_planned_entry_snapshots",
+                    {"calls": 0, "entries": 0},
+                )
+                _increment_counter(snapshot_stats, "kept_table_backed")
+                _increment_counter(snapshot_stats, "kept_entries", int(len(planned_entries)))
+                snapshot_stats["last_kept_entries"] = int(len(planned_entries))
+                return planned_entries
+            snapshot = getattr(planned_entries, "snapshot_table_payloads", None)
+            if not callable(snapshot):
+                return planned_entries
+            snapshot_stats = self.stats.setdefault(
+                "contextual_planned_entry_snapshots",
+                {"calls": 0, "entries": 0},
+            )
+            snapshot_stats["calls"] = int(snapshot_stats.get("calls", 0)) + 1
+            snapshot_stats["entries"] = (
+                int(snapshot_stats.get("entries", 0))
+                + int(len(planned_entries))
+            )
+            snapshot_stats["last_entries"] = int(len(planned_entries))
+            return snapshot()
+
         if route_plan is not None:
             left_keys = route_plan.left_keys
             right_keys = route_plan.right_keys
@@ -11368,31 +11958,42 @@ class AbelianContextualDirectFamilyBuilder:
                         and bool(np.all(left_table_id_array >= 0))
                         and bool(np.all(right_table_id_array >= 0))
                     )
-                    if not table_backed_possible:
-                        left_table_ids_tuple = tuple(
-                            int(value) for value in left_table_id_array
+                    left_table_ids_tuple = tuple(
+                        int(value) for value in left_table_id_array
+                    )
+                    right_table_ids_tuple = tuple(
+                        int(value) for value in right_table_id_array
+                    )
+                    stable_table_key = bool(
+                        table_backed_possible
+                        and not bool(options.snapshot_table_backed_planned_entries)
+                    )
+
+                    def _table_token(table):
+                        if table is None:
+                            return None
+                        if stable_table_key:
+                            return (
+                                id(table),
+                                int(getattr(table, "revision", -1)),
+                            )
+                        return (
+                            id(table),
+                            int(getattr(table, "revision", -1)),
+                            int(getattr(table, "puts", 0)),
+                            int(getattr(table, "evictions", 0)),
+                            int(len(getattr(table, "entries", {}) or {})),
+                            int(len(getattr(table, "payloads", ()) or ())),
                         )
-                        right_table_ids_tuple = tuple(
-                            int(value) for value in right_table_id_array
-                        )
+
                     planned_cache_key = (
-                        (
-                            "planned_direct_family_entries_stable_tables",
-                            route_cache_token,
-                            id(self.left_packed_boundary_table),
-                            id(self.right_packed_boundary_table),
-                            entry_source,
-                        )
-                        if table_backed_possible
-                        else (
-                            "planned_direct_family_entries",
-                            route_cache_token,
-                            id(self.left_packed_boundary_table),
-                            id(self.right_packed_boundary_table),
-                            left_table_ids_tuple,
-                            right_table_ids_tuple,
-                            entry_source,
-                        )
+                        "planned_direct_family_entries",
+                        route_cache_token,
+                        _table_token(self.left_packed_boundary_table),
+                        _table_token(self.right_packed_boundary_table),
+                        left_table_ids_tuple,
+                        right_table_ids_tuple,
+                        entry_source,
                     )
                     planned_cache_stats = self.stats.setdefault(
                         "contextual_planned_entry_cache",
@@ -11471,6 +12072,7 @@ class AbelianContextualDirectFamilyBuilder:
                                 + int(len(entries))
                             )
                             planned_cache_stats["backend_actual"] = "python"
+                        entries = _snapshot_table_backed_planned_entries(entries)
                         if bool(entries._pyqed_planned_direct_family_table_ids):
                             self.planned_entries_cache[planned_cache_key] = entries
                         planned_cache_stats["builds"] = (
@@ -11480,9 +12082,7 @@ class AbelianContextualDirectFamilyBuilder:
                     planned_cache_stats["last_compact_pairs"] = int(
                         compact_pair_count
                     )
-                    planned_cache_stats["last_stable_table_key"] = bool(
-                        table_backed_possible
-                    )
+                    planned_cache_stats["last_stable_table_key"] = bool(stable_table_key)
                     planned_cache_stats["cache_size"] = int(
                         len(self.planned_entries_cache)
                     )
@@ -11837,9 +12437,24 @@ class AbelianContextualComponentStore:
         )
         if (
             str(policy).lower().replace("-", "_") == "auto"
-            and "native_boundary_p" in self.stats
-            and str(self.stats["native_boundary_p"].get("validation_policy", ""))
-            == "off"
+            and (
+                (
+                    "native_boundary_p" in self.stats
+                    and str(
+                        self.stats["native_boundary_p"].get(
+                            "validation_policy",
+                            "",
+                        )
+                    )
+                    == "off"
+                )
+                or bool(
+                    self.matvec_options.get(
+                        "generator_table_allow_planned_packed_contextual_entries",
+                        False,
+                    )
+                )
+            )
         ):
             fast_cap = int(
                 self.matvec_options.get(

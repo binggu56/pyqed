@@ -1,25 +1,28 @@
-"""Many-body perturbation-theory entry points."""
+"""Molecular and periodic GW/BSE helpers.
 
-from __future__ import annotations
+The canonical periodic Gaussian GW/BSE API lives in :mod:`pyqed.pbc.gw`.
+The ``pyqed.gw.pbc`` namespace is kept as a compatibility alias.
+"""
 
 from importlib import import_module
 
-
-_LAZY_ATTRS = {
-    "GW": ("pyqed.gw.gw", "GW"),
-    "BSE": ("pyqed.gw.bse", "BSE"),
-    "TDA": ("pyqed.gw.bse", "TDA"),
-}
+__all__ = [
+    "BSE",
+    "GW",
+    "TDA",
+    "pbc",
+]
 
 
 def __getattr__(name):
-    try:
-        module_name, attr_name = _LAZY_ATTRS[name]
-    except KeyError as exc:
-        raise AttributeError(name) from exc
-    value = getattr(import_module(module_name), attr_name)
-    globals()[name] = value
-    return value
+    if name == "GW":
+        from .gw import GW
 
+        return GW
+    if name in {"BSE", "TDA"}:
+        from .bse import BSE, TDA
 
-__all__ = sorted(_LAZY_ATTRS)
+        return {"BSE": BSE, "TDA": TDA}[name]
+    if name == "pbc":
+        return import_module(f"{__name__}.pbc")
+    raise AttributeError(name)

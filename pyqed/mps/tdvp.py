@@ -86,6 +86,8 @@ _BLOCK_QR_CPP_MIN_ELEMENTS = _env_int("PYQED_TDVP_BLOCK_QR_CPP_MIN_ELEMENTS", 1_
 _BLOCK_ONE_SITE_CPP_ENGINE = _env_int("PYQED_TDVP_CPP_ONE_SITE_ENGINE", 1)
 _AFFINE_BLOCK_SPARSE_MPO_CACHE = OrderedDict()
 _AFFINE_BLOCK_SPARSE_MPO_CACHE_MAX = 64
+_BLOCK_SPARSE_MPO_CACHE = OrderedDict()
+_BLOCK_SPARSE_MPO_CACHE_MAX = _env_int("PYQED_TDVP_BLOCK_SPARSE_MPO_CACHE_MAX", 16)
 
 
 def _is_lanczos_method(method):
@@ -236,6 +238,12 @@ def _mpo_factors(H):
     return H.factors if isinstance(H, MPO) else list(H)
 
 
+def _copy_mpo_factor_for_tdvp(factor):
+    if hasattr(factor, "qns") and hasattr(factor, "copy"):
+        return factor.copy()
+    return np.asarray(factor)
+
+
 def _standard_mps_factors(psi):
     return [np.asarray(psi._get_std_B(i), dtype=complex).copy() for i in range(psi.L)]
 
@@ -324,6 +332,30 @@ def _site_sector_table(local_sectors, nsites, phys_dims):
                 f"local_sectors for site {i} has length {len(table)}, expected physical dimension {phys_dim}."
             )
     return tables
+
+
+def _local_sector_phys_dims(local_sectors, nsites):
+    if local_sectors is None:
+        return None
+
+    local_sectors = list(local_sectors)
+    if not local_sectors:
+        raise ValueError("local_sectors cannot be empty.")
+
+    first = local_sectors[0]
+    first_is_site_table = (
+        isinstance(first, list)
+        and first
+        and not hasattr(first, "components")
+    ) or (
+        isinstance(first, tuple)
+        and first
+        and not hasattr(first, "components")
+        and not all(np.isscalar(item) for item in first)
+    )
+    if len(local_sectors) == nsites and first_is_site_table:
+        return tuple(len(site_sectors) for site_sectors in local_sectors)
+    return tuple(len(local_sectors) for _ in range(nsites))
 
 
 def _dense_sector_mask(shape, local_sectors, target_sector):
@@ -548,6 +580,17 @@ def _site_qn_maps_signature(site_qn_maps):
     )
 
 
+def _stable_mpo_cache_key(H, factors):
+    key = getattr(H, "_pyqed_cache_key", None)
+    if key is None:
+        key = tuple(id(factor) for factor in factors)
+    try:
+        hash(key)
+    except TypeError:
+        key = repr(key)
+    return key
+
+
 def _affine_mpo_metadata(H):
     return getattr(H, "_pyqed_affine_mpo", None)
 
@@ -732,11 +775,24 @@ def _as_block_sparse_mpo(H, site_qn_maps):
     factors = _mpo_factors(H)
     if factors and hasattr(factors[0], "qns"):
         return [to_native_abelian_site_tensor(site, copy=True) for site in factors]
-    return dense_to_symmetric_mpo(
+    cache_key = (
+        _stable_mpo_cache_key(H, factors),
+        _site_qn_maps_signature(site_qn_maps),
+    )
+    cached = _BLOCK_SPARSE_MPO_CACHE.get(cache_key)
+    if cached is not None:
+        _BLOCK_SPARSE_MPO_CACHE.move_to_end(cache_key)
+        return list(cached)
+    converted = dense_to_symmetric_mpo(
         [np.asarray(w) for w in factors],
         site_qn_maps,
         native_site_storage=True,
     )
+    _BLOCK_SPARSE_MPO_CACHE[cache_key] = tuple(converted)
+    _BLOCK_SPARSE_MPO_CACHE.move_to_end(cache_key)
+    if len(_BLOCK_SPARSE_MPO_CACHE) > _BLOCK_SPARSE_MPO_CACHE_MAX:
+        _BLOCK_SPARSE_MPO_CACHE.popitem(last=False)
+    return converted
 
 
 def _block_mps_norm2(factors):
@@ -2643,7 +2699,7 @@ class SymmetricTDVP:
             raise ValueError("SymmetricTDVP currently supports the one-site TDVP integrator only.")
         self.integrator = "tdvp"
         self._mpo_source = H
-        self.mpo = [np.asarray(w) for w in _mpo_factors(H)]
+        self.mpo = [_copy_mpo_factor_for_tdvp(w) for w in _mpo_factors(H)]
         self.local_sectors = local_sectors
         self.target_sector = target_sector
         self.max_bond = max_bond
@@ -2703,7 +2759,9 @@ class SymmetricTDVP:
         nsites = psi.L
         if len(self.mpo) != nsites:
             raise ValueError("MPS and MPO lengths must match.")
-        phys_dims = _block_sparse_phys_dims(psi)
+        phys_dims = _local_sector_phys_dims(self.local_sectors, nsites)
+        if phys_dims is None:
+            phys_dims = _block_sparse_phys_dims(psi)
         key = (nsites, phys_dims)
         cached = self._block_sparse_sector_cache.get(key)
         if cached is None:
@@ -2730,7 +2788,7 @@ class SymmetricTDVP:
     def update_mpo_source(self, H):
         """Refresh the source MPO for affine Hamiltonians without rebuilding the engine."""
         self._mpo_source = H
-        self.mpo = [np.asarray(w) for w in _mpo_factors(H)]
+        self.mpo = [_copy_mpo_factor_for_tdvp(w) for w in _mpo_factors(H)]
 
     def sector_mask(self, shape):
         shape = tuple(int(dim) for dim in shape)

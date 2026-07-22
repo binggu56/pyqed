@@ -101,6 +101,19 @@ def test_sparse_grid_ldr_cellwise_quadrature_is_order_stable():
     np.testing.assert_allclose(V2, V5, atol=1e-13)
 
 
+def test_sparse_grid_ldr_hamiltonian_callable_uses_callable_quadrature():
+    sg = SparseGridLDR(ndim=1, level=3, domain=((0.0, 1.0),), mass=1.0)
+
+    def potential(points):
+        return points[:, 0] ** 2
+
+    T = sg.build_kinetic()
+    V = sg.build_potential_quadrature(potential, order=5)
+    H = sg.build_hamiltonian(potential, quadrature_order=5)
+
+    np.testing.assert_allclose(H.toarray(), (T + V).toarray(), atol=1e-13)
+
+
 def test_sparse_grid_ldr_propagation_preserves_generalized_norm():
     sg = SparseGridLDR(ndim=1, level=4, domain=((0.0, 1.0),), mass=1.0)
     _, evecs = sg.solve(nstates=1)

@@ -791,3 +791,21 @@ class NARG:
         self.result = kernel(h1e, eri, **opts)
         self.e_tot, self.vectors = self.result
         return self.result
+
+    def make_rdm1(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Bare qchem NARG does not retain enough state-reconstruction data for RDMs; "
+            "use symmetry='abelian' with store_tensors=True or symmetry='su2'."
+        )
+
+    def make_rdm2(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Bare qchem NARG does not retain enough state-reconstruction data for RDMs; "
+            "use symmetry='abelian' with store_tensors=True or symmetry='su2'."
+        )
+
+    def make_rdm12(self, state_id=0, with_core=False):
+        return (
+            self.make_rdm1(state_id, with_core=with_core),
+            self.make_rdm2(state_id, with_core=with_core),
+        )

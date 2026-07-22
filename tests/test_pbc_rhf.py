@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyqed.qchem.basis import ERI, S, T, point_charge
 from pyqed.qchem.pbc.ewald import (
@@ -6,9 +7,10 @@ from pyqed.qchem.pbc.ewald import (
     ewald_nuclear_repulsion_1d_inf_vacuum,
     gaussian_pair_ft,
     short_range_eri,
+    short_range_eri_s,
     short_range_point_charge,
 )
-from pyqed.qchem.pbc import Cell, Chain, RHF
+from pyqed.qchem.pbc import Cell, Chain, EwaldRHF, KRHF, RHF
 
 
 def test_pbc_cell_builds_native_1d_and_makes_kpts():
@@ -177,6 +179,110 @@ def test_s_gaussian_pair_fourier_has_real_density_symmetry():
     np.testing.assert_allclose(pair_minus_g, pair_g.conj(), atol=1e-12)
 
 
+def test_ewald_pair_fourier_keeps_finite_g_sp_terms_against_pyscf():
+    pytest.importorskip("pyscf")
+    from pyscf.pbc import gto
+    from pyscf.pbc.df import ft_ao
+
+    atom = "Li 0 0 0; H 3.0 0 0"
+    lattice = np.diag([8.0, 8.0, 8.0])
+    cell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=2,
+        recip_cut=1,
+        jk_builder="ewald",
+    )
+    mf._validate()
+    mf._periodic_setup()
+
+    g = np.pi / 4.0
+    gvecs = np.asarray(
+        [
+            [0.0, 0.0, -g],
+            [-g, 0.0, 0.0],
+            [g, 0.0, 0.0],
+            [0.0, -g, 0.0],
+            [0.0, 0.0, g],
+            [0.0, g, 0.0],
+        ],
+        dtype=float,
+    )
+    kpt = np.asarray(mf.kpts[0], dtype=float)
+    native = mf._periodic_pair_ft_batch(gvecs, kpt)
+
+    pyscf_cell = gto.Cell()
+    pyscf_cell.atom = atom
+    pyscf_cell.a = lattice
+    pyscf_cell.basis = "sto-3g"
+    pyscf_cell.unit = "B"
+    pyscf_cell.spin = 0
+    pyscf_cell.verbose = 0
+    pyscf_cell.cart = True
+    pyscf_cell.build()
+    pyscf_ref = np.asarray(
+        ft_ao.ft_aopair(
+            pyscf_cell,
+            gvecs,
+            aosym="s1",
+            kpti_kptj=np.asarray([kpt, kpt]),
+        )
+    )
+
+    np.testing.assert_allclose(native[:, 0, 2:5], pyscf_ref[:, 0, 2:5], atol=5.0e-6)
+    np.testing.assert_allclose(native, pyscf_ref, atol=5.0e-6)
+
+
+def test_ewald_pair_fourier_compiled_block_matches_direct_shift_loop():
+    from pyqed.qchem.fourier import has_compiled_ao_ft
+
+    if not has_compiled_ao_ft():
+        pytest.skip("compiled AO-pair Fourier backend is not available")
+
+    cell = Cell(
+        atom="Li 0 0 0; H 3.0 0 0",
+        a=np.diag([8.0, 8.0, 8.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=1,
+        recip_cut=1,
+        jk_builder="ewald",
+    )
+    mf._validate()
+    mf._periodic_setup()
+
+    assert mf._pair_ft_block_plan is not None
+    gvecs = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [np.pi / 4.0, 0.0, 0.0],
+            [0.0, -np.pi / 4.0, np.pi / 5.0],
+        ],
+        dtype=float,
+    )
+    kpt = np.asarray(mf.kpts[0], dtype=float)
+    fast = mf._periodic_pair_ft_batch(gvecs, kpt)
+    direct = mf._periodic_pair_ft_batch_direct(gvecs, kpt)
+
+    np.testing.assert_allclose(fast, direct, atol=1.0e-12)
+
+
 def test_pbc_cell_has_native_reciprocal_electronic_matrices():
     cell = Cell(
         atom="H 0 0 0; H 1.4 0 0",
@@ -328,7 +434,7 @@ def test_native_ewald_rhf_runs_s_gaussian_gamma():
     assert np.isfinite(mf.madelung)
 
 
-def test_native_ewald_rhf_rejects_kpoints_for_now():
+def test_native_ewald_rhf_runs_s_gaussian_kpoints():
     cell = Cell(
         atom="H 0 0 0; H 1.4 0 0",
         a=np.diag([4.0, 20.0, 20.0]),
@@ -339,12 +445,408 @@ def test_native_ewald_rhf_rejects_kpoints_for_now():
         vacuum=20.0,
     ).build()
 
-    try:
-        cell.RHF(method="ewald", nk=3)
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError("method='ewald' should reject k-points until implemented.")
+    mf = cell.RHF(method="ewald", nk=3, eta=0.5, real_cut=1, recip_cut=4, mesh=(7, 8, 8)).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+    assert mf.converged
+    assert mf.nkpts == 3
+    assert len(mf.dm) == 3
+    assert all(d.shape == (cell.nao, cell.nao) for d in mf.dm)
+    assert all(np.allclose(f, f.conj().T, atol=1e-10) for f in mf.fock)
+
+
+def test_pbc_exposes_krhf_alias_for_ewald_solver():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    assert KRHF is EwaldRHF
+    assert isinstance(cell.KRHF(nk=(1, 1, 1), eta=0.5), EwaldRHF)
+    assert isinstance(cell.RHF(method="krhf", nk=(1, 1, 1), eta=0.5), EwaldRHF)
+
+
+def test_native_ewald_krhf_uses_global_kpoint_occupations():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    mf = cell.KRHF(kpts=cell.make_kpts((2, 1, 1)), eta=0.5)
+    fock = [
+        np.diag([-2.0, -1.0]),
+        np.diag([0.0, 10.0]),
+    ]
+    overlap = [np.eye(cell.nao), np.eye(cell.nao)]
+
+    _mo_energy, _mo_coeff, mo_occ, dm = mf._solve_fock(fock, overlap)
+
+    np.testing.assert_allclose(mo_occ[0], [2.0, 2.0])
+    np.testing.assert_allclose(mo_occ[1], [0.0, 0.0])
+    electron_count = sum(np.trace(d).real for d in dm) / mf.nkpts
+    np.testing.assert_allclose(electron_count, cell.nelectron, atol=1e-12)
+
+
+def test_native_ewald_krhf_fractionally_occupies_degenerate_frontier():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    mf = cell.KRHF(kpts=cell.make_kpts((2, 1, 1)), eta=0.5)
+    fock = [
+        np.diag([-2.0, 0.0]),
+        np.diag([0.0, 10.0]),
+    ]
+    overlap = [np.eye(cell.nao), np.eye(cell.nao)]
+
+    _mo_energy, mo_coeff, mo_occ, dm = mf._solve_fock(fock, overlap)
+    rebuilt_dm = mf.make_rdm1(mo_coeff, mo_occ)
+
+    np.testing.assert_allclose(mo_occ[0], [2.0, 1.0])
+    np.testing.assert_allclose(mo_occ[1], [1.0, 0.0])
+    for actual, rebuilt in zip(dm, rebuilt_dm):
+        np.testing.assert_allclose(actual, rebuilt, atol=1e-12)
+    electron_count = sum(np.trace(d).real for d in dm) / mf.nkpts
+    np.testing.assert_allclose(electron_count, cell.nelectron, atol=1e-12)
+
+
+def test_native_3d_hydrogen_cell_builds_and_makes_kpts():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    assert cell.built
+    assert cell.dimension == 3
+    assert cell.nao == 2
+    kpts = cell.make_kpts((2, 2, 2))
+    assert kpts.shape == (8, 3)
+    assert np.all(np.isfinite(kpts))
+
+
+def test_native_3d_ewald_rhf_runs_gamma_and_kpoints():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    mf_gamma = cell.RHF(method="ewald", eta=0.5, real_cut=0, recip_cut=3).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+    mf_nk1 = cell.RHF(method="ewald", nk=(1, 1, 1), eta=0.5, real_cut=0, recip_cut=3).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+    mf_k = cell.RHF(method="ewald", nk=(2, 2, 2), eta=0.5, real_cut=0, recip_cut=3).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+
+    assert mf_gamma.converged
+    assert mf_nk1.converged
+    assert mf_k.converged
+    assert np.isfinite(mf_gamma.e_tot)
+    assert np.isfinite(mf_k.e_tot)
+    np.testing.assert_allclose(mf_gamma.e_tot, mf_nk1.e_tot, atol=1e-10)
+    assert mf_k.nkpts == 8
+    assert len(mf_k.dm) == 8
+    assert all(d.shape == (cell.nao, cell.nao) for d in mf_k.dm)
+    assert all(np.allclose(f, f.conj().T, atol=1e-10) for f in mf_k.fock)
+
+
+def test_native_3d_hydrogen_band_structure_shapes():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.RHF(method="ewald", eta=0.5, real_cut=0, recip_cut=2).run(
+        max_cycle=50,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+    path = np.column_stack([np.linspace(-0.5, 0.5, 3), np.zeros(3), np.zeros(3)])
+
+    bands = mf.band_structure(scaled_kpts=path, exchange="average")
+    overlap_sorted = mf.band_structure(
+        scaled_kpts=path,
+        exchange="average",
+        sort_bands="overlap",
+    )
+
+    assert bands["kpts"].shape == (3, 3)
+    assert bands["mo_energy"].shape == (3, cell.nao)
+    assert bands["mo_energy_reference"].shape == (3, cell.nao)
+    assert overlap_sorted["mo_energy"].shape == (3, cell.nao)
+    assert np.isfinite(bands["e_fermi"])
+    assert np.all(np.isfinite(bands["mo_energy"]))
+    assert np.all(np.isfinite(overlap_sorted["mo_energy"]))
+
+
+def test_native_3d_hydrogen_mesh_interpolated_bands():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.RHF(
+        method="ewald",
+        nk=(2, 1, 1),
+        eta=0.5,
+        real_cut=0,
+        pair_cut=0,
+        recip_cut=2,
+        jk_builder="reciprocal",
+    ).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+
+    mesh_bands = mf.band_structure(kpts=mf.kpts, exchange="mesh")
+    interp_at_mesh = mf.band_structure(kpts=mf.kpts, exchange="mesh_interpolate")
+    path = np.column_stack([np.linspace(-0.5, 0.5, 5), np.zeros(5), np.zeros(5)])
+    interp_path = mf.band_structure(scaled_kpts=path, exchange="mesh_interpolate")
+
+    assert interp_at_mesh["interpolated"]
+    np.testing.assert_allclose(
+        interp_at_mesh["mo_energy"],
+        mesh_bands["mo_energy"],
+        atol=1e-10,
+    )
+    assert interp_path["mo_energy"].shape == (5, cell.nao)
+    assert np.all(np.isfinite(interp_path["mo_energy"]))
+    with pytest.raises(ValueError, match="self-consistent SCF k-points"):
+        mf.band_structure(scaled_kpts=path, exchange="mesh")
+
+
+def test_native_3d_reciprocal_jk_accepts_larger_pair_cut():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    kpts = cell.make_kpts((2, 1, 1))
+    mf = cell.RHF(
+        method="ewald",
+        kpts=kpts,
+        eta=0.5,
+        real_cut=0,
+        pair_cut=1,
+        recip_cut=2,
+        jk_builder="reciprocal",
+    ).run(max_cycle=80, conv_tol=1e-10, conv_tol_dm=1e-8)
+
+    assert mf.converged
+    assert mf.nkpts == 2
+    assert all(np.allclose(fock, fock.conj().T, atol=1e-10) for fock in mf.fock)
+    assert np.isfinite(mf.e_tot)
+
+
+def test_optional_pyscf_3d_hydrogen_gamma_reference_scale():
+    pyscf_pbc_gto = pytest.importorskip("pyscf.pbc.gto")
+    pyscf_pbc_scf = pytest.importorskip("pyscf.pbc.scf")
+
+    lattice = np.diag([5.0, 5.0, 5.0])
+    atom = "H 0 0 0; H 1.4 0 0"
+    cell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.RHF(method="ewald", eta=0.5, real_cut=0, recip_cut=3).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+
+    ref_cell = pyscf_pbc_gto.Cell()
+    ref_cell.atom = atom
+    ref_cell.a = lattice
+    ref_cell.basis = "sto-3g"
+    ref_cell.unit = "B"
+    ref_cell.charge = 0
+    ref_cell.spin = 0
+    ref_cell.verbose = 0
+    ref_cell.build()
+    ref_mf = pyscf_pbc_scf.RHF(ref_cell).run(conv_tol=1e-10)
+
+    assert ref_mf.converged
+    assert mf.converged
+    assert np.isfinite(ref_mf.e_tot)
+    assert np.isfinite(mf.e_tot)
+    assert abs(mf.e_tot - ref_mf.e_tot) < 1.0
+
+
+def test_optional_pyscf_3d_hydrogen_centered_krhf_reference_scale():
+    pyscf_pbc_gto = pytest.importorskip("pyscf.pbc.gto")
+    pyscf_pbc_scf = pytest.importorskip("pyscf.pbc.scf")
+
+    lattice = np.diag([5.0, 5.0, 5.0])
+    atom = "H 0 0 0; H 1.4 0 0"
+    cell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    kpts = cell.make_kpts((2, 1, 1))
+    mf = cell.RHF(
+        method="ewald",
+        kpts=kpts,
+        eta=0.5,
+        real_cut=2,
+        pair_cut=2,
+        recip_cut=5,
+        jk_builder="reciprocal",
+    ).run(
+        max_cycle=80,
+        conv_tol=1e-10,
+        conv_tol_dm=1e-8,
+    )
+
+    ref_cell = pyscf_pbc_gto.Cell()
+    ref_cell.atom = atom
+    ref_cell.a = lattice
+    ref_cell.basis = "sto-3g"
+    ref_cell.unit = "B"
+    ref_cell.charge = 0
+    ref_cell.spin = 0
+    ref_cell.verbose = 0
+    ref_cell.build()
+    ref_mf = pyscf_pbc_scf.KRHF(ref_cell, kpts=kpts).run(conv_tol=1e-10)
+
+    assert ref_mf.converged
+    assert mf.converged
+    assert abs(mf.e_tot - ref_mf.e_tot) < 5e-6
+
+    scaled_path = np.column_stack(
+        [np.linspace(-0.5, 0.5, 5), np.zeros(5), np.zeros(5)]
+    )
+    native_bands = mf.band_structure(scaled_kpts=scaled_path, exchange="finite_q")
+    recip = 2.0 * np.pi * np.linalg.inv(lattice).T
+    ref_bands, _ = ref_mf.get_bands(scaled_path @ recip)
+    assert np.max(np.abs(native_bands["mo_energy"] - ref_bands)) < 1e-5
+
+
+def test_optional_pyscf_3d_hydrogen_one_body_reference():
+    pyscf_pbc_gto = pytest.importorskip("pyscf.pbc.gto")
+    pyscf_pbc_scf = pytest.importorskip("pyscf.pbc.scf")
+
+    from pyqed.qchem.pbc.hf.ewald_rhf import EwaldRHF
+
+    lattice = np.diag([5.0, 5.0, 5.0])
+    atom = "H 0 0 0; H 1.4 0 0"
+    cell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = EwaldRHF(cell, eta=0.5, real_cut=1, recip_cut=5)
+    mf._validate()
+    mf._periodic_setup()
+    mf._build_one_body_blocks()
+    overlap = mf._fourier_sum(mf._s_r, np.zeros(3))
+    hcore = (
+        mf._fourier_sum(mf._t_r, np.zeros(3))
+        + mf._fourier_sum(mf._vne_sr_r, np.zeros(3))
+        + mf._reciprocal_nuclear_attraction(np.zeros(3))
+        + mf._nuclear_background_hcore(overlap)
+    )
+
+    ref_cell = pyscf_pbc_gto.Cell()
+    ref_cell.atom = atom
+    ref_cell.a = lattice
+    ref_cell.basis = "sto-3g"
+    ref_cell.unit = "B"
+    ref_cell.charge = 0
+    ref_cell.spin = 0
+    ref_cell.verbose = 0
+    ref_cell.build()
+    ref_mf = pyscf_pbc_scf.RHF(ref_cell)
+
+    assert np.linalg.norm(overlap - ref_mf.get_ovlp()) < 2e-3
+    assert np.linalg.norm(hcore - ref_mf.get_hcore()) < 3e-3
+
+
+def test_optional_pyscf_3d_hydrogen_madelung_reference():
+    pyscf_pbc_gto = pytest.importorskip("pyscf.pbc.gto")
+    pyscf_pbc_tools = pytest.importorskip("pyscf.pbc.tools.pbc")
+
+    from pyqed.qchem.pbc.hf.ewald_rhf import EwaldRHF
+
+    lattice = np.diag([5.0, 5.0, 5.0])
+    atom = "H 0 0 0; H 1.4 0 0"
+    cell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = EwaldRHF(cell, eta=0.5, real_cut=1, recip_cut=5)
+    mf._validate()
+
+    ref_cell = pyscf_pbc_gto.Cell()
+    ref_cell.atom = atom
+    ref_cell.a = lattice
+    ref_cell.basis = "sto-3g"
+    ref_cell.unit = "B"
+    ref_cell.charge = 0
+    ref_cell.spin = 0
+    ref_cell.verbose = 0
+    ref_cell.build()
+
+    np.testing.assert_allclose(
+        mf._madelung(),
+        pyscf_pbc_tools.madelung(ref_cell, np.zeros((1, 3))),
+        atol=6e-4,
+    )
 
 
 def test_native_1d_inf_vacuum_probe_madelung_matches_reference_value():
@@ -396,6 +898,22 @@ def test_cartesian_p_d_short_range_point_charge_matches_full_at_eta_zero():
     sr = short_range_point_charge(p_fn, d_fn, center, eta=0.0)
     full = point_charge(p_fn, d_fn, center)
     np.testing.assert_allclose(sr, full, atol=1e-10)
+
+
+def test_short_range_eri_s_shortcut_matches_generic_cartesian_integral():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    basis = cell.unit_molecule._bas
+
+    expected = short_range_eri(basis[0], basis[1], basis[0], basis[1], eta=0.5)
+    actual = short_range_eri_s(basis[0], basis[1], basis[0], basis[1], eta=0.5)
+    np.testing.assert_allclose(actual, expected, atol=1e-14)
 
 
 def test_cartesian_p_d_short_range_eri_matches_full_at_eta_zero():

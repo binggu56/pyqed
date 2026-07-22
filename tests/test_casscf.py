@@ -75,6 +75,94 @@ def _bruteforce_tdm1_spin_orbital(mc_bra, bra_id, mc_ket, ket_id):
     return tdm
 
 
+def test_cpp_dense_ci_hamiltonian_matches_numpy_path():
+    from pyqed.qchem.ci import fci as fci_module
+
+    if fci_module._casscf_cpp is None:
+        pytest.skip("C++ CASSCF helper extension is not available")
+
+    captured = {}
+    original_ci_h = direct_ci_module.CI_H
+
+    def capture_ci_h(binary, h1, h2, sc1, sc2):
+        captured["args"] = (binary, h1, h2, sc1, sc2)
+        return original_ci_h(binary, h1, h2, sc1, sc2)
+
+    direct_ci_module.CI_H = capture_ci_h
+    try:
+        mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+        mol.build(driver='builtin', eri='dense', aosym='s1')
+        mf = mol.RHF().run()
+        CASCI(mf, ncas=4, nelecas=4, verbose=0).run(nstates=1, method='direct_ci')
+    finally:
+        direct_ci_module.CI_H = original_ci_h
+
+    cpp_h = fci_module.CI_H(*captured["args"])
+    cpp_module = fci_module._casscf_cpp
+    fci_module._casscf_cpp = None
+    try:
+        numpy_h = fci_module.CI_H(*captured["args"])
+    finally:
+        fci_module._casscf_cpp = cpp_module
+
+    np.testing.assert_allclose(cpp_h, numpy_h, atol=1e-12)
+
+
+def test_cpp_spin_string_sigma_matches_numba_path():
+    if direct_ci_module._casscf_cpp is None:
+        pytest.skip("C++ CASSCF helper extension is not available")
+
+    captured = {}
+    original_sigma = direct_ci_module._sigma_compact_spin_string
+
+    def capture_sigma(*args):
+        if not captured:
+            captured["args"] = args
+        return direct_ci_module._sigma_compact_spin_string_numba(*args[:31])
+
+    direct_ci_module._sigma_compact_spin_string = capture_sigma
+    try:
+        mol = Molecule(atom='H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2',
+                       unit='angstrom', basis='sto-3g')
+        mol.build(driver='builtin', eri='dense', aosym='s1')
+        mf = mol.RHF().run()
+        mc = CASCI(mf, ncas=4, nelecas=4, verbose=0)
+        mc.direct_ci_dense_fallback_ndets = 0
+        mc.run(nstates=1, method='direct_ci')
+    finally:
+        direct_ci_module._sigma_compact_spin_string = original_sigma
+
+    args = captured["args"]
+    cpp_sigma = original_sigma(*args)
+    numba_sigma = direct_ci_module._sigma_compact_spin_string_numba(*args[:31])
+
+    np.testing.assert_allclose(cpp_sigma, numba_sigma, atol=1e-12)
+
+
+def test_cpp_opposite_spin_rdm2_scatter_matches_numba_path():
+    if casci_module._casscf_cpp is None:
+        pytest.skip("C++ CASSCF helper extension is not available")
+
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2',
+                   unit='angstrom', basis='sto-3g')
+    mol.build(driver='builtin', eri='dense', aosym='s1')
+    mf = mol.RHF().run()
+    mc = CASCI(mf, ncas=4, nelecas=4, verbose=0)
+    mc.direct_ci_dense_fallback_ndets = 0
+    mc.run(nstates=1, method='direct_ci')
+    ci = mc.ci[0] if np.asarray(mc.ci).ndim > 1 else mc.ci
+
+    cpp_dm2 = casci_module.make_rdm2(ci, mc.binary, None, None)
+    cpp_module = casci_module._casscf_cpp
+    casci_module._casscf_cpp = None
+    try:
+        numba_dm2 = casci_module.make_rdm2(ci, mc.binary, None, None)
+    finally:
+        casci_module._casscf_cpp = cpp_module
+
+    np.testing.assert_allclose(cpp_dm2, numba_dm2, atol=1e-12)
+
+
 def test_casscf_lih_lowers_the_initial_casci_energy():
     """Exercise the native U-matrix orbital optimizer on a nontrivial case."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')

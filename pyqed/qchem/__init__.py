@@ -13,6 +13,21 @@ except (ImportError, OSError):
     pass
 
 try:
+    from .orbital_clustering import (
+        cluster_mf_orbitals,
+        cluster_orbitals,
+        graph_cut_ratio,
+        orbital_interaction_graph,
+        spectral_orbital_clusters,
+    )
+except (ImportError, OSError):
+    cluster_mf_orbitals = None
+    cluster_orbitals = None
+    graph_cut_ratio = None
+    orbital_interaction_graph = None
+    spectral_orbital_clusters = None
+
+try:
     from .tddft import *
 except (ImportError, OSError):
     pass
@@ -28,16 +43,36 @@ except (ImportError, OSError):
     pass
 
 try:
+    from .soc import *
+except (ImportError, OSError):
+    pass
+
+try:
     from .relativistic import *
 except (ImportError, OSError):
     pass
 
 try:
-    from .geometric import BOHamiltonianDerivatives, GeometricFGTerms, bo_hamiltonian_derivatives
+    from .symmetry import *
+except (ImportError, OSError):
+    pass
+
+try:
+    from .geometric import (
+        BOHamiltonianDerivatives,
+        GeometricFGTerms,
+        bo_hamiltonian_derivatives,
+        dipole_exponential_ci_overlap,
+        dipole_orbital_rotation_unitary,
+        orbital_rotation_ci_overlap,
+    )
 except (ImportError, OSError):
     BOHamiltonianDerivatives = None
     GeometricFGTerms = None
     bo_hamiltonian_derivatives = None
+    dipole_exponential_ci_overlap = None
+    dipole_orbital_rotation_unitary = None
+    orbital_rotation_ci_overlap = None
 
 try:
     from .ci.cisd import *
@@ -169,6 +204,55 @@ except (ImportError, OSError):
     CASCI = None
 
 try:
+    from .mcscf.rasscf import RASCI, RASSCF, FirstOrderRASSCF, SecondOrderRASSCF
+except (ImportError, OSError):
+    RASCI = None
+    RASSCF = None
+    FirstOrderRASSCF = None
+    SecondOrderRASSCF = None
+
+try:
+    from .mcscf.nevpt2 import NEVPT2, SCNEVPT2, NEVPT2Component
+except (ImportError, OSError):
+    NEVPT2 = None
+    SCNEVPT2 = None
+    NEVPT2Component = None
+
+try:
+    from .mcscf.caspt2 import CASPT2, DiagonalCASPT2, CASPT2Component
+except (ImportError, OSError):
+    CASPT2 = None
+    DiagonalCASPT2 = None
+    CASPT2Component = None
+
+try:
+    from .mcscf import AVAS, avas
+except (ImportError, OSError):
+    AVAS = None
+    avas = None
+
+try:
+    from .tdcasci import TDCASCI, TDCASCITrajectory
+    from .tdcis import TDCIS, cis_determinant_basis
+    from .mctdhf import (
+        DenseCIDensityProvider,
+        DMRGDensityProvider,
+        MCTDHF,
+        MCTDHFTrajectory,
+        RDM12DensityProvider,
+    )
+except (ImportError, OSError):
+    TDCASCI = None
+    TDCASCITrajectory = None
+    TDCIS = None
+    cis_determinant_basis = None
+    MCTDHF = None
+    MCTDHFTrajectory = None
+    DenseCIDensityProvider = None
+    DMRGDensityProvider = None
+    RDM12DensityProvider = None
+
+try:
     from . import nac
 except (ImportError, OSError):
     nac = None
@@ -187,6 +271,12 @@ except (ImportError, OSError):
     CASSCF = None
     FirstOrderCASSCF = None
     SecondOrderCASSCF = None
+
+try:
+    from pyqed.narg.qchem import NARGOpt, NARGSCF
+except (ImportError, OSError):
+    NARGOpt = None
+    NARGSCF = None
 
 try:
     from .mcscf.soc_si import (

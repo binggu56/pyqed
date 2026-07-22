@@ -48,14 +48,29 @@ _NUMBA_AVAILABLE = njit is not None
 _NUMBA_DENSE_ERI_ENABLED = False
 _BASIS_ACCEL = None
 _OS_BLOCKED_MAX_NAO = 32
+_CPP_CARTESIAN_MAX_L = 6
+_basis_cy = None
+_rys_cy = None
+if os.environ.get("PYQED_LOAD_BASIS_CY", "1").strip().lower() in {"1", "true", "yes", "on"}:
+    try:
+        from . import _basis_cy
+    except Exception:  # pragma: no cover - optional accelerator
+        _basis_cy = None
+    try:
+        from . import _rys_cy
+    except Exception:  # pragma: no cover - optional accelerator
+        _rys_cy = None
 try:
-    from . import _basis_cy
+    from . import _integrals_cpp
 except Exception:  # pragma: no cover - optional accelerator
-    _basis_cy = None
-try:
-    from . import _rys_cy
-except Exception:  # pragma: no cover - optional accelerator
-    _rys_cy = None
+    _integrals_cpp = None
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_basis_accel():
@@ -709,7 +724,26 @@ def _signatures_are_spd_fast_rys(signatures):
     return total_l <= 4 and nd <= 1
 
 
-def _default_dense_builder_name():
+def _signatures_max_l(signatures):
+    if not signatures:
+        return 0
+    return max(sum(int(x) for x in sig[0]) for sig in signatures)
+
+
+def _cpp_dense_eri_available():
+    return _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_dense_eri_cartesian")
+
+
+def _cpp_dense_eri_supported(signatures, max_l=_CPP_CARTESIAN_MAX_L):
+    return _cpp_dense_eri_available() and _signatures_max_l(signatures) <= int(max_l)
+
+
+def _default_dense_builder_name(signatures=None):
+    if (
+        _cpp_dense_eri_available()
+        and (signatures is None or _cpp_dense_eri_supported(signatures))
+    ):
+        return f"cpp-cartesian-lmax{_CPP_CARTESIAN_MAX_L}"
     if _basis_cy is not None:
         return "cython-kernel"
     if _load_basis_accel():
@@ -887,6 +921,181 @@ def _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol
     return np.asarray(eri, dtype=np.float64), int(computed), int(skipped)
 
 
+def _compute_dense_eri_serial_cpp_ssss(signatures, pair_bounds, screen_tol):
+    if _integrals_cpp is None:
+        return None
+    if not all(tuple(int(x) for x in sig[0]) == (0, 0, 0) for sig in signatures):
+        return None
+
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    try:
+        eri, computed, skipped = _integrals_cpp.compute_dense_eri_ssss(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(screen_tol),
+        )
+    except Exception:
+        return None
+    return np.asarray(eri, dtype=np.float64), int(computed), int(skipped)
+
+
+def _compute_dense_eri_serial_cpp_cartesian(
+    signatures,
+    pair_bounds,
+    screen_tol,
+    max_l=_CPP_CARTESIAN_MAX_L,
+    workers=1,
+):
+    if not _cpp_dense_eri_available():
+        return None
+    if _signatures_max_l(signatures) > int(max_l):
+        return None
+
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    try:
+        eri, computed, skipped = _integrals_cpp.compute_dense_eri_cartesian(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(screen_tol),
+            int(max_l),
+            int(max(1, workers)),
+        )
+    except Exception:
+        return None
+    return np.asarray(eri, dtype=np.float64), int(computed), int(skipped)
+
+
+def _compute_eri_s8_cpp_cartesian(
+    signatures,
+    pair_bounds,
+    screen_tol,
+    max_l=_CPP_CARTESIAN_MAX_L,
+    workers=1,
+):
+    if _integrals_cpp is None or not hasattr(_integrals_cpp, "compute_eri_s8_cartesian"):
+        return None
+    if _signatures_max_l(signatures) > int(max_l):
+        return None
+
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    try:
+        eri_s8, computed, skipped = _integrals_cpp.compute_eri_s8_cartesian(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(screen_tol),
+            int(max_l),
+            int(max(1, workers)),
+        )
+    except Exception:
+        return None
+    return np.asarray(eri_s8, dtype=np.float64), int(computed), int(skipped)
+
+
+def direct_jk_cartesian_cpp(
+    shells,
+    origins,
+    exps,
+    weights,
+    nprim,
+    pair_bounds,
+    dm,
+    screen_tol=0.0,
+    workers=1,
+    max_l=_CPP_CARTESIAN_MAX_L,
+):
+    if (
+        _integrals_cpp is None
+        or not hasattr(_integrals_cpp, "direct_jk_cartesian")
+        or np.iscomplexobj(dm)
+    ):
+        return None
+    try:
+        vj, vk, computed, skipped = _integrals_cpp.direct_jk_cartesian(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            np.ascontiguousarray(dm, dtype=np.float64),
+            float(screen_tol),
+            int(max_l),
+            int(max(1, workers)),
+        )
+    except Exception:
+        return None
+    return (
+        np.asarray(vj, dtype=np.float64),
+        np.asarray(vk, dtype=np.float64),
+        int(computed),
+        int(skipped),
+    )
+
+
+def direct_veff_cartesian_cpp(
+    shells,
+    origins,
+    exps,
+    weights,
+    nprim,
+    pair_bounds,
+    dm,
+    screen_tol=0.0,
+    workers=1,
+    max_l=_CPP_CARTESIAN_MAX_L,
+):
+    if (
+        _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "direct_veff_cartesian")
+        and not np.iscomplexobj(dm)
+    ):
+        try:
+            veff, computed, skipped = _integrals_cpp.direct_veff_cartesian(
+                np.ascontiguousarray(shells, dtype=np.int64),
+                np.ascontiguousarray(origins, dtype=np.float64),
+                np.ascontiguousarray(exps, dtype=np.float64),
+                np.ascontiguousarray(weights, dtype=np.float64),
+                np.ascontiguousarray(nprim, dtype=np.int64),
+                np.ascontiguousarray(pair_bounds, dtype=np.float64),
+                np.ascontiguousarray(dm, dtype=np.float64),
+                float(screen_tol),
+                int(max_l),
+                int(max(1, workers)),
+            )
+            return np.asarray(veff, dtype=np.float64), int(computed), int(skipped)
+        except Exception:
+            pass
+
+    direct = direct_jk_cartesian_cpp(
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+        pair_bounds,
+        dm,
+        screen_tol=screen_tol,
+        workers=workers,
+        max_l=max_l,
+    )
+    if direct is None:
+        return None
+    vj, vk, computed, skipped = direct
+    return vj - 0.5 * vk, computed, skipped
+
+
 def _compute_cartesian_shell_quartet_block_cython(signatures, shell_block, use_iterative=False):
     if _basis_cy is None:
         return None
@@ -907,7 +1116,7 @@ def _compute_cartesian_shell_quartet_block_cython(signatures, shell_block, use_i
     return np.asarray(block, dtype=np.float64)
 
 
-def _pivoted_cholesky_from_integral_oracle_cython(signatures, pair_bounds, tol=1e-8, max_rank=None, screen_tol=0.0):
+def _pivoted_cholesky_from_integral_oracle_cython(signatures, pair_bounds, tol=1e-8, max_rank=None, screen_tol=0.0, packed=False):
     if _basis_cy is None:
         return None
 
@@ -929,10 +1138,12 @@ def _pivoted_cholesky_from_integral_oracle_cython(signatures, pair_bounds, tol=1
 
     factors_packed = np.asarray(factors_packed, dtype=np.float64)
     pairs = np.asarray(pairs, dtype=np.int64)
+    if packed:
+        return PackedRIFactors(_remap_packed_pair_factors(factors_packed, pairs, len(signatures)), len(signatures))
     return _unpack_packed_pair_factors(factors_packed, pairs, len(signatures))
 
 
-def _pivoted_cholesky_from_integral_oracle_cython_blocked(signatures, pair_bounds, shell_starts, shell_stops, tol=1e-8, max_rank=None, screen_tol=0.0):
+def _pivoted_cholesky_from_integral_oracle_cython_blocked(signatures, pair_bounds, shell_starts, shell_stops, tol=1e-8, max_rank=None, screen_tol=0.0, packed=False):
     if _basis_cy is None:
         return None
 
@@ -956,6 +1167,8 @@ def _pivoted_cholesky_from_integral_oracle_cython_blocked(signatures, pair_bound
 
     factors_packed = np.asarray(factors_packed, dtype=np.float64)
     pairs = np.asarray(pairs, dtype=np.int64)
+    if packed:
+        return PackedRIFactors(_remap_packed_pair_factors(factors_packed, pairs, len(signatures)), len(signatures))
     return _unpack_packed_pair_factors(factors_packed, pairs, len(signatures))
 
 
@@ -1656,6 +1869,10 @@ def _compute_dense_eri_serial_shellblocked_rys(signatures, pair_bounds, screen_t
 
 
 def _compute_dense_eri_serial(signatures, pair_bounds, screen_tol):
+    cpp_cart_result = _compute_dense_eri_serial_cpp_cartesian(signatures, pair_bounds, screen_tol)
+    if cpp_cart_result is not None:
+        return cpp_cart_result
+
     cy_result = _compute_dense_eri_serial_cython(signatures, pair_bounds, screen_tol)
     if cy_result is not None:
         return cy_result
@@ -1771,6 +1988,16 @@ def _eri_chunk_worker_from_task(task):
     return _eri_chunk_worker(*task)
 
 
+def _remap_packed_pair_factors(factors_packed, pairs, nao):
+    factors_packed = np.asarray(factors_packed)
+    pairs = np.asarray(pairs, dtype=np.int64)
+    npair = int(nao) * (int(nao) + 1) // 2
+    factors = np.zeros((factors_packed.shape[0], npair), dtype=factors_packed.dtype)
+    for pair_idx, (i, j) in enumerate(pairs):
+        factors[:, _packed_pair_index(int(i), int(j))] = factors_packed[:, pair_idx]
+    return factors
+
+
 def _unpack_packed_pair_factors(factors_packed, pairs, nao):
     rank = factors_packed.shape[0]
     factors = np.zeros((rank, nao, nao), dtype=factors_packed.dtype)
@@ -1781,13 +2008,14 @@ def _unpack_packed_pair_factors(factors_packed, pairs, nao):
     return factors
 
 
-def _pivoted_cholesky_from_integral_oracle(signatures, pair_bounds, tol=1e-8, max_rank=None, screen_tol=0.0):
+def _pivoted_cholesky_from_integral_oracle(signatures, pair_bounds, tol=1e-8, max_rank=None, screen_tol=0.0, packed=False):
     cy_result = _pivoted_cholesky_from_integral_oracle_cython(
         signatures,
         pair_bounds,
         tol=tol,
         max_rank=max_rank,
         screen_tol=screen_tol,
+        packed=packed,
     )
     if cy_result is not None:
         return cy_result
@@ -1850,9 +2078,13 @@ def _pivoted_cholesky_from_integral_oracle(signatures, pair_bounds, tol=1e-8, ma
         diag = np.maximum(diag, 0.0)
         rank += 1
 
-    return _unpack_packed_pair_factors(chol[:, :rank].T, pairs, nao)
+    factors_packed = chol[:, :rank].T
+    if packed:
+        return PackedRIFactors(factors_packed, nao)
+    return _unpack_packed_pair_factors(factors_packed, pairs, nao)
 
 ALIAS = {
+    'minao'      : 'ano-r0.1.gbs',
     '631g'       : '6-31g.1.gbs',
     'sto3g'      : "sto-3g.1.gbs",
     'sto6g'      : 'sto-6g.1.gbs',
@@ -2018,6 +2250,49 @@ def _compute_native_ri_tensors_cython(signatures, aux_signatures):
     except Exception:
         return None
     return np.asarray(metric, dtype=np.float64), np.asarray(j3, dtype=np.float64)
+
+
+def _compute_native_ri_pair_tensors_cpp(signatures, aux_signatures, pair_bounds, ri_screen_tol):
+    global _NATIVE_RI_LAST_KERNEL_INFO
+    _NATIVE_RI_LAST_KERNEL_INFO = {}
+    if _integrals_cpp is None or not hasattr(_integrals_cpp, "compute_ri_tensors_packed"):
+        return None
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    try:
+        result = _integrals_cpp.compute_ri_tensors_packed(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(aux_shells, dtype=np.int64),
+            np.ascontiguousarray(aux_origins, dtype=np.float64),
+            np.ascontiguousarray(aux_exps, dtype=np.float64),
+            np.ascontiguousarray(aux_weights, dtype=np.float64),
+            np.ascontiguousarray(aux_nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            float(ri_screen_tol),
+        )
+        if len(result) == 5:
+            metric, j3_pair, computed, skipped, shell_blocked = result
+        else:
+            metric, j3_pair, computed, skipped = result
+            shell_blocked = False
+    except Exception:
+        return None
+    _NATIVE_RI_LAST_KERNEL_INFO = {
+        "tensor_kernel": "cpp-shell-block-vrr-hrr" if shell_blocked else "cpp-ao-loop-packed",
+        "parallel_mode": "serial",
+        "shell_blocked": bool(shell_blocked),
+        "task_count": 1,
+    }
+    return (
+        np.asarray(metric, dtype=np.float64),
+        np.asarray(j3_pair, dtype=np.float64),
+        int(computed),
+        int(skipped),
+    )
 
 
 def _compute_native_ri_pair_tensors_cython(signatures, aux_signatures, pair_bounds, ri_screen_tol):
@@ -2647,11 +2922,12 @@ def _resolve_ri_tensor_backend(mol):
     aliases = {
         "compiled": "cython",
         "c": "cython",
+        "c++": "cpp",
         "serial": "python",
     }
     backend = aliases.get(backend, backend)
-    if backend not in {"auto", "native", "cython", "python"}:
-        raise ValueError("builtin_ri_tensor_backend must be 'auto', 'native', 'cython', or 'python'.")
+    if backend not in {"auto", "native", "cython", "cpp", "python"}:
+        raise ValueError("builtin_ri_tensor_backend must be 'auto', 'native', 'cython', 'cpp', or 'python'.")
     return backend
 
 
@@ -3154,6 +3430,9 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     tol = float(getattr(mol, "builtin_ri_metric_tol", getattr(mol, "native_ri_metric_tol", 1e-10)))
     metric_solver = getattr(mol, "builtin_ri_metric_solver", getattr(mol, "native_ri_metric_solver", "auto"))
     tensor_backend = _resolve_ri_tensor_backend(mol)
+    requested_tensor_backend = tensor_backend
+    effective_tensor_backend = tensor_backend
+    tensor_cpp_fallback = False
     storage = _resolve_native_ri_storage(mol, purpose)
     cache_key = _native_ri_fast_cache_key(
         mol,
@@ -3217,7 +3496,21 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     tensor_builder = None
     workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
     t0 = time.perf_counter()
-    if tensor_backend in {"auto", "native", "cython"}:
+    if tensor_backend in {"auto", "native", "cpp"}:
+        tensors = _compute_native_ri_pair_tensors_cpp(
+            signatures,
+            aux_signatures,
+            pair_bounds,
+            ri_screen_tol,
+        )
+        if tensors is not None:
+            tensor_builder = "cpp-kernel-packed"
+            effective_tensor_backend = "cpp"
+            workers = 1
+        elif tensor_backend == "cpp":
+            tensor_cpp_fallback = True
+
+    if tensors is None and tensor_backend in {"auto", "native", "cython", "cpp"}:
         if workers > 1:
             tensors = _compute_native_ri_pair_tensors_cython_parallel(
                 signatures,
@@ -3234,6 +3527,8 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             if tensor_builder is None:
                 tensor_builder = "cython-kernel-packed"
                 workers = 1
+            if tensor_backend == "cpp":
+                effective_tensor_backend = "cython"
         elif tensor_backend == "cython":
             raise RuntimeError("builtin_ri_tensor_backend='cython' was requested, but no compiled RI tensor kernel is available.")
 
@@ -3247,12 +3542,19 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             ri_screen_tol=ri_screen_tol,
         )
         tensor_builder = "python-parallel" if workers > 1 else "python"
+        if tensor_backend == "cpp":
+            effective_tensor_backend = "python"
     else:
         metric, j3_pair, ri_computed, ri_skipped = tensors
         if tensor_builder != "cython-kernel-packed-parallel":
             workers = 1
+    if tensor_cpp_fallback:
+        tensor_builder = f"cpp-fallback-{tensor_builder}"
     ri_timings["tensor_build"] = time.perf_counter() - t0
     kernel_info = dict(_NATIVE_RI_LAST_KERNEL_INFO or {})
+    if tensor_cpp_fallback:
+        kernel_info["requested_tensor_backend"] = requested_tensor_backend
+        kernel_info["effective_tensor_backend"] = effective_tensor_backend
     evals, evecs = np.linalg.eigh(metric)
     keep = evals > tol
     if not np.any(keep):
@@ -3284,7 +3586,8 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         "tensor_kernel": kernel_info.get("tensor_kernel"),
         "parallel_mode": kernel_info.get("parallel_mode"),
         "kernel_info": kernel_info,
-        "tensor_backend": tensor_backend,
+        "tensor_backend": requested_tensor_backend,
+        "effective_tensor_backend": effective_tensor_backend,
         "storage": storage,
         "pair_shape": tuple(int(x) for x in factors_pair.shape),
         "screen_tol": float(ri_screen_tol),
@@ -3453,10 +3756,26 @@ def _ri_occ_block_size(nao, nocc, naux=None, target_bytes=16 * 1024 * 1024):
     return block_size
 
 
-def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=None):
+def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=None, workers=1):
     pair_factors = np.asarray(pair_factors, dtype=np.float64)
     mo_coeff = np.ascontiguousarray(mo_coeff, dtype=np.float64)
     mo_occ = np.asarray(mo_occ, dtype=np.float64)
+    if (
+        _env_flag("PYQED_QCHEM_CPP_RI_JK", default=True)
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "contract_jk_ri_occ_packed")
+    ):
+        try:
+            vj, vk = _integrals_cpp.contract_jk_ri_occ_packed(
+                np.ascontiguousarray(pair_factors, dtype=np.float64),
+                mo_coeff,
+                np.ascontiguousarray(mo_occ, dtype=np.float64),
+                int(nao),
+                int(max(1, workers)),
+            )
+            return np.asarray(vj, dtype=np.float64), np.asarray(vk, dtype=np.float64)
+        except Exception:
+            pass
     occ_idx = np.abs(mo_occ) > 1e-14
     if not np.any(occ_idx):
         return np.zeros((nao, nao), dtype=np.float64), np.zeros((nao, nao), dtype=np.float64)
@@ -3673,6 +3992,63 @@ def unpack_eri_s8(eri_s8, nao):
     return eri
 
 
+def _eri_s8_to_pair_matrix(eri_s8, nao):
+    eri_s8 = np.asarray(eri_s8)
+    nao = int(nao)
+    npair = nao * (nao + 1) // 2
+    if eri_s8.shape != ((npair * (npair + 1)) // 2,):
+        raise ValueError("eri_s8 shape is inconsistent with nao.")
+    pair_ids = np.arange(npair, dtype=np.int64)
+    return np.ascontiguousarray(
+        eri_s8[_packed_pair_pair_indices(pair_ids[:, None], pair_ids[None, :])]
+    )
+
+
+def pivoted_cholesky_eri_s8(eri_s8, nao, tol=1e-8, max_rank=None, return_pivots=False):
+    """
+    Pivoted-Cholesky factorization of packed eight-fold AO ERIs.
+
+    The returned factors live directly in the unique AO-pair space with shape
+    ``(rank, nao * (nao + 1) // 2)``.
+    """
+    pair_mat = _eri_s8_to_pair_matrix(eri_s8, nao)
+    npair = pair_mat.shape[0]
+    if max_rank is None:
+        max_rank = npair
+    max_rank = min(int(max_rank), npair)
+
+    diag = np.real(np.diag(pair_mat)).copy()
+    chol = np.zeros((npair, max_rank), dtype=pair_mat.dtype)
+    rank = 0
+    pivots = []
+
+    for _ in range(max_rank):
+        pivot = int(np.argmax(diag))
+        delta = float(diag[pivot])
+        if delta <= tol:
+            break
+
+        col = np.array(pair_mat[:, pivot], copy=True)
+        if rank > 0:
+            col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+
+        delta = float(np.real(col[pivot]))
+        if delta <= tol:
+            diag[pivot] = 0.0
+            continue
+
+        chol[:, rank] = col / math.sqrt(delta)
+        diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+        diag = np.maximum(diag, 0.0)
+        pivots.append(pivot)
+        rank += 1
+
+    factors = np.ascontiguousarray(chol[:, :rank].T)
+    if return_pivots:
+        return factors, tuple(pivots)
+    return factors
+
+
 def contract_jk_s4(eri_s4, dm, nao):
     """
     Contract packed AO-pair ERIs with a symmetric density matrix.
@@ -3700,19 +4076,42 @@ def contract_jk_s4(eri_s4, dm, nao):
     return vj, vk
 
 
-def contract_jk_s8(eri_s8, dm, nao):
+def contract_jk_s8(eri_s8, dm, nao, workers=1):
     """
     Contract eight-fold packed AO-pair ERIs with a symmetric density matrix.
     """
     eri_s8 = np.asarray(eri_s8)
     dm = np.asarray(dm)
     nao = int(nao)
+    prefer_cpp = _env_flag("PYQED_QCHEM_CPP_JK", default=True)
+    if prefer_cpp and _integrals_cpp is not None and hasattr(_integrals_cpp, "contract_jk_s8"):
+        try:
+            vj, vk = _integrals_cpp.contract_jk_s8(
+                np.ascontiguousarray(eri_s8, dtype=np.float64),
+                np.ascontiguousarray(dm, dtype=np.float64),
+                nao,
+                int(max(1, workers)),
+            )
+            return np.asarray(vj, dtype=np.float64), np.asarray(vk, dtype=np.float64)
+        except Exception:
+            pass
     if _basis_cy is not None and hasattr(_basis_cy, "contract_jk_s8"):
         return _basis_cy.contract_jk_s8(
             np.ascontiguousarray(eri_s8, dtype=np.float64),
             np.ascontiguousarray(dm, dtype=np.float64),
             nao,
         )
+    if _integrals_cpp is not None and hasattr(_integrals_cpp, "contract_jk_s8"):
+        try:
+            vj, vk = _integrals_cpp.contract_jk_s8(
+                np.ascontiguousarray(eri_s8, dtype=np.float64),
+                np.ascontiguousarray(dm, dtype=np.float64),
+                nao,
+                int(max(1, workers)),
+            )
+            return np.asarray(vj, dtype=np.float64), np.asarray(vk, dtype=np.float64)
+        except Exception:
+            pass
     pair_index = _ao_pair_index_matrix(nao)
     npair = nao * (nao + 1) // 2
     if eri_s8.shape != ((npair * (npair + 1)) // 2,):
@@ -3732,6 +4131,103 @@ def contract_jk_s8(eri_s8, dm, nao):
             indices = _packed_pair_pair_indices(row_pairs[:, None], pair_index[None, :, j])
             vk[i, j] = np.einsum("lk,lk->", dm, eri_s8[indices], optimize=True)
     return vj, vk
+
+
+def contract_veff_s8_mo(eri_s8, mo_coeff, mo_occ, nao, workers=1):
+    """
+    Contract eight-fold packed AO ERIs for an RHF MO density and return
+    ``J - 0.5 K`` directly.
+    """
+    if (
+        _env_flag("PYQED_QCHEM_CPP_JK", default=True)
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "contract_veff_s8_occ")
+        and not np.iscomplexobj(eri_s8)
+        and not np.iscomplexobj(mo_coeff)
+        and not np.iscomplexobj(mo_occ)
+    ):
+        try:
+            veff = _integrals_cpp.contract_veff_s8_occ(
+                np.ascontiguousarray(eri_s8, dtype=np.float64),
+                np.ascontiguousarray(mo_coeff, dtype=np.float64),
+                np.ascontiguousarray(mo_occ, dtype=np.float64),
+                int(max(1, workers)),
+            )
+            return np.asarray(veff, dtype=np.float64)
+        except Exception:
+            pass
+    return None
+
+
+def contract_veff_s8(eri_s8, dm, nao, workers=1):
+    """
+    Contract eight-fold packed AO ERIs with an AO density and return
+    ``J - 0.5 K`` directly.
+    """
+    if (
+        _env_flag("PYQED_QCHEM_CPP_JK", default=True)
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "contract_veff_s8")
+        and not np.iscomplexobj(eri_s8)
+        and not np.iscomplexobj(dm)
+    ):
+        try:
+            veff = _integrals_cpp.contract_veff_s8(
+                np.ascontiguousarray(eri_s8, dtype=np.float64),
+                np.ascontiguousarray(dm, dtype=np.float64),
+                int(nao),
+                int(max(1, workers)),
+            )
+            return np.asarray(veff, dtype=np.float64)
+        except Exception:
+            pass
+    return None
+
+
+def ao2mo_s8(eri_s8, mo_coeff):
+    """
+    Transform eight-fold packed AO ERIs to a dense chemist-notation MO tensor.
+
+    The packed tensor is first promoted to the AO-pair matrix and transformed as
+    ``P.T @ G @ P``.  This uses NumPy's BLAS-backed matrix products and is much
+    faster than the legacy scalar-loop C++ kernel for repeated CASSCF/NARGSCF
+    AO->MO transformations.
+    """
+    eri_s8 = np.asarray(eri_s8)
+    mo_coeff = np.asarray(mo_coeff)
+    if mo_coeff.ndim != 2:
+        raise ValueError("mo_coeff must be a 2D array.")
+    nao, nmo = mo_coeff.shape
+    npair = int(nao) * (int(nao) + 1) // 2
+    if eri_s8.shape != ((npair * (npair + 1)) // 2,):
+        raise ValueError("eri_s8 shape is inconsistent with mo_coeff.")
+    if (
+        _env_flag("PYQED_QCHEM_CPP_AO2MO_SCALAR", default=False)
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "ao2mo_s8")
+        and not np.iscomplexobj(eri_s8)
+        and not np.iscomplexobj(mo_coeff)
+    ):
+        try:
+            eri_mo = _integrals_cpp.ao2mo_s8(
+                np.ascontiguousarray(eri_s8, dtype=np.float64),
+                np.ascontiguousarray(mo_coeff, dtype=np.float64),
+            )
+            return np.asarray(eri_mo, dtype=np.float64)
+        except Exception:
+            pass
+
+    rows, cols = _ao_pair_indices(nao)
+    left = mo_coeff.conj()
+    pair_mo = left[rows, :, None] * mo_coeff[cols, None, :]
+    offdiag = rows != cols
+    if np.any(offdiag):
+        pair_mo[offdiag] += left[cols[offdiag], :, None] * mo_coeff[rows[offdiag], None, :]
+    pair_mo = np.ascontiguousarray(pair_mo.reshape(npair, nmo * nmo))
+    pair_ids = np.arange(npair, dtype=np.int64)
+    eri_s4 = np.asarray(eri_s8)[_packed_pair_pair_indices(pair_ids[:, None], pair_ids[None, :])]
+    eri_mo = pair_mo.T @ (eri_s4 @ pair_mo)
+    return eri_mo.reshape(nmo, nmo, nmo, nmo)
 
 
 def contract_jk_ri(eri_factors, dm, nao):
@@ -3759,7 +4255,15 @@ def contract_jk_ri(eri_factors, dm, nao):
     return vj, vk
 
 
-def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao):
+def contract_veff_ri(eri_factors, dm, nao):
+    """
+    Contract RI/DF factors with an AO density and return ``J - 0.5 K``.
+    """
+    vj, vk = contract_jk_ri(eri_factors, dm, nao)
+    return vj - 0.5 * vk
+
+
+def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=1):
     """
     Contract RI/DF factors for an idempotent MO density.
 
@@ -3769,11 +4273,26 @@ def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao):
     nao = int(nao)
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, nao)
-        return _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao)
+        return _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, workers=workers)
     return _contract_jk_ri_occ_full(eri_factors, mo_coeff, mo_occ, nao)
 
 
-def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+def contract_veff_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=1):
+    """
+    Contract RI/DF factors for an RHF occupied MO density and return
+    ``J - 0.5 K``.
+    """
+    vj, vk = contract_jk_ri_mo(
+        eri_factors,
+        mo_coeff,
+        mo_occ,
+        nao,
+        workers=workers,
+    )
+    return vj - 0.5 * vk
+
+
+def mo_pair_factors(eri_factors, mo_left, mo_right=None):
     """
     Transform AO RI factors to an MO pair block without forcing packed factors
     through a generic einsum backend.
@@ -3784,6 +4303,29 @@ def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
     mo_right = np.asarray(mo_right)
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, mo_left.shape[0])
+        if (
+            _env_flag("PYQED_QCHEM_CPP_RI_AO2MO", default=True)
+            and _integrals_cpp is not None
+            and (
+                hasattr(_integrals_cpp, "mo_pair_factors")
+                or hasattr(_integrals_cpp, "transform_ri_factors_to_mo_pair")
+            )
+            and not np.iscomplexobj(pair_factors)
+            and not np.iscomplexobj(mo_left)
+            and not np.iscomplexobj(mo_right)
+        ):
+            try:
+                transform_cpp = getattr(_integrals_cpp, "mo_pair_factors", None)
+                if transform_cpp is None:
+                    transform_cpp = _integrals_cpp.transform_ri_factors_to_mo_pair
+                out_cpp = transform_cpp(
+                    np.ascontiguousarray(pair_factors, dtype=np.float64),
+                    np.ascontiguousarray(mo_left, dtype=np.float64),
+                    np.ascontiguousarray(mo_right, dtype=np.float64),
+                )
+                return np.asarray(out_cpp, dtype=np.float64)
+            except Exception:
+                pass
         out = np.empty(
             (pair_factors.shape[0], mo_left.shape[1], mo_right.shape[1]),
             dtype=np.result_type(pair_factors, mo_left, mo_right),
@@ -3800,6 +4342,13 @@ def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
         mo_right,
         optimize=True,
     )
+
+
+def transform_ri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None):
+    """
+    Compatibility alias for :func:`mo_pair_factors`.
+    """
+    return mo_pair_factors(eri_factors, mo_left, mo_right)
 
 
 def _compute_dense_eri_spherical_shellwise(basis_cart, signatures, pair_bounds, screen_tol):
@@ -3917,8 +4466,8 @@ def build_builtin(mol):
     eri_backend = str(
         getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
     ).lower()
-    if eri_backend not in {"auto", "rys"}:
-        raise ValueError("builtin_eri_backend/native_eri_backend must be 'auto' or 'rys'.")
+    if eri_backend not in {"auto", "rys", "cpp"}:
+        raise ValueError("builtin_eri_backend/native_eri_backend must be 'auto', 'rys', or 'cpp'.")
     eri_representation = getattr(
         mol,
         "builtin_eri_representation",
@@ -3948,7 +4497,7 @@ def build_builtin(mol):
         )
     if aosym not in {"s1", "s4", "s8"}:
         raise ValueError("builtin_aosym/native_aosym must be 's1', 's4', or 's8'.")
-    if aosym != "s1" and eri_representation in {"factors", "ri"}:
+    if aosym != "s1" and eri_representation == "ri":
         aosym = "s1"
     if aosym != "s1" and eri_representation == "dense+ri":
         raise ValueError("builtin_aosym does not apply to the RI factors in dense+ri builds.")
@@ -3979,16 +4528,48 @@ def build_builtin(mol):
             pair_bounds = np.zeros((nao_cart, nao_cart), dtype=float)
             timings["pair_bounds"] = 0.0
 
+    prefer_cpp_dense = (
+        eri_backend in {"auto", "cpp"}
+        and coord_type == "cartesian"
+        and _cpp_dense_eri_supported(signatures)
+    )
+
+    if (
+        eri_representation == "dense"
+        and aosym == "s8"
+        and coord_type == "cartesian"
+        and eri_backend in {"auto", "cpp"}
+        and not bool(getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False)))
+    ):
+        if eri_backend == "cpp" and _integrals_cpp is None:
+            raise RuntimeError("builtin eri_backend='cpp' requires the compiled _integrals_cpp extension.")
+        t0 = time.perf_counter()
+        cpp_s8 = _compute_eri_s8_cpp_cartesian(
+            signatures,
+            pair_bounds,
+            screen_tol,
+            workers=workers,
+        )
+        if cpp_s8 is not None:
+            eri_s8, computed, skipped = cpp_s8
+            timings["dense_eri"] = time.perf_counter() - t0
+            dense_builder = f"cpp-cartesian-s8-lmax{_CPP_CARTESIAN_MAX_L}"
+            if eri_backend == "auto":
+                dense_builder += "-auto"
+            pack_s8 = False
+
     if (
         eri_representation == "dense"
         and aosym == "s8"
         and coord_type == "cartesian"
         and eri_backend == "auto"
+        and not prefer_cpp_dense
         and workers <= 1
         and _basis_cy is not None
         and hasattr(_basis_cy, "compute_eri_s8")
         and not bool(getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False)))
     ):
+        t0 = time.perf_counter()
         shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
         eri_s8, computed, skipped = _basis_cy.compute_eri_s8(
             np.ascontiguousarray(shells, dtype=np.int64),
@@ -3999,10 +4580,30 @@ def build_builtin(mol):
             np.ascontiguousarray(pair_bounds, dtype=np.float64),
             float(screen_tol),
         )
+        timings["dense_eri"] = time.perf_counter() - t0
         dense_builder = "cython-s8-packed"
         pack_s8 = False
 
     if eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is None:
+        t0 = time.perf_counter()
+        cpp_fallback = False
+        if eri_backend in {"auto", "cpp"} and coord_type == "cartesian":
+            if eri_backend == "cpp" and not _cpp_dense_eri_available():
+                raise RuntimeError("builtin eri_backend='cpp' requires the compiled _integrals_cpp extension.")
+            cpp_eri = _compute_dense_eri_serial_cpp_cartesian(
+                signatures,
+                pair_bounds,
+                screen_tol,
+                workers=workers,
+            )
+            if cpp_eri is not None:
+                eri, computed, skipped = cpp_eri
+                dense_builder = f"cpp-cartesian-lmax{_CPP_CARTESIAN_MAX_L}"
+                if eri_backend == "auto":
+                    dense_builder += "-auto"
+            elif eri_backend == "cpp":
+                cpp_fallback = True
+
         use_rys = (
             eri_backend == "rys"
             or (
@@ -4011,11 +4612,10 @@ def build_builtin(mol):
                 and _signatures_are_sp_only(signatures)
             )
         )
-        t0 = time.perf_counter()
         use_shellwise_spherical = bool(
             getattr(mol, "builtin_shellwise_spherical", getattr(mol, "native_shellwise_spherical", False))
         )
-        if coord_type == "spherical" and workers <= 1 and eri_backend == "auto" and use_shellwise_spherical:
+        if eri is None and coord_type == "spherical" and workers <= 1 and eri_backend == "auto" and use_shellwise_spherical:
             shellwise = _compute_dense_eri_spherical_shellwise(
                 basis_cart, signatures, pair_bounds, screen_tol
             )
@@ -4069,24 +4669,30 @@ def build_builtin(mol):
                     eri, computed, skipped = _compute_dense_eri_serial(
                         signatures, pair_bounds, screen_tol
                     )
-                    dense_builder = _default_dense_builder_name() + "-mixed-d-fallback"
+                    dense_builder = _default_dense_builder_name(signatures) + "-mixed-d-fallback"
         elif eri is None and workers > 1:
             eri, computed, skipped = _compute_dense_eri_parallel(
                 signatures, pair_bounds, screen_tol, workers
             )
-            dense_builder = "python-parallel"
+            dense_builder = "cpp-fallback-python-parallel" if cpp_fallback else "python-parallel"
         elif eri is None:
             blocked = None
             if not _signatures_are_sp_only(signatures) and nao_cart <= _OS_BLOCKED_MAX_NAO:
                 blocked = _compute_dense_eri_serial_cython_blocked(signatures, pair_bounds, screen_tol)
             if blocked is not None:
                 eri, computed, skipped = blocked
-                dense_builder = "cython-shell-os-blocked"
+                dense_builder = (
+                    "cpp-fallback-cython-shell-os-blocked"
+                    if cpp_fallback
+                    else "cython-shell-os-blocked"
+                )
             else:
                 eri, computed, skipped = _compute_dense_eri_serial(
                     signatures, pair_bounds, screen_tol
                 )
-                dense_builder = _default_dense_builder_name()
+                dense_builder = _default_dense_builder_name(signatures)
+                if cpp_fallback:
+                    dense_builder = "cpp-fallback-" + dense_builder
         timings["dense_eri"] = time.perf_counter() - t0
 
         if eri_representation == "dense+ri":
@@ -4112,7 +4718,11 @@ def build_builtin(mol):
                 ),
             )
             timings["low_rank_factors"] = time.perf_counter() - t0
-            factor_builder = "pivoted-cholesky-dense"
+            factor_builder = (
+                "cpp-dense-pivoted-cholesky"
+                if str(dense_builder or "").startswith("cpp-cartesian")
+                else "pivoted-cholesky-dense"
+            )
             factors_are_spherical = bool(eri_is_spherical)
 
     elif eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is not None:
@@ -4124,78 +4734,144 @@ def build_builtin(mol):
         factor_builder = "native-ri"
     elif eri_representation == "direct":
         aosym = "s8"
-        if _basis_cy is None or not hasattr(_basis_cy, "direct_jk"):
-            raise RuntimeError("builtin eri='direct' requires the compiled _basis_cy direct_jk kernel.")
         shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
-        if coord_type == "cartesian" and hasattr(_basis_cy, "compute_eri_s8"):
-            eri_s8, computed, skipped = _basis_cy.compute_eri_s8(
-                np.ascontiguousarray(shells, dtype=np.int64),
-                np.ascontiguousarray(origins, dtype=np.float64),
-                np.ascontiguousarray(exps, dtype=np.float64),
-                np.ascontiguousarray(weights, dtype=np.float64),
-                np.ascontiguousarray(nprim, dtype=np.int64),
-                np.ascontiguousarray(pair_bounds, dtype=np.float64),
-                float(screen_tol),
-            )
-            dense_builder = "direct-cython-s8-cache"
+        direct_kernel = None
+        if (
+            eri_backend in {"auto", "cpp"}
+            and _integrals_cpp is not None
+            and hasattr(_integrals_cpp, "direct_jk_cartesian")
+            and _signatures_max_l(signatures) <= _CPP_CARTESIAN_MAX_L
+        ):
+            direct_kernel = "cpp-cartesian-direct-jk"
+        elif _basis_cy is not None and hasattr(_basis_cy, "direct_jk"):
+            direct_kernel = "cython-direct-jk"
+        elif eri_backend == "cpp":
+            raise RuntimeError("builtin eri_backend='cpp' with eri='direct' requires the compiled _integrals_cpp direct_jk_cartesian kernel.")
         else:
-            shell_blocks = _cart_shell_blocks(basis_cart)
-            shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
-            shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
-            direct_jk_data = {
-                "shells": np.ascontiguousarray(shells, dtype=np.int64),
-                "origins": np.ascontiguousarray(origins, dtype=np.float64),
-                "exps": np.ascontiguousarray(exps, dtype=np.float64),
-                "weights": np.ascontiguousarray(weights, dtype=np.float64),
-                "nprim": np.ascontiguousarray(nprim, dtype=np.int64),
-                "pair_bounds": np.ascontiguousarray(pair_bounds, dtype=np.float64),
-                "shell_starts": shell_starts,
-                "shell_stops": shell_stops,
-                "screen_tol": float(screen_tol),
-                "cache_aosym": None,
-            }
-            dense_builder = "direct-cython-jk"
+            raise RuntimeError("builtin eri='direct' requires the compiled _integrals_cpp or _basis_cy direct JK kernel.")
+
+        shell_blocks = _cart_shell_blocks(basis_cart)
+        shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
+        shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+        direct_jk_data = {
+            "shells": np.ascontiguousarray(shells, dtype=np.int64),
+            "origins": np.ascontiguousarray(origins, dtype=np.float64),
+            "exps": np.ascontiguousarray(exps, dtype=np.float64),
+            "weights": np.ascontiguousarray(weights, dtype=np.float64),
+            "nprim": np.ascontiguousarray(nprim, dtype=np.int64),
+            "pair_bounds": np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            "shell_starts": shell_starts,
+            "shell_stops": shell_stops,
+            "screen_tol": float(screen_tol),
+            "kernel": direct_kernel,
+            "cache_aosym": None,
+            "screening": "schwarz+density",
+            "task_cache": (
+                "cpp-shell-pair-geometry+quartet-tasks"
+                if str(direct_kernel).startswith("cpp-")
+                else None
+            ),
+            "last_mode": None,
+            "last_computed": None,
+            "last_skipped": None,
+        }
+        dense_builder = direct_kernel
     else:
         t0 = time.perf_counter()
         pair_bounds = _compute_pair_bounds(signatures)
         timings["pair_bounds"] = time.perf_counter() - t0
-        shell_blocks = _cart_shell_blocks(basis_cart)
-        shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
-        shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
-        t0 = time.perf_counter()
-        factors = _pivoted_cholesky_from_integral_oracle_cython_blocked(
-            signatures,
-            pair_bounds,
-            shell_starts=shell_starts,
-            shell_stops=shell_stops,
-            tol=float(
-                getattr(mol, "builtin_low_rank_tol", getattr(mol, "native_low_rank_tol", 1e-8))
-            ),
-            max_rank=getattr(
-                mol,
-                "builtin_low_rank_max_rank",
-                getattr(mol, "native_low_rank_max_rank", None),
-            ),
-            screen_tol=screen_tol,
+        low_rank_tol = float(
+            getattr(mol, "builtin_low_rank_tol", getattr(mol, "native_low_rank_tol", 1e-8))
         )
-        if factors is not None:
-            factor_builder = "cython-kernel-blocked"
-        else:
-            factors = _pivoted_cholesky_from_integral_oracle(
+        low_rank_max_rank = getattr(
+            mol,
+            "builtin_low_rank_max_rank",
+            getattr(mol, "native_low_rank_max_rank", None),
+        )
+        factor_cpp_fallback = False
+        if eri_backend == "cpp" and coord_type == "cartesian":
+            if not _cpp_dense_eri_available():
+                raise RuntimeError("builtin eri_backend='cpp' requires the compiled _integrals_cpp extension.")
+            if aosym == "s8" and _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_eri_s8_cartesian"):
+                t0 = time.perf_counter()
+                cpp_s8 = _compute_eri_s8_cpp_cartesian(
+                    signatures,
+                    pair_bounds,
+                    screen_tol,
+                    workers=workers,
+                )
+                timings["packed_s8_eri"] = time.perf_counter() - t0
+                if cpp_s8 is not None:
+                    eri_s8_source, computed, skipped = cpp_s8
+                    dense_builder = f"cpp-cartesian-s8-lmax{_CPP_CARTESIAN_MAX_L}-factor-source"
+                    t0 = time.perf_counter()
+                    factors_pair = pivoted_cholesky_eri_s8(
+                        eri_s8_source,
+                        len(signatures),
+                        tol=low_rank_tol,
+                        max_rank=low_rank_max_rank,
+                    )
+                    factors = PackedRIFactors(factors_pair, len(signatures))
+                    timings["low_rank_factors"] = time.perf_counter() - t0
+                    factor_builder = "cpp-s8-pair-pivoted-cholesky"
+
+            if factors is None:
+                t0 = time.perf_counter()
+                cpp_eri = _compute_dense_eri_serial_cpp_cartesian(
+                    signatures,
+                    pair_bounds,
+                    screen_tol,
+                    workers=workers,
+                )
+                timings["dense_eri"] = time.perf_counter() - t0
+                if cpp_eri is not None:
+                    from pyqed.qchem.hf.rhf import pivoted_cholesky_eri
+
+                    eri_dense, computed, skipped = cpp_eri
+                    dense_builder = f"cpp-cartesian-lmax{_CPP_CARTESIAN_MAX_L}-factor-source"
+                    t0 = time.perf_counter()
+                    factors = pivoted_cholesky_eri(
+                        eri_dense,
+                        tol=low_rank_tol,
+                        max_rank=low_rank_max_rank,
+                    )
+                    timings["low_rank_factors"] = time.perf_counter() - t0
+                    factor_builder = "cpp-dense-pivoted-cholesky"
+                else:
+                    factor_cpp_fallback = True
+
+        if factors is None:
+            shell_blocks = _cart_shell_blocks(basis_cart)
+            shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
+            shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+            packed_factors = aosym == "s8"
+            t0 = time.perf_counter()
+            factors = _pivoted_cholesky_from_integral_oracle_cython_blocked(
                 signatures,
                 pair_bounds,
-                tol=float(
-                    getattr(mol, "builtin_low_rank_tol", getattr(mol, "native_low_rank_tol", 1e-8))
-                ),
-                max_rank=getattr(
-                    mol,
-                    "builtin_low_rank_max_rank",
-                    getattr(mol, "native_low_rank_max_rank", None),
-                ),
+                shell_starts=shell_starts,
+                shell_stops=shell_stops,
+                tol=low_rank_tol,
+                max_rank=low_rank_max_rank,
                 screen_tol=screen_tol,
+                packed=packed_factors,
             )
-            factor_builder = "cython-kernel" if _basis_cy is not None else "python-oracle"
-        timings["low_rank_factors"] = time.perf_counter() - t0
+            if factors is not None:
+                factor_builder = "cython-kernel-blocked-packed" if packed_factors else "cython-kernel-blocked"
+            else:
+                factors = _pivoted_cholesky_from_integral_oracle(
+                    signatures,
+                    pair_bounds,
+                    tol=low_rank_tol,
+                    max_rank=low_rank_max_rank,
+                    screen_tol=screen_tol,
+                    packed=packed_factors,
+                )
+                base_builder = "cython-kernel" if _basis_cy is not None else "python-oracle"
+                factor_builder = f"{base_builder}-packed" if packed_factors else base_builder
+            if factor_cpp_fallback:
+                factor_builder = "cpp-fallback-" + factor_builder
+            timings["low_rank_factors"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     transform = None
@@ -4251,6 +4927,13 @@ def build_builtin(mol):
             setattr(fn, "coord_type", coord_type)
     mol.nbas = mol.nao
     mol._builtin_build_info = {
+        "driver": "builtin",
+        "basis": str(mol.basis),
+        "input_unit": str(getattr(mol, "unit", "bohr")),
+        "coordinate_unit": "bohr",
+        "atom_symbols": list(atoms),
+        "atom_coords_bohr": np.asarray(atcoords, dtype=float).tolist(),
+        "geometry_hash": mol.geometry_hash(),
         "coord_type": coord_type,
         "requested_representation": requested_eri_representation,
         "representation": eri_representation,
@@ -4260,14 +4943,31 @@ def build_builtin(mol):
             else ("s4" if eri_s4 is not None else ("dense" if eri is not None else None))
         ),
         "eri_backend": eri_backend,
+        "cpp_cartesian_max_l": _CPP_CARTESIAN_MAX_L,
         "workers": workers,
         "screen_tol": screen_tol,
         "quartets_computed": int(computed),
         "quartets_screened": int(skipped),
         "factor_rank": None if factors is None else int(factors.shape[0]),
+        "factor_storage": (
+            "packed-pair"
+            if isinstance(factors, PackedRIFactors)
+            else ("full" if factors is not None else None)
+        ),
+        "factor_pair_shape": (
+            tuple(int(x) for x in factors.pair_shape)
+            if isinstance(factors, PackedRIFactors)
+            else None
+        ),
         "dense_builder": dense_builder,
         "factor_builder": factor_builder,
         "ri": ri_info,
+        "direct_jk": None if direct_jk_data is None else {
+            "kernel": direct_jk_data.get("kernel"),
+            "screening": direct_jk_data.get("screening"),
+            "task_cache": direct_jk_data.get("task_cache"),
+            "cache_aosym": direct_jk_data.get("cache_aosym"),
+        },
         "timings": {key: float(value) for key, value in timings.items()},
         "build_time": float(time.perf_counter() - total_start),
     }

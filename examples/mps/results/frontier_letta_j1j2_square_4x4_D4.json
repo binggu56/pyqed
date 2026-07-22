@@ -1,0 +1,162 @@
+{
+  "model": {
+    "nrows": 4,
+    "ncols": 4,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "local_terms": 42
+  },
+  "ansatz": {
+    "kind": "frontier-dense-tied-letta",
+    "tie_graph": "all-j1-nearest-neighbor-bonds",
+    "bond_dim": 4,
+    "tie_edges": 24,
+    "parameters": 1448,
+    "hamiltonian_mpo_bond_dim": 14,
+    "compressed_hamiltonian_mpo_bond_dim": 14,
+    "uncompressed_hamiltonian_mpo_bond_dim": 35,
+    "parent_sets": [
+      [
+        1,
+        7
+      ],
+      [
+        2,
+        6
+      ],
+      [
+        3,
+        5
+      ],
+      [
+        4
+      ],
+      [
+        5,
+        11
+      ],
+      [
+        6,
+        10
+      ],
+      [
+        7,
+        9
+      ],
+      [
+        8
+      ],
+      [
+        9,
+        15
+      ],
+      [
+        10,
+        14
+      ],
+      [
+        11,
+        13
+      ],
+      [
+        12
+      ],
+      [
+        13
+      ],
+      [
+        14
+      ],
+      [
+        15
+      ],
+      []
+    ],
+    "site_order_in_original_snake_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "settings": {
+    "sweeps": 1,
+    "solver": "direct",
+    "frontier_backend": "compressed",
+    "optimize_order": false,
+    "path_optimizer": "greedy",
+    "seed": 7
+  },
+  "ordering": {
+    "method": "snake",
+    "objective": "compressed-MPO-elements-without-D-squared",
+    "seconds": 1.25030055642128e-07,
+    "original_peak_score": 3584.0,
+    "selected_peak_score": 3584.0,
+    "original_total_score": 36496.0,
+    "selected_total_score": 36496.0,
+    "selected_max_frontier_width": 4,
+    "selected_max_operator_rank": 14,
+    "selected_max_uncompressed_mpo_channels": null
+  },
+  "explicit_basis_materialized_in_solver": false,
+  "initial_energy": -0.49650142457211655,
+  "energy": -6.15963878850283,
+  "setup_seconds": 0.050503292004577816,
+  "sweep_seconds": 0.3559570419602096,
+  "contraction_plans": 98,
+  "peak_frontier_elements": 57344,
+  "norm_peak_frontier_elements": 256,
+  "hamiltonian_peak_frontier_elements": 57344,
+  "cached_environment_elements": 586916,
+  "sweep_energies": [
+    -6.15963878850283
+  ],
+  "validation": {
+    "explicit_projector": {
+      "site": 9,
+      "metric_max_error": 1.6903145549918008e-12,
+      "metric_relative_error": 3.40500700606419e-13,
+      "hamiltonian_max_error": 3.3573144264664734e-11,
+      "hamiltonian_relative_error": 1.7238792308950788e-12,
+      "metric_action_max_error": 9.015010959956271e-13,
+      "hamiltonian_action_max_error": 1.645084068968572e-11,
+      "environment_build_seconds": 0.0967292080167681,
+      "cached_hole_seconds": 0.02298608305864036,
+      "explicit_projector_seconds": 0.30035229201894253
+    },
+    "matrix_free": {
+      "site": 15,
+      "local_dimension": 8,
+      "metric_rank": 8,
+      "metric_rank_is_projected": true,
+      "hamiltonian_matvecs": 9,
+      "metric_matvecs": 9,
+      "iterations": 8,
+      "residual_norm": 4.803407434173311e-12,
+      "solver": "matrix_free",
+      "solver_converged": true,
+      "message": "converged",
+      "direct_energy": -6.159638788497422,
+      "matrix_free_energy": -6.159638788495711,
+      "energy_difference": 1.7115198147621413e-12,
+      "direct_environment_seconds": 0.10041545901913196,
+      "matrix_free_environment_seconds": 0.09972695796750486,
+      "direct_seconds": 0.041018208023160696,
+      "matrix_free_seconds": 0.042108541005291045
+    }
+  }
+}

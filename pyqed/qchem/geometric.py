@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 
@@ -235,6 +236,195 @@ def _contract_ao_operator_with_state_model(state_model, bra_id, ket_id, h1e_ao):
         )
     tdm1 = state_model.make_tdm1(bra_id, ket_id)
     return np.einsum('pq,qp->', h1e_cas, tdm1, optimize=True)
+
+
+def _axis_index(axis):
+    if isinstance(axis, str):
+        key = axis.lower()
+        if key not in {"x", "y", "z"}:
+            raise ValueError("axis must be 'x', 'y', 'z', or an integer 0, 1, 2.")
+        return {"x": 0, "y": 1, "z": 2}[key]
+    axis = int(axis)
+    if axis not in (0, 1, 2):
+        raise ValueError("axis must be 'x', 'y', 'z', or an integer 0, 1, 2.")
+    return axis
+
+
+def _infer_nstates(state_model):
+    ci = getattr(state_model, "ci", None)
+    if ci is not None:
+        try:
+            return len(ci)
+        except TypeError:
+            pass
+    e_tot = getattr(state_model, "e_tot", None)
+    if e_tot is not None:
+        arr = np.asarray(e_tot)
+        if arr.ndim > 0:
+            return len(arr)
+    raise ValueError("Could not infer the number of electronic states.")
+
+
+def _normalize_state_ids_for_overlap(state_model, state_ids):
+    nstates = _infer_nstates(state_model)
+    if state_ids is None:
+        return tuple(range(nstates))
+    ids = tuple(int(idx) for idx in state_ids)
+    if len(ids) == 0:
+        raise ValueError("state_ids must contain at least one state.")
+    for idx in ids:
+        if idx < 0 or idx >= nstates:
+            raise ValueError(f"state id {idx} is outside the available range 0..{nstates - 1}.")
+    return ids
+
+
+def _electric_dipole_mo_component(state_model, axis, center=None, dipole_mo=None):
+    axis = _axis_index(axis)
+    if dipole_mo is None:
+        if hasattr(state_model, "_electric_dipole_mo"):
+            dipole_mo = state_model._electric_dipole_mo(center=center)
+        else:
+            mf = getattr(state_model, "mf", None)
+            mo_coeff = getattr(mf, "mo_coeff", None)
+            if mf is None or mo_coeff is None:
+                raise ValueError("state_model must provide mf.mo_coeff or _electric_dipole_mo().")
+            if isinstance(mo_coeff, (tuple, list)):
+                raise NotImplementedError("UHF dipole exponential overlaps are not implemented.")
+            if hasattr(mf, "dipole"):
+                dipole_ao = mf.dipole(center=center, basis="ao")
+            else:
+                mol = getattr(state_model, "mol", getattr(mf, "mol", None))
+                if mol is None or not hasattr(mol, "moment_integral"):
+                    raise ValueError("Could not build the AO dipole operator.")
+                if center is None:
+                    center = mol.center_of_mass()
+                dipole_ao = -np.asarray(
+                    mol.moment_integral(center=np.asarray(center, dtype=float)),
+                    dtype=float,
+                )
+            dipole_ao = np.asarray(dipole_ao)
+            if dipole_ao.shape[0] != 3 and dipole_ao.shape[-1] == 3:
+                dipole_ao = np.moveaxis(dipole_ao, -1, 0)
+            dipole_mo = np.asarray(
+                [mo_coeff.conj().T @ dipole_ao[xyz] @ mo_coeff for xyz in range(3)]
+            )
+
+    if isinstance(dipole_mo, (tuple, list)):
+        raise NotImplementedError("Spin-dependent dipole exponential overlaps are not implemented.")
+
+    dipole_mo = np.asarray(dipole_mo)
+    if dipole_mo.ndim == 3:
+        if dipole_mo.shape[0] != 3:
+            if dipole_mo.shape[-1] == 3:
+                dipole_mo = np.moveaxis(dipole_mo, -1, 0)
+            else:
+                raise ValueError("dipole_mo must have shape (3, nmo, nmo) or (nmo, nmo, 3).")
+        mu = dipole_mo[axis]
+    elif dipole_mo.ndim == 2:
+        mu = dipole_mo
+    else:
+        raise ValueError("dipole_mo must be a rank-2 component or rank-3 Cartesian operator.")
+
+    mu = np.asarray(mu, dtype=np.complex128)
+    return 0.5 * (mu + mu.conj().T)
+
+
+def dipole_orbital_rotation_unitary(
+    state_model,
+    eta_delta_q,
+    *,
+    axis="z",
+    center=None,
+    dipole_mo=None,
+):
+    """
+    Build the one-particle orbital rotation for an exponential dipole link.
+
+    The returned full-MO matrix is
+
+    ``U = exp(1j * eta_delta_q * mu_axis)``
+
+    where ``mu_axis`` is the electronic dipole operator in the MO basis. This
+    is the one-particle representation of the many-electron operator used in
+    geometric velocity-gauge links.
+    """
+    mu = _electric_dipole_mo_component(
+        state_model,
+        axis=axis,
+        center=center,
+        dipole_mo=dipole_mo,
+    )
+    evals, evecs = np.linalg.eigh(mu)
+    phases = np.exp(1.0j * float(eta_delta_q) * evals)
+    return (evecs * phases[np.newaxis, :]) @ evecs.conj().T
+
+
+def orbital_rotation_ci_overlap(state_model, orbital_unitary, *, state_ids=None):
+    """
+    CI-root overlap after an exact one-particle orbital rotation.
+
+    This evaluates
+
+    ``<Psi_beta | Gamma(U) | Psi_alpha>``
+
+    in the CASCI determinant model by passing the full one-particle MO overlap
+    ``U`` to the generalized Slater-determinant overlap machinery. It therefore
+    keeps core/active mixing and active/external leakage present in the full
+    MO-space subblock, instead of exponentiating a truncated state-space dipole.
+    """
+    if getattr(state_model, "binary", None) is None or getattr(state_model, "ci", None) is None:
+        raise ValueError("Run CASCI before requesting orbital-rotation overlaps.")
+    if isinstance(getattr(getattr(state_model, "mf", None), "mo_coeff", None), (tuple, list)):
+        raise NotImplementedError("UHF orbital-rotation CI overlaps are not implemented.")
+
+    u = np.asarray(orbital_unitary, dtype=np.complex128)
+    nmo = getattr(state_model, "nmo", None)
+    if nmo is None:
+        nmo = np.asarray(state_model.mf.mo_coeff).shape[1]
+    if u.shape != (int(nmo), int(nmo)):
+        raise ValueError(f"orbital_unitary has shape {u.shape}; expected {(int(nmo), int(nmo))}.")
+
+    from pyqed.qchem.mcscf.casci import overlap as casci_overlap
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*encountered in det",
+            category=RuntimeWarning,
+        )
+        overlap = casci_overlap(state_model, state_model, s=u)
+    ids = _normalize_state_ids_for_overlap(state_model, state_ids)
+    return np.asarray(overlap)[np.ix_(ids, ids)]
+
+
+def dipole_exponential_ci_overlap(
+    state_model,
+    eta_delta_q,
+    *,
+    axis="z",
+    center=None,
+    state_ids=None,
+    dipole_mo=None,
+):
+    """
+    Many-electron CASCI overlap for ``exp(i * eta_delta_q * mu_axis)``.
+
+    This is the orbital-rotation path for geometric velocity-gauge links:
+
+    ``U_beta_alpha = <Psi_beta| exp(i * eta_delta_q * mu_hat) |Psi_alpha>``.
+
+    The exponential is built in the full MO one-particle space and then lifted
+    to determinant overlaps. This is distinct from, and generally more faithful
+    than, ``expm(i * eta_delta_q * mu_state)`` in a truncated root basis.
+    """
+    u = dipole_orbital_rotation_unitary(
+        state_model,
+        eta_delta_q,
+        axis=axis,
+        center=center,
+        dipole_mo=dipole_mo,
+    )
+    return orbital_rotation_ci_overlap(state_model, u, state_ids=state_ids)
 
 
 def bo_hamiltonian_derivatives(state_model, state_ids=None, mode_vectors=None, overlap_tol=1e-8):

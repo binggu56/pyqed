@@ -32,8 +32,16 @@ def is_positive_def(a):
 
 
 _LAZY_ATTRS = {
+    "view": ("pyqed.visualization", "view"),
+    "MoleculeView": ("pyqed.visualization", "MoleculeView"),
+    "ScalarField3D": ("pyqed.visualization", "ScalarField3D"),
+    "SceneView": ("pyqed.visualization", "SceneView"),
+    "VolumeView": ("pyqed.visualization", "VolumeView"),
     "Mol": ("pyqed.mol", "Mol"),
     "Result": ("pyqed.mol", "Result"),
+    "Cavity": ("pyqed.cavity", "Cavity"),
+    "Composite": ("pyqed.cavity", "Composite"),
+    "SineDVR": ("pyqed.dvr.dvr_1d", "SineDVR"),
     "Molecule": ("pyqed.qchem", "Molecule"),
     "GW": ("pyqed.gw", "GW"),
     "BSE": ("pyqed.gw", "BSE"),
@@ -73,6 +81,9 @@ _LAZY_ATTRS = {
     "sigmaz": ("pyqed.phys", "sigmaz"),
     "isherm": ("pyqed.phys", "isherm"),
     "isunitary": ("pyqed.phys", "isunitary"),
+    "householder": ("pyqed.phys", "householder"),
+    "dominant_eig": ("pyqed.jax_eigs", "dominant_eig"),
+    "dominant_eigval": ("pyqed.jax_eigs", "dominant_eigval"),
     "isdiag": ("pyqed.phys", "isdiag"),
     "hadamard": ("pyqed.qip", "hadamard"),
     "SpinHalfFermionOperators": (

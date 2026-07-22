@@ -7,6 +7,7 @@ Dense environment and effective-H helpers for fixed-layout non-Abelian tensors.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -44,6 +45,129 @@ from .solver import (
 from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
 from .tensor import NonabelianTensor
 from pyqed.mps.su2 import SU2Irrep
+
+
+_USE_REAL_RANK_COUPLED_ACCUMULATE = True
+_IDENTITY_MPO_CORE_CACHE = {}
+_RANK_COUPLED_REAL_TERM_COALESCE = (
+    os.environ.get("PYQED_SU2_RANK_COUPLED_COALESCE_TERMS", "0")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+_RANK_COUPLED_REAL_TERM_COALESCE_STATS = {
+    "calls": 0,
+    "input_terms": 0,
+    "output_terms": 0,
+    "merged_terms": 0,
+}
+
+
+def rank_coupled_real_term_coalesce_stats(*, reset=False):
+    """Return packed rank-coupled term coalescing counters."""
+
+    stats = {
+        str(key): int(value)
+        for key, value in _RANK_COUPLED_REAL_TERM_COALESCE_STATS.items()
+    }
+    if reset:
+        for key in _RANK_COUPLED_REAL_TERM_COALESCE_STATS:
+            _RANK_COUPLED_REAL_TERM_COALESCE_STATS[key] = 0
+    return stats
+
+
+@lru_cache(maxsize=1)
+def _su2_kernel_module():
+    """Return the optional compiled SU(2) helper module, if available."""
+
+    try:
+        from pyqed.mps.nonabelian import _su2_kernel as module
+    except Exception:
+        return None
+    return module
+
+
+def _real64_contiguous_or_none(array):
+    """Return a real float64 contiguous view/copy, or ``None`` for complex data."""
+
+    arr = np.asarray(array)
+    if arr.dtype.kind == "c":
+        return None
+    if arr.dtype == np.float64 and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _rank_coupled_real_term_arrays(reduced):
+    """Pack reduced rank-coupled terms for the real Cython accumulate path."""
+
+    if not _RANK_COUPLED_REAL_TERM_COALESCE:
+        left_indices = []
+        right_indices = []
+        w_blocks = []
+        for left_idx, right_idx, w_block in reduced:
+            w_arr = _real64_contiguous_or_none(w_block)
+            if w_arr is None:
+                n_terms = len(left_indices) + 1
+                _RANK_COUPLED_REAL_TERM_COALESCE_STATS["calls"] += 1
+                _RANK_COUPLED_REAL_TERM_COALESCE_STATS["input_terms"] += int(n_terms)
+                _RANK_COUPLED_REAL_TERM_COALESCE_STATS["output_terms"] += int(n_terms)
+                return None
+            left_indices.append(int(left_idx))
+            right_indices.append(int(right_idx))
+            w_blocks.append(w_arr)
+        n_terms = len(w_blocks)
+        _RANK_COUPLED_REAL_TERM_COALESCE_STATS["calls"] += 1
+        _RANK_COUPLED_REAL_TERM_COALESCE_STATS["input_terms"] += int(n_terms)
+        _RANK_COUPLED_REAL_TERM_COALESCE_STATS["output_terms"] += int(n_terms)
+        return (
+            np.asarray(left_indices, dtype=np.int64),
+            np.asarray(right_indices, dtype=np.int64),
+            tuple(w_blocks),
+        )
+
+    input_terms = 0
+    grouped = {}
+    order = []
+    for left_idx, right_idx, w_block in reduced:
+        input_terms += 1
+        w_arr = _real64_contiguous_or_none(w_block)
+        if w_arr is None:
+            _RANK_COUPLED_REAL_TERM_COALESCE_STATS["calls"] += 1
+            _RANK_COUPLED_REAL_TERM_COALESCE_STATS["input_terms"] += int(input_terms)
+            _RANK_COUPLED_REAL_TERM_COALESCE_STATS["output_terms"] += int(input_terms)
+            return None
+        key = (
+            int(left_idx),
+            int(right_idx),
+            tuple(int(dim) for dim in w_arr.shape),
+        )
+        current = grouped.get(key)
+        if current is None:
+            grouped[key] = w_arr
+            order.append(key)
+        else:
+            grouped[key] = current + w_arr
+    left_indices = []
+    right_indices = []
+    w_blocks = []
+    for left_idx, right_idx, _shape in order:
+        left_indices.append(int(left_idx))
+        right_indices.append(int(right_idx))
+        w_blocks.append(np.ascontiguousarray(grouped[(left_idx, right_idx, _shape)]))
+    output_terms = len(w_blocks)
+    _RANK_COUPLED_REAL_TERM_COALESCE_STATS["calls"] += 1
+    _RANK_COUPLED_REAL_TERM_COALESCE_STATS["input_terms"] += int(input_terms)
+    _RANK_COUPLED_REAL_TERM_COALESCE_STATS["output_terms"] += int(output_terms)
+    _RANK_COUPLED_REAL_TERM_COALESCE_STATS["merged_terms"] += max(
+        0,
+        int(input_terms) - int(output_terms),
+    )
+    return (
+        np.asarray(left_indices, dtype=np.int64),
+        np.asarray(right_indices, dtype=np.int64),
+        tuple(w_blocks),
+    )
 
 
 def _basis_cache_signature(basis):
@@ -158,6 +282,38 @@ _DIAG_BLOCK_PATH = _cached_einsum_path(
     (2, 2, 2),
     (2, 2),
 )
+_RANK_COUPLED_SMALL_CONTRACTION_WORK = int(
+    os.environ.get("PYQED_SU2_RANK_COUPLED_ACCUMULATE_WORK", "1000000000")
+)
+_RANK_COUPLED_GREEDY_CONTRACTION_WORK = int(
+    os.environ.get("PYQED_SU2_RANK_COUPLED_GREEDY_WORK", "8000000")
+)
+
+
+def _rank_coupled_left_work(E_block, A_conj, W_block, B_block):
+    return (
+        int(E_block.shape[0])
+        * int(W_block.shape[1])
+        * int(E_block.shape[1])
+        * int(E_block.shape[2])
+        * int(A_conj.shape[1])
+        * int(W_block.shape[3])
+        * int(A_conj.shape[2])
+        * int(B_block.shape[2])
+    )
+
+
+def _rank_coupled_right_work(A_conj, W_block, F_block, B_block):
+    return (
+        int(W_block.shape[0])
+        * int(F_block.shape[0])
+        * int(A_conj.shape[0])
+        * int(B_block.shape[0])
+        * int(A_conj.shape[1])
+        * int(W_block.shape[3])
+        * int(A_conj.shape[2])
+        * int(F_block.shape[2])
+    )
 
 
 def _contract_rank_coupled_left_step(E_block, A_conj, W_block, B_block):
@@ -171,9 +327,37 @@ def _contract_rank_coupled_left_step(E_block, A_conj, W_block, B_block):
     :returns: Contribution with indices ``yrs``.
     """
 
-    tmp = np.einsum("xij,ipr->xjpr", E_block, A_conj, optimize=False)
-    tmp = np.einsum("xjpr,jqs->xprqs", tmp, B_block, optimize=False)
-    return np.einsum("xprqs,xypq->yrs", tmp, W_block, optimize=False)
+    if (
+        E_block.shape[0] == 1
+        and W_block.shape[0] == 1
+        and W_block.shape[1] == 1
+        and W_block.shape[2] == A_conj.shape[1]
+        and W_block.shape[3] == B_block.shape[1]
+    ):
+        module = _su2_kernel_module()
+        kernel = (
+            None
+            if module is None
+            else getattr(module, "contract_rank_coupled_left_scalar_channel", None)
+        )
+        if kernel is not None:
+            return kernel(E_block, A_conj, W_block, B_block)
+    work = _rank_coupled_left_work(E_block, A_conj, W_block, B_block)
+    if work <= _RANK_COUPLED_SMALL_CONTRACTION_WORK:
+        module = _su2_kernel_module()
+        kernel = (
+            None
+            if module is None
+            else getattr(module, "contract_rank_coupled_left_general", None)
+        )
+        if kernel is not None:
+            out = kernel(E_block, A_conj, W_block, B_block)
+            if out is not None:
+                return out
+    optimize = "greedy" if work >= _RANK_COUPLED_GREEDY_CONTRACTION_WORK else False
+    tmp = np.einsum("xij,ipr->xjpr", E_block, A_conj, optimize=optimize)
+    tmp = np.einsum("xjpr,jqs->xprqs", tmp, B_block, optimize=optimize)
+    return np.einsum("xprqs,xypq->yrs", tmp, W_block, optimize=optimize)
 
 
 def _contract_rank_coupled_right_step(A_conj, W_block, F_block, B_block):
@@ -187,9 +371,37 @@ def _contract_rank_coupled_right_step(A_conj, W_block, F_block, B_block):
     :returns: Contribution with indices ``xij``.
     """
 
-    tmp = np.einsum("yrs,jqs->yrjq", F_block, B_block, optimize=False)
-    tmp = np.einsum("xypq,yrjq->xprj", W_block, tmp, optimize=False)
-    return np.einsum("ipr,xprj->xij", A_conj, tmp, optimize=False)
+    if (
+        F_block.shape[0] == 1
+        and W_block.shape[0] == 1
+        and W_block.shape[1] == 1
+        and W_block.shape[2] == A_conj.shape[1]
+        and W_block.shape[3] == B_block.shape[1]
+    ):
+        module = _su2_kernel_module()
+        kernel = (
+            None
+            if module is None
+            else getattr(module, "contract_rank_coupled_right_scalar_channel", None)
+        )
+        if kernel is not None:
+            return kernel(A_conj, W_block, F_block, B_block)
+    work = _rank_coupled_right_work(A_conj, W_block, F_block, B_block)
+    if work <= _RANK_COUPLED_SMALL_CONTRACTION_WORK:
+        module = _su2_kernel_module()
+        kernel = (
+            None
+            if module is None
+            else getattr(module, "contract_rank_coupled_right_general", None)
+        )
+        if kernel is not None:
+            out = kernel(A_conj, W_block, F_block, B_block)
+            if out is not None:
+                return out
+    optimize = "greedy" if work >= _RANK_COUPLED_GREEDY_CONTRACTION_WORK else False
+    tmp = np.einsum("yrs,jqs->yrjq", F_block, B_block, optimize=optimize)
+    tmp = np.einsum("xypq,yrjq->xprj", W_block, tmp, optimize=optimize)
+    return np.einsum("ipr,xprj->xij", A_conj, tmp, optimize=optimize)
 
 
 def _tensor_dense_layout(tensor, axis_overrides=None):
@@ -290,21 +502,32 @@ def _mpo_dtype(mpo_core):
 
 
 def _is_identity_mpo_core(mpo_core, *, tol=1e-12):
+    cache_key = (id(mpo_core), float(tol))
+    cached = _IDENTITY_MPO_CORE_CACHE.get(cache_key)
+    if cached is not None:
+        return bool(cached)
     if not isinstance(mpo_core, MPO):
         return False
     if mpo_core.left_dim != 1 or mpo_core.right_dim != 1:
+        _IDENTITY_MPO_CORE_CACHE[cache_key] = False
         return False
     for q_out in mpo_core.phys_out_sectors:
         for q_in in mpo_core.phys_in_sectors:
             block = mpo_core.block(q_out, q_in)
             if q_out == q_in:
                 if block is None:
+                    _IDENTITY_MPO_CORE_CACHE[cache_key] = False
                     return False
                 eye = np.eye(mpo_core.phys_out_leg.dim(q_out), dtype=np.asarray(block).dtype)
                 if not np.allclose(np.asarray(block)[0, 0], eye, atol=tol, rtol=tol):
+                    _IDENTITY_MPO_CORE_CACHE[cache_key] = False
                     return False
             elif block is not None and np.linalg.norm(np.asarray(block).reshape(-1)) > tol:
+                _IDENTITY_MPO_CORE_CACHE[cache_key] = False
                 return False
+    if len(_IDENTITY_MPO_CORE_CACHE) > 256:
+        _IDENTITY_MPO_CORE_CACHE.clear()
+    _IDENTITY_MPO_CORE_CACHE[cache_key] = True
     return True
 
 
@@ -1422,6 +1645,8 @@ class RightBlock(_BlockEnvironment):
 
 
 def _contract_from_left_blocks(W, A, E_map, B, phys_slices):
+    if _is_identity_mpo_core(W):
+        return _contract_from_left_identity_blocks(A, E_map, B)
     out = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         for (q_lk, q_pk, q_rk), B_block in B.data.items():
@@ -1450,25 +1675,105 @@ def _contract_from_left_blocks(W, A, E_map, B, phys_slices):
     return out
 
 
+def _contract_from_left_identity_blocks(A, E_map, B):
+    out = {}
+    for (q_lb, q_pb, q_rb), A_block in A.data.items():
+        A_conj = np.asarray(A_block).conj()
+        for (q_lk, q_pk, q_rk), B_block in B.data.items():
+            if q_pb != q_pk:
+                continue
+            E_block = E_map.get((q_lb, q_lk))
+            if E_block is None:
+                continue
+            E_arr = np.asarray(E_block)
+            B_arr = np.asarray(B_block)
+            if E_arr.shape[0] != 1:
+                contrib = _contract_rank_coupled_left_step(
+                    E_arr,
+                    A_conj,
+                    np.eye(A_conj.shape[1], dtype=np.result_type(E_arr, A_conj, B_arr))[
+                        None,
+                        None,
+                    ],
+                    B_arr,
+                )
+            else:
+                block = np.einsum(
+                    "ij,ipr,jps->rs",
+                    E_arr[0],
+                    A_conj,
+                    B_arr,
+                    optimize=False,
+                )
+                contrib = block.reshape(1, int(block.shape[0]), int(block.shape[1]))
+            key = (q_rb, q_rk)
+            if key in out:
+                out[key] = out[key] + contrib
+            else:
+                out[key] = contrib
+    return out
+
+
+def _rank_coupled_site_entries_by_edge(tensor, edge):
+    """
+    Return site blocks grouped by left or right virtual sector.
+
+    Nonabelian site tensors are replaced, not reshaped in place, during sweeps.
+    Caching this grouping on the tensor avoids rebuilding the same small Python
+    dictionaries when multiple rank-coupled environments absorb the same site.
+    The entries keep live array references; conjugation is still done at use.
+    """
+
+    if edge not in ("left", "right"):
+        raise ValueError(f"Unknown rank-coupled site grouping edge {edge!r}.")
+    metadata = getattr(tensor, "metadata", None)
+    cache_key = f"_rank_coupled_site_entries_by_{edge}"
+    data_id_key = f"{cache_key}_data_id"
+    if isinstance(metadata, dict) and metadata.get(data_id_key) == id(tensor.data):
+        cached = metadata.get(cache_key)
+        if cached is not None:
+            return cached
+
+    grouped = {}
+    if edge == "left":
+        for (q_l, q_p, q_r), block in tensor.data.items():
+            arr = np.asarray(block)
+            grouped.setdefault(q_l, []).append(
+                (q_r, q_p, arr, int(arr.shape[2]), arr.dtype)
+            )
+    else:
+        for (q_l, q_p, q_r), block in tensor.data.items():
+            arr = np.asarray(block)
+            grouped.setdefault(q_r, []).append(
+                (q_l, q_p, arr, int(arr.shape[0]), arr.dtype)
+            )
+    grouped = {key: tuple(value) for key, value in grouped.items()}
+    if isinstance(metadata, dict):
+        metadata[cache_key] = grouped
+        metadata[data_id_key] = id(tensor.data)
+    return grouped
+
+
 def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
+    module = _su2_kernel_module()
+    batch_kernel = (
+        None
+        if module is None
+        else getattr(module, "accumulate_rank_coupled_left_terms", None)
+    )
+    real_batch_kernel = (
+        None
+        if module is None or not _USE_REAL_RANK_COUPLED_ACCUMULATE
+        else getattr(module, "accumulate_rank_coupled_left_real_terms", None)
+    )
     reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
         W,
         _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
     )
-    a_blocks_by_left = {}
-    for (q_lb, q_pb, q_rb), A_block in A.data.items():
-        arr = np.asarray(A_block)
-        a_blocks_by_left.setdefault(q_lb, []).append(
-            (q_rb, q_pb, arr.conj(), int(arr.shape[2]), arr.dtype)
-        )
-    b_blocks_by_left = {}
-    for (q_lk, q_pk, q_rk), B_block in B.data.items():
-        arr = np.asarray(B_block)
-        b_blocks_by_left.setdefault(q_lk, []).append(
-            (q_rk, q_pk, arr, int(arr.shape[2]), arr.dtype)
-        )
+    a_blocks_by_left = _rank_coupled_site_entries_by_edge(A, "left")
+    b_blocks_by_left = _rank_coupled_site_entries_by_edge(B, "left")
     reduced_cache = {}
     for (q_lb, q_lk), E_blocks in E_map.items():
         a_entries = a_blocks_by_left.get(q_lb)
@@ -1476,13 +1781,41 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
         if not a_entries or not b_entries:
             continue
         e_arrays = tuple(np.asarray(block) for block in E_blocks)
+        if real_batch_kernel is not None:
+            e_real_arrays = tuple(_real64_contiguous_or_none(block) for block in e_arrays)
+            if any(block is None for block in e_real_arrays):
+                e_real_arrays = None
+        else:
+            e_real_arrays = None
         e_dtypes = tuple(block.dtype for block in e_arrays)
-        for q_rb, q_pb, A_conj, bra_dim, a_dtype in a_entries:
+        for q_rb, q_pb, A_arr, bra_dim, a_dtype in a_entries:
+            A_conj = A_arr.conj()
+            A_real = (
+                None
+                if real_batch_kernel is None
+                else _real64_contiguous_or_none(A_conj)
+            )
             for q_rk, q_pk, B_arr, ket_dim, b_dtype in b_entries:
-                reduced_key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk) if reduced_physical else (q_pb, q_pk)
-                reduced = reduced_cache.get(reduced_key)
-                if reduced is None:
-                    reduced = (
+                B_real = (
+                    None
+                    if real_batch_kernel is None
+                    else _real64_contiguous_or_none(B_arr)
+                )
+                reduced_key = (
+                    (
+                        id(q_lb),
+                        id(q_lk),
+                        id(q_pb),
+                        id(q_pk),
+                        id(q_rb),
+                        id(q_rk),
+                    )
+                    if reduced_physical
+                    else (id(q_pb), id(q_pk))
+                )
+                cached = reduced_cache.get(reduced_key)
+                if cached is None:
+                    raw_reduced = (
                         _left_reduced_rank_coupled_block(
                             W,
                             q_lb,
@@ -1495,7 +1828,20 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                         if reduced_physical
                         else W.reduced_block(q_pb, q_pk)
                     )
-                    reduced_cache[reduced_key] = reduced
+                    reduced = tuple(
+                        (int(left_idx), int(right_idx), np.asarray(block))
+                        for (left_idx, right_idx), block in (raw_reduced or {}).items()
+                    )
+                    cached = (
+                        reduced,
+                        (
+                            None
+                            if real_batch_kernel is None
+                            else _rank_coupled_real_term_arrays(reduced)
+                        ),
+                    )
+                    reduced_cache[reduced_key] = cached
+                reduced, reduced_real = cached
                 if not reduced:
                     continue
                 key = (q_rb, q_rk)
@@ -1507,19 +1853,49 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                         for irrep in W.right_channel_irreps
                     ]
                     out[key] = target
-                for (left_idx, right_idx), w_block in reduced.items():
+                real_attempted = (
+                    real_batch_kernel is not None
+                    and reduced_real is not None
+                    and e_real_arrays is not None
+                    and A_real is not None
+                    and B_real is not None
+                )
+                if real_attempted:
+                    if real_batch_kernel(
+                        target,
+                        e_real_arrays,
+                        A_real,
+                        B_real,
+                        reduced_real[0],
+                        reduced_real[1],
+                        reduced_real[2],
+                        _RANK_COUPLED_SMALL_CONTRACTION_WORK,
+                    ):
+                        continue
+                elif batch_kernel is not None and batch_kernel(
+                    target,
+                    e_arrays,
+                    A_conj,
+                    B_arr,
+                    reduced,
+                    _RANK_COUPLED_SMALL_CONTRACTION_WORK,
+                ):
+                    continue
+                for left_idx, right_idx, w_block in reduced:
                     if left_idx >= len(e_arrays):
                         continue
                     target[right_idx] += _contract_rank_coupled_left_step(
                         e_arrays[left_idx],
                         A_conj,
-                        np.asarray(w_block),
+                        w_block,
                         B_arr,
                     )
     return {key: tuple(blocks) for key, blocks in out.items()}
 
 
 def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
+    if _is_identity_mpo_core(W):
+        return _contract_from_right_identity_blocks(A, F_map, B)
     out = {}
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         for (q_lk, q_pk, q_rk), B_block in B.data.items():
@@ -1548,25 +1924,65 @@ def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
     return out
 
 
+def _contract_from_right_identity_blocks(A, F_map, B):
+    out = {}
+    for (q_lb, q_pb, q_rb), A_block in A.data.items():
+        A_conj = np.asarray(A_block).conj()
+        for (q_lk, q_pk, q_rk), B_block in B.data.items():
+            if q_pb != q_pk:
+                continue
+            F_block = F_map.get((q_rb, q_rk))
+            if F_block is None:
+                continue
+            F_arr = np.asarray(F_block)
+            B_arr = np.asarray(B_block)
+            if F_arr.shape[0] != 1:
+                contrib = _contract_rank_coupled_right_step(
+                    A_conj,
+                    np.eye(A_conj.shape[1], dtype=np.result_type(A_conj, F_arr, B_arr))[
+                        None,
+                        None,
+                    ],
+                    F_arr,
+                    B_arr,
+                )
+            else:
+                block = np.einsum(
+                    "ipr,rs,jps->ij",
+                    A_conj,
+                    F_arr[0],
+                    B_arr,
+                    optimize=False,
+                )
+                contrib = block.reshape(1, int(block.shape[0]), int(block.shape[1]))
+            key = (q_lb, q_lk)
+            if key in out:
+                out[key] = out[key] + contrib
+            else:
+                out[key] = contrib
+    return out
+
+
 def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
+    module = _su2_kernel_module()
+    batch_kernel = (
+        None
+        if module is None
+        else getattr(module, "accumulate_rank_coupled_right_terms", None)
+    )
+    real_batch_kernel = (
+        None
+        if module is None or not _USE_REAL_RANK_COUPLED_ACCUMULATE
+        else getattr(module, "accumulate_rank_coupled_right_real_terms", None)
+    )
     reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
         W,
         _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
     )
-    a_blocks_by_right = {}
-    for (q_lb, q_pb, q_rb), A_block in A.data.items():
-        arr = np.asarray(A_block)
-        a_blocks_by_right.setdefault(q_rb, []).append(
-            (q_lb, q_pb, arr.conj(), int(arr.shape[0]), arr.dtype)
-        )
-    b_blocks_by_right = {}
-    for (q_lk, q_pk, q_rk), B_block in B.data.items():
-        arr = np.asarray(B_block)
-        b_blocks_by_right.setdefault(q_rk, []).append(
-            (q_lk, q_pk, arr, int(arr.shape[0]), arr.dtype)
-        )
+    a_blocks_by_right = _rank_coupled_site_entries_by_edge(A, "right")
+    b_blocks_by_right = _rank_coupled_site_entries_by_edge(B, "right")
     reduced_cache = {}
     for (q_rb, q_rk), F_blocks in F_map.items():
         a_entries = a_blocks_by_right.get(q_rb)
@@ -1574,13 +1990,41 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
         if not a_entries or not b_entries:
             continue
         f_arrays = tuple(np.asarray(block) for block in F_blocks)
+        if real_batch_kernel is not None:
+            f_real_arrays = tuple(_real64_contiguous_or_none(block) for block in f_arrays)
+            if any(block is None for block in f_real_arrays):
+                f_real_arrays = None
+        else:
+            f_real_arrays = None
         f_dtypes = tuple(block.dtype for block in f_arrays)
-        for q_lb, q_pb, A_conj, bra_dim, a_dtype in a_entries:
+        for q_lb, q_pb, A_arr, bra_dim, a_dtype in a_entries:
+            A_conj = A_arr.conj()
+            A_real = (
+                None
+                if real_batch_kernel is None
+                else _real64_contiguous_or_none(A_conj)
+            )
             for q_lk, q_pk, B_arr, ket_dim, b_dtype in b_entries:
-                reduced_key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk) if reduced_physical else (q_pb, q_pk)
-                reduced = reduced_cache.get(reduced_key)
-                if reduced is None:
-                    reduced = (
+                B_real = (
+                    None
+                    if real_batch_kernel is None
+                    else _real64_contiguous_or_none(B_arr)
+                )
+                reduced_key = (
+                    (
+                        id(q_lb),
+                        id(q_lk),
+                        id(q_pb),
+                        id(q_pk),
+                        id(q_rb),
+                        id(q_rk),
+                    )
+                    if reduced_physical
+                    else (id(q_pb), id(q_pk))
+                )
+                cached = reduced_cache.get(reduced_key)
+                if cached is None:
+                    raw_reduced = (
                         _right_reduced_rank_coupled_block(
                             W,
                             q_lb,
@@ -1593,7 +2037,20 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                         if reduced_physical
                         else W.reduced_block(q_pb, q_pk)
                     )
-                    reduced_cache[reduced_key] = reduced
+                    reduced = tuple(
+                        (int(left_idx), int(right_idx), np.asarray(block))
+                        for (left_idx, right_idx), block in (raw_reduced or {}).items()
+                    )
+                    cached = (
+                        reduced,
+                        (
+                            None
+                            if real_batch_kernel is None
+                            else _rank_coupled_real_term_arrays(reduced)
+                        ),
+                    )
+                    reduced_cache[reduced_key] = cached
+                reduced, reduced_real = cached
                 if not reduced:
                     continue
                 key = (q_lb, q_lk)
@@ -1605,12 +2062,40 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                         for irrep in W.left_channel_irreps
                     ]
                     out[key] = target
-                for (left_idx, right_idx), w_block in reduced.items():
+                real_attempted = (
+                    real_batch_kernel is not None
+                    and reduced_real is not None
+                    and f_real_arrays is not None
+                    and A_real is not None
+                    and B_real is not None
+                )
+                if real_attempted:
+                    if real_batch_kernel(
+                        target,
+                        A_real,
+                        B_real,
+                        f_real_arrays,
+                        reduced_real[0],
+                        reduced_real[1],
+                        reduced_real[2],
+                        _RANK_COUPLED_SMALL_CONTRACTION_WORK,
+                    ):
+                        continue
+                elif batch_kernel is not None and batch_kernel(
+                    target,
+                    A_conj,
+                    B_arr,
+                    f_arrays,
+                    reduced,
+                    _RANK_COUPLED_SMALL_CONTRACTION_WORK,
+                ):
+                    continue
+                for left_idx, right_idx, w_block in reduced:
                     if right_idx >= len(f_arrays):
                         continue
                     target[left_idx] += _contract_rank_coupled_right_step(
                         A_conj,
-                        np.asarray(w_block),
+                        w_block,
                         f_arrays[right_idx],
                         B_arr,
                     )
@@ -1759,6 +2244,7 @@ def _precompute_two_site_rank_coupled_factorized_terms(
 
     w1_blocks_by_in = _group_rank_coupled_reduced_blocks_by_input(W1)
     w2_blocks_by_in = _group_rank_coupled_reduced_blocks_by_input(W2)
+    right_factor_middle_cache = {}
 
     for in_entry in basis:
         q_lk, q_p1k, q_p2k, q_rk = in_entry.key
@@ -1766,14 +2252,18 @@ def _precompute_two_site_rank_coupled_factorized_terms(
         if left_factor_table is not None and right_factor_table is not None:
             left_entries = left_factor_table.get((q_lk, q_p1k), ())
             right_entries = right_factor_table.get((q_rk, q_p2k), ())
+            right_by_middle = right_factor_middle_cache.get(id(right_entries))
+            if right_by_middle is None:
+                right_by_middle = {}
+                for right_item in right_entries:
+                    right_by_middle.setdefault(int(right_item[2]), []).append(right_item)
+                right_factor_middle_cache[id(right_entries)] = right_by_middle
             for left_item in left_entries:
                 q_lb, q_p1b, middle_idx, left_factor = left_item[:4]
                 left_families = left_item[4] if len(left_item) > 4 else ()
-                for right_item in right_entries:
+                for right_item in right_by_middle.get(int(middle_idx), ()):
                     q_rb, q_p2b, middle_idx_2, right_factor = right_item[:4]
                     right_families = right_item[4] if len(right_item) > 4 else ()
-                    if middle_idx_2 != middle_idx:
-                        continue
                     out_key = (q_lb, q_p1b, q_p2b, q_rb)
                     out_idx = out_index.get(out_key)
                     if out_idx is not None:
@@ -2653,7 +3143,6 @@ class BlockSparseEnvironmentChain:
                 block,
                 side_table_builders=side_table_builders,
             )
-            self._prepopulate_boundary_factor_tables(entry)
         for bond, block in enumerate(self.right_envs):
             if block is None:
                 continue
@@ -2663,7 +3152,6 @@ class BlockSparseEnvironmentChain:
                 block,
                 side_table_builders=side_table_builders,
             )
-            self._prepopulate_boundary_factor_tables(entry)
         return self
 
     def _prepopulate_boundary_factor_tables(self, entry):
@@ -2734,17 +3222,34 @@ class BlockSparseEnvironmentChain:
         base_key = ("side_operator_table", base_representation, entry.signature)
         base_record = entry.side_operator_tables.get(base_key)
         phys_slices = None if self.rank_coupled else self.site_layouts[entry.bond]["sector_slices"][1]
-        grouped = symbolic_table.factor_boundary_blocks(
-            factor_representation,
-            W,
-            phys_slices=phys_slices,
-        )
+        grouped = None
+        packed_table = None
+        if self.rank_coupled and base_record is not None:
+            try:
+                from .su2_qchem_plan import pack_rank_coupled_factor_table_from_boundary
+
+                packed_table = pack_rank_coupled_factor_table_from_boundary(
+                    getattr(base_record, "packed_table", None),
+                    W,
+                    side=entry.side,
+                    bond=entry.bond,
+                    representation=factor_representation,
+                )
+            except Exception:
+                packed_table = None
+        if packed_table is None:
+            grouped = symbolic_table.factor_boundary_blocks(
+                factor_representation,
+                W,
+                phys_slices=phys_slices,
+            )
         entry.put_side_operator_table(
             key,
             grouped,
             representation=factor_representation,
             source="symbolic_prepared",
             parent_table=base_record,
+            packed_table=packed_table,
         )
         return entry
 
@@ -3146,7 +3651,6 @@ class BlockSparseEnvironmentSweep:
                         rank_coupled=self.chain.rank_coupled,
                     ),
                 )
-                self.chain._prepopulate_boundary_factor_tables(self.current_entry)
                 self.current_env = self.current_entry.block
             else:
                 self.current_env = self.current_env.advance(
@@ -3173,7 +3677,6 @@ class BlockSparseEnvironmentSweep:
                         rank_coupled=self.chain.rank_coupled,
                     ),
                 )
-                self.chain._prepopulate_boundary_factor_tables(self.current_entry)
                 self.current_env = self.current_entry.block
             else:
                 self.current_env = self.current_env.advance(

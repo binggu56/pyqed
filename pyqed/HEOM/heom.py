@@ -13,7 +13,7 @@ From Qutip
 #
 
 import numpy as np
-from pyqed import au2k
+from pyqed import au2k, au2wavenumber, Mol, pauli
 from pyqed.superoperator import left, right
 
 # from numba import jit, njit
@@ -34,6 +34,8 @@ from pyqed import commutator, anticommutator, comm, anticomm, dag, ket2dm, \
 # from lime.superoperator import lindblad_dissipator
 from pyqed.superoperator import op2sop, dm2vec, obs, left, right, operator_to_superoperator
 from pyqed.liouville import sort
+from pyqed import Mol, Result
+
 
 def state_number_enumerate(dims, excitations=None, state=None, idx=0):
     """
@@ -156,9 +158,9 @@ def _calc_matsubara_params(N_exp, coup_strength, cut_freq, temperature):
 #    exp_freq = nu
     return c, nu
 
-class HEOMSolver():
+class HighTemperatureHEOM():
     """
-    HEOM solver with a single exponential function for the correlation functon.
+    HEOM solver with a single exponential function for the correlation function.
     Valid for Lorentz-Drude spectral density at high-T
 
     """
@@ -413,7 +415,6 @@ def _heom_propagator(H, c_ops, e_ops, temperature, cutoff, reorganization,\
 
 def heom_multiexp():
     # TODO
-    from pyqed import Mol, au2wavenumber, pauli
 
     N_c = 4
     N_m = 2

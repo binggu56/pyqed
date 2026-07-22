@@ -39,7 +39,8 @@ from .charmm import (
     read_pdb_coordinates,
 )
 from .constraints import FixBondLengths
-from .engine import MDEngine, MDState
+from .composition import residue_composition
+from .engine import MDEngine, MDState, friction_ps_to_atomic_units
 from .forcefield import load_forcefield, mm_from_topology, solute_from_parameters
 from .ions import add_ions_random, monatomic_ions
 from .io import EnergyLogger, MCBarostatLogger, PDBSnapshotWriter, XYZTrajectoryWriter, write_pdb, write_xyz
@@ -84,6 +85,8 @@ from .openmm_lipids import (
     find_openmm_lipid_xml,
     openmm_lipid_template,
 )
+from .pme import PME_ACCURACY_SPACING_NM, pme_mesh_for_accuracy
+from .protein_membrane import add_ions_to_seed, protein_membrane_seed, read_protein_pdb, write_protein_membrane_seed
 from .protocol import (
     equilibrate,
     membrane_equilibration_stages,
@@ -94,6 +97,7 @@ from .qmmm import QMMM
 from .restart import read_restart, write_restart
 from .solvation import combine_systems, solvate_box, water_count_for_density, water_density
 from .topology import Topology, combine_topologies
+from .thermostat import BerendsenThermostat
 from .velocities import set_maxwell_boltzmann_velocities
 from .verlet import VelocityVerlet
 from .water import tip3p_parameters, tip3p_water, tip3p_waters
@@ -112,6 +116,7 @@ __all__ = [
     "SemiIsotropicBoxController",
     "SemiIsotropicPressureController",
     "add_ions_random",
+    "add_ions_to_seed",
     "area_per_lipid",
     "atoms_from_charmm",
     "atoms_from_openmm_pdb",
@@ -120,6 +125,7 @@ __all__ = [
     "available_lipid_templates",
     "available_openmm_lipid_templates",
     "backend_status",
+    "BerendsenThermostat",
     "bilayer_thickness",
     "charmm_topology_from_types",
     "Coulomb",
@@ -130,6 +136,7 @@ __all__ = [
     "equilibrate",
     "FixBondLengths",
     "find_openmm_lipid_xml",
+    "friction_ps_to_atomic_units",
     "hydrogen_bonds",
     "instantaneous_pressure_tensor",
     "Langevin",
@@ -160,14 +167,19 @@ __all__ = [
     "openmm_lipid_template",
     "PDBSnapshotWriter",
     "PMECoulomb",
+    "protein_membrane_seed",
+    "PME_ACCURACY_SPACING_NM",
+    "pme_mesh_for_accuracy",
     "pme_reciprocal_potential",
     "pme_reciprocal_potential_grid",
     "QMMM",
     "radial_distribution",
+    "read_protein_pdb",
     "read_charmm_parameters",
     "read_charmm_psf",
     "read_pdb_coordinates",
     "read_restart",
+    "residue_composition",
     "run_solvent_equilibration",
     "scale_molecule_centers",
     "Topology",
@@ -195,6 +207,7 @@ __all__ = [
     "water_oxygen_indices",
     "write_minimization_log",
     "write_pdb",
+    "write_protein_membrane_seed",
     "write_xyz",
     "write_restart",
 ]

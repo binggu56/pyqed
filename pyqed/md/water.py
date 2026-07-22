@@ -152,6 +152,7 @@ def tip3p_waters(
         lj_epsilon=lj_epsilon,
         lj_sigma=lj_sigma,
         molecule_ids=molecule_ids,
+        atom_names=np.tile(["O", "H1", "H2"], len(origins)),
     )
 
     mm = None

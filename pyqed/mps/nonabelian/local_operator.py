@@ -1170,14 +1170,16 @@ def compile_factorized_terms(factorized_terms, basis):
         for term in terms:
             out_idx, left_factor, right_factor = term[:3]
             family_names = term[3] if len(term) > 3 else ()
+            left_arr = np.asarray(left_factor)
+            right_arr = np.asarray(right_factor)
             shape_key = (
                 out_idx,
-                tuple(np.asarray(left_factor).shape),
-                tuple(np.asarray(right_factor).shape),
+                tuple(left_arr.shape),
+                tuple(right_arr.shape),
             )
             bucket = grouped.setdefault(shape_key, {"left": [], "right": []})
-            bucket["left"].append(np.asarray(left_factor))
-            bucket["right"].append(np.asarray(right_factor))
+            bucket["left"].append(left_arr)
+            bucket["right"].append(right_arr)
             bucket.setdefault("families", []).append(family_names)
         compiled_terms = []
         for shape_key in sorted(grouped, key=lambda key: basis[key[0]].offset):
