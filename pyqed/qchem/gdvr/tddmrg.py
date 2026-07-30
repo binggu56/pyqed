@@ -32,7 +32,7 @@ from pyqed.qchem.dmrg.spatial_terms import (
     accumulate_symbolic_term as accumulate_spatial_symbolic_term,
 )
 from pyqed.qchem.gdvr.rhf import fock_2e_slice_collocated, prepare_gdvr_fock_builder
-from pyqed.qchem.gdvr.rttdhf import cap_operator_from_z
+from pyqed.qchem.gdvr.rttdhf import _cap_operator_from_z
 
 
 def _axis_index(axis):
@@ -472,7 +472,7 @@ def cap_operator(mol, *, width=2.0, strength=0.005, order=2):
     nz = int(mol.shapes["Nz"])
     m = int(mol.shapes["M"])
     z = np.asarray(mol.z, dtype=float).reshape(nz)
-    return -1j * cap_operator_from_z(
+    return -1j * _cap_operator_from_z(
         z,
         M=m,
         width=width,

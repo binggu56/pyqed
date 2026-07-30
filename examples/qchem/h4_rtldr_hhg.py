@@ -8,7 +8,7 @@ import numpy as np
 from pyqed.dvr import DVR
 from pyqed.namd.rtldr.gdvr import GDVRFrame as RTTDHFFrame
 from pyqed.namd.rtldr.gdvr import Solver as RTLDR
-from pyqed.qchem.gdvr import AtomicChain, cap_operator_from_z
+from pyqed.qchem.gdvr import AtomicChain
 
 
 MASS_H = 1836.15267343
@@ -19,6 +19,7 @@ NPOINTS = 3
 LZ = 8.0
 NZ = 63
 M = 1
+TRANSVERSE_BASIS = "sto3g"
 CAP_WIDTH = 2.0
 CAP_STRENGTH = 0.005
 OMEGA = 0.057
@@ -72,13 +73,19 @@ def frame(q, field):
         Lz=LZ,
         Nz=NZ,
         M=M,
+        transverse_basis=TRANSVERSE_BASIS,
         verbose=False,
         dvr_method="sine",
     )
-    mf = mol.RHF().run(conv=1.0e-8, max_iter=100, verbose=False)
-    cap = cap_operator_from_z(
-        mol.z,
-        M=M,
+    mf = mol.RHF().run(
+        conv=1.0e-8,
+        max_iter=100,
+        newton=True,
+        max_cycles=50,
+        sweeps=4,
+        verbose=False,
+    )
+    cap = mol.cap(
         width=CAP_WIDTH,
         strength=CAP_STRENGTH,
     )
@@ -136,6 +143,7 @@ def run():
         atomic_z=np.array([atomic_positions(q) for q in nuclear.points]),
         electronic_z=solver.frames[0].z,
         cap_profile=np.diag(solver.frames[0].cap).real,
+        transverse_basis=TRANSVERSE_BASIS,
         ground_energy=ground_energy,
         coefficients=trajectory.coefficients,
         nuclear_density=trajectory.coordinate_density,

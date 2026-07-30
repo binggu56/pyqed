@@ -872,7 +872,7 @@ class RHF:
     def newton(
         self,
         alt_cycles=6,
-        sweep_iterations=4,
+        sweeps=4,
         ridge=0.5,
         trust_step=1.0,
         trust_radius=2.0,
@@ -924,7 +924,7 @@ class RHF:
                 d_stack,
                 P_slice,
                 S_prim,
-                n_cycles=int(sweep_iterations),
+                n_cycles=int(sweeps),
                 ridge=float(ridge),
                 trust_step=float(trust_step),
                 trust_radius=float(trust_radius),

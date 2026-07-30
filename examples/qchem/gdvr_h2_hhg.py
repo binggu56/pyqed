@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pyqed.qchem.gdvr import AtomicChain, RTTDHF, cap_operator_from_z
+from pyqed.qchem.gdvr import AtomicChain, RTTDHF
 
 
 AU_TIME_FS = 0.02418884326505
@@ -422,14 +422,19 @@ def run_case(args, nz):
 
     print("[scf] RHF")
     start = walltime.perf_counter()
-    mf = mol.RHF().run(conv=args.scf_conv, max_iter=args.scf_max_iter, verbose=args.verbose)
+    mf = mol.RHF().run(
+        newton=False,
+        conv=args.scf_conv,
+        max_iter=args.scf_max_iter,
+        verbose=args.verbose,
+    )
     scf_seconds = walltime.perf_counter() - start
 
     if args.newton_sweeps > 0:
         print(f"[newton] sweeps={args.newton_sweeps}")
         mf.newton(
             tol=args.scf_conv,
-            sweep_iterations=args.newton_sweeps,
+            sweeps=args.newton_sweeps,
             ridge=0.5,
             trust_step=1.0,
             trust_radius=2.0,
@@ -445,9 +450,7 @@ def run_case(args, nz):
     nsteps = int(np.ceil(field.duration / float(args.dt)))
     cap = None
     if args.cap_strength > 0.0:
-        cap = cap_operator_from_z(
-            mol.z,
-            M=args.m,
+        cap = mol.cap(
             width=args.cap_width,
             strength=args.cap_strength,
             order=args.cap_order,

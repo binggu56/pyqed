@@ -319,7 +319,12 @@ def run_case(args):
 
     print("[scf] RHF")
     start = walltime.perf_counter()
-    mf = mol.RHF().run(conv=args.scf_conv, max_iter=args.scf_max_iter, verbose=args.verbose)
+    mf = mol.RHF().run(
+        newton=False,
+        conv=args.scf_conv,
+        max_iter=args.scf_max_iter,
+        verbose=args.verbose,
+    )
     scf_seconds = walltime.perf_counter() - start
     e_before_transverse_opt = None
     transverse_opt_seconds = 0.0
@@ -330,7 +335,7 @@ def run_case(args):
         mf.newton(
             tol=float(args.transverse_opt_tol),
             max_cycles=int(args.transverse_opt_cycles),
-            sweep_iterations=int(args.transverse_opt_sweeps),
+            sweeps=int(args.transverse_opt_sweeps),
             ridge=float(args.transverse_opt_ridge),
             trust_step=float(args.transverse_opt_step),
             trust_radius=float(args.transverse_opt_radius),

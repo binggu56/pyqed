@@ -28,7 +28,7 @@ def _hermitian(matrix):
     return 0.5 * (matrix + matrix.conj().T)
 
 
-def cap_operator_from_z(z, M=1, width=2.0, strength=0.005, order=2):
+def _cap_operator_from_z(z, M=1, width=2.0, strength=0.005, order=2):
     """
     Build a diagonal complex-absorbing-potential profile W(z).
 

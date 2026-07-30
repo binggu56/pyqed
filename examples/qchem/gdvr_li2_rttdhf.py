@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.qchem.gdvr import AtomicChain, RTTDHF, cap_operator_from_z
+from pyqed.qchem.gdvr import AtomicChain, RTTDHF
 
 
 AU_TIME_FS = 0.02418884326505
@@ -88,9 +88,7 @@ def main(argv=None):
 
     cap = None
     if args.cap_strength > 0.0:
-        cap = cap_operator_from_z(
-            mol.z,
-            M=int(args.m),
+        cap = mol.cap(
             width=float(args.cap_width),
             strength=float(args.cap_strength),
             order=int(args.cap_order),

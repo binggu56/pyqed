@@ -30,6 +30,7 @@ def main():
     )
 
     mf = mol.RHF().run(
+        newton=False,
         conv=1e-8,
         max_iter=100,
         verbose=False,
@@ -40,7 +41,7 @@ def main():
 
     mf.newton(
         tol=1e-8,
-        sweep_iterations=10,
+        sweeps=10,
         ridge=0.5,
         trust_step=1.0,
         trust_radius=2.0,

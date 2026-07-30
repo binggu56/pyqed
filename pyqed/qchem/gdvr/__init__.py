@@ -1,6 +1,6 @@
 from .rhf import *  # noqa: F401,F403
 from .integrals import two_electron_wedge_basis, two_electron_wedge_kinetic  # noqa: F401
-from .rttdhf import RTTDHF, cap_operator_from_z  # noqa: F401
+from .rttdhf import RTTDHF  # noqa: F401
 from .tddmrg import (  # noqa: F401
     GDVRSpatialDensityPhase,
     GDVRSpatialFactorizedDensityPhase,

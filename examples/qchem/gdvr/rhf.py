@@ -42,6 +42,7 @@ mf = mol.build(
     verbose=VERBOSE,
     dvr_method=DVR_METHOD,
 ).RHF().run(
+    newton=False,
     conv=1e-6,
     max_iter=100,
     verbose=VERBOSE,
@@ -51,7 +52,7 @@ print(f"[SCF 0] E = {mf.e_tot:.12f} Eh  (iters={mf.info['iter']})")
 
 mf.newton(
     tol=NEWTON_TOL,
-    sweep_iterations=SWEEP_ITERATIONS,
+    sweeps=SWEEP_ITERATIONS,
     ridge=NEWTON_RIDGE,
     trust_step=TRUST_STEP,
     trust_radius=TRUST_RADIUS,

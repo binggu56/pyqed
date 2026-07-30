@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pyqed.qchem import Molecule as PyQEDMolecule
 from pyqed.qchem import RHF as PyQEDRHF
 from pyqed.qchem import RTTDHF as PyQEDRTTDHF
-from pyqed.qchem.gdvr import AtomicChain, RTTDHF as GDVRRT, cap_operator_from_z
+from pyqed.qchem.gdvr import AtomicChain, RTTDHF as GDVRRT
 from pyqed.qchem.gdvr.rhf import scf_rhf_method2
 
 from gdvr_h2_hhg import (
@@ -236,9 +236,7 @@ def build_strong_pulse(args):
 def run_gdvr_strong(mol, mf, pulse, args):
     cap = None
     if args.gdvr_cap_strength > 0.0:
-        cap = cap_operator_from_z(
-            mol.z,
-            M=int(mol.shapes["M"]),
+        cap = mol.cap(
             width=args.gdvr_cap_width,
             strength=args.gdvr_cap_strength,
             order=args.gdvr_cap_order,

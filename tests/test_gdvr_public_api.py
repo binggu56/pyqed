@@ -68,6 +68,7 @@ def test_gdvr_rhf_to_gto_returns_qchem_adapter():
     )
     mol.build(Lz=3.0, Nz=5, M=1, verbose=False)
     mf = mol.RHF().run(conv=1e-6, max_iter=40, verbose=False)
+    assert mf.info["newton_cycles"] >= 1
 
     adapter = mf.to_gto()
 
@@ -166,13 +167,38 @@ def test_transverse_newton_uses_full_scf_default():
         ],
     )
     mol.build(Lz=3.0, Nz=7, M=1, verbose=False, dvr_method="sine")
-    mf = mol.RHF().run(conv=1e-6, max_iter=40, verbose=False)
+    mf = mol.RHF().run(newton=False, conv=1e-6, max_iter=40, verbose=False)
 
-    mf.newton(max_cycles=1, sweep_iterations=1, scf_conv=1e-6, scf_max_iter=40, verbose=False)
+    mf.newton(max_cycles=1, sweeps=1, scf_conv=1e-6, scf_max_iter=40, verbose=False)
 
     assert mf.info["newton_cycles"] == 1
     assert len(mf.info["newton_energy_history"]) == 2
     assert mf.info["newton_scf_mode"] == "full"
+
+
+def test_gdvr_run_raises_when_initial_scf_does_not_converge():
+    mol = AtomicChain(
+        elements=["H", "H"],
+        coords=[
+            [0.0, 0.0, -0.7],
+            [0.0, 0.0, 0.7],
+        ],
+    )
+    mol.build(Lz=3.0, Nz=7, M=1, verbose=False, dvr_method="sine")
+
+    mf = mol.RHF()
+    with pytest.raises(RuntimeError, match="SCF did not converge"):
+        mf.run(newton=False, conv=1e-12, max_iter=1, verbose=False)
+    assert not mf.info["converged"]
+
+    with pytest.raises(RuntimeError, match="transverse Newton optimization"):
+        mol.RHF().run(
+            conv=1e-6,
+            max_iter=40,
+            max_cycles=1,
+            sweeps=1,
+            verbose=False,
+        )
 
 
 def test_gdvr_rhf_rejects_odd_electron_count():

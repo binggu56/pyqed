@@ -1,6 +1,6 @@
 import numpy as np
 
-from pyqed.qchem.gdvr import RTTDHF, cap_operator_from_z
+from pyqed.qchem.gdvr import Molecule, RTTDHF
 
 
 def _eri_blocks(nz, m, value=0.0):
@@ -90,8 +90,11 @@ def test_gdvr_rttdhf_public_alias_and_scalar_field_uses_z_axis():
     np.testing.assert_allclose(rt.fields[0], [0.0, 0.0, 0.25])
 
 
-def test_gdvr_cap_operator_from_z_has_edge_profile():
-    cap = cap_operator_from_z(np.array([-2.0, -1.0, 0.0, 1.0, 2.0]), width=1.5, strength=0.2)
+def test_gdvr_molecule_cap_has_edge_profile():
+    mol = Molecule([2.0], [[0.0, 0.0, 0.0]], nelec=2)
+    mol.z = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+    mol.shapes = {"Nz": 5, "M": 1, "size": 5}
+    cap = mol.cap(width=1.5, strength=0.2)
 
     np.testing.assert_allclose(
         np.diag(cap),

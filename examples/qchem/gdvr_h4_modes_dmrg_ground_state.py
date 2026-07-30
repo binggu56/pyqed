@@ -85,6 +85,7 @@ def run_point(task):
             verbose=bool(args_dict["verbose"]),
         )
         mf = mol.RHF().run(
+            newton=False,
             conv=float(args_dict["rhf_conv"]),
             verbose=bool(args_dict["verbose"]),
         )
@@ -92,7 +93,7 @@ def run_point(task):
 
         mf.newton(
             max_cycles=int(args_dict["too_cycles"]),
-            sweep_iterations=int(args_dict["too_sweep_iterations"]),
+            sweeps=int(args_dict["too_sweep_iterations"]),
             tol=float(args_dict["too_tol"]),
             ridge=float(args_dict["too_ridge"]),
             trust_step=float(args_dict["too_trust_step"]),

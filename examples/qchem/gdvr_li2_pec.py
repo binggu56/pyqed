@@ -120,6 +120,7 @@ def _run_point(r_bohr, args):
 
     scf_start = time.perf_counter()
     mf = mol.RHF().run(
+        newton=False,
         conv=float(args.scf_conv),
         max_iter=int(args.scf_max_iter),
         verbose=bool(args.verbose),
@@ -134,7 +135,7 @@ def _run_point(r_bohr, args):
         mf.newton(
             tol=float(args.transverse_opt_tol),
             max_cycles=int(args.transverse_opt_cycles),
-            sweep_iterations=int(args.transverse_opt_sweeps),
+            sweeps=int(args.transverse_opt_sweeps),
             ridge=float(args.transverse_opt_ridge),
             trust_step=float(args.transverse_opt_step),
             trust_radius=float(args.transverse_opt_radius),

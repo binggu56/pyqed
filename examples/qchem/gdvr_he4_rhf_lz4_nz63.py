@@ -34,7 +34,7 @@ def main():
         dvr_method="sine",
     )
 
-    mf = mol.RHF().run(conv=1e-8, max_iter=200, verbose=False)
+    mf = mol.RHF().run(newton=False, conv=1e-8, max_iter=200, verbose=False)
     nocc = mol.nelec // 2
 
     print(f"He4 spacing = {spacing:.3f} bohr")

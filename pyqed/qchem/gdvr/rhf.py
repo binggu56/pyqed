@@ -347,6 +347,20 @@ class Molecule:
         op = self.position_operator(axis)
         return -op if electronic else op
 
+    def cap(self, *, width=2.0, strength=0.005, order=2):
+        """Return the nonnegative GDVR complex-absorbing-potential operator."""
+        if self.z is None or self.shapes is None:
+            raise ValueError("Build the GDVR molecule before requesting a CAP.")
+        from pyqed.qchem.gdvr.rttdhf import _cap_operator_from_z
+
+        return _cap_operator_from_z(
+            self.z,
+            M=int(self.shapes["M"]),
+            width=width,
+            strength=strength,
+            order=order,
+        )
+
     def build(
         self,
         Lz=18.0,
@@ -1100,7 +1114,7 @@ class RHF:
         self.dm = None
         self.info = None
 
-    def run(
+    def _run_scf(
         self,
         conv=1e-7,
         max_iter=50,
@@ -1145,6 +1159,70 @@ class RHF:
         self.mo_occ[: self.mol.nelec // 2] = 2.0
         self.dm = np.asarray(P, float)
         self.info = dict(info)
+        return self
+
+    def run(
+        self,
+        conv=1e-7,
+        max_iter=50,
+        verbose=True,
+        damp=0.20,
+        diis_start=3,
+        diis_space=8,
+        level_shift=0.5,
+        shift_decay=0.75,
+        k_ramp_iters=8,
+        dm0=None,
+        newton=True,
+        max_cycles=50,
+        sweeps=4,
+    ):
+        """Run GDVR RHF, with transverse Newton optimization by default."""
+        if self.mol.shapes is None:
+            raise ValueError(
+                "Build the GDVR molecule first with mol.build(...) before calling mol.RHF().run()."
+            )
+        if newton and int(self.mol.shapes["M"]) != 1:
+            raise NotImplementedError(
+                "GDVR transverse Newton optimization currently supports only M=1. "
+                "Use run(newton=False) for fixed-slice SCF."
+            )
+        self._run_scf(
+            conv=conv,
+            max_iter=max_iter,
+            verbose=verbose,
+            damp=damp,
+            diis_start=diis_start,
+            diis_space=diis_space,
+            level_shift=level_shift,
+            shift_decay=shift_decay,
+            k_ramp_iters=k_ramp_iters,
+            dm0=dm0,
+        )
+        if not self.info["converged"]:
+            raise RuntimeError(
+                "GDVR RHF SCF did not converge after "
+                f"{self.info['iter']} iterations "
+                f"(dE={self.info['dE']:.3e}, rnorm={self.info['rnorm']:.3e})."
+            )
+        if not newton:
+            return self
+        self.newton(
+            tol=conv,
+            max_cycles=max_cycles,
+            sweeps=sweeps,
+            scf_conv=conv,
+            scf_max_iter=max_iter,
+            verbose=verbose,
+        )
+        if not self.info["newton_converged"]:
+            history = self.info["newton_energy_history"]
+            delta = abs(history[-1] - history[-2])
+            raise RuntimeError(
+                "GDVR transverse Newton optimization did not converge after "
+                f"{self.info['newton_cycles']} cycles "
+                f"(dE={delta:.3e}, tol={self.info['newton_tol']:.3e})."
+            )
         return self
 
     def make_rdm1(self):
@@ -1193,7 +1271,7 @@ class RHF:
         self,
         tol=None,
         max_cycles=50,
-        sweep_iterations=4,
+        sweeps=4,
         ridge=0.5,
         trust_step=1.0,
         trust_radius=2.0,
@@ -1208,7 +1286,7 @@ class RHF:
                 "Build the GDVR molecule first with mol.build(...) before calling newton()."
             )
         if self.dm is None:
-            self.run(conv=scf_conv, max_iter=scf_max_iter, verbose=verbose)
+            self._run_scf(conv=scf_conv, max_iter=scf_max_iter, verbose=verbose)
         if int(self.mol.shapes["M"]) != 1:
             raise NotImplementedError("newton() currently supports only M=1.")
         if tol is None:
@@ -1278,7 +1356,7 @@ class RHF:
                 d_stack,
                 P_slice,
                 S_prim,
-                n_cycles=int(sweep_iterations),
+                n_cycles=int(sweeps),
                 ridge=float(ridge),
                 trust_step=float(trust_step),
                 trust_radius=float(trust_radius),
@@ -1349,7 +1427,10 @@ class RHF:
             if verbose:
                 print(f"   [SCF] E = {self.e_tot:.12f} Eh  ΔE={E_history[-1] - E_history[-2]:+.3e}")
 
-            if abs(E_history[-1] - E_history[-2]) < tol:
+            if (
+                bool(info.get("converged", False))
+                and abs(E_history[-1] - E_history[-2]) < tol
+            ):
                 converged = True
                 if verbose:
                     print("Converged.")
@@ -1597,6 +1678,7 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
     P_prev2 = None
     diis = PulayCDIIS(space=diis_space)
     beta = float(level_shift)
+    converged = False
 
     def total_energy(Puse, Fuse):
         E_el = 0.5 * np.sum((Hcore + Fuse) * Puse)
@@ -1641,6 +1723,7 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
         if dE < conv and rnorm < 1e-5:
             P = P_new
             E_last = Etot
+            converged = True
             break
 
         if it > 1 and rnorm > 1.5 * la.norm(F @ P - P @ F, ord='fro'):
@@ -1654,7 +1737,15 @@ def scf_rhf_method2(Hcore, ERI_J, ERI_K, Nz, M, nelec, Enuc=0.0,
         P       = P_new
         E_last  = Etot
 
-    info = {"iter": it, "dE": dE, "rnorm": rnorm, "damp": damp, "level_shift": beta, "k_scale": k_scale}
+    info = {
+        "converged": converged,
+        "iter": it,
+        "dE": dE,
+        "rnorm": rnorm,
+        "damp": damp,
+        "level_shift": beta,
+        "k_scale": k_scale,
+    }
     return Etot, eps, Cmo, P, info
 
 
