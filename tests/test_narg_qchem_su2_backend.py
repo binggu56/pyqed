@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from types import SimpleNamespace
 
 from pyqed.narg import NARG as PublicNARG
@@ -38,6 +39,8 @@ from pyqed.narg.qchem.su2_two_site import (
     diagonalize_all_sectors,
     truncate_to_D,
 )
+from pyqed.mps.nonabelian.coupling import clebsch_gordan
+from pyqed.mps.su2 import SU2Irrep
 
 
 def _hubbard_integrals(nsites: int, *, t: float = 0.7, u: float = 2.0):
@@ -63,6 +66,37 @@ def _physical_random_integrals(nsites: int, *, seed: int = 23):
     )
     eri = 0.5 * (eri + eri.transpose(2, 3, 0, 1))
     return h1e, eri
+
+
+def test_native_clebsch_gordan_matches_python_for_general_spins():
+    from pyqed.narg.qchem import su2_native
+
+    native = su2_native.clebsch_gordan_doubled
+    if native is None:
+        pytest.skip("optional SU(2)-NARG C++ extension is unavailable")
+    for left_j2, right_j2, fused_j2 in ((3, 4, 5), (5, 3, 4), (4, 4, 6)):
+        left = SU2Irrep(left_j2)
+        right = SU2Irrep(right_j2)
+        fused = SU2Irrep(fused_j2)
+        for left_m2 in range(-left_j2, left_j2 + 1, 2):
+            for right_m2 in range(-right_j2, right_j2 + 1, 2):
+                fused_m2 = left_m2 + right_m2
+                expected = clebsch_gordan(
+                    left,
+                    right,
+                    fused,
+                    left_m2,
+                    right_m2,
+                    fused_m2,
+                )
+                assert native(
+                    left_j2,
+                    right_j2,
+                    fused_j2,
+                    left_m2,
+                    right_m2,
+                    fused_m2,
+                ) == pytest.approx(expected, abs=1.0e-13)
 
 
 def _su2_chain_sector_roots(h1e, eri, *, D: int, nroots: int = 8, **kwargs):

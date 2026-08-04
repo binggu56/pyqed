@@ -14,6 +14,7 @@ from pathlib import Path
 CPP_PRODUCT_AVAILABLE = False
 CPP_ANGULAR_AVAILABLE = False
 CPP_PRODUCT_BUILD_ERROR = None
+clebsch_gordan_doubled = None
 reduced_product_block_sum = None
 reduced_product_block_sum_batch = None
 product_tensor_pair_entries = None
@@ -74,6 +75,12 @@ def _compile_extension():
         return None
 
     source = Path(__file__).with_name("su2_native.cpp")
+    coupling_header = (
+        Path(__file__).parents[2]
+        / "mps"
+        / "nonabelian"
+        / "su2_coupling_core.hpp"
+    )
     if not source.exists():
         CPP_PRODUCT_BUILD_ERROR = f"source file not found: {source}"
         return None
@@ -89,6 +96,7 @@ def _compile_extension():
         [
             source.name,
             source_mtime,
+            str(coupling_header.stat().st_mtime_ns),
             sys.version.split()[0],
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
@@ -169,6 +177,7 @@ def _compile_extension():
 def _initialize():
     global CPP_PRODUCT_AVAILABLE
     global CPP_ANGULAR_AVAILABLE
+    global clebsch_gordan_doubled
     global reduced_product_block_sum
     global reduced_product_block_sum_batch
     global product_tensor_pair_entries
@@ -180,6 +189,7 @@ def _initialize():
     module = _compile_extension()
     if module is None:
         return
+    clebsch_gordan_doubled = getattr(module, "clebsch_gordan_doubled", None)
     reduced_product_block_sum = getattr(module, "reduced_product_block_sum", None)
     reduced_product_block_sum_batch = getattr(
         module,

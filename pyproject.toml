@@ -115,6 +115,8 @@ namespaces = false
     "basis_set/*.gbs",
     "basis_set/*.txt",
 ]
+"pyqed.narg.qchem" = ["su2_native.cpp"]
+"pyqed.mps.nonabelian" = ["su2_coupling_core.hpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

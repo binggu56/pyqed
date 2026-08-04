@@ -2,6 +2,8 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include "../../mps/nonabelian/su2_coupling_core.hpp"
+
 #include <complex>
 #include <cmath>
 #include <cstdint>
@@ -14,97 +16,6 @@ namespace py = pybind11;
 
 using cdouble = std::complex<double>;
 
-static inline double sqrt_ratio(double numer, double denom) {
-    if (numer <= 0.0) {
-        return 0.0;
-    }
-    return std::sqrt(numer / denom);
-}
-
-static inline double phase_from_doubled(int exponent2) {
-    const int exponent = exponent2 / 2;
-    return (exponent % 2) ? -1.0 : 1.0;
-}
-
-static inline double cg_right_spin_half(
-    int left_j2,
-    int left_m2,
-    int right_m2,
-    int coupled_j2
-) {
-    const double j2 = static_cast<double>(left_j2);
-    const double m2 = static_cast<double>(left_m2);
-    if (right_m2 == 1) {
-        if (coupled_j2 == left_j2 + 1) {
-            return sqrt_ratio(j2 + m2 + 2.0, 2.0 * (j2 + 1.0));
-        }
-        if (coupled_j2 == left_j2 - 1) {
-            return -sqrt_ratio(j2 - m2, 2.0 * (j2 + 1.0));
-        }
-    } else if (right_m2 == -1) {
-        if (coupled_j2 == left_j2 + 1) {
-            return sqrt_ratio(j2 - m2 + 2.0, 2.0 * (j2 + 1.0));
-        }
-        if (coupled_j2 == left_j2 - 1) {
-            return sqrt_ratio(j2 + m2, 2.0 * (j2 + 1.0));
-        }
-    }
-    return 0.0;
-}
-
-static inline double cg_right_spin_one(
-    int left_j2,
-    int left_m2,
-    int right_m2,
-    int coupled_j2
-) {
-    const double j2 = static_cast<double>(left_j2);
-    const double m2 = static_cast<double>(left_m2);
-    const int q2 = right_m2;
-    double denom = 0.0;
-
-    if (coupled_j2 == left_j2 + 2) {
-        denom = 4.0 * (j2 + 1.0) * (j2 + 2.0);
-        if (q2 == 2) {
-            return sqrt_ratio((j2 + m2 + 2.0) * (j2 + m2 + 4.0), denom);
-        }
-        if (q2 == 0) {
-            return sqrt_ratio((j2 - m2 + 2.0) * (j2 + m2 + 2.0), 0.5 * denom);
-        }
-        if (q2 == -2) {
-            return sqrt_ratio((j2 - m2 + 2.0) * (j2 - m2 + 4.0), denom);
-        }
-    }
-
-    if (coupled_j2 == left_j2 && left_j2 > 0) {
-        denom = 2.0 * j2 * (j2 + 2.0);
-        if (q2 == 2) {
-            return -sqrt_ratio((j2 - m2) * (j2 + m2 + 2.0), denom);
-        }
-        if (q2 == 0) {
-            return m2 / std::sqrt(j2 * (j2 + 2.0));
-        }
-        if (q2 == -2) {
-            return sqrt_ratio((j2 + m2) * (j2 - m2 + 2.0), denom);
-        }
-    }
-
-    if (coupled_j2 == left_j2 - 2 && left_j2 >= 2) {
-        denom = 4.0 * j2 * (j2 + 1.0);
-        if (q2 == 2) {
-            return sqrt_ratio((j2 - m2) * (j2 - m2 - 2.0), denom);
-        }
-        if (q2 == 0) {
-            return -sqrt_ratio((j2 - m2) * (j2 + m2), 0.5 * denom);
-        }
-        if (q2 == -2) {
-            return sqrt_ratio((j2 + m2) * (j2 + m2 - 2.0), denom);
-        }
-    }
-
-    return 0.0;
-}
-
 static double cg(
     int left_j2,
     int left_m2,
@@ -113,51 +24,14 @@ static double cg(
     int coupled_j2,
     int coupled_m2
 ) {
-    if (left_m2 + right_m2 != coupled_m2) {
-        return 0.0;
-    }
-    if (
-        std::abs(left_m2) > left_j2
-        || std::abs(right_m2) > right_j2
-        || std::abs(coupled_m2) > coupled_j2
-    ) {
-        return 0.0;
-    }
-    if (
-        (left_j2 - left_m2) % 2
-        || (right_j2 - right_m2) % 2
-        || (coupled_j2 - coupled_m2) % 2
-    ) {
-        return 0.0;
-    }
-    if (coupled_j2 < std::abs(left_j2 - right_j2) || coupled_j2 > left_j2 + right_j2) {
-        return 0.0;
-    }
-    if ((left_j2 + right_j2 + coupled_j2) % 2) {
-        return 0.0;
-    }
-
-    if (right_j2 == 0) {
-        if (coupled_j2 == left_j2 && coupled_m2 == left_m2 && right_m2 == 0) {
-            return 1.0;
-        }
-        return 0.0;
-    }
-    if (right_j2 == 1) {
-        return cg_right_spin_half(left_j2, left_m2, right_m2, coupled_j2);
-    }
-    if (right_j2 == 2) {
-        return cg_right_spin_one(left_j2, left_m2, right_m2, coupled_j2);
-    }
-
-    if (left_j2 == 0 || left_j2 == 1 || left_j2 == 2) {
-        return (
-            phase_from_doubled(left_j2 + right_j2 - coupled_j2)
-            * cg(right_j2, right_m2, left_j2, left_m2, coupled_j2, coupled_m2)
-        );
-    }
-
-    return 0.0;
+    return pyqed::su2::clebsch_gordan_doubled(
+        left_j2,
+        right_j2,
+        coupled_j2,
+        left_m2,
+        right_m2,
+        coupled_m2
+    );
 }
 
 static double product_tensor_pair_coeff(
@@ -842,6 +716,32 @@ static py::array_t<cdouble> accumulate_bilinear(
 
 PYBIND11_MODULE(_su2_native, m) {
     m.doc() = "Native kernels for SU(2)-NARG reduced tensor products";
+    m.def(
+        "clebsch_gordan_doubled",
+        [](
+            int left_j2,
+            int right_j2,
+            int fused_j2,
+            int left_m2,
+            int right_m2,
+            int fused_m2
+        ) {
+            return cg(
+                left_j2,
+                left_m2,
+                right_j2,
+                right_m2,
+                fused_j2,
+                fused_m2
+            );
+        },
+        py::arg("left_j2"),
+        py::arg("right_j2"),
+        py::arg("fused_j2"),
+        py::arg("left_m2"),
+        py::arg("right_m2"),
+        py::arg("fused_m2")
+    );
     m.def(
         "reduced_product_block_sum",
         &reduced_product_block_sum,

@@ -20,6 +20,8 @@ include pyqed/_dop853.hpp
 include pyqed/heom/_heom_cpp.cpp
 include pyqed/mps/nonabelian/_su2_kernel.c
 include pyqed/mps/nonabelian/_su2_kernel.pyx
+include pyqed/mps/nonabelian/su2_coupling_core.hpp
+include pyqed/narg/qchem/su2_native.cpp
 include pyqed/qchem/_basis_cy.c
 include pyqed/qchem/_basis_cy.pyx
 include pyqed/qchem/_casscf_cpp.cpp
